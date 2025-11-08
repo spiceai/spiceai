@@ -15,7 +15,7 @@ limitations under the License.
 */
 //! Data types for semantic information about tables (datasets or views).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -54,16 +54,31 @@ impl Column {
             metadata: HashMap::new(),
         }
     }
+
     #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, Value>) -> Self {
         self.metadata = metadata;
         self
     }
+
     #[must_use]
     pub fn with_embeddings(mut self, embeddings: Vec<ColumnLevelEmbeddingConfig>) -> Self {
         self.embeddings = embeddings;
         self
     }
+
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: ColumnLevelEmbeddingConfig) -> Self {
+        self.embeddings.push(embedding);
+        self
+    }
+
+    #[must_use]
+    pub fn with_full_text_search(mut self, full_text_search: FullTextSearchConfig) -> Self {
+        self.full_text_search = Some(full_text_search);
+        self
+    }
+
     /// Return the column-level metadata that should be added to a [`arrow::datatypes::Field`].
     #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
@@ -75,6 +90,19 @@ impl Column {
             metadata.insert(k.to_string(), v.to_string());
         }
         metadata
+    }
+
+    #[must_use]
+    pub fn as_vector_metadata(&self) -> Option<MetadataType> {
+        let value = self.metadata.get("vectors")?.clone();
+        // If it doesn't deserialize to `MetadataType`, not an issue, just not a `MetadataType`.
+        serde_json::from_value(value).ok()
+    }
+}
+
+impl From<&str> for Column {
+    fn from(value: &str) -> Self {
+        Column::new(value)
     }
 }
 
@@ -105,6 +133,40 @@ pub struct ColumnLevelEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
+}
+
+impl ColumnLevelEmbeddingConfig {
+    #[must_use]
+    pub fn model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            chunking: None,
+            row_ids: None,
+            vector_size: None,
+        }
+    }
+
+    #[must_use]
+    pub fn chunking(mut self, chunking: EmbeddingChunkConfig) -> Self {
+        self.chunking = Some(chunking);
+        self
+    }
+
+    #[must_use]
+    pub fn with_row_id(self, row_id: &str) -> Self {
+        if let Some(mut row_ids) = self.row_ids {
+            row_ids.push(row_id.to_string());
+            Self {
+                row_ids: Some(row_ids),
+                ..self
+            }
+        } else {
+            Self {
+                row_ids: Some(vec![row_id.to_string()]),
+                ..self
+            }
+        }
+    }
 }
 
 // Let `row_id` handle single string or arrays. All acceptable
@@ -152,6 +214,75 @@ pub struct FullTextSearchConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub row_ids: Option<Vec<String>>,
+
+    pub index_store: Option<IndexStore>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum IndexStore {
+    #[default]
+    Memory,
+    File,
+}
+
+impl Display for IndexStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory => write!(f, "memory"),
+            Self::File => write!(f, "file"),
+        }
+    }
+}
+
+impl FullTextSearchConfig {
+    #[must_use]
+    pub fn disabled() -> Self {
+        FullTextSearchConfig {
+            enabled: false,
+            row_ids: None,
+            index_store: Some(IndexStore::default()),
+            index_directory: None,
+        }
+    }
+
+    #[must_use]
+    pub fn enabled() -> Self {
+        FullTextSearchConfig {
+            enabled: true,
+            row_ids: None,
+            index_store: Some(IndexStore::default()),
+            index_directory: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_row_id(self, row_id: &str) -> Self {
+        if let Some(mut row_ids) = self.row_ids {
+            row_ids.push(row_id.to_string());
+            FullTextSearchConfig {
+                row_ids: Some(row_ids),
+                ..self
+            }
+        } else {
+            FullTextSearchConfig {
+                row_ids: Some(vec![row_id.to_string()]),
+                ..self
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MetadataType {
+    #[serde(rename = "non-filterable")]
+    NonFilterable,
+    #[serde(rename = "filterable")]
+    Filterable,
 }
 
 #[cfg(test)]

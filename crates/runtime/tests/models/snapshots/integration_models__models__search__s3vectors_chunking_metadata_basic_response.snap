@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\n2"
+      },
+      "primary_key": {
+        "id": 612
+      },
+      "score": 0.79
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": " is 2."
+      },
+      "primary_key": {
+        "id": 349
+      },
+      "score": 0.78
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 948
+      },
+      "score": 0.55
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 1277
+      },
+      "score": 0.55
+    }
+  ]
+}

@@ -18,7 +18,7 @@ use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
     component::catalog::Catalog,
-    dataconnector::parameters::{ConnectorParams, aws::load_config},
+    dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
@@ -33,8 +33,10 @@ use data_components::{
         provider::IcebergCatalogProvider,
     },
 };
-use iceberg::{Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
-use iceberg_catalog_rest::RestCatalogConfig;
+use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
+};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -81,6 +83,10 @@ pub enum Error {
 
     #[snafu(display("Unexpected table segment in catalog path: {segment}"))]
     UnexpectedTableSegment { segment: String },
+
+    #[snafu(display("Failed to build catalog: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalog { source: iceberg::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -282,7 +288,7 @@ impl CatalogConnector for IcebergCatalog {
                     source: Box::new(e),
                 })?;
 
-            let aws_sdk_config = load_config(
+            let aws_sdk_config = initiate_config_with_credentials(
                 "IcebergCatalogConnector",
                 "s3_region",
                 "s3_access_key_id",
@@ -296,7 +302,9 @@ impl CatalogConnector for IcebergCatalog {
                 message: e.to_string(),
                 connector_component: ConnectorComponent::from(catalog),
                 source: Box::new(e),
-            })?;
+            })?
+            .load()
+            .await;
 
             Some(
                 S3CredentialProvider::from_config(&aws_sdk_config)
@@ -340,7 +348,7 @@ impl CatalogConnector for IcebergCatalog {
         };
 
         props.extend(new_props);
-        let catalog_config = get_rest_catalog_config(base_uri, props);
+        let catalog_config = get_rest_catalog(base_uri, props).await?;
         let mut catalog_client = RestCatalog::new(catalog_config);
         if let Some(loader) = custom_credential_loader {
             catalog_client = catalog_client.with_file_io_extension(loader);
@@ -371,7 +379,7 @@ pub(crate) async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
         } else if url.scheme() == "https" {
             443
         } else {
-            return 0;
+            0
         }
     });
 
@@ -509,17 +517,16 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
     }
 
     // Auto-detect AWS Glue URLs and set signing region, name, and SigV4 enabled
-    if let Some(host_str) = parsed.host_str() {
-        if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
-            if let Some(region) = host_str
-                .strip_prefix("glue.")
-                .and_then(|s| s.strip_suffix(".amazonaws.com"))
-            {
-                props.insert("rest.signing-region".to_string(), region.to_string());
-                props.insert("rest.signing-name".to_string(), "glue".to_string());
-                props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
-            }
-        }
+    if let Some(host_str) = parsed.host_str()
+        && host_str.starts_with("glue.")
+        && host_str.ends_with(".amazonaws.com")
+        && let Some(region) = host_str
+            .strip_prefix("glue.")
+            .and_then(|s| s.strip_suffix(".amazonaws.com"))
+    {
+        props.insert("rest.signing-region".to_string(), region.to_string());
+        props.insert("rest.signing-name".to_string(), "glue".to_string());
+        props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
     }
 
     // The namespace name is the segment immediately after "namespaces"
@@ -577,50 +584,39 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
     }
 }
 
-/// Builds a `RestCatalogConfig` from a base URI and properties.
-///
-/// This function takes a base URI and a map of properties, and builds a `RestCatalogConfig`
-/// with the given properties. If a "warehouse" property is present, it will be used to set the
-/// warehouse for the catalog.
-#[must_use]
-pub fn get_rest_catalog_config(
+/// Builds an `IcebergRestCatalog` from a base URI and properties.
+pub async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,
-) -> RestCatalogConfig {
-    if let Some(warehouse) = props.remove("warehouse") {
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .warehouse(warehouse)
-            .build()
-    } else {
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .build()
-    }
+) -> Result<IcebergRestCatalog> {
+    props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
+    RestCatalogBuilder::default()
+        .load("rest", props)
+        .await
+        .context(UnableToBuildCatalogSnafu)
 }
 
 // Parse out the catalog id from the Glue URL if it exists, i.e.
 // https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces/big_datasets/tables/tpch_sf100_lineitem
 // should return "211125479522"
 fn get_warehouse(url: &Url) -> Option<String> {
-    if let Some(host_str) = url.host_str() {
-        if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
-            let path_segments: Vec<_> = url
-                .path_segments()
-                .map(Iterator::collect)
-                .unwrap_or_default();
+    if let Some(host_str) = url.host_str()
+        && host_str.starts_with("glue.")
+        && host_str.ends_with(".amazonaws.com")
+    {
+        let path_segments: Vec<_> = url
+            .path_segments()
+            .map(Iterator::collect)
+            .unwrap_or_default();
 
-            if path_segments.len() >= 4
-                && path_segments[0] == "iceberg"
-                && path_segments[1] == "v1"
-                && path_segments[2] == "catalogs"
-                && path_segments[3].len() == 12
-                && path_segments[3].chars().all(|c| c.is_ascii_digit())
-            {
-                return Some(path_segments[3].to_string());
-            }
+        if path_segments.len() >= 4
+            && path_segments[0] == "iceberg"
+            && path_segments[1] == "v1"
+            && path_segments[2] == "catalogs"
+            && path_segments[3].len() == 12
+            && path_segments[3].chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(path_segments[3].to_string());
         }
     }
     None

@@ -188,13 +188,8 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 .with_dataset(sqlite_file_on_conflict_drop)
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             // Set a timeout for the test
             tokio::select! {
@@ -224,25 +219,56 @@ WHERE event_name = 'File Download'
             // Wait for result to be refreshed
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
-            let pg_upsert_data =
-                get_query_result(&rt, "SELECT * FROM pg_on_conflict_upsert").await?;
-            let pg_drop_data = get_query_result(&rt, "SELECT * FROM pg_on_conflict_drop").await?;
-            let duckdb_mem_upsert_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_mem_on_conflict_upsert").await?;
-            let duckdb_mem_drop_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_mem_on_conflict_drop").await?;
-            let duckdb_file_upsert_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert").await?;
-            let duckdb_file_drop_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_drop").await?;
-            let sqlite_mem_upsert_data =
-                get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_upsert").await?;
-            let sqlite_mem_drop_data =
-                get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_drop").await?;
-            let sqlite_file_upsert_data =
-                get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_upsert").await?;
-            let sqlite_file_drop_data =
-                get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_drop").await?;
+            let pg_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM pg_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let pg_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM pg_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let duckdb_mem_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_mem_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let duckdb_mem_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_mem_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let duckdb_file_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_file_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let duckdb_file_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_file_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let sqlite_mem_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_mem_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let sqlite_mem_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_mem_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let sqlite_file_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_file_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let sqlite_file_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_file_on_conflict_drop order by event_id asc",
+            )
+            .await?;
 
             let upsert_expected_result = &[
                 "+----------+-------------------+---------------------+",

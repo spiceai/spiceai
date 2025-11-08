@@ -35,6 +35,7 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{arrow, prelude::*};
 use runtime_datafusion_udfs::{bucket, truncate};
+use runtime_table_partition::expression::PartitionedBy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -84,6 +85,8 @@ impl TableProvider for PartitionMemTable {
         Ok(Arc::new(PartitionMemTableExec {
             mem_table_exec,
             partition_value: self.partition_value.clone(),
+            filters: filters.to_vec(),
+            limit,
         }))
     }
 
@@ -101,6 +104,8 @@ impl TableProvider for PartitionMemTable {
 struct PartitionMemTableExec {
     mem_table_exec: Arc<dyn ExecutionPlan>,
     partition_value: ScalarValue,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
 }
 
 impl ExecutionPlan for PartitionMemTableExec {
@@ -125,10 +130,14 @@ impl ExecutionPlan for PartitionMemTableExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let partition_value = self.partition_value.clone();
+        let filters = self.filters.clone();
+        let limit = self.limit;
         let new_mem_table_exec = Arc::clone(&self.mem_table_exec).with_new_children(children)?;
         Ok(Arc::new(PartitionMemTableExec {
             mem_table_exec: new_mem_table_exec,
             partition_value,
+            filters,
+            limit,
         }))
     }
 
@@ -156,7 +165,24 @@ impl DisplayAs for PartitionMemTableExec {
             "{}: partition_value={}",
             self.name(),
             self.partition_value
-        )
+        )?;
+
+        if !self.filters.is_empty() {
+            write!(f, ", filters=[")?;
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{filter}")?;
+            }
+            write!(f, "]")?;
+        }
+
+        if let Some(limit) = self.limit {
+            write!(f, ", limit={limit}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -246,7 +272,10 @@ async fn test_insert_partitioning() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = vec![col("region")];
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         partition_by,
@@ -312,7 +341,10 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = vec![col("region")];
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         partition_by,
@@ -386,10 +418,13 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = Expr::ScalarFunction(ScalarFunction {
-        func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
-        args: vec![lit(4i64), col("id")],
-    });
+    let partition_by = PartitionedBy {
+        name: "bucket_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(4i64), col("id")],
+        }),
+    };
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         vec![partition_by.clone()],
@@ -421,7 +456,8 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
+    let physical_expr =
+        create_physical_expr(&partition_by.expression, &df_schema, &execution_props)?;
     let batch_values = physical_expr.evaluate(&batch)?;
     let bucket_values = match batch_values {
         ColumnarValue::Array(array) => array
@@ -505,10 +541,13 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
     ]));
 
     let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
-    let partition_by = Expr::ScalarFunction(ScalarFunction {
-        func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
-        args: vec![lit(10i64), col("id")],
-    });
+    let partition_by = PartitionedBy {
+        name: "truncate_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new())),
+            args: vec![lit(10i64), col("id")],
+        }),
+    };
     let table_provider = PartitionTableProvider::new(
         Arc::clone(&creator) as Arc<dyn PartitionCreator>,
         vec![partition_by.clone()],
@@ -540,7 +579,8 @@ async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error
 
     let df_schema = DFSchema::try_from(Arc::clone(&schema))?;
     let execution_props = ExecutionProps::new();
-    let physical_expr = create_physical_expr(&partition_by, &df_schema, &execution_props)?;
+    let physical_expr =
+        create_physical_expr(&partition_by.expression, &df_schema, &execution_props)?;
     let batch_values = physical_expr.evaluate(&batch)?;
     let truncated_values = match batch_values {
         ColumnarValue::Array(array) => array
@@ -629,7 +669,10 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
     let granularities = vec!["year", "month", "day", "hour", "minute", "second"];
 
     for granularity in granularities {
-        let partition_by = date_trunc(lit(granularity), col("timestamp"));
+        let partition_by = PartitionedBy {
+            name: "date_trunc_timestamp".to_string(),
+            expression: date_trunc(lit(granularity), col("timestamp")),
+        };
         let table_provider = PartitionTableProvider::new(
             Arc::clone(&creator) as Arc<dyn PartitionCreator>,
             vec![partition_by.clone()],
@@ -728,4 +771,280 @@ fn timestamp_nanos(datetime: &str) -> i64 {
     datetime_utc
         .timestamp_nanos_opt()
         .expect("timestamp_nanos_opt is ok")
+}
+
+/// Test that verifies partition filter splitting - partition filters should be used for pruning
+/// but NOT passed to individual partition scans, while data filters should be passed through.
+#[tokio::test]
+async fn test_partition_filter_splitting_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+
+    // Test 1: Simple column partition
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert test data
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+            Arc::new(StringArray::from(vec![
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "eu-west-1",
+                "eu-west-1",
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60])),
+        ],
+    )?;
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Query with partition filter only (region = 'us-east-1')
+    // This filter should be used for pruning and NOT passed to partition scan
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE region = 'us-east-1'")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("partition_filter_only", explain_plan);
+
+    // Query with partition filter and data filter (region = 'us-east-1' AND value > 20)
+    // Partition filter should be used for pruning only, data filter passed to partition scan
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE region = 'us-east-1' AND value > 20")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("partition_and_data_filters", explain_plan);
+
+    // Query with data filter only (value > 20)
+    // Should scan all partitions with the data filter
+    let df = ctx.sql("SELECT * FROM test_table WHERE value > 20").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("data_filter_only", explain_plan);
+
+    // Query with IN list on partition column
+    // Should prune to only matching partitions
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE region IN ('us-east-1', 'eu-west-1')")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("partition_filter_in_list", explain_plan);
+
+    Ok(())
+}
+
+/// Test partition filter splitting with `bucket()` partition function
+#[tokio::test]
+async fn test_partition_filter_splitting_bucket_snapshot() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+
+    // Partition by bucket(4, id)
+    let partition_by = vec![PartitionedBy {
+        name: "bucket_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(4i64), col("id")],
+        }),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(bucket::Bucket::new().into());
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert test data
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+            Arc::new(StringArray::from(vec![
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80])),
+        ],
+    )?;
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Query with id filter (should map to specific bucket partition)
+    let df = ctx.sql("SELECT * FROM test_table WHERE id = 5").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("bucket_partition_id_filter", explain_plan);
+
+    // Query with id filter and data filter
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE id = 5 AND value > 40")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("bucket_partition_with_data_filter", explain_plan);
+
+    // Query with data filter only (should scan all partitions)
+    let df = ctx.sql("SELECT * FROM test_table WHERE value > 40").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("bucket_data_filter_all_partitions", explain_plan);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_constant_expression_filtering() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(StringArray::from(vec![
+                "us-east-1",
+                "us-west-1",
+                "us-east-1",
+                "us-west-1",
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+        ],
+    )?;
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Test with constant true expression - should not prune any partitions
+    let df = ctx.sql("SELECT * FROM test_table WHERE true").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let partition_values = collect_partition_values(&physical_plan);
+    assert_eq!(
+        partition_values.len(),
+        2,
+        "Constant 'true' should not prune any partitions"
+    );
+
+    // Test with constant false expression - should prune all partitions
+    let df = ctx.sql("SELECT * FROM test_table WHERE false").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let partition_values = collect_partition_values(&physical_plan);
+    assert_eq!(
+        partition_values.len(),
+        0,
+        "Constant 'false' should prune all partitions"
+    );
+
+    // Test with constant expression AND partition filter
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE true AND region = 'us-east-1'")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let partition_values = collect_partition_values(&physical_plan);
+    assert_eq!(
+        partition_values.len(),
+        1,
+        "Constant 'true' AND partition filter should prune to one partition"
+    );
+    assert_eq!(
+        partition_values[0],
+        ScalarValue::Utf8(Some("us-east-1".to_string())),
+        "Should only scan us-east-1 partition"
+    );
+
+    // Test with 1=1 (another constant true)
+    let df = ctx.sql("SELECT * FROM test_table WHERE 1=1").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let partition_values = collect_partition_values(&physical_plan);
+    assert_eq!(
+        partition_values.len(),
+        2,
+        "Constant '1=1' should not prune any partitions"
+    );
+
+    Ok(())
 }

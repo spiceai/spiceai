@@ -25,9 +25,9 @@ use tonic::{Request, Response, Status};
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
     flight::{metrics, util::attach_cache_metadata},
-    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, flightsql, to_tonic_err};
 
@@ -54,9 +54,11 @@ pub(crate) async fn handle(
         }
         Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command).await,
         Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command).await,
-        _ => {
+        unsupported => {
             let _start = metrics::track_flight_request("do_get", None).await;
-            Err(Status::unimplemented("Not yet implemented"))
+            Err(Status::unimplemented(format!(
+                "Not yet implemented: {unsupported:?})"
+            )))
         }
     }
 }

@@ -2,16 +2,17 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q5"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                  |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                                    |
-|               |   Federated                                                                                                                                                           |
-|               |  Projection: count(DISTINCT hits.UserID)                                                                                                                              |
-|               |   Aggregate: groupBy=[[]], aggr=[[count(DISTINCT hits.UserID)]]                                                                                                       |
-|               |     TableScan: hits projection=[UserID]                                                                                                                               |
-| physical_plan | BytesProcessedExec                                                                                                                                                    |
-|               |   SchemaCastScanExec                                                                                                                                                  |
-|               |     VirtualExecutionPlan name=sqlite compute_context=//data/accelerated_sqlite.db initial_sql=SELECT count(DISTINCT `hits`.`UserID`) FROM `hits` |
-|               |                                                                                                                                                                       |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                    |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                      |
+|               |   Federated                                                                                                                                                             |
+|               |  Projection: count(DISTINCT hits.UserID)                                                                                                                                |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(DISTINCT hits.UserID)]]                                                                                                         |
+|               |     TableScan: hits projection=[UserID]                                                                                                                                 |
+| physical_plan | BytesProcessedExec                                                                                                                                                      |
+|               |   SchemaCastScanExec                                                                                                                                                    |
+|               |     CooperativeExec                                                                                                                                                     |
+|               |       VirtualExecutionPlan name=sqlite compute_context=//data/accelerated_sqlite.db initial_sql=SELECT count(DISTINCT `hits`.`UserID`) FROM `hits` |
+|               |                                                                                                                                                                         |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

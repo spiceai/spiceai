@@ -25,13 +25,22 @@ limitations under the License.
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 
-use super::{AccelerationConnection, Result, acceleration_connection};
-use crate::{component::dataset::Dataset, dataconnector::kafka::KafkaMetadata};
+use super::{AccelerationConnection, Error, Result, acceleration_connection};
+use crate::{
+    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
+    dataconnector::kafka::KafkaMetadata,
+};
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "postgres")]
+mod postgres;
+#[cfg(feature = "sqlite")]
+mod sqlite;
+#[cfg(feature = "turso")]
+mod turso;
 
 pub struct KafkaSys {
     dataset_name: String,
@@ -39,72 +48,59 @@ pub struct KafkaSys {
 }
 
 impl KafkaSys {
-    pub async fn try_new(dataset: &Dataset) -> Result<Self> {
+    pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, false).await?,
+            acceleration_connection: acceleration_connection(dataset, open_option).await?,
         })
     }
 
-    pub async fn try_new_create_if_not_exists(dataset: &Dataset) -> Result<Self> {
-        Ok(Self {
-            dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, true).await?,
-        })
-    }
-
-    pub(crate) fn get(&self) -> Option<KafkaMetadata> {
+    pub(crate) async fn get(&self) -> Option<KafkaMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
             #[cfg(feature = "postgres")]
-            AccelerationConnection::Postgres(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in Postgres for state retention across restarts is not currently supported"
-                );
-                None
-            }
+            AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in SQLite for state retention across restarts is not currently supported"
-                );
-                None
-            }
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            AccelerationConnection::SQLite(pool) => self.get_sqlite(pool).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => None,
         }
     }
 
-    pub(crate) fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
+    pub(crate) async fn upsert(&self, metadata: &KafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
             #[cfg(feature = "postgres")]
-            AccelerationConnection::Postgres(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in Postgres for state retention across restarts is not currently supported"
-                );
-                Ok(())
-            }
+            AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(_) => {
-                tracing::warn!(
-                    "Persisting Kafka metadata in SQLite for state retention across restarts is not currently supported"
-                );
-                Ok(())
-            }
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
+            AccelerationConnection::SQLite(pool) => self.upsert_sqlite(pool, metadata).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
+            _ => Err(Error::NoAccelerationConnection),
         }
     }
 
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
-        Ok(serde_json::to_string(schema).map_err(Box::new)?)
+        serde_json::to_string(schema).map_err(Error::external)
     }
 
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
-        let schema: Schema = serde_json::from_str(schema_json).map_err(Box::new)?;
+        let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(std::sync::Arc::new(schema))
     }
 }

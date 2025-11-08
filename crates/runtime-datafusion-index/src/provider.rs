@@ -45,9 +45,16 @@ pub struct IndexedTableProvider {
 
 impl IndexedTableProvider {
     pub fn new(underlying: Arc<dyn TableProvider>) -> Self {
+        IndexedTableProvider::with_indexes(underlying, vec![])
+    }
+
+    pub fn with_indexes(
+        underlying: Arc<dyn TableProvider>,
+        indexes: Vec<Arc<dyn Index + Send + Sync>>,
+    ) -> Self {
         Self {
             underlying,
-            indexes: Vec::new(),
+            indexes,
         }
     }
 
@@ -73,8 +80,18 @@ impl IndexedTableProvider {
     }
 
     #[must_use]
+    pub fn get_all_indexes(&self) -> Vec<Arc<dyn Index + Send + Sync>> {
+        self.indexes.clone()
+    }
+
+    #[must_use]
     pub fn get_underlying(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.underlying)
+    }
+
+    #[must_use]
+    pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.underlying
     }
 }
 
@@ -100,8 +117,10 @@ impl TableProvider for IndexedTableProvider {
         self.underlying.get_table_definition()
     }
 
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
-        self.underlying.get_logical_plan()
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        // Cannot use underlying `get_logical_plan` as `IndexedTableProvider` will be replaced
+        // with the `LogicalPlan` during indexing.
+        None
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {

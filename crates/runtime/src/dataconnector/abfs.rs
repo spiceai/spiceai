@@ -29,6 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
 use std::sync::{Arc, LazyLock};
+use tokio::runtime::Handle;
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -60,6 +61,7 @@ pub enum Error {
 #[derive(Debug)]
 pub struct AzureBlobFS {
     params: Parameters,
+    tokio_io_runtime: Handle,
 }
 
 #[derive(Default, Clone)]
@@ -168,12 +170,12 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         &self,
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(sas_token) = params.parameters.get("sas_string").expose().ok() {
-            if let Some(sas_token) = sas_token.strip_prefix('?') {
-                params
-                    .parameters
-                    .insert("sas_string".to_string(), sas_token.to_string().into());
-            }
+        if let Some(sas_token) = params.parameters.get("sas_string").expose().ok()
+            && let Some(sas_token) = sas_token.strip_prefix('?')
+        {
+            params
+                .parameters
+                .insert("sas_string".to_string(), sas_token.to_string().into());
         }
 
         Box::pin(async move {
@@ -206,6 +208,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
             if use_emulator {
                 let azure = AzureBlobFS {
                     params: params.parameters,
+                    tokio_io_runtime: params.io_runtime,
                 };
                 Ok(Arc::new(azure) as Arc<dyn DataConnector>)
             } else {
@@ -221,6 +224,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 } else {
                     let azure = AzureBlobFS {
                         params: params.parameters,
+                        tokio_io_runtime: params.io_runtime,
                     };
                     Ok(Arc::new(azure) as Arc<dyn DataConnector>)
                 }
@@ -250,6 +254,10 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> Handle {
+        self.tokio_io_runtime.clone()
     }
 
     fn get_object_store_url(

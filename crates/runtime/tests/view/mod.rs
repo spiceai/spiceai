@@ -18,7 +18,8 @@ use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::{
-    component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    component::view::ViewBuilder,
+    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::{dataset::Dataset, view::View};
@@ -69,10 +70,10 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 
             let app_copy = app.clone();
 
+            configure_test_datafusion();
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );
@@ -91,7 +92,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
                 .build_with(Arc::clone(&rt), Arc::new(app_copy));
 
             // Ensure Checkpoint is created after initial view load
-            let checkpoint = DatasetCheckpoint::try_new(&view).await.expect("Failed to create view checkpoint");
+            let checkpoint = DatasetCheckpoint::try_new(&view, OpenOption::OpenExisting).await.expect("Failed to create view checkpoint");
             assert!(checkpoint.exists().await, "Checkpoint does not exist");
             let last_checkpoint_time = checkpoint
                 .last_checkpoint_time()

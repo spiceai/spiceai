@@ -140,58 +140,90 @@ impl ObjectStore for SFTPObjectStore {
         unimplemented!()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn get_opts(
         &self,
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = self.client.get_client()?;
-        let mut file = client
-            .sftp()
-            .map_err(handle_error)?
-            .open(std::path::Path::new(location.as_ref()))
-            .map_err(handle_error)?;
+        let client = Arc::clone(&self.client);
+        let location = location.clone();
 
-        let object_meta = ObjectMeta {
-            location: location.clone(),
-            size: file.stat().map_err(handle_error)?.size.ok_or_else(|| {
-                object_store::Error::Generic {
-                    store: "SFTP",
-                    source: "No size found for file".into(),
-                }
-            })?,
+        // Perform blocking operations in spawn_blocking
+        let (object_meta, start, end, data_to_read) = tokio::task::spawn_blocking(move || {
+            let client = client.get_client()?;
+            let mut file = client
+                .sftp()
+                .map_err(handle_error)?
+                .open(std::path::Path::new(location.as_ref()))
+                .map_err(handle_error)?;
 
-            #[allow(clippy::cast_possible_wrap)]
-            last_modified: DateTime::from_timestamp(
-                file.stat()
-                    .map_err(handle_error)?
-                    .mtime
-                    .ok_or(object_store::Error::Generic {
+            let object_meta = ObjectMeta {
+                location: location.clone(),
+                size: file.stat().map_err(handle_error)?.size.ok_or_else(|| {
+                    object_store::Error::Generic {
                         store: "SFTP",
-                        source: "No modification time found for file".into(),
-                    })? as i64,
-                0,
-            )
-            .ok_or_else(|| object_store::Error::Generic {
-                store: "SFTP",
-                source: "Failed to construct DataTime".into(),
-            })?,
-            e_tag: None,
-            version: None,
-        };
+                        source: "No size found for file".into(),
+                    }
+                })?,
 
-        let mut start = 0;
-        let mut end = object_meta.size;
-        let mut data_to_read = end;
+                #[allow(clippy::cast_possible_wrap)]
+                last_modified: DateTime::from_timestamp(
+                    file.stat().map_err(handle_error)?.mtime.ok_or(
+                        object_store::Error::Generic {
+                            store: "SFTP",
+                            source: "No modification time found for file".into(),
+                        },
+                    )? as i64,
+                    0,
+                )
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: "Failed to construct DataTime".into(),
+                })?,
+                e_tag: None,
+                version: None,
+            };
 
-        if let Some(GetRange::Bounded(range)) = options.range {
-            data_to_read = range.end - range.start;
-            start = range.start;
-            end = range.end;
-        }
+            let mut start = 0;
+            let mut end = object_meta.size;
+            let mut data_to_read = end;
+
+            if let Some(GetRange::Bounded(range)) = options.range {
+                data_to_read = range.end - range.start;
+                start = range.start;
+                end = range.end;
+            }
+
+            Ok::<_, object_store::Error>((object_meta, start, end, data_to_read))
+        })
+        .await
+        .map_err(|e| object_store::Error::Generic {
+            store: "SFTP",
+            source: e.into(),
+        })??;
+
+        let client = Arc::clone(&self.client);
+        let location_clone = object_meta.location.clone();
 
         let stream = stream! {
-            file.seek(SeekFrom::Start(start)).map_err(handle_error)?;
+            let client = Arc::clone(&client);
+            let location = location_clone.clone();
+            let mut file_result = tokio::task::spawn_blocking(move || {
+                let client = client.get_client()?;
+                let mut file = client
+                    .sftp()
+                    .map_err(handle_error)?
+                    .open(std::path::Path::new(location.as_ref()))
+                    .map_err(handle_error)?;
+                file.seek(SeekFrom::Start(start)).map_err(handle_error)?;
+                Ok::<_, object_store::Error>(file)
+            })
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            })??;
 
             let mut total = 0;
             let mut buf = vec![0; 4096];
@@ -199,9 +231,22 @@ impl ObjectStore for SFTPObjectStore {
                 if total > data_to_read {
                     break;
                 }
-                let mut n = file
-                    .read(&mut buf)
-                    .map_err(handle_error)? as u64;
+
+                let read_result = tokio::task::spawn_blocking(move || {
+                    let n = file_result
+                        .read(&mut buf)
+                        .map_err(handle_error)? as u64;
+                    Ok::<_, object_store::Error>((file_result, buf, n))
+                })
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: e.into(),
+                })??;
+
+                file_result = read_result.0;
+                buf = read_result.1;
+                let mut n = read_result.2;
 
                 total += n;
                 if n == 0 {
@@ -245,44 +290,60 @@ impl ObjectStore for SFTPObjectStore {
         let client = Arc::clone(&self.client);
 
         let stream = stream! {
-            let session = client.get_client()?;
+            let client_clone = Arc::clone(&client);
+            let location_clone = location.clone();
 
-            let mut queue = vec![location];
+            let entries = tokio::task::spawn_blocking(move || {
+                let session = client_clone.get_client()?;
+                let mut queue = vec![location_clone];
+                let mut all_entries = Vec::new();
 
-            while let Some(item) = queue.pop() {
-                let list = session
-                    .sftp()
-                    .map_err(handle_error)?
-                    .readdir(std::path::Path::new(&item))
-                    .map_err(handle_error)?;
+                while let Some(item) = queue.pop() {
+                    let list = session
+                        .sftp()
+                        .map_err(handle_error)?
+                        .readdir(std::path::Path::new(&item))
+                        .map_err(handle_error)?;
 
-                for entry in list {
-                    if entry.1.is_dir() {
-                        queue.push(entry.0.to_string_lossy().to_string());
-                        continue;
+                    for entry in list {
+                        if entry.1.is_dir() {
+                            queue.push(entry.0.to_string_lossy().to_string());
+                        } else {
+                            all_entries.push(entry);
+                        }
                     }
-                    yield Ok(ObjectMeta {
-                        location: Path::from(entry.0.to_str().ok_or_else(|| object_store::Error::Generic {
-                            store: "SFTP",
-                            source: "Failed to convert path".into(),
-                        })?),
-                        size: entry.1.size.ok_or_else(|| object_store::Error::Generic {
-                            store: "SFTP",
-                            source: "No size found for file".into(),
-                        })?,
-                        #[allow(clippy::cast_possible_wrap)]
-                        last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
-                                store: "SFTP",
-                                source: "No modification time found for file".into(),
-                            })? as i64, 0)
-                            .ok_or_else(|| object_store::Error::Generic {
-                                store: "SFTP",
-                                source: "Failed to construct DataTime".into(),
-                            })?,
-                        e_tag: None,
-                        version: None,
-                    })
                 }
+
+                Ok::<_, object_store::Error>(all_entries)
+            })
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            })??;
+
+            for entry in entries {
+                yield Ok(ObjectMeta {
+                    location: Path::from(entry.0.to_str().ok_or_else(|| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: "Failed to convert path".into(),
+                    })?),
+                    size: entry.1.size.ok_or_else(|| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: "No size found for file".into(),
+                    })?,
+                    #[allow(clippy::cast_possible_wrap)]
+                    last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
+                            store: "SFTP",
+                            source: "No modification time found for file".into(),
+                        })? as i64, 0)
+                        .ok_or_else(|| object_store::Error::Generic {
+                            store: "SFTP",
+                            source: "Failed to construct DataTime".into(),
+                        })?,
+                    e_tag: None,
+                    version: None,
+                })
             }
         };
 

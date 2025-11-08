@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 pub mod app_utils;
+pub mod constants;
 pub mod flight;
 pub mod gh_utils;
 pub mod git;
@@ -53,7 +54,7 @@ pub enum TestType {
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
-    VectorSearch,
+    Search,
 }
 
 impl TestType {
@@ -66,7 +67,7 @@ impl TestType {
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
             TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
-            TestType::VectorSearch => "testoperator_run_vector_search.yml",
+            TestType::Search => "testoperator_run_search.yml",
         }
     }
 }
@@ -80,7 +81,7 @@ impl Display for TestType {
             TestType::DataConsistency => write!(f, "data_consistency"),
             TestType::HttpConsistency => write!(f, "http_consistency"),
             TestType::HttpOverhead => write!(f, "http_overhead"),
-            TestType::VectorSearch => write!(f, "vector_search"),
+            TestType::Search => write!(f, "search"),
         }
     }
 }

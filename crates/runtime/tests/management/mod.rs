@@ -34,11 +34,11 @@ use crate::{
     utils::{init_tracing_with_task_history, test_request_context, wait_until_true},
 };
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// This test verifies that when management is enabled,
 /// events (such as query executions) are exported from the source app
-/// to the remote endpoint configured by the 'data_endpoint' parameter.
+/// to the remote endpoint configured by the '`data_endpoint`' parameter.
 #[tokio::test]
 async fn management_data_export() -> Result<(), anyhow::Error> {
     let trace_levels =

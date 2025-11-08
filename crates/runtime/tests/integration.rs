@@ -13,14 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-#![allow(clippy::large_futures)]
-
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
+use std::sync::Arc;
 
+use crate::utils::TEST_REQUEST_CONTEXT;
 use runtime::Runtime;
+use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
@@ -82,11 +82,15 @@ mod postgres;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
+mod refresh_worker_panic;
 mod results_cache;
+#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
 #[cfg(feature = "postgres")]
 mod schema_evolution;
+#[cfg(feature = "snapshots")]
+mod snapshot_integration;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "spark")]
@@ -105,17 +109,28 @@ mod podswatcher;
 mod rehydration;
 mod shutdown;
 
-// /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
-// ///
-// /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
-    let state = df.ctx.state_ref();
-    let mut state_lock = state.write();
-    state_lock
-        .config_mut()
-        .options_mut()
-        .execution
-        .target_partitions = 3;
+/// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
+///
+/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+/// 2) Disables coalesce batches and repartition joins for terser plans.
+fn configure_test_datafusion() {
+    match DEFAULT_DATAFUSION_CONFIG.write() {
+        Ok(mut config) => {
+            config.options_mut().execution.target_partitions = 3;
+
+            config.options_mut().execution.coalesce_batches = false;
+
+            config.options_mut().optimizer.repartition_joins = false;
+        }
+        _ => panic!("Must obtain write lock to defaults"),
+    }
+}
+
+fn configure_test_datafusion_request_context() {
+    match DEFAULT_DATAFUSION_CONFIG.write() {
+        Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
+        _ => panic!("Must obtain write lock to defaults"),
+    }
 }
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {

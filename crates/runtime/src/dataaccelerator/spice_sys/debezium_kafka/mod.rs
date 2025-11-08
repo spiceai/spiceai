@@ -24,8 +24,11 @@ limitations under the License.
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
 
-use super::{AccelerationConnection, Result, acceleration_connection};
-use crate::{component::dataset::Dataset, dataconnector::debezium::DebeziumKafkaMetadata};
+use super::{AccelerationConnection, Error, Result, acceleration_connection};
+use crate::{
+    component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption,
+    dataconnector::debezium::DebeziumKafkaMetadata,
+};
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
@@ -35,6 +38,8 @@ mod duckdb;
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+#[cfg(feature = "turso")]
+mod turso;
 
 pub struct DebeziumKafkaSys {
     dataset_name: String,
@@ -42,17 +47,10 @@ pub struct DebeziumKafkaSys {
 }
 
 impl DebeziumKafkaSys {
-    pub async fn try_new(dataset: &Dataset) -> Result<Self> {
+    pub async fn try_new(dataset: &Dataset, open_option: OpenOption) -> Result<Self> {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, false).await?,
-        })
-    }
-
-    pub async fn try_new_create_if_not_exists(dataset: &Dataset) -> Result<Self> {
-        Ok(Self {
-            dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(dataset, true).await?,
+            acceleration_connection: acceleration_connection(dataset, open_option).await?,
         })
     }
 
@@ -64,7 +62,14 @@ impl DebeziumKafkaSys {
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => None,
         }
     }
@@ -77,8 +82,15 @@ impl DebeziumKafkaSys {
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "postgres")))]
-            _ => Err("No acceleration connection available".into()),
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
+            _ => Err(Error::NoAccelerationConnection),
         }
     }
 }

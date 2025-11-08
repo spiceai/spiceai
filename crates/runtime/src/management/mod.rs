@@ -48,16 +48,16 @@ use util::{
 
 use crate::{
     Runtime,
-    component::dataset::{Mode, builder::DatasetBuilder},
+    component::access::AccessMode,
+    component::dataset::builder::DatasetBuilder,
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     datafusion::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
     },
     dataupdate::{DataUpdate, UpdateType},
-    get_params_with_secrets,
-    secrets::Secrets,
     task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
+use runtime_secrets::{Secrets, get_params_with_secrets};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -141,11 +141,11 @@ impl Management {
     async fn start_task_history_export(&self) -> Result<(), Error> {
         let app_ref = self.runtime.app();
         let app_lock = app_ref.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            if !app.runtime.task_history.enabled {
-                tracing::debug!("Task history is disabled via configuration.");
-                return Ok(());
-            }
+        if let Some(app) = app_lock.as_ref()
+            && !app.runtime.task_history.enabled
+        {
+            tracing::debug!("Task history is disabled via configuration.");
+            return Ok(());
         }
         drop(app_lock);
 
@@ -275,6 +275,7 @@ async fn get_spiceai_table_provider(
     };
 
     let secrets = runtime.secrets();
+    let tokio_io_runtime = runtime.tokio_io_runtime();
 
     let mut dataset = DatasetBuilder::try_new(format!("spice.ai/{cloud_dataset_path}"), name)
         .boxed()
@@ -286,10 +287,10 @@ async fn get_spiceai_table_provider(
         .context(UnableToCreateDataConnectorSnafu)?
         .with_params(params);
 
-    dataset.mode = Mode::ReadWrite;
+    dataset.access = AccessMode::ReadWrite;
 
     let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
-        .build(secrets)
+        .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
@@ -380,11 +381,11 @@ async fn get_task_history_records(
 }
 
 fn is_table_not_ready_error(e: &DataFusionError) -> bool {
-    if let DataFusionError::External(e) = e {
-        if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
-            match e {
-                SpiceExternalError::AccelerationNotReady { .. } => return true,
-            }
+    if let DataFusionError::External(e) = e
+        && let Some(e) = e.downcast_ref::<SpiceExternalError>()
+    {
+        match e {
+            SpiceExternalError::AccelerationNotReady { .. } => return true,
         }
     }
     false

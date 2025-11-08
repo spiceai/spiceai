@@ -66,8 +66,8 @@ impl AsTableRefs for CachedSearchResult {
 impl Sizeable for CachedSearchResult {
     fn get_memory_size(&self) -> usize {
         self.results
-            .iter()
-            .map(|(_, result)| {
+            .values()
+            .map(|result| {
                 result
                     .records
                     .iter()

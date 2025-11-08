@@ -17,14 +17,18 @@ limitations under the License.
 use std::{str::FromStr, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
+use aws_config::timeout::TimeoutConfigBuilder;
 use data_components::s3_vectors::{
-    MetadataColumn, MetadataColumns, S3VectorIdentifier, S3VectorsTable,
+    MetadataColumn as S3MetadataColumn, S3VectorIdentifier, S3VectorsTable,
 };
-use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion::sql::TableReference;
+use datafusion_expr::Expr;
 use llms::embeddings::get_or_infer_size;
 use s3_vectors::{Client, S3Vectors};
-use search::generation::util::get_primary_keys;
-use snafu::ResultExt;
+use search::{
+    index::s3_vectors::S3Vector,
+    metadata::{MetadataColumn, MetadataColumns},
+};
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig},
@@ -33,18 +37,18 @@ use spicepod::{
 use tokio::sync::RwLock;
 
 use crate::{
-    dataconnector::parameters::aws::load_config,
-    embeddings::index::retry_client::S3VectorRetryClientBuilder,
-    get_params_with_secrets,
+    dataconnector::parameters::aws::initiate_config_with_credentials,
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
-    secrets::Secrets,
 };
+use retry_client::S3VectorRetryClientBuilder;
+use runtime_secrets::{Secrets, get_params_with_secrets};
+mod client;
+mod metrics;
+use client::S3VectorClient;
+mod retry_client;
 
-mod write;
-pub use write::write;
-mod index;
-pub use index::S3Vector;
+const DEFAULT_BATCH_WRITE_ROWS: usize = 100_000;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
@@ -56,6 +60,9 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         )
         .one_of(&["euclidean", "cosine"])
         .secret(),
+    ParameterSpec::runtime("client_timeout").description(
+        "The duration to wait prior to receiving the first response byte, in time unit format. E.g. 30s, 1m.",
+    ),
     ParameterSpec::component("arn")
         .description("The S3 Vectors bucket ARN to use for the S3 Vectors index.")
         .secret(),
@@ -74,27 +81,30 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use.")
         .secret(),
+    ParameterSpec::component("index_poll_interval")
+        .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query."),
+    ParameterSpec::component("batch_write_rows")
+        .description("The number of rows to chunk record batches into for individual processing. Used to control memory usage during writes."),
 ];
 
-/// Attempt to construct a  S3 `VectorIndex` for the provided dataset on the given column.
+/// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
 #[allow(clippy::too_many_arguments)]
-pub async fn try_from_dataset(
+pub async fn try_from_table(
     ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,
     vector_store_config: &VectorStore,
-    underlying: Arc<dyn TableProvider>,
+    primary_keys: Vec<String>,
+    inner_schema: SchemaRef,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
+    partition_by: Vec<Expr>,
 ) -> Result<S3Vector, Box<dyn std::error::Error + Send + Sync>> {
-    // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
-    let pks_from_table = get_primary_keys(&underlying).await.boxed()?;
-    let inner_schema = underlying.schema();
     let primary_key: Vec<_> = config
         .row_ids
         .clone()
-        .unwrap_or(pks_from_table)
+        .unwrap_or(primary_keys)
         .into_iter()
         .filter_map(|c| {
             let (_, f) = inner_schema.column_with_name(c.as_str())?;
@@ -108,6 +118,16 @@ pub async fn try_from_dataset(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
+    let batch_write_rows = string_from_params(&params, "batch_write_rows")
+        .and_then(|s| match s.parse::<usize>() {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::warn!("Invalid value for 's3_vectors_batch_write_rows': {s}. Error: {e}. Falling back to default: {DEFAULT_BATCH_WRITE_ROWS}");
+                None
+            },
+        })
+        .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
+
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
@@ -119,13 +139,22 @@ pub async fn try_from_dataset(
     )
     .await?;
 
+    let model_read = embedding_models.read().await;
+    let Some(model) = model_read.get(&config.model) else {
+        return Err(Box::from(format!(
+            "Cannot make S3 vector index for table '{}'. No embedding model named: '{}'.",
+            ds_name, config.model
+        )));
+    };
+
     Ok(S3Vector::new(
         table,
         column.clone(),
         primary_key,
         metadata_columns,
-        config.model.clone(),
-        embedding_models,
+        Arc::clone(model),
+        partition_by,
+        batch_write_rows,
     ))
 }
 
@@ -153,6 +182,24 @@ async fn try_vector_table(
     let s3_vectors_arn = string_from_params(&params, "arn");
     let s3_vectors_bucket = string_from_params(&params, "bucket");
     let s3_vectors_index = string_from_params(&params, "index");
+    let client_timeout = string_from_params(&params, "client_timeout")
+        .map(fundu::parse_duration)
+        .transpose()
+        .map_err(|_| {
+            Box::from(format!(
+                "S3 vectors index configured with invalid 'client_timeout'= '{}'",
+                string_from_params(&params, "client_timeout").unwrap_or_default() // If missing, uses default ("").
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+    let index_poll_interval = string_from_params(&params, "index_poll_interval")
+        .map(fundu::parse_duration)
+        .transpose()
+        .map_err(|_| {
+            Box::from(format!(
+                "S3 vectors index configured with invalid 'index_poll_interval'= '{}'",
+                string_from_params(&params, "index_poll_interval").unwrap_or_default() // If missing, uses default ("").
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
 
     let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
@@ -175,7 +222,7 @@ async fn try_vector_table(
         Box::from(format!("Invalid S3 Vectors bucket defined: {e}"))
     })?;
 
-    let config = load_config(
+    let mut config_bldr = initiate_config_with_credentials(
         "S3Vectors",
         "aws_region",
         "aws_access_key_id",
@@ -185,10 +232,18 @@ async fn try_vector_table(
     )
     .await?;
 
-    let s3_vector_client = Client::new(&config);
+    if let Some(dur) = client_timeout {
+        config_bldr =
+            config_bldr.timeout_config(TimeoutConfigBuilder::new().operation_timeout(dur).build());
+    }
 
-    let s3_vector_client = Arc::new(S3VectorRetryClientBuilder::new(s3_vector_client).build())
-        as Arc<dyn S3Vectors + Send + Sync>;
+    let config = config_bldr.load().await;
+
+    let s3_vector_client = S3VectorClient::new(Arc::new(Client::new(&config)), index_poll_interval);
+
+    let s3_vector_client =
+        Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())
+            as Arc<dyn S3Vectors + Send + Sync>;
 
     let Some(dimension) = embedding_vector_size(embedding_models, model_name).await else {
         return Err(Box::from(
@@ -200,7 +255,14 @@ async fn try_vector_table(
         id,
         s3_vector_client,
         dimension as i64,
-        columns,
+        columns
+            .into_iter()
+            .map(|c| match c {
+                MetadataColumn::Filterable(f) => S3MetadataColumn::Filterable(f),
+                MetadataColumn::NonFilterable(f) => S3MetadataColumn::NonFilterable(f),
+            })
+            .collect::<Vec<_>>()
+            .into(),
         string_from_params(&params, "distance_metric"),
     )
     .await?

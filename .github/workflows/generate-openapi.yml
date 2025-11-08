@@ -4,13 +4,18 @@ on:
   push:
     branches: [trunk]
     paths:
-      - "tools/spiceschema/**"
-      - "crates/**"
+      - 'tools/spiceschema/**'
+      - 'crates/**'
   workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   generate_openapi:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Check out repository
@@ -58,7 +63,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: openapi.json
           path: .schema/openapi.json

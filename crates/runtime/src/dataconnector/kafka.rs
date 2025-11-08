@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
     cdc::ChangesStream,
-    kafka::{KafkaConfig, KafkaConsumer},
+    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics},
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
@@ -30,8 +30,12 @@ use snafu::prelude::*;
 use tonic::async_trait;
 
 use crate::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
-    dataaccelerator::spice_sys::kafka::KafkaSys,
+    component::{
+        ComponentType,
+        dataset::{Dataset, acceleration::RefreshMode},
+        metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
+    },
+    dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },
@@ -117,6 +121,13 @@ impl Kafka {
                     tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
                     data_components::kafka::SslIdentification::Https
                 }),
+            consumer_group_id: params
+                .get("consumer_group_id")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            // Metrics instance that will be used by the Kafka consumer to update statistics
+            metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
         Ok(Self {
@@ -145,10 +156,10 @@ fn get_json_format(params: &Parameters) -> Result<Arc<SpiceJsonOptions>> {
         options.schema_infer_max_rec = Some(schema_infer_max_rec);
     }
 
-    if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose() {
-        if flatten_json.eq_ignore_ascii_case("true") {
-            options.flatten_json = Some(".".to_string());
-        }
+    if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose()
+        && flatten_json.eq_ignore_ascii_case("true")
+    {
+        options.flatten_json = Some(".".to_string());
     }
 
     Ok(Arc::new(options))
@@ -204,6 +215,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
         .is_boolean(),
+    ParameterSpec::component("consumer_group_id")
+        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
 ];
 
 impl DataConnectorFactory for KafkaFactory {
@@ -319,6 +332,14 @@ impl DataConnector for Kafka {
             }
         }))
     }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
+            Some(Arc::new(KafkaMetricsProvider::new(Arc::clone(metrics))))
+        } else {
+            None
+        }
+    }
 }
 
 async fn init_kafka_consumer(
@@ -342,6 +363,20 @@ async fn init_kafka_consumer(
             connector_component: ConnectorComponent::from(dataset),
         }
     );
+
+    if let Some(ref group_id) = kafka_config.consumer_group_id {
+        ensure!(
+            group_id == &metadata.consumer_group_id,
+            super::InvalidConfigurationNoSourceSnafu {
+                dataconnector: "kafka",
+                message: format!(
+                    "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{group_id}'). Remove the acceleration file or rename the dataset to proceed.",
+                    metadata.consumer_group_id
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+            }
+        );
+    }
 
     let kafka_consumer =
         KafkaConsumer::create_with_existing_group_id(&metadata.consumer_group_id, kafka_config)
@@ -370,16 +405,18 @@ pub(crate) struct KafkaMetadata {
 }
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
-    let kafka_sys = KafkaSys::try_new(dataset).await.ok()?;
-    kafka_sys.get()
+    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::OpenExisting)
+        .await
+        .ok()?;
+    kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &KafkaMetadata,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let debezium_kafka_sys = KafkaSys::try_new_create_if_not_exists(dataset).await?;
-    debezium_kafka_sys.upsert(metadata)
+) -> Result<(), spice_sys::Error> {
+    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    kafka_sys.upsert(metadata).await
 }
 
 async fn bootstrap_new_kafka_consumer(
@@ -389,12 +426,16 @@ async fn bootstrap_new_kafka_consumer(
     json_options: &Arc<SpiceJsonOptions>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+    let kafka_consumer = KafkaConsumer::create_for_dataset(
+        &dataset_name,
+        kafka_config.consumer_group_id.clone(),
+        kafka_config,
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "kafka",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
 
     kafka_consumer
         .subscribe(topic)
@@ -462,6 +503,7 @@ async fn bootstrap_new_kafka_consumer(
     if dataset.is_file_accelerated() {
         set_metadata_to_accelerator(dataset, &metadata)
             .await
+            .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
@@ -478,4 +520,93 @@ async fn bootstrap_new_kafka_consumer(
         })?;
 
     Ok((kafka_consumer, schema))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct KafkaMetricsProvider {
+    metrics: Arc<KafkaMetrics>,
+}
+
+impl KafkaMetricsProvider {
+    pub(crate) fn new(metrics: Arc<KafkaMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+const METRICS: &[MetricSpec] = &[
+    MetricSpec {
+        name: "records_consumed_total",
+        description: Some("Total number of records consumed"),
+        unit: Some("records"),
+        metric_type: MetricType::ObservableCounterU64,
+    },
+    MetricSpec {
+        name: "bytes_consumed_total",
+        description: Some("Total bytes consumed"),
+        unit: Some("bytes"),
+        metric_type: MetricType::ObservableCounterU64,
+    },
+    MetricSpec {
+        name: "records_lag",
+        description: Some("Total consumer lag across all partitions"),
+        unit: Some("records"),
+        metric_type: MetricType::ObservableGaugeU64,
+    },
+];
+
+impl MetricsProvider for KafkaMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "kafka"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<opentelemetry::KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        match metric.name {
+            "records_consumed_total" => {
+                let metrics = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics
+                            .records_consumed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "bytes_consumed_total" => {
+                let metrics = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics
+                            .bytes_consumed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "records_lag" => {
+                let metrics = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics
+                            .records_lag
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            _ => None,
+        }
+    }
 }

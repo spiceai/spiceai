@@ -14,7 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 event_stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
-mimalloc = { version = "0.1.47", optional = true }
+mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 opentelemetry-prometheus.workspace = true
@@ -24,10 +24,8 @@ otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
-runtime-auth = { path = "../../crates/runtime-auth" }
+runtime-async = { path = "../../crates/runtime-async" }
 rustls.workspace = true
-rustls-pemfile.workspace = true
-serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = { version = "0.3.6" }
@@ -37,6 +35,7 @@ tikv-jemallocator = { version = "0.6.0", optional = true }
 tokio.workspace = true
 tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tracing.workspace = true
+tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util" }
@@ -50,6 +49,7 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
+cluster = ["runtime/cluster"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -64,6 +64,7 @@ default = [
     "dremio",
     "clickhouse",
     "sharepoint",
+    "snapshots",
     "snowflake",
     "spark",
     "ftp",
@@ -77,6 +78,8 @@ default = [
     "oracle",
     "runtime/s3_vectors",
     "mongodb",
+    "iceberg-write",
+    "turso",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -85,6 +88,7 @@ duckdb = ["runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
+iceberg-write = ["runtime/iceberg-write"]
 imap = ["runtime/imap"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
@@ -100,7 +104,10 @@ postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
 sharepoint = ["runtime/sharepoint"]
+snapshots = ["runtime/snapshots"]
 snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
+turso = ["runtime/turso"]
+xxhash = ["runtime/xxhash"]

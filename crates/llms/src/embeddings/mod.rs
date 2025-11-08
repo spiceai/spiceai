@@ -12,16 +12,20 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use crate::embeddings::Error::UnsupportedSyncInvocation;
+pub use async_openai::types::EmbeddingInput;
 use async_openai::types::{
-    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
-    EmbeddingVector, EncodingFormat,
+    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingUsage, EmbeddingVector,
+    EncodingFormat,
 };
+
 use async_trait::async_trait;
+use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
-use std::{any, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
+use tokio::runtime::Handle;
+use tokio::task;
 
 pub mod candle;
 
@@ -42,6 +46,11 @@ pub enum Error {
 
     #[snafu(display("Failed to create embedding. {source}."))]
     FailedToCreateEmbedding {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Embedding rate limit exceeded. {source}."))]
+    RateLimited {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -116,9 +125,6 @@ pub enum Error {
 
     #[snafu(display("Unsupported embedding input for {model}: {message}"))]
     UnsupportedEmbeddingInput { model: String, message: String },
-
-    #[snafu(display("Model {model} does not support sync invocations."))]
-    UnsupportedSyncInvocation { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -138,11 +144,48 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
-    fn embed_sync(&self, _input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
-        let name = any::type_name::<Self>();
-        Err(UnsupportedSyncInvocation {
-            model: name.to_string(),
-        })
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        None
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
+        if let Some(model_name) = self.model_name() {
+            Some((model_name, input).into())
+        } else {
+            tracing::trace!(
+                "dyn Embed does not implement model_name, therefore cannot generate cache key solely against embedding input: {:?} ",
+                self
+            );
+            None
+        }
+    }
+
+    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
+        if let Some(embeddings_cache) = self.cache()
+            && let Some(cached) = embeddings_cache
+                .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
+                .await
+        {
+            return Some(cached);
+        }
+
+        None
+    }
+
+    async fn put_cached_embed(&self, key: CacheKey<'_>, value: CachedEmbeddingResult) {
+        if let Some(embeddings_cache) = self.cache() {
+            embeddings_cache
+                .put_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64(), value)
+                .await;
+        }
+    }
+
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        task::block_in_place(move || Handle::current().block_on(self.embed(input)))
     }
 
     fn supports_sync_embeddings(&self) -> bool {

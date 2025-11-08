@@ -43,6 +43,22 @@ pub static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static ACCELERATION_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("acceleration_size_bytes")
+        .with_description("Size of acceleration data on disk.")
+        .with_unit("bytes")
+        .build()
+});
+
+pub static READY_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("ready_duration_ms")
+        .with_description("Duration until the spicepod is ready.")
+        .with_unit("ms")
+        .build()
+});
+
 pub static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("median_duration_ms")
@@ -160,5 +176,40 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .f64_gauge("score")
         .with_description("Test score.")
         .with_unit("score")
+        .build()
+});
+
+// Spiced runtime metrics (scraped from /metrics endpoint)
+
+pub static SPICED_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_query_count")
+        .with_description("Total number of queries executed by spiced.")
+        .with_unit("queries")
+        .build()
+});
+
+#[allow(dead_code)]
+pub static SPICED_QUERY_DURATION_AVG: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_query_duration_avg_ms")
+        .with_description("Average query duration from spiced metrics.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static SPICED_CACHE_HIT_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_cache_hit_rate")
+        .with_description("Cache hit rate from spiced metrics.")
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SPICED_ACTIVE_CONNECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_active_connections")
+        .with_description("Peak active connections during test.")
+        .with_unit("connections")
         .build()
 });

@@ -175,7 +175,7 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         sorted_durations.sort();
 
         let half = sorted_durations.len() / 2;
-        if sorted_durations.len() % 2 == 0 {
+        if sorted_durations.len().is_multiple_of(2) {
             Ok((sorted_durations[half - 1] + sorted_durations[half]) / 2)
         } else {
             Ok(sorted_durations[half])
@@ -552,13 +552,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                     }
                 }
             } else {
-                extended_metrics_builders
-                    .iter_mut()
-                    .for_each(|(_, builder)| match builder {
+                for builder in &mut extended_metrics_builders.values_mut() {
+                    match builder {
                         Builder::String(builder) => builder.append_null(),
                         Builder::UInt64(builder) => builder.append_null(),
                         Builder::Float64(builder) => builder.append_null(),
-                    });
+                    }
+                }
             }
         }
 

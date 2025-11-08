@@ -11,16 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageArgs,
-    CreateChatCompletionRequestArgs,
-};
+use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::Stream;
 use nsql::SqlGeneration;
-use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -34,19 +29,20 @@ use tracing_futures::Instrument;
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
-        ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, Role,
+        ChatChoice, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
+        ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        Role,
     },
 };
 
 pub mod mistral;
 pub mod nsql;
+use crate::streaming_utils::generate_stream_id;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
 
@@ -533,40 +529,38 @@ pub fn message_to_mistral(
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        let span = tracing::Span::current();
-
-        async move {
-            let req = CreateChatCompletionRequestArgs::default()
+        // BUG FIX: Remove double .instrument(Span::current()) calls that break span propagation
+        // The outer .instrument is redundant and interferes with parent span context
+        self.chat_request(
+            CreateChatCompletionRequestArgs::default()
                 .messages(vec![
-                    ChatCompletionRequestSystemMessageArgs::default()
+                    ChatCompletionRequestUserMessageArgs::default()
                         .content(prompt)
                         .build()
-                        .boxed()
-                        .context(FailedToLoadTokenizerSnafu)?
+                        .map_err(|e| Error::FailedToRunModel {
+                            source: Box::new(e),
+                        })?
                         .into(),
                 ])
                 .build()
-                .boxed()
-                .context(FailedToLoadModelSnafu)?;
-
-            let resp = self
-                .chat_request(req)
-                .await
-                .boxed()
-                .context(FailedToRunModelSnafu)?;
-
-            Ok(resp
-                .choices
+                .map_err(|e| Error::FailedToRunModel {
+                    source: Box::new(e),
+                })?,
+        )
+        .await
+        .map_err(|e| Error::FailedToRunModel {
+            source: Box::new(e),
+        })
+        .map(|resp| {
+            resp.choices
                 .into_iter()
                 .next()
-                .and_then(|c| c.message.content))
-        }
-        .instrument(span)
-        .await
+                .and_then(|c| c.message.content)
+        })
     }
 
-    /// A basic health check to ensure the model can process future [`Self::run`] requests.
-    /// Default implementation is a basic call to [`Self::run`].
+    /// A basic health check to ensure the model can process future [`Self::run`]
+    /// requests. Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -614,7 +608,9 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
-        let mut stream = self.stream(prompt).await.map_err(|e| {
+        // BUG FIX: The stream() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
+        let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -623,48 +619,9 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        let strm_id: String = rng()
-            .sample_iter(&Alphanumeric)
-            .take(10)
-            .map(char::from)
-            .collect();
-        let strm = stream! {
-            let mut i  = 0;
-            while let Some(msg) = stream.next().await {
-                let choice = ChatChoiceStream {
-                    delta: ChatCompletionStreamResponseDelta {
-                        content: Some(msg?.unwrap_or_default()),
-                        tool_calls: None,
-                        role: Some(Role::System),
-                        function_call: None,
-                        refusal: None,
-                    },
-                    index: i,
-                    finish_reason: None,
-                    logprobs: None,
-                };
-
-            yield Ok(CreateChatCompletionStreamResponse {
-                id: format!("{}-{}-{i}", model_id.clone(), strm_id),
-                choices: vec![choice],
-                model: model_id.clone(),
-                created: 0,
-                system_fingerprint: None,
-                object: "list".to_string(),
-                usage: None,
-                service_tier: None,
-            });
-            i+=1;
-        }};
-
-        Ok(Box::pin(strm.map_err(|e: Error| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })))
+        Ok(crate::streaming_utils::string_stream_to_chat_stream(
+            model_id, stream,
+        ))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
@@ -681,6 +638,9 @@ pub trait Chat: Sync + Send {
             .map(message_to_content)
             .collect::<Vec<String>>()
             .join("\n");
+
+        // BUG FIX: The run() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
         let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -706,15 +666,7 @@ pub trait Chat: Sync + Send {
         };
 
         Ok(CreateChatCompletionResponse {
-            id: format!(
-                "{}-{}",
-                model_id.clone(),
-                rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect::<String>()
-            ),
+            id: generate_stream_id(&model_id),
             choices,
             model: model_id,
             created: 0,

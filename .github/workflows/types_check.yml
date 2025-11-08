@@ -8,7 +8,7 @@ jobs:
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
       GOOS: ${{ matrix.target_os }}
       GOARCH: ${{ matrix.target_arch_go }}
 
@@ -28,9 +28,10 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - run: rustup toolchain install stable --profile minimal
 
@@ -89,7 +90,7 @@ jobs:
           chmod +x spice
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: matrix.target_os != 'windows'
         with:
           name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
@@ -123,7 +124,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: 3.x
 
@@ -134,7 +135,7 @@ jobs:
           ls -l test/arrow-types/
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

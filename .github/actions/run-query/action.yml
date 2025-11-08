@@ -4,7 +4,7 @@ inputs:
   query:
     description: 'Query to execute'
     required: true
-  start-runtime: 
+  start-runtime:
     description: 'Whether to start Spice runtime before executing the query'
     required: false
     default: 'false'
@@ -17,13 +17,13 @@ inputs:
     default: 'false'
 outputs:
   query-result:
-    description: "Query result encoded as base64 string"
+    description: 'Query result encoded as base64 string'
     value: ${{ steps.query.outputs.query-result }}
   runtime-trace:
-    description: "Spice runtime execution log"
+    description: 'Spice runtime execution log'
     value: ${{ steps.stop-runtime.outputs.runtime-traces }}
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Start Spice runtime
       id: start-runtime
@@ -34,7 +34,7 @@ runs:
         spice run &> spice.log &
         sleep 3
         echo "Spice runtime started"
-    
+
     - name: Run query
       shell: bash
       id: query
@@ -60,12 +60,12 @@ runs:
         else
           extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Time: /p' | sed '1d;$d')
         fi
-        
+
         if [[ -z "$extracted_result" ]]; then
           extracted_result="$sql_output"
         fi
         echo "query-result=$(echo "$extracted_result" | base64 -w 0)" >> "$GITHUB_OUTPUT"
-     
+
     - name: Stop Spice runtime
       id: stop-runtime
       shell: bash

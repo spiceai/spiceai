@@ -413,6 +413,7 @@ mod test {
         catalog::MemorySchemaProvider, catalog::SchemaProvider, datasource::MemTable,
     };
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     async fn test_register_dataset_with_schema() {
@@ -428,7 +429,8 @@ mod test {
             .build()
             .expect("Failed to build dataset");
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let table_provider = MemTable::try_new(schema, vec![]).expect("to create table provider");
+        let table_provider =
+            MemTable::try_new(schema, vec![vec![]]).expect("to create table provider");
         df.ctx
             .register_table(dataset.name.clone(), Arc::new(table_provider))
             .expect("to register table provider");
@@ -444,7 +446,12 @@ mod test {
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     ) -> Arc<DataFusion> {
         let df = Arc::new(
-            DataFusion::builder(RuntimeStatus::new(), accelerator_engine_registry).build(),
+            DataFusion::builder(
+                RuntimeStatus::new(),
+                accelerator_engine_registry,
+                Handle::current(),
+            )
+            .build(),
         );
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");

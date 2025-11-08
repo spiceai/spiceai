@@ -23,6 +23,7 @@ description: "Query: clickbench_q34"
 |               |                     FallbackOnZeroResultsScanExec                                             |
 |               |                       CoalescePartitionsExec                                                  |
 |               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
-|               |                           DuckSqlExec sql= SELECT "URL" FROM hits                             |
+|               |                           CooperativeExec                                                     |
+|               |                             DuckSqlExec sql= SELECT "URL" FROM hits                           |
 |               |                                                                                               |
 +---------------+-----------------------------------------------------------------------------------------------+

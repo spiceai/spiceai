@@ -26,7 +26,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints, DFSchema},
+    common::{Constraint, Constraints, DFSchema, project_schema},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::Expr,
@@ -97,12 +97,8 @@ impl DebeziumKafka {
             .map(move |msg| {
                 let schema = Arc::clone(&schema);
                 let pk = primary_keys.clone();
-                let Ok(msg) = msg else {
-                    return Err(cdc::StreamError::Kafka(format!(
-                        "Unable to read message: {:?}",
-                        msg.err()
-                    )));
-                };
+
+                let msg = msg.map_err(cdc::StreamError::Kafka)?;
 
                 let val = msg.value();
                 changes::to_change_batch(&schema, &pk, val)
@@ -135,10 +131,13 @@ impl TableProvider for DebeziumKafka {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 }

@@ -19,6 +19,6 @@ description: "Query: clickbench_q35"
 |               |             AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(Int64(1))]                                                                               |
 |               |               BytesProcessedExec                                                                                                                                  |
 |               |                 SchemaCastScanExec                                                                                                                                |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1525] |
+|               |                   DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                                   |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+

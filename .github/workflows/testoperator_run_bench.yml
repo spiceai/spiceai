@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: benchmark - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
@@ -102,6 +102,14 @@ jobs:
           SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -121,6 +129,10 @@ jobs:
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -198,6 +210,7 @@ jobs:
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
@@ -259,6 +272,7 @@ jobs:
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}

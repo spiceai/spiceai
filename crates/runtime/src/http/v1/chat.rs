@@ -21,9 +21,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{
-    http::traceparent::override_task_history_with_traceparent, model::LLMChatCompletionsModelStore,
-};
+use crate::model::LLMChatCompletionsModelStore;
 #[cfg(feature = "openapi")]
 use async_openai::types::CreateChatCompletionResponse;
 use async_openai::{
@@ -47,6 +45,7 @@ use event_stream::get_event_stream;
 use futures::StreamExt;
 use http::HeaderValue;
 use llms::chat::Chat;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;
 use tokio::{
     select,
@@ -124,6 +123,8 @@ pub(crate) async fn post(
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+
     let span = tracing::span!(
         target: "task_history",
         tracing::Level::INFO,
@@ -132,7 +133,9 @@ pub(crate) async fn post(
     );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
-    override_task_history_with_traceparent(&span.clone(), &headers);
+    if let Some(traceparent) = context.trace_parent() {
+        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+    }
 
     let span_clone = span.clone();
     async move {
@@ -290,11 +293,10 @@ fn create_sse_response(
                     if id.is_none() {
                         id = Some(resp.id.clone());
                     }
-                    if let Some(choice) = resp.choices.first() {
-                        if let Some(intermediate_chat_output) = &choice.delta.content {
+                    if let Some(choice) = resp.choices.first()
+                        && let Some(intermediate_chat_output) = &choice.delta.content {
                             chat_output.push_str(intermediate_chat_output);
                         }
-                    }
 
                     yield Ok::<Event, Infallible>(Event::default().json_data(resp).unwrap_or_else(|e| {
                         tracing::error!("Failed to serialize chat completion message: {e}");

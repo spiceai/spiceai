@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{any::Any, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
+use datafusion::common::project_schema;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
@@ -37,6 +39,8 @@ use snafu::prelude::*;
 use tonic::async_trait;
 
 use crate::cdc::{self, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
+
+pub use rdkafka;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -108,6 +112,8 @@ pub struct KafkaConfig {
     pub ssl_ca_location: Option<String>,
     pub enable_ssl_certificate_verification: bool,
     pub ssl_endpoint_identification_algorithm: SslIdentification,
+    pub consumer_group_id: Option<String>,
+    pub metrics_store: Option<Arc<KafkaMetrics>>,
 }
 
 impl std::fmt::Debug for KafkaConfig {
@@ -130,13 +136,104 @@ impl std::fmt::Debug for KafkaConfig {
                 "ssl_endpoint_identification_algorithm",
                 &self.ssl_endpoint_identification_algorithm,
             )
+            .field("consumer_group_id", &self.consumer_group_id)
+            .field(
+                "metrics_store",
+                &self.metrics_store.as_ref().map(|_| "Some(KafkaMetrics)"),
+            )
             .finish()
     }
 }
 
+#[derive(Debug, Default)]
+pub struct KafkaMetrics {
+    /// Total consumer lag across all partitions
+    pub records_lag: AtomicU64,
+    /// Total number of messages consumed
+    pub records_consumed: AtomicU64,
+    /// Total bytes consumed
+    pub bytes_consumed: AtomicU64,
+}
+
+struct KafkaConsumerContext {
+    metrics: Arc<KafkaMetrics>,
+}
+
+impl KafkaConsumerContext {
+    fn new(metrics: Arc<KafkaMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl KafkaMetrics {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update_records_lag(&self, lag: u64) {
+        self.records_lag.store(lag, Ordering::Relaxed);
+    }
+
+    pub fn update_records_consumed(&self, count: u64) {
+        self.records_consumed.store(count, Ordering::Relaxed);
+    }
+
+    pub fn update_bytes_consumed(&self, bytes: u64) {
+        self.bytes_consumed.store(bytes, Ordering::Relaxed);
+    }
+}
+
+impl rdkafka::ClientContext for KafkaConsumerContext {
+    #[allow(clippy::cast_sign_loss)]
+    fn stats(&self, statistics: rdkafka::Statistics) {
+        // Calculate total consumer lag from all topic partitions
+        let mut total_lag = 0u64;
+        let mut has_valid_partitions = false;
+
+        for topic in statistics.topics.values() {
+            for partition in topic.partitions.values() {
+                // Skip internal partitions (partition id -1), and only consider partitions with known lag (-1 means unknown)
+                if partition.partition >= 0 && partition.consumer_lag >= 0 {
+                    total_lag += partition.consumer_lag as u64;
+                    has_valid_partitions = true;
+                }
+            }
+        }
+
+        // Update total lag only if we have valid partitions to avoid misleading data
+        if has_valid_partitions {
+            self.metrics.update_records_lag(total_lag);
+        }
+
+        self.metrics
+            .update_records_consumed(statistics.rxmsgs as u64);
+        self.metrics
+            .update_bytes_consumed(statistics.rxmsg_bytes as u64);
+
+        tracing::trace!(
+            "Kafka metrics updated for consumer: {}, topics: {:?}, lag: {}, messages: {}, bytes: {}, brokers={:?}, consumer_group_state={:?}",
+            statistics.name,
+            statistics.topics.keys().collect::<Vec<_>>(),
+            total_lag,
+            statistics.rxmsgs,
+            statistics.rxmsg_bytes,
+            statistics
+                .brokers
+                .values()
+                .map(|b| format!("{}:{}", b.name, b.state))
+                .collect::<Vec<_>>(),
+            statistics.cgrp.as_ref().map(|cgrp| &cgrp.state),
+        );
+    }
+}
+
+impl rdkafka::consumer::ConsumerContext for KafkaConsumerContext {}
+
 pub struct KafkaConsumer {
     group_id: String,
-    consumer: StreamConsumer,
+    consumer: StreamConsumer<KafkaConsumerContext>,
+    metrics: Arc<KafkaMetrics>,
 }
 
 impl KafkaConsumer {
@@ -147,11 +244,15 @@ impl KafkaConsumer {
         Self::create(group_id.into(), kafka_config)
     }
 
-    pub fn create_with_generated_group_id(
+    pub fn create_for_dataset(
         dataset: &str,
+        group_id: Option<String>,
         kafka_config: &KafkaConfig,
     ) -> Result<Self> {
-        Self::create(Self::generate_group_id(dataset), kafka_config)
+        Self::create(
+            group_id.unwrap_or_else(|| Self::generate_group_id(dataset)),
+            kafka_config,
+        )
     }
 
     #[must_use]
@@ -168,7 +269,7 @@ impl KafkaConsumer {
     /// Receive a JSON message from the Kafka topic.
     pub async fn next_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
-    ) -> Result<Option<KafkaMessage<K, V>>> {
+    ) -> Result<Option<KafkaMessage<'_, K, V>>> {
         let mut stream = Box::pin(self.stream_json::<K, V>());
         stream.next().await.transpose()
     }
@@ -176,7 +277,7 @@ impl KafkaConsumer {
     /// Stream JSON messages from the Kafka topic.
     pub fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
-    ) -> impl Stream<Item = Result<KafkaMessage<K, V>>> {
+    ) -> impl Stream<Item = Result<KafkaMessage<'_, K, V>>> {
         self.consumer.stream().filter_map(move |msg| async move {
             let msg = match msg {
                 Ok(msg) => msg,
@@ -255,6 +356,11 @@ impl KafkaConsumer {
         Ok(())
     }
 
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<KafkaMetrics> {
+        &self.metrics
+    }
+
     fn create(group_id: String, kafka_config: &KafkaConfig) -> Result<Self> {
         let (_, version) = get_rdkafka_version();
         tracing::debug!("rd_kafka_version: {}", version);
@@ -263,6 +369,13 @@ impl KafkaConsumer {
         config
             .set("group.id", group_id.clone())
             .set("bootstrap.servers", &kafka_config.brokers)
+            // Explicit statistics emission interval configuration (1s is the default)
+            .set("statistics.interval.ms", "1000")
+            .set("retry.backoff.ms", "1000")
+            .set("retry.backoff.max.ms", "30000")
+            .set("reconnect.backoff.ms", "1000")
+            .set("reconnect.backoff.max.ms", "30000")
+            .set("debug", "broker,cgrp,fetch")
             // For new consumer groups, start reading at the beginning of the topic
             .set("auto.offset.reset", "smallest")
             // Commit offsets automatically
@@ -296,12 +409,21 @@ impl KafkaConsumer {
                 .to_string(),
         );
 
-        let consumer: StreamConsumer = config
+        let metrics = kafka_config
+            .metrics_store
+            .clone()
+            .unwrap_or(Arc::new(KafkaMetrics::new()));
+
+        let consumer: StreamConsumer<KafkaConsumerContext> = config
             .set_log_level(RDKafkaLogLevel::Debug)
-            .create()
+            .create_with_context(KafkaConsumerContext::new(Arc::clone(&metrics)))
             .context(UnableToCreateConsumerSnafu)?;
 
-        Ok(Self { group_id, consumer })
+        Ok(Self {
+            group_id,
+            consumer,
+            metrics,
+        })
     }
 
     fn generate_group_id(dataset: &str) -> String {
@@ -310,7 +432,7 @@ impl KafkaConsumer {
 }
 
 pub struct KafkaMessage<'a, K, V> {
-    consumer: &'a StreamConsumer,
+    consumer: &'a StreamConsumer<KafkaConsumerContext>,
     msg: BorrowedMessage<'a>,
     key: Option<K>,
     value: V,
@@ -318,7 +440,7 @@ pub struct KafkaMessage<'a, K, V> {
 
 impl<'a, K, V> KafkaMessage<'a, K, V> {
     fn new(
-        consumer: &'a StreamConsumer,
+        consumer: &'a StreamConsumer<KafkaConsumerContext>,
         msg: BorrowedMessage<'a>,
         key: Option<K>,
         value: V,
@@ -396,12 +518,7 @@ impl Kafka {
             .stream_json::<serde_json::Value, serde_json::Value>()
             .map(move |msg| {
                 let schema = Arc::clone(&schema);
-                let Ok(msg) = msg else {
-                    return Err(cdc::StreamError::Kafka(format!(
-                        "Unable to read message: {:?}",
-                        msg.err()
-                    )));
-                };
+                let msg = msg.map_err(cdc::StreamError::Kafka)?;
 
                 let json_str = match flatten_json {
                     Some(ref delimiter) => {
@@ -448,10 +565,13 @@ impl TableProvider for Kafka {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))) as Arc<dyn ExecutionPlan>)
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 }

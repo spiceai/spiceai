@@ -16,7 +16,7 @@ use std::{any::Any, cmp::min, sync::Arc};
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
     generation::{
-        text_search::{DEFAULT_BATCH_SIZE, FullTextSearchFieldIndex, exec::FullTextSearchExec},
+        text_search::{DEFAULT_LIMIT_MAXIMUM, FullTextSearchFieldIndex, exec::FullTextSearchExec},
         util::append_fields,
     },
 };
@@ -33,7 +33,7 @@ use datafusion::{
 /// [`RecordBatch`] results will be ordered by the relevancy score.
 #[derive(Debug)]
 pub struct FullTextSearchQuery {
-    pub index: FullTextSearchFieldIndex,
+    pub index: Arc<FullTextSearchFieldIndex>,
     pub query: String,
 
     /// If Some(N), will only retrieve `N` results from the index. If filters are provided that are
@@ -91,14 +91,14 @@ impl TableProvider for FullTextSearchQuery {
     ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         Ok(Arc::new(
             FullTextSearchExec::try_new(
-                self.index.clone(),
+                &self.index,
                 self.query.clone(),
                 self.schema(),
                 projection,
                 filters.to_vec(),
-                self.limit_to_use(limit).unwrap_or(DEFAULT_BATCH_SIZE),
+                self.limit_to_use(limit).unwrap_or(DEFAULT_LIMIT_MAXIMUM),
             )
-            .map_err(|e| DataFusionError::ArrowError(e, None))?,
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
         ))
     }
 }

@@ -15,12 +15,15 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::LoadTestArgs, wait_test_and_memory};
+use crate::{
+    args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper, wait_test_and_memory,
+};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
+    opentelemetry::KeyValue,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
@@ -53,6 +56,14 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
+
+    // Start metrics scraper if enabled
+    let metrics_scraper = if args.test_args.common.scrape_spiced_metrics {
+        Some(MetricsScraper::spawn()?)
+    } else {
+        None
+    };
 
     let test_duration = Duration::from_secs(args.test_args.common.duration);
     let test_hours = (test_duration.as_secs() / 60 / 60).max(1);
@@ -119,7 +130,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
+    let health_report = health_monitor.stop().await;
+
+    // Stop and process metrics scraper if enabled
+    let attributes = vec![KeyValue::new("test", "load")];
+    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
+        .await;
+
     spiced_instance.stop()?;
+    let health_report = health_report?;
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
@@ -166,12 +185,19 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         }
     }
 
+    let mut failure_messages = Vec::new();
     if !args.no_error && yellow_measurements >= 3 {
-        return Err(anyhow::anyhow!(
-            "Load test failed due to too many yellow measurements"
-        ));
-    } else if !args.no_error && !test_passed {
-        return Err(anyhow::anyhow!("Load test failed."));
+        failure_messages.push("Load test failed due to too many yellow measurements".to_string());
+    }
+    if !args.no_error && !test_passed {
+        failure_messages.push("Load test failed.".to_string());
+    }
+    if let Some(message) = health_report.failure_message() {
+        failure_messages.push(message);
+    }
+
+    if !failure_messages.is_empty() {
+        return Err(anyhow::anyhow!(failure_messages.join("\n")));
     }
 
     println!("Load test completed");

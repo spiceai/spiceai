@@ -16,7 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
+use crate::component::metrics::MetricsProvider;
+use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
@@ -27,7 +28,7 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{KafkaConfig, KafkaConsumer};
+use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,13 @@ impl Debezium {
                     tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
                     data_components::kafka::SslIdentification::Https
                 }),
+            consumer_group_id: params
+                .get("kafka_consumer_group_id")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            // Metrics instance that will be used by the Kafka consumer to update statistics
+            metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
         Ok(Self { kafka_config })
@@ -195,6 +203,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_ssl_endpoint_identification_algorithm")
         .default("https")
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
+    ParameterSpec::runtime("kafka_consumer_group_id")
+        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -360,6 +370,16 @@ impl DataConnector for Debezium {
             }
         }))
     }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
+            Some(Arc::new(super::kafka::KafkaMetricsProvider::new(
+                Arc::clone(metrics),
+            )))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -371,15 +391,18 @@ pub(crate) struct DebeziumKafkaMetadata {
 }
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset).await.ok()?;
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset, OpenOption::OpenExisting)
+        .await
+        .ok()?;
     debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
+) -> Result<(), spice_sys::Error> {
+    let debezium_kafka_sys =
+        DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     debezium_kafka_sys.upsert(metadata).await
 }
 
@@ -389,12 +412,16 @@ async fn get_metadata_from_kafka(
     kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
-    let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "debezium",
-            connector_component: ConnectorComponent::from(dataset),
-        })?;
+    let kafka_consumer = KafkaConsumer::create_for_dataset(
+        &dataset_name,
+        kafka_config.consumer_group_id.clone(),
+        kafka_config,
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "debezium",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
 
     kafka_consumer
         .subscribe(topic)
@@ -467,6 +494,7 @@ async fn get_metadata_from_kafka(
     if dataset.is_file_accelerated() {
         set_metadata_to_accelerator(dataset, &metadata)
             .await
+            .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
                 connector_component: ConnectorComponent::from(dataset),

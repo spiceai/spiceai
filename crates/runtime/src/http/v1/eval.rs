@@ -31,8 +31,8 @@ use crate::{
     Runtime,
     datafusion::request_context_extension::get_current_datafusion,
     model::{EvalScorerRegistry, LLMChatCompletionsModelStore, handle_eval_run, sql_query_for},
-    request::{AsyncMarker, RequestContext},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[cfg(feature = "openapi")]
 use crate::model::EvalRunResponse;
@@ -125,13 +125,13 @@ pub(crate) async fn post(
             .into_response();
     }
 
-    match handle_eval_run(
+    match Box::pin(handle_eval_run(
         eval,
         model,
         Arc::clone(&df),
         Arc::clone(&llms),
         eval_scorer_registry,
-    )
+    ))
     .await
     {
         Ok(id) => {

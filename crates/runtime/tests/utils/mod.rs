@@ -31,7 +31,7 @@ use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
 use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
-use runtime::request::{Protocol, RequestContext, UserAgent};
+use runtime_request_context::{Protocol, RequestContext, UserAgent};
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(
@@ -159,8 +159,13 @@ pub(crate) fn init_tracing_with_task_history(
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
 
-    let task_history_exporter =
-        TaskHistoryExporter::new(rt.datafusion(), TaskHistoryCapturedOutput::Truncated);
+    let task_history_exporter = TaskHistoryExporter::new(
+        rt.datafusion(),
+        TaskHistoryCapturedOutput::Truncated,
+        None, // min_sql_duration_ms
+        spicepod::component::runtime::TaskHistoryCapturedPlan::None,
+        None, // min_plan_duration_ms
+    );
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
     let provider = TracerProvider::builder()

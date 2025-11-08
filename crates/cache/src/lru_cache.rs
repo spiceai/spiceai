@@ -15,40 +15,58 @@ limitations under the License.
 */
 
 use crate::AsTableRefs;
-use crate::CacheProvider;
 use crate::FailedToInvalidateCacheSnafu;
+use crate::HashBuilder;
 use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
-use crate::current_time_secs;
+use crate::TabledCacheProvider;
 use crate::metrics::CacheMetrics;
+use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
 use spicepod::component::caching::CacheConfig;
-use spicepod::component::caching::HashingAlgorithm;
+use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
     cache: Cache<u64, V, T>,
     hasher: T,
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
+    ttl: Duration,
+    initial_instant: Instant,
 }
 
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> Display for LruCache<V, T>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max size: {:.2}, item ttl: {:?}",
+            Byte::from_u64(self.max_size).get_adjusted_unit(byte_unit::Unit::MiB),
+            self.ttl
+        )
+    }
+}
+
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > std::fmt::Debug for LruCache<V, T>
 {
@@ -70,11 +88,9 @@ impl<
 ///
 /// - If the specified `max_size` cannot be parsed as a valid byte size.
 /// - If the specified `item_ttl` cannot be parsed as a valid duration.
-pub fn build_from_config<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
->(
+pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static>(
     cache_config: &CacheConfig,
-) -> Result<Arc<dyn CacheProvider<V> + Send + Sync>> {
+) -> Result<Arc<LruCache<V, HashBuilder>>> {
     let cache_max_size: u64 = match &cache_config.max_size {
         Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
             .context(super::FailedToParseCacheMaxSizeSnafu)?
@@ -89,22 +105,12 @@ pub fn build_from_config<
         None => std::time::Duration::from_secs(1),
     };
 
-    Ok(match cache_config.hashing_algorithm {
-        HashingAlgorithm::Siphash => Arc::new(LruCache::new(
-            cache_max_size,
-            ttl,
-            std::hash::RandomState::default(),
-        )),
-        HashingAlgorithm::Ahash => Arc::new(LruCache::new(
-            cache_max_size,
-            ttl,
-            ahash::RandomState::default(),
-        )),
-    })
+    let hash_builder = get_hash_builder(cache_config.hashing_algorithm)?;
+    Ok(Arc::new(LruCache::new(cache_max_size, ttl, hash_builder)))
 }
 
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > LruCache<V, T>
 {
@@ -132,17 +138,35 @@ impl<
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
+        V::init();
+
         LruCache {
             cache,
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: AtomicU64::new(0),
+            ttl,
+            initial_instant: Instant::now(),
         }
+    }
+
+    pub fn as_provider(self: Arc<Self>) -> Arc<dyn CacheProvider<V> + Send + Sync> {
+        self
     }
 }
 
 impl<
     V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> LruCache<V, T>
+{
+    pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
+        self
+    }
+}
+
+impl<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > HashProvider for LruCache<V, T>
 {
@@ -153,7 +177,7 @@ impl<
 
 #[async_trait]
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > CacheProvider<V> for LruCache<V, T>
 {
@@ -171,11 +195,20 @@ impl<
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.cache.insert(*key, value).await;
 
-        let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
             V::record_max_size(self.max_size() as u64);
@@ -185,28 +218,23 @@ impl<
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
 
-        let now_seconds = current_time_secs();
-        if now_seconds - self.metrics_last_reported_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             V::record_item_count(self.item_count());
             V::record_size(self.size_bytes());
         }
-    }
-
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        let table_name = match &table_ref {
-            TableReference::Bare { table }
-            | TableReference::Partial { table, .. }
-            | TableReference::Full { table, .. } => table,
-        };
-        let table_name = Arc::clone(table_name);
-        self.cache
-            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
-            .context(FailedToInvalidateCacheSnafu { table_name })?;
-
-        Ok(())
     }
 
     fn size_bytes(&self) -> u64 {
@@ -226,6 +254,27 @@ impl<
     }
 }
 
+#[async_trait]
+impl<
+    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+> TabledCacheProvider<V> for LruCache<V, T>
+{
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let table_name = match &table_ref {
+            TableReference::Bare { table }
+            | TableReference::Partial { table, .. }
+            | TableReference::Full { table, .. } => table,
+        };
+        let table_name = Arc::clone(table_name);
+        self.cache
+            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
+            .context(FailedToInvalidateCacheSnafu { table_name })?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::CacheKey;
@@ -236,6 +285,8 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
+    #[cfg(feature = "xxhash")]
+    use spicepod::component::caching::HashingAlgorithm;
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
     use std::time::Duration;
@@ -401,6 +452,36 @@ mod tests {
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
     async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
+        let cache: LruCache<CachedQueryResult, _> =
+            LruCache::new(10, Duration::from_millis(100), hasher);
+        let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache.put_raw_key(&key().as_u64(), result).await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_some());
+
+        // Wait for the TTL to expire
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+
+    #[cfg(feature = "xxhash")]
+    #[rstest]
+    #[case::xxh3(HashingAlgorithm::XXH3)]
+    #[case::xxh32(HashingAlgorithm::XXH32)]
+    #[case::xxh64(HashingAlgorithm::XXH64)]
+    #[case::xxh128(HashingAlgorithm::XXH128)]
+    #[tokio::test]
+    async fn test_cache_ttl_xhash(#[case] hashing_algo: HashingAlgorithm) {
+        let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
+
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());

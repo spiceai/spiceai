@@ -1,28 +1,48 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "multi_column_search",
+      "dataset": "qs",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "question": "How many groups of 3 are in 18?"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "id": 463
       },
-      "score": 0.03
+      "score": 0.01
     },
     {
-      "dataset": "multi_column_search",
+      "dataset": "qs",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "id": 1277
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+      },
+      "primary_key": {
+        "id": 948
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "How many groups of 5 are in 25?"
+      },
+      "primary_key": {
+        "id": 464
       },
       "score": 0.01
     }

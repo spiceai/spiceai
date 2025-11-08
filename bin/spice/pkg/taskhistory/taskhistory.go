@@ -40,7 +40,7 @@ func SqlRequestToTraces(rtcontext *context.RuntimeContext, sql string) ([]TaskHi
 	request.Header.Set("Content-Type", "text/plain")
 	request.Header.Set("Accept", "Application/json")
 
-	response, err := rtcontext.Client().Do(request)
+	response, err := rtcontext.LongRunningClient().Do(request)
 
 	if err != nil {
 		return nil, fmt.Errorf("error sending SQL request: %w", err)
@@ -90,15 +90,23 @@ func (tMs *TimeWithMilliSeconds) UnmarshalJSON(b []byte) error {
 	s := string(b)
 	s = s[1 : len(s)-1]
 
-	layout := "2006-01-02T15:04:05.999999"
-
-	t, err := time.Parse(layout, s)
-	if err != nil {
-		return err
+	layouts := []string{
+		"2006-01-02T15:04:05.999999Z",
+		"2006-01-02T15:04:05.999999",
 	}
 
-	*tMs = TimeWithMilliSeconds(t)
-	return nil
+	var t time.Time
+	var err error
+
+	for _, layout := range layouts {
+		t, err = time.Parse(layout, s)
+		if err == nil {
+			*tMs = TimeWithMilliSeconds(t)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("cannot parse time: %w", err)
 }
 
 func (tMs TimeWithMilliSeconds) asTime() time.Time {

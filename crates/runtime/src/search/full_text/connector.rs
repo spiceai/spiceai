@@ -14,14 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
+use runtime_datafusion_index::Index;
 use std::any::Any;
 use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::component::{ComponentInitialization, dataset::Dataset, metrics::MetricsProvider};
+use crate::changes::{Indexes, index_change_envelope};
+use crate::component::{
+    ComponentInitialization,
+    dataset::{Dataset, acceleration::RefreshMode},
+    metrics::MetricsProvider,
+};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::federated_table::FederatedTable;
+use crate::search::full_text::table::add_full_text_search_to_table;
+use crate::search::util::find_index_in_table_provider;
+use futures::StreamExt;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
 
@@ -36,87 +46,41 @@ impl FullTextConnector {
         Self { inner_connector }
     }
 
-    pub(crate) async fn wrap_table(
+    #[allow(clippy::needless_pass_by_value)]
+    fn with_indexed_stream<F>(
         &self,
-        inner_table_provider: Arc<dyn TableProvider>,
-        dataset: &Dataset,
-    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let (search_fields, primary_key_overrides): (Vec<_>, Vec<_>) = dataset
-            .columns
-            .iter()
-            .filter_map(|c| {
-                if c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled) {
-                    let primary_key_overrides = c
-                        .full_text_search
-                        .as_ref()
-                        .and_then(|cfg| cfg.row_ids.clone());
-                    Some((c.name.clone(), primary_key_overrides))
-                } else {
-                    None
-                }
-            })
-            .unzip();
+        federated_table: Arc<FederatedTable>,
+        f: F,
+    ) -> Option<ChangesStream>
+    where
+        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+    {
+        let table_provider = federated_table.try_table_provider_sync()?;
 
-        if search_fields.is_empty() {
-            return Ok(inner_table_provider);
-        }
+        let Some((indexed, underlying)) =
+            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+        else {
+            tracing::debug!(
+                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
+            );
+            return None;
+        };
 
-        let index = FullTextDatabaseIndex::try_new(
-            Arc::clone(&inner_table_provider),
-            search_fields.clone(),
-            Self::warn_different_primary_keys(
-                dataset.name.to_string().as_str(),
-                primary_key_overrides,
-                search_fields.as_slice(),
-            ),
+        let indexed = indexed
+            .into_iter()
+            .cloned()
+            .map(|i| Arc::new(i) as Arc<dyn Index + Send + Sync>)
+            .collect();
+
+        let indexed = Indexes::new(indexed);
+        let ft = Arc::new(FederatedTable::Immediate(underlying));
+
+        let stream = f(&self.inner_connector, ft)?;
+        Some(
+            stream
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexed)))
+                .boxed(),
         )
-        .await
-        .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
-            message: e.to_string(),
-            connector_component: dataset.into(),
-            source: Box::new(e),
-        })?;
-
-        let tbl = IndexedTableProvider::new(inner_table_provider)
-            .add_index(Arc::new(index) as Arc<dyn Index + Send + Sync>);
-
-        Ok(Arc::new(tbl) as Arc<dyn TableProvider>)
-    }
-
-    // For all full text search columns, find the first with a non-null primary key override and
-    // if there are multiple, warn if they are different.
-    fn warn_different_primary_keys(
-        ds_name: &str,
-        sets: Vec<Option<Vec<String>>>,
-        fields: &[String],
-    ) -> Option<Vec<String>> {
-        let mut first: Option<Vec<String>> = None;
-        let cmp_idx = 0;
-        for (i, s) in sets.into_iter().enumerate() {
-            let Some(mut pks) = s else {
-                continue;
-            };
-            pks.sort();
-
-            // If not first primary key defined, check it matches previous. Otherwise set to be used for next comparison.
-            if let Some(ref f) = first {
-                if *pks != *f {
-                    tracing::warn!(
-                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
-                        ds_name,
-                        fields[cmp_idx],
-                        f.join(", "),
-                        fields[i],
-                        pks.join(", "),
-                    );
-                }
-            } else {
-                first = Some(pks.clone());
-            }
-        }
-
-        first
     }
 }
 
@@ -130,8 +94,18 @@ impl DataConnector for FullTextConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
-            .await
+        add_full_text_search_to_table(
+            self.inner_connector.read_provider(dataset).await?,
+            &dataset.columns,
+            &dataset.name,
+        )
+        .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })
     }
 
     async fn read_write_provider(
@@ -139,7 +113,16 @@ impl DataConnector for FullTextConnector {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
+            Some(Ok(inner)) => Some(
+                add_full_text_search_to_table(inner, &dataset.columns, &dataset.name)
+                    .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
+                    .map_err(|e| DataConnectorError::InvalidConfiguration {
+                        dataconnector: dataset.source().to_string(),
+                        message: e.to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }),
+            ),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }
@@ -168,5 +151,25 @@ impl DataConnector for FullTextConnector {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
+    }
+
+    fn resolve_refresh_mode(&self, refresh_mode: Option<RefreshMode>) -> RefreshMode {
+        self.inner_connector.resolve_refresh_mode(refresh_mode)
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        self.inner_connector.supports_changes_stream()
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| inner.changes_stream(ft))
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        self.inner_connector.supports_append_stream()
+    }
+
+    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
 }

@@ -14,32 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::AcceleratedTable;
+use crate::changes::Indexes;
+use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorError;
-use crate::dataconnector::DataConnectorResult;
-use crate::embeddings::execution_plan::compute_additional_embedding_columns;
-use crate::embeddings::execution_plan::construct_record_batch;
+use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::embeddings::execution_plan::{
+    compute_additional_embedding_columns, construct_record_batch,
+};
+use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
-use data_components::cdc::ChangeEnvelope;
-use data_components::cdc::ChangesStream;
-use data_components::cdc::StreamError;
-use data_components::cdc::replace_change_batch_data;
+use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
-use spicepod::vector::VectorStore;
+
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -92,12 +89,26 @@ impl EmbeddingConnector {
         }
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
-        if let Some(vector_engine) = &dataset.vectors {
-            if vector_engine.enabled {
-                return self
-                    .wrap_table_as_index(dataset, Arc::clone(&inner_table_provider), vector_engine)
-                    .await;
-            }
+        if let Some(vector_engine) = &dataset.vectors
+            && vector_engine.enabled
+        {
+            return wrap_table_as_index(
+                &dataset.runtime().datafusion().ctx,
+                &self.embedding_models,
+                &self.secrets,
+                &dataset.name,
+                &dataset.columns,
+                dataset.params.get("file_format").map(String::as_str),
+                Arc::clone(&inner_table_provider),
+                vector_engine,
+            )
+            .await
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: dataset.source().to_string(),
+                connector_component: dataset.into(),
+                source: e,
+                message: "Could not instantiate vector index".to_string(),
+            });
         }
 
         // Add in embedding columns from `dataset.columns.embeddings`.
@@ -114,55 +125,15 @@ impl EmbeddingConnector {
                 })
             })
             .collect_vec();
-        let mut embeddings = dataset.embeddings.clone();
+
+        let mut embeddings: Vec<ColumnEmbeddingConfig> = dataset.embeddings.clone();
         embeddings.extend(from_columns);
 
-        if embeddings.is_empty() {
-            return Ok(inner_table_provider);
-        }
-
-        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
-            .iter()
-            .map(|e| (e.column.clone(), e.clone()))
-            .collect::<HashMap<_, _>>();
-
-        // Early check if embedding models are available.
-        for (column, config) in &embed_columns {
-            let model = &config.model;
-            if !self.embedding_models.read().await.contains_key(model) {
-                return Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "EmbeddingConnector".to_string(),
-                    message: format!(
-                        "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
-                    ),
-                    connector_component: dataset.into(),
-                });
-            }
-        }
-
-        let embed_chunker_config: HashMap<String, ChunkingConfig> = embeddings
-            .iter()
-            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
-            .filter_map(|e| {
-                e.chunking.as_ref().map(|chunk_cfg| {
-                    (
-                        e.column.clone(),
-                        ChunkingConfig {
-                            target_chunk_size: chunk_cfg.target_chunk_size,
-                            overlap_size: chunk_cfg.overlap_size,
-                            trim_whitespace: chunk_cfg.trim_whitespace,
-                            file_format: dataset.params.get("file_format").map(String::as_str),
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>();
-
-        let embedding_table = EmbeddingTable::try_new(
+        EmbeddingTable::from_spicepod_columns(
             inner_table_provider,
-            embed_columns,
-            Arc::clone(&self.embedding_models),
-            embed_chunker_config,
+            embeddings,
+            &self.embedding_models,
+            dataset.params.get("file_format").map(String::as_str),
         )
         .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -170,108 +141,7 @@ impl EmbeddingConnector {
             message: e.to_string(),
             connector_component: dataset.into(),
             source: Box::new(e),
-        })?;
-
-        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
-    }
-
-    async fn wrap_table_as_index(
-        &self,
-        dataset: &Dataset,
-        inner_table_provider: Arc<dyn TableProvider>,
-        vector_store: &VectorStore,
-    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        match vector_store.engine.as_deref() {
-            #[cfg(feature = "s3_vectors")]
-            Some("s3" | "s3_vectors") => {
-                tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
-                let start = std::time::Instant::now();
-
-                let embedding_columns: Vec<_> = dataset
-                    .columns
-                    .iter()
-                    .filter_map(|c| {
-                        c.embeddings
-                            .first()
-                            .map(|embed| (c.name.clone(), embed.clone()))
-                    })
-                    .collect();
-                let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
-                for (column, config) in embedding_columns {
-                    use runtime_datafusion_index::Index;
-
-                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
-
-                    let vector_index = super::index::s3::try_from_dataset(
-                        &dataset.name,
-                        column,
-                        config,
-                        vector_store,
-                        Arc::clone(&inner_table_provider),
-                        Arc::clone(&self.embedding_models),
-                        dataset.columns.clone(),
-                        Arc::clone(&self.secrets),
-                    )
-                    .await
-                    .map_err(|e| {
-                        DataConnectorError::UnableToConnectInternal {
-                            dataconnector: dataset.source().to_string(),
-                            connector_component: dataset.into(),
-                            source: e,
-                        }
-                    })?;
-
-                    // augment the previous underlying table provider with the vector index
-                    // this will result in recursive augmentation of the underlying table for N embedding columns
-                    provider.underlying = Arc::new(VectorScanTableProvider::new(
-                        provider.underlying,
-                        Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>,
-                    )) as Arc<dyn TableProvider>;
-                    provider = provider.add_index(Arc::new(vector_index.clone()) as Arc<dyn Index>);
-                }
-                tracing::info!(
-                    "S3 Vectors for dataset {} initialized in {:?}",
-                    dataset.name,
-                    start.elapsed()
-                );
-                Ok(Arc::new(provider))
-            }
-            None => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                message: "No vector engine specified. Use '.datasets[].vectors.engine'".to_string(),
-            }),
-            Some(unknown_engine) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                message: format!("Unknown vector engine '.vectors.engine: {unknown_engine}'"),
-            }),
-        }
-    }
-
-    async fn index_change_envelope(
-        maybe_envelope: Result<ChangeEnvelope, StreamError>,
-        embedding_table: Arc<IndexedTableProvider>,
-    ) -> Result<ChangeEnvelope, StreamError> {
-        let envelope = maybe_envelope.map_err(|e| {
-            tracing::debug!("Error in underlying base stream: {e:?}");
-            e
-        })?;
-
-        let (change_committer, batch) = envelope.into_parts();
-        let mut batches = vec![batch.data_batch()];
-
-        for index in &embedding_table.indexes {
-            batches = index
-                .compute_index(batches)
-                .await
-                .map_err(|e| StreamError::External(e.to_string()))?;
-        }
-
-        let new_change_batch = replace_change_batch_data(&batches[0], &batch)
-            .map_err(|e| StreamError::Arrow(e.to_string()))?;
-
-        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
+        })
     }
 
     async fn embed_change_envelope(
@@ -371,20 +241,24 @@ impl DataConnector for EmbeddingConnector {
 
     fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
-
         if let Some(indexed_table) = table_provider
             .as_any()
             .downcast_ref::<IndexedTableProvider>()
             .cloned()
         {
             let indexed_table = Arc::new(indexed_table);
-            let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&table_provider)?;
+            let Some(underlying_federated_table) =
+                underlying_federated_table_for_indexed_table(&table_provider)
+            else {
+                return self.inner_connector.changes_stream(federated_table);
+            };
+
+            let indexes = Indexes::new(indexed_table.get_all_indexes());
 
             let stream = self
                 .inner_connector
                 .changes_stream(underlying_federated_table)?
-                .then(move |item| Self::index_change_envelope(item, Arc::clone(&indexed_table)))
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
             return Some(stream);
@@ -424,10 +298,12 @@ impl DataConnector for EmbeddingConnector {
             let underlying_federated_table =
                 underlying_federated_table_for_indexed_table(&table_provider)?;
 
+            let indexes = Indexes::new(indexed_table.get_all_indexes());
+
             let stream = self
                 .inner_connector
                 .append_stream(underlying_federated_table)?
-                .then(move |item| Self::index_change_envelope(item, Arc::clone(&indexed_table)))
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
             return Some(stream);

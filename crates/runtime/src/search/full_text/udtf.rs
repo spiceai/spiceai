@@ -27,35 +27,39 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
-use std::{
-    borrow::Cow,
-    sync::{Arc, Weak},
-};
-
+use arrow_schema::DataType;
+use datafusion::common::exec_err;
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
-    catalog::{Session, TableFunctionImpl, TableProvider},
-    common::{Column, Constraints, Statistics},
-    datasource::TableType,
+    catalog::{TableFunctionImpl, TableProvider},
+    common::Column,
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
     sql::TableReference,
 };
-use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::text_search::{
-    index::FullTextDatabaseIndex, udtf::TextSearchIndexProvider,
-};
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
+use moka::future::FutureExt;
+use search::{
+    generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
+    provider::SearchQueryProvider,
+};
+use std::any::Any;
+use std::sync::LazyLock;
+use std::sync::{Arc, Weak};
+
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{
     datafusion::DataFusion,
     embeddings::udtf::parse_limit_scalar,
-    request::{AsyncMarker, RequestContext},
-    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+    search::util::{find_index_in_table_provider, table_ref_from_column_expr, to_column_expr},
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
+pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> =
+    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
@@ -106,12 +110,34 @@ impl TextSearchTableFuncArgs {
 pub struct TextSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
+    df_ptr: u64,
+}
+
+impl PartialEq for TextSearchTableFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.df_ptr == other.df_ptr
+    }
+}
+
+impl Eq for TextSearchTableFunc {}
+
+impl std::hash::Hash for TextSearchTableFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.df_ptr.hash(state);
+    }
 }
 
 impl TextSearchTableFunc {
     #[must_use]
     pub fn new(df: Weak<DataFusion>) -> Self {
-        Self { df }
+        let ptr = df.as_ptr().addr() as u64;
+
+        Self { df, df_ptr: ptr }
+    }
+
+    fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
+        exec_err!("{TEXT_SEARCH_UDTF_NAME} does not support scalar invocation.")
     }
 }
 
@@ -222,7 +248,9 @@ impl TextSearchTableFunc {
             }
         };
         Ok(TextSearchTableFuncArgs {
-            tbl: tbl_ref,
+            tbl: tbl_ref
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .into(),
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
@@ -246,101 +274,64 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let index_table_provider = find_concrete_table_provider::<IndexedTableProvider>(
-            &table_provider,
-        )
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "Table '{}' does not have a full text search index.",
-                args.tbl.clone()
-            ))
-        })?;
+        let mut fts_indexes =
+            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Table '{}' does not have a full text search index.",
+                        args.tbl.clone()
+                    ))
+                })?
+                .0;
 
-        let Some(fts_index) = index_table_provider.get_index::<FullTextDatabaseIndex>() else {
+        let Some(fts_index) = fts_indexes.pop() else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have a full text search index.",
                 args.tbl.clone()
             )));
         };
 
+        // Select single column if needed.
         let column = args.column(&fts_index.search_fields)?;
-        Ok(Arc::new(TextSearchIndexProviderWrapper {
-            inner: Arc::new(TextSearchIndexProvider {
-                query: args.query.clone(),
-                column,
-                pre_limit: args.limit,
-                index: fts_index.clone(),
-                underlying: table_provider,
-            }),
-        }))
+        let mut fts_index = fts_index.clone();
+        fts_index.search_fields = vec![column];
+
+        Ok(Arc::new(
+            SearchQueryProvider::try_from_index(
+                &(Arc::new(fts_index) as Arc<dyn SearchIndex>),
+                table_provider,
+                args.query.as_str(),
+                args.limit,
+            )?
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_text_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
+        ))
     }
 }
 
-#[derive(Debug)]
-struct TextSearchIndexProviderWrapper {
-    inner: Arc<TextSearchIndexProvider>,
-}
-
-#[async_trait::async_trait]
-impl TableProvider for TextSearchIndexProviderWrapper {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self.inner.as_any()
+impl ScalarUDFImpl for TextSearchTableFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
-    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        self.inner.schema()
+    fn name(&self) -> &str {
+        TEXT_SEARCH_UDTF_NAME
     }
 
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
+    fn signature(&self) -> &Signature {
+        &TEXT_SEARCH_SIGNATURE
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Self::scalar_invocation_error()
     }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, insert_op).await
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let request_context = RequestContext::current(AsyncMarker::new().await);
-        telemetry::track_text_search(&request_context.to_dimensions());
-
-        self.inner.scan(state, projection, filters, limit).await
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Self::scalar_invocation_error()
     }
 }

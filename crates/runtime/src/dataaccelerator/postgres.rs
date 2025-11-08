@@ -23,7 +23,7 @@ use datafusion::{
 use datafusion_table_providers::postgres::{
     PostgresTableProviderFactory, write::PostgresTableWriter,
 };
-use runtime_table_partition::expression::PartitionBy;
+use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
@@ -37,9 +37,25 @@ pub enum Error {
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display(
+        "Invalid connection pool configuration: connection_pool_min_idle ({connection_pool_min_idle}) cannot be greater than connection_pool_max ({connection_pool_max})"
+    ))]
+    InvalidConnectionPoolConfiguration {
+        connection_pool_min_idle: usize,
+        connection_pool_max: usize,
+    },
+
+    #[snafu(display(
+        "Invalid value for parameter '{parameter}': '{value}'. Expected a positive integer."
+    ))]
+    InvalidParameterValue { parameter: String, value: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+const DEFAULT_CONNECTION_POOL_MIN: usize = 5;
+const DEFAULT_CONNECTION_POOL_MAX: usize = 10;
 
 pub struct PostgresAccelerator {
     postgres_factory: PostgresTableProviderFactory,
@@ -68,9 +84,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("pass").secret(),
     ParameterSpec::component("sslmode"),
     ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_pool_min")
+        .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
+        .default("5"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("connection_pool_size")
-        .description("The maximum number of connections created in the connection pool")
+        .description("The maximum number of connections created in the connection pool.")
         .default("10"),
 ];
 
@@ -89,16 +108,44 @@ impl DataAccelerator for PostgresAccelerator {
         &self,
         mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
-        partition_by: Option<PartitionBy>,
+        partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
-            partition_by.is_none(),
+            partition_by.is_empty(),
             super::InvalidConfigurationSnafu {
                 msg: "Postgres data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
 
         let ctx = SessionContext::new();
+
+        // Validate and normalize pool_min and connection_pool_size
+        let connection_pool_min_idle = match cmd.options.get("connection_pool_min") {
+            Some(s) => s
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidParameterValue {
+                    parameter: "connection_pool_min".to_string(),
+                    value: s.clone(),
+                })?,
+            None => DEFAULT_CONNECTION_POOL_MIN,
+        };
+        let connection_pool_max = match cmd.options.get("connection_pool_size") {
+            Some(s) => s
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidParameterValue {
+                    parameter: "connection_pool_size".to_string(),
+                    value: s.clone(),
+                })?,
+            None => DEFAULT_CONNECTION_POOL_MAX,
+        };
+
+        if connection_pool_min_idle > connection_pool_max {
+            return Err(Error::InvalidConnectionPoolConfiguration {
+                connection_pool_min_idle,
+                connection_pool_max,
+            }
+            .into());
+        }
 
         cmd.options.insert(
             "application_name".to_string(),

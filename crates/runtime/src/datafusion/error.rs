@@ -93,24 +93,28 @@ pub fn find_datafusion_root(e: DataFusionError) -> DataFusionError {
                 },
             },
             DataFusionError::Context(_, err) => last_error = *err,
-            DataFusionError::ArrowError(ArrowError::ExternalError(err), message) => {
-                match err.downcast::<DataFusionError>() {
-                    Ok(inner) => last_error = *inner,
-                    Err(err) => match err.downcast::<Arc<DataFusionError>>() {
-                        Ok(inner) => {
-                            tracing::debug!(
-                                "Found Arc<DataFusionError> in ArrowError: {:?}",
-                                inner
-                            );
+
+            // Attempt to convert `ArrowError`'s internal error into first `DataFusionError`, then `Arc<DataFusionError>`.
+            DataFusionError::ArrowError(err_box, ref message) => {
+                let possibly_df_err = if let ArrowError::ExternalError(e) = *err_box {
+                    e.downcast::<DataFusionError>().map(|e| *e)
+                } else {
+                    // Return `last_error`. This should match the `_ => ...` arm below. We cannot pattern match since inner error is `Box<T>`.
+                    return DataFusionError::ArrowError(err_box, message.clone());
+                };
+                match possibly_df_err {
+                    Ok(df_err) => last_error = df_err,
+                    Err(err) => match err.downcast::<Arc<DataFusionError>>().map(|e| *e) {
+                        Ok(df_err) => {
                             return DataFusionError::ArrowError(
-                                ArrowError::ExternalError(inner),
-                                message,
+                                Box::new(ArrowError::ExternalError(Box::new(df_err))),
+                                message.clone(),
                             );
                         }
                         Err(err) => {
                             return DataFusionError::ArrowError(
-                                ArrowError::ExternalError(err),
-                                message,
+                                Box::new(ArrowError::ExternalError(err)),
+                                message.clone(),
                             );
                         }
                     },

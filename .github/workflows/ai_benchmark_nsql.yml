@@ -5,22 +5,22 @@ on:
   workflow_dispatch:
     inputs:
       model_option:
-        description: "Which model do you want to test? (Default is ALL)"
+        description: 'Which model do you want to test? (Default is ALL)'
         required: false
         type: choice
         options:
-          - "all"
-          - "gpt-4o"
-          - "gpt-4o-mini"
-          - "gpt-5"
-          - "o1"
-          - "o3_mini"
-          - "llama3-3B-Instruct"
-          - "claude-3-5-sonnet"
-          - "grok2"
-        default: "all"
+          - 'all'
+          - 'gpt-4o'
+          - 'gpt-4o-mini'
+          - 'gpt-5'
+          - 'o1'
+          - 'o3_mini'
+          - 'llama3-3B-Instruct'
+          - 'claude-3-5-sonnet'
+          - 'grok2'
+        default: 'all'
   schedule:
-    - cron: "0 5 * * 2,5" # Every Monday and Thursday at 10pm PST (5am UTC next day)
+    - cron: '0 5 * * 2,5' # Every Monday and Thursday at 10pm PST (5am UTC next day)
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -30,33 +30,19 @@ concurrency:
 jobs:
   build-testoperator:
     name: Build testoperator
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
         with:
-          os: "darwin"
-
-      - name: Build the testoperator
-        run: |
-          cargo build -p testoperator --release
-
-      - name: make testoperator executable
-        run: |
-          mv target/release/testoperator testoperator
-          chmod +x testoperator
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: testoperator
-          path: testoperator
+          install_to_system_path: 'false'
+          upload_artifact: 'true'
 
   build-spiced:
     name: Build spiced
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v5
 
@@ -82,7 +68,7 @@ jobs:
           chmod +x spiced
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: spiced
           path: spiced
@@ -95,7 +81,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         id: setup-matrix
         with:
           script: |
@@ -125,7 +111,7 @@ jobs:
       - build-testoperator
       - build-spiced
       - setup-matrix
-    runs-on: "spiceai-macos"
+    runs-on: 'spiceai-macos'
     strategy:
       max-parallel: 1
       fail-fast: false
@@ -135,12 +121,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download testoperator
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
-          name: testoperator
+          name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: spiced
 

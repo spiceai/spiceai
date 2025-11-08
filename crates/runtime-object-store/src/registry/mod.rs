@@ -26,8 +26,9 @@ use datafusion::{
 };
 use object_store::{
     ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
-    http::HttpBuilder,
+    client::SpawnedReqwestConnector, http::HttpBuilder,
 };
+use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
@@ -35,18 +36,25 @@ use crate::store::ftp::FTPObjectStore;
 #[cfg(feature = "ftp")]
 use crate::store::sftp::SFTPObjectStore;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SpiceObjectStoreRegistry {
     inner: DefaultObjectStoreRegistry,
+    io_runtime: Handle,
 }
 
 impl SpiceObjectStoreRegistry {
     #[must_use]
-    pub fn new() -> Self {
-        SpiceObjectStoreRegistry::default()
+    pub fn new(io_runtime: Handle) -> Self {
+        Self {
+            inner: DefaultObjectStoreRegistry::new(),
+            io_runtime,
+        }
     }
 
-    fn prepare_s3_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn prepare_s3_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(bucket_name) = url.host_str() else {
             return Err(DataFusionError::Configuration(
                 "No bucket name provided".to_string(),
@@ -55,6 +63,7 @@ impl SpiceObjectStoreRegistry {
 
         let mut s3_builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
+            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
             .with_allow_http(true);
         let mut client_options = ClientOptions::default();
 
@@ -83,45 +92,41 @@ impl SpiceObjectStoreRegistry {
             client_options = client_options.with_allow_http(as_bool);
         }
 
-        let mut load_credentials_from_environment = true;
+        // Determine credential configuration using common utility
+        let credential_config = aws_sdk_credential_bridge::determine_s3_credential_config(
+            params.get("key").map(String::as_str),
+            params.get("secret").map(String::as_str),
+            params.get("auth").map(String::as_str),
+        )
+        .map_err(DataFusionError::Configuration)?;
 
-        if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
+        // Apply explicit credentials if provided
+        if !credential_config.load_from_environment
+            && !credential_config.skip_signature
+            && let (Some(key), Some(secret)) = (params.get("key"), params.get("secret"))
+        {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
             if let Some(token) = params.get("session_token") {
                 s3_builder = s3_builder.with_token(token);
             }
-            load_credentials_from_environment = false;
-        } else {
-            match params.get("auth") {
-                Some(auth) if auth == "iam_role" => {
-                    s3_builder = s3_builder.with_skip_signature(false);
-                }
-                Some(auth) if auth == "public" => {
-                    s3_builder = s3_builder.with_skip_signature(true);
-                    load_credentials_from_environment = false;
-                }
-                None => {
-                    // Default to public if no auth is provided
-                    s3_builder = s3_builder.with_skip_signature(true);
-                    load_credentials_from_environment = false;
-                }
-                Some(auth) => {
-                    return Err(DataFusionError::Configuration(format!(
-                        "Unexpected S3 auth method: {auth}",
-                    )));
-                }
-            }
         }
+
+        // Configure skip signature for public access
+        if credential_config.skip_signature {
+            s3_builder = s3_builder.with_skip_signature(true);
+        }
+
         s3_builder = s3_builder.with_client_options(client_options);
 
-        if load_credentials_from_environment {
+        // Load credentials from AWS SDK environment if needed
+        if credential_config.load_from_environment {
             tracing::trace!("Loading S3 credentials from environment");
             if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::trace!("Using S3 credentials provider from SDK config");
                     s3_builder = s3_builder.with_credentials(Arc::new(
-                        S3CredentialProvider::from_config(sdk_config).map_err(|e| {
+                        S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(|e| {
                             object_store::Error::Generic {
                                 store: "S3",
                                 source: e.into(),
@@ -135,7 +140,9 @@ impl SpiceObjectStoreRegistry {
                     s3_builder = s3_builder.with_skip_signature(true);
                 }
             } else {
-                tracing::trace!("No AWS SDK loaded, assuming public access");
+                tracing::trace!(
+                    "No AWS SDK credentials provider available, assuming public access"
+                );
                 s3_builder = s3_builder.with_skip_signature(true);
             }
         }
@@ -143,7 +150,10 @@ impl SpiceObjectStoreRegistry {
         Ok(Arc::new(s3_builder.build()?))
     }
 
-    fn prepare_https_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn prepare_https_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let base_url = if url.scheme() == "https" {
             format!("https://{}/", url.authority())
         } else {
@@ -163,6 +173,7 @@ impl SpiceObjectStoreRegistry {
 
         let builder = HttpBuilder::new()
             .with_url(base_url)
+            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
             .with_client_options(client_options);
 
         Ok(Arc::new(builder.build()?))
@@ -251,7 +262,10 @@ impl SpiceObjectStoreRegistry {
 
     // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
     #[allow(clippy::too_many_lines)]
-    fn prepare_azure_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn prepare_azure_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let mut url = url.clone();
 
         // Rewrite the URL Scheme
@@ -265,7 +279,9 @@ impl SpiceObjectStoreRegistry {
             .into_owned()
             .collect();
         url.set_fragment(None);
-        let mut builder = MicrosoftAzureBuilder::from_env();
+
+        let mut builder = MicrosoftAzureBuilder::from_env()
+            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()));
 
         if let Some(sas) = params.get("sas_string") {
             url.set_query(Some(sas));
@@ -422,21 +438,25 @@ impl SpiceObjectStoreRegistry {
             builder = builder.with_disable_tagging(as_bool);
         }
 
-        let azure_store = Arc::new(builder.build().map_err(DataFusionError::ObjectStore)?);
+        let azure_store = Arc::new(
+            builder
+                .build()
+                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?,
+        );
 
         Ok(azure_store as Arc<dyn ObjectStore>)
     }
 
-    fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
-            return Self::prepare_https_object_store(url);
+            return self.prepare_https_object_store(url);
         }
         if url.as_str().starts_with("s3://") {
-            return Self::prepare_s3_object_store(url);
+            return self.prepare_s3_object_store(url);
         }
 
         if url.as_str().starts_with("abfs://") {
-            return Self::prepare_azure_object_store(url);
+            return self.prepare_azure_object_store(url);
         }
 
         #[cfg(feature = "ftp")]
@@ -466,7 +486,7 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 
     fn get_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         self.inner.get_store(url).or_else(|_| {
-            let store = Self::get_feature_store(url)?;
+            let store = self.get_feature_store(url)?;
             self.inner.register_store(url, Arc::clone(&store));
 
             Ok(store)
@@ -477,9 +497,9 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
 #[must_use]
-pub fn default_runtime_env() -> Arc<RuntimeEnv> {
+pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
         .build_arc()
     {
         Ok(runtime_env) => runtime_env,
@@ -493,8 +513,8 @@ pub fn default_runtime_env() -> Arc<RuntimeEnv> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_runtime_env() {
-        let _ = default_runtime_env();
+    #[tokio::test]
+    async fn test_default_runtime_env() {
+        let _ = default_runtime_env(Handle::current());
     }
 }

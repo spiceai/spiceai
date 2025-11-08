@@ -1,0 +1,74 @@
+[package]
+authors = ["Spice.ai OSS Authors"]
+description = "Cayenne: A DuckLake-inspired lakehouse format using SQLite for metadata and Vortex files for data storage"
+edition = "2021"
+license = "Apache-2.0"
+name = "cayenne"
+repository = "https://github.com/spiceai/spiceai"
+version = "0.1.0"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+base64.workspace = true
+bytes = { workspace = true }
+chrono = { workspace = true }
+data_components = { path = "../data_components" }
+datafusion = { workspace = true }
+datafusion-catalog = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+futures = { workspace = true }
+roaring = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tracing = { workspace = true }
+turso = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["v7"] }
+vortex = { workspace = true }
+vortex-alp = { workspace = true }
+vortex-array = { workspace = true }
+vortex-bytebool = { workspace = true }
+vortex-datafusion = { workspace = true }
+vortex-datetime-parts = { workspace = true }
+vortex-decimal-byte-parts = { workspace = true }
+vortex-dict = { workspace = true }
+vortex-fastlanes = { workspace = true }
+vortex-fsst = { workspace = true }
+vortex-runend = { workspace = true }
+vortex-sequence = { workspace = true }
+vortex-session = { workspace = true }
+vortex-sparse = { workspace = true }
+vortex-zigzag = { workspace = true }
+
+# Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+aegis = { version = "0.9.3", default-features = false, features = [
+    "std",
+    "pure-rust",
+] }
+
+[features]
+default = []
+turso = ["dep:turso"]
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+insta = { workspace = true, features = ["json"] }
+paste.workspace = true
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
+
+[[bench]]
+harness = false
+name = "metastore_operations"

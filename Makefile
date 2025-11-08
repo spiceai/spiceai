@@ -43,18 +43,18 @@ endif
 
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture --skip spiceai_integration_test
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -74,18 +74,19 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures
 
 lint-rust-fix:
-	cargo fmt --all -- --check
+	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -96,6 +97,25 @@ lint-rust-fix:
 lint-go:
 	go vet ./...
 	golangci-lint run
+
+check-rust-features:
+	cargo check $(CARGO_PROFILE) --no-default-features
+	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
+	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
+	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
+	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
+	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
+	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
+	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
+	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
+	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
+	cargo check $(CARGO_PROFILE) --no-default-features --features dremio
+	cargo check $(CARGO_PROFILE) --no-default-features --features clickhouse
+	cargo check $(CARGO_PROFILE) --no-default-features --features debezium
+	cargo check $(CARGO_PROFILE) --no-default-features --features runtime/openapi
+	cargo check $(CARGO_PROFILE) --no-default-features --features dynamodb
+	cargo check $(CARGO_PROFILE) --no-default-features --features oracle
+	cargo check $(CARGO_PROFILE) --no-default-features --features mongodb
 
 .PHONY: fmt-toml
 fmt-toml:

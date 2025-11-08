@@ -22,10 +22,8 @@ use crate::{
 };
 
 use app::AppBuilder;
-use runtime::{
-    Runtime,
-    request::{CacheControl, Protocol, RequestContext, UserAgent},
-};
+use runtime::Runtime;
+use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
 
 #[tokio::test]
 async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
@@ -48,11 +46,8 @@ async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
                 .with_dataset(get_dataset()?)
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

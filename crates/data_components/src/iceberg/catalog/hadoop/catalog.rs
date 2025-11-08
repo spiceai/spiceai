@@ -155,14 +155,10 @@ impl HadoopCatalogBuilder {
                 for table in tables {
                     let metadata = catalog.load_metadata(&table).await;
                     // lazy scheme inferring - only check until we get the first valid metadata
-                    if let Ok(m) = metadata {
-                        if let Some((scheme, _)) = m.location().split_once("://") {
-                            if !cloned_warehouse_root.starts_with(scheme) {
+                    if let Ok(m) = metadata && let Some((scheme, _)) = m.location().split_once("://") && !cloned_warehouse_root.starts_with(scheme) {
                                 inferred_scheme = Some(scheme.to_string());
                                 break;
                             }
-                        }
-                    }
                 }
 
                 if let Some(scheme) = inferred_scheme {
@@ -210,6 +206,18 @@ pub struct HadoopCatalog {
 
 #[async_trait]
 impl Catalog for HadoopCatalog {
+    /// Register an existing table to the catalog.
+    async fn register_table(
+        &self,
+        _table: &TableIdent,
+        _metadata_location: String,
+    ) -> Result<Table> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Registering tables is not supported in hadoop catalog",
+        ))
+    }
+
     // Unsupported operations in Hadoop Catalog
     async fn create_namespace(
         &self,

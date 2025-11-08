@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -27,40 +28,43 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
+// quoteSQLString escapes single quotes in a string and wraps it in single quotes
+// This follows PostgreSQL string literal syntax
+func quoteSQLString(s string) string {
+	// Escape single quotes by doubling them (SQL standard)
+	escaped := strings.ReplaceAll(s, "'", "''")
+	return fmt.Sprintf("'%s'", escaped)
+}
+
 var (
-// The id of the trace to provide
-id string
+	// The id of the trace to provide
+	id string
 
-// The trace_id of the trace to provide
-trace_id string
+	// The trace_id of the trace to provide
+	trace_id string
 
-// The include input flag
-include_input bool
+	// The include input flag
+	include_input bool
 
-// The include output flag
-include_output bool
+	// The include output flag
+	include_output bool
 
-// The truncation length
-truncateLength int
+	// The truncation length
+	truncateLength int
 
-// The output format flag: table (default), sql, csv (future)
-outputFormat string
+	// The output format flag: table (default), sql, csv (future)
+	outputFormat string
 )
 
 var supported_trace_tasks = []string{
-	"ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
-	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::load_memory",
+	"ai", "ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
+	"tool_use::search", "tool_use::list_datasets", "tool_use::load_memory",
 	"tool_use::sample_data", "tool_use::sql", "tool_use::store_memory",
-	"tool_use::table_schema", "vector_search", "scheduled_worker", "text_embed",
+	"tool_use::table_schema", "search", "scheduled_worker", "text_embed",
 }
 
 func isValidTraceTask(task string) bool {
-	for _, supported_task := range supported_trace_tasks {
-		if task == supported_task {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(supported_trace_tasks, task)
 }
 
 var traceCmd = &cobra.Command{
@@ -226,12 +230,14 @@ func init() {
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {
+	// Use proper SQL string escaping to prevent SQL injection
+	// This follows PostgreSQL string literal syntax by escaping single quotes
 	if id != "" {
-		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id='%s')", id), nil
+		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id=%s)", quoteSQLString(id)), nil
 	}
 	if trace_id != "" {
-		return fmt.Sprintf("trace_id='%s'", trace_id), nil
+		return fmt.Sprintf("trace_id=%s", quoteSQLString(trace_id)), nil
 	}
 	// use last by default
-	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task='%s' order by start_time desc limit 1)", task), nil
+	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task=%s order by start_time desc limit 1)", quoteSQLString(task)), nil
 }

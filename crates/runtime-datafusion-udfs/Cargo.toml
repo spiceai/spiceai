@@ -1,9 +1,9 @@
 [package]
-name = "runtime-datafusion-udfs"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
+name = "runtime-datafusion-udfs"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -12,10 +12,22 @@ version.workspace = true
 ahash.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
+async-openai.workspace = true
+async-trait.workspace = true
 datafusion.workspace = true
+futures.workspace = true
+llms = { path = "../llms" }
+runtime-request-context = { path = "../runtime-request-context" }
 snafu.workspace = true
+tokio.workspace = true
 tracing.workspace = true
-tract-core = "0.21.10"
+tract-core.workspace = true
 
 [dev-dependencies]
+async-stream.workspace = true
 insta.workspace = true
+tracing-subscriber.workspace = true
+tracing-test = "0.2"
+
+[features]
+models = []

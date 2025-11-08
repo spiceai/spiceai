@@ -26,9 +26,17 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
+use tokio::runtime::Handle;
 
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
+
+#[derive(Clone, Debug)]
+pub struct ParsedRetentionSql {
+    pub delete_expr: Expr,
+    pub delete_statement: Delete,
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -82,7 +90,7 @@ pub fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,
     schema: Arc<Schema>,
-) -> Result<Expr> {
+) -> Result<ParsedRetentionSql> {
     let mut statements = DFParser::parse_sql_with_dialect(retention_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
 
@@ -97,15 +105,19 @@ pub fn parse_retention_sql(
 
     match statement {
         Statement::Statement(statement) => match statement.as_ref() {
-            SQLStatement::Delete(Delete {
-                from, selection, ..
-            }) => {
+            SQLStatement::Delete(delete) => {
                 // Validate the table name matches
-                validate_table_name(from, expected_table)?;
+                validate_table_name(&delete.from, expected_table)?;
 
                 // Extract and return the WHERE clause
-                match selection {
-                    Some(where_expr) => to_df_logical_expr(where_expr, schema),
+                match &delete.selection {
+                    Some(where_expr) => {
+                        let delete_expr = to_df_logical_expr(where_expr, schema)?;
+                        Ok(ParsedRetentionSql {
+                            delete_expr,
+                            delete_statement: delete.clone(),
+                        })
+                    }
                     None => MissingWhereClauseSnafu {
                         expected_table: expected_table.clone(),
                     }
@@ -176,7 +188,10 @@ fn validate_table_name(
 fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let df_schema = DFSchema::try_from(schema).context(SchemaConversionSnafu)?;
 
-    let ctx = SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env());
+    let ctx = SessionContext::new_with_config_rt(
+        get_df_default_config(),
+        default_runtime_env(Handle::current()),
+    );
 
     // To convert SQLExpr to DataFusion Expr, we need SqlToRel, which requires a ContextProvider.
     // SessionContextProvider used by DataFusion is not exposed publicly, so we provide the filter as a string
@@ -203,20 +218,43 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn test_valid_delete_statement() -> Result<()> {
+    #[tokio::test]
+    async fn test_valid_delete_statement() -> Result<()> {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql = "DELETE FROM test_table WHERE deleted = true";
 
         let result = parse_retention_sql(&table, sql, schema)?;
         // The result should be the WHERE clause expression
-        assert!(matches!(result, Expr::BinaryExpr { .. }));
+        assert!(matches!(result.delete_expr, Expr::BinaryExpr { .. }));
+        assert!(result.delete_statement.selection.is_some());
         Ok(())
     }
 
-    #[test]
-    fn test_missing_where_clause() {
+    #[tokio::test]
+    async fn test_delete_statement_preserves_table_reference() -> Result<()> {
+        use datafusion::sql::sqlparser::ast::{FromTable, TableFactor};
+
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "DELETE FROM test_table WHERE deleted = true";
+
+        let result = parse_retention_sql(&table, sql, schema)?;
+        let FromTable::WithFromKeyword(tables) = &result.delete_statement.from else {
+            panic!("expected table reference");
+        };
+        assert_eq!(tables.len(), 1);
+        let table_name = match &tables[0].relation {
+            TableFactor::Table { name, .. } => name.to_string(),
+            _ => panic!("expected table factor"),
+        };
+        assert_eq!(table_name, "test_table");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_missing_where_clause() {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql = "DELETE FROM test_table";
@@ -225,8 +263,8 @@ mod tests {
         assert!(matches!(result, Err(Error::MissingWhereClause { .. })));
     }
 
-    #[test]
-    fn test_wrong_table_name() {
+    #[tokio::test]
+    async fn test_wrong_table_name() {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql = "DELETE FROM wrong_table WHERE deleted = true";
@@ -235,8 +273,8 @@ mod tests {
         assert!(matches!(result, Err(Error::TableMismatch { .. })));
     }
 
-    #[test]
-    fn test_select_statement_not_allowed() {
+    #[tokio::test]
+    async fn test_select_statement_not_allowed() {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT * FROM test_table WHERE deleted = true";
@@ -245,8 +283,8 @@ mod tests {
         assert!(matches!(result, Err(Error::OnlyDeleteStatements { .. })));
     }
 
-    #[test]
-    fn test_multiple_statements() {
+    #[tokio::test]
+    async fn test_multiple_statements() {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql =
@@ -259,30 +297,30 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_complex_where_clause() -> Result<()> {
+    #[tokio::test]
+    async fn test_complex_where_clause() -> Result<()> {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql = "DELETE FROM test_table WHERE deleted = true OR created_at < NOW() - INTERVAL '10 days'";
 
         let result = parse_retention_sql(&table, sql, schema)?;
-        assert!(matches!(result, Expr::BinaryExpr { .. }));
+        assert!(matches!(result.delete_expr, Expr::BinaryExpr { .. }));
         Ok(())
     }
 
-    #[test]
-    fn test_qualified_table_name() -> Result<()> {
+    #[tokio::test]
+    async fn test_qualified_table_name() -> Result<()> {
         let schema = create_test_schema();
         let table = TableReference::parse_str("schema.test_table");
         let sql = "DELETE FROM schema.test_table WHERE deleted = true";
 
         let result = parse_retention_sql(&table, sql, schema)?;
-        assert!(matches!(result, Expr::BinaryExpr { .. }));
+        assert!(matches!(result.delete_expr, Expr::BinaryExpr { .. }));
         Ok(())
     }
 
-    #[test]
-    fn test_case_sensitive_table_and_column_names() -> Result<()> {
+    #[tokio::test]
+    async fn test_case_sensitive_table_and_column_names() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("ID", DataType::Int64, false),
             Field::new("Deleted", DataType::Boolean, true),
@@ -292,12 +330,12 @@ mod tests {
         let sql = "DELETE FROM Test_Table WHERE Deleted = true";
 
         let result = parse_retention_sql(&table, sql, schema)?;
-        assert!(matches!(result, Expr::BinaryExpr { .. }));
+        assert!(matches!(result.delete_expr, Expr::BinaryExpr { .. }));
         Ok(())
     }
 
-    #[test]
-    fn test_quoted_table_and_column_names() -> Result<()> {
+    #[tokio::test]
+    async fn test_quoted_table_and_column_names() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("is deleted", DataType::Boolean, true),
@@ -307,12 +345,12 @@ mod tests {
         let sql = "DELETE FROM \"Test Table\" WHERE \"is deleted\" = true";
 
         let result = parse_retention_sql(&table, sql, schema)?;
-        assert!(matches!(result, Expr::BinaryExpr { .. }));
+        assert!(matches!(result.delete_expr, Expr::BinaryExpr { .. }));
         Ok(())
     }
 
-    #[test]
-    fn test_nonexistent_column() {
+    #[tokio::test]
+    async fn test_nonexistent_column() {
         let schema = create_test_schema();
         let table = TableReference::parse_str("test_table");
         let sql = "DELETE FROM test_table WHERE nonexistent_column = true";

@@ -23,11 +23,14 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, path::PathBuf};
+
+#[cfg(feature = "object-store")]
+use std::sync::Arc;
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, model::Model,
-    runtime::Runtime, secret::Secret, tool::Tool, view::View, worker::Worker,
+    runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
@@ -39,6 +42,7 @@ pub mod extension;
 mod keywords;
 pub mod metric;
 pub mod param;
+pub mod partitioning;
 pub mod reader;
 pub mod semantic;
 pub mod spec;
@@ -46,7 +50,15 @@ pub mod vector;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse spicepod.yaml: {source}"))]
+    #[snafu(display(
+        "Failed to parse spicepod.yaml: {source}\n\n\
+        The spicepod.yaml file contains invalid YAML or does not match the expected schema.\n\
+        Common issues:\n\
+        • Check for syntax errors (indentation, colons, quotes)\n\
+        • Verify all required fields are present (name, version, kind)\n\
+        • Ensure component definitions match the schema\n\n\
+        See: https://docs.spiceai.org/reference/spicepod for the complete schema reference."
+    ))]
     UnableToParseSpicepod { source: serde_yaml::Error },
 
     #[snafu(display("Unable to resolve spicepod components {}: {source}", path.display()))]
@@ -55,15 +67,26 @@ pub enum Error {
         path: PathBuf,
     },
 
-    #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
+    #[snafu(display(
+        "spicepod.yaml not found in {}\n\n\
+        Cannot start the Spice runtime without a valid spicepod.yaml file.\n\n\
+        To fix this:\n\
+        • If you're in the wrong directory, navigate to your Spice app directory\n\
+        • If you haven't created a Spice app yet, run: spice init <app-name>\n\
+        • If spicepod.yaml exists but isn't being detected, check the file name and location\n\n\
+        Current working directory: {}\n\
+        Expected file: {}/spicepod.yaml or {}/spicepod.yml",
+        path.display(),
+        std::env::current_dir().ok().and_then(|p| p.to_str().map(String::from)).unwrap_or_else(|| "<unknown>".to_string()),
+        path.display(),
+        path.display()
+    ))]
     SpicepodNotFound { path: PathBuf },
 
     #[snafu(display("Unable to load duplicate spicepod {component} component '{name}'"))]
     DuplicateComponent { component: String, name: String },
 
-    #[snafu(display("Unable to create tokio runtime: {source}"))]
-    UnableToCreateTokioRuntime { source: std::io::Error },
-
+    #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse URL {}: {source}", path))]
     UnableToParseUrl {
         source: object_store::Error,
@@ -76,6 +99,7 @@ pub enum Error {
         path: PathBuf,
     },
 
+    #[cfg(feature = "object-store")]
     #[snafu(display("Unable to parse S3 URL {}: {source}", path))]
     UnableToParseS3Url {
         source: aws_sdk_credential_bridge::Error,
@@ -121,6 +145,8 @@ pub struct Spicepod {
     pub runtime: Runtime,
 
     pub management: Option<Management>,
+
+    pub snapshots: Option<Snapshots>,
 }
 
 fn detect_duplicate_component_names(
@@ -154,9 +180,8 @@ fn check_for_reserved_keywords(components: &[Dataset]) -> Result<()> {
 impl Spicepod {
     pub async fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let path_str = path.to_string_lossy();
-
-        match url::Url::parse(&path_str) {
+        #[cfg(feature = "object-store")]
+        match url::Url::parse(&path.to_string_lossy()) {
             Ok(url)
                 if matches!(
                     url.scheme(),
@@ -167,8 +192,14 @@ impl Spicepod {
             }
             _ => Self::load_from(&reader::StdFileSystem, path).await,
         }
+
+        #[cfg(not(feature = "object-store"))]
+        {
+            Self::load_from(&reader::StdFileSystem, path).await
+        }
     }
 
+    #[cfg(feature = "object-store")]
     pub async fn load_from_object_store(url: url::Url) -> Result<Self> {
         let (store, path) = match (url.scheme(), url.path()) {
             ("s3", path) => {
@@ -386,6 +417,7 @@ fn from_definition(
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
         management: spicepod_definition.management,
+        snapshots: spicepod_definition.snapshots,
     }
 }
 

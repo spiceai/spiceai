@@ -58,7 +58,7 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-use crate::request::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext};
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -95,7 +95,7 @@ impl utoipa::IntoParams for Format {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The various formats that the Arrow data can be converted and returned from HTTP requests.
 pub enum ResponseMimeType {
@@ -131,13 +131,13 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
-    pub fn to_accept_header(&self) -> Option<http::HeaderValue> {
+    pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
-            ResponseMimeType::Json => "application/json",
-            ResponseMimeType::Csv => "text/csv",
-            ResponseMimeType::Plain => "text/plain",
-            ResponseMimeType::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
-            ResponseMimeType::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
+            Self::Json => "application/json",
+            Self::Csv => "text/csv",
+            Self::Plain => "text/plain",
+            Self::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
+            Self::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
         };
         HeaderValue::from_str(media_type).ok()
     }
@@ -198,6 +198,7 @@ pub async fn sql_to_http_response(
         ResponseMetadata::empty(),
     )
     .await
+    .into_response()
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.
@@ -224,25 +225,36 @@ pub async fn to_http_response(
     cache_status: CacheStatus,
     format: ResponseMimeType,
     meta: ResponseMetadata,
-) -> Response {
-    let res = match format {
+) -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+
+    // Offload CPU-intensive serialization to blocking thread pool to avoid blocking async runtime
+    let res = tokio::task::spawn_blocking(move || match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
         ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
             arrow_to_vnd_sql_json_v1(&data, meta)
         }
-    };
+    })
+    .await;
 
     let body = match res {
-        Ok(body) => body,
+        Ok(Ok(body)) => body,
+        Ok(Err(e)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+        }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            tracing::error!("Serialization task panicked: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                headers,
+                "Serialization failed".to_string(),
+            );
         }
     };
 
     let request_context = RequestContext::current(AsyncMarker::new().await);
-    let mut headers = HeaderMap::new();
 
     if let Some(header_value) = format.to_accept_header() {
         headers.insert(CONTENT_TYPE, header_value);
@@ -254,7 +266,7 @@ pub async fn to_http_response(
         request_context.client_supplied_cache_key().is_some(),
     );
 
-    (StatusCode::OK, headers, body).into_response()
+    (StatusCode::OK, headers, body)
 }
 
 fn attach_cache_headers(
@@ -382,7 +394,7 @@ mod tests {
 
         // Test conversion without SQL
         let result_without_sql =
-            arrow_to_vnd_sql_json_v1(&[batch.clone()], ResponseMetadata::empty())
+            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), ResponseMetadata::empty())
                 .expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_without_sql",

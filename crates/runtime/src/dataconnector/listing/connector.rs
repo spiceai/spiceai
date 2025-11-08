@@ -34,7 +34,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
-use datafusion::execution::{config::SessionConfig, context::SessionContext};
+use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
@@ -50,9 +50,9 @@ use crate::dataconnector::{
 use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
-use runtime_object_store::registry::default_runtime_env;
-
 use super::DelimitedFormat;
+use crate::datafusion::builder::get_df_default_config;
+use runtime_object_store::registry::default_runtime_env;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
@@ -84,13 +84,13 @@ pub trait ListingTableConnector: DataConnector {
     fn get_params(&self) -> &Parameters;
 
     #[must_use]
-    fn get_session_context() -> SessionContext {
+    fn get_session_context(&self) -> SessionContext {
         SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
+            get_df_default_config().set_bool(
                 "datafusion.execution.listing_table_ignore_subdirectory",
                 false,
             ),
-            default_runtime_env(),
+            default_runtime_env(self.get_tokio_io_runtime()),
         )
     }
 
@@ -105,7 +105,7 @@ pub trait ListingTableConnector: DataConnector {
                 connector_component: ConnectorComponent::from(dataset),
             },
         )?;
-        Self::get_session_context()
+        self.get_session_context()
             .runtime_env()
             .object_store(&listing_store_url)
             .boxed()
@@ -118,6 +118,10 @@ pub trait ListingTableConnector: DataConnector {
     fn get_runtime(&self) -> Option<Runtime> {
         None
     }
+
+    /// Returns a handle to the IO runtime that this object store connector should
+    /// use for spawning IO tasks.
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle;
 
     async fn construct_metadata_provider(
         &self,
@@ -294,10 +298,10 @@ pub trait ListingTableConnector: DataConnector {
             format = format.with_format(json_format);
         }
 
-        if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose() {
-            if flatten_json.eq_ignore_ascii_case("true") {
-                format = format.with_flatten_json(".".to_string());
-            }
+        if let ExposedParamLookup::Present(flatten_json) = params.get("flatten_json").expose()
+            && flatten_json.eq_ignore_ascii_case("true")
+        {
+            format = format.with_flatten_json(".".to_string());
         }
 
         Ok(Arc::new(format))
@@ -428,7 +432,7 @@ pub trait ListingTableConnector: DataConnector {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh
@@ -473,20 +477,28 @@ pub trait ListingTableConnector: DataConnector {
                     factory.default()
                 });
 
-        Ok(ObjectStoreTextTable::try_new(
-            self.get_object_store(dataset)?,
-            &url.clone(),
-            Some(extension.to_string()),
-            content_formatter,
-        )
-        .context(crate::dataconnector::InvalidConfigurationSnafu {
-            dataconnector: format!("{self}"),
-            connector_component: ConnectorComponent::from(dataset),
-            message: format!(
-                "Invalid file extension ({extension}) for source ({})",
-                dataset.name
-            ),
-        })?)
+        let metadata_columns = dataset.listing_table_metadata_columns(
+            get_url_prefix(url),
+            &ObjectStoreTextTable::base_table_schema(),
+        );
+
+        Ok(Arc::new(
+            ObjectStoreTextTable::try_new(
+                self.get_object_store(dataset)?,
+                &url.clone(),
+                Some(extension.to_string()),
+                content_formatter,
+                metadata_columns,
+            )
+            .context(crate::dataconnector::InvalidConfigurationSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "Invalid file extension ({extension}) for source ({})",
+                    dataset.name
+                ),
+            })?,
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -511,7 +523,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let object_store = self.get_object_store(dataset)?;
 
-        let ctx: SessionContext = Self::get_session_context();
+        let ctx: SessionContext = self.get_session_context();
 
         let (schema_infer_url, schema_infer_meta) =
             if let Some(url) = dataset.params.get("schema_source_path") {
@@ -565,14 +577,17 @@ pub trait ListingTableConnector: DataConnector {
             sanitized_url = schema_infer_url.sanitized_url(),
         );
 
-        let mut options = ListingOptions::new(file_format).with_file_extension(extension);
+        let session_state = ctx.state();
+        let mut options = ListingOptions::new(file_format)
+            .with_file_extension(extension)
+            .with_session_config_options(session_state.config());
 
         let resolved_schema = options
             .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())
             .await
             .map_err(|e| match e {
                 DataFusionError::ObjectStore(object_store_error) => {
-                    self.handle_object_store_error(dataset, object_store_error)
+                    self.handle_object_store_error(dataset, *object_store_error)
                 }
                 e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),
@@ -668,7 +683,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh
@@ -845,10 +860,10 @@ async fn verify_schema_source_path(
                 source: err.into(),
             })?
     {
-        if let Some(ext) = file.location.extension() {
-            if format!(".{ext}") == extension {
-                return Ok(Some(file));
-            }
+        if let Some(ext) = file.location.extension()
+            && format!(".{ext}") == extension
+        {
+            return Ok(Some(file));
         }
 
         scanned_files += 1;
@@ -977,6 +992,7 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
+    use tokio::runtime::Handle;
     use url::Url;
 
     use crate::component::dataset::builder::DatasetBuilder;
@@ -1031,6 +1047,10 @@ mod tests {
 
         fn get_params(&self) -> &Parameters {
             &self.params
+        }
+
+        fn get_tokio_io_runtime(&self) -> Handle {
+            Handle::current()
         }
 
         fn get_object_store_url(

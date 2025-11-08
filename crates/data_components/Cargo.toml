@@ -12,14 +12,16 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
+arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-smithy-async = { workspace = true, optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
@@ -30,6 +32,7 @@ chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
+datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
@@ -44,23 +47,23 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-http = { version = "1.3.1" }
+http.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
-itertools.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
-opendal = "0.53.0"
+opendal = "0.54"
 oracle = { version = "0.6", optional = true }
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
-regex = "1.10.4"
+regex.workspace = true
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -70,7 +73,7 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "3044f8188176f050d930a0930f68c6c893f04362", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8", features = [
     "tls",
 ], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }
@@ -82,7 +85,9 @@ tokio-postgres = { workspace = true, features = [
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
-url = "2.5.4"
+turso = { workspace = true, optional = true }
+twox-hash = { workspace = true, optional = true }
+url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
 
@@ -90,10 +95,11 @@ uuid.workspace = true
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
+bench = [] # Feature for benchmarking that exposes internal functions
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
-kafka = ["dep:rdkafka"]
+default = []
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
     "dep:duckdb",
@@ -101,10 +107,11 @@ duckdb = [
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-smithy-async"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
-mongodb = ["datafusion-table-providers/mongodb",]
+kafka = ["dep:rdkafka"]
+mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
@@ -114,7 +121,11 @@ postgres = [
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
-s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
+s3_vectors = [
+    "dep:s3_vectors",
+    "dep:s3_vectors_metadata_filter",
+    "dep:twox-hash",
+]
 sharepoint = ["dep:graph-rs-sdk"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
@@ -123,13 +134,26 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
+turso = ["dep:turso"]
 
 test_hadoop_catalog_docker = []
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
+chrono = { workspace = true }
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.5.0"
-iceberg_test_utils = { version = "0.5.1", features = ["tests"] }
-insta = { version = "1.43" }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
+insta.workspace = true
+object_store = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[[bench]]
+harness = false
+name = "arrow_write"
+required-features = ["bench"]
+
+[[bench]]
+harness = false
+name = "object_filter"

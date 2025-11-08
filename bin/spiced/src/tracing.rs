@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{borrow::Cow, sync::Arc};
 
+use app::spicepod::component::runtime::OutputLevel;
 use app::{App, spicepod::component::runtime::TracingConfig};
 use futures::future::BoxFuture;
 use opentelemetry::InstrumentationScope;
@@ -28,8 +29,10 @@ use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
 use std::time::Duration;
 use tracing::Subscriber;
+use tracing_log::LogTracer;
 use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, registry::LookupSpan};
 
+#[derive(PartialEq, Debug)]
 pub enum LogVerbosity {
     Default,
     Verbose,
@@ -38,7 +41,12 @@ pub enum LogVerbosity {
 }
 
 impl LogVerbosity {
-    pub(crate) fn from_flags_and_env(verbose: bool, very_verbose: bool, env_var: &str) -> Self {
+    pub(crate) fn from_flags_and_env_and_config(
+        verbose: bool,
+        very_verbose: bool,
+        env_var: &str,
+        config_output_level: Option<OutputLevel>,
+    ) -> Self {
         if very_verbose {
             return LogVerbosity::VeryVerbose;
         }
@@ -51,7 +59,11 @@ impl LogVerbosity {
             return LogVerbosity::Specific(filter);
         }
 
-        LogVerbosity::Default
+        match config_output_level {
+            Some(OutputLevel::VeryVerbose) => LogVerbosity::VeryVerbose,
+            Some(OutputLevel::Verbose) => LogVerbosity::Verbose,
+            None | Some(OutputLevel::Info) => LogVerbosity::Default,
+        }
     }
 }
 
@@ -69,9 +81,11 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "tpc_extension",
     "workers",
     "search",
+    "ballista",
+    "datafusion",
 ];
 
-const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off";
+const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
@@ -109,20 +123,20 @@ pub(crate) async fn init_tracing(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let filter: EnvFilter = verbosity.into();
 
-    if let Some(app) = app.as_ref() {
-        if !app.runtime.task_history.enabled {
-            let subscriber = tracing_subscriber::registry().with(filter).with(
-                fmt::layer()
-                    .with_ansi(true)
-                    .with_filter(filter::filter_fn(|metadata| {
-                        metadata.target() != "task_history"
-                    })),
-            );
+    if let Some(app) = app.as_ref()
+        && !app.runtime.task_history.enabled
+    {
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            fmt::layer()
+                .with_ansi(true)
+                .with_filter(filter::filter_fn(|metadata| {
+                    metadata.target() != "task_history"
+                })),
+        );
 
-            tracing::subscriber::set_global_default(subscriber)?;
+        tracing::subscriber::set_global_default(subscriber)?;
 
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let subscriber = tracing_subscriber::registry()
@@ -142,6 +156,7 @@ pub(crate) async fn init_tracing(
         );
 
     tracing::subscriber::set_global_default(subscriber)?;
+    LogTracer::init()?;
 
     Ok(())
 }
@@ -162,8 +177,32 @@ where
         .transpose()?
         .unwrap_or_default();
 
+    let min_sql_duration_ms = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.min_sql_duration_as_millis())
+        .transpose()?
+        .flatten();
+
+    let captured_plan = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.get_captured_plan())
+        .transpose()?
+        .unwrap_or_default();
+
+    let min_plan_duration_ms = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.min_plan_duration_as_millis())
+        .transpose()?
+        .flatten();
+
     let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
-        task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
+        task_history::otel_exporter::TaskHistoryExporter::new(
+            df,
+            captured_output,
+            min_sql_duration_ms,
+            captured_plan,
+            min_plan_duration_ms,
+        ),
     )];
 
     if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config).await {
@@ -286,5 +325,64 @@ impl SpanExporter for OtelExportMultiplexer {
         for exporter in &mut self.exporters {
             exporter.set_resource(resource);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_very_verbose_if_flag_set() {
+        unsafe {
+            std::env::set_var("TEST_LOG_ENV", "custom");
+        }
+        let result = LogVerbosity::from_flags_and_env_and_config(
+            false,
+            true,
+            "TEST_LOG_ENV",
+            Some(OutputLevel::Verbose),
+        );
+        unsafe {
+            std::env::remove_var("TEST_LOG_ENV");
+        }
+
+        assert_eq!(result, LogVerbosity::VeryVerbose);
+    }
+
+    #[test]
+    fn returns_specific_if_env_set() {
+        unsafe {
+            std::env::set_var("TEST_LOG_ENV", "custom");
+        }
+        let result = LogVerbosity::from_flags_and_env_and_config(
+            false,
+            false,
+            "TEST_LOG_ENV",
+            Some(OutputLevel::VeryVerbose),
+        );
+        unsafe {
+            std::env::remove_var("TEST_LOG_ENV");
+        }
+
+        assert_eq!(result, LogVerbosity::Specific("custom".to_string()));
+    }
+
+    #[test]
+    fn returns_very_verbose_from_config() {
+        let result = LogVerbosity::from_flags_and_env_and_config(
+            false,
+            false,
+            "NON_EXISTENT_ENV",
+            Some(OutputLevel::VeryVerbose),
+        );
+        assert_eq!(result, LogVerbosity::VeryVerbose);
+    }
+
+    #[test]
+    fn returns_default_when_none() {
+        let result =
+            LogVerbosity::from_flags_and_env_and_config(false, false, "NON_EXISTENT_ENV", None);
+        assert_eq!(result, LogVerbosity::Default);
     }
 }

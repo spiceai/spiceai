@@ -17,9 +17,17 @@ limitations under the License.
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::{acceleration as spicepod_acceleration, param::Params};
+use spicepod::{
+    acceleration::{self as spicepod_acceleration},
+    param::Params,
+    partitioning::PartitionedBy,
+};
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
+
+#[cfg(feature = "duckdb")]
+use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -130,17 +138,24 @@ pub enum Engine {
     Arrow,
     DuckDB,
     PartitionedDuckDB,
+    TableModePartitionedDuckDB,
     Sqlite,
+    Turso,
     PostgreSQL,
+    Cayenne,
 }
 
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+                write!(f, "duckdb")
+            }
             Engine::Sqlite => write!(f, "sqlite"),
+            Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Cayenne => write!(f, "cayenne"),
         }
     }
 }
@@ -153,7 +168,9 @@ impl TryFrom<&str> for Engine {
             "arrow" => Ok(Engine::Arrow),
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
+            "turso" => Ok(Engine::Turso),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "cayenne" | "vortex" => Ok(Engine::Cayenne),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -297,7 +314,9 @@ pub struct Acceleration {
 
     pub disable_federation: bool,
 
-    pub partition_by: Vec<String>,
+    pub partition_by: Vec<PartitionedBy>,
+
+    pub snapshots: SnapshotBehavior,
 }
 
 impl Acceleration {
@@ -365,13 +384,19 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine =
-            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
-                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
-                    Engine::PartitionedDuckDB
+        let mut params = acceleration.params.clone();
+
+        let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+        let engine = match Engine::try_from(engine_str)? {
+            #[cfg(feature = "duckdb")]
+            Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                match get_duckdb_partition_mode(&params) {
+                    DuckDBPartitionMode::Tables => Engine::TableModePartitionedDuckDB,
+                    DuckDBPartitionMode::Files => Engine::PartitionedDuckDB,
                 }
-                engine => engine,
-            };
+            }
+            engine => engine,
+        };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(
@@ -388,8 +413,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
             );
         }
-
-        let mut params = acceleration.params.clone();
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
 
@@ -440,6 +463,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
+            snapshots: SnapshotBehavior::disabled(),
         })
     }
 }
@@ -472,6 +496,7 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
+            snapshots: SnapshotBehavior::Disabled,
         }
     }
 }
@@ -479,17 +504,17 @@ impl Default for Acceleration {
 /// Returns true if the `query_federation` parameter is set to "disabled".
 #[allow(clippy::result_large_err)]
 fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<bool, crate::Error> {
-    if let Some(params) = params {
-        if let Some(value) = params.data.remove("query_federation") {
-            match value {
-                spicepod::param::ParamValue::String(s) if s == "enabled" => return Ok(false),
-                spicepod::param::ParamValue::String(s) if s == "disabled" => return Ok(true),
-                _ => {
-                    return Err(crate::Error::InvalidAccelerationConfiguration {
+    if let Some(params) = params
+        && let Some(value) = params.data.remove("query_federation")
+    {
+        match value {
+            spicepod::param::ParamValue::String(s) if s == "enabled" => return Ok(false),
+            spicepod::param::ParamValue::String(s) if s == "disabled" => return Ok(true),
+            _ => {
+                return Err(crate::Error::InvalidAccelerationConfiguration {
                         source:
                             format!("Invalid 'query_federation' param value: {value:?}. Expected 'enabled' or 'disabled'.").into(),
                     });
-                }
             }
         }
     }

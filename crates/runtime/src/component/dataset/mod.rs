@@ -15,10 +15,9 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, dataaccelerator::AccelerationSource};
+use crate::{Runtime, component::access::AccessMode, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
 use app::App;
-use arrow::datatypes::SchemaRef;
 use datafusion::sql::{
     TableReference,
     sqlparser::{
@@ -31,7 +30,7 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::Column,
+    semantic::{Column, IndexStore},
     vector::VectorStore,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
@@ -109,22 +108,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Mode {
-    #[default]
-    Read,
-    ReadWrite,
-}
-
-impl From<spicepod_dataset::Mode> for Mode {
-    fn from(mode: spicepod_dataset::Mode) -> Self {
-        match mode {
-            spicepod_dataset::Mode::Read => Mode::Read,
-            spicepod_dataset::Mode::ReadWrite => Mode::ReadWrite,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TimeFormat {
@@ -252,7 +235,7 @@ impl Display for CheckAvailability {
 pub struct Dataset {
     pub from: String,
     pub name: TableReference,
-    pub mode: Mode,
+    pub access: AccessMode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
@@ -265,7 +248,6 @@ pub struct Dataset {
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Arc<App>,
-    schema: Option<SchemaRef>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
@@ -279,7 +261,7 @@ impl std::fmt::Debug for Dataset {
         f.debug_struct("Dataset")
             .field("from", &self.from)
             .field("name", &self.name)
-            .field("mode", &self.mode)
+            .field("access", &self.access)
             .field("params", &self.params)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
@@ -292,7 +274,6 @@ impl std::fmt::Debug for Dataset {
             .field("acceleration", &self.acceleration)
             .field("embeddings", &self.embeddings)
             .field("app", &self.app)
-            .field("schema", &self.schema)
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
@@ -309,7 +290,7 @@ impl PartialEq for Dataset {
     fn eq(&self, other: &Self) -> bool {
         self.from == other.from
             && self.name == other.name
-            && self.mode == other.mode
+            && self.access == other.access
             && self.params == other.params
             && self.has_metadata_table == other.has_metadata_table
             && self.replication == other.replication
@@ -319,7 +300,6 @@ impl PartialEq for Dataset {
             && self.time_partition_format == other.time_partition_format
             && self.acceleration == other.acceleration
             && self.embeddings == other.embeddings
-            && self.schema == other.schema
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
@@ -339,20 +319,9 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
-        self
-    }
-
-    #[must_use]
     pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
         self.params = params;
         self
-    }
-
-    #[must_use]
-    pub fn schema(&self) -> Option<SchemaRef> {
-        self.schema.clone()
     }
 
     #[allow(clippy::result_large_err)]
@@ -461,47 +430,47 @@ impl Dataset {
 
     #[must_use]
     pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if acceleration.refresh_jitter_enabled {
-                // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-                return match acceleration.refresh_jitter_max {
-                    Some(jitter) => Some(jitter),
-                    None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-                };
-            }
+        if let Some(acceleration) = &self.acceleration
+            && acceleration.refresh_jitter_enabled
+        {
+            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
+            return match acceleration.refresh_jitter_max {
+                Some(jitter) => Some(jitter),
+                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
+            };
         }
         None
     }
 
     pub fn retention_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(retention_check_interval) = &acceleration.retention_check_interval {
-                if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse retention check interval for dataset {}: {}",
-                    self.name,
-                    retention_check_interval
-                );
+        if let Some(acceleration) = &self.acceleration
+            && let Some(retention_check_interval) = &acceleration.retention_check_interval
+        {
+            if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
+                return Some(duration);
             }
+            tracing::warn!(
+                "Unable to parse retention check interval for dataset {}: {}",
+                self.name,
+                retention_check_interval
+            );
         }
 
         None
     }
 
     pub fn retention_period(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(retention_period) = &acceleration.retention_period {
-                if let Ok(duration) = fundu::parse_duration(retention_period) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse retention period for dataset {}: {}",
-                    self.name,
-                    retention_period
-                );
+        if let Some(acceleration) = &self.acceleration
+            && let Some(retention_period) = &acceleration.retention_period
+        {
+            if let Ok(duration) = fundu::parse_duration(retention_period) {
+                return Some(duration);
             }
+            tracing::warn!(
+                "Unable to parse retention period for dataset {}: {}",
+                self.name,
+                retention_period
+            );
         }
 
         None
@@ -527,17 +496,17 @@ impl Dataset {
 
     #[must_use]
     pub fn refresh_data_window(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_data_window) = &acceleration.refresh_data_window {
-                if let Ok(duration) = fundu::parse_duration(refresh_data_window) {
-                    return Some(duration);
-                }
-                tracing::warn!(
-                    "Unable to parse refresh period for dataset {}: {}",
-                    self.name,
-                    refresh_data_window
-                );
+        if let Some(acceleration) = &self.acceleration
+            && let Some(refresh_data_window) = &acceleration.refresh_data_window
+        {
+            if let Ok(duration) = fundu::parse_duration(refresh_data_window) {
+                return Some(duration);
             }
+            tracing::warn!(
+                "Unable to parse refresh period for dataset {}: {}",
+                self.name,
+                refresh_data_window
+            );
         }
 
         None
@@ -560,8 +529,8 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn mode(&self) -> Mode {
-        self.mode
+    pub fn access(&self) -> AccessMode {
+        self.access
     }
 
     #[must_use]
@@ -677,7 +646,19 @@ impl Dataset {
     }
 }
 
+/// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
+pub struct FullTextSearchDatasetConfig {
+    pub index_store: IndexStore,
+    pub index_path: Option<String>,
+    pub search_fields: Vec<String>,
+    pub primary_key: Vec<String>,
+}
+
 impl AccelerationSource for Dataset {
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+        Arc::new(self.clone())
+    }
+
     fn is_file_accelerated(&self) -> bool {
         self.is_file_accelerated()
     }
@@ -696,6 +677,14 @@ impl AccelerationSource for Dataset {
 
     fn name(&self) -> &TableReference {
         &self.name
+    }
+
+    fn time_column(&self) -> Option<&str> {
+        self.time_column.as_deref()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

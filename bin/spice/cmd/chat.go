@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -183,7 +185,7 @@ type ResponseStreamEvent struct {
 	Response       *ResponsesAPIResponse `json:"response,omitempty"`
 }
 
-func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 	input := messagesToInput(messages)
 
 	// Show spinner if requested
@@ -301,26 +303,28 @@ func handleResponsesAPI(rtcontext *context.RuntimeContext, cmd *cobra.Command, m
 		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 	}
 
-	// Show usage information
-	if usage != (ResponseUsage{}) {
-		// If timeAtCompletion wasn't set, use current time
-		if timeAtCompletion.IsZero() {
-			timeAtCompletion = time.Now()
+	// Show usage information for interactive mode only.
+	if interactiveMode {
+		if usage != (ResponseUsage{}) {
+			// If timeAtCompletion wasn't set, use current time
+			if timeAtCompletion.IsZero() {
+				timeAtCompletion = time.Now()
+			}
+			cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
+				&usage,
+				timeAtFirstToken.Sub(startTime).Abs(),
+				timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+			))
+		} else {
+			cmd.Print("\n\n")
 		}
-		cmd.Printf("\n\n%s\n\n", generateResponsesUsageMessage(
-			&usage,
-			timeAtFirstToken.Sub(startTime).Abs(),
-			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
-		))
-	} else {
-		cmd.Print("\n\n")
 	}
 
 	return messages, nil
 }
 
 // handleChatCompletions handles streaming responses using the Chat Completions API
-func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool) ([]Message, error) {
+func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command, model string, messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 	// Only create these variables if using spinner
 	var done chan bool
 	var doneLoading bool
@@ -402,7 +406,11 @@ func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command
 		}
 
 		token := chatResponse.Choices[0].Delta.Content
-		cmd.Printf("%s", token)
+		if interactiveMode {
+			cmd.Printf("%s", token)
+		} else {
+			fmt.Printf("%s", token)
+		}
 		responseMessage = responseMessage + token
 	}
 
@@ -417,14 +425,17 @@ func handleChatCompletions(rtcontext *context.RuntimeContext, cmd *cobra.Command
 	if responseMessage != "" {
 		messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 	}
-	if usage != (Usage{}) {
-		cmd.Printf("\n\n%s\n\n", generateUsageMessage(
-			&usage,
-			timeAtFirstToken.Sub(startTime).Abs(),
-			timeAtCompletion.Sub(timeAtFirstToken).Abs(),
-		))
-	} else {
-		cmd.Print("\n\n")
+	// Show usage information (only if not piped)
+	if interactiveMode {
+		if usage != (Usage{}) {
+			cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+				&usage,
+				timeAtFirstToken.Sub(startTime).Abs(),
+				timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+			))
+		} else {
+			cmd.Print("\n\n")
+		}
 	}
 
 	return messages, nil
@@ -452,6 +463,62 @@ spice chat --model <model> "What is Spice.ai?"
 		if err != nil {
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
+		}
+
+		// Check for piped input
+		stdinInput, isInteractiveMode, err := readStdinIfNonInteractive()
+		if err != nil {
+			slog.Error("failed to read stdin", "error", err)
+			os.Exit(1)
+		}
+
+		// If we have piped input, combine it with any command line argument
+		if !isInteractiveMode {
+			if len(args) > 0 {
+				// Combine piped input with command line argument
+				args[0] = stdinInput + "\n" + args[0]
+			} else {
+				// Use piped input as the message
+				args = []string{stdinInput}
+			}
+		}
+
+		// Check for --endpoint flag for remote HTTP mode
+		endpoint, err := cmd.Flags().GetString("endpoint")
+		if err != nil {
+			slog.Error("getting endpoint flag", "error", err)
+			os.Exit(1)
+		}
+
+		// Check for --cloud flag
+		if rtcontext.IsCloud() {
+			if endpoint != "" {
+				slog.Error("cannot use both --cloud and --endpoint flags")
+				os.Exit(1)
+			}
+
+			// Get API key from context or environment variable
+			apiKey := os.Getenv("SPICE_API_KEY")
+			if apiKey == "" {
+				if cmdApiKey, err := rtcontext.GetApiKey(); err == nil && cmdApiKey != "" {
+					apiKey = cmdApiKey
+				}
+			}
+
+			if apiKey == "" {
+				slog.Error("API key is required when using --cloud. Set SPICE_API_KEY environment variable or use --api-key flag.")
+				os.Exit(1)
+			}
+
+			// Use cloud connection - cloud uses HTTPS
+			runRemoteChatREPL(cmd, rtcontext, "https://data.spiceai.io", args, isInteractiveMode)
+			return
+		}
+
+		if endpoint != "" {
+			// Remote HTTP mode
+			runRemoteChatREPL(cmd, rtcontext, endpoint, args, isInteractiveMode)
+			return
 		}
 
 		temperature, err := cmd.Flags().GetFloat32("temperature")
@@ -565,11 +632,11 @@ spice chat --model <model> "What is Spice.ai?"
 		// Handler for Chat Completions API - handled by standalone function
 
 		// Main message handler that delegates to the appropriate API handler
-		getChatResponse := func(messages []Message, useSpinner bool) ([]Message, error) {
+		getChatResponse := func(messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
 			if useResponsesAPI {
-				return handleResponsesAPI(rtcontext, cmd, model, messages, useSpinner)
+				return handleResponsesAPI(rtcontext, cmd, model, messages, useSpinner, isInteractiveMode)
 			}
-			return handleChatCompletions(rtcontext, cmd, model, messages, useSpinner)
+			return handleChatCompletions(rtcontext, cmd, model, messages, useSpinner, isInteractiveMode)
 		}
 
 		if len(args) > 0 {
@@ -579,7 +646,7 @@ spice chat --model <model> "What is Spice.ai?"
 				{Role: "user", Content: userMessage},
 			}
 
-			_, err = getChatResponse(messages, false)
+			_, err = getChatResponse(messages, false, isInteractiveMode)
 			if err != nil {
 				os.Exit(1)
 			}
@@ -588,6 +655,9 @@ spice chat --model <model> "What is Spice.ai?"
 		}
 
 		var messages = []Message{}
+
+		cmd.Println("Welcome to the Spice.ai chat REPL! Type your message to chat with the model.")
+		cmd.Println()
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
@@ -600,15 +670,18 @@ spice chat --model <model> "What is Spice.ai?"
 			message, err := line.Prompt("chat> ")
 			if err == liner.ErrPromptAborted {
 				break
+			} else if err == io.EOF {
+				// EOF reached (Ctrl+D or piped input exhausted)
+				break
 			} else if err != nil {
 				slog.Error("reading input line", "error", err)
-				continue
+				break
 			}
 
 			line.AppendHistory(message)
 			messages = append(messages, Message{Role: "user", Content: message})
 
-			messages, err = getChatResponse(messages, true)
+			messages, err = getChatResponse(messages, true, false)
 			if err != nil {
 				continue
 			}
@@ -643,7 +716,7 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request body: %w", err)
 	}
-	return rtcontext.Do("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+	return rtcontext.DoLongRunning("POST", "/v1/chat/completions", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
 func sendResponsesRequest(rtcontext *context.RuntimeContext, body *ResponsesRequestBody) (*http.Response, error) {
@@ -651,7 +724,7 @@ func sendResponsesRequest(rtcontext *context.RuntimeContext, body *ResponsesRequ
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request body: %w", err)
 	}
-	return rtcontext.Do("POST", "/v1/responses", bytes.NewReader(jsonBody), "Content-Type", "application/json")
+	return rtcontext.DoLongRunning("POST", "/v1/responses", bytes.NewReader(jsonBody), "Content-Type", "application/json")
 }
 
 // messagesToInput converts a message history into a single input string for the Responses API
@@ -745,10 +818,292 @@ func isEndOfStream(chunk string) bool {
 	return false
 }
 
+// readStdinIfNonInteractive checks if the input is an interactive shell, and if not, reads the entire input.
+//
+// Returns:
+//
+//	1 The full input content, if non-interactive:
+//	2 true, if stdin is interactive
+//	3. If an error os or io error occurred determining interactivity, or reading input.
+func readStdinIfNonInteractive() (string, bool, error) {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return "", true, err
+	}
+
+	// Check if input is coming from a pipe or file (not a terminal)
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		// Read all input from stdin
+		input, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", false, err
+		}
+		return strings.TrimSpace(string(input)), false, nil
+	}
+
+	return "", true, nil
+}
+
+func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, httpEndpoint string, args []string, interactiveMode bool) {
+	// Get API key from context or environment variable
+	apiKey := os.Getenv("SPICE_API_KEY")
+	if apiKey == "" {
+		if cmdApiKey, err := rtcontext.GetApiKey(); err == nil && cmdApiKey != "" {
+			apiKey = cmdApiKey
+		}
+	}
+
+	model, err := cmd.Flags().GetString("model")
+	if err != nil {
+		slog.Error("could not get model flag", "error", err)
+		os.Exit(1)
+	}
+
+	if model == "" {
+		slog.Error("--model flag is required for remote chat")
+		os.Exit(1)
+	}
+
+	useResponsesAPI, err := cmd.Flags().GetBool("responses")
+	if err != nil {
+		slog.Error("could not get responses flag", "error", err)
+		os.Exit(1)
+	}
+
+	// Parse custom headers
+	customHeaders := make(map[string]string)
+	if headers, err := cmd.Flags().GetStringSlice("headers"); err == nil {
+		for _, header := range headers {
+			parts := strings.SplitN(header, ":", 2)
+			if len(parts) == 2 {
+				customHeaders[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
+	// Create HTTP client
+	httpClient := &http.Client{
+		Timeout: 0, // No timeout for long-running queries
+	}
+
+	// Check server health and readiness
+	checkDuration, healthOk := util.CheckRemoteServerHealth(httpEndpoint, httpClient, apiKey)
+	if healthOk {
+		cmd.Printf("Connected to %s (%dms).\n", httpEndpoint, checkDuration.Milliseconds())
+	}
+	cmd.Println()
+
+	// Function to send chat request
+	sendChatRequest := func(messages []Message, useSpinner bool, interactiveMode bool) ([]Message, error) {
+		var done chan bool
+		var doneLoading bool
+		if useSpinner {
+			done = make(chan bool)
+			doneLoading = false
+			go func() {
+				util.ShowSpinner(done)
+			}()
+		}
+
+		var endpoint string
+		var body interface{}
+
+		if useResponsesAPI {
+			endpoint = fmt.Sprintf("%s/v1/responses", httpEndpoint)
+			input := messagesToInput(messages)
+			body = NewResponsesRequestBody(model, input, true)
+		} else {
+			endpoint = fmt.Sprintf("%s/v1/chat/completions", httpEndpoint)
+			body = NewChatRequestBody(messages, model, true, &StreamOptions{IncludeUsage: true})
+			body, _ = ApplyChatOptions(body.(*ChatRequestBody), cmd)
+		}
+
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			if useSpinner {
+				done <- true
+			}
+			return messages, fmt.Errorf("marshaling request: %w", err)
+		}
+
+		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(jsonBody))
+		if err != nil {
+			if useSpinner {
+				done <- true
+			}
+			return messages, fmt.Errorf("creating request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept-Encoding", "zstd, gzip, deflate")
+		req.Header.Set("User-Agent", spice_http.UserAgent())
+		if apiKey != "" {
+			req.Header.Set("X-API-Key", apiKey)
+		}
+
+		// Add custom headers
+		for key, value := range customHeaders {
+			req.Header.Set(key, value)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if useSpinner {
+				done <- true
+			}
+			return messages, fmt.Errorf("sending request: %w", err)
+		}
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				slog.Error("closing response body", "error", err)
+			}
+		}()
+
+		if resp.StatusCode != http.StatusOK {
+			if useSpinner {
+				done <- true
+			}
+			body, _ := io.ReadAll(resp.Body)
+			return messages, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Get decompressing reader if response is compressed
+		bodyReader := io.ReadCloser(resp.Body)
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if contentEncoding != "" {
+			decompReader, err := getDecompressingReader(resp.Body, contentEncoding)
+			if err != nil {
+				if useSpinner {
+					done <- true
+				}
+				return messages, fmt.Errorf("creating decompressor: %w", err)
+			}
+			bodyReader = decompReader
+		}
+
+		// Handle streaming response
+		scanner := bufio.NewScanner(bodyReader)
+		var responseMessage string
+
+		for scanner.Scan() {
+			chunk := scanner.Text()
+
+			if !strings.HasPrefix(chunk, "data: ") {
+				continue
+			}
+			chunk = strings.TrimPrefix(chunk, "data: ")
+
+			if chunk == "[DONE]" {
+				break
+			}
+
+			if useResponsesAPI {
+				var streamEvent ResponseStreamEvent
+				if err := json.Unmarshal([]byte(chunk), &streamEvent); err != nil {
+					continue
+				}
+
+				if streamEvent.Type == "response.output_text.delta" {
+					token := streamEvent.Delta
+					if useSpinner && !doneLoading && token != "" {
+						done <- true
+						doneLoading = true
+					}
+					cmd.Printf("%s", token)
+					responseMessage += token
+				}
+
+				if streamEvent.Type == "response.done" {
+					break
+				}
+			} else {
+				var chatResponse ChatCompletion
+				if err := json.Unmarshal([]byte(chunk), &chatResponse); err != nil {
+					continue
+				}
+
+				if useSpinner && !doneLoading {
+					done <- true
+					doneLoading = true
+				}
+
+				if len(chatResponse.Choices) > 0 {
+					token := chatResponse.Choices[0].Delta.Content
+					cmd.Printf("%s", token)
+					responseMessage += token
+				}
+			}
+		}
+
+		if useSpinner && !doneLoading {
+			done <- true
+		}
+
+		if responseMessage != "" {
+			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+		}
+		// Only add newlines if not piped
+		if interactiveMode {
+			cmd.Print("\n\n")
+		}
+
+		return messages, nil
+	}
+
+	// Single message mode
+	if len(args) > 0 {
+		userMessage := args[0]
+		messages := []Message{{Role: "user", Content: userMessage}}
+		_, err := sendChatRequest(messages, false, interactiveMode)
+		if err != nil {
+			slog.Error("chat request failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Interactive mode
+	cmd.Printf("Welcome to the Spice.ai chat REPL! Type your message to chat with '%s'.\n", model)
+	cmd.Println()
+
+	var messages []Message
+	line := liner.NewLiner()
+	line.SetCtrlCAborts(true)
+	defer func() {
+		if err := line.Close(); err != nil {
+			slog.Error("closing line", "error", err)
+		}
+	}()
+
+	for {
+		message, err := line.Prompt("chat> ")
+		if err == liner.ErrPromptAborted {
+			break
+		} else if err == io.EOF {
+			// EOF reached (Ctrl+D or piped input exhausted)
+			break
+		} else if err != nil {
+			slog.Error("reading input line", "error", err)
+			break
+		}
+
+		line.AppendHistory(message)
+		messages = append(messages, Message{Role: "user", Content: message})
+
+		messages, err = sendChatRequest(messages, true, false)
+		if err != nil {
+			slog.Error("chat request failed", "error", err)
+			continue
+		}
+	}
+}
+
 func init() {
 	chatCmd.Flags().String(constants.ModelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().Float32("temperature", 1, "Model temperature for chat request")
 	chatCmd.Flags().Bool("responses", false, "Whether to use the responses API for all completions")
+	chatCmd.Flags().String("endpoint", "", "Specifies the remote Spice instance HTTP endpoint (e.g., http://localhost:8090)")
+	chatCmd.Flags().StringSlice("headers", []string{}, "Custom HTTP headers to pass to remote endpoint in the format 'Key:Value'. Can be specified multiple times.")
 
 	RootCmd.AddCommand(chatCmd)
 }

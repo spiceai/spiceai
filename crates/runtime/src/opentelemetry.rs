@@ -52,7 +52,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
-use tonic::service::interceptor;
+use tonic::service::InterceptorLayer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::Health;
 use tonic_health::pb::health_server::HealthServer;
@@ -205,7 +205,7 @@ impl MetricsService for Service {
 }
 
 async fn create_health_service() -> HealthServer<impl Health> {
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<MetricsServiceServer<Service>>()
         .await;
@@ -264,25 +264,25 @@ fn number_data_points_to_record_batch(
     let mut start_time_unix_nano_builder = UInt64Builder::new();
     let mut attributes = Vec::new();
 
-    if let Some(s) = existing_schema {
-        if let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME) {
-            match value_field.data_type() {
-                DataType::Float64 => {
-                    values_builder = Some(Box::new(Float64Builder::new()));
-                    values_type = DataType::Float64;
+    if let Some(s) = existing_schema
+        && let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME)
+    {
+        match value_field.data_type() {
+            DataType::Float64 => {
+                values_builder = Some(Box::new(Float64Builder::new()));
+                values_type = DataType::Float64;
+            }
+            DataType::Int64 => {
+                values_builder = Some(Box::new(Int64Builder::new()));
+                values_type = DataType::Int64;
+            }
+            _ => {
+                return UnsupportedExistingMetricValueColumnTypeSnafu {
+                    metric,
+                    data_type: value_field.data_type().clone(),
+                    data_point_type: "NumberDataPoint",
                 }
-                DataType::Int64 => {
-                    values_builder = Some(Box::new(Int64Builder::new()));
-                    values_type = DataType::Int64;
-                }
-                _ => {
-                    return UnsupportedExistingMetricValueColumnTypeSnafu {
-                        metric,
-                        data_type: value_field.data_type().clone(),
-                        data_point_type: "NumberDataPoint",
-                    }
-                    .fail();
-                }
+                .fail();
             }
         }
     }
@@ -615,7 +615,7 @@ pub async fn start(
     }
 
     let server = server
-        .layer(interceptor(make_interceptor(grpc_auth)))
+        .layer(InterceptorLayer::new(make_interceptor(grpc_auth)))
         .add_service(create_health_service().await)
         .add_service(svc);
 

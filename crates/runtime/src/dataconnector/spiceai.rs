@@ -222,20 +222,17 @@ fn configure_max_message_size(
     mut flight_client: FlightClient,
     params: &ConnectorParams,
 ) -> Result<FlightClient> {
-    if let Some(app) = params.app.as_ref() {
-        if let Some(flight) = app.runtime.flight.as_ref() {
-            if let Some(max_message_size) =
-                flight
-                    .max_message_size_bytes()
-                    .map_err(|err| Error::InvalidParameterValue {
-                        parameter: "max_message_size".to_string(),
-                        source: err,
-                    })?
-            {
-                flight_client =
-                    flight_client.with_max_message_size(max_message_size, max_message_size);
-            }
-        }
+    if let Some(app) = params.app.as_ref()
+        && let Some(flight) = app.runtime.flight.as_ref()
+        && let Some(max_message_size) =
+            flight
+                .max_message_size_bytes()
+                .map_err(|err| Error::InvalidParameterValue {
+                    parameter: "max_message_size".to_string(),
+                    source: err,
+                })?
+    {
+        flight_client = flight_client.with_max_message_size(max_message_size, max_message_size);
     }
     Ok(flight_client)
 }
@@ -250,8 +247,6 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let dataset_schema = dataset.schema();
-
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
             Err(e) => {
@@ -265,7 +260,7 @@ impl DataConnector for SpiceAI {
 
         let (flight_factory, table_reference) = self.flight_factory(dataset_path);
 
-        match Read::table_provider(&flight_factory, table_reference, dataset_schema).await {
+        match Read::table_provider(&flight_factory, table_reference).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -314,13 +309,12 @@ impl DataConnector for SpiceAI {
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
         };
 
-        let read_write_result =
-            ReadWrite::table_provider(&flight_factory, table_reference, dataset.schema())
-                .await
-                .context(super::UnableToGetReadWriteProviderSnafu {
-                    dataconnector: "spice.ai",
-                    connector_component: ConnectorComponent::from(dataset),
-                });
+        let read_write_result = ReadWrite::table_provider(&flight_factory, table_reference)
+            .await
+            .context(super::UnableToGetReadWriteProviderSnafu {
+                dataconnector: "spice.ai",
+                connector_component: ConnectorComponent::from(dataset),
+            });
 
         Some(read_write_result)
     }

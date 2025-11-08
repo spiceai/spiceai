@@ -1,0 +1,39 @@
+[package]
+description = "Acceleration support for the Spice runtime"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "runtime-acceleration"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+bytes.workspace = true
+chrono.workspace = true
+datafusion.workspace = true
+fundu.workspace = true
+futures.workspace = true
+object_store.workspace = true
+opentelemetry.workspace = true
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-secrets = { path = "../runtime-secrets" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tokio = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+url.workspace = true
+util = { path = "../util" }
+
+[features]
+default = []
+snapshots = []
+
+[dev-dependencies]
+tempfile.workspace = true

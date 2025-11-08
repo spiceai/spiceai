@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_credential_types::Credentials;
+use aws_config::ConfigLoader;
 use snafu::prelude::*;
 use tonic::async_trait;
 
@@ -191,14 +190,17 @@ impl Validator for AuthValidator {
     }
 }
 
-pub async fn load_config(
+/// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
+///
+/// Return [`ConfigLoader`] to allow further customisation.
+pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
     key_name: &'static str,
     secret_name: &'static str,
     token_name: &'static str,
     params: &Parameters,
-) -> Result<SdkConfig, Error> {
+) -> Result<ConfigLoader, Error> {
     let region = params
         .get(region_name)
         .expose()
@@ -208,41 +210,24 @@ pub async fn load_config(
         .to_string();
 
     let access_key_id = params.get(key_name).expose().ok().map(ToString::to_string);
-
     let secret_access_key = params
         .get(secret_name)
         .expose()
         .ok()
         .map(ToString::to_string);
-
     let session_token = params
         .get(token_name)
         .expose()
         .ok()
         .map(ToString::to_string);
 
-    Ok(match (access_key_id, secret_access_key) {
-        (Some(access_key_id), Some(secret_access_key)) => {
-            let credentials = Credentials::new(
-                access_key_id,
-                secret_access_key,
-                session_token,
-                None,
-                provider_name,
-            );
-
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .region(Region::new(region))
-                .credentials_provider(credentials)
-                .load()
-                .await
-        }
-        _ => {
-            // This will automatically load AWS credentials from the environment, via IAM roles if configured.
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .region(Region::new(region))
-                .load()
-                .await
-        }
-    })
+    // Delegate to the common implementation in aws-sdk-credential-bridge
+    Ok(aws_sdk_credential_bridge::initiate_config_with_credentials(
+        provider_name,
+        region,
+        access_key_id,
+        secret_access_key,
+        session_token,
+    )
+    .await)
 }

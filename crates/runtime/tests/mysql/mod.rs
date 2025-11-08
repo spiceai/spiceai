@@ -40,6 +40,7 @@ const MYSQL_PORT1: u16 = 13316;
 const MYSQL_PORT2: u16 = 13317;
 const MYSQL_PORT3: u16 = 13318;
 
+#[allow(clippy::too_many_lines)]
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
     let pool = get_mysql_conn(port)?;
@@ -247,11 +248,8 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT1, false))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -342,11 +340,8 @@ async fn mysql_character_set_results_test() -> Result<(), String> {
                 ))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -437,11 +432,8 @@ async fn mysql_timezone_test() -> Result<(), String> {
                 .with_dataset(ds_custom)
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

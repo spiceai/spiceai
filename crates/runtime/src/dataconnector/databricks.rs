@@ -35,6 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use token_provider::registry::TokenProviderRegistry;
 use token_provider::{StaticTokenProvider, TokenProvider};
+use tokio::runtime::Handle;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -104,6 +105,7 @@ impl std::fmt::Debug for Databricks {
 impl Databricks {
     pub async fn new(
         params: Parameters,
+        io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
     ) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
@@ -163,6 +165,7 @@ impl Databricks {
                     Endpoint(endpoint.to_string()),
                     storage_options,
                     token_provider,
+                    io_runtime,
                 );
 
                 Ok(Self {
@@ -221,7 +224,7 @@ impl Databricks {
         })
     }
 
-    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials> {
+    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
         let token = params.get("token").ok();
         let client_id = params.get("client_id").expose().ok();
         let client_secret = params.get("client_secret").ok();
@@ -463,11 +466,26 @@ impl DataConnectorFactory for DatabricksFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
+            let param_map = params.parameters.to_secret_map();
             Box::pin(async move {
-                // Initialize the AWS SDK and make it available.
-                let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
-                let databricks =
-                    Databricks::new(params.parameters, runtime.token_provider_registry()).await?;
+                // Initialize AWS SDK credentials if not using explicit credentials
+                if !aws_sdk_credential_bridge::has_explicit_credentials(
+                    &param_map,
+                    "aws_access_key_id",
+                    "aws_secret_access_key",
+                ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                {
+                    tracing::warn!(
+                        "Unable to initialize AWS credentials for Databricks connector: {err}"
+                    );
+                }
+
+                let databricks = Databricks::new(
+                    params.parameters,
+                    params.io_runtime,
+                    runtime.token_provider_registry(),
+                )
+                .await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
             })
         } else {
@@ -502,7 +520,7 @@ impl DataConnector for Databricks {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
-            .table_provider(table_reference, dataset.schema())
+            .table_provider(table_reference)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "databricks",

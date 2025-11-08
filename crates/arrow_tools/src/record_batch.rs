@@ -44,9 +44,9 @@ impl From<Error> for DataFusionError {
         match e {
             Error::UnableToConvertRecordBatch {
                 source: arrow_error,
-            } => DataFusionError::ArrowError(arrow_error, None),
+            } => DataFusionError::ArrowError(Box::new(arrow_error), None),
             Error::FieldNotNullable { .. } => {
-                DataFusionError::ArrowError(ArrowError::SchemaError(e.to_string()), None)
+                DataFusionError::ArrowError(Box::new(ArrowError::SchemaError(e.to_string())), None)
             }
         }
     }
@@ -110,46 +110,43 @@ pub fn to_primitive_type_list(
     column: &ArrayRef,
     field: &Arc<Field>,
 ) -> Result<(ArrayRef, Arc<Field>), ArrowError> {
-    if let DataType::List(inner_field) = field.data_type() {
-        if let DataType::Struct(struct_fields) = inner_field.data_type() {
-            if struct_fields.len() == 1 {
-                let list_item_field = Arc::clone(&struct_fields[0]);
+    if let DataType::List(inner_field) = field.data_type()
+        && let DataType::Struct(struct_fields) = inner_field.data_type()
+        && struct_fields.len() == 1
+    {
+        let list_item_field = Arc::clone(&struct_fields[0]);
 
-                let original_list_array =
-                    column
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .ok_or(ArrowError::CastError(
-                            "Failed to downcast to ListArray".into(),
-                        ))?;
+        let original_list_array =
+            column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or(ArrowError::CastError(
+                    "Failed to downcast to ListArray".into(),
+                ))?;
 
-                let struct_array = original_list_array
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .ok_or(ArrowError::CastError(
-                        "Failed to downcast to StructArray".into(),
-                    ))?;
+        let struct_array = original_list_array
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or(ArrowError::CastError(
+                "Failed to downcast to StructArray".into(),
+            ))?;
 
-                let struct_column_array = Arc::clone(struct_array.column(0));
+        let struct_column_array = Arc::clone(struct_array.column(0));
 
-                let new_list_field = Arc::new(Field::new(
-                    field.name(),
-                    DataType::List(Arc::clone(&list_item_field)),
-                    field.is_nullable(),
-                ));
-                let new_list_array = ListArray::new(
-                    list_item_field,
-                    OffsetBuffer::new(
-                        Buffer::from_slice_ref(original_list_array.value_offsets()).into(),
-                    ),
-                    struct_column_array,
-                    original_list_array.logical_nulls(),
-                );
+        let new_list_field = Arc::new(Field::new(
+            field.name(),
+            DataType::List(Arc::clone(&list_item_field)),
+            field.is_nullable(),
+        ));
+        let new_list_array = ListArray::new(
+            list_item_field,
+            OffsetBuffer::new(Buffer::from_slice_ref(original_list_array.value_offsets()).into()),
+            struct_column_array,
+            original_list_array.logical_nulls(),
+        );
 
-                return Ok((Arc::new(new_list_array), new_list_field));
-            }
-        }
+        return Ok((Arc::new(new_list_array), new_list_field));
     }
 
     Err(ArrowError::CastError("Invalid column type".into()))
@@ -227,39 +224,72 @@ pub fn truncate_numeric_column_length(
 /// # Errors
 /// Returns an error when a value in an array cannot be converted into a scalar.
 pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
-    let mut param_values: Vec<(String, Option<usize>, ScalarValue)> = Vec::new();
+    let num_columns = batch.num_columns();
 
+    // Fast path: empty batch
+    if num_columns == 0 {
+        return Ok(ParamValues::List(Vec::new()));
+    }
+
+    let schema = batch.schema_ref();
+
+    // Pre-allocate with exact capacity to avoid reallocation
+    let mut list_params: Vec<(usize, ScalarValue)> = Vec::with_capacity(num_columns);
+    let mut named_params: Vec<(String, ScalarValue)> = Vec::with_capacity(num_columns);
     let mut is_list = true;
-    for col_index in 0..batch.num_columns() {
+    let mut needs_sort = false;
+    let mut prev_index = 0usize;
+    let mut has_prev_index = false;
+
+    // Single pass: determine type and collect values simultaneously
+    for col_index in 0..num_columns {
         let array = batch.column(col_index);
         let scalar = ScalarValue::try_from_array(array, 0)?;
-        let name = batch
-            .schema_ref()
-            .field(col_index)
-            .name()
-            .trim_start_matches('$')
-            .to_string();
-        let index = name.parse().ok();
-        is_list &= index.is_some();
-        param_values.push((name, index, scalar));
+        let name = schema.field(col_index).name();
+
+        // Check if name is a parameter index (with or without $ prefix)
+        let index = if let Some(stripped) = name.strip_prefix('$') {
+            stripped.parse::<usize>().ok()
+        } else {
+            name.parse::<usize>().ok()
+        };
+        if let Some(index) = index {
+            if has_prev_index && index < prev_index {
+                needs_sort = true;
+            }
+            prev_index = index;
+            has_prev_index = true;
+            list_params.push((index, scalar));
+            continue;
+        }
+
+        // Not a numbered parameter - switch to named mode
+        is_list = false;
+        named_params.push((name.to_string(), scalar));
     }
-    if is_list {
-        let mut values: Vec<(Option<usize>, ScalarValue)> = param_values
-            .into_iter()
-            .map(|(_name, index, value)| (index, value))
-            .collect();
-        values.sort_by_key(|(index, _value)| *index);
-        Ok(values
-            .into_iter()
-            .map(|(_index, value)| value)
-            .collect::<Vec<ScalarValue>>()
-            .into())
+
+    if is_list && !list_params.is_empty() {
+        if needs_sort {
+            list_params.sort_unstable_by_key(|(index, _)| *index);
+        }
+
+        // Extract just the values (compiler can optimize this to a move)
+        Ok(ParamValues::List(
+            list_params.into_iter().map(|(_, value)| value).collect(),
+        ))
     } else {
-        Ok(param_values
-            .into_iter()
-            .map(|(name, _index, value)| (name, value))
-            .collect::<Vec<(String, ScalarValue)>>()
-            .into())
+        // Convert list_params back to named if we have mixed types
+        // IMPORTANT: Preserve the '$' prefix for positional parameters to maintain consistency
+        // with DataFusion's parameter naming convention. DataFusion's SQL parser and parameter
+        // resolution expect positional parameters to be named "$1", "$2", etc.
+        // Mixed mode occurs when we have both "$1" style and "param_name" style parameters.
+        if !list_params.is_empty() {
+            for (index, value) in list_params {
+                // Preserve the '$' prefix format: "$1", "$2", etc.
+                named_params.push((format!("${index}"), value));
+            }
+        }
+        Ok(ParamValues::Map(named_params.into_iter().collect()))
     }
 }
 
@@ -272,6 +302,53 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
         | DataType::List(inner) => inner.data_type().is_numeric(),
         _ => false,
     }
+}
+
+/// For a given [`RecordBatch`], replace a given column, by name, with a new [`ArrayRef`] data.
+///
+/// If `col` is not in [`RecordBatch`], no change occurs.
+///
+/// # Errors
+///
+/// This function will return an error if it unexpectedly fails to create a new [`RecordBatch`].
+pub fn replace_column_in_record(
+    rb: RecordBatch,
+    col: &str,
+    data: &ArrayRef,
+) -> Result<RecordBatch, ArrowError> {
+    let Some((idx, _)) = rb.schema().column_with_name(col) else {
+        return Ok(rb);
+    };
+    let schema = Schema::new(
+        rb.schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == col {
+                    Arc::unwrap_or_clone(Arc::clone(f))
+                        .with_data_type(data.data_type().clone())
+                        .into()
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let columns = rb
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, arr)| {
+            if i == idx {
+                Arc::clone(data)
+            } else {
+                Arc::clone(arr)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(schema.into(), columns)
 }
 
 #[cfg(test)]
@@ -491,6 +568,25 @@ mod test {
     }
 
     #[test]
+    fn record_to_param_values_list_parameters_no_dollar() {
+        let batch = create_record_batch(
+            vec![("1", DataType::Int32), ("2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::List(vec![
+            ScalarValue::Int32(Some(42)),
+            ScalarValue::Utf8(Some("hello".to_string())),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
     fn record_to_param_values_named_parameters() {
         let batch = create_record_batch(
             vec![("param1", DataType::Int32), ("param2", DataType::Utf8)],
@@ -524,7 +620,8 @@ mod test {
 
         let result = record_to_param_values(&batch).expect("record to param values");
         let mut expected_map = HashMap::new();
-        expected_map.insert("1".to_string(), ScalarValue::Int32(Some(10)));
+        // Preserve the '$' prefix for positional parameters in mixed mode
+        expected_map.insert("$1".to_string(), ScalarValue::Int32(Some(10)));
         expected_map.insert(
             "param2".to_string(),
             ScalarValue::Utf8(Some("test".to_string())),

@@ -15,8 +15,10 @@ limitations under the License.
 */
 
 use app::App;
+use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use http::HeaderMap;
+use runtime_request_context::{Extension, RequestContextBuilder};
 use secrecy::SecretString;
 use spicepod::{
     component::{catalog::Catalog, dataset::Dataset},
@@ -26,7 +28,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::datafusion::DataFusion;
+use crate::{component::access::AccessMode, datafusion::DataFusion};
 
 const SPICE_DATABRICKS_HEADER: &str = "spice-databricks-auth";
 
@@ -47,7 +49,40 @@ impl Default for DatabricksAuthExtension {
     }
 }
 
+#[async_trait]
+impl Extension for DatabricksAuthExtension {
+    async fn load(&self) {
+        self.load_u2m_components().await;
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl DatabricksAuthExtension {
+    #[must_use]
+    pub fn new(
+        app: Option<Arc<App>>,
+        df: Option<Arc<DataFusion>>,
+        tokens: Arc<HashMap<String, SecretString>>,
+    ) -> Self {
+        Self { app, df, tokens }
+    }
+
+    #[must_use]
+    pub fn add_from_headers(
+        self,
+        mut bldr: RequestContextBuilder,
+        headers: &HeaderMap,
+    ) -> RequestContextBuilder {
+        if let Some(extension) = DatabricksAuthExtension::from_headers(&self.app, &self.df, headers)
+        {
+            bldr = bldr.with_extension(extension);
+        }
+        bldr
+    }
+
     #[must_use]
     pub fn from_headers(
         app: &Option<Arc<App>>,
@@ -147,8 +182,9 @@ impl DatabricksAuthExtension {
             let catalog_futures = databricks_u2m_catalogs.into_iter().map(|catalog| {
                 let df = Arc::clone(&df);
                 let name = catalog.name.clone();
+                let access = AccessMode::from(catalog.access);
                 Box::pin(async move {
-                    if let Err(err) = df.load_deferred_catalog(name.as_str()).await {
+                    if let Err(err) = df.load_deferred_catalog(name.as_str(), &access).await {
                         tracing::warn!("Failed to load catalog {}: {}", name, err);
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>

@@ -42,7 +42,7 @@ use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::projection::ProjectionExpr;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::{
     catalog::{Session, memory::DataSourceExec},
@@ -55,7 +55,7 @@ use datafusion::{
     },
     error::Result,
     physical_expr::LexRequirement,
-    physical_plan::{ExecutionPlan, PhysicalExpr},
+    physical_plan::ExecutionPlan,
 };
 use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::file_groups::FileGroup;
@@ -179,6 +179,11 @@ impl FileFormat for SpiceJsonFormat {
         Ok(format!("{}{}", ext, file_compression_type.get_ext()))
     }
 
+    /// Returns whether this instance uses compression if applicable
+    fn compression_type(&self) -> Option<FileCompressionType> {
+        Some(self.options.compression.into())
+    }
+
     async fn infer_schema(
         &self,
         _state: &dyn Session,
@@ -267,7 +272,6 @@ impl FileFormat for SpiceJsonFormat {
         &self,
         _state: &dyn Session,
         mut conf: FileScanConfig,
-        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let source = Arc::new(
             SpiceJsonSource::new()
@@ -471,8 +475,8 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
     fn try_swapping_with_projection(
         &self,
-        projection: &ProjectionExec,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        projection: &[ProjectionExpr],
+    ) -> Result<Option<Arc<dyn DataSource>>> {
         self.inner.try_swapping_with_projection(projection)
     }
 }

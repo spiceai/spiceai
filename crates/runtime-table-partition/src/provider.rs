@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, DFSchema},
+    common::{Constraints, DFSchema, project_schema},
     datasource::TableType,
     error::DataFusionError,
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
@@ -32,8 +32,10 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::{
-    Partition, creator::PartitionCreator, expression::validate_scalar_compatibility,
-    insert::PartitionerExec,
+    Partition,
+    creator::PartitionCreator,
+    expression::{PartitionedBy, validate_scalar_compatibility},
+    insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
 
 pub mod pruning;
@@ -54,14 +56,15 @@ pub enum Error {
     InvalidPartitionExpression,
 }
 
-type ScalarValueString = String;
+pub(crate) type ScalarValueString = String;
 
 #[derive(Debug)]
 pub struct PartitionTableProvider {
     creator: Arc<dyn PartitionCreator>,
-    partition_by: Expr,
+    partition_by: PartitionedBy,
     partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
     schema: SchemaRef,
+    insert_strategy: Arc<dyn InsertStrategy>,
 }
 
 impl PartitionTableProvider {
@@ -73,14 +76,13 @@ impl PartitionTableProvider {
     /// validation fails.
     pub async fn new(
         creator: Arc<dyn PartitionCreator>,
-        mut partition_by: Vec<Expr>,
+        mut partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let num_partition_by = partition_by.len();
-        ensure!(
-            num_partition_by == 1,
-            PartitionByViolationSnafu { num_partition_by }
-        );
+        let partition_by = partition_by
+            .pop()
+            .context(PartitionByViolationSnafu { num_partition_by })?;
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
@@ -88,14 +90,14 @@ impl PartitionTableProvider {
             .await
             .context(CreatingPartitionSnafu)?;
 
-        let partition_by = partition_by
-            .pop()
-            .context(PartitionByViolationSnafu { num_partition_by })?;
-
         let partitions = partitions
             .into_iter()
             .map(|p| {
-                validate_scalar_compatibility(&partition_by, &p.partition_value, &df_schema)?;
+                validate_scalar_compatibility(
+                    &partition_by.expression,
+                    &p.partition_value,
+                    &df_schema,
+                )?;
                 Ok((p.partition_value.to_string(), p))
             })
             .collect::<Result<HashMap<_, _>, _>>()
@@ -108,7 +110,15 @@ impl PartitionTableProvider {
             partition_by,
             partitions,
             schema,
+            insert_strategy: Arc::new(DefaultInsertStrategy),
         })
+    }
+
+    /// Sets a custom data insertion strategy for this [`PartitionTableProvider`].
+    #[must_use]
+    pub fn with_insert_strategy(mut self, insert_strategy: Arc<dyn InsertStrategy>) -> Self {
+        self.insert_strategy = insert_strategy;
+        self
     }
 }
 
@@ -144,27 +154,62 @@ impl TableProvider for PartitionTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Split filters into partition filters (for pruning) and data filters (for partition scans)
+        // Partition filters are those that can be evaluated using only the partition expression columns
+        let partition_columns = self.partition_by.expression.column_refs();
+
+        // Pre-compute column references for all filters to avoid repeated expression tree traversals
+        let filter_columns_cache: Vec<_> =
+            filters.iter().map(|filter| filter.column_refs()).collect();
+
+        let (partition_filters, data_filters): (Vec<_>, Vec<_>) = filters
+            .iter()
+            .cloned()
+            .zip(filter_columns_cache.iter())
+            .partition(|(_, filter_columns)| {
+                // A filter is a partition filter if:
+                // 1. It has no column references (constant expression like WHERE true), OR
+                // 2. All its column references are in the partition expression columns
+                filter_columns.is_empty()
+                    || filter_columns
+                        .iter()
+                        .all(|col| partition_columns.contains(col))
+            });
+
+        // Extract just the filters (without the cached column refs)
+        let partition_filters: Vec<_> = partition_filters.into_iter().map(|(f, _)| f).collect();
+        let data_filters: Vec<_> = data_filters.into_iter().map(|(f, _)| f).collect();
+
+        tracing::debug!(
+            "Partition pruning: {} partition filters, {} data filters",
+            partition_filters.len(),
+            data_filters.len()
+        );
+
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
+            // Use partition filters for pruning
             if prune_partition(
-                filters,
-                &self.partition_by,
+                &partition_filters,
+                &self.partition_by.expression,
                 &partition.partition_value,
                 &self.schema,
             )? {
                 continue;
             }
+            // Only pass data filters to partition scan (partition filters are redundant after pruning)
             let plan = partition
                 .table_provider
-                .scan(state, projection, filters, limit)
+                .scan(state, projection, &data_filters, limit)
                 .await?;
             plans.push(plan);
         }
 
         let plan = match plans {
             plans if plans.is_empty() => {
-                return Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))));
+                let projected_schema = project_schema(&self.schema, projection)?;
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
             }
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
@@ -185,13 +230,15 @@ impl TableProvider for PartitionTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        Ok(Arc::new(PartitionerExec::new(
-            input,
-            self.partition_by.clone(),
-            Arc::clone(&self.creator),
-            Arc::clone(&self.partitions),
-            insert_op,
-            Arc::clone(&self.schema),
-        )))
+        let ctx = PartitionContext {
+            creator: Arc::clone(&self.creator),
+            partition_by: self.partition_by.clone(),
+            partitions: Arc::clone(&self.partitions),
+            schema: Arc::clone(&self.schema),
+        };
+
+        self.insert_strategy
+            .execute_insert(input, insert_op, &ctx)
+            .await
     }
 }

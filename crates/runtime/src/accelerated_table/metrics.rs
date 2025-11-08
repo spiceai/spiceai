@@ -21,6 +21,14 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
+pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
+    "dataset_acceleration_max_timestamp_before_refresh_ms";
+pub const METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS: &str =
+    "dataset_acceleration_max_timestamp_after_refresh_ms";
+pub const METRIC_REFRESH_LAG_MS: &str = "dataset_acceleration_refresh_lag_ms";
+pub const METRIC_INGESTION_LAG_MS: &str = "dataset_acceleration_ingestion_lag_ms";
+pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_worker_panics";
+
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
 
 pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -33,7 +41,7 @@ pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("dataset_acceleration_last_refresh_time_ms")
-        .with_description("Unix timestamp in seconds when the last refresh completed.")
+        .with_description("Unix timestamp in milliseconds when the last refresh completed.")
         .with_unit("ms")
         .build()
 });
@@ -46,9 +54,44 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .build()
 });
 
+pub(crate) static REFRESH_WORKER_PANICS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter(METRIC_REFRESH_WORKER_PANICS)
+        .with_description("Number of times a refresh worker panicked while refreshing a dataset.")
+        .build()
+});
+
 pub(crate) static READY_STATE_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("accelerated_ready_state_federated_fallback")
         .with_description("Number of times the federated table was queried due to the accelerated table loading the initial data.")
+        .build()
+});
+
+pub(crate) static MAX_TIMESTAMP_BEFORE_REFRESH_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge(METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS)
+        .with_description("Maximum value of the dataset's time_column before the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static MAX_TIMESTAMP_AFTER_REFRESH_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge(METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS)
+        .with_description("Maximum value of the dataset's time_column after the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static REFRESH_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge(METRIC_REFRESH_LAG_MS)
+        .with_description("Difference between the maximum time_column value after and before the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge(METRIC_INGESTION_LAG_MS)
+        .with_description("Lag between the current wall-clock time and the maximum time_column value after the refresh operation, in milliseconds.")
         .build()
 });

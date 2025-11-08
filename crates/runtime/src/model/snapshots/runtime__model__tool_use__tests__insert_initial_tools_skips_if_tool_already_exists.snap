@@ -1,0 +1,28 @@
+---
+source: crates/runtime/src/model/tool_use.rs
+expression: result
+snapshot_kind: text
+---
+[
+  {
+    "role": "system",
+    "content": "You are a helpful assistant"
+  },
+  {
+    "role": "user",
+    "content": "Hello"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "test_id",
+        "type": "function",
+        "function": {
+          "name": "list_datasets",
+          "arguments": "{}"
+        }
+      }
+    ]
+  }
+]

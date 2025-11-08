@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::DatabaseName;
 use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
-use crate::dataconnector::parameters::aws::load_config;
+use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
 use crate::dataconnector::{DataConnector, parameters};
 use crate::{
     Runtime,
@@ -118,7 +118,7 @@ impl GlueCatalogProvider {
     ) -> Result<Self> {
         Self::validate_parameters(&mut parameters).await?;
 
-        let config = load_config(
+        let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
             "key",
@@ -127,7 +127,9 @@ impl GlueCatalogProvider {
             &parameters.parameters,
         )
         .await
-        .context(ConfigurationLoadingFailedSnafu)?;
+        .context(ConfigurationLoadingFailedSnafu)?
+        .load()
+        .await;
 
         let client = Client::new(&config);
 
@@ -176,7 +178,8 @@ impl GlueCatalogProvider {
                     parameters.insert("catalog_id".to_string(), catalog_id.to_string().into());
                 }
 
-                let connector = GlueDataConnector::new(parameters);
+                let connector =
+                    GlueDataConnector::new(parameters, self.parameters.io_runtime.clone());
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
@@ -329,11 +332,11 @@ fn database_might_match(database: &str, patterns: &[String]) -> bool {
 
 fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
     let database_with_table = format!("{database}.{table}");
-    if let Some(include) = include {
-        if !include.is_match(&database_with_table) {
-            tracing::debug!("skipping table {database_with_table}");
-            return false;
-        }
+    if let Some(include) = include
+        && !include.is_match(&database_with_table)
+    {
+        tracing::debug!("skipping table {database_with_table}");
+        return false;
     }
     true
 }

@@ -257,13 +257,13 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
         .build()
         .run()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to run query: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run query: {e:?}"))?;
 
     let collected_data = query_result
         .data
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to collect query results: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to collect query results: {e:?}"))?;
 
     Ok(collected_data)
 }
@@ -277,11 +277,8 @@ async fn init_spice_app(
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion_configuration_fn(configure_test_datafusion)
-        .build()
-        .await;
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
 
     let cloned_rt = Arc::new(rt.clone());
 

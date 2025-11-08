@@ -123,26 +123,16 @@ impl Read for FlightSQLFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider = match schema {
-            Some(schema) => Arc::new(FlightSQLTable::create_with_schema(
+        let table_provider = Arc::new(
+            FlightSQLTable::create(
                 "flightsql",
                 &self.endpoint,
                 self.client.clone(),
                 table_reference,
-                schema,
-            )),
-            None => Arc::new(
-                FlightSQLTable::create(
-                    "flightsql",
-                    &self.endpoint,
-                    self.client.clone(),
-                    table_reference,
-                )
-                .await?,
-            ),
-        };
+            )
+            .await?,
+        );
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
@@ -218,10 +208,10 @@ impl FlightSQLTable {
     }
 
     fn get_str_from_record_batch(b: &RecordBatch, row: usize, col_name: &str) -> Option<String> {
-        if let Some(col_array) = b.column_by_name(col_name) {
-            if let Some(y) = col_array.as_any().downcast_ref::<array::StringArray>() {
-                return Some(y.value(row).to_string());
-            }
+        if let Some(col_array) = b.column_by_name(col_name)
+            && let Some(y) = col_array.as_any().downcast_ref::<array::StringArray>()
+        {
+            return Some(y.value(row).to_string());
         }
         None
     }

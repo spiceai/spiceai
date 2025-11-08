@@ -27,11 +27,14 @@ use runtime::{
     accelerated_table::{
         AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
     },
-    component::dataset::{
-        Mode, TimeFormat,
-        acceleration::{Acceleration, RefreshMode},
-        builder::DatasetBuilder,
-        replication::Replication,
+    component::{
+        access::AccessMode,
+        dataset::{
+            TimeFormat,
+            acceleration::{Acceleration, RefreshMode},
+            builder::DatasetBuilder,
+            replication::Replication,
+        },
     },
     dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
@@ -142,7 +145,11 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .context(UnableToConnectToSpiceCloudSnafu)?;
         let response = client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)
@@ -299,6 +306,8 @@ async fn get_spiceai_table_provider(
         });
     };
 
+    let io_runtime = runtime.tokio_io_runtime();
+
     let mut dataset = DatasetBuilder::try_new(cloud_dataset_path.to_string(), name)
         .boxed()
         .context(UnableToCreateDataConnectorSnafu)?
@@ -308,11 +317,11 @@ async fn get_spiceai_table_provider(
         .boxed()
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    dataset.mode = Mode::ReadWrite;
+    dataset.access = AccessMode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
     let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
-        .build(secrets)
+        .build(secrets, io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
@@ -348,9 +357,13 @@ pub async fn create_synced_internal_accelerated_table(
     runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let ctx = Arc::clone(&runtime.datafusion().ctx);
-    let source_table_provider =
-        get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets), runtime)
-            .await?;
+    let source_table_provider = get_spiceai_table_provider(
+        table_reference.table(),
+        from,
+        Arc::clone(&secrets),
+        Arc::clone(&runtime),
+    )
+    .await?;
     let federated_table = Arc::new(FederatedTable::new_unchecked(source_table_provider));
 
     let accelerated_table_provider = accelerator_engine_registry
@@ -373,7 +386,9 @@ pub async fn create_synced_internal_accelerated_table(
         "spice.ai".to_string(),
         accelerated_table_provider,
         refresh,
+        runtime.tokio_io_runtime(),
     );
+    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
 
     builder.retention(retention);
 

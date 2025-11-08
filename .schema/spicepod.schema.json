@@ -81,6 +81,17 @@
         "$ref": "#/$defs/Secret"
       }
     },
+    "snapshots": {
+      "description": "Optional acceleration snapshot configuration",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Snapshots"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "tools": {
       "type": "array",
       "items": {
@@ -140,7 +151,7 @@
           ]
         },
         "mode": {
-          "$ref": "#/$defs/Mode2",
+          "$ref": "#/$defs/Mode",
           "default": "memory"
         },
         "on_conflict": {
@@ -166,7 +177,7 @@
         "partition_by": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/PartitionedBy"
           }
         },
         "primary_key": {
@@ -273,9 +284,20 @@
             "string",
             "null"
           ]
+        },
+        "snapshots": {
+          "description": "Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.\n\n Options: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n `disabled` (default) will turn off snapshots for this dataset.\n `enabled` will enable both creating and bootstrapping from snapshots.\n `bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n `create_only` will only create snapshots, it won't attempt to bootstrap from one.",
+          "$ref": "#/$defs/SnapshotBehavior"
         }
       },
       "additionalProperties": false
+    },
+    "AccessMode": {
+      "type": "string",
+      "enum": [
+        "read",
+        "read_write"
+      ]
     },
     "ApiKey": {
       "oneOf": [
@@ -356,6 +378,14 @@
       },
       "additionalProperties": false
     },
+    "BootstrapOnFailureBehavior": {
+      "type": "string",
+      "enum": [
+        "warn",
+        "retry",
+        "fallback"
+      ]
+    },
     "CacheConfig": {
       "type": "object",
       "properties": {
@@ -398,6 +428,16 @@
     "Caching": {
       "type": "object",
       "properties": {
+        "embeddings": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "search_results": {
           "anyOf": [
             {
@@ -429,6 +469,9 @@
             "string",
             "null"
           ]
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
         },
         "dataset_params": {
           "anyOf": [
@@ -483,6 +526,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -756,6 +800,9 @@
             }
           ]
         },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
         "check_availability": {
           "description": "Configures whether the dataset availability monitor is enabled for this dataset.\n When enabled, the runtime will periodically check dataset availability\n and report metrics. Dataset availability is only checked if the dataset is not accelerated.",
           "$ref": "#/$defs/CheckAvailability"
@@ -800,9 +847,6 @@
               "type": "null"
             }
           ]
-        },
-        "mode": {
-          "$ref": "#/$defs/Mode"
         },
         "name": {
           "type": "string"
@@ -955,6 +999,7 @@
           "additionalProperties": true
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -998,6 +1043,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "name",
         "dataset",
@@ -1036,6 +1082,22 @@
         "enabled": {
           "type": "boolean"
         },
+        "index_directory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index_store": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IndexStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "row_id": {
           "type": [
             "array",
@@ -1054,7 +1116,18 @@
       "type": "string",
       "enum": [
         "siphash",
-        "ahash"
+        "ahash",
+        "xxh3",
+        "xxh32",
+        "xxh64",
+        "xxh128"
+      ]
+    },
+    "IndexStore": {
+      "type": "string",
+      "enum": [
+        "memory",
+        "file"
       ]
     },
     "IndexType": {
@@ -1092,6 +1165,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "api_key"
       ]
@@ -1126,13 +1200,6 @@
       ]
     },
     "Mode": {
-      "type": "string",
-      "enum": [
-        "read",
-        "read_write"
-      ]
-    },
-    "Mode2": {
       "type": "string",
       "enum": [
         "memory",
@@ -1191,6 +1258,7 @@
           "additionalProperties": true
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -1252,6 +1320,14 @@
         "upsert_dedup_by_row_id"
       ]
     },
+    "OutputLevel": {
+      "type": "string",
+      "enum": [
+        "info",
+        "verbose",
+        "very_verbose"
+      ]
+    },
     "ParamValue": {
       "anyOf": [
         {
@@ -1274,6 +1350,51 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/ParamValue"
+      }
+    },
+    "PartitionedBy": {
+      "type": "object",
+      "properties": {
+        "expression": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "expression"
+      ]
+    },
+    "Query": {
+      "type": "object",
+      "properties": {
+        "memory_limit": {
+          "description": "Specifies the runtime memory limit. When configured, will spill to disk\n for supported queries larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spill_compression": {
+          "description": "Specifies the compression codec used when spilling data to disk.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpillCompression"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temp_directory": {
+          "description": "Configures where the runtime will store temporary files needed for operations like\n spilling to disk for queries & accelerations that are larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "ReadyState": {
@@ -1444,11 +1565,25 @@
             }
           ]
         },
-        "memory_limit": {
-          "description": "Specifies the runtime memory limit. When configured, will spill to disk\n for supported queries larger than memory.",
-          "type": [
-            "string",
-            "null"
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_level": {
+          "description": "Configures log level for the runtime. Can be overriden if flags or environment variables\n are set.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutputLevel"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "params": {
@@ -1456,6 +1591,16 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "query": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Query"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "results_cache": {
           "anyOf": [
@@ -1479,13 +1624,6 @@
         },
         "telemetry": {
           "$ref": "#/$defs/TelemetryConfig"
-        },
-        "temp_directory": {
-          "description": "Configures where the runtime will store temporary files needed for operations like\n spilling to disk for queries & accelerations that are larger than memory.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
@@ -1574,10 +1712,69 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
       ]
+    },
+    "SnapshotBehavior": {
+      "oneOf": [
+        {
+          "description": "Snapshots are disabled (default).",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "Enable both creating and bootstrapping from snapshots.",
+          "type": "string",
+          "const": "enabled"
+        },
+        {
+          "description": "Only bootstrap from existing snapshots, don't attempt to create new ones.",
+          "type": "string",
+          "const": "bootstrap_only"
+        },
+        {
+          "description": "Only create new snapshots.",
+          "type": "string",
+          "const": "create_only"
+        }
+      ]
+    },
+    "Snapshots": {
+      "description": "Datasets accelerated using a file-mode acceleration\n engine (i.e. `Sqlite` or `DuckDB`) can bootstrap from a DB\n file on object storage (i.e. S3) if the acceleration file\n does not exist on startup using this configuration.\n\n Each dataset needs to opt-in for snapshots in addition to this config.",
+      "type": "object",
+      "properties": {
+        "bootstrap_on_failure_behavior": {
+          "description": "The behavior when loading a snapshot fails: 'warn', 'retry' or 'fallback'\n\n 'warn' will continue with an empty acceleration after logging a warning.\n `retry` will retry loading the newest snapshot indefinitely until the snapshot is loaded correctly.\n 'fallback' will try older snapshot files if loading newer ones fail.",
+          "$ref": "#/$defs/BootstrapOnFailureBehavior"
+        },
+        "enabled": {
+          "description": "Global enable/disable for dataset snapshots.",
+          "type": "boolean",
+          "default": true
+        },
+        "location": {
+          "description": "The object store location pointing to a folder\n containing the dataset snapshots.\n i.e. `s3://my-bucket/spice/snapshots/`",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Auth params for accessing the object store location.\n For S3, this is the same as the S3 dataset connector params\n with the notable exception that `s3_auth` is set to `iam_role` by default.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "SpicepodKind": {
       "type": "string",
@@ -1592,6 +1789,14 @@
         "v1"
       ]
     },
+    "SpillCompression": {
+      "type": "string",
+      "enum": [
+        "zstd",
+        "lz4_frame",
+        "uncompressed"
+      ]
+    },
     "TaskHistory": {
       "type": "object",
       "properties": {
@@ -1599,9 +1804,27 @@
           "type": "string",
           "default": "none"
         },
+        "captured_plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "enabled": {
           "type": "boolean",
           "default": true
+        },
+        "min_plan_duration": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_sql_duration": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "retention_check_interval": {
           "type": "string",
@@ -1731,6 +1954,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "from",
         "name"
@@ -1792,6 +2016,12 @@
               "type": "null"
             }
           ]
+        },
+        "partition_by": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PartitionedBy"
+          }
         }
       },
       "additionalProperties": false
@@ -1850,8 +2080,19 @@
             "string",
             "null"
           ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -1895,6 +2136,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]

@@ -19,25 +19,32 @@ limitations under the License.
 use std::{path::Path, sync::Arc};
 
 use super::AccelerationSource;
+use snafu::{OptionExt, ResultExt, Snafu};
 
 #[cfg(feature = "postgres")]
 use {
-    datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool,
+    datafusion_table_providers::sql::db_connection_pool::postgrespool::{
+        self, PostgresConnectionPool,
+    },
     datafusion_table_providers::util::secrets::to_secret_map,
 };
 
+#[cfg(feature = "turso")]
+use super::turso::{Error as TursoError, TursoAccelerator};
 #[cfg(feature = "duckdb")]
 use {
-    super::duckdb::DuckDBAccelerator, super::partitioned_duckdb::PartitionedDuckDBAccelerator,
+    super::duckdb::{DuckDBAccelerator, Error as DuckDbError},
+    super::partitioned_duckdb::{Error as PartitionedDuckDbError, PartitionedDuckDBAccelerator},
     datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 #[cfg(feature = "sqlite")]
 use {
-    super::sqlite::SqliteAccelerator,
+    super::sqlite::{Error as SqliteError, SqliteAccelerator},
     datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
 };
 
 use crate::component::dataset::acceleration::Engine;
+use crate::dataaccelerator::get_registered_accelerator;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -53,101 +60,267 @@ enum AccelerationConnection {
     Postgres(PostgresConnectionPool),
     #[cfg(feature = "sqlite")]
     SQLite(SqliteConnectionPool),
+    #[cfg(feature = "turso")]
+    Turso(Arc<super::turso::TursoConnectionPool>),
 }
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Acceleration is not enabled"))]
+    AccelerationNotEnabled,
 
+    #[snafu(display("{engine:?} accelerator engine not available"))]
+    AcceleratorEngineUnavailable { engine: Engine },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("Failed to resolve DuckDB file path: {source}"))]
+    DuckDbFilePath { source: DuckDbError },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("DuckDB file does not exist at {path}"))]
+    DuckDbFileMissing { path: String },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
+    DuckDbPool { source: DuckDbError },
+
+    #[cfg(feature = "duckdb")]
+    #[snafu(display("Unable to create Partitioned DuckDB connection pool: {source}"))]
+    PartitionedDuckDbPool { source: PartitionedDuckDbError },
+
+    #[cfg(feature = "sqlite")]
+    #[snafu(display("Failed to resolve SQLite file path: {source}"))]
+    SqliteFilePath { source: SqliteError },
+
+    #[cfg(feature = "sqlite")]
+    #[snafu(display("SQLite file does not exist at {path}"))]
+    SqliteFileMissing { path: String },
+
+    #[cfg(feature = "sqlite")]
+    #[snafu(display("Unable to create SQLite connection pool: {source}"))]
+    SqlitePool { source: SqliteError },
+
+    #[cfg(feature = "postgres")]
+    #[snafu(display("Unable to create PostgreSQL connection pool: {source}"))]
+    PostgresPool { source: postgrespool::Error },
+
+    #[cfg(not(feature = "duckdb"))]
+    #[snafu(display("Spice wasn't built with DuckDB support enabled"))]
+    DuckDbFeatureNotEnabled,
+
+    #[cfg(not(feature = "sqlite"))]
+    #[snafu(display("Spice wasn't built with SQLite support enabled"))]
+    SqliteFeatureNotEnabled,
+
+    #[cfg(not(feature = "postgres"))]
+    #[snafu(display("Spice wasn't built with PostgreSQL support enabled"))]
+    PostgresFeatureNotEnabled,
+
+    #[cfg(feature = "turso")]
+    #[snafu(display("Failed to resolve Turso file path: {source}"))]
+    TursoFilePath { source: TursoError },
+
+    #[cfg(feature = "turso")]
+    #[snafu(display("Turso file does not exist at {path}"))]
+    TursoFileMissing { path: String },
+
+    #[cfg(feature = "turso")]
+    #[snafu(display("Unable to create Turso connection: {source}"))]
+    TursoConnection { source: TursoError },
+
+    #[cfg(not(feature = "turso"))]
+    #[snafu(display("Spice wasn't built with Turso support enabled"))]
+    TursoFeatureNotEnabled,
+
+    #[snafu(display("{engine} acceleration not supported"))]
+    UnsupportedEngine { engine: Engine },
+
+    #[snafu(display("No acceleration connection available"))]
+    NoAccelerationConnection,
+
+    #[snafu(display("Failed to downcast to {target}"))]
+    DowncastFailed { target: &'static str },
+
+    #[snafu(display("{source}"))]
+    External {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl Error {
+    fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::External { source: err.into() }
+    }
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum OpenOption {
+    CreateIfNotExists,
+    OpenExisting,
+}
+
+#[allow(clippy::too_many_lines)]
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
-    create_table_if_not_exists: bool,
+    open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
-    let runtime = source.runtime();
-
-    let acceleration_settings = source.acceleration().ok_or("Acceleration is not enabled")?;
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
     match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = runtime
-                .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings.engine)
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
                 .await
-                .ok_or("DuckDB accelerator engine not available")?;
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::DuckDB,
+                })?;
 
             let duckdb_accelerator = accelerator
                 .as_any()
                 .downcast_ref::<DuckDBAccelerator>()
-                .ok_or("Accelerator is not a DuckDBAccelerator")?;
+                .context(DowncastFailedSnafu {
+                    target: "DuckDBAccelerator",
+                })?;
 
-            let duckdb_file = duckdb_accelerator.duckdb_file_path(source)?;
-            if !create_table_if_not_exists && !Path::new(&duckdb_file).exists() {
-                return Err("DuckDB file does not exist.".into());
+            let duckdb_file = duckdb_accelerator
+                .duckdb_file_path(source)
+                .context(DuckDbFilePathSnafu)?;
+            if open_option == OpenOption::OpenExisting && !Path::new(&duckdb_file).exists() {
+                return DuckDbFileMissingSnafu { path: duckdb_file }.fail();
             }
 
             let pool = duckdb_accelerator
                 .get_shared_pool(source)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context(DuckDbPoolSnafu)?;
 
             Ok(AccelerationConnection::DuckDB(Arc::new(pool)))
         }
         #[cfg(feature = "duckdb")]
         Engine::PartitionedDuckDB => {
-            let accelerator = runtime
-                .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings.engine)
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
                 .await
-                .ok_or("DuckDB accelerator engine not available")?;
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::PartitionedDuckDB,
+                })?;
             let duckdb_accelerator = accelerator
                 .as_any()
                 .downcast_ref::<PartitionedDuckDBAccelerator>()
-                .ok_or("Accelerator is not a PartitionedDuckDBAccelerator")?;
+                .context(DowncastFailedSnafu {
+                    target: "PartitionedDuckDBAccelerator",
+                })?;
 
             let pool = duckdb_accelerator
                 .get_shared_pool(source)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context(PartitionedDuckDbPoolSnafu)?;
+
+            Ok(AccelerationConnection::DuckDB(pool))
+        }
+        #[cfg(feature = "duckdb")]
+        Engine::TableModePartitionedDuckDB => {
+            use crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
+
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::TableModePartitionedDuckDB,
+                })?;
+            let duckdb_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<TablesModePartitionedDuckDBAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "TableModePartitionedDuckDBAccelerator",
+                })?;
+
+            let pool = duckdb_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(PartitionedDuckDbPoolSnafu)?;
 
             Ok(AccelerationConnection::DuckDB(pool))
         }
         #[cfg(not(feature = "duckdb"))]
-        Engine::DuckDB | Engine::PartitionedDuckDB => {
-            Err("Spice wasn't built with DuckDB support enabled".into())
+        Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+            DuckDbFeatureNotEnabledSnafu.fail()
         }
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = runtime
-                .accelerator_engine_registry()
-                .get_accelerator_engine(acceleration_settings.engine)
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
                 .await
-                .ok_or("Sqlite accelerator engine not available")?;
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::Sqlite,
+                })?;
             let sqlite_accelerator = accelerator
                 .as_any()
                 .downcast_ref::<SqliteAccelerator>()
-                .ok_or("Accelerator is not a SqliteAccelerator")?;
+                .context(DowncastFailedSnafu {
+                    target: "SqliteAccelerator",
+                })?;
 
-            let sqlite_file = sqlite_accelerator.sqlite_file_path(source)?;
-            if !create_table_if_not_exists && !Path::new(&sqlite_file).exists() {
-                return Err("Sqlite file does not exist.".into());
+            let sqlite_file = sqlite_accelerator
+                .sqlite_file_path(source)
+                .context(SqliteFilePathSnafu)?;
+            if open_option == OpenOption::OpenExisting && !Path::new(&sqlite_file).exists() {
+                return SqliteFileMissingSnafu { path: sqlite_file }.fail();
             }
 
-            let conn = sqlite_accelerator.get_shared_pool(source).await?;
+            let conn = sqlite_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(SqlitePoolSnafu)?;
 
             Ok(AccelerationConnection::SQLite(conn))
         }
         #[cfg(not(feature = "sqlite"))]
-        Engine::Sqlite => Err("Spice wasn't built with Sqlite support enabled".into()),
+        Engine::Sqlite => SqliteFeatureNotEnabledSnafu.fail(),
         #[cfg(feature = "postgres")]
         Engine::PostgreSQL => {
             let secret_map = to_secret_map(acceleration_settings.params.clone());
 
             let pool = PostgresConnectionPool::new(secret_map)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context(PostgresPoolSnafu)?;
 
             Ok(AccelerationConnection::Postgres(pool))
         }
         #[cfg(not(feature = "postgres"))]
-        Engine::PostgreSQL => Err("Spice wasn't built with PostgreSQL support enabled".into()),
-        Engine::Arrow => Err("Arrow acceleration not supported for metadata".into()),
+        Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
+
+        #[cfg(feature = "turso")]
+        Engine::Turso => {
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::Turso,
+                })?;
+            let turso_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<TursoAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "TursoAccelerator",
+                })?;
+
+            let turso_file = turso_accelerator
+                .turso_file_path(source)
+                .context(TursoFilePathSnafu)?;
+            if open_option == OpenOption::OpenExisting && !Path::new(&turso_file).exists() {
+                return TursoFileMissingSnafu { path: turso_file }.fail();
+            }
+
+            let pool = turso_accelerator
+                .get_shared_pool(source)
+                .await
+                .context(TursoConnectionSnafu)?;
+
+            Ok(AccelerationConnection::Turso(pool))
+        }
+        #[cfg(not(feature = "turso"))]
+        Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
+        Engine::Arrow | Engine::Cayenne => UnsupportedEngineSnafu {
+            engine: acceleration_settings.engine,
+        }
+        .fail(),
     }
 }

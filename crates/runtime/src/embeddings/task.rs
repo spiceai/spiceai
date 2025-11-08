@@ -20,13 +20,11 @@ use async_openai::types::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
 use async_trait::async_trait;
-use llms::{
-    chunking::{Chunker, ChunkingConfig},
-    embeddings::{Embed, Result as EmbedResult, get_or_infer_size},
-};
+use cache::key::CacheKey;
+use chunking::{Chunker, ChunkingConfig};
+use llms::embeddings::{Embed, Result as EmbedResult, get_or_infer_size};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing::{Instrument, Span};
-
-use crate::request::{AsyncMarker, RequestContext};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};
 
@@ -91,6 +89,14 @@ impl Embed for TaskEmbed {
 
     async fn health<'b>(&'b self) -> EmbedResult<()> {
         self.inner.health().await
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        Some(self.name.as_str())
+    }
+
+    fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
+        self.inner.embedding_input_cache_key(input)
     }
 
     fn size(&self) -> i32 {

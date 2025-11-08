@@ -24,7 +24,7 @@ use std::{
 use crate::{
     Runtime,
     component::{ComponentInitialization, catalog::Catalog},
-    dataconnector::{ConnectorComponent, parameters::ConnectorParams, s3},
+    dataconnector::{ConnectorComponent, parameters::ConnectorParams},
     parameters::{ParameterSpec, Parameters},
 };
 use async_trait::async_trait;
@@ -75,6 +75,9 @@ pub enum Error {
         "Failed to initiate catalog, app reference cannot be obtained from the runtime."
     ))]
     FailedToGetAppFromRuntime {},
+
+    #[snafu(transparent)]
+    IcebergSnafu { source: iceberg::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -147,7 +150,7 @@ pub async fn register_all() {
         CatalogConnectorFactory::new(
             glue::GlueCatalog::new_connector,
             glue::PREFIX,
-            &s3::PARAMETERS,
+            &super::dataconnector::glue::PARAMETERS,
         ),
     );
 
@@ -198,13 +201,13 @@ impl CatalogConnectorFactory {
     }
 }
 
-/// A `CatalogConnector` knows how to connect to a remote catalog and create a DataFusion `CatalogProvider`.
+/// A `CatalogConnector` knows how to connect to a remote catalog and create a `DataFusion` `CatalogProvider`.
 #[async_trait]
 pub trait CatalogConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    /// Returns a DataFusion `CatalogProvider` which can automatically populate tables from a remote catalog.
-    /// The returned provider must implement RefreshableCatalogProvider which will be used to refresh the catalog.
+    /// Returns a `DataFusion` `CatalogProvider` which can automatically populate tables from a remote catalog.
+    /// The returned provider must implement `RefreshableCatalogProvider` which will be used to refresh the catalog.
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         _runtime: Arc<Runtime>,

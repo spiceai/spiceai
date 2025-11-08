@@ -39,6 +39,7 @@ use runtime::{
     accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::acceleration::Acceleration;
+use tokio::runtime::Handle;
 use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -118,7 +119,9 @@ async fn create_refresh_task(
             Arc::clone(&accelerated_table.get_federated_table()),
             None,
             accelerated_table.get_accelerator(),
+            Handle::current(),
         )
+        .with_cpu_runtime(rt.datafusion().cpu_runtime().cloned())
         .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))
@@ -169,11 +172,8 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .with_dataset(ds_default_retries)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

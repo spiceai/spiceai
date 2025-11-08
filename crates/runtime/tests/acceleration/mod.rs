@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    component::dataset::Dataset,
+    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
 use spicepod::{acceleration::Mode, param::Params};
 
@@ -25,6 +26,8 @@ mod checkpoint_duckdb;
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
+#[cfg(feature = "turso")]
+mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
 #[cfg(feature = "sqlite")]
@@ -33,7 +36,10 @@ mod file_watcher;
 mod on_conflict;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
+#[cfg(not(target_os = "windows"))]
+mod partition_by_cayenne;
 mod query_push_down;
+mod refresh;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 
@@ -57,7 +63,7 @@ async fn wait_for_checkpoints(
 
     for dataset in datasets {
         let check_future = async move {
-            match DatasetCheckpoint::try_new(&dataset).await {
+            match DatasetCheckpoint::try_new(&dataset, OpenOption::OpenExisting).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

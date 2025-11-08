@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::RecordBatch;
 use crate::configure_test_datafusion;
+use crate::init_tracing;
 use crate::utils::test_request_context;
 use app::AppBuilder;
 use arrow::util::pretty::pretty_format_batches;
@@ -79,11 +80,8 @@ async fn run_delta_lake_test(
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion_configuration_fn(configure_test_datafusion)
-        .build()
-        .await;
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
 
     let cloned_rt = Arc::new(rt.clone());
 
@@ -115,6 +113,8 @@ async fn run_delta_lake_test(
 
 #[tokio::test]
 async fn query_delta_lake_with_partitions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
     test_request_context().scope(async {
         let path = setup_test_data(
             "https://public-data.spiceai.org/delta-lake-nation-with-partitionkey.zip",
@@ -172,6 +172,8 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
 
 #[tokio::test]
 async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
     test_request_context()
         .scope(async {
             let path = setup_test_data(
@@ -225,6 +227,8 @@ async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
 
 #[tokio::test]
 async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
     test_request_context()
         .scope(async {
             let path = setup_test_data(
@@ -261,6 +265,8 @@ async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
 
 #[tokio::test]
 async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
     test_request_context()
         .scope(async {
             let path = setup_test_data(

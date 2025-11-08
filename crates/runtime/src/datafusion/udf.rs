@@ -16,60 +16,58 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::{functions::math::random::RandomFunc, prelude::SessionContext};
-use runtime_datafusion_udfs::{alias, bucket, cosine_distance, truncate};
+use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
+use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
+use crate::search::rrf;
+use crate::search::rrf::RRF_UDF_NAME;
+use crate::search::util::parse_explicit_primary_keys;
+use datafusion::functions::math::random::RandomFunc;
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::ai;
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::embed;
+use runtime_datafusion_udfs::{alias, bucket, cosine_distance, digest_many, truncate};
 
-// UDFs that need a reference to [`crate::datafusion::DataFusion`] must be defined in [`crate::builder::RuntimeBuilder::build`].
-pub fn register_udfs(ctx: &SessionContext) {
+pub async fn register_udfs(runtime: &crate::Runtime) {
+    let ctx = &runtime.df.ctx;
     ctx.register_udf(alias::ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(bucket::Bucket::new().into());
     ctx.register_udf(cosine_distance::CosineDistance::new().into());
     ctx.register_udf(truncate::Truncate::new().into());
-}
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+    ctx.register_udf(TextSearchTableFunc::new(Arc::downgrade(&runtime.df)).into());
+    ctx.register_udtf(
+        TEXT_SEARCH_UDTF_NAME,
+        Arc::new(TextSearchTableFunc::new(Arc::downgrade(&runtime.df))),
+    );
 
-    use arrow::{
-        array::{Float64Array, Int64Array, RecordBatch},
-        datatypes::{Field, Schema},
-    };
-    use arrow_schema::DataType;
-    use datafusion::{assert_batches_eq, datasource::MemTable, prelude::SessionContext};
+    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    ctx.register_udf(
+        VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
+    );
+    ctx.register_udtf(
+        VECTOR_SEARCH_UDTF_NAME,
+        Arc::new(VectorSearchTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            explicit_pks,
+        )),
+    );
 
-    #[tokio::test]
-    async fn test_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
+    ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(ctx).into());
+    ctx.register_udtf(
+        RRF_UDF_NAME,
+        Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
+    );
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Float64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(Float64Array::from(vec![0.9, 2.1, 3.0])),
-            ],
-        )?;
-        let table = MemTable::try_new(schema, vec![vec![batch]])?;
-        ctx.register_table("t1", Arc::new(table))?;
-        let sql = "SELECT greatest(a, 2), least(a, 2), greatest(a, b), least(a, b), greatest(a, b, 2), least(a, b, 2) from t1";
-        let actual = ctx.sql(sql).await?.collect().await?;
-
-        assert_batches_eq!(
-            &[
-                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-                "| greatest(t1.a,Int64(2)) | least(t1.a,Int64(2)) | greatest(t1.a,t1.b) | least(t1.a,t1.b) | greatest(t1.a,t1.b,Int64(2)) | least(t1.a,t1.b,Int64(2)) |",
-                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-                "| 2                       | 1                    | 1.0                 | 0.9              | 2.0                          | 0.9                       |",
-                "| 2                       | 2                    | 2.1                 | 2.0              | 2.1                          | 2.0                       |",
-                "| 3                       | 2                    | 3.0                 | 3.0              | 3.0                          | 2.0                       |",
-                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-            ],
-            &actual
+    #[cfg(feature = "models")]
+    {
+        ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
+        ctx.register_udf(
+            ai::Ai::new(runtime.completion_llms())
+                .into_async_udf()
+                .into_scalar_udf(),
         );
-        Ok(())
     }
+
+    ctx.register_udf(digest_many::INSTANCE.clone());
 }

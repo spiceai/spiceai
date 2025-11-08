@@ -150,11 +150,8 @@ async fn run_iceberg_test(
 ) -> Result<Runtime, anyhow::Error> {
     let app = AppBuilder::new(app_name).with_dataset(dataset).build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion_configuration_fn(configure_test_datafusion)
-        .build()
-        .await;
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {

@@ -17,15 +17,18 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
+    CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
     acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
+use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
+    acceleration as spicepod_acceleration,
     component::{
         dataset::{self as spicepod_dataset},
         embeddings::ColumnEmbeddingConfig,
@@ -39,7 +42,7 @@ use spicepod::{
 pub struct DatasetBuilder {
     pub from: String,
     pub name: TableReference,
-    pub mode: Mode,
+    pub access: AccessMode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
@@ -50,6 +53,7 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub acceleration_snapshot: spicepod_acceleration::SnapshotBehavior,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -76,6 +80,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
+        let acceleration_snapshot = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
+                a.snapshots
+            });
+
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -94,25 +105,12 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
                     dataset.name
                 );
             }
-
-            // Chunking with vector engines is not supported (yet).
-            for column in &dataset.columns {
-                for embedding in &column.embeddings {
-                    if embedding.chunking.is_some() {
-                        return Err(crate::Error::InvalidSpicepodDataset {
-                            source: Error::ChunkingNotSupportedForVectorEngine {
-                                column: column.name.clone(),
-                            },
-                        });
-                    }
-                }
-            }
         }
 
         Ok(DatasetBuilder {
             from: dataset.from,
             name: table_reference,
-            mode: Mode::from(dataset.mode),
+            access: AccessMode::from(dataset.access),
             params: dataset
                 .params
                 .as_ref()
@@ -134,6 +132,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
+            acceleration_snapshot,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -153,7 +152,7 @@ impl DatasetBuilder {
         Ok(DatasetBuilder {
             from,
             name: Self::parse_table_reference(name)?,
-            mode: Mode::default(),
+            access: AccessMode::default(),
             params: HashMap::default(),
             metadata: HashMap::default(),
             columns: Vec::default(),
@@ -164,6 +163,7 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
+            acceleration_snapshot: spicepod_acceleration::SnapshotBehavior::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -227,7 +227,7 @@ impl DatasetBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Dataset> {
+    pub fn build(mut self) -> Result<Dataset> {
         let app = self.app.ok_or(Error::UnableToBuildDataset {
             dataset: self.name.to_string(),
             missing_component: "app".to_string(),
@@ -237,10 +237,19 @@ impl DatasetBuilder {
             missing_component: "runtime".to_string(),
         })?;
 
+        if let Some(acceleration) = self.acceleration.as_mut() {
+            acceleration.snapshots = SnapshotBehavior::from(
+                app.snapshots.clone(),
+                self.acceleration_snapshot,
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+            );
+        }
+
         let dataset = Dataset {
             from: self.from,
             name: self.name,
-            mode: self.mode,
+            access: self.access,
             params: self.params,
             metadata: self.metadata,
             columns: self.columns,
@@ -253,7 +262,6 @@ impl DatasetBuilder {
             acceleration: self.acceleration,
             embeddings: self.embeddings,
             app,
-            schema: None,
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
             metrics: self.metrics,

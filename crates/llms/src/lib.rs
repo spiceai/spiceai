@@ -18,7 +18,6 @@ pub mod accumulate;
 pub mod anthropic;
 pub mod bedrock;
 pub mod chat;
-pub mod chunking;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
@@ -27,6 +26,7 @@ pub mod openai;
 pub mod perplexity;
 pub mod progress;
 pub mod responses;
+pub mod streaming_utils;
 pub mod xai;
 
 pub enum HealthCheck {

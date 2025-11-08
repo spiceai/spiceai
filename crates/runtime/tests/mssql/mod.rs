@@ -34,6 +34,7 @@ use tracing::instrument;
 const MSSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-types-mssql";
 const MSSQL_PORT: u16 = 11433;
 
+#[allow(clippy::too_many_lines)]
 #[instrument]
 async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     let mut config = tiberius::Config::new();
@@ -198,11 +199,8 @@ async fn mssql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mssql_dataset("test", "test", MSSQL_PORT))
                 .build();
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

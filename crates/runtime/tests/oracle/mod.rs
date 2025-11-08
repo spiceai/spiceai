@@ -35,6 +35,7 @@ use tracing::instrument;
 const ORACLE_DOCKER_CONTAINER: &str = "runtime-integration-test-oracle";
 const ORACLE_PORT: u16 = 15210;
 
+#[allow(clippy::too_many_lines)]
 #[instrument]
 async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
     let connector = oracle_connector::new(
@@ -200,9 +201,9 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
                 .with_dataset(accelerated_ds)
                 .build();
 
+            configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -301,11 +302,8 @@ async fn oracle_test_cloud_mtls() -> Result<(), anyhow::Error> {
                 .with_dataset(ds)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 

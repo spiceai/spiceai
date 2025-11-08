@@ -95,7 +95,7 @@ func getRustArch() string {
 	return runtime.GOARCH
 }
 
-// GPU versions that are supported via dedicated CUDA builds
+// GPU versions that are supported via dedicated CUDA builds (Linux only)
 var supportedCudaVersionsBinaries = []string{"80", "86", "87", "89", "90"}
 
 func checkCudaVersionSupported(computeCap string) bool {
@@ -119,7 +119,7 @@ func get_ai_accelerator() (string, bool) {
 		}
 	}
 
-	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+	if runtime.GOOS == "linux" {
 		version, err := get_cuda_version()
 		if err != nil {
 			slog.Debug("Failed to check for CUDA device", "error", err)
@@ -157,7 +157,7 @@ func has_metal_device() (bool, error) {
 }
 
 func get_cuda_version() (*string, error) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+	if runtime.GOOS != "linux" {
 		return nil, nil
 	}
 

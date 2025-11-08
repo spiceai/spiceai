@@ -19,8 +19,6 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use byte_unit::Byte;
@@ -48,6 +46,8 @@ use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
+use crate::result::embeddings::CachedEmbeddingResult;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
@@ -64,12 +64,25 @@ pub enum Error {
 
     #[snafu(display("Cache invalidation failed with error: {source}."))]
     FailedToInvalidateCacheGeneric { source: moka::PredicateError },
+
+    #[snafu(display(
+        "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
+    ))]
+    InvalidHashingAlgorithm,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
+}
+
+impl Sizeable for Vec<Vec<f32>> {
+    fn get_memory_size(&self) -> usize {
+        self.iter()
+            .map(|vec| vec.len() * std::mem::size_of::<f32>())
+            .sum()
+    }
 }
 
 pub trait HashProvider {
@@ -88,30 +101,129 @@ impl AsTableRefs for LogicalPlan {
 }
 
 #[async_trait]
-pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
-    HashProvider + std::fmt::Debug
+pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
+    HashProvider + std::fmt::Debug + std::fmt::Display
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
     fn invalidate_all(&self);
-
-    /// Invalidates all cache entries for the specified table.
-    ///
-    /// # Errors
-    ///
-    /// If the cache invalidation fails.
-    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
 }
 
+/// A ``TabledCacheProvider`` represents a cache that can invalidate entries based on table references which their values reference.
+pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
+    CacheProvider<V>
+{
+    /// Invalidates all cache entries for the specified table.
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails.
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub enum HashBuilder {
+    Ahash(ahash::RandomState),
+    Siphash(std::hash::RandomState),
+    #[cfg(feature = "xxhash")]
+    XxHash3(std::hash::BuildHasherDefault<twox_hash::XxHash3_64>),
+    #[cfg(feature = "xxhash")]
+    XxHash32(std::hash::BuildHasherDefault<twox_hash::XxHash32>),
+    #[cfg(feature = "xxhash")]
+    XxHash64(std::hash::BuildHasherDefault<twox_hash::XxHash64>),
+    #[cfg(feature = "xxhash")]
+    XxHash128,
+}
+
+impl std::hash::BuildHasher for HashBuilder {
+    type Hasher = Box<dyn Hasher>;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        match self {
+            HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
+            HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xxhash")]
+            HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xxhash")]
+            HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xxhash")]
+            HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
+            #[cfg(feature = "xxhash")]
+            HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
+        }
+    }
+}
+
+/// Returns a hash builder for the specified algorithm.
+///
+/// # Errors
+/// Return an error if the hashing algorithm is not supported.
+pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuilder, Error> {
+    match hashing_algorithm {
+        HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
+        HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
+        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(std::hash::BuildHasherDefault::<
+            twox_hash::XxHash3_64,
+        >::default())),
+        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(std::hash::BuildHasherDefault::<
+            twox_hash::XxHash32,
+        >::default())),
+        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
+            twox_hash::XxHash64,
+        >::default())),
+        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128),
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::InvalidHashingAlgorithm),
+    }
+}
+
+#[cfg(feature = "xxhash")]
+mod xxhash_compat {
+    use std::hash::Hasher;
+
+    pub struct XxHash3_128Wrapper {
+        hasher: twox_hash::XxHash3_128,
+    }
+
+    impl XxHash3_128Wrapper {
+        pub fn new() -> Self {
+            Self {
+                hasher: twox_hash::XxHash3_128::with_seed(0),
+            }
+        }
+    }
+
+    impl Hasher for XxHash3_128Wrapper {
+        #[allow(clippy::cast_possible_truncation)]
+        fn finish(&self) -> u64 {
+            let hasher_copy = self.hasher.clone();
+            let hash128 = hasher_copy.finish_128();
+
+            let high = (hash128 >> 64) as u64;
+            let low = hash128 as u64;
+            high ^ low
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.hasher.write(bytes);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Caching {
     pub results: Option<Arc<QueryResultsCacheProvider>>,
-    pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
-    pub search: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+    pub plans: Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>>,
+    pub search: Option<Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>>,
+    pub embeddings: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Caching {
@@ -120,6 +232,7 @@ impl std::fmt::Debug for Caching {
             .field("results", &self.results)
             .field("plans", &self.plans)
             .field("search", &self.search)
+            .field("embeddings", &self.embeddings)
             .finish_non_exhaustive()
     }
 }
@@ -139,7 +252,7 @@ impl Caching {
     #[must_use]
     pub fn with_plans_cache(
         mut self,
-        plans: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
+        plans: Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>,
     ) -> Self {
         self.plans = Some(plans);
         self
@@ -148,9 +261,18 @@ impl Caching {
     #[must_use]
     pub fn with_search_cache(
         mut self,
-        search: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
+        search: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
     ) -> Self {
         self.search = Some(search);
+        self
+    }
+
+    #[must_use]
+    pub fn with_embeddings_cache(
+        mut self,
+        embeddings: Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>,
+    ) -> Self {
+        self.embeddings = Some(embeddings);
         self
     }
 
@@ -177,7 +299,7 @@ impl Caching {
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
 pub struct QueryResultsCacheProvider {
-    cache: Arc<dyn CacheProvider<CachedQueryResult> + Send + Sync>,
+    cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
 
@@ -214,19 +336,11 @@ impl QueryResultsCacheProvider {
             None => std::time::Duration::from_secs(1),
         };
 
+        let hash_builder = get_hash_builder(config.hashing_algorithm)?;
+        let cache = Arc::new(LruCache::new(cache_max_size, ttl, hash_builder));
+
         let cache_provider = QueryResultsCacheProvider {
-            cache: match config.hashing_algorithm {
-                HashingAlgorithm::Ahash => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    ahash::RandomState::default(),
-                )),
-                HashingAlgorithm::Siphash => Arc::new(LruCache::new(
-                    cache_max_size,
-                    ttl,
-                    std::hash::RandomState::default(),
-                )),
-            },
+            cache,
             cache_max_size,
             ttl,
             ignore_schemas,
@@ -320,6 +434,9 @@ impl QueryResultsCacheProvider {
                 LogicalPlan::Explain { .. }
                 | LogicalPlan::Analyze { .. }
                 | LogicalPlan::DescribeTable { .. }
+                | LogicalPlan::Ddl(..)
+                | LogicalPlan::Dml(..)
+                | LogicalPlan::Copy { .. }
                 | LogicalPlan::Statement(..) => return false,
                 _ => {}
             }
@@ -341,14 +458,6 @@ impl Display for QueryResultsCacheProvider {
         )
     }
 }
-
-pub(crate) fn current_time_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use utils::tests::parse_sql_to_logical_plan;
@@ -391,5 +500,65 @@ mod tests {
                 .expect("valid cache provider");
 
         assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_insert_into() {
+        let sql = "INSERT INTO customer (id, first_name, last_name, state) VALUES (1, 'John', 'Doe', 'NY')";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_update() {
+        let sql = "UPDATE customer SET first_name = 'Jane' WHERE id = 1";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_delete() {
+        let sql = "DELETE FROM customer WHERE id = 1";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_create_table() {
+        let sql = "CREATE TABLE test_table (id INT, name VARCHAR(50))";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_copy() {
+        let sql = "COPY customer TO 'output.csv'";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
     }
 }

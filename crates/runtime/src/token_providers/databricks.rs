@@ -24,7 +24,8 @@ use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::request::{DatabricksAuthExtension, RequestContext};
+use crate::request::DatabricksAuthExtension;
+use runtime_request_context::RequestContext;
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
@@ -162,7 +163,10 @@ async fn get_m2m_access_token(
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     let token_endpoint_url = format!("https://{databricks_endpoint}/oidc/v1/token");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
     let response = client
         .post(&token_endpoint_url)

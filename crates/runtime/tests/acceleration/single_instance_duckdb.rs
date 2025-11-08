@@ -70,13 +70,8 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 ))
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             let app_ref = rt.app();
             let app_lock = app_ref.read().await;
@@ -92,13 +87,13 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;

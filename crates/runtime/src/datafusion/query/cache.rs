@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{
+    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
+};
+use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
@@ -26,17 +30,10 @@ use datafusion::{
     logical_expr::LogicalPlan,
     sql::TableReference,
 };
+use runtime_request_context::{CacheControl, CacheKeyType, RequestContext};
 use snafu::ResultExt;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
 use tracing::Span;
-
-use super::{
-    BindingParametersSnafu, Query, QueryResult, QueryTracker, attach_query_tracker_to_stream,
-};
-use crate::{
-    datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode},
-    request::{CacheControl, CacheKeyType, RequestContext},
-};
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
@@ -300,7 +297,6 @@ impl Query {
     }
 }
 
-#[allow(clippy::large_futures)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,13 +311,14 @@ mod tests {
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
     use spicepod::component::caching::SQLResultsCacheConfig;
+    use tokio::runtime::Handle;
 
     use crate::{
         builder::RuntimeBuilder,
         datafusion::{DataFusion, query::QueryBuilder},
-        request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
     };
+    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
 
     // Helper function to create a test RequestContext
     fn create_test_request_context(
@@ -360,6 +357,7 @@ mod tests {
             DataFusion::builder(
                 status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
+                Handle::current(),
             )
             .with_caching(Arc::new(
                 Caching::new()

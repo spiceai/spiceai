@@ -9,7 +9,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ahash.workspace = true
 app = { path = "../app" }
 arrow.workspace = true
 arrow-csv.workspace = true
@@ -17,7 +16,6 @@ arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc.workspace = true
 arrow-json.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
-arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
 async-stream.workspace = true
@@ -27,19 +25,21 @@ aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
-aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
+ballista-core = { workspace = true, optional = true }
+ballista-executor = { workspace = true, optional = true }
+ballista-scheduler = { workspace = true, optional = true }
 base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
-chrono = { version = "0.4.38" }
+chrono.workspace = true
+chunking = { path = "../chunking" }
 clap.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 csv = "1.3.0"
-dashmap = "6.1.0"
 data_components = { path = "../data_components" }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
@@ -47,15 +47,16 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+datafusion-proto = { workspace = true, optional = true }
+datafusion-spark.workspace = true
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
-dotenvy.workspace = true
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
-    "vtab",
-    "vtab-arrow",
+    "extensions-full",
 ], optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
@@ -69,7 +70,7 @@ headers-accept = "0.1.3"
 http.workspace = true
 http-body-util = "0.1.3"
 hyper = "1.7.0"
-hyper-util = { version = "0.1.16", features = ["service"] }
+hyper-util = { version = "0.1.17", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
@@ -78,13 +79,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.2", features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-], optional = true }
 llms = { path = "../llms" }
-logos.workspace = true
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -96,7 +91,7 @@ object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.29", features = [
+opentelemetry-proto = { version = "0.30", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -108,7 +103,6 @@ percent-encoding.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
-prometheus-parse = "0.2.5"
 prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
@@ -126,19 +120,27 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-child-process",
     "transport-streamable-http-server",
 ] }
+runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
-runtime-table-partition = { path = "../runtime-table-partition" }
+runtime-parameters = { path = "../runtime-parameters" }
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
-search = { path = "../search" }
+search = { path = "../search", default-features = false, features = [
+    "text_search",
+], optional = false }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -146,7 +148,6 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 strsim = { version = "0.11.1", optional = true }
-tantivy.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
@@ -164,8 +165,9 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
-tract-core = "0.21.10"
-url = "2.5.4"
+tract-core.workspace = true
+turso = { workspace = true, optional = true }
+url.workspace = true
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
 utoipa-swagger-ui = { version = ">=8.1.1", features = [
@@ -177,67 +179,81 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]
-anyhow = "1.0.99"
+anyhow.workspace = true
 async-graphql = "7.0.16"
 async-graphql-axum = "7.0.16"
-azure_core = "0.27.0"
+azure_core = "0.28.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
-dirs = "5.0.1"
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+dirs = "6.0.0"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
-insta = { workspace = true, features = ["json"] }
+insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
+rdkafka = { workspace = true, features = ["ssl-vendored"] }
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
-test-framework = { path = "../test-framework" }
 tempfile.workspace = true
+test-framework = { path = "../test-framework" }
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-rdkafka = { workspace = true, features = ["ssl-vendored"] }
 
 [features]
 aws-secrets-manager = [
     "dep:aws-config",
-    "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
+    "runtime-secrets/aws-secrets-manager",
 ]
 bedrock = ["dep:aws-config"]
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
-    "arrow_sql_gen/clickhouse",
     "data_components/clickhouse",
+]
+cluster = [
+    "dep:ballista-core",
+    "dep:ballista-scheduler",
+    "dep:ballista-executor",
+    "dep:datafusion-proto",
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
-debezium = ["data_components/debezium"]
-kafka = ["data_components/kafka"]
+debezium = ["kafka", "data_components/debezium"]
 default = [
     "keyring-secret-store",
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
+    "dep:datafusion-proto",
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
-duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
+duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb", "datafusion-optimizer-rules/duckdb"]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
+iceberg-write = []
 imap = ["data_components/imap", "dep:imap"]
-keyring-secret-store = ["dep:keyring"]
+kafka = ["data_components/kafka"]
+keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
-models = ["model_components/full", "mcp", "dep:strsim"]
+models = [
+    "model_components/full",
+    "mcp",
+    "dep:strsim",
+    "runtime-datafusion-udfs/models",
+    "search/llms",
+]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
@@ -250,8 +266,13 @@ postgres = [
     "datafusion-table-providers/postgres",
 ]
 postgres-write = []
-s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
+s3_vectors = [
+    "data_components/s3_vectors",
+    "dep:s3_vectors",
+    "search/s3_vectors",
+]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
+snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",
     "db_connection_pool/snowflake",
@@ -264,6 +285,22 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+turso = [
+    "dep:turso",
+    "dep:tokio-rusqlite",
+    "db_connection_pool/sqlite",
+    "data_components/sqlite",
+    "data_components/turso",
+    "dep:rusqlite",
+]
+vortex = ["dep:vortex-datafusion", "dep:vortex"]
+xxhash = ["cache/xxhash"]
 
-[target.'cfg(windows)'.dependencies]
-winver = "1.0.0"
+[target.'cfg(not(windows))'.dependencies]
+cayenne = { path = "../cayenne", features = ["turso"] }
+vortex = { workspace = true, optional = true }
+vortex-datafusion = { workspace = true, optional = true }
+
+[[bench]]
+harness = false
+name = "prepared_statement"

@@ -14,27 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, fmt::Display, sync::Arc};
+#[cfg(feature = "cluster")]
+use datafusion::execution::SessionStateBuilder;
+use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
     get_logical_plan_input_tables,
     key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
     error::DataFusionError,
-    execution::{SendableRecordBatchStream, context::SQLOptions},
+    execution::SendableRecordBatchStream,
+    execution::TaskContext,
     logical_expr::LogicalPlan,
-    physical_plan::stream::RecordBatchStreamAdapter,
-    prelude::DataFrame,
+    physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -50,15 +49,33 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
+#[cfg(feature = "cluster")]
+use {
+    crate::config::ClusterMode,
+    crate::datafusion::builder::default_extension_planners,
+    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
+    crate::datafusion::cluster::config::SpiceClusterConfig,
+    ballista_core::extension::{SessionConfigExt, SessionStateExt},
+    ballista_core::planner::BallistaQueryPlanner,
+    datafusion::physical_planner::DefaultPhysicalPlanner,
+    datafusion_proto::protobuf::LogicalPlanNode,
+};
+
+use datafusion::execution::SessionState;
+
 use async_stream::stream;
 use futures::StreamExt;
 
-use crate::{
-    datafusion::{DataFusion, query::cache::RequestCacheManager},
-    request::{AsyncMarker, RequestContext},
-};
-
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
+
+use super::managed_runtime;
+use crate::datafusion::{
+    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+};
+use managed_runtime::ManagedRuntimeError;
+use opentelemetry::KeyValue;
+use runtime_request_context::{AsyncMarker, RequestContext};
+use tokio::runtime::Handle;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -83,14 +100,17 @@ pub enum Error {
     BindingParameters { source: DataFusionError },
 }
 
-// There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
-thread_local! {
-    static RESTRICTED_SQL_OPTIONS: LazyCell<SQLOptions> = LazyCell::new(|| {
-        SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false)
-    });
+impl Error {
+    // Attempts to return the internal [`DataFusionError`] if present. On error, returns the original error.
+    pub fn attempt_internal_datafusion_err(self) -> Result<DataFusionError, Self> {
+        match self {
+            Self::UnableToExecuteQuery { source }
+            | Self::UnableToCreateMemoryStream { source }
+            | Self::UnableToCollectResults { source }
+            | Self::BindingParameters { source } => Ok(source),
+            e => Err(e),
+        }
+    }
 }
 
 pub enum QueryMethod {
@@ -125,21 +145,107 @@ macro_rules! handle_error {
 }
 
 impl Query {
+    #[cfg(not(feature = "cluster"))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn get_session_state(&self) -> Result<SessionState> {
+        Ok(self.df.ctx.state())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn get_session_state(&self) -> Result<SessionState> {
+        if !matches!(self.df.cluster_config.mode, Some(ClusterMode::Scheduler)) {
+            return Ok(self.df.ctx.state());
+        }
+
+        let cfg = self
+            .df
+            .ctx
+            .copied_config()
+            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec());
+
+        let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
+            BallistaQueryPlanner::with_local_planner(
+                self.df.cluster_config.scheduler_url.to_string(),
+                cfg.ballista_config(),
+                SpiceLogicalCodec::new_codec(),
+                DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
+            );
+
+        SessionStateBuilder::new_from_existing(self.df.ctx.state())
+            .with_config(
+                cfg.with_ballista_query_planner(Arc::new(query_planner))
+                    .with_option_extension(SpiceClusterConfig::default()),
+            )
+            .build()
+            .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
+            .map_err(|e| Error::UnableToExecuteQuery { source: e })
+    }
+
     /// Run a query and return the result.
     ///
     /// # Panics
     ///
     /// Panics when running under test if no cache key is computed for the query.
-    #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
+        if let Some(runtime_handle) = self.df.cpu_runtime().cloned() {
+            return self
+                .run_with_managed_runtime(request_context, runtime_handle)
+                .await;
+        }
+
+        self.run_internal(request_context).await
+    }
+
+    async fn run_with_managed_runtime(
+        self,
+        request_context: Arc<RequestContext>,
+        runtime_handle: Handle,
+    ) -> Result<QueryResult> {
+        let span = Span::current();
+
+        let runtime_request_context = Arc::clone(&request_context);
+        let future_request_context = request_context;
+
+        let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+            runtime_handle,
+            runtime_request_context,
+            span,
+            async move {
+                self.run_internal(future_request_context)
+                    .await
+                    .map(|query_result| (query_result.cache_status, query_result.data))
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            ManagedRuntimeError::Future(err) => err,
+            ManagedRuntimeError::DriverTaskEnded => Error::UnableToExecuteQuery {
+                source: DataFusionError::Execution(
+                    "Query driver task ended unexpectedly".to_string(),
+                ),
+            },
+        })?;
+
+        let (cache_status, stream) = managed_stream.into_parts();
+
+        Ok(QueryResult::new(stream, cache_status))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.df.ctx.state();
+            let mut session = self.get_session_state()?;
 
             let ctx = self;
             let tracker = ctx.tracker;
@@ -177,9 +283,7 @@ impl Query {
                 }
             };
 
-            if let Err(e) =
-                RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
-            {
+            if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
                 let e = find_datafusion_root(e);
                 handle_error!(
                     tracker,
@@ -222,11 +326,23 @@ impl Query {
                 t
             });
 
-            let df = DataFrame::new(session, *plan);
+            // Special handling for DescribeTable in cluster mode - execute locally
+            #[cfg(feature = "cluster")]
+            let use_local_session = {
+                matches!(ctx.df.cluster_config.mode, Some(ClusterMode::Scheduler))
+                    && matches!(&*plan, LogicalPlan::DescribeTable { .. })
+            };
 
-            let df_schema: SchemaRef = Arc::clone(df.schema().inner());
+            #[cfg(not(feature = "cluster"))]
+            let use_local_session = false;
 
-            let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
+            let session_for_execution = if use_local_session {
+                ctx.df.ctx.state()
+            } else {
+                session
+            };
+
+            let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     let e = find_datafusion_root(e);
@@ -241,9 +357,27 @@ impl Query {
                 }
             };
 
+            let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+
+            let res_stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+            };
+
+            let plan_schema = Arc::clone(plan.schema().inner());
             let res_schema = res_stream.schema();
 
-            if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
+            if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
                 handle_error!(
                     tracker,
                     &request_context,
@@ -263,6 +397,19 @@ impl Query {
             } else {
                 res_stream
             };
+
+            let final_stream = attach_physical_plan_metrics_to_stream(
+                final_stream,
+                physical_plan,
+                Arc::clone(&request_context),
+                inner_span.clone(),
+            );
+
+            let final_stream = attach_query_active_guard_to_stream(
+                final_stream,
+                &request_context,
+                inner_span.clone(),
+            );
 
             Ok(QueryResult::new(
                 attach_query_tracker_to_stream(
@@ -327,7 +474,7 @@ impl Query {
         };
 
         // Verify the plan against the restricted options
-        if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
+        if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
             let e = find_datafusion_root(e);
             self.handle_schema_error(&request_context, &e);
             return Err(e);
@@ -384,9 +531,9 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
         None
     } else {
         let mut builder = SchemaBuilder::new();
-        parameters
-            .into_iter()
-            .for_each(|(name, typ)| builder.push(Field::new(name, typ, false)));
+        for (name, typ) in parameters {
+            builder.push(Field::new(name, typ, false));
+        }
         Some(builder.finish())
     };
 
@@ -397,7 +544,7 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
 /// Attaches a query tracker to a stream of record batches.
 ///
 /// Processes a stream of record batches, updating the query tracker
-/// with the number of records returned and saving query details at the end.
+/// with the number of records/bytes returned and saving query details at the end.
 ///
 /// Note: If an error occurs during stream processing, the query tracker
 /// is finalized with error details, and further streaming is terminated.
@@ -452,6 +599,7 @@ fn attach_query_tracker_to_stream(
         }
 
         crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_rows_returned(num_records, &request_context.to_dimensions());
 
         tracker
             .schema(schema_copy)
@@ -463,6 +611,114 @@ fn attach_query_tracker_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+/// This guard guarantees:
+///  * If we incremented nested query count, we will decrement. And vice versa.
+///  * If we incremented active query count, we will decrement. And vice versa.
+///  * Active query count decrement will be called with the same dimensions as increment.
+pub struct QueryActiveGuard {
+    request_context: Arc<RequestContext>,
+    dimensions: &'static [KeyValue],
+    active: bool,
+}
+
+impl QueryActiveGuard {
+    pub fn new(request_context: Arc<RequestContext>) -> Self {
+        let dimensions = request_context.to_protocol_dimensions();
+
+        let active = request_context.entered_top_level_query();
+        if active {
+            crate::metrics::telemetry::inc_query_active_count(dimensions);
+        }
+
+        Self {
+            request_context,
+            dimensions,
+            active,
+        }
+    }
+}
+
+impl Drop for QueryActiveGuard {
+    fn drop(&mut self) {
+        let exited = self.request_context.exited_top_level_query();
+        if self.active && exited {
+            crate::metrics::telemetry::dec_query_active_count(self.dimensions);
+        }
+    }
+}
+
+fn attach_query_active_guard_to_stream(
+    stream: SendableRecordBatchStream,
+    request_context: &Arc<RequestContext>,
+    span: Span,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+
+    let guard = QueryActiveGuard::new(Arc::clone(request_context));
+
+    let updated_stream =
+        futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
+            stream
+                .next()
+                .await
+                .map(|batch_result| (batch_result, (stream, guard)))
+        });
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        Box::pin(updated_stream.instrument(span)),
+    ))
+}
+
+#[must_use]
+/// Attaches logic to a stream which emits metrics from a physical plan.
+fn attach_physical_plan_metrics_to_stream(
+    mut stream: SendableRecordBatchStream,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    request_context: Arc<RequestContext>,
+    span: Span,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+
+    let updated_stream = stream! {
+        while let Some(batch_result) = stream.next().await {
+            yield batch_result;
+        }
+
+        let mut totals = PhysicalPlanMetricsTotals::default();
+        collect_physical_plan_metrics(physical_plan.as_ref(), &mut totals);
+
+        crate::metrics::telemetry::track_produced_spills(totals.produced_spills, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_spilled_bytes(totals.spilled_bytes, &request_context.to_dimensions());
+        crate::metrics::telemetry::track_spilled_rows(totals.spilled_rows, &request_context.to_dimensions());
+    };
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        Box::pin(updated_stream.instrument(span)),
+    ))
+}
+
+#[derive(Default, Debug)]
+/// Used to collect aggregated metrics from a physical plan.
+struct PhysicalPlanMetricsTotals {
+    pub produced_spills: u64,
+    pub spilled_bytes: u64,
+    pub spilled_rows: u64,
+}
+
+fn collect_physical_plan_metrics(plan: &dyn ExecutionPlan, totals: &mut PhysicalPlanMetricsTotals) {
+    if let Some(metrics) = plan.metrics() {
+        totals.produced_spills += metrics.spill_count().unwrap_or_default() as u64;
+        totals.spilled_bytes += metrics.spilled_bytes().unwrap_or_default() as u64;
+        totals.spilled_rows += metrics.spilled_rows().unwrap_or_default() as u64;
+    }
+
+    for child in plan.children() {
+        collect_physical_plan_metrics(child.as_ref(), totals);
+    }
 }
 
 pub fn write_to_json_string(
@@ -481,8 +737,14 @@ pub fn write_to_json_string(
 mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
     use arrow::array::Int64Array;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
+    use std::any::Any;
+    use std::fmt::{Debug, Formatter};
 
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
@@ -503,6 +765,7 @@ mod tests {
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
             )
             .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
             .build(),
@@ -763,5 +1026,127 @@ mod tests {
             param_names,
             vec!["$1", "$2", "$10", "another_param", "non_numeric_param"]
         );
+    }
+
+    struct TestExecutionPlan {
+        metrics: Option<MetricsSet>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        properties: PlanProperties,
+    }
+
+    impl TestExecutionPlan {
+        fn new(metrics: Option<MetricsSet>, children: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+            Self {
+                metrics,
+                children,
+                properties: PlanProperties::new(
+                    EquivalenceProperties::new(Arc::new(Schema::empty())),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Final,
+                    Boundedness::Bounded,
+                ),
+            }
+        }
+    }
+
+    impl Debug for TestExecutionPlan {
+        fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
+            todo!()
+        }
+    }
+
+    impl DisplayAs for TestExecutionPlan {
+        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> std::fmt::Result {
+            todo!()
+        }
+    }
+
+    impl ExecutionPlan for TestExecutionPlan {
+        fn name(&self) -> &'static str {
+            "TestExecutionPlan"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &PlanProperties {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.children.iter().collect()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            self.metrics.clone()
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::common::Result<SendableRecordBatchStream> {
+            todo!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_physical_plan_metrics_no_children() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics_set).spill_count(1).add(13);
+        MetricBuilder::new(&metrics_set).spill_count(2).add(7);
+        MetricBuilder::new(&metrics_set).spilled_rows(2).add(100);
+
+        let plan = Arc::new(TestExecutionPlan::new(
+            Some(metrics_set.clone_inner()),
+            vec![],
+        )) as Arc<dyn ExecutionPlan>;
+
+        let mut totals = PhysicalPlanMetricsTotals::default();
+        collect_physical_plan_metrics(plan.as_ref(), &mut totals);
+
+        assert_eq!(totals.produced_spills, 20);
+        assert_eq!(totals.spilled_bytes, 0);
+        assert_eq!(totals.spilled_rows, 100);
+    }
+
+    #[tokio::test]
+    async fn test_collect_physical_plan_metrics_with_children() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics_set).spill_count(1).add(13);
+        MetricBuilder::new(&metrics_set).spill_count(2).add(7);
+        MetricBuilder::new(&metrics_set).spilled_rows(2).add(100);
+
+        let child1 = Arc::new(TestExecutionPlan::new(
+            Some(metrics_set.clone_inner()),
+            vec![],
+        )) as Arc<dyn ExecutionPlan>;
+
+        let child2 = Arc::new(TestExecutionPlan::new(None, vec![])) as Arc<dyn ExecutionPlan>;
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics_set).spill_count(1).add(13);
+        MetricBuilder::new(&metrics_set).spill_count(2).add(7);
+        MetricBuilder::new(&metrics_set).spilled_rows(2).add(100);
+
+        let plan = Arc::new(TestExecutionPlan::new(
+            Some(metrics_set.clone_inner()),
+            vec![child1, child2],
+        )) as Arc<dyn ExecutionPlan>;
+
+        let mut totals = PhysicalPlanMetricsTotals::default();
+        collect_physical_plan_metrics(plan.as_ref(), &mut totals);
+
+        assert_eq!(totals.produced_spills, 40);
+        assert_eq!(totals.spilled_bytes, 0);
+        assert_eq!(totals.spilled_rows, 200);
     }
 }

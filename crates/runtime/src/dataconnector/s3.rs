@@ -102,6 +102,7 @@ pub enum Error {
 pub struct S3 {
     pub(crate) params: Parameters,
     pub(crate) runtime: Option<Runtime>,
+    pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for S3 {
@@ -154,14 +155,14 @@ impl DataConnectorFactory for S3Factory {
         &self,
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
-            if endpoint.ends_with('/') {
-                tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
-                params.parameters.insert(
-                    "endpoint".to_string(),
-                    endpoint.trim_end_matches('/').to_string().into(),
-                );
-            }
+        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
+            && endpoint.ends_with('/')
+        {
+            tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
+            params.parameters.insert(
+                "endpoint".to_string(),
+                endpoint.trim_end_matches('/').to_string().into(),
+            );
         }
 
         Box::pin(async move {
@@ -169,18 +170,34 @@ impl DataConnectorFactory for S3Factory {
                 validator.validate(&mut params).await?;
             }
 
-            // `initialize_sdk_config` emits a warning if the credentials provider cannot be initialized
-            // so we skip it if the auth method is public.
-            match params.parameters.get("auth").expose().ok() {
-                None | Some("public") => (),
+            // Initialize AWS SDK credentials for IAM role authentication.
+            // Skip initialization for 'public' and 'key' auth methods which use explicit credentials.
+            // Default to 'public' if no auth method is specified.
+            let auth = params
+                .parameters
+                .get("auth")
+                .expose()
+                .ok()
+                .unwrap_or("public");
+
+            match auth {
+                "public" | "key" => {
+                    // Skip AWS SDK initialization - use explicit auth method directly
+                }
                 _ => {
-                    let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
+                    // Initialize AWS SDK for IAM role or any other auth method
+                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                        tracing::warn!(
+                            "Unable to initialize AWS credentials for S3 connector: {err}"
+                        );
+                    }
                 }
             }
 
             let s3 = S3 {
                 params: params.parameters,
                 runtime: params.runtime.map(Arc::unwrap_or_clone),
+                tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
@@ -208,6 +225,10 @@ impl ListingTableConnector for S3 {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        self.tokio_io_runtime.clone()
     }
 
     fn get_object_store_url(

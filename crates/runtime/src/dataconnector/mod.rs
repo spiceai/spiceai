@@ -76,6 +76,7 @@ pub mod file;
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
+pub mod git;
 pub mod github;
 pub mod graphql;
 pub mod https;
@@ -393,6 +394,7 @@ pub async fn register_all() {
     register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
     register_connector_factory("https", https::HttpsFactory::new_arc()).await;
+    register_connector_factory("git", git::GitFactory::new_arc()).await;
     register_connector_factory("github", github::GithubFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
@@ -520,7 +522,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh
@@ -682,6 +684,7 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
+    use tokio::runtime::Handle;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -756,7 +759,7 @@ mod tests {
             ConnectorComponent::Dataset(Arc::new(dataset)),
         );
 
-        let result = builder.build(secrets).await;
+        let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
 
         let params = result.expect("failed to build connector params");

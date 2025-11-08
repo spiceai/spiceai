@@ -9,7 +9,7 @@ inputs:
     default: 'postgres'
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Install PostgreSQL (Linux)
       if: inputs.os == 'linux'
@@ -27,7 +27,7 @@ runs:
       if: inputs.os == 'darwin'
       shell: bash
       run: |
-        # macos-14 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
+        # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
         brew update
         brew install postgresql
         brew services start postgresql
@@ -35,7 +35,7 @@ runs:
         createuser -s postgres
         psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
         createdb ${{ inputs.pg-db }}
-    
+
     - name: Wait for PostgreSQL to start
       shell: bash
       run: sleep 10

@@ -85,7 +85,7 @@ impl Runtime {
 
         let source = catalog.provider.clone();
         let params = ConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
-            .build(self.secrets())
+            .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeCatalogConnectorSnafu)?;
 
@@ -181,7 +181,7 @@ impl Runtime {
             });
 
         self.df
-            .register_catalog(&catalog.name, catalog_provider)
+            .register_catalog(&catalog.name, &catalog.access, catalog_provider)
             .await
             .boxed()
             .context(UnableToLoadCatalogConnectorSnafu {

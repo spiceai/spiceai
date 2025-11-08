@@ -26,12 +26,13 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionTokensDetails,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
+    PromptTokensDetails,
 };
 
 use async_trait::async_trait;
@@ -44,9 +45,10 @@ use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::Runtime;
-use crate::request::{AsyncMarker, RequestContext};
+use crate::model::ModelContextExtension;
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use llms::progress::Progress;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,
@@ -92,12 +94,12 @@ impl ToolUsingChat {
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if self.tools.iter().any(|t| t.name() == "list_datasets") {
-            // Add messages to start of message list to pretend it has already asked to list the available datasets.
-            let mut list_dataset_messages = self.create_list_dataset_messages().await?;
-            list_dataset_messages.extend_from_slice(req.messages.as_slice());
-            req.messages = list_dataset_messages;
+        if !self.tools.iter().any(|t| t.name() == "list_datasets") {
+            return Ok(req);
         }
+
+        let list_dataset_messages = self.create_list_dataset_messages().await?;
+        req.messages = insert_initial_tools(req.messages, "list_datasets", &list_dataset_messages);
 
         Ok(req)
     }
@@ -407,6 +409,9 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let context = RequestContext::current(AsyncMarker::new().await);
+        if context.extension::<ModelContextExtension>().is_none() {
+            context.insert_extension(ModelContextExtension::new());
+        }
         let inner_req = self.prepare_req(req).await?;
 
         // wrap the completion stream to track the `ai_inferences_with_spice_count` when it is ready.
@@ -418,13 +423,17 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let context = RequestContext::current(AsyncMarker::new().await);
+        if context.extension::<ModelContextExtension>().is_none() {
+            context.insert_extension(ModelContextExtension::new());
+        }
+
         let inner_req = self.prepare_req(req).await?;
         let response = self
             .chat_request_inner(inner_req, self.recursion_limit)
             .await;
 
         // track ai_inferences_with_spice_count metric
-        let context = RequestContext::current(AsyncMarker::new().await);
         crate::model::track_ai_inferences_with_spice_count(&context);
 
         response
@@ -463,11 +472,11 @@ fn create_new_recursive_req(
     }
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
-    if let Some(max_completion_tokens) = new_req.max_completion_tokens {
-        if let Some(usage) = marginal_usage {
-            new_req.max_completion_tokens =
-                Some(max_completion_tokens.saturating_sub(usage.completion_tokens));
-        }
+    if let Some(max_completion_tokens) = new_req.max_completion_tokens
+        && let Some(usage) = marginal_usage
+    {
+        new_req.max_completion_tokens =
+            Some(max_completion_tokens.saturating_sub(usage.completion_tokens));
     }
 
     new_req
@@ -542,6 +551,50 @@ pub fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     }
 }
 
+// Ensure that `tool_messages` have been added to `messages` after all initial developer/system messages and after initial user messages (i.e. not including user messages after assistant messages).
+fn insert_initial_tools(
+    messages: Vec<ChatCompletionRequestMessage>,
+    tool_name: &str,
+    tool_messages: &[ChatCompletionRequestMessage],
+) -> Vec<ChatCompletionRequestMessage> {
+    // Do not add `tool_messages` if already in `messages`.
+    if messages.iter().any(|m| {
+        let ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            tool_calls: Some(tools),
+            ..
+        }) = m
+        else {
+            return false;
+        };
+        tools.iter().any(|t| t.function.name == tool_name)
+    }) {
+        return messages;
+    }
+
+    // Find index to insert at
+    let idx = messages
+        .iter()
+        .enumerate()
+        .find_map(|(i, m)| {
+            if matches!(
+                m,
+                ChatCompletionRequestMessage::Assistant(_)
+                    | ChatCompletionRequestMessage::Tool(_)
+                    | ChatCompletionRequestMessage::Function(_)
+            ) {
+                return Some(i);
+            }
+            None
+        })
+        .unwrap_or(messages.len());
+
+    let Some((a, b)) = messages.split_at_checked(idx) else {
+        return messages;
+    };
+
+    [a, tool_messages, b].concat()
+}
+
 struct CustomStream {
     receiver: mpsc::Receiver<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
 }
@@ -578,11 +631,10 @@ fn make_a_stream(
                     let response = match result {
                         Ok(response) => response,
                         Err(e) => {
-                            if let Err(e) = sender_clone.send(Err(e)).await {
-                                if !sender_clone.is_closed() {
+                            if let Err(e) = sender_clone.send(Err(e)).await
+                                && !sender_clone.is_closed() {
                                     tracing::error!("Error sending error: {}", e);
                                 }
-                            }
                             return;
                         }
                     };
@@ -650,9 +702,9 @@ fn make_a_stream(
                                 let tool_calls_to_process = {
                                     match tool_call_states_clone.lock() {
                                         Ok(states_lock) => states_lock
-                                            .iter()
-                                            .map(|(_key, tool_call)| tool_call.clone())
-                                            .collect::<Vec<_>>(),
+                                            .values()
+                                            .cloned()
+                                            .collect(),
                                         Err(e) => {
                                             tracing::error!(
                                                 "Failed to lock tool_call_states: {}",
@@ -677,11 +729,10 @@ fn make_a_stream(
                                         continue;
                                     }
                                     Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await {
-                                            if !sender_clone.is_closed() {
+                                        if let Err(e) = sender_clone.send(Err(e)).await
+                                            && !sender_clone.is_closed() {
                                                 tracing::error!("Error sending error: {}", e);
                                             }
-                                        }
                                         return;
                                     }
                                 };
@@ -706,11 +757,10 @@ fn make_a_stream(
                                         }
                                     }
                                     Err(e) => {
-                                        if let Err(e) = sender_clone.send(Err(e)).await {
-                                            if !sender_clone.is_closed() {
+                                        if let Err(e) = sender_clone.send(Err(e)).await
+                                            && !sender_clone.is_closed() {
                                                 tracing::error!("Error sending error: {}", e);
                                             }
-                                        }
                                         return;
                                     }
                                 }
@@ -730,21 +780,18 @@ fn make_a_stream(
 
                         let mut resp2 = response.clone();
                         resp2.choices = finished_choices;
-                        if let Err(e) = sender_clone.send(Ok(resp2)).await {
-                            if !sender_clone.is_closed() {
+                        if let Err(e) = sender_clone.send(Ok(resp2)).await
+                            && !sender_clone.is_closed() {
                                 tracing::error!("Error sending error: {}", e);
                             }
-                        }
                     }
 
                     // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with no choices).
-                    if response.choices.is_empty() && response.usage.is_some() {
-                        if let Err(e) = sender_clone.send(Ok(response)).await {
-                            if !sender_clone.is_closed() {
+                    if response.choices.is_empty() && response.usage.is_some()
+                        && let Err(e) = sender_clone.send(Ok(response)).await
+                            && !sender_clone.is_closed() {
                                 tracing::error!("Error sending error: {}", e);
                             }
-                        }
-                    }
                 }
 
                 tracing::info!(target: "task_history", captured_output = %chat_output);
@@ -792,5 +839,193 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
             Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionToolType, FunctionCall,
+    };
+
+    fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestSystemMessageArgs::default()
+            .content(content)
+            .build()
+            .expect("couldn't create system message")
+            .into()
+    }
+
+    fn create_user_message(content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(content)
+            .build()
+            .expect("couldn't create user message")
+            .into()
+    }
+
+    fn create_assistant_message_with_tool_calls(
+        tool_calls: Vec<ChatCompletionMessageToolCall>,
+    ) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestAssistantMessageArgs::default()
+            .tool_calls(tool_calls)
+            .build()
+            .expect("couldn't create assistant message w. tools")
+            .into()
+    }
+
+    fn create_tool_message(tool_call_id: &str, content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestToolMessageArgs::default()
+            .tool_call_id(tool_call_id)
+            .content(content)
+            .build()
+            .expect("couldn't create tool message")
+            .into()
+    }
+
+    fn create_list_datasets_tool_call() -> ChatCompletionMessageToolCall {
+        ChatCompletionMessageToolCall {
+            id: "test_id".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "list_datasets".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_insert_initial_tools_empty_messages() {
+        let messages = vec![];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
+    }
+
+    #[test]
+    fn test_insert_initial_tools_with_system_and_user_messages() {
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("Hello"),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
+    }
+
+    #[test]
+    fn test_insert_initial_tools_with_existing_assistant_message() {
+        let existing_tool_call = ChatCompletionMessageToolCall {
+            id: "existing_id".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "other_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("Hello"),
+            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
+    }
+
+    #[test]
+    fn test_insert_initial_tools_skips_if_tool_already_exists() {
+        let existing_list_datasets_call = create_list_datasets_tool_call();
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("Hello"),
+            create_assistant_message_with_tool_calls(vec![existing_list_datasets_call]),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages.clone(), "list_datasets", &tool_messages);
+
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]"
+        });
+    }
+
+    #[test]
+    fn test_insert_initial_tools_with_different_tool_name() {
+        let existing_tool_call = ChatCompletionMessageToolCall {
+            id: "other_id".to_string(),
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionCall {
+                name: "other_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_assistant_message_with_tool_calls(vec![existing_tool_call]),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
+    }
+
+    #[test]
+    fn test_insert_initial_tools_insertion_point_end_of_messages() {
+        let messages = vec![
+            create_system_message("You are a helpful assistant"),
+            create_user_message("What datasets are available?"),
+            create_user_message("And what about tables?"),
+        ];
+        let tool_messages = vec![
+            create_assistant_message_with_tool_calls(vec![create_list_datasets_tool_call()]),
+            create_tool_message("test_id", "dataset1, dataset2"),
+        ];
+
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
+
+        insta::assert_json_snapshot!(result, {
+            "[].Assistant.tool_calls[].id" => "[tool_call_id]",
+            "[].Tool.tool_call_id" => "[tool_call_id]"
+        });
     }
 }

@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::{any::Any, env};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -42,6 +43,7 @@ use super::{
 #[derive(Debug)]
 pub struct File {
     params: Parameters,
+    tokio_io_runtime: Handle,
 }
 
 impl std::fmt::Display for File {
@@ -77,6 +79,7 @@ impl DataConnectorFactory for FileFactory {
         Box::pin(async move {
             Ok(Arc::new(File {
                 params: params.parameters,
+                tokio_io_runtime: params.io_runtime,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -98,6 +101,10 @@ impl ListingTableConnector for File {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> Handle {
+        self.tokio_io_runtime.clone()
     }
 
     /// Creates a valid file [`url::Url`], from the dataset, supporting both
@@ -144,7 +151,7 @@ impl ListingTableConnector for File {
     /// Set up a file watcher to refresh the accelerated table when the file is updated.
     ///
     /// Spawns an async top-level Tokio task to watch the file(s) and adds it to the join
-    /// handles of the AcceleratedTable. When the AcceleratedTable is dropped, the file
+    /// handles of the `AcceleratedTable`. When the `AcceleratedTable` is dropped, the file
     /// watcher is aborted.
     async fn on_accelerated_table_registration(
         &self,
@@ -282,6 +289,7 @@ mod tests {
 
         let connector = File {
             params: Parameters::new(([]).to_vec(), "test", &[]),
+            tokio_io_runtime: Handle::current(),
         };
 
         let url = connector

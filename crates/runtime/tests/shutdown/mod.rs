@@ -44,7 +44,7 @@ pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     dataset
 }
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Test that the `shutdown_timeout` parameter is correctly applied:
 /// 1. The runtime shutdown waits for 5 seconds for a long-running HTTP operation to complete.
@@ -79,8 +79,8 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("5s")
                 .build();
 
+            configure_test_datafusion();
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);
@@ -169,8 +169,8 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("20s")
                 .build();
 
+            configure_test_datafusion();
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);
