@@ -252,13 +252,6 @@ impl<
     async fn checkpoint(&self) {
         self.cache.run_pending_tasks().await;
     }
-
-    fn uptime_secs(&self) -> u32 {
-        let secs = self.initial_instant.elapsed().as_secs();
-        #[allow(clippy::cast_possible_truncation)]
-        let uptime = secs.min(u64::from(u32::MAX)) as u32;
-        uptime
-    }
 }
 
 #[async_trait]
@@ -316,7 +309,7 @@ mod tests {
             Arc::new(vec![record_batch.clone()]),
             Arc::new(record_batch.schema().as_ref().to_owned()),
             Arc::new(input_tables),
-            0,
+            std::time::Instant::now(),
         )
     }
 

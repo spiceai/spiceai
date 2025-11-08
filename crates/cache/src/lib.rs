@@ -111,7 +111,6 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
     fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
-    fn uptime_secs(&self) -> u32;
 }
 
 /// A ``TabledCacheProvider`` represents a cache that can invalidate entries based on table references which their values reference.
@@ -418,11 +417,6 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub fn ttl(&self) -> std::time::Duration {
         self.ttl
-    }
-
-    #[must_use]
-    pub fn uptime_secs(&self) -> u32 {
-        self.cache.uptime_secs()
     }
 
     #[must_use]

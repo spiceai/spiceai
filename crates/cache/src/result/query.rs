@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -38,38 +39,36 @@ pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
     pub input_tables: Arc<HashSet<TableReference>>,
-    /// Timestamp (seconds) captured relative to the owning cache provider's start.
-    /// Stored as `u32` because caches expose uptime in second precision.
-    cached_at_offset_secs: u32,
+    /// Timestamp when the result was cached.
+    cached_at: Instant,
 }
 
 impl CachedQueryResult {
-    /// Create a new cached query result with the provided cached-at offset (seconds).
+    /// Create a new cached query result with the provided cached-at timestamp.
     #[must_use]
     pub fn new(
         records: Arc<Vec<RecordBatch>>,
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
-        cached_at_offset_secs: u32,
+        cached_at: Instant,
     ) -> Self {
         Self {
             records,
             schema,
             input_tables,
-            cached_at_offset_secs,
+            cached_at,
         }
     }
 
-    /// Check if the cached data is stale (older than the given TTL in seconds)
+    /// Check if the cached data is stale (older than the given TTL).
     #[must_use]
-    pub fn is_stale(&self, ttl_seconds: u64, now_offset_secs: u32) -> bool {
-        let age = u64::from(now_offset_secs.saturating_sub(self.cached_at_offset_secs));
-        age > ttl_seconds
+    pub fn is_stale(&self, ttl: Duration, now: Instant) -> bool {
+        now.duration_since(self.cached_at) > ttl
     }
 
     #[must_use]
-    pub fn cached_at_offset_secs(&self) -> u32 {
-        self.cached_at_offset_secs
+    pub fn cached_at(&self) -> Instant {
+        self.cached_at
     }
 }
 
