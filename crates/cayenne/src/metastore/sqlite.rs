@@ -120,7 +120,8 @@ impl SqliteMetastore {
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
-            partition_column TEXT
+            partition_column TEXT,
+            vortex_config_json TEXT
         )
     ";
 

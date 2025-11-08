@@ -74,7 +74,7 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster,llama_cpp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -86,7 +86,7 @@ lint-rust:
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster,llama_cpp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -97,6 +97,25 @@ lint-rust-fix:
 lint-go:
 	go vet ./...
 	golangci-lint run
+
+check-rust-features:
+	cargo check $(CARGO_PROFILE) --no-default-features
+	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
+	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
+	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
+	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
+	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
+	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
+	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
+	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
+	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
+	cargo check $(CARGO_PROFILE) --no-default-features --features dremio
+	cargo check $(CARGO_PROFILE) --no-default-features --features clickhouse
+	cargo check $(CARGO_PROFILE) --no-default-features --features debezium
+	cargo check $(CARGO_PROFILE) --no-default-features --features runtime/openapi
+	cargo check $(CARGO_PROFILE) --no-default-features --features dynamodb
+	cargo check $(CARGO_PROFILE) --no-default-features --features oracle
+	cargo check $(CARGO_PROFILE) --no-default-features --features mongodb
 
 .PHONY: fmt-toml
 fmt-toml:

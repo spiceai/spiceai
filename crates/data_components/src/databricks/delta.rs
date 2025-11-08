@@ -80,7 +80,7 @@ impl DatabricksDelta {
             }
         }
 
-        let delta_table = DeltaTable::from(table_uri, storage_options, self.io_runtime.clone())?;
+        let delta_table = DeltaTable::from(table_uri, storage_options, &self.io_runtime).boxed()?;
 
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }

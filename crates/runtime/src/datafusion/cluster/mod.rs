@@ -36,12 +36,14 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 pub mod codec;
-pub mod common;
 pub mod config;
+pub mod datafusion_scheduler_ext;
 pub mod physical_plan;
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
+    tracing::warn!("Distributed Query (Alpha) is in preview and should not be used in production.");
+
     let scheduler = create_scheduler_server(rt).await?;
 
     rt.df
@@ -61,6 +63,8 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
+    tracing::warn!("Distributed Query (Alpha) is in preview and should not be used in production.");
+
     executor_bind_app(&rt, rt.config.cluster.scheduler_url.to_string()).await?;
 
     let runtime_handle = Arc::clone(&rt);

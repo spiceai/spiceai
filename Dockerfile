@@ -1,12 +1,12 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.89
+ARG RUST_VERSION=1.90
 FROM rust:${RUST_VERSION}-slim-bookworm as build
 
 # cache mounts below may already exist and owned by root
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev libclang-dev \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build

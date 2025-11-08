@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings};
 use crate::models::openai::get_openai_embeddings;
+#[cfg(feature = "s3_vectors")]
 use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
@@ -434,7 +435,10 @@ async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
     run_search_w_explain(
         app.build(),
         [
+        #[cfg(feature = "s3_vectors")]
         basic_vector_search_tests("multi_column_view_answer"),
+        #[cfg(not(feature = "s3_vectors"))]
+        vec![],
         vec![
             SearchTestCase::new(
                 "multi_column_view_basic".to_string(),
@@ -1553,14 +1557,17 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
 
     let queries = vec![
         (
+            "topk_with_fetch_4",
             "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic') order by score desc LIMIT 4".to_string(),
-            vec!["SortPreservingMergeExec: [score@1 DESC], fetch=4"]
+            vec!["SortExec: TopK(fetch=4)"]
         ),
         (
+            "topk_with_fetch_2_from_parameter_ignores_other_limit",
             "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 2) order by score desc LIMIT 4".to_string(),
-            vec!["SortPreservingMergeExec: [score@1 DESC], fetch=4", "SortExec: TopK(fetch=2)"]
+            vec!["SortExec: TopK(fetch=2)"]
         ),
         (
+            "topk_with_fetch_3_from_parameter",
             "EXPLAIN SELECT cp_catalog_page_sk, score FROM vector_search(spice.public.basic_embedding_search, 'basic', 3) order by score desc".to_string(),
             vec!["SortExec: TopK(fetch=3)"]
         )
@@ -1569,8 +1576,14 @@ async fn test_vector_search_limit_plans() -> Result<(), anyhow::Error> {
     let api_config = start_app(app).await?;
     let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    for (query, must_contain) in queries {
+    for (name, query, must_contain) in queries {
         let result = http_sql(http_base_url.as_str(), &query).await?;
+
+        insta::assert_snapshot!(
+            format!("{name}_response"),
+            normalize_search_response(result.clone())
+        );
+
         let result_str = result
             .as_array()
             .and_then(|o| o.last())

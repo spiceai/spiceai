@@ -14,6 +14,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | Delta Lake                       | ✅           | @Sevenannn      |
 | Dremio                           | ✅           | @Sevenannn      |
 | DuckDB                           | ✅           | @peasee         |
+| DynamoDB                         | ➖           |                 |
 | File                             | ✅           | @peasee         |
 | FlightSQL                        | ➖           |                 |
 | FTP/SFTP                         | ➖           |                 |
