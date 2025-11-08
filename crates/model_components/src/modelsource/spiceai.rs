@@ -171,13 +171,25 @@ impl ModelSource for SpiceAI {
         let versioned_path_clone = versioned_path.clone();
         let file_path_clone = file_path.clone();
         tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(versioned_path_clone)
+            std::fs::create_dir_all(&versioned_path_clone)
                 .context(super::UnableToCreateModelPathSnafu {})?;
-            let mut file = std::fs::File::create(file_path_clone)
-                .context(super::UnableToCreateModelPathSnafu {})?;
+            let mut file = std::fs::File::create(&file_path_clone).map_err(|e| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!(
+                        "Failed to create model file {}: {e}",
+                        file_path_clone.display()
+                    ),
+                }
+            })?;
             let mut content = Cursor::new(bytes);
-            std::io::copy(&mut content, &mut file)
-                .context(super::UnableToCreateModelPathSnafu {})?;
+            std::io::copy(&mut content, &mut file).map_err(|e| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!(
+                        "Failed to write model file {}: {e}",
+                        file_path_clone.display()
+                    ),
+                }
+            })?;
             Ok::<(), super::Error>(())
         })
         .await

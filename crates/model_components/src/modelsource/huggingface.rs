@@ -62,9 +62,15 @@ impl ModelSource for Huggingface {
         // it is not copying local model into .spice folder
         let local_path = super::ensure_model_path(name.as_str())?;
         let local_path = PathBuf::from(local_path);
-        let root_dir = local_path
-            .parent()
-            .map_or_else(|| local_path.clone(), Path::to_path_buf);
+        
+        // Get the parent directory as the root for security boundary checks.
+        // This ensures files cannot escape the model's parent directory.
+        let root_dir = local_path.parent().context(super::UnableToLoadConfigSnafu {
+            reason: format!(
+                "Model path has no parent directory: {}. Expected path structure like /path/to/models/<model_name>",
+                local_path.display()
+            ),
+        })?;
 
         let remote_path = params
             .get("path")

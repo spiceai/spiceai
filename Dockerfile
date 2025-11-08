@@ -116,18 +116,17 @@ RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_s
 RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
 
-# Give the nobody user ownership of app dir
-RUN chown -R 65534:65534 /spice_sandbox/app
-
 # Create HuggingFace cache directory in sandbox
 RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
 RUN chown -R 65534:65534 /spice_sandbox/.cache
 RUN chmod -R 755 /spice_sandbox/.cache
 
 # Create spiced user and group in sandbox
-RUN groupadd -r spiced && useradd -r -g spiced spiced -d /app
 RUN echo 'spiced:x:999:999::/app:/usr/sbin/nologin' >> /spice_sandbox/etc/passwd && \
     echo 'spiced:x:999:' >> /spice_sandbox/etc/group
+
+# Give the spiced user ownership of app dir
+RUN chown -R 999:999 /spice_sandbox/app
 
 FROM scratch
 
