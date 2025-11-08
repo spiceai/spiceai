@@ -145,7 +145,7 @@ impl ScalarUDFImpl for DigestMany {
 
         // We have arrays - need to process row by row
         let Some(num_rows) = args.iter().find_map(|arg| match arg {
-            ColumnarValue::Array(arr) if arr.len() > 0 => Some(arr.len()),
+            ColumnarValue::Array(arr) if !arr.is_empty() => Some(arr.len()),
             ColumnarValue::Array(_) | ColumnarValue::Scalar(_) => None,
         }) else {
             return Ok(ColumnarValue::Array(Arc::new(StringViewArray::new_null(0))));
