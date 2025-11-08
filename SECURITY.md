@@ -12,6 +12,8 @@ In the latest major version, the last 2 minor versions are supported for securit
 | 1.8.2   | :white_check_mark: |
 | 1.8.1   | :white_check_mark: |
 | 1.8.0   | :white_check_mark: |
+| 1.7.3   | :white_check_mark: |
+| 1.7.2   | :white_check_mark: |
 | 1.7.1   | :white_check_mark: |
 | 1.7.0   | :white_check_mark: |
 | 1.6.1   | :x:                |

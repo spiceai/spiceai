@@ -24,6 +24,7 @@ use crate::search::util::parse_explicit_primary_keys;
 use datafusion::functions::math::random::RandomFunc;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::ai;
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed;
 use runtime_datafusion_udfs::{alias, bucket, cosine_distance, digest_many, truncate};
 
@@ -58,10 +59,9 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
     );
 
-    ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
-
     #[cfg(feature = "models")]
     {
+        ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
         ctx.register_udf(
             ai::Ai::new(runtime.completion_llms())
                 .into_async_udf()

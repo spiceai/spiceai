@@ -47,8 +47,8 @@ pub fn to_cached_record_batch_stream(
 
         while let Some(batch_result) = stream.next().await {
             if records_size < cache_max_size && let Ok(batch) = &batch_result {
-                    records.push(batch.clone());
-                    records_size += batch.get_array_memory_size();
+                records.push(batch.clone());
+                records_size += batch.get_array_memory_size();
             }
 
             yield batch_result;

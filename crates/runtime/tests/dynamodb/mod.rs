@@ -27,7 +27,7 @@ use crate::{configure_test_datafusion, init_tracing, utils::test_request_context
 
 use aws_config::Region;
 use aws_credential_types::Credentials;
-use aws_sdk_dynamodb::config::BehaviorVersion;
+use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
     ScalarAttributeType,
@@ -571,7 +571,7 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
 
 #[allow(clippy::missing_panics_doc)]
 #[allow(clippy::missing_errors_doc)]
-pub fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> {
+pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> {
     let Ok(dynamodb_access_key_id) = env::var("AWS_DYNAMODB_KEY") else {
         panic!("AWS_DYNAMODB_KEY not set")
     };
@@ -588,13 +588,13 @@ pub fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> 
         "dynamodb",
     );
 
-    let config = aws_sdk_dynamodb::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
+    let config = default_aws_config()
         .region(Region::new("ap-northeast-2"))
         .credentials_provider(credentials)
-        .build();
+        .load()
+        .await;
 
-    let client = aws_sdk_dynamodb::Client::from_conf(config);
+    let client = aws_sdk_dynamodb::Client::new(&config);
 
     Ok(client)
 }
@@ -602,7 +602,7 @@ pub fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> 
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)]
 async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
-    let client = get_dynamodb_client()?;
+    let client = get_dynamodb_client().await?;
 
     tracing::info!("Initializing test table: {}", table_name);
 
