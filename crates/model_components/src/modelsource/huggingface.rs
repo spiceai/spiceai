@@ -62,7 +62,7 @@ impl ModelSource for Huggingface {
         // it is not copying local model into .spice folder
         let local_path = super::ensure_model_path(name.as_str())?;
         let local_path = PathBuf::from(local_path);
-        
+
         // Get the parent directory as the root for security boundary checks.
         // This ensures files cannot escape the model's parent directory.
         let root_dir = local_path.parent().context(super::UnableToLoadConfigSnafu {
@@ -135,7 +135,7 @@ impl ModelSource for Huggingface {
                 file,
             );
 
-            let file_path = resolve_model_file_path(&root_dir, &versioned_path, &file)?;
+            let file_path = resolve_model_file_path(root_dir, &versioned_path, &file)?;
 
             if std::fs::metadata(&file_path).is_ok() {
                 tracing::info!(
