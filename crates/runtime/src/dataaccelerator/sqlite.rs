@@ -32,6 +32,7 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
@@ -105,7 +106,8 @@ impl SqliteAccelerator {
                 .with_decimal_between(true)
                 // Prepared statements currently map timestamp values incorrectly (see spiceai#7629),
                 // so use the legacy insert path until the upstream fix lands.
-                .with_batch_insert_use_prepared_statements(false),
+                .with_batch_insert_use_prepared_statements(false)
+                .with_function_support(deny_spice_specific_functions()),
         }
     }
 
