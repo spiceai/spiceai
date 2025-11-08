@@ -107,7 +107,6 @@ impl S3Vectors for S3VectorRetryClient {
                         CreateIndexError::AccessDeniedException(_)
                         | CreateIndexError::ConflictException(_)
                         | CreateIndexError::NotFoundException(_)
-                        | CreateIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -152,7 +151,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         CreateVectorBucketError::AccessDeniedException(_)
                         | CreateVectorBucketError::ConflictException(_)
-                        | CreateVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -196,9 +194,9 @@ impl S3Vectors for S3VectorRetryClient {
                         err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
-                        DeleteIndexError::AccessDeniedException(_)
-                        | DeleteIndexError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
+                        DeleteIndexError::AccessDeniedException(_) | _ => {
+                            Err(RetryError::permanent(e))
+                        }
                     },
                     SdkError::DispatchFailure(d) => {
                         let credentials_not_loaded = d
@@ -242,7 +240,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         DeleteVectorBucketError::AccessDeniedException(_)
                         | DeleteVectorBucketError::ConflictException(_)
-                        | DeleteVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -287,7 +284,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         DeleteVectorBucketPolicyError::AccessDeniedException(_)
                         | DeleteVectorBucketPolicyError::NotFoundException(_)
-                        | DeleteVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -335,7 +331,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | DeleteVectorsError::KmsDisabledException(_)
                         | DeleteVectorsError::KmsInvalidKeyUsageException(_)
                         | DeleteVectorsError::KmsInvalidStateException(_)
-                        | DeleteVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -380,7 +375,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         GetIndexError::AccessDeniedException(_)
                         | GetIndexError::NotFoundException(_)
-                        | GetIndexError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -425,7 +419,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         GetVectorBucketError::AccessDeniedException(_)
                         | GetVectorBucketError::NotFoundException(_)
-                        | GetVectorBucketError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -470,7 +463,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         GetVectorBucketPolicyError::AccessDeniedException(_)
                         | GetVectorBucketPolicyError::NotFoundException(_)
-                        | GetVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -519,7 +511,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | GetVectorsError::KmsInvalidKeyUsageException(_)
                         | GetVectorsError::KmsInvalidStateException(_)
                         | GetVectorsError::KmsNotFoundException(_)
-                        | GetVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -564,7 +555,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         ListIndexesError::AccessDeniedException(_)
                         | ListIndexesError::NotFoundException(_)
-                        | ListIndexesError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -607,9 +597,9 @@ impl S3Vectors for S3VectorRetryClient {
                         err if err.meta().code() == Some("RequestTimeoutException") => {
                             Err(RetryError::transient(e))
                         }
-                        ListVectorBucketsError::AccessDeniedException(_)
-                        | ListVectorBucketsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
+                        ListVectorBucketsError::AccessDeniedException(_) | _ => {
+                            Err(RetryError::permanent(e))
+                        }
                     },
                     SdkError::DispatchFailure(d) => {
                         let credentials_not_loaded = d
@@ -653,7 +643,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         ListVectorsError::AccessDeniedException(_)
                         | ListVectorsError::NotFoundException(_)
-                        | ListVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -698,7 +687,6 @@ impl S3Vectors for S3VectorRetryClient {
                         }
                         PutVectorBucketPolicyError::AccessDeniedException(_)
                         | PutVectorBucketPolicyError::NotFoundException(_)
-                        | PutVectorBucketPolicyError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -747,7 +735,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | PutVectorsError::KmsInvalidKeyUsageException(_)
                         | PutVectorsError::KmsInvalidStateException(_)
                         | PutVectorsError::KmsNotFoundException(_)
-                        | PutVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {
@@ -796,7 +783,6 @@ impl S3Vectors for S3VectorRetryClient {
                         | QueryVectorsError::KmsInvalidKeyUsageException(_)
                         | QueryVectorsError::KmsInvalidStateException(_)
                         | QueryVectorsError::KmsNotFoundException(_)
-                        | QueryVectorsError::ServiceQuotaExceededException(_)
                         | _ => Err(RetryError::permanent(e)),
                     },
                     SdkError::DispatchFailure(d) => {

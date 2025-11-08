@@ -650,7 +650,7 @@ async fn query_vector_stream(
             .map_err(|e| {
                 DataFusionError::External(
                     Error::S3VectorGetVectorsError {
-                        source: e.into_service_error(),
+                        source: Box::new(e.into_service_error()),
                     }
                     .into(),
                 )
