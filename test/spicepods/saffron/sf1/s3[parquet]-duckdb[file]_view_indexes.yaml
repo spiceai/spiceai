@@ -56,5 +56,7 @@ views:
       refresh_on_startup: auto
       params:
         duckdb_preserve_insertion_order: true
+        query_federation: disabled
+        duckdb_file: number_info_with_cap.duckdb
       indexes:
         '(AccountSid, NumberPoolSid)': enabled
