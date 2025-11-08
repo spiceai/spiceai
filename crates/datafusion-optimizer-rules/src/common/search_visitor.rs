@@ -31,6 +31,8 @@ impl<T> Default for SearchVisitor<T> {
 }
 
 impl SearchVisitor<()> {
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn collect_concrete_down<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
@@ -39,6 +41,8 @@ impl SearchVisitor<()> {
             .find(plan)
     }
 
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn collect_concrete_up<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
@@ -47,6 +51,8 @@ impl SearchVisitor<()> {
             .find(plan)
     }
 
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn first_concrete_down<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -55,6 +61,8 @@ impl SearchVisitor<()> {
             .find_first(plan)
     }
 
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn first_concrete_up<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -100,11 +108,15 @@ impl<T: 'static> SearchVisitor<T> {
 
     // API
 
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn find(mut self, plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<T>> {
         plan.visit(&mut self)?;
         Ok(self.values)
     }
 
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn find_first(self, plan: &Arc<dyn ExecutionPlan>) -> Result<Option<T>> {
         let mut with_limit = self.limit(1);
         plan.visit(&mut with_limit)?;

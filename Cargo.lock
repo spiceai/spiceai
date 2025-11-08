@@ -4624,7 +4624,10 @@ dependencies = [
  "cache",
  "datafusion",
  "datafusion-expr",
+ "datafusion-table-providers",
+ "duckdb",
  "futures",
+ "r2d2",
  "tracing",
 ]
 
