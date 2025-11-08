@@ -94,7 +94,7 @@ impl DatabricksDelta {
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
         )
-        .boxed()?
+        .boxed()?;
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
