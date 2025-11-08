@@ -157,7 +157,7 @@ impl RefreshTask {
             refresh.sql.as_deref(),
         )
         .await
-        .map_err(inner_err_from_retry_ref)
+        .map_err(|e| inner_err_from_retry_ref(&e))
         .context(ChangesAfterLoadBootstrappingSnafu)?;
 
         if let Some(ready_sender) = ready_sender.as_ref() {
