@@ -17,7 +17,8 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{
-    Column, DataFusionError, JoinType, Result, ScalarValue, TableReference, exec_err, not_impl_err,
+    Column, Constraint, DataFusionError, JoinType, Result, ScalarValue, TableReference, exec_err,
+    not_impl_err,
 };
 use datafusion::datasource::TableType;
 use datafusion::functions_aggregate::expr_fn::{first_value, max};
@@ -378,7 +379,7 @@ impl ReciprocalRankFusion {
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
     // then finally re-rank and sort fused results
     fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
-        let subquery_dfs = self.prepare_and_execute_subqueries(args)?;
+        let (subquery_dfs, join_key) = self.prepare_and_execute_subqueries(args)?;
         let score_expr = Self::compute_score_expr(args, &subquery_dfs)?;
 
         // Create column expressions for final projection
@@ -399,18 +400,9 @@ impl ReciprocalRankFusion {
             }
         }));
 
-        // Join DFs together, apply final projection, and sort by the new fused score
-        let join_key = args
-            .join_key
-            .clone()
-            .map_or("__spice_rrf_row_id".to_string(), |k| {
-                let (_, qname) = k.qualified_name();
-                qname
-            });
-
         let mut join_err: Option<DataFusionError> = None;
         let maybe_joined = subquery_dfs.into_iter().reduce(|a, b| {
-            let joined = Self::fold_join(a, b, &join_key);
+            let joined = Self::fold_join(a, b, join_key.qualified_name().1.as_str());
 
             // No way to short circuit reduce, so we will surface the error at the end
             match joined {
@@ -439,7 +431,7 @@ impl ReciprocalRankFusion {
                 let (_, cname) = c.qualified_name();
 
                 // Do not aggregate the join key
-                if cname == join_key {
+                if cname == join_key.qualified_name().1 {
                     None
                 } else {
                     Some(
@@ -451,11 +443,27 @@ impl ReciprocalRankFusion {
 
             joined
                 .select(columns)?
-                .aggregate(vec![ident(&join_key)], agg_cols)?
+                .aggregate(vec![join_key], agg_cols)?
                 .drop_columns(&["__spice_rrf_row_id"])?
                 .sort(vec![col("fused_score").sort(false, false)])
         } else {
             exec_err!("{RRF_UDF_NAME}: Unable to join result sets")
+        }
+    }
+
+    /// For a set of primary keys, return an inferred join key expression if all tables share the same PK.
+    ///
+    /// Only single-column PKs are supported for now.
+    fn infer_join_key(table_pks: &[Option<Vec<String>>]) -> Option<Expr> {
+        let inferred_key = table_pks.iter().find(|&s| s.is_some())?.clone()?;
+        if table_pks
+            .iter()
+            .all(|pk_opt| pk_opt.as_ref() == Some(&inferred_key))
+            && inferred_key.len() == 1
+        {
+            Some(ident(&inferred_key[0]))
+        } else {
+            None
         }
     }
 
@@ -464,10 +472,10 @@ impl ReciprocalRankFusion {
     fn prepare_and_execute_subqueries(
         &self,
         args: &ReciprocalRankFusionArgs,
-    ) -> Result<Vec<DataFrame>> {
+    ) -> Result<(Vec<DataFrame>, Expr)> {
         tracing::trace!("{RRF_UDF_NAME} preparing subqueries for: {:?}", args);
 
-        let search_dfs: Vec<DataFrame> = args
+        let (search_dfs, per_table_pks): (Vec<DataFrame>, Vec<Option<Vec<String>>>) = args
             .search_udtf_exprs
             .iter()
             .map(|expr| {
@@ -477,9 +485,33 @@ impl ReciprocalRankFusion {
                 self.session_context
                     .table_function(sf.name())
                     .and_then(|udtf| udtf.create_table_provider(&sf.args))
-                    .and_then(|provider| self.session_context.read_table(provider))
+                    .and_then(|provider| {
+                        let pk = provider.constraints().as_ref().and_then(|&cs| {
+                            cs.iter().find_map(|c| match c {
+                                Constraint::PrimaryKey(pk) => provider
+                                    .schema()
+                                    .project(pk)
+                                    .map(|x| {
+                                        x.fields()
+                                            .iter()
+                                            .map(|f| f.name().clone())
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .ok(),
+                                Constraint::Unique(_) => None,
+                            })
+                        });
+                        Ok((self.session_context.read_table(provider)?, pk))
+                    })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
+
+        let join_key = args
+            .join_key
+            .clone()
+            .or(Self::infer_join_key(per_table_pks.as_slice()));
 
         let prepared_dfs: Vec<DataFrame> = search_dfs
             .into_iter()
@@ -492,7 +524,7 @@ impl ReciprocalRankFusion {
                     );
                 }
 
-                let df_with_id = match args.join_key {
+                let df_with_id = match join_key {
                     Some(_) => Ok(df),
                     None => Self::with_rrf_rowid(df),
                 };
@@ -503,7 +535,7 @@ impl ReciprocalRankFusion {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(prepared_dfs)
+        Ok((prepared_dfs, join_key.unwrap_or(col("__spice_rrf_row_id"))))
     }
 
     // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
