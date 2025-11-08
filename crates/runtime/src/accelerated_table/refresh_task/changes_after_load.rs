@@ -14,23 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{RefreshTask, accelerator_df};
+use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
-use crate::accelerated_table::{ChangesAfterLoadSnafu, Result};
+use crate::accelerated_table::{
+    ChangesAfterLoadBootstrappingSnafu, ChangesAfterLoadCheckDatasetSnafu, Result,
+};
 use crate::dataconnector::changes_after_load::{ChangesAfterLoadCoordinator, DatasetStatus};
-use crate::dataconnector::dynamodb::DynamoDBChangesAfterLoadCoordinator;
 use crate::dataconnector::get_data;
 use crate::dataupdate::{StreamingDataUpdate, UpdateType};
 use cache::Caching;
 use datafusion::catalog::TableProvider;
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
-use futures::StreamExt;
 use snafu::ResultExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use tokio::sync::{Notify, RwLock};
-use tokio::time::sleep;
 
 impl RefreshTask {
     pub async fn coordinate_changes_after_load(
@@ -53,9 +52,9 @@ impl RefreshTask {
         .await;
 
         match coordinator
-            .check_dataset_state(ctx)
+            .check_dataset_status(ctx)
             .await
-            .context(ChangesAfterLoadSnafu)?
+            .context(ChangesAfterLoadCheckDatasetSnafu)?
         {
             DatasetStatus::Bootstrap => {
                 self.cold_start(
@@ -100,7 +99,7 @@ impl RefreshTask {
             ready_sender,
             Arc::clone(&initial_load_completed),
         )
-        .await;
+        .await?;
 
         // Step 3. Start changes stream
         tracing::debug!(
@@ -125,7 +124,7 @@ impl RefreshTask {
         refresh: Arc<RwLock<Refresh>>,
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
-    ) {
+    ) -> Result<()> {
         let start_time = SystemTime::now();
 
         let dataset_name = self.dataset_name.clone();
@@ -141,7 +140,7 @@ impl RefreshTask {
 
         let refresh = refresh.read().await;
 
-        let batch_stream_result = get_data(
+        let batch_stream = get_data(
             &mut ctx,
             dataset_name,
             federated_provider,
@@ -149,29 +148,24 @@ impl RefreshTask {
             vec![],
         )
         .await
-        .map_err(check_and_mark_retriable_error);
-
-        let batch_stream = match batch_stream_result {
-            Ok(batch_stream) => batch_stream,
-            Err(err) => {
-                return;
-            }
-        };
+        .context(ChangesAfterLoadBootstrappingSnafu)?;
 
         let streaming_data_update = StreamingDataUpdate::new(batch_stream, UpdateType::Append);
 
-        let write_result = self
-            .write_streaming_data_update(
-                Some(start_time),
-                streaming_data_update,
-                refresh.sql.as_deref(),
-            )
-            .await;
+        self.write_streaming_data_update(
+            Some(start_time),
+            streaming_data_update,
+            refresh.sql.as_deref(),
+        )
+        .await
+        .context(ChangesAfterLoadBootstrappingSnafu)?;
 
         if let Some(ready_sender) = ready_sender.as_ref() {
             ready_sender.notify_waiters();
         }
         initial_load_completed.store(true, Ordering::Relaxed);
+
+        Ok(())
     }
 
     async fn changes_after_load_stream(

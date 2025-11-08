@@ -30,7 +30,7 @@ pub enum DatasetStatus {
 pub trait ChangesAfterLoadCoordinator: Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    async fn check_dataset_state(
+    async fn check_dataset_status(
         &self,
         ctx: &SessionContext,
     ) -> Result<DatasetStatus, DataFusionError>;
