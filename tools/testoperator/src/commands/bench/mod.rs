@@ -70,7 +70,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
-    let query_set = QuerySet::from(args.query_set.clone());
+    let query_set = args.load_query_set()?;
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 

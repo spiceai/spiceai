@@ -1,0 +1,53 @@
+# Custom query set for HTTP connector testing with TVMaze API
+name: http_tvmaze
+queries:
+  # Test 1: Single JSON object - Breaking Bad show details
+  - name: single_object_show
+    sql: SELECT _path, _query, content FROM show_details WHERE _path = '/shows/169'
+    expected_results:
+      row_count: 1
+
+  # Test 2: JSON array expansion - People search results
+  - name: multi_object_search
+    sql: SELECT _path, _query, content FROM people_search WHERE _path = '/search/people' AND _query = 'q=michael'
+    expected_results:
+      row_count: 10
+
+  # Test 3: Combined OR filter across endpoints
+  - name: combined_endpoints
+    sql: SELECT _path, COUNT(*) as count FROM combined_data GROUP BY _path ORDER BY _path
+    expected_results:
+      columns: '_path, count'
+      rows:
+        - '/search/people, 10'
+        - '/shows/169, 1'
+
+  # Test 4: IN list with multiple show IDs
+  - name: multiple_shows_in_list
+    sql: SELECT _path FROM multiple_shows ORDER BY _path
+    expected_results:
+      columns: '_path'
+      rows:
+        - '/shows/169'
+        - '/shows/170'
+        - '/shows/171'
+
+  # Test 5: Verify content structure for single object
+  - name: verify_show_structure
+    sql: |
+      SELECT 
+        _path,
+        json_get(content, 'id') as show_id,
+        json_get(content, 'name') as show_name
+      FROM show_details 
+      WHERE _path = '/shows/169'
+    expected_results:
+      columns: '_path, show_id, show_name'
+      rows:
+        - '/shows/169, 169, Breaking Bad'
+
+  # Test 6: Count results without filters (should get all data)
+  - name: count_all_search_results
+    sql: SELECT COUNT(*) as total FROM people_search
+    expected_results:
+      row_count: 1

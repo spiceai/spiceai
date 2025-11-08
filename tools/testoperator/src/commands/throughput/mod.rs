@@ -38,7 +38,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    let query_set = QuerySet::from(args.query_set.clone());
+    let query_set = args.load_query_set()?;
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 

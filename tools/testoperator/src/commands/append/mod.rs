@@ -33,7 +33,7 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    let query_set = QuerySet::from(args.query_set.clone());
+    let query_set = args.load_query_set()?;
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
 
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
