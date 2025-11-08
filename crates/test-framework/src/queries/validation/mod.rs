@@ -519,8 +519,11 @@ pub fn validate_with_expected_batches(
             QueryValidationFailReason::NoAnswer,
         ));
     };
-    
-    let Some(actual_schema) = actual_batches.first().map(arrow::array::RecordBatch::schema) else {
+
+    let Some(actual_schema) = actual_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::NoAnswer,
         ));
@@ -545,7 +548,7 @@ pub fn validate_with_expected_batches(
         println!("Query '{query_name}' row count mismatch:");
         println!("  expected: {}", expected_batches.num_rows());
         println!("  actual: {}", actual_batches.num_rows());
-        
+
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::RowCountMismatch {
                 expected: expected_batches.num_rows(),
@@ -571,7 +574,7 @@ pub fn validate_row_count(
         println!("Query '{query_name}' row count mismatch:");
         println!("  expected: {expected_row_count}");
         println!("  actual: {actual_row_count}");
-        
+
         Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::RowCountMismatch {
                 expected: expected_row_count,
