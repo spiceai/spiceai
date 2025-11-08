@@ -27,7 +27,7 @@ use runtime::Runtime;
 use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
-use runtime_datafusion::extension::bytes_processed::BytesProcessedExtensionPlanner;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion::{
     execution_plan::schema_cast::EnsureSchema, extension::ExtensionPlanQueryPlanner,
 };
@@ -108,15 +108,14 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .with_query_planner(Arc::new(
                     ExtensionPlanQueryPlanner::from_extension_planners(vec![
                         Arc::new(FederatedPlanner::new()),
-                        Arc::new(BytesProcessedExtensionPlanner::new(
-                            Box::new(track_bytes_processed),
-                            cfg!(feature = "cluster"),
-                        )),
                         Arc::new(IndexTableScanExtensionPlanner::new()),
                     ]),
                 ))
                 .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+                .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                    Arc::new(Box::new(track_bytes_processed)),
+                )))
                 .build();
 
             if let Err(e) = datafusion_functions_json::register_all(&mut state) {

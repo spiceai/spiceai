@@ -54,6 +54,7 @@ async fn test_cayenne_basic_workflow_impl(
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     // 3. Create Cayenne table provider
@@ -604,6 +605,7 @@ async fn test_cayenne_statistics_impl(
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let table = CayenneTableProvider::create_table(
@@ -717,6 +719,7 @@ async fn test_cayenne_core_data_types_impl(
         primary_key: vec!["col_int64".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     let table = CayenneTableProvider::create_table(

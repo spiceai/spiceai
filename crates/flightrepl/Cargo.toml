@@ -28,7 +28,6 @@ rustyline = { version = "17.0.1", features = [
   "derive",
 ] }
 serde_json.workspace = true
-sqlparser.workspace = true
 tokio = { workspace = true }
 tonic = { workspace = true, features = [
   "transport",

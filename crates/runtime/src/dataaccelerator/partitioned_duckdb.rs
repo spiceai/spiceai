@@ -56,8 +56,11 @@ use super::{
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
-    component::dataset::acceleration::Mode, dataaccelerator::FilePathError,
-    datafusion::dialect::new_duckdb_dialect, parameters::ParameterSpec, spice_data_base_path,
+    component::dataset::acceleration::Mode,
+    dataaccelerator::FilePathError,
+    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
+    parameters::ParameterSpec,
+    spice_data_base_path,
 };
 
 pub mod tables_mode;
@@ -474,6 +477,7 @@ fn create_factory() -> DuckDBTableProviderFactory {
         .with_settings_registry(
             DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
         )
+        .with_function_support(deny_spice_specific_functions())
 }
 
 async fn get_pool(

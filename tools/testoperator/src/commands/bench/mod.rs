@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_app_and_start_request};
-use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
+use crate::{
+    args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper,
+    wait_test_and_memory,
+};
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -84,6 +87,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let ready_wait_duration = ready_wait_start.elapsed();
     let health_monitor = HealthMonitor::spawn()?;
+
+    // Start metrics scraper if enabled
+    let metrics_scraper = if args.common.scrape_spiced_metrics {
+        Some(MetricsScraper::spawn()?)
+    } else {
+        None
+    };
 
     // baseline run
     println!("Running benchmark test");
@@ -169,11 +179,16 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path())?;
 
-    telemetry.emit().await?;
-
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
+
     let health_report = health_monitor.stop().await;
+
+    // Stop and process metrics scraper if enabled
+    super::process_spiced_metrics(metrics_scraper, args.common.metrics, &[]).await;
+
+    telemetry.emit().await?;
+
     spiced_instance.stop()?;
     let health_report = health_report?;
     let mut error_messages = Vec::new();

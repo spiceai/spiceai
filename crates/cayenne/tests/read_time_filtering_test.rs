@@ -59,6 +59,7 @@ async fn setup_test_table(
         primary_key: vec!["id".to_string()],
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
     // Create table provider

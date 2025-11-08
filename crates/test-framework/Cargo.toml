@@ -9,22 +9,19 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ahash.workspace = true
-anyhow = "1.0.99"
+anyhow.workspace = true
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
-arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-clap.workspace = true
 dashmap = "6.1.0"
 duckdb = { optional = true, workspace = true, features = [
     "bundled",
     "r2d2",
     "vtab",
     "vtab-arrow",
-]}
+] }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.18.0"
@@ -41,16 +38,16 @@ secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+spiceai = { workspace = true }
 spicepod = { path = "../spicepod" }
 sysinfo = "0.35.2"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
 tokio.workspace = true
-tonic.workspace = true
 tokio-util.workspace = true
+tonic.workspace = true
 util = { path = "../util" }
 uuid = { workspace = true, features = ["v4"] }
-spiceai = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { version = "0.30", features = ["signal"] }
@@ -69,8 +66,8 @@ dremio = []
 duckdb = []
 flightsql = []
 ftp = []
-keyring-secret-store = []
 imap = []
+keyring-secret-store = []
 models = []
 mssql = []
 mysql = []
