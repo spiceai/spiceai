@@ -1,0 +1,1156 @@
+{
+    "version": "2.2.0",
+    "summary": {
+        "title": "Spice.ai OSS v1.9.0",
+        "owner": "Phillip LeBlanc",
+        "description": "Spice is a portable, open-source runtime for fast, last-mile SQL query, search (vector, full-text, keyword), and AI inference with Model Context Protocol support.",
+        "id": 0
+    },
+    "detail": {
+        "contributors": [],
+        "diagrams": [
+            {
+                "id": 0,
+                "title": "SQL Query, Search, and AI Inference (Local Machine/Network)",
+                "diagramType": "STRIDE",
+                "placeholder": "New STRIDE diagram description",
+                "thumbnail": "./public/content/images/thumbnail.stride.jpg",
+                "version": "2.2.0",
+                "cells": [
+                    {
+                        "position": {
+                            "x": 290,
+                            "y": 179.99999999999983
+                        },
+                        "size": {
+                            "width": 250,
+                            "height": 350
+                        },
+                        "shape": "trust-boundary-box",
+                        "attrs": {
+                            "headerText": {
+                                "text": "Spice Runtime Process"
+                            }
+                        },
+                        "zIndex": -1,
+                        "id": "d7fa1282-6622-4dda-b3c8-a4f51746ef86",
+                        "data": {
+                            "type": "tm.BoundaryBox",
+                            "name": "Spice Runtime Process",
+                            "description": "",
+                            "isTrustBoundary": true,
+                            "hasOpenThreats": false
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": -21.00000000000233,
+                            "y": 90
+                        },
+                        "size": {
+                            "width": 600,
+                            "height": 600
+                        },
+                        "shape": "trust-boundary-box",
+                        "attrs": {
+                            "headerText": {
+                                "text": "Local Machine/Network"
+                            }
+                        },
+                        "zIndex": -1,
+                        "id": "b2bbd52d-f20e-4d29-8246-5c24a7d84de6",
+                        "data": {
+                            "type": "tm.BoundaryBox",
+                            "name": "Local Machine/Network",
+                            "description": "",
+                            "isTrustBoundary": true,
+                            "hasOpenThreats": false
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": -3.126388037344441e-13,
+                            "y": 179.99999999999983
+                        },
+                        "size": {
+                            "width": 260,
+                            "height": 350
+                        },
+                        "shape": "trust-boundary-box",
+                        "attrs": {
+                            "headerText": {
+                                "text": "Application Process"
+                            }
+                        },
+                        "zIndex": -1,
+                        "id": "e98ca2eb-b692-4154-a852-b6329be72330",
+                        "data": {
+                            "type": "tm.BoundaryBox",
+                            "name": "Application Process",
+                            "description": "",
+                            "isTrustBoundary": true,
+                            "hasOpenThreats": false
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 410,
+                            "y": 210
+                        },
+                        "size": {
+                            "width": 130,
+                            "height": 180
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "Spice Runtime"
+                            },
+                            "body": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "process",
+                        "zIndex": 1,
+                        "id": "910108ef-e112-4d35-869a-55bae2e7e631",
+                        "data": {
+                            "type": "tm.Process",
+                            "name": "Spice Runtime",
+                            "description": "Core runtime process handling SQL queries, search operations, AI inference, and MCP protocol",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": true,
+                            "handlesCardPayment": false,
+                            "handlesGoodsOrServices": false,
+                            "isWebApplication": true,
+                            "privilegeLevel": "",
+                            "threats": [
+                                {
+                                    "id": "dff68689-b77c-4a7d-8ac0-f5dd0f68c832",
+                                    "title": "Bypass data source AuthN/AuthZ",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "Users with access to the Spice runtime APIs can access information from the data source either via federated SQL query, search operations, or through queries on a configured accelerator, potentially getting access to data they don't normally have access to.",
+                                    "mitigation": "This is an expected behavior of the system. Spice can be used by design to provide access to data without needing to divulge the underlying connection information.\n\nThe current supported deployment model is that endpoints aren't exposed to untrusted entities.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 4,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "5caf188d-20ad-44e8-9668-fd8bbb2fff5b",
+                                    "title": "Task history reset on restart",
+                                    "status": "Open",
+                                    "severity": "Low",
+                                    "type": "Repudiation",
+                                    "description": "The task history table is only kept in-memory, which means any tasks that would be captured are lost if an attacker wants to conceal what they did by either timing their activity to occur before a maintenance activity that results in a restart, or by purposefully causing the runtime to restart.",
+                                    "mitigation": "Persist task_history locally",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 5,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "4c5c5857-7dd9-4507-9901-65a46bca1e4f",
+                                    "title": "Expensive queries can lead to denial of service",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Denial of service",
+                                    "description": "An attacker or misconfigured application could potentially cause a denial of service on the Spice runtime through expensive SQL queries, vector search operations, or LLM inference requests.",
+                                    "mitigation": "Configurable limit on how much time a query can take\nDeploy more Spice instances, where each Spice instance has its own resource limits\nUse query_max_runtime and search timeouts",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 6,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "6f77fbb6-e541-4cf7-8a01-66c8fb5fa1fc",
+                                    "title": "No persistent audit logs",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Repudiation",
+                                    "description": "Spice does not provide audit logging of actions taken that could repudiate that a certain action was taken.\nAll access to Spice assumes the caller is trusted, so no identity information could be gathered even if audit logs were maintained",
+                                    "mitigation": "Implement a proper audit/task history log tracking both changes to the runtime operation (i.e. modifying Spicepod, runtime settings) as well as data operations (queries, refreshes, search, chat) that is persistent across restarts.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 11,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "3b998f5e-b14c-471a-821a-70492d1f03cf",
+                                    "title": "Data source connection details (or any secrets) leaked via errors/logging",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "Metadata about connected data sources is leaked through error messages, revealing sensitive infrastructure details.",
+                                    "mitigation": "Review code where logs are emitted to ensure that potential sensitive information (i.e. credentials encoded in headers) is not leaked via error messages.\n- [Action]: Remove ODBC printing the connection string",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 12,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "060959c9-eef4-4f5c-b2ec-883b817d4fb6",
+                                    "title": "Excessive acceleration",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Denial of service",
+                                    "description": "An attacker with the ability to control the Spicepod (or an unintentionally misconfigured Spicepod through legitimate means) can cause the runtime to load an acceleration that is too large to fit in-memory on the filesystem, or causes the running organization to incur excessive costs from the remote data source.",
+                                    "mitigation": "Configure acceleration limits and use Cayenne accelerator which has better scaling characteristics than DuckDB file-based acceleration",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 13,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "1b7e7d8e-91f6-44c2-8b23-4e6ae2e59e1f",
+                                    "title": "Malicious SQL / SQL injection leading to ACE",
+                                    "status": "Mitigated",
+                                    "severity": "Medium",
+                                    "type": "Elevation of privilege",
+                                    "description": "A user exploits a vulnerability in the SQL parser to execute arbitrary code (ACE) on the Spice runtime.",
+                                    "mitigation": "We reject queries that would allow modifying the state of the runtime at the parsing layer. Write operations only allowed with explicit read_write access configuration.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 14,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "279a3e89-40a7-463e-b6f0-33a1a76e9579",
+                                    "title": "Results caching reuse",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "A malicious actor targets the query results or search results caching mechanism to retrieve sensitive data from previous queries or searches.",
+                                    "mitigation": "Implement results caching with proper AuthN/AuthZ. Currently assumes trusted environment.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 16,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "b2f796eb-4409-446f-8888-61d46a165b49",
+                                    "title": "Malicious compressed small payload has unbounded/very large size",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Denial of service",
+                                    "description": "If an attacker is able to send a payload to a Spice endpoint that is compressed, and the decompression of that payload causes Spice to run out of memory due to the payload itself having a very large/potentially unbounded size - then it could cause a denial of service. (i.e. Zipbomb)",
+                                    "mitigation": "- No known Gzip attack vector and the HTTP endpoints only accept Gzip compression\n- For connecting to data sources, we rely on object_store's implementation which should protect against this.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 18,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "9982eda7-8112-42ee-9459-a6606d997b28",
+                                    "title": "Task History shows truncated results",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "If you have access to the runtime, you can access the task_history table along with some truncated outputs of data you might not normally be able to access.\n\nThis isn't a problem in v1.9.0, because if you can access the task_history table, then you trivially can access any of the data sources.",
+                                    "mitigation": "No mitigation currently. Once we add AuthN/AuthZ, we will need to design how to lock this down appropriately. (i.e. RLS)",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 19,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "5432e91b-7e85-45eb-ae9f-0d9649b3c969",
+                                    "title": "Malicious SQL / SQL injection leading to information disclosure",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "If there are functions that allow reading from the environment/file-system, this could lead to unexpected information disclosure of the system details/secrets",
+                                    "mitigation": "- Run in a chroot process with limited file-system access\n- Disable functions that allow this access",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 21,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "0c78df7c-43c7-4be4-9a31-78bb4d60acd6",
+                                    "title": "Supply chain attack leading to compromised dependency",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Elevation of privilege",
+                                    "description": "If an attacker is able to compromise a dependency that we depend on, and we release a version of Spice with that compromised dependency, then all of Spice users would potentially be affected.",
+                                    "mitigation": "- CVE scanner/dependabot to scan for known issues with dependencies\n- Adopt a policy of waiting before upgrading a dependency to allow for the community to identify\n- Processing scanning to identify suspicious behavior",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 22,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "23a1b456-cd78-9012-ef34-567890abcdef",
+                                    "title": "Vector search index poisoning",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Tampering",
+                                    "description": "An attacker with access to the filesystem or S3 Vectors buckets could modify vector embeddings or indexes to return incorrect search results, leading to data poisoning attacks in RAG applications.",
+                                    "mitigation": "- Limit file permissions to only the user running the Spice instance\n- Use S3 bucket policies and IAM roles to restrict access to S3 Vectors indexes\n- Enable versioning and audit logging on S3 buckets",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 23,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "24b2c567-de89-0123-fg45-678901bcdefg",
+                                    "title": "MCP server compromise leading to tool execution attacks",
+                                    "status": "Open",
+                                    "severity": "High",
+                                    "type": "Elevation of privilege",
+                                    "description": "If Spice connects to a malicious or compromised MCP server (stdio or SSE-based), the server could return malicious tool definitions that, when executed by LLMs, could lead to unauthorized actions, data exfiltration, or code execution.",
+                                    "mitigation": "- Only connect to trusted MCP servers\n- Implement allowlists for MCP server endpoints\n- Review and validate tool definitions before execution\n- Run MCP stdio servers in sandboxed processes with limited permissions\n- Implement rate limiting on tool executions",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 24,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "25c3d678-ef90-1234-gh56-789012cdefgh",
+                                    "title": "MCP protocol exploitation via malformed messages",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Denial of service",
+                                    "description": "An attacker could send malformed MCP SSE messages to the /v1/mcp/sse endpoint or manipulate stdio communication to crash the runtime or cause resource exhaustion.",
+                                    "mitigation": "- Implement strict input validation for MCP messages\n- Set timeouts for MCP communication\n- Implement rate limiting on MCP endpoints\n- Use memory limits for MCP message processing",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 25,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "26d4e789-fg01-2345-hi67-890123defghi",
+                                    "title": "Full-text search index manipulation",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Tampering",
+                                    "description": "An attacker with file system access could modify Tantivy-based full-text search indexes to alter search rankings or inject false search results.",
+                                    "mitigation": "- Proper file permissions so that only the Spice instance can access search indexes\n- Store indexes in protected directories\n- Implement index integrity checks\n- Use read-only mounts where possible",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 26,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "27e5f890-gh12-3456-ij78-901234efghij",
+                                    "title": "LLM prompt injection via search results",
+                                    "status": "Open",
+                                    "severity": "High",
+                                    "type": "Elevation of privilege",
+                                    "description": "If vector or full-text search results contain malicious content with prompt injection attacks, and these results are used in RAG with LLMs, an attacker could manipulate the LLM's behavior to leak sensitive information or execute unauthorized actions.",
+                                    "mitigation": "- Sanitize search results before including in LLM context\n- Implement system prompts that are resistant to prompt injection\n- Use structured output formats to separate data from instructions\n- Implement content filtering on search results\n- Use LLM guardrails and safety measures",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 27,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "28f6g901-hi23-4567-jk89-012345fghijk",
+                                    "title": "Cayenne metadata database tampering",
+                                    "status": "Open",
+                                    "severity": "High",
+                                    "type": "Tampering",
+                                    "description": "An attacker with access to the SQLite metadata database used by Cayenne accelerator could manipulate schemas, snapshots, statistics, or file tracking to cause data corruption, return incorrect query results, or cause denial of service.",
+                                    "mitigation": "- Limit file permissions on Cayenne metadata database to only the Spice process\n- Enable SQLite WAL mode for atomicity\n- Implement database backup and recovery procedures\n- Use file integrity monitoring for metadata databases\n- Store metadata databases on encrypted filesystems",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 28,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "29g7h012-ij34-5678-kl90-123456ghijkl",
+                                    "title": "Vortex columnar format exploitation",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Denial of service",
+                                    "description": "Maliciously crafted Vortex columnar data files could exploit parsing vulnerabilities to cause crashes, memory exhaustion, or incorrect query results in Cayenne accelerator.",
+                                    "mitigation": "- Validate Vortex file headers and metadata\n- Implement size limits for Vortex chunks\n- Use fuzzing to identify parsing vulnerabilities\n- Monitor memory usage during Vortex file parsing",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 29,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "30h8i123-jk45-6789-lm01-234567hijklm",
+                                    "title": "S3 Vectors petabyte-scale access cost attack",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Denial of service",
+                                    "description": "An attacker with access to Spice runtime could perform expensive vector searches on S3 Vectors indexes, causing excessive S3 API costs and potential service degradation.",
+                                    "mitigation": "- Implement rate limiting on vector search operations\n- Set query cost budgets and alerts\n- Use S3 request metrics and CloudWatch alarms\n- Implement query result caching for vector search\n- Restrict access to expensive search operations",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 30,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "31i9j234-kl56-7890-mn12-345678ijklmn",
+                                    "title": "Acceleration snapshot poisoning",
+                                    "status": "Open",
+                                    "severity": "High",
+                                    "type": "Tampering",
+                                    "description": "An attacker with access to object storage (S3) where acceleration snapshots are stored could replace legitimate snapshots with malicious ones containing poisoned data, which would be loaded on runtime cold start.",
+                                    "mitigation": "- Implement snapshot integrity checks (checksums, signatures)\n- Use S3 bucket versioning to track snapshot changes\n- Enable S3 access logging and monitor for unauthorized access\n- Validate snapshot metadata before loading\n- Use separate IAM roles for snapshot read/write operations",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 31,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "32j0k345-lm67-8901-no23-456789jklmno",
+                                    "title": "Iceberg table write injection",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Tampering",
+                                    "description": "With INSERT INTO support for Iceberg tables, an attacker could inject malicious data into Iceberg tables if they have access to datasets/catalogs with read_write access.",
+                                    "mitigation": "- Only enable read_write access for trusted users/applications\n- Implement schema validation on INSERT operations\n- Use Iceberg table snapshots for rollback capabilities\n- Monitor write operations through task_history\n- Implement write rate limiting",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 32,
+                                    "score": ""
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "shape": "trust-boundary-curve",
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Boundary",
+                            "name": "Internet/Untrusted Network",
+                            "description": "",
+                            "isTrustBoundary": true,
+                            "hasOpenThreats": false
+                        },
+                        "id": "32f83b98-a3b6-478e-8415-f64b6886e44b",
+                        "labels": [
+                            "Internet/Untrusted Network"
+                        ],
+                        "source": {
+                            "x": 530,
+                            "y": 30
+                        },
+                        "target": {
+                            "x": 880,
+                            "y": 320
+                        }
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": "block"
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": true,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "In-memory Arrow",
+                            "threats": []
+                        },
+                        "id": "25b3a98a-0e28-4d2b-bf74-bede05ce95eb",
+                        "labels": [
+                            ""
+                        ],
+                        "source": {
+                            "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+                        },
+                        "target": {
+                            "cell": "f32481b0-efee-44f0-991f-ad091abceba2"
+                        },
+                        "vertices": [
+                            {
+                                "x": 390,
+                                "y": 410
+                            }
+                        ]
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": "block"
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "Data Flow",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": true,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "",
+                            "threats": []
+                        },
+                        "id": "fb051e3e-9e0f-4158-87c4-610a8435286e",
+                        "source": {
+                            "cell": "f32481b0-efee-44f0-991f-ad091abceba2"
+                        },
+                        "target": {
+                            "cell": "03fb0ac1-ff87-46cc-8c51-f75357f8d350"
+                        },
+                        "vertices": []
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": "block"
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "Data Flow",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": true,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "",
+                            "threats": []
+                        },
+                        "id": "635ec413-fcc8-458b-b664-debefc2c249d",
+                        "source": {
+                            "x": 448,
+                            "y": 510
+                        },
+                        "target": {
+                            "cell": "03fb0ac1-ff87-46cc-8c51-f75357f8d350"
+                        }
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": "block"
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "Data Flow",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": true,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "",
+                            "threats": []
+                        },
+                        "id": "fa7ba349-b32b-4435-bf04-62dc4c148cd9",
+                        "source": {
+                            "x": 459,
+                            "y": 410
+                        },
+                        "target": {
+                            "cell": "81367a19-0ccf-4772-b2fe-55f1232cd67f"
+                        }
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": ""
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "Data Flow",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": false,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "",
+                            "threats": []
+                        },
+                        "id": "aae7d043-5c7c-46ca-b335-b2c62e0e7fca",
+                        "source": {
+                            "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+                        },
+                        "target": {
+                            "cell": "df26fc07-6901-4028-b816-f7fdc36bffb5"
+                        }
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": ""
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "Data Flow",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": false,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "",
+                            "threats": [
+                                {
+                                    "id": "a6c73295-0d6b-4b9d-af68-80fc976115a0",
+                                    "title": "Man-in-the-middle Data Sources",
+                                    "status": "Mitigated",
+                                    "severity": "Medium",
+                                    "type": "Tampering",
+                                    "description": "A potential man-in-the-middle attack is possible where an attacker can inject themselves in the middle of the data source data stream to modify data in transit, causing Spice to return attacker-controlled payloads to the client applications.",
+                                    "mitigation": "Connect to remote data sources using TLS/SSL\nFor data connectors that don't support TLS (FTP, Debezium) - connect over a secure network instead.\n",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 9,
+                                    "score": ""
+                                }
+                            ]
+                        },
+                        "id": "2f011021-dff5-4dc3-9e8d-218272cbfe15",
+                        "source": {
+                            "cell": "b7b0e199-6a96-4240-b70e-5a349ec627bc"
+                        },
+                        "target": {
+                            "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+                        },
+                        "vertices": [
+                            {
+                                "x": 540,
+                                "y": 150
+                            }
+                        ]
+                    },
+                    {
+                        "position": {
+                            "x": 690,
+                            "y": 30
+                        },
+                        "size": {
+                            "width": 120,
+                            "height": 60
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "Data Source(s)"
+                            },
+                            "topLine": {
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            },
+                            "bottomLine": {
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "store",
+                        "zIndex": 12,
+                        "id": "b7b0e199-6a96-4240-b70e-5a349ec627bc",
+                        "data": {
+                            "type": "tm.Store",
+                            "name": "Data Source(s)",
+                            "description": "Represents any number of data sources that Spice can connect to",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isALog": false,
+                            "isEncrypted": false,
+                            "isSigned": false,
+                            "storesCredentials": false,
+                            "storesInventory": true,
+                            "threats": []
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 300,
+                            "y": 450
+                        },
+                        "size": {
+                            "width": 100,
+                            "height": 60
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "Embedded \nDuckDB"
+                            },
+                            "topLine": {
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            },
+                            "bottomLine": {
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "store",
+                        "zIndex": 13,
+                        "id": "f32481b0-efee-44f0-991f-ad091abceba2",
+                        "data": {
+                            "type": "tm.Store",
+                            "name": "Embedded \nDuckDB",
+                            "description": "",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isALog": false,
+                            "isEncrypted": false,
+                            "isSigned": false,
+                            "storesCredentials": false,
+                            "storesInventory": true,
+                            "threats": []
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 46.99999999999993,
+                            "y": 270.0000000000001
+                        },
+                        "size": {
+                            "width": 160,
+                            "height": 80
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "Client Application"
+                            },
+                            "body": {
+                                "stroke": "#333333",
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "actor",
+                        "zIndex": 14,
+                        "id": "df26fc07-6901-4028-b816-f7fdc36bffb5",
+                        "data": {
+                            "type": "tm.Actor",
+                            "name": "Client Application",
+                            "description": "Applications connecting via Flight SQL, HTTP, or MCP protocols",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "providesAuthentication": false,
+                            "threats": []
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 410,
+                            "y": 450
+                        },
+                        "size": {
+                            "width": 120,
+                            "height": 60
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "Cayenne\n(SQLite+Vortex)"
+                            },
+                            "topLine": {
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            },
+                            "bottomLine": {
+                                "strokeWidth": 1.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "store",
+                        "zIndex": 15,
+                        "id": "81367a19-0ccf-4772-b2fe-55f1232cd67f",
+                        "data": {
+                            "type": "tm.Store",
+                            "name": "Cayenne\n(SQLite+Vortex)",
+                            "description": "New accelerator using SQLite for metadata and Vortex for columnar data",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isALog": false,
+                            "isEncrypted": false,
+                            "isSigned": false,
+                            "storesCredentials": false,
+                            "storesInventory": false,
+                            "threats": []
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 290,
+                            "y": 579
+                        },
+                        "size": {
+                            "width": 250,
+                            "height": 80
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "Local Machine Filesystem\n(Indexes, Snapshots, Accelerators)"
+                            },
+                            "topLine": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            },
+                            "bottomLine": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "store",
+                        "zIndex": 16,
+                        "id": "03fb0ac1-ff87-46cc-8c51-f75357f8d350",
+                        "data": {
+                            "type": "tm.Store",
+                            "name": "Local Machine Filesystem\n(Indexes, Snapshots, Accelerators)",
+                            "description": "Stores acceleration files, vector indexes, full-text search indexes, and snapshots",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": true,
+                            "isALog": false,
+                            "isEncrypted": false,
+                            "isSigned": false,
+                            "storesCredentials": false,
+                            "storesInventory": false,
+                            "threats": [
+                                {
+                                    "id": "f243829c-4d65-4fb8-9a24-ddf941c6fc48",
+                                    "title": "Tampering with file-based accelerators",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Tampering",
+                                    "description": "Modifying file-based accelerators to inject malicious content",
+                                    "mitigation": "- Run Spice as a least privileged user.\n- Run application with least privilege, ideally without file-system access.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 1,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "1dd96996-2703-4cc7-9e02-9dee68efc22d",
+                                    "title": "Bypass underlying data source AuthN/AuthZ by reading accelerator files",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "When Spice is configured to accelerate data from a data source to a file (i.e. DuckDB/SQLite/Cayenne) then its possible to bypass all AuthN/AuthZ measures if the attacker has access to the file.",
+                                    "mitigation": "- Limit the file permissions to only the user running the Spice instance\n  - [Action]: Change default file permission to 600\n  - [Action]: Configuration to allow changing permission\n- Instead of running Spice on the same machine, run it in a separate machine in the trusted network.\n- chroot the Spice instance AND chroot the application",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 17,
+                                    "score": ""
+                                },
+                                {
+                                    "id": "946eec8b-6e87-45d4-976a-c11cbebc1d70",
+                                    "title": "Tampering with the Spicepod",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Tampering",
+                                    "description": "If an attacker can access/modify the Spicepod, they can tamper with how the Spice runtime loads data sources and potentially point them to data sources that the attacker controls, to disrupt/poison the operations of applications configured to query this Spice instance.",
+                                    "mitigation": "- Proper file permissions so that only the Spice instance can access the Spicepod.\n- [Action]: Update deployment examples to limit file permissions of Spicepod.",
+                                    "modelType": "STRIDE",
+                                    "new": false,
+                                    "number": 20,
+                                    "score": ""
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 690,
+                            "y": 450
+                        },
+                        "size": {
+                            "width": 140,
+                            "height": 80
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "S3 Vectors\n(Vector Indexes)"
+                            },
+                            "topLine": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            },
+                            "bottomLine": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "store",
+                        "zIndex": 17,
+                        "id": "s3-vectors-store",
+                        "data": {
+                            "type": "tm.Store",
+                            "name": "S3 Vectors\n(Vector Indexes)",
+                            "description": "Petabyte-scale vector search indexes stored in S3",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": true,
+                            "isALog": false,
+                            "isEncrypted": false,
+                            "isSigned": false,
+                            "storesCredentials": false,
+                            "storesInventory": false,
+                            "threats": [
+                                {
+                                    "id": "33k1l456-mn78-9012-op34-567890klmnop",
+                                    "title": "Unauthorized access to S3 Vectors indexes",
+                                    "status": "Open",
+                                    "severity": "Medium",
+                                    "type": "Information disclosure",
+                                    "description": "An attacker with S3 bucket access could download vector embeddings and reconstruct sensitive information from the vector space.",
+                                    "mitigation": "- Use S3 bucket policies to restrict access\n- Enable S3 encryption at rest\n- Use IAM roles with least privilege\n- Enable S3 access logging and monitoring\n- Consider using S3 Bucket Keys for cost-effective encryption",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 33,
+                                    "score": ""
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "position": {
+                            "x": 690,
+                            "y": 210
+                        },
+                        "size": {
+                            "width": 140,
+                            "height": 80
+                        },
+                        "attrs": {
+                            "text": {
+                                "text": "MCP Server\n(External)"
+                            },
+                            "topLine": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            },
+                            "bottomLine": {
+                                "stroke": "red",
+                                "strokeWidth": 2.5,
+                                "strokeDasharray": null
+                            }
+                        },
+                        "visible": true,
+                        "shape": "process",
+                        "zIndex": 18,
+                        "id": "mcp-server-external",
+                        "data": {
+                            "type": "tm.Process",
+                            "name": "MCP Server\n(External)",
+                            "description": "External MCP servers (stdio or SSE) that provide tools to Spice",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": true,
+                            "handlesCardPayment": false,
+                            "handlesGoodsOrServices": false,
+                            "isWebApplication": false,
+                            "privilegeLevel": "",
+                            "threats": [
+                                {
+                                    "id": "34l2m567-no89-0123-pq45-678901lmnopq",
+                                    "title": "Malicious MCP server tool definitions",
+                                    "status": "Open",
+                                    "severity": "High",
+                                    "type": "Elevation of privilege",
+                                    "description": "A compromised or malicious MCP server could provide tool definitions that execute harmful operations when invoked by Spice LLMs.",
+                                    "mitigation": "- Validate MCP server identity and certificates\n- Implement tool execution sandboxing\n- Use allowlists for permitted tools\n- Monitor tool execution for anomalies\n- Implement user confirmation for sensitive tool operations",
+                                    "modelType": "STRIDE",
+                                    "new": true,
+                                    "number": 34,
+                                    "score": ""
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": "block"
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "MCP Protocol",
+                            "description": "SSE or stdio communication",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": true,
+                            "isEncrypted": false,
+                            "isPublicNetwork": false,
+                            "protocol": "MCP (SSE/stdio)",
+                            "threats": []
+                        },
+                        "id": "mcp-flow",
+                        "source": {
+                            "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+                        },
+                        "target": {
+                            "cell": "mcp-server-external"
+                        }
+                    },
+                    {
+                        "shape": "flow",
+                        "attrs": {
+                            "line": {
+                                "stroke": "#333333",
+                                "targetMarker": {
+                                    "name": "block"
+                                },
+                                "sourceMarker": {
+                                    "name": "block"
+                                },
+                                "strokeDasharray": null
+                            }
+                        },
+                        "width": 200,
+                        "height": 100,
+                        "zIndex": 10,
+                        "connector": "smooth",
+                        "data": {
+                            "type": "tm.Flow",
+                            "name": "Vector Search",
+                            "description": "Read vector indexes from S3",
+                            "outOfScope": false,
+                            "reasonOutOfScope": "",
+                            "hasOpenThreats": false,
+                            "isBidirectional": true,
+                            "isEncrypted": true,
+                            "isPublicNetwork": true,
+                            "protocol": "HTTPS/S3 API",
+                            "threats": []
+                        },
+                        "id": "s3-vectors-flow",
+                        "source": {
+                            "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+                        },
+                        "target": {
+                            "cell": "s3-vectors-store"
+                        },
+                        "vertices": [
+                            {
+                                "x": 600,
+                                "y": 380
+                            }
+                        ]
+                    }
+                ],
+                "description": "Models the components involved in SQL queries, vector/full-text search, AI inference, and MCP protocol interactions with Spice v1.9.0 deployed to serve APIs"
+            }
+        ],
+        "diagramTop": 2,
+        "reviewer": "Spice AI Engineering Team",
+        "threatTop": 34
+    }
+}
