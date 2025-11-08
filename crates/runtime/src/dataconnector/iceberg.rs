@@ -147,6 +147,7 @@ impl IcebergDataConnector {
                 "s3_session_token",
                 &self.params,
             )
+            .await
             .map_err(|e| Error::InvalidConfiguration {
                 dataconnector: "iceberg".into(),
                 message: e.to_string(),

@@ -117,13 +117,20 @@ impl DataConnectorFactory for DeltaLakeFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let param_map = params.parameters.to_secret_map();
         Box::pin(async move {
-            // Initialize the AWS SDK and make it available.
-            if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+            // Initialize AWS SDK credentials if not using explicit credentials
+            if !aws_sdk_credential_bridge::has_explicit_credentials(
+                &param_map,
+                "aws_access_key_id",
+                "aws_secret_access_key",
+            ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+            {
                 tracing::warn!(
                     "Unable to initialize AWS credentials for Delta Lake connector: {err}"
                 );
             }
+
             let delta = DeltaLake::new(params.parameters, params.io_runtime);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
