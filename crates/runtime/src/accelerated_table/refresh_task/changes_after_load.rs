@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::RefreshTask;
+use super::{inner_err_from_retry_ref, RefreshTask};
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::{
     ChangesAfterLoadBootstrappingSnafu, ChangesAfterLoadCheckDatasetSnafu, Result,
@@ -24,7 +24,6 @@ use crate::dataconnector::get_data;
 use crate::dataupdate::{StreamingDataUpdate, UpdateType};
 use cache::Caching;
 use datafusion::catalog::TableProvider;
-use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use snafu::ResultExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -158,6 +157,7 @@ impl RefreshTask {
             refresh.sql.as_deref(),
         )
         .await
+        .map_err(inner_err_from_retry_ref)
         .context(ChangesAfterLoadBootstrappingSnafu)?;
 
         if let Some(ready_sender) = ready_sender.as_ref() {
