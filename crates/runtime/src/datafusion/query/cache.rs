@@ -31,7 +31,8 @@ use datafusion::{
     logical_expr::LogicalPlan,
     sql::TableReference,
 };
-use runtime_request_context::{CacheControl, CacheKeyType, RequestContext};
+use futures::TryStreamExt;
+use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
 use scopeguard;
 use snafu::ResultExt;
 use std::sync::OnceLock;
@@ -98,7 +99,7 @@ enum CacheResult {
 impl Query {
     /// Returns a `LogicalPlan` if the result is not cached and needs to be executed, otherwise returns a cached `QueryResult`.
     pub(super) async fn get_plan_or_cached(
-        df: &DataFusion,
+        df: &Arc<DataFusion>,
         session: &SessionState,
         request_context: Arc<RequestContext>,
         sql: &str,
@@ -209,7 +210,7 @@ impl Query {
 
     #[allow(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
-        df: &DataFusion,
+        df: &Arc<DataFusion>,
         request_context: Arc<RequestContext>,
         mut tracker: Option<QueryTracker>,
         key: &'a CacheKey<'a>,
@@ -306,7 +307,17 @@ impl Query {
                 tracing::debug!(
                     "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
                 );
-                Self::trigger_background_query_revalidation(df, sql, &request_context);
+                // Extract plan from cache key if available to avoid re-parsing
+                let plan = match key {
+                    CacheKey::LogicalPlan(p) => Some(*p),
+                    _ => None,
+                };
+                Self::trigger_background_query_revalidation(
+                    Arc::clone(df),
+                    sql,
+                    &request_context,
+                    plan,
+                );
             }
         }
 
@@ -340,9 +351,14 @@ impl Query {
 
     /// Trigger background query re-execution for stale-while-revalidate.
     ///
-    /// This spawns a background task that re-executes the original query, which will:
-    /// 1. Go through acceleration if available, or the data source
-    /// 2. Naturally populate the cache with fresh data via the normal caching mechanism
+    /// This spawns a background task that re-executes the original query through the full
+    /// query pipeline (including cache population), which will:
+    /// 1. Use the proper cache control settings to populate the cache
+    /// 2. Go through acceleration if available, or the data source
+    /// 3. Update the cache with fresh data via the normal `Query::run` flow
+    ///
+    /// If a `LogicalPlan` is provided, it will be used directly to avoid re-parsing the SQL.
+    /// This is more efficient when the plan is already available (e.g., from a plan cache hit).
     ///
     /// Uses lock-free deduplication to ensure only one revalidation task runs per query.
     /// Multiple concurrent requests for the same stale cache entry will not spawn redundant
@@ -352,16 +368,17 @@ impl Query {
     /// - The `DataFusion` context is dropped (runtime shutdown)
     /// - The query execution is interrupted via the session context
     fn trigger_background_query_revalidation(
-        df: &DataFusion,
+        df: Arc<DataFusion>,
         sql: &str,
-        _request_context: &Arc<RequestContext>,
+        request_context: &Arc<RequestContext>,
+        plan: Option<&LogicalPlan>,
     ) {
         // Static map to track ongoing revalidation tasks
         static REVALIDATION_TASKS: OnceLock<DashMap<String, ()>> = OnceLock::new();
         let tasks = REVALIDATION_TASKS.get_or_init(DashMap::new);
 
-        let ctx = Arc::clone(&df.ctx);
         let sql = sql.to_string();
+        let plan = plan.cloned();
 
         // Try to insert a marker for this query - if it already exists, another task is running
         if tasks.insert(sql.clone(), ()).is_some() {
@@ -371,6 +388,23 @@ impl Query {
             return;
         }
 
+        // Create a background request context that will cache results
+        // Use the same cache key type as the original request, but remove stale-while-revalidate
+        // to ensure the query executes normally and populates the cache
+        let cache_control = match request_context.cache_control() {
+            CacheControl::CacheWithStaleWhileRevalidate(key_type, _) => {
+                CacheControl::Cache(key_type)
+            }
+            other => other,
+        };
+        let client_supplied_key = request_context.client_supplied_cache_key().clone();
+        let background_context = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(cache_control)
+                .with_client_supplied_cache_key(client_supplied_key)
+                .build(),
+        );
+
         // Spawn a detached task for background revalidation
         // The task will be automatically cancelled if the DataFusion context is dropped
         tokio::spawn(async move {
@@ -379,31 +413,38 @@ impl Query {
                 tasks.remove(&sql);
             });
 
-            tracing::debug!("Background revalidation: re-executing query");
-
-            // Execute the query in the background - this will go through acceleration/datasource
-            // and automatically populate the cache with fresh results
-            let query_result = ctx.sql(&sql).await;
-
-            // Check if we should continue (context might be cancelled)
-            let Ok(df_result) = query_result else {
-                if let Err(e) = query_result {
-                    tracing::debug!("Background revalidation query failed to plan: {}", e);
-                }
-                return;
+            // Execute the query through the full Query pipeline to ensure cache population
+            let query = if let Some(logical_plan) = plan {
+                tracing::debug!("Background revalidation: re-executing query with existing plan");
+                super::Query::from_logical_plan(&df, &logical_plan)
+            } else {
+                tracing::debug!("Background revalidation: re-executing query (will re-parse SQL)");
+                super::QueryBuilder::new(&sql, df).build()
             };
+            let result = background_context
+                .scope(async move { query.run().await })
+                .await;
 
-            // Collect the results to ensure the query executes and cache is populated
-            match df_result.collect().await {
-                Ok(batches) => {
-                    tracing::debug!(
-                        "Background revalidation completed successfully, {} batches cached",
-                        batches.len()
-                    );
+            match result {
+                Ok(query_result) => {
+                    // Drain the stream to ensure the query executes and cache is populated
+                    match query_result.data.try_collect::<Vec<_>>().await {
+                        Ok(batches) => {
+                            tracing::debug!(
+                                "Background revalidation completed successfully, {} batches cached",
+                                batches.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Background revalidation failed during collection: {}",
+                                e
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
-                    // Don't log as warning if it's a cancellation
-                    tracing::debug!("Background revalidation failed during collection: {}", e);
+                    tracing::debug!("Background revalidation query failed: {}", e);
                 }
             }
         });
