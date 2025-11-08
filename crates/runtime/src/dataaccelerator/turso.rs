@@ -56,6 +56,7 @@ use tokio::sync::Mutex;
 use crate::{
     component::dataset::acceleration::Engine,
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
@@ -666,18 +667,25 @@ impl DataAccelerator for TursoAccelerator {
                 .collect::<Vec<_>>(),
         ));
 
-        let turso_provider = Arc::new(TursoTableProvider::new(schema, table_name, pool));
+        let turso_provider = Arc::new(
+            TursoTableProvider::new(schema, table_name, pool)
+                .with_function_support(deny_spice_specific_functions()),
+        );
 
         // Wrap in PolyTableProvider for proper read/write separation
         // This allows the table to support both reading and writing operations
         let write_provider = Arc::clone(&turso_provider);
         let delete_provider = Arc::clone(&turso_provider);
-        let read_provider = turso_provider as Arc<dyn TableProvider>;
+        let fed_provider = Arc::new(
+            Arc::clone(&turso_provider)
+                .create_federated_table_provider()
+                .boxed()?,
+        ) as Arc<dyn TableProvider>;
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
             delete_provider,
-            read_provider,
+            fed_provider,
         ));
 
         Ok(table_provider)

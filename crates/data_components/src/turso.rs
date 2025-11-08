@@ -104,6 +104,9 @@ use arrow::{
     },
 };
 use async_trait::async_trait;
+use datafusion_table_providers::util::supported_functions::{
+    FunctionSupport, contains_unsupported_functions,
+};
 use std::ops::ControlFlow;
 
 use datafusion::{
@@ -115,7 +118,7 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType, dml::InsertOp},
+    logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -477,6 +480,7 @@ pub struct TursoTableProvider {
     schema: SchemaRef,
     table_name: String,
     pool: Arc<TursoConnectionPool>,
+    pub(crate) function_support: Option<FunctionSupport>,
 }
 
 impl TursoTableProvider {
@@ -492,7 +496,14 @@ impl TursoTableProvider {
             schema,
             table_name,
             pool,
+            function_support: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 
     /// Converts Turso database rows to Arrow RecordBatch, matching the exact schema types.
@@ -1284,6 +1295,13 @@ impl SQLExecutor for TursoTableProvider {
 
     fn compute_context(&self) -> Option<String> {
         None
+    }
+
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        // Default to not federate if [`Self::function_support`] provided, otherwise true.
+        self.function_support.as_ref().is_none_or(|func_supp| {
+            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
+        })
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
