@@ -996,7 +996,7 @@ impl DataFusion {
                 Arc::clone(&refresh_schema),
                 constraints,
                 &acceleration_settings,
-                secrets.clone(),
+                Arc::clone(&secrets),
                 Some(dataset),
                 Arc::clone(&self.ctx),
             )

@@ -50,9 +50,9 @@ impl RefreshTask {
         .await;
 
         let refresh_cloned = Arc::clone(&refresh);
-        let _refresh = refresh_cloned.read().await;
-        let max_retries = if _refresh.retry_enabled {
-            _refresh.retry_max_attempts
+        let refresh_guard = refresh_cloned.read().await;
+        let max_retries = if refresh_guard.retry_enabled {
+            refresh_guard.retry_max_attempts
         } else {
             Some(0)
         };
@@ -95,7 +95,7 @@ impl RefreshTask {
                 });
             }
             DatasetStatus::ChangesStream => {
-                let _ = self
+                let () = self
                     .changes_after_load_stream(
                         coordinator,
                         refresh,
@@ -144,7 +144,7 @@ impl RefreshTask {
             initial_load_completed,
         )
         .await
-        .map_err(|e| RetryError::permanent(e))
+        .map_err(RetryError::permanent)
     }
 
     async fn cold_start_ingestion(
@@ -211,6 +211,6 @@ impl RefreshTask {
             .await
         {
             tracing::error!("Changes stream failed with error: {err}");
-        };
+        }
     }
 }

@@ -564,6 +564,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn changes_after_load_coordinator(
         &self,
         _federated_table: Arc<FederatedTable>,
