@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::prelude::*;
 use data_components::http::provider::HttpTableProvider;
+use datafusion::prelude::*;
 use reqwest::Client;
 use std::sync::Arc;
 
@@ -23,12 +23,7 @@ use std::sync::Arc;
 #[tokio::test]
 async fn test_http_provider_with_real_endpoint() {
     let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(
-        base_url,
-        Client::new(),
-        "json".to_string(),
-        false,
-    );
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
     // Create a DataFusion context
     let ctx = SessionContext::new();
@@ -54,20 +49,18 @@ async fn test_http_provider_with_real_endpoint() {
         .downcast_ref::<arrow::array::StringArray>()
         .expect("content should be StringArray");
     let content = content_array.value(0);
-    
-    assert!(content.contains("slideshow"), "Content should contain JSON data from httpbin.org/json");
+
+    assert!(
+        content.contains("slideshow"),
+        "Content should contain JSON data from httpbin.org/json"
+    );
 }
 
 /// Test with query parameters
 #[tokio::test]
 async fn test_http_provider_with_query_params() {
     let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(
-        base_url,
-        Client::new(),
-        "json".to_string(),
-        false,
-    );
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -75,7 +68,9 @@ async fn test_http_provider_with_query_params() {
 
     // Query with path and query parameters
     let df = ctx
-        .sql("SELECT path, query, content FROM httpbin WHERE path = '/get' AND query = 'test=value'")
+        .sql(
+            "SELECT path, query, content FROM httpbin WHERE path = '/get' AND query = 'test=value'",
+        )
         .await
         .expect("Failed to create dataframe");
 
@@ -92,22 +87,23 @@ async fn test_http_provider_with_query_params() {
         .downcast_ref::<arrow::array::StringArray>()
         .expect("content should be StringArray");
     let content = content_array.value(0);
-    
+
     // httpbin.org/get returns the query args in the response
-    assert!(content.contains("test"), "Content should contain the query parameter");
-    assert!(content.contains("value"), "Content should contain the query parameter value");
+    assert!(
+        content.contains("test"),
+        "Content should contain the query parameter"
+    );
+    assert!(
+        content.contains("value"),
+        "Content should contain the query parameter value"
+    );
 }
 
 /// Test scanning without filters (should use base URL)
 #[tokio::test]
 async fn test_http_provider_without_filters() {
     let base_url = url::Url::parse("https://httpbin.org/json").expect("valid URL");
-    let provider = HttpTableProvider::new(
-        base_url,
-        Client::new(),
-        "json".to_string(),
-        false,
-    );
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -130,12 +126,7 @@ async fn test_http_provider_without_filters() {
 #[tokio::test]
 async fn test_http_provider_with_base_path() {
     let base_url = url::Url::parse("https://httpbin.org/anything/base").expect("valid URL");
-    let provider = HttpTableProvider::new(
-        base_url,
-        Client::new(),
-        "json".to_string(),
-        false,
-    );
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -151,15 +142,18 @@ async fn test_http_provider_with_base_path() {
 
     assert!(!results.is_empty(), "Should have at least one result");
     let batch = &results[0];
-    
+
     let content_col = batch.column(1);
     let content_array = content_col
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .expect("content should be StringArray");
     let content = content_array.value(0);
-    
+
     // httpbin.org/anything returns the URL in the response
     // Should be: https://httpbin.org/anything/base/extra
-    assert!(content.contains("/anything/base/extra"), "Should have appended path to base URL");
+    assert!(
+        content.contains("/anything/base/extra"),
+        "Should have appended path to base URL"
+    );
 }
