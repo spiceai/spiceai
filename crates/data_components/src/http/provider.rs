@@ -117,7 +117,6 @@ pub struct HttpTableProvider {
     constraints: Constraints,
     cache: Arc<RwLock<HashMap<String, CachedResponse>>>,
     acceleration_enabled: bool,
-    flatten_json: Option<String>,
     retry_strategy: util::fibonacci_backoff::FibonacciBackoff,
     content_type: Option<String>,
 }
@@ -128,7 +127,6 @@ impl std::fmt::Debug for HttpTableProvider {
             .field("base_url", &self.base_url)
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
-            .field("flatten_json", &self.flatten_json)
             .finish_non_exhaustive()
     }
 }
@@ -150,19 +148,9 @@ impl HttpTableProvider {
             constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1, 2])]),
             cache: Arc::new(RwLock::new(HashMap::new())),
             acceleration_enabled,
-            flatten_json: None,
             retry_strategy: FibonacciBackoffBuilder::new().max_retries(Some(3)).build(),
             content_type: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_flatten_json(mut self, flatten_json: Option<String>) -> Self {
-        // If flatten_json is Some but empty string, use default delimiter "_"
-        // If flatten_json is Some with a value, use that value
-        // If flatten_json is None, don't flatten
-        self.flatten_json = flatten_json.map(|s| if s.is_empty() { "_".to_string() } else { s });
-        self
     }
 
     #[must_use]
@@ -626,7 +614,7 @@ impl HttpExec {
             );
 
             // Parse content to determine how many rows we'll create
-            let content_rows = Self::parse_content(&content, provider.flatten_json.as_ref());
+            let content_rows = Self::parse_content(&content);
             let num_rows = content_rows.len();
 
             if num_rows == 0 {
@@ -670,7 +658,7 @@ impl HttpExec {
     /// - For JSON objects: single row
     /// - For newline-delimited JSON: each line becomes a row
     /// - For other content: single row
-    fn parse_content(content: &str, flatten_json: Option<&String>) -> Vec<String> {
+    fn parse_content(content: &str) -> Vec<String> {
         let trimmed = content.trim();
 
         // Try to parse as JSON
@@ -678,31 +666,10 @@ impl HttpExec {
             match json_value {
                 serde_json::Value::Array(arr) => {
                     // JSON array: each element is a row
-                    let rows = arr
-                        .into_iter()
-                        .map(|item| {
-                            if let Some(delimiter) = flatten_json {
-                                let flattened = dataformat_json::flatten_json_obj(&item, delimiter);
-                                flattened.to_string()
-                            } else {
-                                item.to_string()
-                            }
-                        })
-                        .collect();
-                    return rows;
-                }
-                serde_json::Value::Object(_) => {
-                    // Single JSON object: one row
-                    let row_content = if let Some(delimiter) = flatten_json {
-                        let flattened = dataformat_json::flatten_json_obj(&json_value, delimiter);
-                        flattened.to_string()
-                    } else {
-                        json_value.to_string()
-                    };
-                    return vec![row_content];
+                    return arr.into_iter().map(|item| item.to_string()).collect();
                 }
                 _ => {
-                    // Primitive JSON value: one row
+                    // Single JSON object or primitive value: one row
                     return vec![json_value.to_string()];
                 }
             }
@@ -714,20 +681,11 @@ impl HttpExec {
             !line_trimmed.is_empty()
                 && serde_json::from_str::<serde_json::Value>(line_trimmed).is_ok()
         }) {
-            let rows = trimmed
+            return trimmed
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .map(|line| {
-                    if let Some(delimiter) = flatten_json
-                        && let Ok(json_value) = serde_json::from_str::<serde_json::Value>(line)
-                    {
-                        let flattened = dataformat_json::flatten_json_obj(&json_value, delimiter);
-                        return flattened.to_string();
-                    }
-                    line.to_string()
-                })
+                .map(std::string::ToString::to_string)
                 .collect();
-            return rows;
         }
 
         // For non-JSON content (CSV, plain text, etc.), return as single row

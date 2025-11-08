@@ -107,26 +107,6 @@ impl DataConnector for Https {
             let file_format = format.unwrap_or_else(|| "auto".to_string());
             let acceleration_enabled = dataset.is_accelerated();
 
-            // Handle flatten_json parameter
-            // If set to empty string or "true", use default delimiter "_"
-            // If set to a specific value, use that as the delimiter
-            // If not set or "false", don't flatten
-            let flatten_json = self
-                .params
-                .get("flatten_json")
-                .expose()
-                .ok()
-                .and_then(|val| {
-                    let val_lower = val.to_lowercase();
-                    if val_lower == "false" || val_lower == "no" {
-                        None
-                    } else if val_lower == "true" || val_lower == "yes" || val.is_empty() {
-                        Some(String::new()) // Empty string will be converted to "_" in with_flatten_json
-                    } else {
-                        Some(val.to_string())
-                    }
-                });
-
             // Handle http_max_retries parameter with default of 3
             let max_retries = self
                 .params
@@ -150,7 +130,6 @@ impl DataConnector for Https {
                 file_format,
                 acceleration_enabled,
             )
-            .with_flatten_json(flatten_json)
             .with_max_retries(max_retries)
             .with_content_type(content_type);
 
@@ -224,8 +203,6 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("http_post_content_type")
             .description("Content-Type header for POST requests when using _body filter."),
-        ParameterSpec::runtime("flatten_json")
-            .description("Flatten JSON response into columns. Use 'true' for default delimiter '_', or specify a custom delimiter."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
