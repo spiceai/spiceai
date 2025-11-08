@@ -32,7 +32,7 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 /// Calculate the maximum depth of a JSON object to prevent stack overflow attacks.
 ///
 /// This is a specialized version for `Map<String, Value>` that delegates to the
-/// shared `get_json_depth` utility after wrapping in a Value::Object.
+/// shared `get_json_depth` utility after wrapping in a `Value::Object`.
 fn get_json_depth_from_object(obj: &Map<String, Value>) -> usize {
     if obj.is_empty() {
         1
@@ -80,14 +80,16 @@ impl ServerHandler for RuntimeServer {
             arguments,
         } = request;
         Box::pin(async move {
-            // Security: Validate tool name to prevent injection attacks
+            // Security constants
             const MAX_TOOL_NAME_LENGTH: usize = 256;
+            const MAX_ARGS_SIZE: usize = 1024 * 1024; // 1 MB
+
+            // Security: Validate tool name to prevent injection attacks
             if tool_name.len() > MAX_TOOL_NAME_LENGTH {
                 return Err(McpError::invalid_params(
                     format!(
-                        "Tool name too long ({} chars). Maximum: {}",
-                        tool_name.len(),
-                        MAX_TOOL_NAME_LENGTH
+                        "Tool name too long ({} chars). Maximum: {MAX_TOOL_NAME_LENGTH}",
+                        tool_name.len()
                     ),
                     None,
                 ));
@@ -118,8 +120,7 @@ impl ServerHandler for RuntimeServer {
                     if depth > MAX_SAFE_JSON_DEPTH {
                         return Err(McpError::invalid_params(
                             format!(
-                                "Arguments JSON too deeply nested (depth: {}). Maximum: {}",
-                                depth, MAX_SAFE_JSON_DEPTH
+                                "Arguments JSON too deeply nested (depth: {depth}). Maximum: {MAX_SAFE_JSON_DEPTH}"
                             ),
                             None,
                         ));
@@ -136,13 +137,11 @@ impl ServerHandler for RuntimeServer {
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
             // Security: Validate serialized argument size to prevent DoS
-            const MAX_ARGS_SIZE: usize = 1024 * 1024; // 1 MB
             if args.len() > MAX_ARGS_SIZE {
                 return Err(McpError::invalid_params(
                     format!(
-                        "Arguments too large ({} bytes). Maximum: {} bytes",
-                        args.len(),
-                        MAX_ARGS_SIZE
+                        "Arguments too large ({} bytes). Maximum: {MAX_ARGS_SIZE} bytes",
+                        args.len()
                     ),
                     None,
                 ));

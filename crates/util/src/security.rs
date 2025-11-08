@@ -209,7 +209,7 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
 ///
 /// - Time Complexity: O(n) where n is the total number of values in the JSON
 /// - Space Complexity: O(d) where d is the depth (stack frames)
-/// - Uses iterative max() to avoid extra allocations
+/// - Uses iterative `max()` to avoid extra allocations
 ///
 /// # Arguments
 ///
@@ -427,7 +427,7 @@ mod tests {
         // All primitives have depth 1
         assert_eq!(get_json_depth(&json!("string")), 1);
         assert_eq!(get_json_depth(&json!(42)), 1);
-        assert_eq!(get_json_depth(&json!(3.14)), 1);
+        assert_eq!(get_json_depth(&json!(42.5)), 1);
         assert_eq!(get_json_depth(&json!(true)), 1);
         assert_eq!(get_json_depth(&json!(false)), 1);
         assert_eq!(get_json_depth(&json!(null)), 1);

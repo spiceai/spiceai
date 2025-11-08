@@ -112,8 +112,7 @@ impl SpiceModelTool for McpToolWrapper {
             // Security: Validate JSON depth to prevent stack overflow
             if get_json_depth(&input) > MAX_SAFE_JSON_DEPTH {
                 return Err(format!(
-                    "Input JSON too deeply nested. Maximum depth: {}",
-                    MAX_SAFE_JSON_DEPTH
+                    "Input JSON too deeply nested. Maximum depth: {MAX_SAFE_JSON_DEPTH}"
                 )
                 .into());
             }

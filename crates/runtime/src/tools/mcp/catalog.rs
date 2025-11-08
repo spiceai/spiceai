@@ -17,7 +17,7 @@ limitations under the License.
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
 use rmcp::{
-    Error as McpError, RoleClient, ServiceError, ServiceExt,
+    RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, ClientRequest,
         Extensions, Implementation, InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
@@ -100,6 +100,10 @@ impl McpToolCatalog {
     }
 
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
+        // Security constants
+        const MAX_ARGS: usize = 100;
+        const MAX_ARG_LENGTH: usize = 4096;
+
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security: Validate command path to prevent command injection
@@ -108,36 +112,30 @@ impl McpToolCatalog {
                     return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
-                            "Invalid command path '{}'. Only absolute paths or simple commands allowed",
-                            command
+                            "Invalid command path '{command}'. Only absolute paths or simple commands allowed"
                         ),
                     });
                 }
 
                 // Security: Limit number of arguments to prevent resource exhaustion
-                const MAX_ARGS: usize = 100;
                 if args.len() > MAX_ARGS {
                     return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
-                            "Too many arguments ({}). Maximum allowed: {}",
-                            args.len(),
-                            MAX_ARGS
+                            "Too many arguments ({}). Maximum allowed: {MAX_ARGS}",
+                            args.len()
                         ),
                     });
                 }
 
                 // Security: Validate argument lengths to prevent buffer overflow attacks
-                const MAX_ARG_LENGTH: usize = 4096;
                 for (i, arg) in args.iter().enumerate() {
                     if arg.len() > MAX_ARG_LENGTH {
                         return Err(Error::CouldNotConstructTool {
                             name: "mcp_stdio".to_string(),
                             e: format!(
-                                "Argument {} too long ({} bytes). Maximum allowed: {} bytes",
-                                i,
-                                arg.len(),
-                                MAX_ARG_LENGTH
+                                "Argument {i} too long ({} bytes). Maximum allowed: {MAX_ARG_LENGTH} bytes",
+                                arg.len()
                             ),
                         });
                     }
@@ -212,19 +210,19 @@ impl McpToolCatalog {
     }
 
     async fn list_tools(&self) -> std::result::Result<Vec<rmcp::model::Tool>, ServiceError> {
+        // Security: Limit pagination to prevent infinite loops and memory exhaustion
+        const MAX_PAGINATION_ITERATIONS: usize = 100;
+        const MAX_TOTAL_TOOLS: usize = 10000;
+
         let mut cursor: Option<String> = None;
         let mut tools: Vec<rmcp::model::Tool> = vec![];
-
-        // Security: Limit pagination iterations to prevent infinite loops
-        const MAX_PAGINATION_ITERATIONS: usize = 100;
         let mut iterations = 0;
 
         loop {
             iterations += 1;
             if iterations > MAX_PAGINATION_ITERATIONS {
                 tracing::warn!(
-                    "MCP tool listing exceeded maximum pagination iterations ({}), stopping iteration",
-                    MAX_PAGINATION_ITERATIONS
+                    "MCP tool listing exceeded maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
                 );
                 break; // Stop paginating instead of erroring
             }
@@ -239,11 +237,9 @@ impl McpToolCatalog {
                 .await?;
 
             // Security: Validate total tools count to prevent memory exhaustion
-            const MAX_TOTAL_TOOLS: usize = 10000;
             if tools.len() + response.tools.len() > MAX_TOTAL_TOOLS {
                 tracing::warn!(
-                    "MCP tool listing exceeded maximum tools count ({}), limiting results",
-                    MAX_TOTAL_TOOLS
+                    "MCP tool listing exceeded maximum tools count ({MAX_TOTAL_TOOLS}), limiting results"
                 );
                 // Only add tools up to the limit
                 let remaining = MAX_TOTAL_TOOLS - tools.len();
@@ -264,29 +260,26 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
-        // Security: Validate tool name length
+        // Security: Validate tool name length and limit pagination
         const MAX_TOOL_NAME_LENGTH: usize = 256;
+        const MAX_PAGINATION_ITERATIONS: usize = 100;
+
         if name.len() > MAX_TOOL_NAME_LENGTH {
             tracing::warn!(
-                "Tool name too long ({} chars), maximum is {}. Returning None.",
-                name.len(),
-                MAX_TOOL_NAME_LENGTH
+                "Tool name too long ({} chars), maximum is {MAX_TOOL_NAME_LENGTH}. Returning None.",
+                name.len()
             );
             return Ok(None); // Tool name too long, treat as not found
         }
 
         let mut cursor: Option<String> = None;
-
-        // Security: Limit pagination iterations
-        const MAX_PAGINATION_ITERATIONS: usize = 100;
         let mut iterations = 0;
 
         loop {
             iterations += 1;
             if iterations > MAX_PAGINATION_ITERATIONS {
                 tracing::warn!(
-                    "MCP get_tool pagination exceeded maximum iterations ({}), stopping search",
-                    MAX_PAGINATION_ITERATIONS
+                    "MCP get_tool pagination exceeded maximum iterations ({MAX_PAGINATION_ITERATIONS}), stopping search"
                 );
                 break; // Stop searching, return None
             }
