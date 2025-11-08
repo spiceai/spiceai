@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{Array, ArrayRef, StringBuilder};
+use arrow::array::{Array, ArrayRef, StringBuilder, StringViewArray};
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::config::ConfigOptions;
 use datafusion::functions::crypto;
@@ -143,15 +143,13 @@ impl ScalarUDFImpl for DigestMany {
             ]));
         }
 
-        // Arrays present - use optimized batch processing
-
-        let num_rows = args
-            .iter()
-            .find_map(|arg| match arg {
-                ColumnarValue::Array(arr) => Some(arr.len()),
-                ColumnarValue::Scalar(_) => None,
-            })
-            .unwrap_or_default();
+        // We have arrays - need to process row by row
+        let Some(num_rows) = args.iter().find_map(|arg| match arg {
+            ColumnarValue::Array(arr) if arr.len() > 0 => Some(arr.len()),
+            ColumnarValue::Array(_) | ColumnarValue::Scalar(_) => None,
+        }) else {
+            return Ok(ColumnarValue::Array(Arc::new(StringViewArray::new_null(0))));
+        };
 
         // Pre-allocate concatenated strings buffer with estimated capacity
         let estimated_row_size = args.len() * 16;
