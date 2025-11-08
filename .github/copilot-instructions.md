@@ -212,9 +212,127 @@ async fn bad(&self) {
 
 ### Connection Pooling & Arc Cloning
 
-- **Always use pools**: Pool creation never fails, errors only on `.get()`
-- **Use `deadpool`/`r2d2`**: For async/sync respectively
-- **Avoid unnecessary Arc clones**: Prefer `&Arc<T>` if no ownership needed
+### Stream Handling (CRITICAL)
+
+- **AVOID `stream!` macro**: Breaks rust-analyzer IDE hints and makes debugging harder
+- **Use manual Stream implementations or `async_stream::stream` sparingly**: When unavoidable, document why
+
+### Logging (CRITICAL)
+
+- **Use `tracing::` for logging**: Use `tracing::info!`, `tracing::error!`, `tracing::debug!`, etc.
+- **DO NOT use `log::`**: The project uses `tracing` crate, not `log` crate
+- **DO NOT add newlines in log messages or error strings**: Keep all log/error messages on a single line
+
+```rust
+// GOOD
+tracing::info!("Starting runtime");
+tracing::error!("Failed to connect: {}", error);
+tracing::warn!(attempt = 1, "Failed to initialize credentials; retrying");
+
+// GOOD - long messages on single line
+tracing::debug!("AWS credential provider initialized without credentials. Proceeding without authentication.");
+
+// BAD - don't use log crate
+log::info!("Starting runtime");
+
+// BAD - don't add newlines in messages
+tracing::error!(
+    "Failed to connect: {}. \
+     Please check your configuration.",
+    error
+);
+```
+
+### Async/Blocking Patterns (CRITICAL)
+
+**Rule**: Async code should never spend a long time without reaching an `.await`.
+
+- **Target**: No more than 10-100 microseconds between `.await` points
+- **NEVER use blocking operations in async functions**:
+  - ❌ `std::thread::sleep` → ✅ `tokio::time::sleep`
+  - ❌ `std::fs` → ✅ `tokio::fs`
+  - ❌ Blocking database calls → ✅ Use connection pools with async APIs
+
+**Handling blocking operations:**
+
+1. **For blocking I/O** (file system, synchronous DB clients):
+
+   ```rust
+   // Use spawn_blocking for synchronous operations
+   let result = tokio::task::spawn_blocking(move || {
+       // Blocking operations here (file I/O, synchronous DB calls)
+       std::fs::read_to_string("file.txt")
+   }).await?;
+   ```
+
+2. **For CPU-bound computations**:
+
+   ```rust
+   // Use rayon for parallel CPU work
+   let (tx, rx) = tokio::sync::oneshot::channel();
+   rayon::spawn(move || {
+       let result = expensive_computation();
+       let _ = tx.send(result);
+   });
+   let result = rx.await?;
+   ```
+
+3. **For long-running background tasks**: Spawn dedicated threads with `std::thread::spawn`
+
+**Why this matters**: Blocking an async runtime thread prevents other tasks from running, causing cascading delays and poor throughput under load.
+
+### Clippy Rules (Enforced in CI)
+
+The following clippy rules are **errors** in CI (`-Dwarnings`):
+
+- `clippy::pedantic` - All pedantic lints enabled
+- `clippy::unwrap_used` - No `.unwrap()` calls
+- `clippy::expect_used` - No `.expect()` calls (use proper error handling)
+- `clippy::clone_on_ref_ptr` - Don't clone `Arc`/`Rc` unnecessarily
+
+Allowed exceptions:
+
+- `clippy::module_name_repetitions` - OK to have `module_name::ModuleName`
+- `clippy::large_futures` - Allowed due to async complexity
+
+### Performance and Memory Management
+
+#### Zero-Copy Operations
+
+- **Prefer zero-copy** when working with Arrow arrays
+- Use `Arc<dyn Array>` for type-erased arrays (cheap to clone)
+- Avoid unnecessary data copies between Arrow, DataFusion, and connectors
+
+```rust
+// GOOD - zero-copy sharing
+let array: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 3]));
+let shared = Arc::clone(&array); // Cheap reference count increment
+
+// BAD - unnecessary copy
+let copied = array.to_data().clone(); // Avoid unless necessary
+```
+
+#### Connection Pooling
+
+- **Always use connection pools** for database connectors
+- Pool creation should never fail - errors only on `.get()`
+- Use `deadpool` or `r2d2` for async/sync pooling respectively
+
+```rust
+// GOOD - pool creation doesn't fail, errors on get
+let pool = Pool::builder(manager).build()?;
+// Later...
+let conn = pool.get().await?; // Error only here
+
+// BAD - don't create connections on-demand
+let conn = create_connection().await?; // Creates new connection every time
+```
+
+#### Arc/Rc Cloning
+
+- **Avoid unnecessary `Arc`/`Rc` clones** (caught by `clippy::clone_on_ref_ptr`)
+- `Arc::clone()` is cheap but not free - don't clone in hot loops unnecessarily
+- When passing `Arc<T>` to functions, prefer `&Arc<T>` if you don't need ownership
 
 ```rust
 // GOOD - function signature

@@ -11,8 +11,18 @@ version.workspace = true
 [dependencies]
 datafusion.workspace = true
 datafusion-expr.workspace = true
+datafusion-table-providers.workspace = true
+r2d2 = { optional = true, workspace = true }
+duckdb = { optional = true, workspace = true }
 async-stream.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 futures.workspace = true
 cache = { path = "../cache" }
+
+[features]
+duckdb = [
+    "datafusion-table-providers/duckdb",
+    "dep:duckdb",
+    "dep:r2d2"
+]

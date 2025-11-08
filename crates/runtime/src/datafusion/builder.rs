@@ -47,6 +47,8 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+#[cfg(feature = "duckdb")]
+use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -222,6 +224,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -244,8 +247,16 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
-            .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
-            .build();
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        #[cfg(feature = "duckdb")]
+        {
+            state = state.with_physical_optimizer_rule(
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            );
+        }
+
+        let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");

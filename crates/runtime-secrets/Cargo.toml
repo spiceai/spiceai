@@ -24,6 +24,7 @@ tokio = { workspace = true, features = ["sync"] }
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge", optional = true }
 aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
 keyring = { version = "3.6.3", features = [
@@ -39,6 +40,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "te
 [features]
 aws-secrets-manager = [
     "dep:aws-config",
+    "dep:aws-sdk-credential-bridge",
     "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
 ]
