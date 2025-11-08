@@ -83,6 +83,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         // Order here will be preserved in sidebar at https://spiceai.org/docs/api/http/runtime.
         v1::query::post,
         v1::datasets::get,
+        v1::datasets::dataset_get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::catalogs::get,
@@ -199,6 +200,7 @@ pub(crate) fn routes(
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
+        .route("/v1/datasets/{name}/get", post(v1::datasets::dataset_get))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),

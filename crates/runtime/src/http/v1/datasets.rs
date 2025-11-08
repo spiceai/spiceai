@@ -28,6 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use datafusion::sql::TableReference;
+use futures::TryStreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -457,4 +458,303 @@ fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
     );
 
     properties
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DatasetGetRequest {
+    /// Parameters to pass to the data connector
+    pub params: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DatasetGetResponse {
+    /// The retrieved data
+    pub data: Vec<HashMap<String, serde_json::Value>>,
+    
+    /// Whether the data was served from cache
+    pub cached: bool,
+    
+    /// The SQL query used for cache key
+    pub cache_key_sql: Option<String>,
+}
+
+/// Dataset Get
+///
+/// Read-through HTTP proxy-cache for datasets. Fetches data from the data connector,
+/// caches it using Spice's LRU cache, and optionally inserts into acceleration.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/datasets/{name}/get",
+    operation_id = "post_dataset_get",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset to query.")
+    ),
+    request_body(
+        description = "Parameters to pass to the data connector",
+        content((
+            DatasetGetRequest = "application/json",
+            example = json!({
+                "params": {
+                    "user_id": 123,
+                    "status": "active"
+                }
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "Data retrieved successfully", content((
+            DatasetGetResponse = "application/json",
+            example = json!({
+                "data": [
+                    {"id": 1, "name": "John", "status": "active"},
+                    {"id": 2, "name": "Jane", "status": "active"}
+                ],
+                "cached": false,
+                "cache_key_sql": "SELECT * FROM users WHERE user_id = 123 AND status = 'active'"
+            })
+        ))),
+        (status = 404, description = "Dataset not found", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset users not found"
+            })
+        ))),
+        (status = 500, description = "Internal server error occurred", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Failed to fetch data from connector"
+            })
+        )))
+    )
+))]
+pub(crate) async fn dataset_get(
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    Extension(rt): Extension<Arc<Runtime>>,
+    Path(dataset_name): Path<String>,
+    Json(payload): Json<DatasetGetRequest>,
+) -> Response {
+    let app_lock = tokio::select! {
+        lock = app.read() => lock,
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return (
+                status::StatusCode::REQUEST_TIMEOUT,
+                "timeout".to_string()
+            ).into_response();
+        }
+    };
+    let Some(readable_app) = app_lock.as_ref() else {
+        return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    };
+
+    let Some(dataset) = readable_app
+        .datasets
+        .iter()
+        .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
+    else {
+        return (
+            status::StatusCode::NOT_FOUND,
+            Json(MessageResponse {
+                message: format!("Dataset {dataset_name} not found"),
+            }),
+        )
+            .into_response();
+    };
+
+    // Generate SQL from params for cache key
+    let cache_key_sql = match generate_sql_from_params(&dataset.name, &payload.params) {
+        Ok(sql) => sql,
+        Err(e) => {
+            return (
+                status::StatusCode::BAD_REQUEST,
+                Json(MessageResponse {
+                    message: format!("Failed to generate SQL from params: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
+    // Execute the query through DataFusion (which handles caching)
+    match df
+        .query_builder(&cache_key_sql)
+        .build()
+        .run()
+        .await
+    {
+        Ok(query_result) => {
+            let cache_status = query_result.cache_status;
+            
+            // Collect the stream into record batches
+            let batches = match query_result.data.try_collect::<Vec<_>>().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return (
+                        status::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(MessageResponse {
+                            message: format!("Failed to collect query results: {e}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            
+            // Convert RecordBatches to JSON
+            let data = match record_batches_to_json(&batches) {
+                Ok(d) => d,
+                Err(e) => {
+                    return (
+                        status::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(MessageResponse {
+                            message: format!("Failed to convert results to JSON: {e}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+
+            (
+                status::StatusCode::OK,
+                Json(DatasetGetResponse {
+                    data,
+                    cached: matches!(cache_status, cache::result::CacheStatus::CacheHit),
+                    cache_key_sql: Some(cache_key_sql),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            status::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(MessageResponse {
+                message: format!("Failed to execute query: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn generate_sql_from_params(
+    table_name: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    if params.is_empty() {
+        return Ok(format!("SELECT * FROM {table_name}"));
+    }
+
+    let mut where_clauses = Vec::new();
+    for (key, value) in params {
+        let sql_value = match value {
+            serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => "NULL".to_string(),
+            _ => return Err(format!("Unsupported parameter type for key: {key}")),
+        };
+        where_clauses.push(format!("{key} = {sql_value}"));
+    }
+
+    Ok(format!(
+        "SELECT * FROM {table_name} WHERE {}",
+        where_clauses.join(" AND ")
+    ))
+}
+
+fn record_batches_to_json(
+    batches: &[arrow::array::RecordBatch],
+) -> Result<Vec<HashMap<String, serde_json::Value>>, String> {
+    let mut result = Vec::new();
+    
+    for batch in batches {
+        let schema = batch.schema();
+        for row_idx in 0..batch.num_rows() {
+            let mut row_map = HashMap::new();
+            
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let column = batch.column(col_idx);
+                let value = arrow_value_to_json(column, row_idx)?;
+                row_map.insert(field.name().clone(), value);
+            }
+            
+            result.push(row_map);
+        }
+    }
+    
+    Ok(result)
+}
+
+fn arrow_value_to_json(
+    array: &dyn arrow::array::Array,
+    row_idx: usize,
+) -> Result<serde_json::Value, String> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+    
+    if array.is_null(row_idx) {
+        return Ok(serde_json::Value::Null);
+    }
+    
+    match array.data_type() {
+        DataType::Int8 => {
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::UInt64 => {
+            let arr = array.as_any().downcast_ref::<UInt64Array>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Number(arr.value(row_idx).into()))
+        }
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>().ok_or("downcast failed")?;
+            serde_json::Number::from_f64(f64::from(arr.value(row_idx)))
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| "invalid float".to_string())
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().ok_or("downcast failed")?;
+            serde_json::Number::from_f64(arr.value(row_idx))
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| "invalid float".to_string())
+        }
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::Bool(arr.value(row_idx)))
+        }
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::String(arr.value(row_idx).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().ok_or("downcast failed")?;
+            Ok(serde_json::Value::String(arr.value(row_idx).to_string()))
+        }
+        _ => Err(format!("Unsupported data type: {:?}", array.data_type())),
+    }
 }
