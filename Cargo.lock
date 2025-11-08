@@ -4624,7 +4624,10 @@ dependencies = [
  "cache",
  "datafusion",
  "datafusion-expr",
+ "datafusion-table-providers",
+ "duckdb",
  "futures",
+ "r2d2",
  "tracing",
 ]
 
@@ -4838,7 +4841,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=7d4fa6d36b464a72afea88e7d3644e143c2535ad#7d4fa6d36b464a72afea88e7d3644e143c2535ad"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=7aa05392457e3f5986aa234b98968dd7373f7049#7aa05392457e3f5986aa234b98968dd7373f7049"
 dependencies = [
  "arrow",
  "arrow-json",
