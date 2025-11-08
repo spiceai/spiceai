@@ -328,16 +328,18 @@ impl HttpTableProvider {
     ) -> Result<String> {
         let mut url = self.base_url.clone();
 
-        // Append the path to the base URL's path
-        let base_path = self.base_url.path();
-        let full_path = if base_path == "/" || base_path.is_empty() {
-            path.to_string()
-        } else if path.starts_with('/') {
-            format!("{}{}", base_path.trim_end_matches('/'), path)
-        } else {
-            format!("{}/{}", base_path.trim_end_matches('/'), path)
-        };
-        url.set_path(&full_path);
+        // Append the path to the base URL's path (only if path is non-empty)
+        if !path.is_empty() {
+            let base_path = self.base_url.path();
+            let full_path = if base_path == "/" || base_path.is_empty() {
+                path.to_string()
+            } else if path.starts_with('/') {
+                format!("{}{}", base_path.trim_end_matches('/'), path)
+            } else {
+                format!("{}/{}", base_path.trim_end_matches('/'), path)
+            };
+            url.set_path(&full_path);
+        }
 
         if let Some(q) = query {
             url.set_query(Some(q));

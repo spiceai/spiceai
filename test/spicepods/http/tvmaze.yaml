@@ -1,0 +1,50 @@
+version: v1
+kind: Spicepod
+name: tvmaze
+
+datasets:
+  # Single JSON object endpoint - Breaking Bad show details
+  - from: https://api.tvmaze.com
+    name: show_details
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT _path, _query, content 
+        FROM show_details 
+        WHERE _path = '/shows/169'
+
+  # JSON array endpoint - People search (expands to multiple rows)
+  - from: https://api.tvmaze.com
+    name: people_search
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT _path, _query, content 
+        FROM people_search 
+        WHERE _path = '/search/people' 
+          AND _query = 'q=michael'
+
+  # Combined OR filter across different endpoints
+  - from: https://api.tvmaze.com
+    name: combined_data
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT _path, _query, content 
+        FROM combined_data 
+        WHERE (_path = '/search/people' AND _query = 'q=michael')
+           OR _path = '/shows/169'
+
+  # IN list with multiple show IDs
+  - from: https://api.tvmaze.com
+    name: multiple_shows
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT _path, _query, content 
+        FROM multiple_shows 
+        WHERE _path IN ('/shows/169', '/shows/170', '/shows/171')
