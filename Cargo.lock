@@ -5434,7 +5434,6 @@ version = "1.9.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
- "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-dynamodbstreams",
  "aws-smithy-runtime-api",
