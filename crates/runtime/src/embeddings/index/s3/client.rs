@@ -64,6 +64,24 @@ impl S3VectorClient {
             ttl,
         }
     }
+
+    /// Performs a lightweight health check to verify S3 Vectors API connectivity.
+    /// Returns Ok(()) if the API is reachable, Err otherwise.
+    ///
+    /// This method makes a minimal API call (listing vector buckets with max_results=1)
+    /// to verify connectivity without incurring significant cost.
+    pub async fn health_check(&self) -> Result<(), String> {
+        let input = ListVectorBucketsInput::builder()
+            .max_results(1)
+            .build()
+            .map_err(|e| format!("Failed to build health check input: {e}"))?;
+
+        self.client
+            .list_vector_buckets(input)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("S3 Vectors API health check failed: {e}"))
+    }
 }
 #[async_trait]
 impl S3Vectors for S3VectorClient {
@@ -217,13 +235,17 @@ impl S3Vectors for S3VectorClient {
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
         if is_full_list && let Some(ttl) = self.ttl {
-            let cache = self.list_indexes_cache.read().await;
-            if let Some(bucket) = &input.vector_bucket_name
-                && let Some((cached_output, timestamp)) = cache.get(bucket)
-                && timestamp.elapsed() < ttl
+            // Fast path: check with read lock first
             {
-                return Ok(cached_output.clone());
+                let cache = self.list_indexes_cache.read().await;
+                if let Some(bucket) = &input.vector_bucket_name
+                    && let Some((cached_output, timestamp)) = cache.get(bucket)
+                    && timestamp.elapsed() < ttl
+                {
+                    return Ok(cached_output.clone());
+                }
             }
+            // Read lock dropped here before API call
         }
 
         let result = {
@@ -236,13 +258,20 @@ impl S3Vectors for S3VectorClient {
                 .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
         };
 
-        // Cache successful full list results
+        // Cache successful full list results with double-check pattern
         if is_full_list
-            && self.ttl.is_some()
+            && let Some(ttl) = self.ttl
             && let Ok(output) = &result
-            && let Some(bucket) = input.vector_bucket_name
+            && let Some(bucket) = input.vector_bucket_name.clone()
         {
             let mut cache = self.list_indexes_cache.write().await;
+            // Check again - another thread might have cached during our API call
+            if let Some((_, timestamp)) = cache.get(&bucket)
+                && timestamp.elapsed() < ttl
+            {
+                // Fresh cache exists, don't overwrite with potentially older data
+                return result;
+            }
             cache.insert(bucket, (output.clone(), Instant::now()));
         }
 

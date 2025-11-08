@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_credential_types::provider::error::CredentialsError;
@@ -42,6 +43,7 @@ pub struct S3VectorRetryClientBuilder {
     client: Arc<dyn S3Vectors + Send + Sync>,
     retry_strategy: FibonacciBackoff,
     max_parallelism: usize,
+    operation_timeout: Duration,
 }
 
 impl S3VectorRetryClientBuilder {
@@ -51,6 +53,7 @@ impl S3VectorRetryClientBuilder {
             client,
             retry_strategy: FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
             max_parallelism: 10,
+            operation_timeout: Duration::from_secs(300), // 5 minute default timeout
         }
     }
 
@@ -69,11 +72,19 @@ impl S3VectorRetryClientBuilder {
     }
 
     #[must_use]
+    #[allow(unused)]
+    pub fn operation_timeout(mut self, timeout: Duration) -> Self {
+        self.operation_timeout = timeout;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> S3VectorRetryClient {
         S3VectorRetryClient {
             client: self.client,
             retry_strategy: self.retry_strategy,
             semaphore: Semaphore::new(self.max_parallelism),
+            operation_timeout: self.operation_timeout,
         }
     }
 }
@@ -82,6 +93,7 @@ pub struct S3VectorRetryClient {
     client: Arc<dyn S3Vectors + Send + Sync>,
     retry_strategy: FibonacciBackoff,
     semaphore: Semaphore,
+    operation_timeout: Duration,
 }
 
 #[async_trait]
@@ -90,45 +102,54 @@ impl S3Vectors for S3VectorRetryClient {
         &self,
         input: CreateIndexInput,
     ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.create_index(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        CreateIndexError::ServiceUnavailableException(_)
-                        | CreateIndexError::TooManyRequestsException(_)
-                        | CreateIndexError::InternalServerException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        CreateIndexError::AccessDeniedException(_)
-                        | CreateIndexError::ConflictException(_)
-                        | CreateIndexError::NotFoundException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
+        tokio::time::timeout(
+            self.operation_timeout,
+            retry(self.retry_strategy.clone(), || async {
+                let _permit = self.semaphore.acquire().await;
+                match self.client.create_index(input.clone()).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => match &e {
+                        SdkError::ServiceError(service_error) => match service_error.err() {
+                            CreateIndexError::ServiceUnavailableException(_)
+                            | CreateIndexError::TooManyRequestsException(_)
+                            | CreateIndexError::InternalServerException(_) => {
+                                Err(RetryError::transient(e))
+                            }
+                            err if err.meta().code() == Some("RequestTimeoutException") => {
+                                Err(RetryError::transient(e))
+                            }
+                            CreateIndexError::AccessDeniedException(_)
+                            | CreateIndexError::ConflictException(_)
+                            | CreateIndexError::NotFoundException(_)
+                            | _ => Err(RetryError::permanent(e)),
+                        },
+                        SdkError::DispatchFailure(d) => {
+                            let credentials_not_loaded = d
+                                .as_connector_error()
+                                .and_then(|e| e.source())
+                                .and_then(|s| s.downcast_ref::<CredentialsError>())
+                                .is_some_and(|ce| {
+                                    matches!(ce, CredentialsError::CredentialsNotLoaded(_))
+                                });
 
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
+                            if credentials_not_loaded {
+                                Err(RetryError::permanent(e))
+                            } else {
+                                Err(RetryError::transient(e))
+                            }
                         }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+                        _ => Err(RetryError::permanent(e)),
+                    },
+                }
+            }),
+        )
         .await
+        .map_err(|_| {
+            SdkError::construction_failure(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Operation timed out",
+            ))
+        })?
     }
 
     async fn create_vector_bucket(

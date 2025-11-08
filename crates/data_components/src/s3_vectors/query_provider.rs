@@ -62,7 +62,7 @@ use tracing::{Instrument, info_span};
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
 /// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
-pub static S3_VECTOR_MAX_TOPK: i64 = 30;
+pub static S3_VECTOR_MAX_TOPK: i32 = 30;
 
 /// [`ComputeQueryVector`] allows [`S3VectorsQueryTable`] to be instantiated in a non-async setting.
 #[async_trait]
@@ -125,21 +125,25 @@ fn create_spill_plan_query(
                 vec![],
             );
 
-            #[allow(clippy::cast_possible_wrap)]
-            let limit: i64 = match limit {
-                Some(l) if (l as i64) > S3_VECTOR_MAX_TOPK => {
-                    tracing::warn!(
-                        "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                    );
-                    S3_VECTOR_MAX_TOPK
+            let limit_i32: i32 = match limit {
+                Some(l) => {
+                    // Safe conversion: check against i32::MAX first, then compare with limit
+                    let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
+                    if l_i32 > S3_VECTOR_MAX_TOPK {
+                        tracing::warn!(
+                            "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
+                        );
+                        S3_VECTOR_MAX_TOPK
+                    } else {
+                        l_i32
+                    }
                 }
                 None => S3_VECTOR_MAX_TOPK,
-                Some(l) => l as i64,
             };
             let index_plan = Arc::new(S3VectorsQueryExec::new(
                 &query_table,
                 projection,
-                limit,
+                i64::from(limit_i32),
                 query_vector.to_owned(),
                 filters.to_vec(),
             ));
@@ -365,21 +369,25 @@ impl TableProvider for S3VectorsQueryTable {
         }
 
         if self.partition_by.is_empty() {
-            #[allow(clippy::cast_possible_wrap)]
-            let limit: i64 = match limit {
-                Some(l) if (l as i64) > S3_VECTOR_MAX_TOPK => {
-                    tracing::warn!(
-                        "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                    );
-                    S3_VECTOR_MAX_TOPK
+            let limit_i32: i32 = match limit {
+                Some(l) => {
+                    // Safe conversion: check against i32::MAX first, then compare with limit
+                    let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
+                    if l_i32 > S3_VECTOR_MAX_TOPK {
+                        tracing::warn!(
+                            "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
+                        );
+                        S3_VECTOR_MAX_TOPK
+                    } else {
+                        l_i32
+                    }
                 }
                 None => S3_VECTOR_MAX_TOPK,
-                Some(l) => l as i64,
             };
             return Ok(Arc::new(S3VectorsQueryExec::new(
                 self,
                 projection,
-                limit,
+                i64::from(limit_i32),
                 query_vector.clone(),
                 filters.to_vec(),
             )));
@@ -442,16 +450,8 @@ impl S3VectorsQueryExec {
         query: Vec<f32>,
         filters: Vec<Expr>,
     ) -> Self {
-        let projected_schema = match projection {
-            Some(proj) => {
-                let fields = proj
-                    .iter()
-                    .map(|&i| table.schema().field(i).clone())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            }
-            None => table.schema(),
-        };
+        let projected_schema =
+            project_schema(&table.schema(), projection).unwrap_or_else(|_| table.schema());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
@@ -657,16 +657,28 @@ async fn query_vector_stream(
             })?;
 
         // Put the vector data in the query_vectors
+        // Use HashMap for O(n) lookup instead of O(n²) nested loop
+        let output_map: std::collections::HashMap<_, _> = output_vectors
+            .into_iter()
+            .map(|v| (v.key.clone(), v))
+            .collect();
 
-        // Would be nice to zip these to avoid the nested loop and clone but don't know that they come back in the same order
-        // for (query_vector, output_vector) in query_vectors.iter_mut().zip(output_vectors) {
+        let mut missing_keys = Vec::new();
         for query_vector in &mut query_vectors {
-            for output_vector in &output_vectors {
-                if query_vector.key == output_vector.key {
-                    query_vector.data.clone_from(&output_vector.data);
-                    break;
-                }
+            if let Some(output_vector) = output_map.get(&query_vector.key) {
+                query_vector.data.clone_from(&output_vector.data);
+            } else {
+                missing_keys.push(&query_vector.key);
             }
+        }
+
+        // Warn if GetVectors returned incomplete data
+        if !missing_keys.is_empty() {
+            tracing::warn!(
+                "GetVectors returned incomplete data for {} keys: {:?}",
+                missing_keys.len(),
+                missing_keys
+            );
         }
     }
 
