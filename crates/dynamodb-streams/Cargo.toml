@@ -1,0 +1,26 @@
+[package]
+name = "dynamodb-streams"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
+aws-sdk-dynamodbstreams = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+snafu = { workspace = true }
+
+[dev-dependencies]
+aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
+itertools = { workspace = true }
+ulid = "1.1.0"

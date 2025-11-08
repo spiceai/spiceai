@@ -11,6 +11,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
     "crates/flightrepl",
@@ -91,6 +92,7 @@ aws-sdk-bedrockruntime = "1.109.0"
 aws-sdk-cognitoidentity = "1.87.0"
 aws-sdk-cognitoidentityprovider = "1.100.0"
 aws-sdk-dynamodb = "1.95.0"
+aws-sdk-dynamodbstreams = "1.87.0"
 aws-sdk-glue = "1.124.0"
 aws-sdk-s3 = "1.108.0"
 aws-sdk-s3vectors = "1.11"
@@ -345,6 +347,7 @@ aws-sdk-bedrockruntime = { git = "https://github.com/spiceai/aws-sdk-rust", rev 
 aws-sdk-cognitoidentity = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-cognitoidentity" }                 # pinned from release-2025-10-08
 aws-sdk-cognitoidentityprovider = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-cognitoidentityprovider" } # pinned from release-2025-10-08
 aws-sdk-dynamodb = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-dynamodb" }                               # pinned from release-2025-10-08
+aws-sdk-dynamodbstreams = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-dynamodbstreams" }                 # pinned from release-2025-10-08
 aws-sdk-glue = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-glue" }                                       # pinned from release-2025-10-08
 aws-sdk-s3 = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-s3" }                                           # pinned from release-2025-10-08
 aws-sdk-s3vectors = { git = "https://github.com/spiceai/aws-sdk-rust", rev = "887b71e58fe61d939c7999cb32ec99069d8b1ed0", package = "aws-sdk-s3vectors" }                             # pinned from release-2025-10-08
