@@ -64,11 +64,15 @@ impl DataConnector for Https {
             .get("file_format")
             .expose()
             .ok()
-            .map(|s| s.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
 
-        // If file_format is not specified or is set to 'json', use the HTTP table provider
-        // with virtual path/query/content columns
-        if format.is_none() || format.as_deref() == Some("json") {
+        // If file_format is not specified, default to auto-detection
+        // If file_format is set to 'json' or 'auto', use the HTTP table provider
+        // with virtual _path/_query/content columns
+        let use_http_provider =
+            format.is_none() || matches!(format.as_deref(), Some("json" | "auto"));
+
+        if use_http_provider {
             let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
                 DataConnectorError::InvalidConfiguration {
                     dataconnector: "https".to_string(),
@@ -100,15 +104,57 @@ impl DataConnector for Https {
                     source: e,
                 })?;
 
-            let file_format = format.unwrap_or_else(|| "json".to_string());
+            let file_format = format.unwrap_or_else(|| "auto".to_string());
             let acceleration_enabled = dataset.is_accelerated();
 
-            let provider = Arc::new(data_components::http::provider::HttpTableProvider::new(
+            // Handle flatten_json parameter
+            // If set to empty string or "true", use default delimiter "_"
+            // If set to a specific value, use that as the delimiter
+            // If not set or "false", don't flatten
+            let flatten_json = self
+                .params
+                .get("flatten_json")
+                .expose()
+                .ok()
+                .and_then(|val| {
+                    let val_lower = val.to_lowercase();
+                    if val_lower == "false" || val_lower == "no" {
+                        None
+                    } else if val_lower == "true" || val_lower == "yes" || val.is_empty() {
+                        Some(String::new()) // Empty string will be converted to "_" in with_flatten_json
+                    } else {
+                        Some(val.to_string())
+                    }
+                });
+
+            // Handle http_max_retries parameter with default of 3
+            let max_retries = self
+                .params
+                .get("http_max_retries")
+                .expose()
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(3);
+
+            // Handle http_post_content_type parameter for POST requests
+            let content_type = self
+                .params
+                .get("http_post_content_type")
+                .expose()
+                .ok()
+                .map(std::string::ToString::to_string);
+
+            let provider = data_components::http::provider::HttpTableProvider::new(
                 base_url,
                 client,
                 file_format,
                 acceleration_enabled,
-            ));
+            )
+            .with_flatten_json(flatten_json)
+            .with_max_retries(max_retries)
+            .with_content_type(content_type);
+
+            let provider = Arc::new(provider);
 
             // Validate the HTTP endpoint (non-blocking, log warnings only)
             let provider_clone = Arc::clone(&provider);
@@ -174,6 +220,12 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("port").description("The port to connect to."),
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for HTTP(S) client."),
+        ParameterSpec::runtime("http_max_retries")
+            .description("Maximum number of retries for HTTP requests. Default: 3"),
+        ParameterSpec::runtime("http_post_content_type")
+            .description("Content-Type header for POST requests when using _body filter."),
+        ParameterSpec::runtime("flatten_json")
+            .description("Flatten JSON response into columns. Use 'true' for default delimiter '_', or specify a custom delimiter."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
