@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_cte
+name: s3[parquet]-duckdb[file]_view_indexes.yaml
 
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
@@ -55,6 +55,6 @@ views:
       mode: file
       refresh_on_startup: auto
       params:
-        duckdb_preserve_insertion_order: false
+        duckdb_preserve_insertion_order: true
       indexes:
         '(AccountSid, NumberPoolSid)': enabled
