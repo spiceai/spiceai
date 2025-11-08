@@ -24,7 +24,7 @@ use test_framework::{
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     opentelemetry::KeyValue,
-    queries::{QueryOverrides, QuerySet},
+    queries::QueryOverrides,
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,

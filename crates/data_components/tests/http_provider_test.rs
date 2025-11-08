@@ -158,8 +158,8 @@ async fn test_http_provider_with_base_path() {
     );
 }
 
-/// Integration test with TVMaze API - Single JSON object
-/// Tests endpoint: https://api.tvmaze.com/shows/169
+/// Integration test with `TVMaze` API - Single JSON object
+/// Tests endpoint: <https://api.tvmaze.com/shows/169>
 /// Expected: Returns a single JSON object (Breaking Bad show details)
 #[tokio::test]
 async fn test_tvmaze_single_object() {
@@ -208,8 +208,8 @@ async fn test_tvmaze_single_object() {
     );
 }
 
-/// Integration test with TVMaze API - Multiple JSON objects (array)
-/// Tests endpoint: https://api.tvmaze.com/search/people?q=michael
+/// Integration test with `TVMaze` API - Multiple JSON objects (array)
+/// Tests endpoint: <https://api.tvmaze.com/search/people?q=michael>
 /// Expected: Returns a JSON array with multiple search results, each as a separate row
 #[tokio::test]
 async fn test_tvmaze_multi_object() {
@@ -285,7 +285,7 @@ async fn test_tvmaze_multi_object() {
     }
 }
 
-/// Integration test with TVMaze API - Combined OR filter
+/// Integration test with `TVMaze` API - Combined OR filter
 /// Tests multiple endpoints in a single query using OR
 /// Expected: Returns rows from both endpoints combined
 #[tokio::test]
@@ -339,7 +339,7 @@ async fn test_tvmaze_combined_or_filter() {
     );
 }
 
-/// Integration test with TVMaze API - IN list filter
+/// Integration test with `TVMaze` API - IN list filter
 /// Tests using IN clause for multiple paths
 /// Expected: Returns rows from multiple different endpoints
 #[tokio::test]

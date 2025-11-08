@@ -17,7 +17,7 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::{TestType, queries::QuerySet};
+use test_framework::TestType;
 
 use super::dataset::{QueryOverridesArg, QuerySetArg};
 

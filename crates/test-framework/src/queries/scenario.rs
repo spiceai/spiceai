@@ -73,6 +73,7 @@ impl ScenarioQuerySet {
     }
 
     /// Convert scenario query definitions into Query objects
+    #[must_use]
     pub fn into_queries(self) -> Vec<Query> {
         self.queries
             .into_iter()
@@ -80,7 +81,7 @@ impl ScenarioQuerySet {
             .collect()
     }
 
-    /// Get expected results for validation (as RecordBatches)
+    /// Get expected results for validation (as `RecordBatches`)
     /// Returns a map of query name to expected results
     pub fn get_expected_results(
         &self,
@@ -117,6 +118,7 @@ impl ScenarioQuerySet {
     }
 
     /// Get expected row counts for queries that only specify row count validation
+    #[must_use]
     pub fn get_expected_row_counts(&self) -> HashMap<Arc<str>, usize> {
         let mut counts = HashMap::new();
 
@@ -130,7 +132,7 @@ impl ScenarioQuerySet {
     }
 }
 
-/// Load CSV file as Arrow RecordBatches
+/// Load CSV file as Arrow `RecordBatches`
 fn load_csv_as_batches(path: &Path) -> anyhow::Result<Vec<RecordBatch>> {
     use arrow::csv::ReaderBuilder;
     use arrow::csv::reader::Format;
@@ -153,7 +155,7 @@ fn load_csv_as_batches(path: &Path) -> anyhow::Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// Load CSV from string as Arrow RecordBatches
+/// Load CSV from string as Arrow `RecordBatches`
 fn load_csv_from_string(csv_data: &str) -> anyhow::Result<Vec<RecordBatch>> {
     use arrow::csv::ReaderBuilder;
     use arrow::csv::reader::Format;
@@ -176,7 +178,7 @@ fn load_csv_from_string(csv_data: &str) -> anyhow::Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// Load structured data (columns + rows) as Arrow RecordBatches
+/// Load structured data (columns + rows) as Arrow `RecordBatches`
 /// Columns and rows are comma-delimited strings
 fn load_from_structured_data(
     columns_str: &str,
@@ -187,7 +189,7 @@ fn load_from_structured_data(
     use std::io::{Cursor, Seek};
 
     // Parse column names
-    let columns: Vec<&str> = columns_str.split(',').map(|s| s.trim()).collect();
+    let columns: Vec<&str> = columns_str.split(',').map(str::trim).collect();
 
     if columns.is_empty() {
         return Ok(vec![]);

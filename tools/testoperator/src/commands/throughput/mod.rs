@@ -21,7 +21,7 @@ use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
-    queries::{QueryOverrides, QuerySet},
+    queries::QueryOverrides,
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,

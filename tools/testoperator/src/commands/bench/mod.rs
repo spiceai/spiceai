@@ -30,7 +30,7 @@ use test_framework::{
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    queries::{QueryOverrides, QuerySet},
+    queries::QueryOverrides,
     spiced::SpicedInstance,
     spicepod::acceleration::Mode,
     spicetest::{

@@ -126,10 +126,9 @@ impl DatasetTestArgs {
     pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
         match self.query_set {
             QuerySetArg::Scenario => {
-                let file_path = self
-                    .scenario_query_file
-                    .as_ref()
-                    .expect("scenario_query_file should be required when query_set is Scenario");
+                let Some(file_path) = self.scenario_query_file.as_ref() else {
+                    anyhow::bail!("scenario_query_file is required when query_set is Scenario");
+                };
 
                 let scenario_set =
                     test_framework::queries::scenario::ScenarioQuerySet::from_file(file_path)?;

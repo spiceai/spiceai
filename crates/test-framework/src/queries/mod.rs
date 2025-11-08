@@ -379,7 +379,7 @@ impl Display for QuerySet {
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
             QuerySet::Scenario { scenario_set, .. } => {
                 if let Some(name) = &scenario_set.name {
-                    write!(f, "scenario[{}]", name)
+                    write!(f, "scenario[{name}]")
                 } else {
                     write!(f, "scenario")
                 }
