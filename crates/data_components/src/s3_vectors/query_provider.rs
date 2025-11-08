@@ -616,50 +616,56 @@ async fn query_vector_stream(
 
     let num_vectors = query_vectors.len();
 
-    // Get the vector data for each output using GetVectors API.
-    let keys = query_vectors.iter().map(|v| v.key.clone()).collect();
-    let GetVectorsOutput {
-        vectors: output_vectors,
-        ..
-    } = client
-        .get_vectors(
-            GetVectorsInput::builder()
-                .set_keys(Some(keys))
-                .set_vector_bucket_name(bucket_name.clone())
-                .set_index_arn(arn.clone())
-                .set_index_name(index_name.clone())
-                .set_return_data(Some(true))
-                .build()
-                .boxed()
-                .map_err(DataFusionError::External)?,
-        )
-        .instrument(info_span!(
-            target: "task_history",
-            "s3_get_vectors",
-            bucket_name = bucket_name,
-            index_name = index_name,
-            arn = arn,
-        ))
-        .instrument(combined_span)
-        .await
-        .map_err(|e| {
-            DataFusionError::External(
-                Error::S3VectorGetVectorsError {
-                    source: e.into_service_error(),
-                }
-                .into(),
+    // Only fetch vector data if the embeddings column is in the projection.
+    // Check if "data" column is present in the schema.
+    let needs_embeddings = schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some();
+
+    if needs_embeddings {
+        // Get the vector data for each output using GetVectors API.
+        let keys = query_vectors.iter().map(|v| v.key.clone()).collect();
+        let GetVectorsOutput {
+            vectors: output_vectors,
+            ..
+        } = client
+            .get_vectors(
+                GetVectorsInput::builder()
+                    .set_keys(Some(keys))
+                    .set_vector_bucket_name(bucket_name.clone())
+                    .set_index_arn(arn.clone())
+                    .set_index_name(index_name.clone())
+                    .set_return_data(Some(true))
+                    .build()
+                    .boxed()
+                    .map_err(DataFusionError::External)?,
             )
-        })?;
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_get_vectors",
+                bucket_name = bucket_name,
+                index_name = index_name,
+                arn = arn,
+            ))
+            .instrument(combined_span)
+            .await
+            .map_err(|e| {
+                DataFusionError::External(
+                    Error::S3VectorGetVectorsError {
+                        source: e.into_service_error(),
+                    }
+                    .into(),
+                )
+            })?;
 
-    // Put the vector data in the query_vectors
+        // Put the vector data in the query_vectors
 
-    // Would be nice to zip these to avoid the nested loop and clone but don't know that they come back in the same order
-    // for (query_vector, output_vector) in query_vectors.iter_mut().zip(output_vectors) {
-    for query_vector in &mut query_vectors {
-        for output_vector in &output_vectors {
-            if query_vector.key == output_vector.key {
-                query_vector.data.clone_from(&output_vector.data);
-                break;
+        // Would be nice to zip these to avoid the nested loop and clone but don't know that they come back in the same order
+        // for (query_vector, output_vector) in query_vectors.iter_mut().zip(output_vectors) {
+        for query_vector in &mut query_vectors {
+            for output_vector in &output_vectors {
+                if query_vector.key == output_vector.key {
+                    query_vector.data.clone_from(&output_vector.data);
+                    break;
+                }
             }
         }
     }
