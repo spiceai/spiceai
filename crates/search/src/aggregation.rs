@@ -99,7 +99,7 @@ pub struct AggregationResult {
     /// to all the columns in `data` that derived from it.
     ///
     /// Example
-    /// ```
+    /// ```json
     /// {
     ///   "body": ["body_fts", "body_similarity"]
     /// }
