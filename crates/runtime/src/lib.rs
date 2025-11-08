@@ -253,6 +253,11 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes_after_load', but the data connector doesn't support changes after load."
+    ))]
+    AcceleratedTableInvalidChangesAfterLoadSnafu { dataset_name: String },
+
+    #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {

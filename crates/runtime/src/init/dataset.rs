@@ -17,7 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
-    AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
+    AcceleratedReadWriteTableWithoutReplicationSnafu,
+    AcceleratedTableInvalidChangesAfterLoadSnafuSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
     UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
@@ -318,6 +319,19 @@ impl Runtime {
             && !data_connector.supports_changes_stream()
         {
             let err = AcceleratedTableInvalidChangesSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
+        if let Some(acceleration) = &ds.acceleration
+            && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
+                == RefreshMode::ChangesAfterLoad
+            && !data_connector.supports_changes_after_load()
+        {
+            let err = AcceleratedTableInvalidChangesAfterLoadSnafuSnafu {
                 dataset_name: ds.name.to_string(),
             }
             .build();

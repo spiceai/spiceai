@@ -91,6 +91,7 @@ use spicepod::metric::Metrics;
 use std::collections::HashSet;
 
 mod changes;
+mod changes_after_load;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
@@ -347,6 +348,9 @@ impl RefreshTask {
                 }
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
+                RefreshMode::ChangesAfterLoad => {
+                    unreachable!("ChangesAfterLoad are handled upstream")
+                }
             },
             &dataset_metrics_label_sets,
         );
@@ -363,6 +367,7 @@ impl RefreshTask {
             }
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::ChangesAfterLoad => unreachable!("ChangesAfterLoad are handled upstream"),
         };
 
         let streaming_data_update = match get_data_update_result {
@@ -726,6 +731,7 @@ impl RefreshTask {
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::ChangesAfterLoad => unreachable!("ChangesAfterLoad are handled upstream"),
         };
 
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {

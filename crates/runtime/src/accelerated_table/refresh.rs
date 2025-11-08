@@ -26,6 +26,7 @@ use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
+use crate::dataconnector::changes_after_load::ChangesAfterLoadCoordinator;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
@@ -266,8 +267,8 @@ impl Refresh {
                 };
                 last_checkpoint.last_checkpoint_time().await.ok().flatten()
             }
-            // Append and Changes modes are always refreshed since they stream changes from the source table.
-            RefreshMode::Append | RefreshMode::Changes => {
+            // Append, Changes and ChangesAfterLoad modes are always refreshed since they stream changes from the source table.
+            RefreshMode::Append | RefreshMode::Changes | RefreshMode::ChangesAfterLoad => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
@@ -417,6 +418,7 @@ pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
+    ChangesAfterLoad(Arc<dyn ChangesAfterLoadCoordinator>),
 }
 
 pub struct Refresher {
@@ -620,6 +622,9 @@ impl Refresher {
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
                 return Some(self.start_changes_stream(stream));
+            }
+            (AccelerationRefreshMode::ChangesAfterLoad(coordinator), _) => {
+                return Some(self.coordinate_changes_after_load(coordinator));
             }
         };
 
@@ -834,6 +839,46 @@ impl Refresher {
                 .await
             {
                 tracing::error!("Changes stream failed with error: {err}");
+            }
+        })
+    }
+
+    fn coordinate_changes_after_load(
+        &mut self,
+        coordinator: Arc<dyn ChangesAfterLoadCoordinator>,
+    ) -> tokio::task::JoinHandle<()> {
+        let refresh_task = Arc::new(
+            RefreshTask::builder(
+                Arc::clone(&self.runtime_status),
+                self.dataset_name.clone(),
+                Arc::clone(&self.federated),
+                self.federated_source.clone(),
+                Arc::clone(&self.accelerator),
+                self.io_runtime.clone(),
+            )
+            .with_disable_federation(self.disable_federation)
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_metrics(self.metrics.clone())
+            .build(),
+        );
+
+        let caching = self.caching.clone();
+        let refresh = Arc::clone(&self.refresh);
+        let initial_load_completed = Arc::clone(&self.initial_load_completed);
+
+        let notifier = self.on_complete_notification.clone();
+        tokio::spawn(async move {
+            if let Err(err) = refresh_task
+                .coordinate_changes_after_load(
+                    refresh,
+                    coordinator,
+                    caching,
+                    notifier,
+                    initial_load_completed,
+                )
+                .await
+            {
+                tracing::error!("start_changes_after_load_coordinator failed with error: {err}");
             }
         })
     }

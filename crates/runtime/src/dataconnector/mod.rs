@@ -17,8 +17,8 @@ limitations under the License.
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
-use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::{Dataset, acceleration};
 use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
@@ -50,8 +50,11 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
+use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::dataconnector::changes_after_load::ChangesAfterLoadCoordinator;
+use runtime_secrets::Secrets;
 use std::future::Future;
 
 pub mod listing;
@@ -95,6 +98,7 @@ pub mod odbc;
 #[cfg(feature = "oracle")]
 pub mod oracle;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+pub mod changes_after_load;
 pub mod deferred;
 pub mod glue;
 pub mod iceberg;
@@ -311,6 +315,15 @@ pub enum DataConnectorError {
     UseOfProtectedKeyword {
         dataconnector: String,
         keyword: String,
+    },
+
+    #[snafu(display(
+        "Failed to initialize changes_after_load coordinator for the {connector_component} ({dataconnector}). {source}"
+    ))]
+    UnableToInitializeChangesAfterLoadCoordinator {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -545,6 +558,23 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::OnStartup
+    }
+
+    fn supports_changes_after_load(&self) -> bool {
+        false
+    }
+
+    async fn changes_after_load_coordinator(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+        _accelerator: Arc<dyn TableProvider>,
+        _accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+        _acceleration_settings: &acceleration::Acceleration,
+        _secrets: Arc<RwLock<Secrets>>,
+        _ctx: Arc<SessionContext>,
+        _dataset: &Dataset,
+    ) -> Option<DataConnectorResult<Arc<dyn ChangesAfterLoadCoordinator>>> {
+        None
     }
 }
 

@@ -131,6 +131,9 @@ pub enum Error {
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
     UnableToCreateDataAccelerator { source: dataaccelerator::Error },
 
+    #[snafu(display("Unable to create changes_after_load coordinator: {source}"))]
+    UnableToCreateChangesAfterLoadCoordinator { source: DataConnectorError },
+
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
@@ -993,7 +996,7 @@ impl DataFusion {
                 Arc::clone(&refresh_schema),
                 constraints,
                 &acceleration_settings,
-                secrets,
+                secrets.clone(),
                 Some(dataset),
                 Arc::clone(&self.ctx),
             )
@@ -1067,7 +1070,7 @@ impl DataFusion {
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
             dataset.source().to_string(),
-            accelerated_table_provider,
+            Arc::clone(&accelerated_table_provider),
             refresh,
             self.io_runtime.clone(),
         );
@@ -1086,6 +1089,26 @@ impl DataFusion {
             }
             None => None,
         };
+
+        if refresh_mode == RefreshMode::ChangesAfterLoad {
+            let changes_after_load_coordinator = source
+                .changes_after_load_coordinator(
+                    Arc::clone(&source_table_provider),
+                    Arc::clone(&accelerated_table_provider),
+                    Arc::clone(&self.accelerator_engine_registry),
+                    &acceleration_settings,
+                    secrets,
+                    Arc::clone(&self.ctx),
+                    dataset,
+                )
+                .await;
+
+            if let Some(changes_after_load_coordinator) = changes_after_load_coordinator {
+                let coordinator = changes_after_load_coordinator
+                    .context(UnableToCreateChangesAfterLoadCoordinatorSnafu)?;
+                accelerated_table_builder.changes_after_load_coordinator(coordinator);
+            }
+        }
 
         let retention = Retention::builder()
             .time_column(dataset.time_column.clone())

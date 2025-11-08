@@ -20,6 +20,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::get_primary_keys_from_constraints;
+use crate::dataconnector::changes_after_load::ChangesAfterLoadCoordinator;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
@@ -157,6 +158,9 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
+
+    #[snafu(display("{source}"))]
+    ChangesAfterLoad { source: DataFusionError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -167,6 +171,11 @@ pub enum AcceleratedTableBuilderError {
         "A changes stream is required when `refresh_mode` is set to `changes`. For details, visit: https://spiceai.org/docs/features/cdc"
     ))]
     ExpectedChangesStream,
+
+    #[snafu(display(
+        "A changes_after_load coordinator is required when `refresh_mode` is set to `changes_after_load`. For details, visit: https://spiceai.org/docs/features/cdc"
+    ))]
+    ExpectedChangesAfterLoadCoordinator,
 
     #[snafu(display(
         "An append stream is required when `refresh_mode` is set to `append` without a `time_column`. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
@@ -255,6 +264,7 @@ pub struct Builder {
     caching: Option<Arc<Caching>>,
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
+    changes_after_load_coordinator: Option<Arc<dyn ChangesAfterLoadCoordinator>>,
     disable_federation: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
@@ -291,6 +301,7 @@ impl Builder {
             caching: None,
             changes_stream: None,
             append_stream: None,
+            changes_after_load_coordinator: None,
             checkpointer: None,
             synchronize_with: None,
             disable_federation: false,
@@ -368,6 +379,20 @@ impl Builder {
     pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
         assert!(self.refresh.mode == RefreshMode::Append);
         self.append_stream = Some(append_stream);
+        self
+    }
+
+    /// Set the `changes_after_load` coordinator for the accelerated table
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refresh mode isn't `RefreshMode::ChangesAfterLoad`.
+    pub fn changes_after_load_coordinator(
+        &mut self,
+        changes_after_load_coordinator: Arc<dyn ChangesAfterLoadCoordinator>,
+    ) -> &mut Self {
+        assert!(self.refresh.mode == RefreshMode::ChangesAfterLoad);
+        self.changes_after_load_coordinator = Some(changes_after_load_coordinator);
         self
     }
 
@@ -507,6 +532,18 @@ impl Builder {
                 };
                 (
                     refresh::AccelerationRefreshMode::Changes(changes_stream),
+                    None,
+                )
+            }
+            RefreshMode::ChangesAfterLoad => {
+                let Some(changes_after_load_coordinator) = self.changes_after_load_coordinator
+                else {
+                    return ExpectedChangesAfterLoadCoordinatorSnafu.fail();
+                };
+                (
+                    refresh::AccelerationRefreshMode::ChangesAfterLoad(
+                        changes_after_load_coordinator,
+                    ),
                     None,
                 )
             }
