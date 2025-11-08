@@ -309,6 +309,7 @@ mod tests {
             records: Arc::new(vec![record_batch.clone()]),
             schema: Arc::new(record_batch.schema().as_ref().to_owned()),
             input_tables: Arc::new(input_tables),
+            cached_at: std::time::SystemTime::now(),
         }
     }
 

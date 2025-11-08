@@ -27,20 +27,24 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    physical_expr::EquivalenceProperties,
     scalar::ScalarValue,
 };
-use futures::Stream;
 use reqwest::{Client, header::CACHE_CONTROL};
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc, time::{Duration, SystemTime}};
-use tokio::sync::RwLock;
 use std::collections::HashMap;
+use std::{
+    any::Any,
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::sync::RwLock;
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -76,14 +80,17 @@ struct CachedResponse {
 
 impl CachedResponse {
     fn is_fresh(&self) -> bool {
-        self.cached_at.elapsed().ok().map_or(false, |elapsed| elapsed < self.max_age)
+        self.cached_at
+            .elapsed()
+            .ok()
+            .is_some_and(|elapsed| elapsed < self.max_age)
     }
 
     fn is_stale_but_revalidatable(&self) -> bool {
-        if let Some(stale_duration) = self.stale_while_revalidate {
-            if let Ok(elapsed) = self.cached_at.elapsed() {
-                return elapsed >= self.max_age && elapsed < self.max_age + stale_duration;
-            }
+        if let Some(stale_duration) = self.stale_while_revalidate
+            && let Ok(elapsed) = self.cached_at.elapsed()
+        {
+            return elapsed >= self.max_age && elapsed < self.max_age + stale_duration;
         }
         false
     }
@@ -112,7 +119,13 @@ impl std::fmt::Debug for HttpTableProvider {
 }
 
 impl HttpTableProvider {
-    pub fn new(base_url: Url, client: Client, file_format: String, acceleration_enabled: bool) -> Self {
+    #[must_use]
+    pub fn new(
+        base_url: Url,
+        client: Client,
+        file_format: String,
+        acceleration_enabled: bool,
+    ) -> Self {
         Self {
             base_url,
             client,
@@ -135,31 +148,46 @@ impl HttpTableProvider {
     }
 
     /// Extract path and query from filters
-    fn extract_path_and_query(filters: &[Expr]) -> (Option<String>, Option<String>) {
-        let mut path = None;
-        let mut query = None;
-
-        for filter in filters {
-            if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter {
-                if *op == Operator::Eq {
-                    if let Expr::Column(col) = left.as_ref() {
-                        if let Expr::Literal(ScalarValue::Utf8(Some(value))) = right.as_ref() {
-                            match col.name.as_str() {
-                                "path" => path = Some(value.clone()),
-                                "query" => query = Some(value.clone()),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        (path, query)
+    fn get_cache_key(path: &str, query: Option<&str>) -> String {
+        format!("{}?{}", path, query.unwrap_or(""))
     }
 
-    fn get_cache_key(&self, path: &str, query: Option<&str>) -> String {
-        format!("{}?{}", path, query.unwrap_or(""))
+    /// Validates the HTTP endpoint by attempting a request to a non-existent path.
+    /// This helps detect issues like DNS errors, connection problems, or invalid URLs
+    /// early in the initialization process.
+    pub async fn validate_endpoint(&self) -> Result<()> {
+        use rand::Rng;
+        use rand::distr::Alphanumeric;
+
+        // Generate a random path that should return 404
+        let random_suffix: String = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let test_path = format!("/__spice_health_check_{}", random_suffix);
+
+        let mut test_url = self.base_url.clone();
+        test_url.set_path(&test_path);
+
+        tracing::debug!("Validating HTTP endpoint: {}", self.base_url);
+
+        match self.client.get(test_url).send().await {
+            Ok(response) => {
+                let status = response.status();
+                tracing::debug!(
+                    "HTTP endpoint validation response: {} (status: {})",
+                    self.base_url,
+                    status
+                );
+                // Any response (including 404) means the endpoint is reachable
+                Ok(())
+            }
+            Err(e) => {
+                // Check the error type to provide more specific messages and just return the error
+                Err(Error::HttpRequest { source: e })
+            }
+        }
     }
 
     fn parse_cache_control(cache_control_header: Option<&str>) -> (Duration, Option<Duration>) {
@@ -173,10 +201,10 @@ impl HttpTableProvider {
                     if let Ok(seconds) = value.parse::<u64>() {
                         max_age = Duration::from_secs(seconds);
                     }
-                } else if let Some(value) = directive.strip_prefix("stale-while-revalidate=") {
-                    if let Ok(seconds) = value.parse::<u64>() {
-                        stale_while_revalidate = Some(Duration::from_secs(seconds));
-                    }
+                } else if let Some(value) = directive.strip_prefix("stale-while-revalidate=")
+                    && let Ok(seconds) = value.parse::<u64>()
+                {
+                    stale_while_revalidate = Some(Duration::from_secs(seconds));
                 }
             }
         }
@@ -186,7 +214,18 @@ impl HttpTableProvider {
 
     async fn fetch_and_cache(&self, path: &str, query: Option<&str>) -> Result<String> {
         let mut url = self.base_url.clone();
-        url.set_path(path);
+
+        // Append the path to the base URL's path
+        let base_path = self.base_url.path();
+        let full_path = if base_path == "/" || base_path.is_empty() {
+            path.to_string()
+        } else if path.starts_with('/') {
+            format!("{}{}", base_path.trim_end_matches('/'), path)
+        } else {
+            format!("{}/{}", base_path.trim_end_matches('/'), path)
+        };
+        url.set_path(&full_path);
+
         if let Some(q) = query {
             url.set_query(Some(q));
         }
@@ -200,10 +239,8 @@ impl HttpTableProvider {
             .await
             .context(HttpRequestSnafu)?;
 
-        if !response.status().is_success() {
-            return Err(Error::HttpRequest {
-                source: response.error_for_status().expect_err("expected error"),
-            });
+        if let Err(err) = response.error_for_status_ref() {
+            return Err(Error::HttpRequest { source: err });
         }
 
         // Parse Cache-Control header
@@ -218,7 +255,7 @@ impl HttpTableProvider {
 
         // Cache the response if max_age > 0
         if max_age.as_secs() > 0 {
-            let cache_key = self.get_cache_key(path, query);
+            let cache_key = Self::get_cache_key(path, query);
             let cached_response = CachedResponse {
                 content: content.clone(),
                 cached_at: SystemTime::now(),
@@ -234,7 +271,7 @@ impl HttpTableProvider {
     }
 
     async fn get_content(&self, path: &str, query: Option<&str>) -> Result<String> {
-        let cache_key = self.get_cache_key(path, query);
+        let cache_key = Self::get_cache_key(path, query);
 
         // Try to get from cache
         let cached = {
@@ -249,7 +286,10 @@ impl HttpTableProvider {
             }
 
             if cached_response.is_stale_but_revalidatable() && self.acceleration_enabled {
-                tracing::debug!("Returning stale content while revalidating for {}", cache_key);
+                tracing::debug!(
+                    "Returning stale content while revalidating for {}",
+                    cache_key
+                );
 
                 // Trigger background refresh
                 let provider = Self {
@@ -325,15 +365,26 @@ impl TableProvider for HttpTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (path, query) = Self::extract_path_and_query(filters);
+        tracing::debug!(
+            "HTTP scan called with {} filters: {:?}",
+            filters.len(),
+            filters
+        );
+
+        // Extract all (path, query) pairs from filters (supporting IN/OR)
+        let partitions = Self::extract_partitions(filters, &self.base_url);
+
+        tracing::debug!(
+            "Extracted {} partitions: {:?}",
+            partitions.len(),
+            partitions
+        );
 
         let projected_schema = project_schema(&self.schema, projection)?;
-
         Ok(Arc::new(HttpExec::new(
             projected_schema,
             Arc::new(self.clone()),
-            path,
-            query,
+            partitions,
         )))
     }
 }
@@ -342,62 +393,85 @@ impl TableProvider for HttpTableProvider {
 pub struct HttpExec {
     projected_schema: SchemaRef,
     provider: Arc<HttpTableProvider>,
-    path: Option<String>,
-    query: Option<String>,
+    partitions: Vec<(Option<String>, Option<String>)>,
     properties: PlanProperties,
 }
 
 impl HttpExec {
+    #[must_use]
     pub fn new(
         projected_schema: SchemaRef,
         provider: Arc<HttpTableProvider>,
-        path: Option<String>,
-        query: Option<String>,
+        partitions: Vec<(Option<String>, Option<String>)>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(partitions.len()),
             EmissionType::Final,
             Boundedness::Bounded,
         );
-
         Self {
             projected_schema,
             provider,
-            path,
-            query,
+            partitions,
             properties,
         }
     }
 
-    async fn fetch_and_create_batch(&self, provider: &HttpTableProvider) -> DataFusionResult<RecordBatch> {
-        let path = self.path.as_deref().unwrap_or("/");
-        let query = self.query.as_deref();
+    async fn fetch_and_create_batches(
+        &self,
+        provider: &HttpTableProvider,
+    ) -> DataFusionResult<Vec<RecordBatch>> {
+        let mut batches = Vec::with_capacity(self.partitions.len());
+        for (path, query) in &self.partitions {
+            // Use the filter path or empty string (base URL only)
+            let path_val = path.as_deref().unwrap_or("");
+            let query_val = query.as_deref();
 
-        let content = provider
-            .get_content(path, query)
-            .await
-            .map_err(DataFusionError::from)?;
+            tracing::debug!(
+                "HttpExec fetching partition: path={:?}, query={:?}",
+                path_val,
+                query_val
+            );
 
-        let columns = self
-            .projected_schema
-            .fields()
-            .iter()
-            .map(|field| match field.name().as_str() {
-                "path" => Ok(Arc::new(StringArray::from(vec![path])) as ArrayRef),
-                "query" => {
-                    Ok(Arc::new(StringArray::from(vec![query.unwrap_or("")])) as ArrayRef)
-                }
-                "content" => Ok(Arc::new(StringArray::from(vec![content.as_str()])) as ArrayRef),
-                _ => Err(DataFusionError::Execution(format!(
-                    "Unsupported field name: {}",
-                    field.name()
-                ))),
-            })
-            .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+            let content = provider
+                .get_content(path_val, query_val)
+                .await
+                .map_err(DataFusionError::from)?;
 
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-            .map_err(DataFusionError::from)
+            // The path and query values in the batch MUST match the filter values exactly
+            // so that DataFusion's FilterExec will keep these rows
+            let path_for_batch = path.as_deref().unwrap_or("");
+            let query_for_batch = query.as_deref().unwrap_or("");
+
+            tracing::debug!(
+                "Creating batch with path={:?}, query={:?}, content_len={}",
+                path_for_batch,
+                query_for_batch,
+                content.len()
+            );
+
+            let columns = self
+                .projected_schema
+                .fields()
+                .iter()
+                .map(|field| match field.name().as_str() {
+                    "path" => Ok(Arc::new(StringArray::from(vec![path_for_batch])) as ArrayRef),
+                    "query" => Ok(Arc::new(StringArray::from(vec![query_for_batch])) as ArrayRef),
+                    "content" => {
+                        Ok(Arc::new(StringArray::from(vec![content.as_str()])) as ArrayRef)
+                    }
+                    _ => Err(DataFusionError::Execution(format!(
+                        "Unsupported field name: {}",
+                        field.name()
+                    ))),
+                })
+                .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+            let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+                .map_err(DataFusionError::from)?;
+            batches.push(batch);
+        }
+        Ok(batches)
     }
 }
 
@@ -411,9 +485,23 @@ impl DisplayAs for HttpExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "HttpExec: base_url={}, format={}",
+            "HttpExec: base_url={}, format={}, partitions=[",
             self.provider.base_url, self.provider.file_format
-        )
+        )?;
+
+        for (i, (path, query)) in self.partitions.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(
+                f,
+                "(path={:?}, query={:?})",
+                path.as_deref().unwrap_or(""),
+                query.as_deref().unwrap_or("")
+            )?;
+        }
+
+        write!(f, "]")
     }
 }
 
@@ -443,17 +531,288 @@ impl ExecutionPlan for HttpExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        tracing::debug!(
+            "HttpExec::execute called for partition {}, total partitions: {}",
+            partition,
+            self.partitions.len()
+        );
+
         let exec = Arc::new(self.clone());
         let provider = Arc::clone(&self.provider);
-        let stream = futures::stream::once(async move {
-            exec.fetch_and_create_batch(&provider).await
-        });
-
-        let stream_adapter = RecordBatchStreamAdapter::new(self.projected_schema.clone(), stream);
-
+        let schema = Arc::clone(&self.projected_schema);
+        let stream = async_stream::try_stream! {
+            tracing::debug!("Starting to fetch batches for {} partitions", exec.partitions.len());
+            let batches = exec.fetch_and_create_batches(&provider).await?;
+            tracing::debug!("Fetched {} batches", batches.len());
+            for (i, batch) in batches.into_iter().enumerate() {
+                tracing::debug!("Yielding batch {}: {} rows", i, batch.num_rows());
+                yield batch;
+            }
+        };
+        let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
         Ok(Box::pin(stream_adapter))
+    }
+}
+
+impl HttpTableProvider {
+    /// Extract all (path, query) pairs from filters, supporting = and IN-list
+    fn extract_partitions(
+        filters: &[Expr],
+        _base_url: &url::Url,
+    ) -> Vec<(Option<String>, Option<String>)> {
+        // Extract path and query values from filters
+        let mut paths: Vec<String> = vec![];
+        let mut queries: Vec<Option<String>> = vec![];
+        let mut has_path_filter = false;
+        let mut has_query_filter = false;
+
+        for filter in filters {
+            if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter
+                && *op == Operator::Eq
+                && let Expr::Column(col) = left.as_ref()
+                && let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = right.as_ref()
+            {
+                match col.name.as_str() {
+                    "path" => {
+                        paths.push(value.clone());
+                        has_path_filter = true;
+                    }
+                    "query" => {
+                        queries.push(Some(value.clone()));
+                        has_query_filter = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // If no path filter, use empty path (will use base URL's path as-is)
+        if !has_path_filter {
+            paths.push(String::new());
+        }
+
+        // If no query filter, use None (no query string)
+        if !has_query_filter {
+            queries.push(None);
+        }
+
+        // Cross product of paths and queries to create all partition combinations
+        let mut partitions = vec![];
+        for p in &paths {
+            for q in &queries {
+                partitions.push((if p.is_empty() { None } else { Some(p.clone()) }, q.clone()));
+            }
+        }
+
+        partitions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use datafusion::scalar::ScalarValue;
+    use url::Url;
+
+    #[test]
+    fn test_extract_partitions_with_path_and_query_filters() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+
+        // Create filters: path = '/singlesearch/shows' AND query = 'q=South%20Park'
+        let filters = vec![
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/singlesearch/shows".to_string())),
+                    None,
+                )),
+            }),
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("query"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("q=South%20Park".to_string())),
+                    None,
+                )),
+            }),
+        ];
+
+        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0],
+            (
+                Some("/singlesearch/shows".to_string()),
+                Some("q=South%20Park".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_extract_partitions_with_only_path_filter() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/data".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (Some("/api/data".to_string()), None));
+    }
+
+    #[test]
+    fn test_extract_partitions_with_no_filters() {
+        let base_url = Url::parse("https://api.example.com/default/path").expect("valid URL");
+
+        let filters = vec![];
+
+        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (None, None));
+    }
+
+    #[test]
+    fn test_extract_partitions_multiple_paths() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+
+        let filters = vec![
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/path1".to_string())),
+                    None,
+                )),
+            }),
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(Column::from_name("path"))),
+                op: Operator::Eq,
+                right: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("/path2".to_string())),
+                    None,
+                )),
+            }),
+        ];
+
+        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+
+        assert_eq!(partitions.len(), 2);
+        assert!(partitions.contains(&(Some("/path1".to_string()), None)));
+        assert!(partitions.contains(&(Some("/path2".to_string()), None)));
+    }
+
+    #[test]
+    fn test_url_construction_with_base_path() {
+        // Test that path from filter is appended to base URL path
+        let base_url = Url::parse("https://api.example.com/v1").expect("valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+
+        // Simulate what fetch_and_cache does
+        let mut url = provider.base_url.clone();
+        let filter_path = "/users";
+
+        let base_path = provider.base_url.path();
+        let full_path = if base_path == "/" || base_path.is_empty() {
+            filter_path.to_string()
+        } else if filter_path.starts_with('/') {
+            format!("{}{}", base_path.trim_end_matches('/'), filter_path)
+        } else {
+            format!("{}/{}", base_path.trim_end_matches('/'), filter_path)
+        };
+        url.set_path(&full_path);
+
+        assert_eq!(url.path(), "/v1/users");
+        assert_eq!(url.as_str(), "https://api.example.com/v1/users");
+    }
+
+    #[test]
+    fn test_url_construction_without_base_path() {
+        let base_url = Url::parse("https://api.example.com/").expect("valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+
+        let mut url = provider.base_url.clone();
+        let filter_path = "/singlesearch/shows";
+
+        let base_path = provider.base_url.path();
+        let full_path = if base_path == "/" || base_path.is_empty() {
+            filter_path.to_string()
+        } else if filter_path.starts_with('/') {
+            format!("{}{}", base_path.trim_end_matches('/'), filter_path)
+        } else {
+            format!("{}/{}", base_path.trim_end_matches('/'), filter_path)
+        };
+        url.set_path(&full_path);
+
+        assert_eq!(url.path(), "/singlesearch/shows");
+        assert_eq!(url.as_str(), "https://api.example.com/singlesearch/shows");
+    }
+
+    #[test]
+    fn test_url_construction_with_query() {
+        let base_url = Url::parse("https://api.example.com/").expect("valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+
+        let mut url = provider.base_url.clone();
+        let filter_path = "/singlesearch/shows";
+        let filter_query = "q=South%20Park";
+
+        let base_path = provider.base_url.path();
+        let full_path = if base_path == "/" || base_path.is_empty() {
+            filter_path.to_string()
+        } else if filter_path.starts_with('/') {
+            format!("{}{}", base_path.trim_end_matches('/'), filter_path)
+        } else {
+            format!("{}/{}", base_path.trim_end_matches('/'), filter_path)
+        };
+        url.set_path(&full_path);
+        url.set_query(Some(filter_query));
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/singlesearch/shows?q=South%20Park"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_generation() {
+        let key1 = HttpTableProvider::get_cache_key("/path", Some("query"));
+        let key2 = HttpTableProvider::get_cache_key("/path", None);
+        let key3 = HttpTableProvider::get_cache_key("/other", Some("query"));
+
+        assert_eq!(key1, "/path?query");
+        assert_eq!(key2, "/path?");
+        assert_eq!(key3, "/other?query");
+        assert_ne!(key1, key2);
+        assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn test_base_table_schema() {
+        let schema = HttpTableProvider::base_table_schema();
+
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "path");
+        assert_eq!(schema.field(1).name(), "query");
+        assert_eq!(schema.field(2).name(), "content");
+        assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
+        assert!(!schema.field(0).is_nullable()); // path is not nullable
+        assert!(schema.field(1).is_nullable()); // query is nullable
+        assert!(!schema.field(2).is_nullable()); // content is not nullable
     }
 }

@@ -35,6 +35,19 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use reqwest::Client;
 use std::time::Duration;
+
+#[derive(Debug)]
+pub struct Https {
+    params: Parameters,
+    tokio_io_runtime: Handle,
+}
+
+impl std::fmt::Display for Https {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "https")
+    }
+}
+
 #[async_trait]
 impl DataConnector for Https {
     fn as_any(&self) -> &dyn Any {
@@ -90,26 +103,49 @@ impl DataConnector for Https {
             let file_format = format.unwrap_or_else(|| "json".to_string());
             let acceleration_enabled = dataset.is_accelerated();
 
-            Ok(Arc::new(data_components::http::provider::HttpTableProvider::new(
+            let provider = Arc::new(data_components::http::provider::HttpTableProvider::new(
                 base_url,
                 client,
                 file_format,
                 acceleration_enabled,
-            )))
+            ));
+
+            // Validate the HTTP endpoint (non-blocking, log warnings only)
+            let provider_clone = Arc::clone(&provider);
+            let dataset_name = dataset.name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = provider_clone.validate_endpoint().await {
+                    tracing::warn!(
+                        "HTTP endpoint validation failed for dataset '{}': {}. \
+                        The endpoint may be temporarily unavailable or misconfigured. \
+                        Queries will continue but may fail if the endpoint is not accessible.",
+                        dataset_name,
+                        e
+                    );
+                }
+            });
+
+            Ok(provider)
         } else {
-            // Fall back to listing table for other formats
-            ListingTableConnector::read_provider(self, dataset).await
+            // For other formats, use the listing table connector
+            // Create a wrapper that implements ListingTableConnector
+            let wrapper = HttpsListingWrapper {
+                params: self.params.clone(),
+                tokio_io_runtime: self.tokio_io_runtime.clone(),
+            };
+            <HttpsListingWrapper as DataConnector>::read_provider(&wrapper, dataset).await
         }
     }
 }
 
-#[derive(Debug)]
-pub struct Https {
+// Wrapper struct to use the ListingTableConnector implementation
+#[derive(Debug, Clone)]
+struct HttpsListingWrapper {
     params: Parameters,
     tokio_io_runtime: Handle,
 }
 
-impl std::fmt::Display for Https {
+impl std::fmt::Display for HttpsListingWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "https")
     }
@@ -169,7 +205,7 @@ impl DataConnectorFactory for HttpsFactory {
     }
 }
 
-impl ListingTableConnector for Https {
+impl ListingTableConnector for HttpsListingWrapper {
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use arrow::array::RecordBatch;
 use datafusion::{
@@ -59,6 +59,7 @@ pub fn to_cached_record_batch_stream(
                 records: Arc::new(records),
                 schema: schema_copy,
                 input_tables,
+                cached_at: SystemTime::now(),
             };
 
             if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
