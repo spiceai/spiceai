@@ -229,7 +229,8 @@ async fn try_vector_table(
         "aws_secret_access_key",
         "aws_session_token",
         &params,
-    )?;
+    )
+    .await?;
 
     if let Some(dur) = client_timeout {
         config_bldr =

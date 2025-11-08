@@ -104,7 +104,7 @@ impl Read for DeltaTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
         let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.clone(), self.io_runtime.clone()).boxed()?;
+            DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime).boxed()?;
         Ok(Arc::new(delta))
     }
 }
@@ -121,7 +121,7 @@ impl DeltaTable {
     pub fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
-        io_runtime: Handle,
+        io_runtime: &Handle,
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
@@ -139,29 +139,41 @@ impl DeltaTable {
             }
         }
 
-        let mut load_credentials_from_environment = true;
-        if let (Some(_), Some(_)) = (
-            storage_options.get("aws_access_key_id"),
-            storage_options.get("aws_secret_access_key"),
-        ) {
-            load_credentials_from_environment = false;
-        }
+        let table_object_store = if table_url.scheme() == "s3" {
+            let region = storage_options.get("aws_region").map(ToString::to_string);
 
-        let table_object_store = match (
-            load_credentials_from_environment,
-            aws_sdk_credential_bridge::get_sdk_config(),
-        ) {
-            (true, Some(sdk_config)) => {
-                let region = storage_options.get("aws_region").map(ToString::to_string);
-                aws_sdk_credential_bridge::from_s3_url_and_config(
+            if let Some(sdk_config) = aws_sdk_credential_bridge::should_use_sdk_credentials(
+                &storage_options,
+                "aws_access_key_id",
+                "aws_secret_access_key",
+            ) {
+                // Use AWS SDK credential bridge for IAM role or environment-based authentication.
+                // This allows dynamic credential fetching from IAM roles, environment variables,
+                // or other AWS credential sources at query time.
+                tracing::trace!("Using AWS SDK credentials provider for Delta Lake table");
+                match aws_sdk_credential_bridge::from_s3_url_and_config(
                     &table_url,
                     region,
                     sdk_config.as_ref(),
-                    io_runtime,
-                )
-                .ok()
+                    io_runtime.clone(),
+                ) {
+                    Ok(object_store) => Some(object_store),
+                    Err(err) => {
+                        tracing::debug!(
+                            "Unable to create S3 object store with AWS SDK credentials for Delta Lake table at {}: {err}",
+                            table_url
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::trace!(
+                    "Using delta_kernel's built-in AWS credential resolution for Delta Lake table"
+                );
+                None
             }
-            _ => None,
+        } else {
+            None
         };
 
         let engine = match table_object_store {

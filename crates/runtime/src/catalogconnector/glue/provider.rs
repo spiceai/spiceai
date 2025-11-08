@@ -126,6 +126,7 @@ impl GlueCatalogProvider {
             "session_token",
             &parameters.parameters,
         )
+        .await
         .context(ConfigurationLoadingFailedSnafu)?
         .load()
         .await;
