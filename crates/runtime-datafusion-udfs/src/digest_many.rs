@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef, StringBuilder};
 use arrow_schema::{DataType, Field, FieldRef};
 use datafusion::config::ConfigOptions;
 use datafusion::functions::crypto;
@@ -143,7 +143,8 @@ impl ScalarUDFImpl for DigestMany {
             ]));
         }
 
-        // We have arrays - need to process row by row
+        // Arrays present - use optimized batch processing
+
         let num_rows = args
             .iter()
             .find_map(|arg| match arg {
@@ -152,39 +153,45 @@ impl ScalarUDFImpl for DigestMany {
             })
             .unwrap_or_default();
 
-        let mut result_hashes = Vec::with_capacity(num_rows);
+        // Pre-allocate concatenated strings buffer with estimated capacity
+        let estimated_row_size = args.len() * 16;
+        let mut concatenated_builder =
+            StringBuilder::with_capacity(num_rows, num_rows * estimated_row_size);
 
+        // Reusable buffer for row concatenation (avoids per-row allocation)
+        let mut row_buffer = String::with_capacity(estimated_row_size);
+
+        // Build concatenated strings for all rows
+        // This batches the string building, then delegates to hash function for vectorized hashing
         for row_idx in 0..num_rows {
-            let mut hash_me = String::with_capacity(32 * args.len());
+            row_buffer.clear(); // Keeps allocated capacity (allocation minimization)
 
             for arg in &args {
                 match arg {
                     ColumnarValue::Array(array) => {
-                        // Get the scalar value at this row index
                         let scalar = ScalarValue::try_from_array(array, row_idx)?;
-                        write!(&mut hash_me, "{scalar}")?;
+                        write!(&mut row_buffer, "{scalar}")?;
                     }
                     ColumnarValue::Scalar(scalar) => {
-                        write!(&mut hash_me, "{scalar}")?;
+                        write!(&mut row_buffer, "{scalar}")?;
                     }
                 }
             }
 
-            // Hash this row's concatenated string
-            let row_hash = hash_fn.invoke_with_args(Self::make_scalar_function_args(vec![
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(hash_me))),
-            ]))?;
-
-            // Extract the hash value
-            if let ColumnarValue::Scalar(hash_scalar) = row_hash {
-                result_hashes.push(hash_scalar);
-            } else {
-                return exec_err!("{DIGEST_UDF_NAME}: expected scalar hash result");
-            }
+            concatenated_builder.append_value(&row_buffer);
         }
-        Ok(ColumnarValue::Array(ScalarValue::iter_to_array(
-            result_hashes,
-        )?))
+
+        let concatenated_array = Arc::new(concatenated_builder.finish()) as ArrayRef;
+
+        // Hash entire array in one call - hash function can leverage SIMD internally
+        // This is more efficient than N separate hash calls for N rows
+        hash_fn.invoke_with_args(ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(concatenated_array)],
+            number_rows: num_rows,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("hash", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
     }
 
     fn documentation(&self) -> Option<&Documentation> {
