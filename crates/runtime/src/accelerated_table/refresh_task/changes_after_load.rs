@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{RefreshTask, inner_err_from_retry_ref};
+use super::{RefreshTask, include_source_to_table_name, inner_err_from_retry_ref};
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::{
     ChangesAfterLoadBootstrappingSnafu, ChangesAfterLoadCheckDatasetSnafu, Error,
@@ -172,15 +172,12 @@ impl RefreshTask {
         )
         .await
         .inspect_err(|e| {
-            // tracing::warn!(
-            //         "Failed to load data for {} {}: {}",
-            //         self.component_type(),
-            //         include_source_to_table_name(
-            //             &self.dataset_name,
-            //             self.federated_source.as_deref()
-            //         ),
-            //         inner_err_from_retry_ref(e)
-            //     );
+            tracing::warn!(
+                "Failed to write data for {} {}: {}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+                inner_err_from_retry_ref(e)
+            );
         })?;
 
         if let Some(ready_sender) = ready_sender.as_ref() {
