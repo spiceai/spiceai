@@ -17,7 +17,7 @@ limitations under the License.
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
 use rmcp::{
-    RoleClient, ServiceError, ServiceExt,
+    Error as McpError, RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequestParam, CallToolResult, ClientCapabilities, ClientInfo, ClientRequest,
         Extensions, Implementation, InitializeRequestParam, ListToolsResult, PaginatedRequestParam,
@@ -37,9 +37,17 @@ use tokio::{
 
 use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 
-use super::{MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
+use super::{Error, MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
+
+/// Check if a hostname is localhost
+fn is_localhost(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    )
+}
 
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
@@ -93,20 +101,91 @@ impl McpToolCatalog {
 
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
         match cfg {
-            MCPConfig::Stdio { command, args, env } => Ok(McpClient::Stdio(
-                serve_client(
-                    (),
-                    TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
-                        c.envs(env).args(args);
-                    }))
+            MCPConfig::Stdio { command, args, env } => {
+                // Security: Validate command path to prevent command injection
+                // Only allow absolute paths or commands without path separators
+                if command.contains("..") || (command.contains('/') && !command.starts_with('/')) {
+                    return Err(Error::CouldNotConstructTool {
+                        name: "mcp_stdio".to_string(),
+                        e: format!(
+                            "Invalid command path '{}'. Only absolute paths or simple commands allowed",
+                            command
+                        ),
+                    });
+                }
+
+                // Security: Limit number of arguments to prevent resource exhaustion
+                const MAX_ARGS: usize = 100;
+                if args.len() > MAX_ARGS {
+                    return Err(Error::CouldNotConstructTool {
+                        name: "mcp_stdio".to_string(),
+                        e: format!(
+                            "Too many arguments ({}). Maximum allowed: {}",
+                            args.len(),
+                            MAX_ARGS
+                        ),
+                    });
+                }
+
+                // Security: Validate argument lengths to prevent buffer overflow attacks
+                const MAX_ARG_LENGTH: usize = 4096;
+                for (i, arg) in args.iter().enumerate() {
+                    if arg.len() > MAX_ARG_LENGTH {
+                        return Err(Error::CouldNotConstructTool {
+                            name: "mcp_stdio".to_string(),
+                            e: format!(
+                                "Argument {} too long ({} bytes). Maximum allowed: {} bytes",
+                                i,
+                                arg.len(),
+                                MAX_ARG_LENGTH
+                            ),
+                        });
+                    }
+                }
+
+                tracing::info!(
+                    "Starting MCP stdio client: command={}, args_count={}, env_count={}",
+                    command,
+                    args.len(),
+                    env.len()
+                );
+
+                Ok(McpClient::Stdio(
+                    serve_client(
+                        (),
+                        TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
+                            c.envs(env).args(args);
+                        }))
+                        .boxed()
+                        .context(UnderlyingTransportSnafu)?,
+                    )
+                    .await
                     .boxed()
                     .context(UnderlyingTransportSnafu)?,
-                )
-                .await
-                .boxed()
-                .context(UnderlyingTransportSnafu)?,
-            )),
+                ))
+            }
             MCPConfig::Https { url } => {
+                // Security: Validate URL scheme (only https allowed, http for localhost testing)
+                if url.scheme() != "https" && url.scheme() != "http" {
+                    return Err(Error::CouldNotConstructTool {
+                        name: "mcp_https".to_string(),
+                        e: format!(
+                            "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
+                            url.scheme()
+                        ),
+                    });
+                }
+
+                // Security: Warn if using http (unencrypted) for non-localhost
+                if url.scheme() == "http" && !is_localhost(url.host_str().unwrap_or_default()) {
+                    tracing::warn!(
+                        "MCP HTTPS client using unencrypted HTTP connection to non-localhost host: {}. This is insecure.",
+                        url
+                    );
+                }
+
+                tracing::info!("Starting MCP HTTPS client: url={}", url);
+
                 let transport = SseClientTransport::start(url.to_string())
                     .await
                     .boxed()
@@ -135,7 +214,21 @@ impl McpToolCatalog {
     async fn list_tools(&self) -> std::result::Result<Vec<rmcp::model::Tool>, ServiceError> {
         let mut cursor: Option<String> = None;
         let mut tools: Vec<rmcp::model::Tool> = vec![];
+
+        // Security: Limit pagination iterations to prevent infinite loops
+        const MAX_PAGINATION_ITERATIONS: usize = 100;
+        let mut iterations = 0;
+
         loop {
+            iterations += 1;
+            if iterations > MAX_PAGINATION_ITERATIONS {
+                tracing::warn!(
+                    "MCP tool listing exceeded maximum pagination iterations ({}), stopping iteration",
+                    MAX_PAGINATION_ITERATIONS
+                );
+                break; // Stop paginating instead of erroring
+            }
+
             let response = self
                 .client
                 .read()
@@ -144,6 +237,20 @@ impl McpToolCatalog {
                     cursor: cursor.clone(),
                 }))
                 .await?;
+
+            // Security: Validate total tools count to prevent memory exhaustion
+            const MAX_TOTAL_TOOLS: usize = 10000;
+            if tools.len() + response.tools.len() > MAX_TOTAL_TOOLS {
+                tracing::warn!(
+                    "MCP tool listing exceeded maximum tools count ({}), limiting results",
+                    MAX_TOTAL_TOOLS
+                );
+                // Only add tools up to the limit
+                let remaining = MAX_TOTAL_TOOLS - tools.len();
+                tools.extend(response.tools.into_iter().take(remaining));
+                break; // Stop paginating
+            }
+
             tools.extend(response.tools);
             cursor = response.next_cursor;
             if cursor.is_none() {
@@ -157,8 +264,33 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
+        // Security: Validate tool name length
+        const MAX_TOOL_NAME_LENGTH: usize = 256;
+        if name.len() > MAX_TOOL_NAME_LENGTH {
+            tracing::warn!(
+                "Tool name too long ({} chars), maximum is {}. Returning None.",
+                name.len(),
+                MAX_TOOL_NAME_LENGTH
+            );
+            return Ok(None); // Tool name too long, treat as not found
+        }
+
         let mut cursor: Option<String> = None;
+
+        // Security: Limit pagination iterations
+        const MAX_PAGINATION_ITERATIONS: usize = 100;
+        let mut iterations = 0;
+
         loop {
+            iterations += 1;
+            if iterations > MAX_PAGINATION_ITERATIONS {
+                tracing::warn!(
+                    "MCP get_tool pagination exceeded maximum iterations ({}), stopping search",
+                    MAX_PAGINATION_ITERATIONS
+                );
+                break; // Stop searching, return None
+            }
+
             let response = self
                 .client
                 .read()

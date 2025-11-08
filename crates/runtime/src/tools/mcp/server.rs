@@ -27,6 +27,19 @@ use rmcp::{
 };
 use serde_json::{Map, Value, json};
 use std::{borrow::Cow, future::Future, ops::Deref, sync::Arc};
+use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
+
+/// Calculate the maximum depth of a JSON object to prevent stack overflow attacks.
+///
+/// This is a specialized version for `Map<String, Value>` that delegates to the
+/// shared `get_json_depth` utility after wrapping in a Value::Object.
+fn get_json_depth_from_object(obj: &Map<String, Value>) -> usize {
+    if obj.is_empty() {
+        1
+    } else {
+        get_json_depth(&Value::Object(obj.clone()))
+    }
+}
 
 #[derive(Clone)]
 pub struct RuntimeServer(Arc<Runtime>);
@@ -67,6 +80,30 @@ impl ServerHandler for RuntimeServer {
             arguments,
         } = request;
         Box::pin(async move {
+            // Security: Validate tool name to prevent injection attacks
+            const MAX_TOOL_NAME_LENGTH: usize = 256;
+            if tool_name.len() > MAX_TOOL_NAME_LENGTH {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Tool name too long ({} chars). Maximum: {}",
+                        tool_name.len(),
+                        MAX_TOOL_NAME_LENGTH
+                    ),
+                    None,
+                ));
+            }
+
+            // Security: Validate tool name contains only safe characters
+            if !tool_name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                return Err(McpError::invalid_params(
+                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, and dot allowed".to_string(),
+                    None,
+                ));
+            }
+
             let Some(tool) = self.get_tool(tool_name.to_string().as_str()).await else {
                 return Err(McpError::method_not_found::<CallToolRequestMethod>());
             };
@@ -74,6 +111,21 @@ impl ServerHandler for RuntimeServer {
             // If possible, we pass the call through to the MCP server.
             if let Some(mcp_proxy) = tool.as_mcp_proxy().await {
                 tracing::debug!("{tool_name} uses MCP. Will call directly");
+
+                // Security: Validate arguments JSON depth before proxying
+                if let Some(ref args) = arguments {
+                    let depth = get_json_depth_from_object(args);
+                    if depth > MAX_SAFE_JSON_DEPTH {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "Arguments JSON too deeply nested (depth: {}). Maximum: {}",
+                                depth, MAX_SAFE_JSON_DEPTH
+                            ),
+                            None,
+                        ));
+                    }
+                }
+
                 return mcp_proxy
                     .call_tool(arguments)
                     .await
@@ -82,6 +134,19 @@ impl ServerHandler for RuntimeServer {
 
             let args = serde_json::to_string(&arguments)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+            // Security: Validate serialized argument size to prevent DoS
+            const MAX_ARGS_SIZE: usize = 1024 * 1024; // 1 MB
+            if args.len() > MAX_ARGS_SIZE {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Arguments too large ({} bytes). Maximum: {} bytes",
+                        args.len(),
+                        MAX_ARGS_SIZE
+                    ),
+                    None,
+                ));
+            }
 
             let result = tool
                 .call(args.as_str())

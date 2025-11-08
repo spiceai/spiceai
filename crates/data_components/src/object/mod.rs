@@ -45,7 +45,19 @@ impl ObjectStoreContext {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (prefix, filename_regex_opt) = parse_prefix_and_regex(url, extension)?;
         let filename_regex = filename_regex_opt
-            .map(|regex| Regex::new(&regex).boxed())
+            .map(|regex| {
+                // Prevent ReDoS attacks by limiting regex complexity
+                const MAX_REGEX_LENGTH: usize = 1000;
+                if regex.len() > MAX_REGEX_LENGTH {
+                    return Err(format!(
+                        "Regex pattern too long ({} chars). Maximum allowed: {}",
+                        regex.len(),
+                        MAX_REGEX_LENGTH
+                    )
+                    .into());
+                }
+                Regex::new(&regex).boxed()
+            })
             .transpose()?;
 
         Ok(Self {

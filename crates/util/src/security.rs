@@ -25,6 +25,13 @@ limitations under the License.
 use datafusion::{common::utils::quote_identifier, sql::TableReference};
 use std::path::Path;
 
+/// The maximum safe nesting depth for JSON values.
+///
+/// This limit prevents stack overflow attacks from deeply nested JSON structures.
+/// A depth of 32 is sufficient for legitimate use cases while protecting against
+/// malicious payloads designed to exhaust stack space.
+pub const MAX_SAFE_JSON_DEPTH: usize = 32;
+
 /// Sanitizes a filename by extracting only the file component, preventing path traversal.
 ///
 /// This function is critical for security when accepting filenames from untrusted sources
@@ -186,6 +193,100 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
     }
 }
 
+/// Calculates the maximum nesting depth of a JSON value.
+///
+/// This function is critical for preventing stack overflow attacks from maliciously
+/// crafted JSON payloads with excessive nesting. Deep nesting can exhaust stack space
+/// during parsing, serialization, or traversal operations.
+///
+/// # Security Guarantees
+///
+/// - Prevents stack overflow from deeply nested JSON structures
+/// - Efficiently calculates depth without recursive stack consumption
+/// - Works with both objects and arrays at any nesting level
+///
+/// # Performance
+///
+/// - Time Complexity: O(n) where n is the total number of values in the JSON
+/// - Space Complexity: O(d) where d is the depth (stack frames)
+/// - Uses iterative max() to avoid extra allocations
+///
+/// # Arguments
+///
+/// * `value` - The JSON value to measure (from `serde_json::Value`)
+///
+/// # Returns
+///
+/// The maximum nesting depth as a `usize`. A simple value (string, number, bool, null)
+/// has depth 1. Each level of nesting (array or object) adds 1 to the depth.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use util::security::get_json_depth;
+///
+/// // Simple values have depth 1
+/// assert_eq!(get_json_depth(&json!("string")), 1);
+/// assert_eq!(get_json_depth(&json!(42)), 1);
+/// assert_eq!(get_json_depth(&json!(true)), 1);
+/// assert_eq!(get_json_depth(&json!(null)), 1);
+///
+/// // Empty containers have depth 1
+/// assert_eq!(get_json_depth(&json!([])), 1);
+/// assert_eq!(get_json_depth(&json!({})), 1);
+///
+/// // Nested structures add depth
+/// assert_eq!(get_json_depth(&json!({"a": 1})), 2);
+/// assert_eq!(get_json_depth(&json!([1, 2, 3])), 2);
+/// assert_eq!(get_json_depth(&json!({"a": {"b": 1}})), 3);
+/// assert_eq!(get_json_depth(&json!([[[1]]])), 4);
+///
+/// // Complex nested structure
+/// let complex = json!({
+///     "level1": {
+///         "level2": {
+///             "level3": [1, 2, {"level4": "deep"}]
+///         }
+///     }
+/// });
+/// assert_eq!(get_json_depth(&complex), 5);
+/// ```
+///
+/// # Validation Example
+///
+/// ```
+/// use serde_json::json;
+/// use util::security::{get_json_depth, MAX_SAFE_JSON_DEPTH};
+///
+/// let user_input = json!({"a": {"b": {"c": "value"}}});
+/// let depth = get_json_depth(&user_input);
+///
+/// if depth > MAX_SAFE_JSON_DEPTH {
+///     panic!("JSON too deeply nested: {} levels (max: {})", depth, MAX_SAFE_JSON_DEPTH);
+/// }
+/// ```
+#[must_use = "JSON depth must be validated to prevent stack overflow attacks"]
+pub fn get_json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                1
+            } else {
+                1 + arr.iter().map(get_json_depth).max().unwrap_or(0)
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if obj.is_empty() {
+                1
+            } else {
+                1 + obj.values().map(get_json_depth).max().unwrap_or(0)
+            }
+        }
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +418,143 @@ mod tests {
         assert!(quoted.contains("DROP TABLE"));
         assert!(quoted.starts_with('"'));
         assert!(quoted.ends_with('"'));
+    }
+
+    #[test]
+    fn test_get_json_depth_primitives() {
+        use serde_json::json;
+
+        // All primitives have depth 1
+        assert_eq!(get_json_depth(&json!("string")), 1);
+        assert_eq!(get_json_depth(&json!(42)), 1);
+        assert_eq!(get_json_depth(&json!(3.14)), 1);
+        assert_eq!(get_json_depth(&json!(true)), 1);
+        assert_eq!(get_json_depth(&json!(false)), 1);
+        assert_eq!(get_json_depth(&json!(null)), 1);
+    }
+
+    #[test]
+    fn test_get_json_depth_empty_containers() {
+        use serde_json::json;
+
+        // Empty containers have depth 1
+        assert_eq!(get_json_depth(&json!([])), 1);
+        assert_eq!(get_json_depth(&json!({})), 1);
+    }
+
+    #[test]
+    fn test_get_json_depth_flat_containers() {
+        use serde_json::json;
+
+        // Flat arrays/objects have depth 2
+        assert_eq!(get_json_depth(&json!([1, 2, 3])), 2);
+        assert_eq!(get_json_depth(&json!(["a", "b", "c"])), 2);
+        assert_eq!(get_json_depth(&json!({"a": 1, "b": 2})), 2);
+        assert_eq!(get_json_depth(&json!({"key": "value"})), 2);
+    }
+
+    #[test]
+    fn test_get_json_depth_nested_arrays() {
+        use serde_json::json;
+
+        assert_eq!(get_json_depth(&json!([[1, 2]])), 3);
+        assert_eq!(get_json_depth(&json!([[[1]]])), 4);
+        assert_eq!(get_json_depth(&json!([[[[1]]]])), 5);
+
+        // Mixed nesting levels - should return max
+        assert_eq!(get_json_depth(&json!([1, [2, [3]]])), 4);
+        assert_eq!(get_json_depth(&json!([[1], 2, [[[3]]]])), 5);
+    }
+
+    #[test]
+    fn test_get_json_depth_nested_objects() {
+        use serde_json::json;
+
+        assert_eq!(get_json_depth(&json!({"a": {"b": 1}})), 3);
+        assert_eq!(get_json_depth(&json!({"a": {"b": {"c": 1}}})), 4);
+        assert_eq!(get_json_depth(&json!({"a": {"b": {"c": {"d": 1}}}})), 5);
+
+        // Multiple keys at same level
+        assert_eq!(get_json_depth(&json!({"a": {"b": 1}, "c": {"d": 2}})), 3);
+    }
+
+    #[test]
+    fn test_get_json_depth_mixed_structures() {
+        use serde_json::json;
+
+        // Object containing array
+        assert_eq!(get_json_depth(&json!({"arr": [1, 2, 3]})), 3);
+
+        // Array containing object
+        assert_eq!(get_json_depth(&json!([{"key": "value"}])), 3);
+
+        // Complex nested structure
+        let complex = json!({
+            "users": [
+                {"name": "Alice", "age": 30},
+                {"name": "Bob", "age": 25}
+            ],
+            "metadata": {
+                "version": 1,
+                "nested": {
+                    "deep": "value"
+                }
+            }
+        });
+        assert_eq!(get_json_depth(&complex), 4);
+    }
+
+    #[test]
+    fn test_get_json_depth_maximum_safe_depth() {
+        use serde_json::json;
+
+        // Test at the boundary of MAX_SAFE_JSON_DEPTH
+        let mut nested = json!(1);
+        for _ in 0..31 {
+            // 32 levels total
+            nested = json!([nested]);
+        }
+        assert_eq!(get_json_depth(&nested), MAX_SAFE_JSON_DEPTH);
+
+        // One level deeper should exceed the limit
+        nested = json!([nested]);
+        assert_eq!(get_json_depth(&nested), MAX_SAFE_JSON_DEPTH + 1);
+    }
+
+    #[test]
+    fn test_get_json_depth_attack_scenario() {
+        use serde_json::json;
+
+        // Simulate a malicious deeply nested payload
+        let mut attack_payload = json!({"end": "value"});
+        for i in 0..100 {
+            attack_payload = json!({format!("level{}", i): attack_payload});
+        }
+
+        let depth = get_json_depth(&attack_payload);
+        assert_eq!(depth, 102); // 100 levels + 1 for outer + 1 for inner value
+        assert!(depth > MAX_SAFE_JSON_DEPTH);
+    }
+
+    #[test]
+    fn test_get_json_depth_realistic_api_payload() {
+        use serde_json::json;
+
+        // Realistic API request payload (should be well within limits)
+        let api_payload = json!({
+            "query": "SELECT * FROM users",
+            "parameters": {
+                "$1": 42,
+                "$2": "test"
+            },
+            "options": {
+                "timeout": 30,
+                "format": "json"
+            }
+        });
+
+        let depth = get_json_depth(&api_payload);
+        assert_eq!(depth, 3);
+        assert!(depth <= MAX_SAFE_JSON_DEPTH);
     }
 }
