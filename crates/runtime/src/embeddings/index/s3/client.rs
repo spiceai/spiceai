@@ -64,25 +64,8 @@ impl S3VectorClient {
             ttl,
         }
     }
-
-    /// Performs a lightweight health check to verify S3 Vectors API connectivity.
-    /// Returns Ok(()) if the API is reachable, Err otherwise.
-    ///
-    /// This method makes a minimal API call (listing vector buckets with max_results=1)
-    /// to verify connectivity without incurring significant cost.
-    pub async fn health_check(&self) -> Result<(), String> {
-        let input = ListVectorBucketsInput::builder()
-            .max_results(1)
-            .build()
-            .map_err(|e| format!("Failed to build health check input: {e}"))?;
-
-        self.client
-            .list_vector_buckets(input)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("S3 Vectors API health check failed: {e}"))
-    }
 }
+
 #[async_trait]
 impl S3Vectors for S3VectorClient {
     async fn create_index(

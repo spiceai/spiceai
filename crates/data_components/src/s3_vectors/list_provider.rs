@@ -575,7 +575,7 @@ mod tests {
 
     use super::*;
 
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{logical_expr::col, prelude::SessionContext, scalar::ScalarValue};
     use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
