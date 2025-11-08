@@ -222,8 +222,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    telemetry.emit().await?;
-
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;
     print_batches(&baseline_records)?;
@@ -238,6 +236,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let attributes = vec![KeyValue::new("test", "load")];
     super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
         .await;
+
+    telemetry.emit().await?;
 
     spiced_instance.stop()?;
     let health_report = health_report?;
