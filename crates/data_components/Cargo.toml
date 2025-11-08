@@ -18,7 +18,6 @@ arrow-flight.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
@@ -38,7 +37,6 @@ datafusion-federation = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
-derive_builder = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -53,22 +51,20 @@ git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-http = { version = "1.3.1" }
+http.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
-itertools.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
 opendal = "0.54"
 oracle = { version = "0.6", optional = true }
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
-regex = "1.12.2"
+regex.workspace = true
 reqwest.workspace = true
-runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -91,7 +87,7 @@ tonic = { workspace = true }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash = { workspace = true, optional = true }
-url = "2.5.4"
+url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
 
@@ -99,11 +95,11 @@ uuid.workspace = true
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
-default = []
 bench = [] # Feature for benchmarking that exposes internal functions
 clickhouse = ["dep:clickhouse-rs"]
 databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
+default = []
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
     "dep:duckdb",
@@ -111,7 +107,7 @@ duckdb = [
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "dep:aws-smithy-async", "dep:derive_builder"]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-smithy-async"]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
@@ -149,15 +145,15 @@ chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.5.0"
 iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
-insta = { version = "1.43" }
+insta.workspace = true
 object_store = { workspace = true }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [[bench]]
-name = "arrow_write"
 harness = false
+name = "arrow_write"
 required-features = ["bench"]
 
 [[bench]]
-name = "object_filter"
 harness = false
+name = "object_filter"

@@ -21,6 +21,7 @@ mod args;
 mod commands;
 mod health;
 mod metrics;
+mod spiced_metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,

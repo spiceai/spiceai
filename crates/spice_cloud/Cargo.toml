@@ -11,8 +11,6 @@ version.workspace = true
 [dependencies]
 async-trait.workspace = true
 datafusion.workspace = true
-futures.workspace = true
-globset.workspace = true
 reqwest.workspace = true
 runtime = { path = "../runtime" }
 serde.workspace = true

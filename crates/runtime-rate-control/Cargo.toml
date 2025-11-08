@@ -14,4 +14,3 @@ governor = { workspace = true, features = ["std"] }
 rand.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["full"] }
-tracing.workspace = true

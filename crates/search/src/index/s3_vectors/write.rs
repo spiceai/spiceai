@@ -480,10 +480,9 @@ fn create_embedding_array(
 
     for embedding_opt in embedding_vectors {
         if let Some(embedding) = embedding_opt {
-            builder.values().append_values(
-                embedding,
-                &(0..embedding.len()).map(|_| true).collect::<Vec<_>>(),
-            );
+            // Optimized: append_slice automatically marks all values as valid
+            // without needing to allocate a separate validity vector
+            builder.values().append_slice(embedding);
             builder.append(true);
         } else {
             builder.values().append_nulls(dimension as usize);
@@ -551,9 +550,8 @@ mod tests {
         builder = builder.with_field(field);
         for embedding_opt in embeddings {
             if let Some(embedding) = embedding_opt {
-                builder
-                    .values()
-                    .append_values(&embedding, &(0..dim).map(|_| true).collect::<Vec<_>>());
+                // Optimized: append_slice is more efficient than append_values with manual validity
+                builder.values().append_slice(&embedding);
                 builder.append(true);
             } else {
                 builder.values().append_nulls(dim as usize);
