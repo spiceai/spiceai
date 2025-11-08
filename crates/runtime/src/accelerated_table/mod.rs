@@ -163,11 +163,6 @@ pub enum Error {
         "Failed to check dataset status. {source} Ensure the dataset configuration is valid, and try again"
     ))]
     ChangesAfterLoadCheckDataset { source: DataFusionError },
-
-    #[snafu(display(
-        "Failed to bootstrap dataset. {source} Ensure the dataset configuration is valid, and try again"
-    ))]
-    ChangesAfterLoadBootstrapping { source: DataFusionError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

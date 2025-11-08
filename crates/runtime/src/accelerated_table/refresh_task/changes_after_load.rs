@@ -17,14 +17,10 @@ limitations under the License.
 use super::{RefreshTask, include_source_to_table_name, inner_err_from_retry_ref};
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::{
-    ChangesAfterLoadBootstrappingSnafu, ChangesAfterLoadCheckDatasetSnafu, Error,
-    Result as AcceleratedTableResult,
+    ChangesAfterLoadCheckDatasetSnafu, Error, Result as AcceleratedTableResult,
 };
 use crate::dataconnector::changes_after_load::{ChangesAfterLoadCoordinator, DatasetStatus};
-use crate::dataconnector::get_data;
-use crate::dataupdate::{StreamingDataUpdate, UpdateType};
 use cache::Caching;
-use datafusion::catalog::TableProvider;
 use snafu::ResultExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
