@@ -13076,6 +13076,7 @@ name = "runtime-acceleration"
 version = "1.9.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
@@ -13092,6 +13093,7 @@ dependencies = [
  "sha2",
  "snafu",
  "spicepod",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",

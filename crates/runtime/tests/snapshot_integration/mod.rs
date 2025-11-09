@@ -581,6 +581,90 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     })
 }
 
+async fn prepare_cayenne_fixture(test_name: &str) -> Result<SnapshotFixture> {
+    configure_test_datafusion();
+
+    let context = SnapshotS3Context::new(test_name).await?;
+    let temp_dir = TempDir::new().context("Creating temporary directory for Cayenne")?;
+    let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+    let sample_source_path = temp_dir.path().join("taxi_sample.csv");
+    fs::write(&sample_source_path, sample_csv_contents)
+        .await
+        .context("Writing sample CSV for dataset source")?;
+    let dataset_from = format!("file://{}", sample_source_path.display());
+    let local_db_path = temp_dir.path().join("taxi_trips");
+
+    let dataset_params = HashMap::from([
+        ("file_format".to_string(), "csv".to_string()),
+        ("csv_has_header".to_string(), "true".to_string()),
+    ]);
+
+    let mut accel_params = HashMap::new();
+    accel_params.insert(
+        "cayenne_warehouse".to_string(),
+        local_db_path.to_string_lossy().to_string(),
+    );
+
+    let dataset = build_dataset(
+        &dataset_from,
+        TAXI_TRIPS_DATASET_NAME,
+        &dataset_params,
+        DatasetSnapshotBehavior::Enabled,
+        &accel_params,
+        "cayenne",
+        RefreshOnStartup::Auto,
+    );
+
+    let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn);
+
+    let app = AppBuilder::new(format!("{test_name}_bootstrap"))
+        .with_snapshots(snapshots)
+        .with_dataset(dataset)
+        .build();
+
+    let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+    load_runtime(Arc::clone(&runtime)).await?;
+
+    let baseline = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+        .await
+        .context("Executing baseline query for Cayenne snapshot")?;
+
+    let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
+        .await
+        .context("Retrieving schema for taxi_trips dataset")?
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
+
+    runtime.shutdown().await;
+
+    let snapshot_objects = context
+        .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+        .await?;
+    let metadata = build_metadata_document(
+        &context,
+        TAXI_TRIPS_DATASET_NAME,
+        &snapshot_objects,
+        &schema,
+    );
+    context
+        .write_metadata(&metadata)
+        .await
+        .context("Writing initial snapshot metadata")?;
+
+    Ok(SnapshotFixture {
+        context,
+        _temp_dir: temp_dir,
+        dataset_from,
+        local_db_path,
+        dataset_params,
+        schema,
+        baseline,
+        engine: "cayenne",
+        initial_snapshot_count: snapshot_objects.len(),
+    })
+}
+
 fn remove_existing_local_files(path: &Path) {
     let candidates = [
         path.to_path_buf(),
@@ -597,6 +681,17 @@ fn remove_existing_local_files(path: &Path) {
                 candidate.display()
             );
         }
+    }
+
+    // For Cayenne (directory-based), also remove the directory
+    if path.is_dir()
+        && let Err(err) = std::fs::remove_dir_all(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            "Failed to remove local acceleration directory {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -1158,4 +1253,121 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             fixture.cleanup().await
         })
         .await
+}
+
+/// Parameterized test that verifies snapshot bootstrap works for both `DuckDB` and Cayenne accelerators.
+///
+/// This test:
+/// 1. Creates an initial snapshot by running the runtime with the accelerator
+/// 2. Removes the local acceleration file/directory
+/// 3. Restarts the runtime and verifies it bootstraps from the snapshot
+/// 4. Validates that query results match the original baseline
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_unified_test_bootstrap_from_s3() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+
+    // Test both DuckDB and Cayenne if their features are enabled
+    let test_cases = vec![
+        #[cfg(feature = "duckdb")]
+        ("duckdb", "unified_duckdb"),
+        ("cayenne", "unified_cayenne"),
+    ];
+
+    for (engine, test_suffix) in test_cases {
+        tracing::info!("Running unified snapshot bootstrap test for {engine}");
+
+        test_request_context()
+            .scope(async {
+                let fixture = match engine {
+                    #[cfg(feature = "duckdb")]
+                    "duckdb" => {
+                        prepare_duckdb_fixture(&format!("snapshot_unified_{test_suffix}")).await?
+                    }
+                    "cayenne" => {
+                        prepare_cayenne_fixture(&format!("snapshot_unified_{test_suffix}")).await?
+                    }
+                    _ => unreachable!("Unsupported engine in test"),
+                };
+
+                // Verify initial snapshot was created
+                assert_eq!(
+                    fixture.initial_snapshot_count, 1,
+                    "{engine}: Expected exactly one snapshot to be created during bootstrap"
+                );
+
+                // Remove local acceleration file/directory to force bootstrap from snapshot
+                remove_existing_local_files(&fixture.local_db_path);
+                assert!(
+                    !fixture.local_db_path.exists(),
+                    "{engine}: Local acceleration path should be removed before bootstrap test"
+                );
+
+                // Configure runtime to bootstrap from snapshot
+                let dataset = fixture.dataset(
+                    DatasetSnapshotBehavior::Enabled,
+                    RefreshOnStartup::Auto,
+                    &[],
+                    &[],
+                );
+                let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+
+                let app = AppBuilder::new(format!("snapshot_unified_{test_suffix}_restart"))
+                    .with_snapshots(snapshots)
+                    .with_dataset(dataset)
+                    .build();
+
+                configure_test_datafusion();
+
+                let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+                load_runtime(Arc::clone(&runtime)).await?;
+
+                // Verify data was bootstrapped correctly by comparing results
+                let bootstrap_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+                    .await
+                    .with_context(|| {
+                        format!("Querying dataset bootstrapped from {engine} snapshot")
+                    })?;
+
+                let expected = fixture.baseline_pretty()?;
+                let actual = pretty_format_batches(&bootstrap_results)
+                    .map(|fmt| fmt.to_string())
+                    .with_context(|| format!("Formatting {engine} bootstrap result batches"))?;
+
+                assert_eq!(
+                    expected, actual,
+                    "{engine}: Bootstrap query results should match snapshot baseline"
+                );
+
+                // Verify snapshot metadata is correct
+                let metadata = fixture.context.metadata_json().await?;
+                let location = metadata
+                    .get("location")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!("{engine}: Snapshot metadata missing 'location' field")
+                    })?;
+                assert_eq!(
+                    location,
+                    fixture.context.location_uri(),
+                    "{engine}: Snapshot metadata location should match configured location"
+                );
+
+                // Verify local path now exists after bootstrap
+                assert!(
+                    fixture.local_db_path.exists(),
+                    "{engine}: Local acceleration path should exist after successful bootstrap"
+                );
+
+                runtime.shutdown().await;
+
+                tracing::info!("✓ Unified snapshot bootstrap test passed for {engine}");
+
+                fixture.cleanup().await
+            })
+            .await?;
+    }
+
+    Ok(())
 }

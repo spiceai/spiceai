@@ -40,7 +40,6 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::SnapshotBehavior;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -585,15 +584,6 @@ impl DataAccelerator for CayenneAccelerator {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(
                         "Cayenne data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
-                    ),
-                }));
-            }
-
-            // Validate that snapshots are not enabled
-            if !matches!(acceleration.snapshots, SnapshotBehavior::Disabled) {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: false' or remove the snapshots configuration",
                     ),
                 }));
             }

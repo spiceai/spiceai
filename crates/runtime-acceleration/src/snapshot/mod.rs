@@ -22,10 +22,10 @@ use std::{
     time::Instant,
 };
 
+use arrow_schema::{Schema, SchemaRef};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::StreamExt;
 use object_store::{
     ClientOptions, ObjectStore, PutMode, PutPayload, UpdateVersion, aws::AmazonS3Builder,
@@ -50,8 +50,10 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
+mod directory_archive;
 pub mod metrics;
 pub use behavior::SnapshotBehavior;
+pub use directory_archive::{ArchiveError, archive_directories, extract_archive};
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -579,6 +581,8 @@ impl SnapshotManager {
 
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
     ///
+    /// For directory-based accelerators (Cayenne), a tar archive is created first.
+    ///
     /// # Errors
     ///
     /// - If the local acceleration file cannot be opened or read.
@@ -601,8 +605,77 @@ impl SnapshotManager {
             self.dataset_name
         );
 
-        let file = fs::File::open(&local_path).await.context(OpenLocalSnafu {
-            path: local_path.clone(),
+        // For directory-based snapshots (Cayenne), create a temporary tar archive
+        let (upload_path, _temp_file) = if local_path.is_dir() {
+            let temp_tar = tempfile::NamedTempFile::new().map_err(|source| {
+                SnapshotUploadError::OpenLocal {
+                    path: local_path.clone(),
+                    source,
+                }
+            })?;
+
+            let temp_path = temp_tar.path().to_path_buf();
+
+            // Archive the directory to the temp file
+            tracing::debug!(
+                "Creating tar archive for directory snapshot. dataset={} dir={}",
+                self.dataset_name,
+                local_path.display()
+            );
+
+            // Cayenne directories have metadata/ and data/ subdirectories
+            let metadata_dir = local_path.join("metadata");
+            let data_dir = local_path.clone(); // data files are in the main directory
+
+            let dirs = vec![
+                (metadata_dir, "metadata/".to_string()),
+                (data_dir, "data/".to_string()),
+            ];
+
+            let tar_file = std::fs::File::create(&temp_path).map_err(|source| {
+                SnapshotUploadError::OpenLocal {
+                    path: temp_path.clone(),
+                    source,
+                }
+            })?;
+
+            let mut archive = tar::Builder::new(tar_file);
+            for (dir, prefix) in dirs {
+                if dir.exists() && dir.is_dir() {
+                    let append_dir_all = |builder: &mut tar::Builder<std::fs::File>,
+                                          path: &std::path::Path,
+                                          prefix: &str|
+                     -> std::io::Result<()> {
+                        builder.append_dir_all(prefix, path)
+                    };
+                    append_dir_all(&mut archive, &dir, &prefix).map_err(|source| {
+                        SnapshotUploadError::ReadLocal {
+                            path: dir.clone(),
+                            source,
+                        }
+                    })?;
+                }
+            }
+            archive
+                .finish()
+                .map_err(|source| SnapshotUploadError::ReadLocal {
+                    path: temp_path.clone(),
+                    source,
+                })?;
+
+            tracing::debug!(
+                "Tar archive created. dataset={} size={} bytes",
+                self.dataset_name,
+                temp_path.metadata().map(|m| m.len()).unwrap_or(0)
+            );
+
+            (temp_path, Some(temp_tar))
+        } else {
+            (local_path.clone(), None)
+        };
+
+        let file = fs::File::open(&upload_path).await.context(OpenLocalSnafu {
+            path: upload_path.clone(),
         })?;
 
         let mut reader = BufReader::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE, file);
@@ -648,7 +721,7 @@ impl SnapshotManager {
                             });
                         }
                         return Err(SnapshotUploadError::ReadLocal {
-                            path: local_path,
+                            path: upload_path,
                             source,
                         });
                     }
@@ -1098,6 +1171,56 @@ impl SnapshotManager {
                 expected: entry.snapshot_checksum.clone(),
                 actual: actual_checksum,
             });
+        }
+
+        // For directory-based snapshots (Cayenne), we need to extract the tar archive
+        // We can detect this by checking if the local_path has no file extension
+        // (Cayenne uses directories without extensions, while DuckDB/SQLite use .db/.sqlite extensions)
+        let should_extract = self.local_path.extension().is_none();
+
+        if should_extract {
+            use tokio::task::spawn_blocking;
+
+            tracing::debug!(
+                "Extracting tar archive for directory snapshot. dataset={}",
+                self.dataset_name
+            );
+
+            // Extract the tar archive
+            let tar_path = self.local_path.clone();
+            let extract_to = self
+                .local_path
+                .parent()
+                .ok_or_else(|| SnapshotDownloadError::WriteLocal {
+                    path: self.local_path.clone(),
+                    source: std::io::Error::other("No parent directory for extraction"),
+                })?
+                .to_path_buf();
+            let extract_to_display = extract_to.clone();
+
+            spawn_blocking(move || {
+                let tar_file = std::fs::File::open(&tar_path)?;
+                let mut archive = tar::Archive::new(tar_file);
+                archive.unpack(&extract_to)?;
+                // Clean up the temporary tar file
+                std::fs::remove_file(&tar_path)?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .map_err(|e| SnapshotDownloadError::WriteLocal {
+                path: self.local_path.clone(),
+                source: std::io::Error::other(e.to_string()),
+            })?
+            .map_err(|source| SnapshotDownloadError::WriteLocal {
+                path: self.local_path.clone(),
+                source,
+            })?;
+
+            tracing::debug!(
+                "Tar archive extracted. dataset={} extracted_to={}",
+                self.dataset_name,
+                extract_to_display.display()
+            );
         }
 
         let checkpointer = (checkpointer_factory)()

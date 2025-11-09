@@ -62,6 +62,7 @@ enum AccelerationConnection {
     SQLite(SqliteConnectionPool),
     #[cfg(feature = "turso")]
     Turso(Arc<super::turso::TursoConnectionPool>),
+    Cayenne(std::path::PathBuf, std::path::PathBuf), // (metadata_path, data_path)
 }
 
 #[derive(Debug, Snafu)]
@@ -318,7 +319,53 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
-        Engine::Arrow | Engine::Cayenne => UnsupportedEngineSnafu {
+        Engine::Cayenne => {
+            use crate::dataaccelerator::cayenne::CayenneAccelerator;
+
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::Cayenne,
+                })?;
+            let cayenne_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<CayenneAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "CayenneAccelerator",
+                })?;
+
+            // For Cayenne, we need the metadata and data directories
+            let metadata_dir = if let Some(acceleration) = source.acceleration() {
+                acceleration.params.get("cayenne_metadata_dir").map_or_else(
+                    || format!("{}/metadata", crate::spice_data_base_path()),
+                    String::clone,
+                )
+            } else {
+                format!("{}/metadata", crate::spice_data_base_path())
+            };
+
+            let data_dir =
+                cayenne_accelerator
+                    .cayenne_data_dir(source)
+                    .map_err(|e| Error::External {
+                        source: Box::new(e),
+                    })?;
+
+            if open_option == OpenOption::OpenExisting && !Path::new(&data_dir).exists() {
+                return Err(Error::External {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Cayenne data directory does not exist: {data_dir}"),
+                    )),
+                });
+            }
+
+            Ok(AccelerationConnection::Cayenne(
+                std::path::PathBuf::from(metadata_dir),
+                std::path::PathBuf::from(data_dir),
+            ))
+        }
+        Engine::Arrow => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),
