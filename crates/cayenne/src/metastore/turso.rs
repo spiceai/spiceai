@@ -115,7 +115,6 @@ impl TursoMetastore {
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
-            partition_column TEXT,
             vortex_config_json TEXT
         )
     ";
@@ -157,12 +156,15 @@ impl TursoMetastore {
     /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT NOT NULL,
+            partition_id BIGINT PRIMARY KEY,
             table_id BIGINT NOT NULL,
+            partition_name TEXT NOT NULL,
+            partition_expression TEXT,
             partition_value TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            row_count BIGINT NOT NULL
+            path TEXT NOT NULL,
+            path_is_relative BOOLEAN NOT NULL,
+            record_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0
         )
     ";
 }

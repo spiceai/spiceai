@@ -90,7 +90,6 @@ async fn test_cayenne_partition_pruning_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: Some("region".to_string()),
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -382,16 +381,14 @@ async fn test_cayenne_bucket_partitioning_impl(
         Field::new("value", DataType::Int64, false),
     ]));
 
-    // Note: Cayenne's partition_column is a simple string, not an expression like bucket(3, id)
-    // So we'll test with a simple column partition here, but the runtime integration with
-    // PartitionTableProvider would handle bucket() expressions
-    // For now, we'll demonstrate the pattern with a regular partition
+    // Note: For expression-based partitioning like bucket(3, id), use the runtime layer
+    // with PartitionTableProvider which wraps CayenneTableProvider
+    // This test uses a simple non-partitioned table at the Cayenne level
     let table_options = CreateTableOptions {
         table_name: "bucket_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: Some("id".to_string()), // In practice, runtime would use bucket(3, id)
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -400,7 +397,7 @@ async fn test_cayenne_bucket_partitioning_impl(
         table_options,
     )
     .await?;
-    println!("✓ Table created with partition column: id");
+    println!("✓ Table created (non-partitioned at Cayenne level)");
 
     // Register with DataFusion context
     let ctx = SessionContext::new();

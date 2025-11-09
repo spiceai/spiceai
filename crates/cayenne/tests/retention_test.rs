@@ -49,7 +49,6 @@ async fn test_retention_filters_apply_on_insert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: table_dir.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -162,7 +161,6 @@ async fn test_retention_filters_skip_when_no_matches_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: table_dir.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 

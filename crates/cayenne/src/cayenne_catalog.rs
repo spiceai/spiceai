@@ -291,8 +291,6 @@ impl MetadataCatalog for CayenneCatalog {
             })?)
         };
 
-        let partition_column = options.partition_column.clone();
-
         // Double-check if table was created by another thread while we were preparing
         let double_check = self
             .query_row_helper(
@@ -340,8 +338,8 @@ impl MetadataCatalog for CayenneCatalog {
                     INSERT INTO cayenne_table (
                         table_id, table_uuid,
                         table_name, path, path_is_relative, schema_json, primary_key_json,
-                        current_snapshot_id, partition_column, vortex_config_json
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                        current_snapshot_id, vortex_config_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ",
                 params: vec![
                     MetastoreValue::Integer(table_id),
@@ -352,7 +350,6 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Text(schema_json),
                     primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(initial_snapshot_id.clone()),
-                    partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(vortex_config_json),
                 ],
             })
@@ -406,7 +403,7 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                     SELECT table_id, table_uuid,
                            table_name, path, path_is_relative, schema_json, primary_key_json,
-                           current_snapshot_id, partition_column, vortex_config_json
+                           current_snapshot_id, vortex_config_json
                     FROM cayenne_table
                     WHERE table_name = ?1
                     LIMIT 1
@@ -422,8 +419,7 @@ impl MetadataCatalog for CayenneCatalog {
                 let schema_json = row.get_string(5)?;
                 let primary_key_json = row.get_optional_string(6)?;
                 let current_snapshot_id = row.get_string(7)?;
-                let partition_column = row.get_optional_string(8)?;
-                let vortex_config_json = row.get_optional_string(9)?;
+                let vortex_config_json = row.get_optional_string(8)?;
 
                 // Deserialize schema using Arrow IPC format
                 let schema = {
@@ -475,7 +471,6 @@ impl MetadataCatalog for CayenneCatalog {
                     schema,
                     primary_key,
                     current_snapshot_id,
-                    partition_column,
                     vortex_config,
                 })
             },
@@ -650,13 +645,14 @@ impl MetadataCatalog for CayenneCatalog {
         self.execute_helper(ExecuteParams {
             sql: r"
                 INSERT INTO cayenne_partition (
-                    partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    partition_id, table_id, partition_name, partition_expression, partition_value, path, path_is_relative, record_count, file_size_bytes
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ",
             params: vec![
                 MetastoreValue::Integer(partition_id),
                 MetastoreValue::Integer(partition.table_id),
                 MetastoreValue::Text(partition.partition_column),
+                partition.partition_expression.map_or(MetastoreValue::Null, MetastoreValue::Text),
                 MetastoreValue::Text(partition.partition_value),
                 MetastoreValue::Text(partition.path),
                 MetastoreValue::Bool(partition.path_is_relative),
@@ -680,7 +676,7 @@ impl MetadataCatalog for CayenneCatalog {
         self.query_helper(
             QueryParams {
                 sql: r"
-                    SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                    SELECT partition_id, table_id, partition_name, partition_expression, partition_value, path, path_is_relative, record_count, file_size_bytes
                     FROM cayenne_partition
                     WHERE table_id = ?1
                     ORDER BY partition_id
@@ -692,11 +688,12 @@ impl MetadataCatalog for CayenneCatalog {
                     partition_id: row.get_i64(0)?,
                     table_id: row.get_i64(1)?,
                     partition_column: row.get_string(2)?,
-                    partition_value: row.get_string(3)?,
-                    path: row.get_string(4)?,
-                    path_is_relative: row.get_bool(5)?,
-                    record_count: row.get_i64(6)?,
-                    file_size_bytes: row.get_i64(7)?,
+                    partition_expression: row.get_optional_string(3)?,
+                    partition_value: row.get_string(4)?,
+                    path: row.get_string(5)?,
+                    path_is_relative: row.get_bool(6)?,
+                    record_count: row.get_i64(7)?,
+                    file_size_bytes: row.get_i64(8)?,
                 })
             },
         )
@@ -712,7 +709,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_row_helper(
                 QueryRowParams {
                     sql: r"
-                        SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                        SELECT partition_id, table_id, partition_column, partition_expression, partition_value, path, path_is_relative, record_count, file_size_bytes
                         FROM cayenne_partition
                         WHERE table_id = ?1 AND partition_value = ?2
                         LIMIT 1
@@ -727,11 +724,12 @@ impl MetadataCatalog for CayenneCatalog {
                         partition_id: row.get_i64(0)?,
                         table_id: row.get_i64(1)?,
                         partition_column: row.get_string(2)?,
-                        partition_value: row.get_string(3)?,
-                        path: row.get_string(4)?,
-                        path_is_relative: row.get_bool(5)?,
-                        record_count: row.get_i64(6)?,
-                        file_size_bytes: row.get_i64(7)?,
+                        partition_expression: row.get_optional_string(3)?,
+                        partition_value: row.get_string(4)?,
+                        path: row.get_string(5)?,
+                        path_is_relative: row.get_bool(6)?,
+                        record_count: row.get_i64(7)?,
+                        file_size_bytes: row.get_i64(8)?,
                     })
                 },
             )

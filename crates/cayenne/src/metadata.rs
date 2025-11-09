@@ -38,8 +38,6 @@ pub struct TableMetadata {
     /// Current snapshot ID (`UUIDv7`, changes on overwrite/delete operations)
     /// All tables are created with an initial snapshot.
     pub current_snapshot_id: String,
-    /// Partition column name (if this is a partitioned table)
-    pub partition_column: Option<String>,
     /// Vortex encoding configuration for this table
     pub vortex_config: VortexConfig,
 }
@@ -103,8 +101,11 @@ pub struct PartitionMetadata {
     pub partition_id: i64,
     /// Table this partition belongs to
     pub table_id: i64,
-    /// Name of the partition column
+    /// Name of the partition (used in directory names and as the partition identifier)
     pub partition_column: String,
+    /// Optional partition expression (SQL string for expression-based partitioning like `bucket(10, col1)`)
+    /// Stores the SQL expression that was used to compute this partition's value
+    pub partition_expression: Option<String>,
     /// Partition value (serialized as string for storage)
     pub partition_value: String,
     /// Path to the partition's data directory
@@ -182,8 +183,6 @@ pub struct CreateTableOptions {
     pub primary_key: Vec<String>,
     /// Base path for storing table data
     pub base_path: String,
-    /// Optional partition column name (for partitioned tables)
-    pub partition_column: Option<String>,
     /// Vortex encoding configuration
     pub vortex_config: VortexConfig,
 }

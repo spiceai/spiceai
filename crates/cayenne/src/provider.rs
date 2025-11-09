@@ -1978,7 +1978,6 @@ mod tests {
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
                 base_path: temp_dir.path().to_string_lossy().to_string(),
-                partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
             .await

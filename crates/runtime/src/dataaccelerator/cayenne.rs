@@ -452,7 +452,6 @@ impl CayenneAccelerator {
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
             primary_key: vec![], // No PK by default, can be set by caller
             base_path: dir_path.to_string(),
-            partition_column: None, // Non-partitioned table
             vortex_config,
         };
 
@@ -955,10 +954,17 @@ impl PartitionCreator for CayennePartitionCreator {
         let partition_value_str = partition_value.to_string();
         let partition_column_name = self.partition_column_label().to_string();
 
+        // Store the expression as SQL string if it's not just a simple column reference
+        let partition_expression = match &self.partition_by.expression {
+            Expr::Column(_) => None, // Simple column partitioning - no expression needed
+            expr => Some(expr.to_string()), // Expression-based partitioning - store the SQL
+        };
+
         let partition_metadata = cayenne::PartitionMetadata {
             partition_id: 0, // Will be assigned by catalog
             table_id: self.table_id,
             partition_column: partition_column_name,
+            partition_expression,
             partition_value: partition_value_str.clone(),
             path: partition_path.clone(),
             path_is_relative: false,
@@ -979,7 +985,6 @@ impl PartitionCreator for CayennePartitionCreator {
             schema: Arc::clone(&self.schema),
             primary_key: vec![],
             base_path: partition_path.clone(),
-            partition_column: None, // Partitions themselves are not partitioned
             vortex_config: self.vortex_config.clone(),
         };
 

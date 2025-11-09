@@ -102,7 +102,7 @@ async fn get_physical_plan(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
-    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    let _tracing = crate::init_tracing(Some("runtime_table_partition::provider=debug,integration=debug,info"));
 
     test_request_context()
         .scope(async {

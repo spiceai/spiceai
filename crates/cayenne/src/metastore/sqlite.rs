@@ -120,7 +120,6 @@ impl SqliteMetastore {
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
-            partition_column TEXT,
             vortex_config_json TEXT
         )
     ";
@@ -161,7 +160,8 @@ impl SqliteMetastore {
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id BIGINT PRIMARY KEY,
             table_id BIGINT NOT NULL,
-            partition_column TEXT NOT NULL,
+            partition_name TEXT NOT NULL,
+            partition_expression TEXT,
             partition_value TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,

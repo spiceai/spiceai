@@ -51,7 +51,6 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: VortexConfig::default(),
     };
 
@@ -205,7 +204,6 @@ async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std
         schema: Arc::clone(&schema),
         primary_key: vec![],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: VortexConfig::default(),
     };
 

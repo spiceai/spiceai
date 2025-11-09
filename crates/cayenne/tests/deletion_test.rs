@@ -60,7 +60,6 @@ async fn test_delete_with_primary_key_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -200,7 +199,6 @@ async fn test_delete_without_primary_key_impl(
         schema: Arc::clone(&schema),
         primary_key: vec![], // NO primary key
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -301,7 +299,6 @@ async fn test_delete_all_rows_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -378,7 +375,6 @@ async fn test_delete_then_insert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
@@ -484,7 +480,6 @@ async fn test_delete_with_complex_filter_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         base_path: data_path.to_string_lossy().to_string(),
-        partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
