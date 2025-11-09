@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-//! Test that verifies partition_by works correctly with the new chunking implementation
+//! Test that verifies `partition_by` works correctly with the new chunking implementation
 
 mod common;
 
@@ -86,7 +86,7 @@ async fn test_partitioned_table_with_chunking_impl(
             ids.iter()
                 .zip(categories.iter())
                 .zip(values.iter())
-                .map(|((id, cat), val)| format!("({}, '{}', {})", id, cat, val))
+                .map(|((id, cat), val)| format!("({id}, '{cat}', {val})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -108,7 +108,7 @@ async fn test_partitioned_table_with_chunking_impl(
             ids.iter()
                 .zip(categories.iter())
                 .zip(values.iter())
-                .map(|((id, cat), val)| format!("({}, '{}', {})", id, cat, val))
+                .map(|((id, cat), val)| format!("({id}, '{cat}', {val})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -130,7 +130,7 @@ async fn test_partitioned_table_with_chunking_impl(
             ids.iter()
                 .zip(categories.iter())
                 .zip(values.iter())
-                .map(|((id, cat), val)| format!("({}, '{}', {})", id, cat, val))
+                .map(|((id, cat), val)| format!("({id}, '{cat}', {val})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -155,7 +155,7 @@ async fn test_partitioned_table_with_chunking_impl(
         .expect("Count should be Int64");
     let total_count = count_array.value(0);
     assert_eq!(total_count, 13000, "Expected 13000 total rows");
-    println!("✓ Total rows: {}", total_count);
+    println!("✓ Total rows: {total_count}");
 
     // Count by partition
     let df = ctx
@@ -316,6 +316,7 @@ async fn test_partitioned_table_with_large_chunks_impl(
 // Generate test variants for timestamp partitioning test
 test_with_backends!(test_timestamp_partition_with_date_part_impl);
 
+#[allow(clippy::too_many_lines)]
 async fn test_timestamp_partition_with_date_part_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -367,13 +368,12 @@ async fn test_timestamp_partition_with_date_part_impl(
 
     // January 2024 data (month="2024-01")
     for i in 0..1000 {
-        let timestamp_ms = 1704067200000i64 + (i * 3600000); // Jan 1, 2024 00:00:00 UTC + i hours
+        let timestamp_ms = 1_704_067_200_000_i64 + (i * 3_600_000); // Jan 1, 2024 00:00:00 UTC + i hours
         let month = "2024-01";
         let value = i;
 
         ctx.sql(&format!(
-            "INSERT INTO timestamp_partitioned_table VALUES ({}, {}, {}, '{}')",
-            i, timestamp_ms, value, month
+            "INSERT INTO timestamp_partitioned_table VALUES ({i}, {timestamp_ms}, {value}, '{month}')",
         ))
         .await?
         .collect()
@@ -383,13 +383,12 @@ async fn test_timestamp_partition_with_date_part_impl(
 
     // February 2024 data (month="2024-02")
     for i in 1000..2000 {
-        let timestamp_ms = 1706745600000i64 + ((i - 1000) * 3600000); // Feb 1, 2024 00:00:00 UTC
+        let timestamp_ms = 1_706_745_600_000_i64 + ((i - 1000) * 3_600_000); // Feb 1, 2024 00:00:00 UTC
         let month = "2024-02";
         let value = i;
 
         ctx.sql(&format!(
-            "INSERT INTO timestamp_partitioned_table VALUES ({}, {}, {}, '{}')",
-            i, timestamp_ms, value, month
+            "INSERT INTO timestamp_partitioned_table VALUES ({i}, {timestamp_ms}, {value}, '{month}')",
         ))
         .await?
         .collect()
@@ -399,13 +398,12 @@ async fn test_timestamp_partition_with_date_part_impl(
 
     // March 2024 data (month="2024-03")
     for i in 2000..2500 {
-        let timestamp_ms = 1709251200000i64 + ((i - 2000) * 3600000); // Mar 1, 2024 00:00:00 UTC
+        let timestamp_ms = 1_709_251_200_000_i64 + ((i - 2000) * 3_600_000); // Mar 1, 2024 00:00:00 UTC
         let month = "2024-03";
         let value = i;
 
         ctx.sql(&format!(
-            "INSERT INTO timestamp_partitioned_table VALUES ({}, {}, {}, '{}')",
-            i, timestamp_ms, value, month
+            "INSERT INTO timestamp_partitioned_table VALUES ({i}, {timestamp_ms}, {value}, '{month}')",
         ))
         .await?
         .collect()
