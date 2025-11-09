@@ -415,6 +415,11 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
+    pub fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
+    #[must_use]
     pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
         let mut plan_stack = vec![plan];
 

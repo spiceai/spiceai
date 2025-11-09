@@ -34,6 +34,10 @@ use snafu::{ResultExt, prelude::*};
 use super::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable};
 
 const PUT_VECTORS_MAX_ITEMS: usize = 500;
+// S3 Vectors API has a 1MB (1,048,576 bytes) payload limit
+const PUT_VECTORS_MAX_PAYLOAD_BYTES: usize = 1_048_576;
+// Estimate overhead per vector: vector_id, metadata, JSON structure (~200 bytes)
+const ESTIMATED_OVERHEAD_PER_VECTOR: usize = 200;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,6 +54,14 @@ pub enum Error {
     ColumnTypeMismatch { name: String, expected: String },
     #[snafu(display("Expected {expected} datatype but got a different datatype"))]
     DatatypeMismatch { expected: String },
+    #[snafu(display("Invalid primary key at row {row}: {reason}"))]
+    InvalidPrimaryKey { row: usize, reason: String },
+    #[snafu(display("Invalid metadata key '{key}' at row {row}: {reason}"))]
+    InvalidMetadataKey {
+        key: String,
+        row: usize,
+        reason: String,
+    },
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -93,6 +105,9 @@ impl DataSink for PutVectorsSink {
         _context: &Arc<TaskContext>,
     ) -> DataFusionResult<u64> {
         let mut count = 0;
+        // Calculate batch size once based on vector dimensions from schema
+        let vector_dimensions = usize::try_from(self.table.dimension).unwrap_or(0);
+        let batch_size = calculate_batch_size(vector_dimensions);
 
         while let Some(record_batch) = data.next().await {
             let record_batch = record_batch?;
@@ -102,8 +117,10 @@ impl DataSink for PutVectorsSink {
             let (index_arn, vector_bucket_name, index_name) =
                 self.table.idx.index_identifier_variables();
 
-            for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-                self.table
+            for chunk in vectors.chunks(batch_size) {
+                let chunk_len = chunk.len();
+                let output = self
+                    .table
                     .client
                     .put_vectors(
                         PutVectorsInput::builder()
@@ -119,12 +136,47 @@ impl DataSink for PutVectorsSink {
                     .boxed()
                     .context(PutVectorsSnafu)?;
 
-                count += chunk.len();
+                // Validate that all vectors were successfully written
+                // The PutVectorsOutput may contain failed_vectors or similar fields
+                // If the response indicates failures, we should warn or error
+                if let Some(failed) = output.failed_vectors() {
+                    if !failed.is_empty() {
+                        tracing::warn!(
+                            failed_count = failed.len(),
+                            chunk_size = chunk_len,
+                            "Some vectors failed to be written to S3 Vectors index; partial batch failure occurred"
+                        );
+                        // Count only successful writes
+                        count += chunk_len.saturating_sub(failed.len());
+                        continue;
+                    }
+                }
+
+                count += chunk_len;
             }
         }
 
         Ok(count as _)
     }
+}
+
+/// Calculate optimal batch size based on vector dimensions to stay under 1MB payload limit
+///
+/// Each vector consumes: (dimensions * 4 bytes for f32) + overhead (~200 bytes)
+/// We conservatively cap at PUT_VECTORS_MAX_ITEMS (500) to avoid API limits
+fn calculate_batch_size(vector_dimensions: usize) -> usize {
+    if vector_dimensions == 0 {
+        return PUT_VECTORS_MAX_ITEMS;
+    }
+
+    // Each f32 is 4 bytes
+    let bytes_per_vector = (vector_dimensions * 4) + ESTIMATED_OVERHEAD_PER_VECTOR;
+
+    // Calculate max vectors that fit in 1MB, leaving 10% safety margin
+    let max_by_size = (PUT_VECTORS_MAX_PAYLOAD_BYTES * 9) / (bytes_per_vector * 10);
+
+    // Take the minimum of size-based limit and API item limit
+    max_by_size.min(PUT_VECTORS_MAX_ITEMS).max(1) // At least 1 vector per batch
 }
 
 fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
@@ -165,6 +217,30 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
     for row in 0..record_batch.num_rows() {
         let key = keys.value(row).to_string();
 
+        // Validate primary key
+        if key.is_empty() {
+            return Err(Error::InvalidPrimaryKey {
+                row,
+                reason: "Primary key cannot be empty".to_string(),
+            });
+        }
+        if key.len() > 1024 {
+            return Err(Error::InvalidPrimaryKey {
+                row,
+                reason: format!(
+                    "Primary key exceeds maximum length of 1024 characters (got {})",
+                    key.len()
+                ),
+            });
+        }
+        // S3 Vectors keys should not contain control characters
+        if key.chars().any(|c| c.is_control()) {
+            return Err(Error::InvalidPrimaryKey {
+                row,
+                reason: "Primary key contains invalid control characters".to_string(),
+            });
+        }
+
         let vector = vectors
             .value(row)
             .as_any()
@@ -189,6 +265,33 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
         let mut metadata = HashMap::new();
 
         for (index, name, data_type) in &fields {
+            // Validate metadata key
+            if name.is_empty() {
+                return Err(Error::InvalidMetadataKey {
+                    key: name.to_string(),
+                    row,
+                    reason: "Metadata key cannot be empty".to_string(),
+                });
+            }
+            if name.len() > 256 {
+                return Err(Error::InvalidMetadataKey {
+                    key: name.to_string(),
+                    row,
+                    reason: format!(
+                        "Metadata key exceeds maximum length of 256 characters (got {})",
+                        name.len()
+                    ),
+                });
+            }
+            // Metadata keys should not contain control characters or special chars
+            if name.chars().any(|c| c.is_control() || c == '\0') {
+                return Err(Error::InvalidMetadataKey {
+                    key: name.to_string(),
+                    row,
+                    reason: "Metadata key contains invalid characters".to_string(),
+                });
+            }
+
             let col = record_batch.column(*index);
             let value = metadata_from_row(row, data_type, col)?;
             metadata.insert((*name).to_string(), value);

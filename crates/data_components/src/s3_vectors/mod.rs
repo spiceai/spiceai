@@ -18,8 +18,8 @@ use arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, ListIndexesError, ListIndexesInput, PutVectorsError, QueryVectorsError,
-    S3Vectors,
+    GetVectorBucketError, GetVectorsError, ListIndexesError, ListIndexesInput, PutVectorsError,
+    QueryVectorsError, S3Vectors,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::{ResultExt as _, Snafu};
@@ -56,6 +56,9 @@ pub enum Error {
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
     S3VectorQueryVectorsError { source: Box<QueryVectorsError> },
+
+    #[snafu(display("Failed to get vectors from S3 Vectors. {source}"))]
+    S3VectorGetVectorsError { source: Box<GetVectorsError> },
 
     #[snafu(display(
         "Failed to query vectors from S3 Vectors due to an unsupported filter: {filter_pre} {filter:?}"
