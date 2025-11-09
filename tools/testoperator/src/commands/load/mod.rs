@@ -15,12 +15,15 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::LoadTestArgs, health::HealthMonitor, wait_test_and_memory};
+use crate::{
+    args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper, wait_test_and_memory,
+};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
+    opentelemetry::KeyValue,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
@@ -54,6 +57,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
     let health_monitor = HealthMonitor::spawn()?;
+
+    // Start metrics scraper if enabled
+    let metrics_scraper = if args.test_args.common.scrape_spiced_metrics {
+        Some(MetricsScraper::spawn()?)
+    } else {
+        None
+    };
 
     let test_duration = Duration::from_secs(args.test_args.common.duration);
     let test_hours = (test_duration.as_secs() / 60 / 60).max(1);
@@ -121,6 +131,12 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;
+
+    // Stop and process metrics scraper if enabled
+    let attributes = vec![KeyValue::new("test", "load")];
+    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
+        .await;
+
     spiced_instance.stop()?;
     let health_report = health_report?;
 

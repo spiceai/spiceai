@@ -448,9 +448,18 @@ impl RequestContextBuilder {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
                 CacheControl::Cache(cache_key_type)
             }
+            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, duration) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::CacheWithStaleWhileRevalidate(cache_key_type, duration)
+            }
             // If sanitized out, fall back to default
             CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
+            }
+            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::ClientSupplied, duration)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, duration)
             }
             cache_control => cache_control,
         };

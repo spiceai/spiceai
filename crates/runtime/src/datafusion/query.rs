@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use datafusion::execution::SessionStateBuilder;
 use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
@@ -55,7 +57,6 @@ use {
     crate::datafusion::cluster::config::SpiceClusterConfig,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
-    datafusion::execution::SessionStateBuilder,
     datafusion::physical_planner::DefaultPhysicalPlanner,
     datafusion_proto::protobuf::LogicalPlanNode,
 };
@@ -67,15 +68,14 @@ use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
+use super::managed_runtime;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
+use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
-
-use super::managed_runtime;
-use managed_runtime::ManagedRuntimeError;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -98,6 +98,13 @@ pub enum Error {
 
     #[snafu(display("Failed to set parameters in logical plan: {source}"))]
     BindingParameters { source: DataFusionError },
+
+    #[snafu(display(
+        "Cache-Control header specifies 'stale-while-revalidate' which is only supported with cache_key_type: sql (raw). \
+        The current configuration uses cache_key_type: {cache_key_type}. \
+        Either remove 'stale-while-revalidate' from the Cache-Control header or change cache_key_type to 'sql'."
+    ))]
+    UnsupportedStaleWhileRevalidate { cache_key_type: String },
 }
 
 impl Error {

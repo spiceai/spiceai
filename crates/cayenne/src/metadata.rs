@@ -40,6 +40,8 @@ pub struct TableMetadata {
     pub current_snapshot_id: String,
     /// Partition column name (if this is a partitioned table)
     pub partition_column: Option<String>,
+    /// Vortex encoding configuration for this table
+    pub vortex_config: VortexConfig,
 }
 
 /// Represents a data file containing table rows.
@@ -124,6 +126,58 @@ pub struct PartitionStats {
     pub file_size_bytes: i64,
 }
 
+/// Configuration for Vortex encodings to optimize compression and performance.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct VortexConfig {
+    /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
+    pub enable_alp: bool,
+    /// Enable FSST (Fast String Suffix Trie) encoding for string columns
+    pub enable_fsst: bool,
+    /// Enable `BitPacking` encoding for integer columns
+    pub enable_bitpacking: bool,
+    /// Enable Delta encoding for sequential data
+    pub enable_delta: bool,
+    /// Enable Run-Length Encoding (RLE)
+    pub enable_rle: bool,
+    /// Enable Dictionary encoding for low-cardinality columns
+    pub enable_dict: bool,
+    /// Enable Frame-of-Reference (FOR) encoding
+    pub enable_for: bool,
+    /// Enable `ZigZag` encoding for signed integers
+    pub enable_zigzag: bool,
+    /// Footer cache size in MB
+    pub footer_cache_mb: usize,
+    /// Segment cache size in MB
+    pub segment_cache_mb: usize,
+    /// Target size for individual Vortex files in MB. When writes exceed this size,
+    /// a new Vortex file will be created in the same listing directory. This allows
+    /// for better parallelism and more granular statistics for query optimization.
+    /// Defaults to 256 MB.
+    pub target_vortex_file_size_mb: usize,
+}
+
+impl Default for VortexConfig {
+    fn default() -> Self {
+        Self {
+            // Enable all SIMD-optimized encodings by default
+            enable_alp: true,
+            enable_fsst: true,
+            enable_bitpacking: true,
+            enable_delta: true,
+            enable_rle: true,
+            enable_dict: true,
+            enable_for: true,
+            enable_zigzag: true,
+            // Cache configuration
+            footer_cache_mb: 128,
+            segment_cache_mb: 32,
+            // Target file size: 256 MB
+            target_vortex_file_size_mb: 256,
+        }
+    }
+}
+
 /// Options for creating a new Cayenne table.
 #[derive(Debug, Clone)]
 pub struct CreateTableOptions {
@@ -137,6 +191,8 @@ pub struct CreateTableOptions {
     pub base_path: String,
     /// Optional partition column name (for partitioned tables)
     pub partition_column: Option<String>,
+    /// Vortex encoding configuration
+    pub vortex_config: VortexConfig,
 }
 
 /// Statistics about a table.
