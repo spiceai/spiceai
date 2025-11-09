@@ -50,3 +50,21 @@ queries:
     sql: SELECT COUNT(*) as setosa_count FROM iris_csv WHERE species = 'setosa'
     expected_results:
       row_count: 1
+
+  # Test 8: Test parquet file with dynamic filter
+  - name: read_parquet_dynamic
+    sql: SELECT * FROM parquet_dynamic WHERE request_path = '/allenai/c4/default/train/0000.parquet' LIMIT 5
+    expected_results:
+      row_count: 5
+
+  # Test 9: Test auto-detection with CSV
+  - name: read_diamonds_auto
+    sql: SELECT COUNT(*) as total_rows FROM diamonds_auto
+    expected_results:
+      row_count: 1
+
+  # Test 10: Verify auto-detected CSV columns
+  - name: query_diamonds_auto
+    sql: SELECT AVG(price) as avg_price FROM diamonds_auto
+    expected_results:
+      row_count: 1

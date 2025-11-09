@@ -626,3 +626,267 @@ async fn test_http_with_retries() {
     assert!(!results.is_empty(), "Should have results");
     assert_eq!(results[0].num_rows(), 1, "Should have exactly one row");
 }
+
+/// Test CSV format with static file URL (no filters)
+/// Note: CSV data is returned in the 'content' column as text
+#[tokio::test]
+async fn test_csv_static_file() {
+    // Using a well-known CSV dataset
+    let base_url =
+        url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv")
+            .expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("iris", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Query the CSV file - content will be the raw CSV text
+    let df = ctx
+        .sql("SELECT content FROM iris")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+    let batch = &results[0];
+    assert_eq!(batch.num_rows(), 1, "Should have 1 row with CSV content");
+
+    // Verify content contains CSV data
+    let content_col = batch.column(0);
+    let content_array = content_col
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("content should be StringArray");
+    let content = content_array.value(0);
+
+    assert!(
+        content.contains("sepal_length"),
+        "Should contain CSV header"
+    );
+    assert!(
+        content.contains("setosa"),
+        "Should contain iris species data"
+    );
+}
+
+/// Test CSV format with column selection
+/// Note: When using CSV format, the actual CSV columns are in 'content', not as separate columns
+#[tokio::test]
+async fn test_csv_column_selection() {
+    let base_url =
+        url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv")
+            .expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("iris", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Select the content column which contains the CSV data
+    let df = ctx
+        .sql("SELECT content FROM iris")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+    let batch = &results[0];
+    assert_eq!(batch.num_columns(), 1, "Should have 1 column (content)");
+    assert_eq!(batch.num_rows(), 1, "Should have 1 row");
+
+    // Verify the content is valid CSV
+    let content_col = batch.column(0);
+    let content_array = content_col
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("content should be StringArray");
+    let content = content_array.value(0);
+
+    // Should have multiple lines (CSV rows)
+    assert!(content.lines().count() > 100, "Should have many CSV rows");
+}
+
+/// Test auto-detection format with CSV file
+/// Note: Auto-detection returns content as text, not parsed columns
+#[tokio::test]
+async fn test_auto_detect_csv() {
+    let base_url =
+        url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/tips.csv")
+            .expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "auto".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("tips", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Query should work with auto-detection
+    let df = ctx
+        .sql("SELECT content FROM tips")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+    let batch = &results[0];
+    assert_eq!(batch.num_rows(), 1, "Should have 1 row");
+
+    // Verify content is CSV
+    let content_col = batch.column(0);
+    let content_array = content_col
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("content should be StringArray");
+    let content = content_array.value(0);
+
+    assert!(content.contains("total_bill"), "Should contain CSV header");
+}
+
+/// Test auto-detection format with JSON file
+#[tokio::test]
+async fn test_auto_detect_json() {
+    let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "auto".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("tvmaze", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Query with auto-detection should work for JSON
+    let df = ctx
+        .sql("SELECT content FROM tvmaze WHERE request_path = '/shows/169'")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+    let batch = &results[0];
+    assert_eq!(batch.num_rows(), 1, "Should have 1 row");
+}
+
+/// Test NDJSON (newline-delimited JSON) format
+#[tokio::test]
+async fn test_ndjson_format() {
+    // Create a simple in-memory test - we'll use httpbin which returns JSON
+    // and treat it as NDJSON for format testing
+    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "ndjson".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("httpbin", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // This should work even though httpbin returns regular JSON
+    // The NDJSON parser will treat each line as a separate JSON object
+    let df = ctx
+        .sql("SELECT content FROM httpbin WHERE request_path = '/json'")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+}
+
+/// Test CSV format with dynamic filters (request_path)
+#[tokio::test]
+async fn test_csv_with_dynamic_filter() {
+    // Base URL pointing to a directory structure
+    let base_url = url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master")
+        .expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("datasets", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Use request_path to select different CSV files
+    let df = ctx
+        .sql("SELECT * FROM datasets WHERE request_path = '/iris.csv' LIMIT 5")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+    let batch = &results[0];
+
+    // Should have iris data columns
+    assert!(
+        batch.num_columns() > 3,
+        "Should have multiple data columns plus metadata"
+    );
+}
+
+/// Test multiple CSV files with IN clause
+#[tokio::test]
+async fn test_csv_multiple_files_in_clause() {
+    let base_url = url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master")
+        .expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("datasets", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Query multiple CSV files using IN clause
+    let df = ctx
+        .sql("SELECT request_path FROM datasets WHERE request_path IN ('/iris.csv', '/tips.csv')")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+
+    // Collect unique paths
+    let mut paths = std::collections::HashSet::new();
+    for batch in &results {
+        let path_col = batch.column(0);
+        let path_array = path_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("request_path should be StringArray");
+
+        for i in 0..batch.num_rows() {
+            paths.insert(path_array.value(i).to_string());
+        }
+    }
+
+    assert_eq!(
+        paths.len(),
+        2,
+        "Should have results from 2 different CSV files"
+    );
+    assert!(paths.contains("/iris.csv"), "Should include iris.csv");
+    assert!(paths.contains("/tips.csv"), "Should include tips.csv");
+}
+
+/// Test mixed format query - CSV and JSON with OR filter
+#[tokio::test]
+async fn test_mixed_format_csv_json_or() {
+    // This tests that the provider can handle different formats in the same query
+    // when using OR conditions with request_path
+    let base_url = url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master")
+        .expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "auto".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("data", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Note: In practice, mixing CSV and JSON in one query may not work well
+    // because they have different schemas. This tests the mechanism works.
+    let df = ctx
+        .sql("SELECT request_path FROM data WHERE request_path = '/iris.csv' OR request_path = '/tips.csv'")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+}

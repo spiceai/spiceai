@@ -60,103 +60,92 @@ impl DataConnector for Https {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        // Determine file format
-        let format = self
+        let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https", dataset.from),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            }
+        })?;
+
+        let timeout_secs = self
+            .params
+            .get("client_timeout")
+            .expose()
+            .ok()
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
+
+        let client = Client::builder()
+            .user_agent("spice")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(timeout_secs))
+            .pool_max_idle_per_host(10) // Allow connection reuse
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .boxed()
+            .map_err(|e| DataConnectorError::InternalWithSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            })?;
+
+        // Determine file format - default to "auto" if not specified
+        let file_format = self
             .params
             .get("file_format")
             .expose()
             .ok()
-            .map(str::to_ascii_lowercase);
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "auto".to_string());
 
-        // If file_format is not specified, default to auto-detection
-        // If file_format is set to 'json' or 'auto', use the HTTP table provider
-        // with virtual _path/_query/content columns
-        let use_http_provider =
-            format.is_none() || matches!(format.as_deref(), Some("json" | "auto"));
+        let acceleration_enabled = dataset.is_accelerated();
 
-        if use_http_provider {
-            let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
-                DataConnectorError::InvalidConfiguration {
-                    dataconnector: "https".to_string(),
-                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https", dataset.from),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: e,
-                }
-            })?;
+        // Handle http_max_retries parameter with default of 3
+        let max_retries = self
+            .params
+            .get("http_max_retries")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
 
-            let timeout_secs = self
-                .params
-                .get("client_timeout")
-                .expose()
-                .ok()
-                .and_then(|t| t.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
+        // Handle http_post_content_type parameter for POST requests
+        let content_type = self
+            .params
+            .get("http_post_content_type")
+            .expose()
+            .ok()
+            .map(std::string::ToString::to_string);
 
-            let client = Client::builder()
-                .user_agent("spice")
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(timeout_secs))
-                .pool_max_idle_per_host(10) // Allow connection reuse
-                .pool_idle_timeout(Duration::from_secs(90))
-                .build()
-                .boxed()
-                .map_err(|e| DataConnectorError::InternalWithSource {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: e,
-                })?;
+        let provider = data_components::http::provider::HttpTableProvider::new(
+            base_url,
+            client,
+            file_format,
+            acceleration_enabled,
+        )
+        .with_max_retries(max_retries)
+        .with_content_type(content_type);
 
-            let file_format = format.unwrap_or_else(|| "auto".to_string());
-            let acceleration_enabled = dataset.is_accelerated();
+        let provider = Arc::new(provider);
 
-            // Handle http_max_retries parameter with default of 3
-            let max_retries = self
-                .params
-                .get("http_max_retries")
-                .expose()
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(3);
+        // Validate the HTTP endpoint (non-blocking, log warnings only)
+        let provider_clone = Arc::clone(&provider);
+        let dataset_name = dataset.name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = provider_clone.validate_endpoint().await {
+                tracing::warn!(
+                    "HTTP endpoint validation failed for dataset '{}': {}. \
+                    The endpoint may be temporarily unavailable or misconfigured. \
+                    Queries will continue but may fail if the endpoint is not accessible.",
+                    dataset_name,
+                    e
+                );
+            }
+        });
 
-            // Handle http_post_content_type parameter for POST requests
-            let content_type = self
-                .params
-                .get("http_post_content_type")
-                .expose()
-                .ok()
-                .map(std::string::ToString::to_string);
-
-            let provider = data_components::http::provider::HttpTableProvider::new(
-                base_url,
-                client,
-                file_format,
-                acceleration_enabled,
-            )
-            .with_max_retries(max_retries)
-            .with_content_type(content_type);
-
-            let provider = Arc::new(provider);
-
-            // Validate the HTTP endpoint (non-blocking, log warnings only)
-            let provider_clone = Arc::clone(&provider);
-            let dataset_name = dataset.name.clone();
-            tokio::spawn(async move {
-                if let Err(e) = provider_clone.validate_endpoint().await {
-                    tracing::warn!(
-                        "HTTP endpoint validation failed for dataset '{}': {}. \
-                        The endpoint may be temporarily unavailable or misconfigured. \
-                        Queries will continue but may fail if the endpoint is not accessible.",
-                        dataset_name,
-                        e
-                    );
-                }
-            });
-
-            Ok(provider)
-        } else {
-            // For other formats, use the listing table connector implementation
-            <Https as DataConnector>::read_provider(self, dataset).await
-        }
+        Ok(provider)
     }
 }
 
@@ -215,79 +204,5 @@ impl DataConnectorFactory for HttpsFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         &PARAMETERS
-    }
-}
-
-impl ListingTableConnector for Https {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn get_params(&self) -> &Parameters {
-        &self.params
-    }
-
-    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
-        self.tokio_io_runtime.clone()
-    }
-
-    fn get_object_store_url(
-        &self,
-        dataset: &Dataset,
-        url: Option<&str>,
-    ) -> DataConnectorResult<Url> {
-        let url = url.unwrap_or(dataset.from.as_str());
-        let mut u = Url::parse(url).boxed().map_err(|e| {
-            DataConnectorError::InvalidConfiguration {
-                dataconnector: "https".to_string(),
-                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https"),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
-            }
-        })?;
-
-        if let Some(p) = self.params.get("port").expose().ok() {
-            let n = match p.parse::<u16>() {
-                Ok(n) => n,
-                Err(e) => {
-                    return Err(DataConnectorError::InvalidConfiguration {
-                        dataconnector: "https".to_string(),
-                        message: "The specified `https_port` parameter was invalid. Specify a valid port number and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https#parameters".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(e),
-                    });
-                }
-            };
-            let _ = u.set_port(Some(n));
-        }
-
-        if let Some(p) = self.params.get("password").expose().ok()
-            && u.set_password(Some(p)).is_err()
-        {
-            return Err(
-                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            );
-        }
-
-        if let Some(p) = self.params.get("username").expose().ok()
-            && u.set_username(p).is_err()
-        {
-            return Err(
-                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            );
-        }
-
-        u.set_fragment(Some(&listing::build_fragments(
-            &self.params,
-            vec!["client_timeout"],
-        )));
-
-        Ok(u)
     }
 }

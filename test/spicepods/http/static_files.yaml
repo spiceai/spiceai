@@ -29,3 +29,21 @@ datasets:
     acceleration:
       enabled: true
       refresh_mode: full
+
+  # Parquet file example - using publicly available parquet dataset
+  - from: https://datasets-server.huggingface.co/parquet
+    name: parquet_dynamic
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+      refresh_mode: full
+
+  # Test auto-detection with CSV
+  - from: https://raw.githubusercontent.com/mwaskom/seaborn-data/master/diamonds.csv
+    name: diamonds_auto
+    params:
+      file_format: auto
+    acceleration:
+      enabled: true
+      refresh_mode: full
