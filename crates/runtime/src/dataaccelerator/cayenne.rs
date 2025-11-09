@@ -325,8 +325,11 @@ impl CayenneAccelerator {
             config.footer_cache_mb = parse_usize("cayenne_footer_cache_mb", 64);
             config.segment_cache_mb = parse_usize("cayenne_segment_cache_mb", 0);
 
+            // Parse file size options
+            config.target_vortex_file_size_mb = parse_usize("cayenne_target_file_size_mb", 256);
+
             tracing::info!(
-                "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB",
+                "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB",
                 config.enable_alp,
                 config.enable_fsst,
                 config.enable_bitpacking,
@@ -336,7 +339,8 @@ impl CayenneAccelerator {
                 config.enable_for,
                 config.enable_zigzag,
                 config.footer_cache_mb,
-                config.segment_cache_mb
+                config.segment_cache_mb,
+                config.target_vortex_file_size_mb
             );
         }
 
