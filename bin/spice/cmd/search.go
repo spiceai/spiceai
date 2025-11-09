@@ -34,6 +34,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
+	"github.com/spiceai/spiceai/bin/spice/pkg/history"
 	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -179,13 +180,34 @@ spice search --cloud
 		cmd.Println("Welcome to the Spice.ai search REPL! Enter your search queries.")
 		cmd.Println()
 
+		// Initialize history manager
+		historyMgr, err := history.NewManager(history.SearchHistory)
+		if err != nil {
+			slog.Warn("failed to initialize search history", "error", err)
+			historyMgr = nil
+		}
+
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer func() {
+			// Save history before closing
+			if historyMgr != nil {
+				if err := historyMgr.Save(); err != nil {
+					slog.Warn("failed to save search history", "error", err)
+				}
+			}
 			if err := line.Close(); err != nil {
 				slog.Error("closing line", "error", err)
 			}
 		}()
+
+		// Load history into liner
+		if historyMgr != nil {
+			historyMgr.LoadIntoLiner(line)
+			// Enable tab completion based on history
+			line.SetCompleter(historyMgr.GetCompleter())
+		}
+
 		for {
 			message, err := line.Prompt("search> ")
 			if err == liner.ErrPromptAborted {
@@ -203,7 +225,36 @@ spice search --cloud
 				continue
 			}
 
+			if strings.ToLower(message) == ".clear" {
+				// Clear the screen using ANSI escape codes
+				cmd.Print("\033[H\033[2J")
+				continue
+			}
+
+			if strings.ToLower(message) == ".clear history" {
+				if historyMgr != nil {
+					historyMgr.Clear()
+					if err := historyMgr.Save(); err != nil {
+						cmd.Printf("\033[31mError:\033[0m Failed to clear history: %v\n", err)
+					} else {
+						cmd.Println("Search history cleared.")
+					}
+				} else {
+					cmd.Println("History is not available.")
+				}
+				continue
+			}
+
 			line.AppendHistory(message)
+
+			// Add to persistent history and save immediately
+			if historyMgr != nil {
+				historyMgr.Add(message)
+				if err := historyMgr.Save(); err != nil {
+					slog.Warn("failed to save search history", "error", err)
+				}
+			}
+
 			done := make(chan bool)
 			go func() {
 				util.ShowSpinner(done)
@@ -414,13 +465,33 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 	}
 	cmd.Println()
 
+	// Initialize history manager
+	historyMgr, err := history.NewManager(history.SearchHistory)
+	if err != nil {
+		slog.Warn("failed to initialize search history", "error", err)
+		historyMgr = nil
+	}
+
 	line := liner.NewLiner()
 	line.SetCtrlCAborts(true)
 	defer func() {
+		// Save history before closing
+		if historyMgr != nil {
+			if err := historyMgr.Save(); err != nil {
+				slog.Warn("failed to save search history", "error", err)
+			}
+		}
 		if err := line.Close(); err != nil {
 			slog.Error("closing line", "error", err)
 		}
 	}()
+
+	// Load history into liner
+	if historyMgr != nil {
+		historyMgr.LoadIntoLiner(line)
+		// Enable tab completion based on history
+		line.SetCompleter(historyMgr.GetCompleter())
+	}
 
 	for {
 		message, err := line.Prompt("search> ")
@@ -439,7 +510,35 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 			continue
 		}
 
+		if strings.ToLower(message) == ".clear" {
+			// Clear the screen using ANSI escape codes
+			cmd.Print("\033[H\033[2J")
+			continue
+		}
+
+		if strings.ToLower(message) == ".clear history" {
+			if historyMgr != nil {
+				historyMgr.Clear()
+				if err := historyMgr.Save(); err != nil {
+					cmd.Printf("\033[31mError:\033[0m Failed to clear history: %v\n", err)
+				} else {
+					cmd.Println("Search history cleared.")
+				}
+			} else {
+				cmd.Println("History is not available.")
+			}
+			continue
+		}
+
 		line.AppendHistory(message)
+
+		// Add to persistent history and save immediately
+		if historyMgr != nil {
+			historyMgr.Add(message)
+			if err := historyMgr.Save(); err != nil {
+				slog.Warn("failed to save search history", "error", err)
+			}
+		}
 
 		// Send search request
 		searchReq := &SearchRequest{

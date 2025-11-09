@@ -28,11 +28,7 @@ use crate::s3_vectors::{
 const LIST_S3_VECTORS_NUM_READ_SEGMENTS: usize = 10;
 
 use super::{S3VectorIdentifier, SpillIndex};
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-    json::ReaderBuilder,
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, json::ReaderBuilder};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -317,16 +313,8 @@ impl S3VectorsListExec {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Self {
-        let projected_schema = match projection {
-            Some(proj) => {
-                let fields = proj
-                    .iter()
-                    .map(|&i| table.schema().field(i).clone())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            }
-            None => table.schema(),
-        };
+        let projected_schema =
+            project_schema(&table.schema(), projection).unwrap_or_else(|_| table.schema());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
@@ -587,7 +575,7 @@ mod tests {
 
     use super::*;
 
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{logical_expr::col, prelude::SessionContext, scalar::ScalarValue};
     use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
