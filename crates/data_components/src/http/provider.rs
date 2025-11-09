@@ -145,7 +145,7 @@ impl HttpTableProvider {
             client,
             file_format,
             schema: Arc::new(Self::base_table_schema()),
-            // Mark `_path`, `_query`, and `_body` as primary key components
+            // Mark `request_path`, `request_query`, and `request_body` as primary key components
             constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1, 2])]),
             cache: Arc::new(RwLock::new(HashMap::new())),
             acceleration_enabled,
@@ -171,9 +171,9 @@ impl HttpTableProvider {
     #[must_use]
     pub fn base_table_schema() -> Schema {
         Schema::new(vec![
-            Field::new("_path", DataType::Utf8, false),
-            Field::new("_query", DataType::Utf8, true),
-            Field::new("_body", DataType::Utf8, true),
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
         ])
     }
@@ -364,10 +364,9 @@ impl HttpTableProvider {
             let request_builder = if let Some(ref body_content) = body_owned {
                 let mut req = client.post(url.clone());
 
-                // Set Content-Type if specified
-                if let Some(ref ct) = content_type {
-                    req = req.header("Content-Type", ct);
-                }
+                // Set Content-Type header, defaulting to application/json if not specified
+                let ct = content_type.as_deref().unwrap_or("application/json");
+                req = req.header("Content-Type", ct);
 
                 req.body(body_content.clone())
             } else {
@@ -543,7 +542,7 @@ impl TableProvider for HttpTableProvider {
         }
 
         // Extract all (path, query) pairs from filters (supporting IN/OR)
-        let partitions = Self::extract_partitions(filters, &self.base_url);
+        let partitions = Self::extract_partitions(filters);
 
         tracing::debug!("Extracted {} partitions from filters", partitions.len());
         for (i, partition) in partitions.iter().enumerate() {
@@ -607,7 +606,7 @@ impl HttpExec {
         let body_val = body.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: _path={:?}, _query={:?}, _body={:?}",
+            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
             partition,
             path_val,
             query_val,
@@ -650,13 +649,13 @@ impl HttpExec {
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                "_path" => {
+                "request_path" => {
                     Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
                 }
-                "_query" => {
+                "request_query" => {
                     Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows])) as ArrayRef)
                 }
-                "_body" => {
+                "request_body" => {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
@@ -804,7 +803,6 @@ impl HttpTableProvider {
     /// Extract all (path, query) pairs from filters, supporting =, IN, and OR expressions
     fn extract_partitions(
         filters: &[Expr],
-        _base_url: &url::Url,
     ) -> Vec<(Option<String>, Option<String>, Option<String>)> {
         // Extract path, query, and body values from filters
         let mut paths: Vec<String> = vec![];
@@ -869,21 +867,21 @@ impl HttpTableProvider {
         has_body_filter: &mut bool,
     ) {
         match filter {
-            // Handle equality: _path = 'value', _query = 'value', or _body = 'value'
+            // Handle equality: request_path = 'value', request_query = 'value', or request_body = 'value'
             Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
                 if let Expr::Column(col) = left.as_ref()
                     && let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = right.as_ref()
                 {
                     match col.name.as_str() {
-                        "_path" => {
+                        "request_path" => {
                             paths.push(value.clone());
                             *has_path_filter = true;
                         }
-                        "_query" => {
+                        "request_query" => {
                             queries.push(Some(value.clone()));
                             *has_query_filter = true;
                         }
-                        "_body" => {
+                        "request_body" => {
                             bodies.push(Some(value.clone()));
                             *has_body_filter = true;
                         }
@@ -891,23 +889,26 @@ impl HttpTableProvider {
                     }
                 }
             }
-            // Handle IN list: _path IN (...), _query IN (...), or _body IN (...)
+            // Handle IN list: request_path IN (...), request_query IN (...), or request_body IN (...)
             Expr::InList(in_list) => {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
                     let column_name = col.name.as_str();
-                    if matches!(column_name, "_path" | "_query" | "_body") {
+                    if matches!(
+                        column_name,
+                        "request_path" | "request_query" | "request_body"
+                    ) {
                         for expr in &in_list.list {
                             if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = expr {
                                 match column_name {
-                                    "_path" => {
+                                    "request_path" => {
                                         paths.push(value.clone());
                                         *has_path_filter = true;
                                     }
-                                    "_query" => {
+                                    "request_query" => {
                                         queries.push(Some(value.clone()));
                                         *has_query_filter = true;
                                     }
-                                    "_body" => {
+                                    "request_body" => {
                                         bodies.push(Some(value.clone()));
                                         *has_body_filter = true;
                                     }
@@ -967,18 +968,24 @@ impl HttpTableProvider {
     /// Check if a filter expression can be pushed down to HTTP requests
     fn can_pushdown_filter(filter: &Expr) -> bool {
         match filter {
-            // Simple equality on _path, _query, or _body
+            // Simple equality on request_path, request_query, or request_body
             Expr::BinaryExpr(BinaryExpr { left, op, right: _ }) if *op == Operator::Eq => {
                 if let Expr::Column(col) = left.as_ref() {
-                    matches!(col.name.as_str(), "_path" | "_query" | "_body")
+                    matches!(
+                        col.name.as_str(),
+                        "request_path" | "request_query" | "request_body"
+                    )
                 } else {
                     false
                 }
             }
-            // IN list on _path, _query, or _body
+            // IN list on request_path, request_query, or request_body
             Expr::InList(in_list) => {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
-                    matches!(col.name.as_str(), "_path" | "_query" | "_body")
+                    matches!(
+                        col.name.as_str(),
+                        "request_path" | "request_query" | "request_body"
+                    )
                 } else {
                     false
                 }
@@ -1004,12 +1011,10 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_path_and_query_filters() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         // Create filters: path = '/singlesearch/shows' AND query = 'q=South%20Park'
         let filters = vec![
             Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_path"))),
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("/singlesearch/shows".to_string())),
@@ -1017,7 +1022,7 @@ mod tests {
                 )),
             }),
             Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_query"))),
+                left: Box::new(Expr::Column(Column::from_name("request_query"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("q=South%20Park".to_string())),
@@ -1026,7 +1031,7 @@ mod tests {
             }),
         ];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 1);
         assert_eq!(
@@ -1041,10 +1046,8 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_only_path_filter() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::from_name("_path"))),
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
             op: Operator::Eq,
             right: Box::new(Expr::Literal(
                 ScalarValue::Utf8(Some("/api/data".to_string())),
@@ -1052,7 +1055,7 @@ mod tests {
             )),
         })];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0], (Some("/api/data".to_string()), None, None));
@@ -1060,11 +1063,9 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_no_filters() {
-        let base_url = Url::parse("https://api.example.com/default/path").expect("valid URL");
-
         let filters = vec![];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0], (None, None, None));
@@ -1072,11 +1073,9 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_multiple_paths() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         let filters = vec![
             Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_path"))),
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("/path1".to_string())),
@@ -1084,7 +1083,7 @@ mod tests {
                 )),
             }),
             Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_path"))),
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("/path2".to_string())),
@@ -1093,7 +1092,7 @@ mod tests {
             }),
         ];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.contains(&(Some("/path1".to_string()), None, None)));
@@ -1102,11 +1101,9 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_in_list_path() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         // Create filter: path IN ('/api/v1/users', '/api/v1/posts')
         let filters = vec![Expr::InList(InList::new(
-            Box::new(Expr::Column(Column::from_name("_path"))),
+            Box::new(Expr::Column(Column::from_name("request_path"))),
             vec![
                 Expr::Literal(ScalarValue::Utf8(Some("/api/v1/users".to_string())), None),
                 Expr::Literal(ScalarValue::Utf8(Some("/api/v1/posts".to_string())), None),
@@ -1114,7 +1111,7 @@ mod tests {
             false,
         ))];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.contains(&(Some("/api/v1/users".to_string()), None, None)));
@@ -1123,11 +1120,9 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_in_list_query() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         // Create filter: query IN ('limit=10', 'limit=20')
         let filters = vec![Expr::InList(InList::new(
-            Box::new(Expr::Column(Column::from_name("_query"))),
+            Box::new(Expr::Column(Column::from_name("request_query"))),
             vec![
                 Expr::Literal(ScalarValue::Utf8(Some("limit=10".to_string())), None),
                 Expr::Literal(ScalarValue::Utf8(Some("limit=20".to_string())), None),
@@ -1135,7 +1130,7 @@ mod tests {
             false,
         ))];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.contains(&(None, Some("limit=10".to_string()), None)));
@@ -1144,12 +1139,10 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_or_expression() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         // Create filter: path = '/api/v1' OR path = '/api/v2'
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_path"))),
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("/api/v1".to_string())),
@@ -1158,7 +1151,7 @@ mod tests {
             })),
             op: Operator::Or,
             right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_path"))),
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("/api/v2".to_string())),
@@ -1167,7 +1160,7 @@ mod tests {
             })),
         })];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         assert_eq!(partitions.len(), 2);
         assert!(partitions.contains(&(Some("/api/v1".to_string()), None, None)));
@@ -1176,12 +1169,10 @@ mod tests {
 
     #[test]
     fn test_extract_partitions_with_combined_filters() {
-        let base_url = Url::parse("https://api.example.com").expect("valid URL");
-
         // Create filters: path = '/api/users' AND query IN ('limit=10', 'limit=20')
         let filters = vec![
             Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("_path"))),
+                left: Box::new(Expr::Column(Column::from_name("request_path"))),
                 op: Operator::Eq,
                 right: Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("/api/users".to_string())),
@@ -1189,7 +1180,7 @@ mod tests {
                 )),
             }),
             Expr::InList(InList::new(
-                Box::new(Expr::Column(Column::from_name("_query"))),
+                Box::new(Expr::Column(Column::from_name("request_query"))),
                 vec![
                     Expr::Literal(ScalarValue::Utf8(Some("limit=10".to_string())), None),
                     Expr::Literal(ScalarValue::Utf8(Some("limit=20".to_string())), None),
@@ -1198,7 +1189,7 @@ mod tests {
             )),
         ];
 
-        let partitions = HttpTableProvider::extract_partitions(&filters, &base_url);
+        let partitions = HttpTableProvider::extract_partitions(&filters);
 
         // Should create cross product: 1 path * 2 queries = 2 partitions
         assert_eq!(partitions.len(), 2);
@@ -1307,17 +1298,17 @@ mod tests {
         let schema = HttpTableProvider::base_table_schema();
 
         assert_eq!(schema.fields().len(), 4);
-        assert_eq!(schema.field(0).name(), "_path");
-        assert_eq!(schema.field(1).name(), "_query");
-        assert_eq!(schema.field(2).name(), "_body");
+        assert_eq!(schema.field(0).name(), "request_path");
+        assert_eq!(schema.field(1).name(), "request_query");
+        assert_eq!(schema.field(2).name(), "request_body");
         assert_eq!(schema.field(3).name(), "content");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
-        assert!(!schema.field(0).is_nullable()); // _path is not nullable
-        assert!(schema.field(1).is_nullable()); // _query is nullable
-        assert!(schema.field(2).is_nullable()); // _body is nullable
+        assert!(!schema.field(0).is_nullable()); // request_path is not nullable
+        assert!(schema.field(1).is_nullable()); // request_query is nullable
+        assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
     }
 }

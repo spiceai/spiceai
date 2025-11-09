@@ -1,0 +1,50 @@
+version: v1
+kind: Spicepod
+name: http_basic
+
+datasets:
+  # Basic GET request - httpbin.org/json
+  - from: https://httpbin.org
+    name: httpbin_json
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, content 
+        FROM httpbin_json 
+        WHERE request_path = '/json'
+
+  # GET with query parameters
+  - from: https://httpbin.org
+    name: httpbin_get
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, request_query, content 
+        FROM httpbin_get 
+        WHERE request_path = '/get' 
+          AND request_query = 'param1=value1&param2=value2'
+
+  # Multiple paths with OR
+  - from: https://httpbin.org
+    name: httpbin_multiple
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, content 
+        FROM httpbin_multiple 
+        WHERE request_path = '/json' 
+           OR request_path = '/uuid'
+
+  # Status codes - testing different endpoints
+  - from: https://httpbin.org
+    name: httpbin_status
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, content 
+        FROM httpbin_status 
+        WHERE request_path IN ('/status/200', '/status/201')

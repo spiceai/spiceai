@@ -1,0 +1,110 @@
+# Query set for HTTP connector POST request tests
+name: http_post_requests
+queries:
+  # Test 1: POST with JSON body creates a resource
+  - name: post_json_body
+    sql: |
+      SELECT request_path, request_body, content 
+      FROM create_post 
+      WHERE request_path = '/posts' 
+        AND request_body = '{"title": "foo", "body": "bar", "userId": 1}'
+    expected_results:
+      row_count: 1
+
+  # Test 2: Verify POST response contains our data
+  - name: verify_post_response
+    sql: |
+      SELECT 
+        request_path,
+        json_get(content, 'title') as title,
+        json_get(content, 'userId') as user_id
+      FROM create_post
+      WHERE request_body = '{"title": "foo", "body": "bar", "userId": 1}'
+    expected_results:
+      row_count: 1
+
+  # Test 3: POST with form-encoded content type
+  - name: post_form_encoded
+    sql: |
+      SELECT request_path, request_body, content 
+      FROM post_form 
+      WHERE request_path = '/post'
+        AND request_body = 'key1=value1&key2=value2'
+    expected_results:
+      row_count: 1
+
+  # Test 4: POST with default JSON content type (application/json)
+  - name: post_default_json
+    sql: |
+      SELECT request_path, request_body, content 
+      FROM post_json_default 
+      WHERE request_path = '/post'
+        AND request_body = '{"test": "data"}'
+    expected_results:
+      row_count: 1
+
+  # Test 5: Verify httpbin echoes back our form data
+  - name: verify_form_echo
+    sql: |
+      SELECT 
+        request_path,
+        json_get(content, 'form') as form_data
+      FROM post_form
+      WHERE request_body = 'key1=value1&key2=value2'
+    expected_results:
+      row_count: 1
+
+  # Test 6: Multiple POST requests with different bodies
+  - name: multiple_post_bodies
+    sql: |
+      SELECT request_body, COUNT(*) as count
+      FROM multiple_posts
+      WHERE request_path = '/posts'
+        AND request_body IN (
+          '{"title": "foo", "body": "bar", "userId": 1}',
+          '{"title": "test", "body": "content", "userId": 2}'
+        )
+      GROUP BY request_body
+      ORDER BY request_body
+    expected_results:
+      row_count: 2
+
+  # Test 7: Verify each POST body is separate
+  - name: verify_separate_posts
+    sql: |
+      SELECT request_path, request_body
+      FROM multiple_posts
+      ORDER BY request_body
+    expected_results:
+      row_count: 2
+
+  # Test 8: Verify httpbin POST response structure
+  - name: verify_httpbin_structure
+    sql: |
+      SELECT 
+        request_path,
+        json_get(content, 'url') as url,
+        json_get(content, 'data') as data
+      FROM post_json_default
+      WHERE request_body = '{"test": "data"}'
+    expected_results:
+      row_count: 1
+
+  # Test 9: Verify JSONPlaceholder response contains id
+  - name: verify_jsonplaceholder_id
+    sql: |
+      SELECT 
+        json_get(content, 'id') as post_id
+      FROM create_post
+      WHERE request_body = '{"title": "foo", "body": "bar", "userId": 1}'
+    expected_results:
+      row_count: 1
+
+  # Test 10: Test POST without request_body filter (should use base URL with no body)
+  - name: post_withoutrequest_body
+    sql: |
+      SELECT request_path, request_query
+      FROM post_json_default
+      WHERE request_path = '/get'
+    expected_results:
+      row_count: 1

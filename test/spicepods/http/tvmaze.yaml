@@ -10,9 +10,9 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM show_details 
-        WHERE _path = '/shows/169'
+        WHERE request_path = '/shows/169'
 
   # JSON array endpoint - People search (expands to multiple rows)
   - from: https://api.tvmaze.com
@@ -21,10 +21,10 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM people_search 
-        WHERE _path = '/search/people' 
-          AND _query = 'q=michael'
+        WHERE request_path = '/search/people' 
+          AND request_query = 'q=michael'
 
   # Combined OR filter across different endpoints
   - from: https://api.tvmaze.com
@@ -33,10 +33,10 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM combined_data 
-        WHERE (_path = '/search/people' AND _query = 'q=michael')
-           OR _path = '/shows/169'
+        WHERE (request_path = '/search/people' AND request_query = 'q=michael')
+           OR request_path = '/shows/169'
 
   # IN list with multiple show IDs
   - from: https://api.tvmaze.com
@@ -45,6 +45,6 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM multiple_shows 
-        WHERE _path IN ('/shows/169', '/shows/170', '/shows/171')
+        WHERE request_path IN ('/shows/169', '/shows/170', '/shows/171')

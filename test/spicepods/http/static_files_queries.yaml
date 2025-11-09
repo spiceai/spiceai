@@ -1,0 +1,52 @@
+# Query set for HTTP connector static file tests
+name: http_static_files
+queries:
+  # Test 1: Read CSV file directly - Iris dataset
+  - name: read_iris_csv
+    sql: SELECT COUNT(*) as total_rows FROM iris_csv
+    expected_results:
+      row_count: 1
+
+  # Test 2: Verify CSV columns are parsed correctly
+  - name: verify_iris_structure
+    sql: |
+      SELECT 
+        sepal_length, 
+        sepal_width, 
+        petal_length,
+        petal_width,
+        species 
+      FROM iris_csv 
+      LIMIT 1
+    expected_results:
+      row_count: 1
+
+  # Test 3: Read JSON array file directly
+  - name: read_json_array
+    sql: SELECT * FROM json_array LIMIT 5
+    expected_results:
+      row_count: 5
+
+  # Test 4: Read second CSV file
+  - name: read_tips_csv
+    sql: SELECT COUNT(*) as total_rows FROM tips_csv
+    expected_results:
+      row_count: 1
+
+  # Test 5: Query CSV data - count distinct species
+  - name: query_iris_species
+    sql: SELECT COUNT(DISTINCT species) as species_count FROM iris_csv
+    expected_results:
+      row_count: 1
+
+  # Test 6: Query tips data - verify numeric columns
+  - name: query_tips_data
+    sql: SELECT AVG(total_bill) as avg_bill FROM tips_csv
+    expected_results:
+      row_count: 1
+
+  # Test 7: Filter iris data
+  - name: filter_iris_data
+    sql: SELECT COUNT(*) as setosa_count FROM iris_csv WHERE species = 'setosa'
+    expected_results:
+      row_count: 1

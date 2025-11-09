@@ -154,27 +154,9 @@ impl DataConnector for Https {
 
             Ok(provider)
         } else {
-            // For other formats, use the listing table connector
-            // Create a wrapper that implements ListingTableConnector
-            let wrapper = HttpsListingWrapper {
-                params: self.params.clone(),
-                tokio_io_runtime: self.tokio_io_runtime.clone(),
-            };
-            <HttpsListingWrapper as DataConnector>::read_provider(&wrapper, dataset).await
+            // For other formats, use the listing table connector implementation
+            <Https as DataConnector>::read_provider(self, dataset).await
         }
-    }
-}
-
-// Wrapper struct to use the ListingTableConnector implementation
-#[derive(Debug, Clone)]
-struct HttpsListingWrapper {
-    params: Parameters,
-    tokio_io_runtime: Handle,
-}
-
-impl std::fmt::Display for HttpsListingWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "https")
     }
 }
 
@@ -204,7 +186,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("http_max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("http_post_content_type")
-            .description("Content-Type header for POST requests when using _body filter."),
+            .description("Content-Type header for POST requests when using _body filter. Defaults to 'application/json'."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -236,7 +218,7 @@ impl DataConnectorFactory for HttpsFactory {
     }
 }
 
-impl ListingTableConnector for HttpsListingWrapper {
+impl ListingTableConnector for Https {
     fn as_any(&self) -> &dyn Any {
         self
     }

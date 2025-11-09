@@ -32,7 +32,9 @@ async fn test_http_provider_with_real_endpoint() {
 
     // Query with specific path and no query string
     let df = ctx
-        .sql("SELECT _path, _query, content FROM httpbin WHERE _path = '/json'")
+        .sql(
+            "SELECT request_path, request_query, content FROM httpbin WHERE request_path = '/json'",
+        )
         .await
         .expect("Failed to create dataframe");
 
@@ -58,7 +60,7 @@ async fn test_http_provider_with_real_endpoint() {
 
 /// Test with query parameters
 #[tokio::test]
-async fn test_http_provider_with_query_params() {
+async fn test_http_provider_withrequest_query_params() {
     let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
     let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
@@ -69,7 +71,7 @@ async fn test_http_provider_with_query_params() {
     // Query with path and query parameters
     let df = ctx
         .sql(
-            "SELECT _path, _query, content FROM httpbin WHERE _path = '/get' AND _query = 'test=value'",
+            "SELECT request_path, request_query, content FROM httpbin WHERE request_path = '/get' AND request_query = 'test=value'",
         )
         .await
         .expect("Failed to create dataframe");
@@ -124,7 +126,7 @@ async fn test_http_provider_without_filters() {
 
 /// Test with base URL that has a path component
 #[tokio::test]
-async fn test_http_provider_with_base_path() {
+async fn test_http_provider_with_baserequest_path() {
     let base_url = url::Url::parse("https://httpbin.org/anything/base").expect("valid URL");
     let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
@@ -134,7 +136,7 @@ async fn test_http_provider_with_base_path() {
 
     // The filter path should be appended to the base path
     let df = ctx
-        .sql("SELECT _path, content FROM httpbin WHERE _path = '/extra'")
+        .sql("SELECT request_path, content FROM httpbin WHERE request_path = '/extra'")
         .await
         .expect("Failed to create dataframe");
 
@@ -172,7 +174,7 @@ async fn test_tvmaze_single_object() {
 
     // Query for a specific show (Breaking Bad, ID 169)
     let df = ctx
-        .sql("SELECT _path, _query, content FROM tvmaze WHERE _path = '/shows/169'")
+        .sql("SELECT request_path, request_query, content FROM tvmaze WHERE request_path = '/shows/169'")
         .await
         .expect("Failed to create dataframe");
 
@@ -223,7 +225,7 @@ async fn test_tvmaze_multi_object() {
     // Query for people search results
     let df = ctx
         .sql(
-            "SELECT _path, _query, content FROM tvmaze WHERE _path = '/search/people' AND _query = 'q=michael'",
+            "SELECT request_path, request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=michael'",
         )
         .await
         .expect("Failed to create dataframe");
@@ -258,29 +260,29 @@ async fn test_tvmaze_multi_object() {
         "Each result should have a person object"
     );
 
-    // Verify all rows have the same _path and _query
+    // Verify all rows have the same request_path and request_query
     let path_col = batch.column(0);
     let path_array = path_col
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .expect("_path should be StringArray");
+        .expect("request_path should be StringArray");
 
     let query_col = batch.column(1);
     let query_array = query_col
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .expect("_query should be StringArray");
+        .expect("request_query should be StringArray");
 
     for i in 0..batch.num_rows() {
         assert_eq!(
             path_array.value(i),
             "/search/people",
-            "All rows should have the same _path"
+            "All rows should have the same request_path"
         );
         assert_eq!(
             query_array.value(i),
             "q=michael",
-            "All rows should have the same _query"
+            "All rows should have the same request_query"
         );
     }
 }
@@ -298,12 +300,12 @@ async fn test_tvmaze_combined_or_filter() {
         .expect("Failed to register table");
 
     // Query combining single object and array endpoints
-    // Note: We only filter on _path for the single object, not on _query
+    // Note: We only filter on request_path for the single object, not on request_query
     let df = ctx
         .sql(
-            "SELECT _path, _query, content FROM tvmaze 
-             WHERE _path = '/shows/169' 
-                OR (_path = '/search/people' AND _query = 'q=michael')",
+            "SELECT request_path, request_query, content FROM tvmaze 
+             WHERE request_path = '/shows/169' 
+                OR (request_path = '/search/people' AND request_query = 'q=michael')",
         )
         .await
         .expect("Failed to create dataframe");
@@ -321,7 +323,7 @@ async fn test_tvmaze_combined_or_filter() {
         let path_array = path_col
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .expect("_path should be StringArray");
+            .expect("request_path should be StringArray");
 
         for i in 0..batch.num_rows() {
             match path_array.value(i) {
@@ -343,7 +345,7 @@ async fn test_tvmaze_combined_or_filter() {
 /// Tests using IN clause for multiple paths
 /// Expected: Returns rows from multiple different endpoints
 #[tokio::test]
-async fn test_tvmaze_in_list_paths() {
+async fn test_tvmaze_in_listrequest_paths() {
     let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
     let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
 
@@ -354,8 +356,8 @@ async fn test_tvmaze_in_list_paths() {
     // Query multiple show IDs using IN clause
     let df = ctx
         .sql(
-            "SELECT _path, content FROM tvmaze 
-             WHERE _path IN ('/shows/169', '/shows/1', '/shows/82')",
+            "SELECT request_path, content FROM tvmaze 
+             WHERE request_path IN ('/shows/169', '/shows/1', '/shows/82')",
         )
         .await
         .expect("Failed to create dataframe");
@@ -365,7 +367,7 @@ async fn test_tvmaze_in_list_paths() {
     assert!(!results.is_empty(), "Should have results");
 
     // Collect unique paths and verify we got all 3 paths
-    let mut unique_paths = std::collections::HashSet::new();
+    let mut uniquerequest_paths = std::collections::HashSet::new();
     let mut show_ids = Vec::new();
 
     for batch in &results {
@@ -373,7 +375,7 @@ async fn test_tvmaze_in_list_paths() {
         let path_array = path_col
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .expect("_path should be StringArray");
+            .expect("request_path should be StringArray");
 
         let content_col = batch.column(1);
         let content_array = content_col
@@ -383,7 +385,7 @@ async fn test_tvmaze_in_list_paths() {
 
         for i in 0..batch.num_rows() {
             let path = path_array.value(i);
-            unique_paths.insert(path.to_string());
+            uniquerequest_paths.insert(path.to_string());
 
             let content = content_array.value(i);
             // Extract ID from JSON (basic check)
@@ -398,20 +400,20 @@ async fn test_tvmaze_in_list_paths() {
     }
 
     assert_eq!(
-        unique_paths.len(),
+        uniquerequest_paths.len(),
         3,
         "Should have queried exactly 3 unique paths"
     );
     assert!(
-        unique_paths.contains("/shows/169"),
+        uniquerequest_paths.contains("/shows/169"),
         "Should include path /shows/169"
     );
     assert!(
-        unique_paths.contains("/shows/1"),
+        uniquerequest_paths.contains("/shows/1"),
         "Should include path /shows/1"
     );
     assert!(
-        unique_paths.contains("/shows/82"),
+        uniquerequest_paths.contains("/shows/82"),
         "Should include path /shows/82"
     );
 
@@ -419,4 +421,208 @@ async fn test_tvmaze_in_list_paths() {
     assert!(show_ids.contains(&169), "Should include show 169");
     assert!(show_ids.contains(&1), "Should include show 1");
     assert!(show_ids.contains(&82), "Should include show 82");
+}
+
+/// Test POST request with `request_body` filter (default JSON content-type)
+#[tokio::test]
+async fn test_http_post_with_jsonrequest_body() {
+    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("httpbin", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // POST request with JSON body
+    let df = ctx
+        .sql(
+            r#"SELECT request_path, request_body, content FROM httpbin 
+               WHERE request_path = '/post' 
+               AND request_body = '{"test": "data", "number": 42}'"#,
+        )
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have at least one result");
+    let batch = &results[0];
+    assert_eq!(batch.num_rows(), 1, "Should have exactly one row");
+
+    // Verify the content echoes back our POST data
+    let content_col = batch.column(2);
+    let content_array = content_col
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("content should be StringArray");
+    let content = content_array.value(0);
+
+    // httpbin.org/post returns the posted data in the response
+    assert!(
+        content.contains("test"),
+        "Content should contain posted JSON data"
+    );
+    assert!(
+        content.contains("data"),
+        "Content should contain posted JSON value"
+    );
+    assert!(
+        content.contains("42"),
+        "Content should contain posted number"
+    );
+}
+
+/// Test POST request with custom content-type
+#[tokio::test]
+async fn test_http_post_with_custom_content_type() {
+    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+        .with_content_type(Some("application/x-www-form-urlencoded".to_string()));
+
+    let ctx = SessionContext::new();
+    ctx.register_table("httpbin", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // POST request with form-encoded body
+    let df = ctx
+        .sql(
+            r"SELECT request_path, request_body, content FROM httpbin 
+               WHERE request_path = '/post' 
+               AND request_body = 'key1=value1&key2=value2'",
+        )
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have at least one result");
+    let batch = &results[0];
+    assert_eq!(batch.num_rows(), 1, "Should have exactly one row");
+
+    // Verify the content echoes back our form data
+    let content_col = batch.column(2);
+    let content_array = content_col
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("content should be StringArray");
+    let content = content_array.value(0);
+
+    // httpbin.org/post returns form data in the 'form' field
+    assert!(
+        content.contains("\"form\""),
+        "Content should contain form data"
+    );
+    assert!(content.contains("key1"), "Content should contain form key");
+    assert!(
+        content.contains("value1"),
+        "Content should contain form value"
+    );
+}
+
+/// Test POST with multiple different bodies using IN clause
+#[tokio::test]
+async fn test_http_post_multiple_bodies() {
+    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("httpbin", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Multiple POST requests with different bodies
+    let df = ctx
+        .sql(
+            r#"SELECT request_path, request_body, content FROM httpbin 
+               WHERE request_path = '/post' 
+               AND request_body IN (
+                   '{"id": 1}',
+                   '{"id": 2}'
+               )"#,
+        )
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+
+    // Should have 2 rows (one for each body)
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total_rows, 2, "Should have exactly 2 rows (one per body)");
+
+    // Verify each body is separate
+    let mut bodies = std::collections::HashSet::new();
+    for batch in &results {
+        let body_col = batch.column(1);
+        let body_array = body_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("request_body should be StringArray");
+
+        for i in 0..batch.num_rows() {
+            bodies.insert(body_array.value(i).to_string());
+        }
+    }
+
+    assert_eq!(bodies.len(), 2, "Should have 2 unique bodies");
+    assert!(bodies.contains(r#"{"id": 1}"#), "Should include first body");
+    assert!(
+        bodies.contains(r#"{"id": 2}"#),
+        "Should include second body"
+    );
+}
+
+/// Test POST with OR expression combining different bodies
+#[tokio::test]
+async fn test_http_post_or_expression() {
+    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("httpbin", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // OR expression with different bodies
+    let df = ctx
+        .sql(
+            r#"SELECT request_path, request_body FROM httpbin 
+               WHERE request_path = '/post' 
+               AND (request_body = '{"type": "A"}' OR request_body = '{"type": "B"}')"#,
+        )
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    let total_rows: usize = results
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total_rows, 2, "Should have 2 rows from OR expression");
+}
+
+/// Test with retries on transient failures
+#[tokio::test]
+async fn test_http_with_retries() {
+    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
+    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+        .with_max_retries(5);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("httpbin", Arc::new(provider))
+        .expect("Failed to register table");
+
+    // Test that retries work by using a valid endpoint
+    let df = ctx
+        .sql("SELECT content FROM httpbin WHERE request_path = '/json'")
+        .await
+        .expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+    assert_eq!(results[0].num_rows(), 1, "Should have exactly one row");
 }
