@@ -64,26 +64,34 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         Arc::new(DuckDBIntermediateIndexMaterializationOptimizer {})
     }
 
+    /// Split a SQL AST expression into conjunctive parts
+    /// This mimics `datafusion::logical_expr::utils::split_conjunction` but for SQL AST
+    fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
+        fn split_conjunction_recursive<'a>(expr: &'a Expr, parts: &mut Vec<&'a Expr>) {
+            match expr {
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::And,
+                    right,
+                } => {
+                    split_conjunction_recursive(left, parts);
+                    split_conjunction_recursive(right, parts);
+                }
+                Expr::Nested(inner) => split_conjunction_recursive(inner, parts),
+                _ => parts.push(expr),
+            }
+        }
+        let mut parts = Vec::new();
+        split_conjunction_recursive(expr, &mut parts);
+        parts
+    }
+
     /// Walk the `Expr` collecting all AND bin-ops
     fn collect_conjunctive_filters(expr: &Expr) -> Vec<SelectionWithIdents> {
-        let mut selections = vec![];
-
-        let _ = visit_expressions(expr, |e| {
-            let Expr::BinaryOp { op, .. } = e else {
-                return ControlFlow::<()>::Continue(());
-            };
-
-            match op {
-                BinaryOperator::And => ControlFlow::<()>::Continue(()),
-                BinaryOperator::Or | BinaryOperator::Xor => ControlFlow::<()>::Break(()),
-                _ => {
-                    selections.push(SelectionWithIdents::from(e));
-                    ControlFlow::<()>::Continue(())
-                }
-            }
-        });
-
-        selections
+        Self::split_conjunction(expr)
+            .into_iter()
+            .map(SelectionWithIdents::from)
+            .collect()
     }
 
     /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
@@ -467,6 +475,22 @@ mod tests {
                 vec![make_index(&["a", "b"])],
                 Some(
                     "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3 ORDER BY d",
+                ),
+            ),
+            // case with OR
+            (
+                "SELECT a, b FROM foo WHERE a = 1 AND b = 2 AND ((c = 1) OR (c = 0))",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT a, b, c FROM foo WHERE a = 1 AND b = 2) SELECT a, b FROM _intermediate_materialize WHERE true AND true AND ((c = 1) OR (c = 0))",
+                ),
+            ),
+            // case with IN
+            (
+                "SELECT a, b FROM foo WHERE a = 1 AND b = 2 AND (c IN (1, 0))",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT a, b, c FROM foo WHERE a = 1 AND b = 2) SELECT a, b FROM _intermediate_materialize WHERE true AND true AND (c IN (1, 0))",
                 ),
             ),
         ];
