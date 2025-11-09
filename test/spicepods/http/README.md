@@ -85,7 +85,6 @@ Should return exactly 1 row with the Breaking Bad show details:
 _path        | _query | content
 -------------|--------|------------------------------------------------
 /shows/169   |        | {"id":169,"name":"Breaking Bad","type":"Scr..."}
-/shows/169   |        | {"id":169,"url":"http://...","name":"Breaking Bad",...}
 ```
 
 ### Combined Test (tvmaze_data)
