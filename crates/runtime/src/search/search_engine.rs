@@ -217,7 +217,10 @@ impl SearchEngine {
                         CacheStatus::CacheBypass,
                     )
                 }
-                (CacheControl::Cache(_), None) => {
+                (
+                    CacheControl::Cache(_) | CacheControl::CacheWithStaleWhileRevalidate(_, _),
+                    None,
+                ) => {
                     tracing::trace!("Search cache miss");
                     let results = self.search(req).await?;
                     (
@@ -225,7 +228,10 @@ impl SearchEngine {
                         CacheStatus::CacheMiss,
                     )
                 }
-                (CacheControl::Cache(_), Some(cached_result)) => {
+                (
+                    CacheControl::Cache(_) | CacheControl::CacheWithStaleWhileRevalidate(_, _),
+                    Some(cached_result),
+                ) => {
                     tracing::trace!("Search cache hit");
                     // each CachedAggregationResult needs to be re-mapped to an AggregationResult
                     let mut results = HashMap::new();
