@@ -728,7 +728,7 @@ impl CayenneTableProvider {
     /// This method implements size-based chunking to control Vortex file sizes:
     /// - Batches are accumulated until the target file size is reached
     /// - Each chunk is written as a separate Vortex file in parallel
-    /// - Each file maintains proper statistics for DataFusion pushdown and pruning
+    /// - Each file maintains proper statistics for `DataFusion` pushdown and pruning
     ///
     /// The target file size is configurable via `VortexConfig.target_vortex_file_size_mb`
     /// and defaults to 256 MB.
@@ -737,7 +737,7 @@ impl CayenneTableProvider {
     ///
     /// - **Streaming**: Processes chunks as they're formed, avoiding buffering all data
     /// - **Parallel writes**: Multiple chunks written concurrently with bounded parallelism
-    /// - **Zero-copy**: Reuses RecordBatch Arc references, no data copying
+    /// - **Zero-copy**: Reuses `RecordBatch` Arc references, no data copying
     /// - **Pre-allocation**: Reserves capacity to minimize reallocations
     ///
     /// # Errors
@@ -749,18 +749,14 @@ impl CayenneTableProvider {
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
         // Process stream in chunks and write them in parallel with bounded concurrency
-        let total_rows = self
+        let (total_rows, chunk_count) = self
             .chunk_and_write_parallel(stream, target_size_bytes)
             .await?;
 
         tracing::debug!(
-            "Insert completed, wrote {} rows to Vortex in {} size-based chunks",
+            "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
             total_rows,
-            if total_rows > 0 {
-                (total_rows as f64 / (target_size_bytes / 8192) as f64).ceil() as usize
-            } else {
-                0
-            }
+            chunk_count
         );
 
         // Apply retention filters before refreshing the listing table so any rows matching the
@@ -804,6 +800,12 @@ impl CayenneTableProvider {
     /// - Parallel writes with bounded concurrency (max 4 concurrent writes)
     /// - Zero-copy batch handling (Arc references)
     ///
+    /// # Returns
+    ///
+    /// Returns a tuple of `(total_rows, chunk_count)` where:
+    /// - `total_rows` is the total number of rows written
+    /// - `chunk_count` is the number of Vortex files created
+    ///
     /// # Errors
     ///
     /// Returns an error if any chunk write fails.
@@ -811,7 +813,7 @@ impl CayenneTableProvider {
         &self,
         mut stream: SendableRecordBatchStream,
         target_size_bytes: usize,
-    ) -> CatalogResult<u64> {
+    ) -> CatalogResult<(u64, usize)> {
         use tokio::sync::Semaphore;
 
         // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
@@ -824,6 +826,7 @@ impl CayenneTableProvider {
         let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
         let mut current_size = 0usize;
         let mut total_rows = 0u64;
+        let mut chunk_count = 0usize;
 
         while let Some(batch_result) = stream.next().await {
             let batch =
@@ -848,6 +851,7 @@ impl CayenneTableProvider {
                     Vec::with_capacity(estimated_batches_per_chunk),
                 );
                 current_size = 0;
+                chunk_count += 1;
 
                 // Clone self for the async task
                 let self_clone = self.clone_for_write();
@@ -870,6 +874,8 @@ impl CayenneTableProvider {
                 }
             })?;
 
+            chunk_count += 1;
+
             let self_clone = self.clone_for_write();
             write_tasks.spawn(async move {
                 let result = self_clone.write_chunk(current_chunk).await;
@@ -887,7 +893,7 @@ impl CayenneTableProvider {
             total_rows += row_count;
         }
 
-        Ok(total_rows)
+        Ok((total_rows, chunk_count))
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -910,6 +916,8 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the chunk cannot be written.
+    #[allow(clippy::items_after_statements)]
+    #[allow(clippy::too_many_lines)]
     async fn write_chunk(&self, chunk: Vec<RecordBatch>) -> CatalogResult<u64> {
         if chunk.is_empty() {
             return Ok(0);
