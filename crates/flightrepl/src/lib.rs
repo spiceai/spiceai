@@ -17,6 +17,7 @@ limitations under the License.
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::Display;
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -124,7 +125,16 @@ async fn send_nsql_request(
         .await
 }
 
-const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
+const SPECIAL_COMMANDS: [&str; 8] = [
+    ".exit",
+    "exit",
+    "quit",
+    "q",
+    ".error",
+    "help",
+    ".clear",
+    ".clear history",
+];
 const PROMPT_COLOR: Colour = Colour::Fixed(8);
 
 #[derive(Clone)]
@@ -262,6 +272,43 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     let mut rl = Editor::with_config(config)?;
 
+    // Set up persistent history (with graceful fallback)
+    let history_path = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".spice")
+                .join("query_history.txt")
+        });
+
+    if let Some(ref path) = history_path {
+        // Create .spice directory if it doesn't exist
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Warning: Failed to create history directory: {e}. History will not be persisted."
+            );
+        }
+
+        // Load existing history (ignore errors - just means no history file yet)
+        if let Err(e) = rl.load_history(path) {
+            // Most load failures are just "file not found" which is expected on first run
+            // Only show warnings for other error types
+            match e {
+                ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    // File doesn't exist yet, that's fine
+                }
+                _ => {
+                    eprintln!("Warning: Could not load history file: {e}");
+                }
+            }
+        }
+    } else {
+        eprintln!("Warning: Could not determine home directory. History will not be persisted.");
+    }
+
     rl.set_helper(Some(EditorHelper::new(
         Some(client.clone()),
         repl_config.api_key.clone(),
@@ -336,6 +383,26 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     }
                     None => println!("No previous error recorded."),
                 }
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".clear" => {
+                // Clear the screen using ANSI escape codes
+                print!("\x1B[H\x1B[2J");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".clear history" => {
+                // Clear the readline history
+                let _ = rl.clear_history();
+                // Save the empty history to file (if path is available)
+                if let Some(ref path) = history_path
+                    && let Err(e) = rl.save_history(path)
+                {
+                    eprintln!("Warning: Failed to save cleared history: {e}");
+                }
+                println!("Query history cleared.");
+                let _ = std::io::stdout().flush();
                 continue;
             }
             "help" => {
@@ -348,8 +415,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     "{} Show details of the last error",
                     PROMPT_COLOR.paint(".error:")
                 );
+                println!("{} Clear the screen", PROMPT_COLOR.paint(".clear:"));
+                println!(
+                    "{} Clear the query history",
+                    PROMPT_COLOR.paint(".clear history:")
+                );
                 println!("{} Show this help message", PROMPT_COLOR.paint("help:"));
                 println!("\nOther lines will be interpreted as SQL");
+                let _ = std::io::stdout().flush();
                 continue;
             }
             "show tables" | "show tables;" => {
@@ -402,6 +475,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 );
             }
         }
+    }
+
+    // Save history before exiting (if path is available)
+    if let Some(ref path) = history_path
+        && let Err(e) = rl.save_history(path)
+    {
+        eprintln!("Warning: Failed to save history on exit: {e}");
     }
 
     if let Some(helper) = rl.helper_mut() {

@@ -179,11 +179,12 @@ mod tests {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult {
-            records: Arc::new(vec![record_batch.clone()]),
-            schema: Arc::new(record_batch.schema().as_ref().to_owned()),
-            input_tables: Arc::new(input_tables),
-        }
+        CachedQueryResult::new(
+            Arc::new(vec![record_batch.clone()]),
+            Arc::new(record_batch.schema().as_ref().to_owned()),
+            Arc::new(input_tables),
+            std::time::Instant::now(),
+        )
     }
 
     #[rstest]

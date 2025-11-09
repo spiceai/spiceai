@@ -34,6 +34,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/history"
 	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -659,13 +660,34 @@ spice chat --model <model> "What is Spice.ai?"
 		cmd.Println("Welcome to the Spice.ai chat REPL! Type your message to chat with the model.")
 		cmd.Println()
 
+		// Initialize history manager
+		historyMgr, err := history.NewManager(history.ChatHistory)
+		if err != nil {
+			slog.Warn("failed to initialize chat history", "error", err)
+			historyMgr = nil
+		}
+
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer func() {
+			// Save history before closing
+			if historyMgr != nil {
+				if err := historyMgr.Save(); err != nil {
+					slog.Warn("failed to save chat history", "error", err)
+				}
+			}
 			if err := line.Close(); err != nil {
 				slog.Error("closing line", "error", err)
 			}
 		}()
+
+		// Load history into liner
+		if historyMgr != nil {
+			historyMgr.LoadIntoLiner(line)
+			// Enable tab completion based on history
+			line.SetCompleter(historyMgr.GetCompleter())
+		}
+
 		for {
 			message, err := line.Prompt("chat> ")
 			if err == liner.ErrPromptAborted {
@@ -678,7 +700,30 @@ spice chat --model <model> "What is Spice.ai?"
 				break
 			}
 
+			if strings.ToLower(message) == ".clear history" {
+				if historyMgr != nil {
+					historyMgr.Clear()
+					if err := historyMgr.Save(); err != nil {
+						cmd.Printf("\033[31mError:\033[0m Failed to clear history: %v\n", err)
+					} else {
+						cmd.Println("Chat history cleared.")
+					}
+				} else {
+					cmd.Println("History is not available.")
+				}
+				continue
+			}
+
 			line.AppendHistory(message)
+
+			// Add to persistent history and save immediately
+			if historyMgr != nil {
+				historyMgr.Add(message)
+				if err := historyMgr.Save(); err != nil {
+					slog.Warn("failed to save chat history", "error", err)
+				}
+			}
+
 			messages = append(messages, Message{Role: "user", Content: message})
 
 			messages, err = getChatResponse(messages, true, false)
@@ -1066,14 +1111,34 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 	cmd.Printf("Welcome to the Spice.ai chat REPL! Type your message to chat with '%s'.\n", model)
 	cmd.Println()
 
+	// Initialize history manager
+	historyMgr, err := history.NewManager(history.ChatHistory)
+	if err != nil {
+		slog.Warn("failed to initialize chat history", "error", err)
+		historyMgr = nil
+	}
+
 	var messages []Message
 	line := liner.NewLiner()
 	line.SetCtrlCAborts(true)
 	defer func() {
+		// Save history before closing
+		if historyMgr != nil {
+			if err := historyMgr.Save(); err != nil {
+				slog.Warn("failed to save chat history", "error", err)
+			}
+		}
 		if err := line.Close(); err != nil {
 			slog.Error("closing line", "error", err)
 		}
 	}()
+
+	// Load history into liner
+	if historyMgr != nil {
+		historyMgr.LoadIntoLiner(line)
+		// Enable tab completion based on history
+		line.SetCompleter(historyMgr.GetCompleter())
+	}
 
 	for {
 		message, err := line.Prompt("chat> ")
@@ -1087,7 +1152,36 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 			break
 		}
 
+		if strings.ToLower(message) == ".clear" {
+			// Clear the screen using ANSI escape codes
+			cmd.Print("\033[H\033[2J")
+			continue
+		}
+
+		if strings.ToLower(message) == ".clear history" {
+			if historyMgr != nil {
+				historyMgr.Clear()
+				if err := historyMgr.Save(); err != nil {
+					cmd.Printf("\033[31mError:\033[0m Failed to clear history: %v\n", err)
+				} else {
+					cmd.Println("Chat history cleared.")
+				}
+			} else {
+				cmd.Println("History is not available.")
+			}
+			continue
+		}
+
 		line.AppendHistory(message)
+
+		// Add to persistent history and save immediately
+		if historyMgr != nil {
+			historyMgr.Add(message)
+			if err := historyMgr.Save(); err != nil {
+				slog.Warn("failed to save chat history", "error", err)
+			}
+		}
+
 		messages = append(messages, Message{Role: "user", Content: message})
 
 		messages, err = sendChatRequest(messages, true, false)
