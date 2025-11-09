@@ -36,6 +36,8 @@ use datafusion::datasource::TableProvider;
 use reqwest::Client;
 use std::time::Duration;
 
+const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
@@ -88,7 +90,7 @@ impl DataConnector for Https {
                 .expose()
                 .ok()
                 .and_then(|t| t.parse::<u64>().ok())
-                .unwrap_or(30);
+                .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
 
             let client = Client::builder()
                 .user_agent("spice")

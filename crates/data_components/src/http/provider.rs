@@ -93,9 +93,10 @@ impl From<Error> for DataFusionError {
 
 #[derive(Clone)]
 struct CachedResponse {
-    content: String,
+    content: Arc<String>,
     cached_at: SystemTime,
     max_age: Duration,
+    detected_format: Option<String>,
 }
 
 impl CachedResponse {
@@ -259,6 +260,8 @@ impl HttpTableProvider {
                 return "csv".to_string();
             } else if content_type_lower.contains("application/x-ndjson")
                 || content_type_lower.contains("application/jsonlines")
+                || content_type_lower.contains("application/jsonl")
+                || content_type_lower.contains("application/x-jsonl")
             {
                 return "ndjson".to_string();
             } else if content_type_lower.contains("application/x-parquet")
@@ -287,9 +290,8 @@ impl HttpTableProvider {
             }
         }
 
-        // 3. Default to json if we can't detect
-        tracing::debug!("Could not detect file format from headers or path, defaulting to json");
-        "json".to_string()
+        // 3. Return empty string if we can't detect - caller will try content-based detection
+        String::new()
     }
 
     /// Infer file format from content by examining the first line
@@ -353,7 +355,6 @@ impl HttpTableProvider {
         let client = self.client.clone();
         let content_type = self.content_type.clone();
         let body_owned = body.map(String::from);
-        let file_format = self.file_format.clone();
         let cache = Arc::clone(&self.cache);
         let path_owned = path.to_string();
         let query_owned = query.map(String::from);
@@ -404,14 +405,13 @@ impl HttpTableProvider {
             }
 
             // Success! Process the response
-            // Detect file format from Content-Type header in response
-            if file_format.is_empty() || file_format == "auto" {
-                let detected_format = Self::detect_file_format(&response, &path_owned);
-                tracing::debug!(
-                    "Auto-detected file format from Content-Type header: {}",
-                    detected_format
-                );
-            }
+            // Try to detect file format from Content-Type header in response
+            // This takes priority over the configured format
+            let detected_format = Self::detect_file_format(&response, &path_owned);
+            tracing::debug!(
+                "Detected file format from Content-Type header: {}",
+                detected_format
+            );
 
             // Parse Cache-Control header
             let cache_control_header = response
@@ -426,27 +426,35 @@ impl HttpTableProvider {
                 .await
                 .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
 
-            // If we still need to detect format, infer from content as fallback
-            if file_format.is_empty() || file_format == "auto" {
+            // If we couldn't detect format from headers, try inferring from content
+            let detected_format = if detected_format.is_empty() {
                 let inferred = Self::infer_format_from_content(&content);
                 tracing::debug!("Inferred file format from content: {}", inferred);
-            }
+                inferred
+            } else {
+                detected_format
+            };
 
             // Cache the response if max_age > 0
             if max_age.as_secs() > 0 {
                 let cache_key =
                     Self::get_cache_key(&path_owned, query_owned.as_deref(), body_owned.as_deref());
+                let content_arc = Arc::new(content);
                 let cached_response = CachedResponse {
-                    content: content.clone(),
+                    content: Arc::clone(&content_arc),
                     cached_at: SystemTime::now(),
                     max_age,
+                    detected_format: Some(detected_format),
                 };
 
                 let mut cache_write = cache.write().await;
                 cache_write.insert(cache_key, cached_response);
-            }
 
-            Ok(content)
+                // Return the content from the Arc to avoid cloning
+                Ok(Arc::unwrap_or_clone(content_arc))
+            } else {
+                Ok(content)
+            }
         })
         .await
     }
@@ -468,8 +476,16 @@ impl HttpTableProvider {
         if let Some(cached_response) = cached
             && cached_response.is_fresh()
         {
-            tracing::debug!("Returning fresh cached content for {}", cache_key);
-            return Ok(cached_response.content);
+            if let Some(ref format) = cached_response.detected_format {
+                tracing::debug!(
+                    "Returning fresh cached content for {} (detected format: {})",
+                    cache_key,
+                    format
+                );
+            } else {
+                tracing::debug!("Returning fresh cached content for {}", cache_key);
+            }
+            return Ok((*cached_response.content).clone());
         }
 
         // Fetch fresh content
@@ -578,81 +594,82 @@ impl HttpExec {
         }
     }
 
-    async fn fetch_and_create_batches(
+    async fn fetch_and_create_batch(
         &self,
         provider: &HttpTableProvider,
-    ) -> DataFusionResult<Vec<RecordBatch>> {
-        let mut batches = Vec::with_capacity(self.partitions.len());
-        for (path, query, body) in &self.partitions {
-            // Use the filter path or empty string (base URL only)
-            let path_val = path.as_deref().unwrap_or("");
-            let query_val = query.as_deref();
-            let body_val = body.as_deref();
+        partition: usize,
+    ) -> DataFusionResult<RecordBatch> {
+        let (path, query, body) = &self.partitions[partition];
 
-            tracing::debug!(
-                "HttpExec fetching partition: _path={:?}, _query={:?}, _body={:?}",
-                path_val,
-                query_val,
-                body_val
-            );
+        // Use the filter path or empty string (base URL only)
+        let path_val = path.as_deref().unwrap_or("");
+        let query_val = query.as_deref();
+        let body_val = body.as_deref();
 
-            let content = provider
-                .get_content(path_val, query_val, body_val)
-                .await
-                .map_err(DataFusionError::from)?;
+        tracing::debug!(
+            "HttpExec fetching partition {}: _path={:?}, _query={:?}, _body={:?}",
+            partition,
+            path_val,
+            query_val,
+            body_val
+        );
 
-            // The path, query, and body values in the batch MUST match the filter values exactly
-            // so that DataFusion's FilterExec will keep these rows
-            let path_for_batch = path.as_deref().unwrap_or("");
-            let query_for_batch = query.as_deref().unwrap_or("");
-            let body_for_batch = body.as_deref().unwrap_or("");
+        let content = provider
+            .get_content(path_val, query_val, body_val)
+            .await
+            .map_err(DataFusionError::from)?;
 
-            tracing::debug!(
-                "Creating batch with _path={:?}, _query={:?}, _body={:?}, content_len={}",
-                path_for_batch,
-                query_for_batch,
-                body_for_batch,
-                content.len()
-            );
+        // The path, query, and body values in the batch MUST match the filter values exactly
+        // so that DataFusion's FilterExec will keep these rows
+        let path_for_batch = path.as_deref().unwrap_or("");
+        let query_for_batch = query.as_deref().unwrap_or("");
+        let body_for_batch = body.as_deref().unwrap_or("");
 
-            // Parse content to determine how many rows we'll create
-            let content_rows = Self::parse_content(&content);
-            let num_rows = content_rows.len();
+        tracing::debug!(
+            "Creating batch with _path={:?}, _query={:?}, _body={:?}, content_len={}",
+            path_for_batch,
+            query_for_batch,
+            body_for_batch,
+            content.len()
+        );
 
-            if num_rows == 0 {
-                tracing::warn!("No rows found in HTTP response");
-                continue;
-            }
+        // Parse content to determine how many rows we'll create
+        let content_rows = Self::parse_content(&content);
+        let num_rows = content_rows.len();
 
-            // Create columns with the same number of rows
-            let columns = self
-                .projected_schema
-                .fields()
-                .iter()
-                .map(|field| match field.name().as_str() {
-                    "_path" => {
-                        Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
-                    }
-                    "_query" => {
-                        Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows]))
-                            as ArrayRef)
-                    }
-                    "_body" => {
-                        Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
-                    }
-                    "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
-                    _ => Err(DataFusionError::Execution(format!(
-                        "Unsupported field name: {}",
-                        field.name()
-                    ))),
-                })
-                .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
-
-            let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
-                .map_err(DataFusionError::from)?;
-            batches.push(batch);
+        if num_rows == 0 {
+            tracing::warn!("No rows found in HTTP response for partition {}", partition);
+            return Err(DataFusionError::Execution(
+                "No rows found in HTTP response".to_string(),
+            ));
         }
-        Ok(batches)
+
+        // Create columns with the same number of rows
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "_path" => {
+                    Ok(Arc::new(StringArray::from(vec![path_for_batch; num_rows])) as ArrayRef)
+                }
+                "_query" => {
+                    Ok(Arc::new(StringArray::from(vec![query_for_batch; num_rows])) as ArrayRef)
+                }
+                "_body" => {
+                    Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
+                }
+                "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
+                _ => Err(DataFusionError::Execution(format!(
+                    "Unsupported field name: {}",
+                    field.name()
+                ))),
+            })
+            .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+
+        let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+            .map_err(DataFusionError::from)?;
+        Ok(batch)
     }
 
     /// Parse content into individual rows
@@ -765,15 +782,19 @@ impl ExecutionPlan for HttpExec {
         let exec = Arc::new(self.clone());
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
-        let stream = async_stream::try_stream! {
-            tracing::debug!("Starting to fetch batches for {} partitions", exec.partitions.len());
-            let batches = exec.fetch_and_create_batches(&provider).await?;
-            tracing::debug!("Fetched {} batches", batches.len());
-            for (i, batch) in batches.into_iter().enumerate() {
-                tracing::debug!("Yielding batch {}: {} rows", i, batch.num_rows());
-                yield batch;
-            }
-        };
+
+        // Use futures::stream::once to create a stream from a single async operation
+        let stream = futures::stream::once(async move {
+            tracing::debug!("Fetching partition {}", partition);
+            let batch = exec.fetch_and_create_batch(&provider, partition).await?;
+            tracing::debug!(
+                "Yielding batch for partition {}: {} rows",
+                partition,
+                batch.num_rows()
+            );
+            Ok(batch)
+        });
+
         let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
         Ok(Box::pin(stream_adapter))
     }
