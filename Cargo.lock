@@ -13171,6 +13171,7 @@ dependencies = [
  "runtime-request-context",
  "tokio",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ use crate::search::util::parse_explicit_primary_keys;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
+use once_cell::sync::Lazy;
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
@@ -83,6 +84,20 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udf(INSTANCE.clone());
 }
 
+/// Cached list of JSON function names to avoid repeated SessionContext creation.
+/// This is initialized once at startup and reused for all accelerator configurations.
+static JSON_FUNCTIONS: Lazy<Vec<String>> = Lazy::new(|| {
+    let mut ctx = SessionContext::new();
+    let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
+    let _ = datafusion_functions_json::register_all(&mut ctx);
+    ctx.state()
+        .scalar_functions()
+        .keys()
+        .filter(|&k| !existing.contains(k))
+        .cloned()
+        .collect()
+});
+
 /// Create a [`FunctionSupport`] with all spice specific functions as unsupported for federation.
 pub fn deny_spice_specific_functions() -> FunctionSupport {
     let builtin = [
@@ -101,22 +116,10 @@ pub fn deny_spice_specific_functions() -> FunctionSupport {
             builtin
                 .iter()
                 .map(ToString::to_string)
-                .chain(json_functions())
+                .chain(JSON_FUNCTIONS.iter().cloned())
                 .collect::<Vec<_>>(),
         )),
         None,
         None,
     )
-}
-
-fn json_functions() -> Vec<String> {
-    let mut ctx = SessionContext::new();
-    let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
-    let _ = datafusion_functions_json::register_all(&mut ctx);
-    ctx.state()
-        .scalar_functions()
-        .keys()
-        .filter(|&k| !existing.contains(k))
-        .cloned()
-        .collect()
 }

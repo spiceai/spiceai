@@ -20,6 +20,7 @@ futures.workspace = true
 opentelemetry.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
 tracing.workspace = true
+xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 
 [dev-dependencies]
 datafusion-datasource.workspace = true
