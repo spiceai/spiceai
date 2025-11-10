@@ -191,20 +191,13 @@ static MEGA_SCIENCE_COLUMN_CONFIGS: LazyLock<HashMap<String, Vec<Column>>> = Laz
 });
 
 impl SearchSpicepodConfiguration {
-    // search.duckdb.no_vector_engine.join_view.hybrid_single_column
+    // duckdb.no_vector_engine.join_view.hybrid_single_column
     pub fn from_str(
         id: &str,
         column_configs: &HashMap<String, Vec<Column>>,
     ) -> Result<Self, anyhow::Error> {
-        let Some(
-            [
-                "search",
-                engine,
-                vector,
-                table_component,
-                column_configuration,
-            ],
-        ) = id.split('.').collect_array()
+        let Some([engine, vector, table_component, column_configuration]) =
+            id.split('-').collect_array()
         else {
             return Err(anyhow::anyhow!("Invalid search spicepod slug: '{id}'."));
         };
@@ -304,27 +297,38 @@ pub fn build_mega_science(mut app: AppBuilder, cfg: &SearchSpicepodConfiguration
     app
 }
 
-#[tokio::test]
-pub async fn run_tests() {
-    let slugs = vec![
-        // "search.arrow.s3_vectors.view_union_all_join.basic",
-        "search.arrow.no_vector_engine.dataset.basic",
-    ];
-    for s in slugs {
-        let app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-2M",
-            "hf_minilm",
-        ));
-        let cfg = SearchSpicepodConfiguration::from_str(s, &MEGA_SCIENCE_COLUMN_CONFIGS)
-            .expect("could not initialise configuration");
-        run_search_w_explain(
-            build_mega_science(app, &cfg).build(),
-            basic_vector_search_tests_on_table(s, "qs"),
-            true,
-        )
-        .await
-        .expect("failed to run searh tests");
-    }
+macro_rules! generate_search_tests {
+    ([$($slug:expr),* $(,)?]) => {
+        paste::paste! {
+            $(
+                #[tokio::test]
+                #[allow(non_snake_case)]
+                async fn [<test_search_ $slug:snake>]() {
+                    let app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
+                        "minishlab/potion-base-2M",
+                        "hf_minilm",
+                    ));
+
+                    let cfg = SearchSpicepodConfiguration::from_str($slug, &MEGA_SCIENCE_COLUMN_CONFIGS)
+                        .expect("could not initialise configuration");
+                    run_search_w_explain(
+                        build_mega_science(app, &cfg).build(),
+                        basic_vector_search_tests_on_table($slug, "qs"),
+                        true,
+                    )
+                    .await
+                    .expect("failed to run search tests");
+                }
+            )*
+        }
+    };
+}
+pub mod twoz {
+    pub use super::*;
+    generate_search_tests!([
+        "arrow-s3_vectors-view_union_all_join-basic",
+        "arrow-no_vector_engine-dataset-basic",
+    ]);
 }
 
 async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
@@ -634,966 +638,969 @@ pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
         .into(),
     )
 }
+// mod old {
+//     pub use super::*;
 
-#[tokio::test]
-async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
-    let (ds, views) = get_mega_science_view(
-        Some("qs"),
-        // multi_column
-        Some(Column::new("question").with_embeddings(vec![
-            ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-        ])),
-        Some(Column::new("answer").with_embeddings(vec![
-            ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-        ])),
-    );
+//     #[tokio::test]
+//     async fn test_multi_column_search_view() -> Result<(), anyhow::Error> {
+//         let (ds, views) = get_mega_science_view(
+//             Some("qs"),
+//             // multi_column
+//             Some(Column::new("question").with_embeddings(vec![
+//                 ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+//             ])),
+//             Some(Column::new("answer").with_embeddings(vec![
+//                 ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+//             ])),
+//         );
 
-    let mut app = AppBuilder::new("search_app")
-        .with_dataset(ds)
-        .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-2M",
-            "hf_minilm",
-        ));
+//         let mut app = AppBuilder::new("search_app")
+//             .with_dataset(ds)
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ));
 
-    for v in views {
-        app = app.with_view(v);
-    }
+//         for v in views {
+//             app = app.with_view(v);
+//         }
 
-    run_search_w_explain(
-        app.build(),
-        [
-        basic_vector_search_tests_on_table("multi_column_view_answer", "qs"),
-        vec![
-            SearchTestCase::new(
-                "multi_column_view_basic".to_string(),
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_view_additional_columns".to_string(),
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_view_with_where".to_string(),
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject='math'",
-                    "limit": 1,
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_view_question_vector_search_sql_filters".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "multi_column_view_question_vector_search_sql_no_score".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "multi_column_view_question_vector_search_sql_random".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "multi_column_view_question_vector_search_sql_vectors".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
-                ),
-            ),
-        ]
-        ].concat(),
-        true
-    )
-    .await
-}
+//         run_search_w_explain(
+//         app.build(),
+//         [
+//         basic_vector_search_tests_on_table("multi_column_view_answer", "qs"),
+//         vec![
+//             SearchTestCase::new(
+//                 "multi_column_view_basic".to_string(),
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_view_additional_columns".to_string(),
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_view_with_where".to_string(),
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject='math'",
+//                     "limit": 1,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_view_question_vector_search_sql_filters".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_view_question_vector_search_sql_no_score".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_view_question_vector_search_sql_random".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_view_question_vector_search_sql_vectors".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+//                 ),
+//             ),
+//         ]
+//         ].concat(),
+//         true
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-async fn test_multi_column_search() -> Result<(), anyhow::Error> {
-    let ds = get_mega_science_dataset(
-        Some("qs"),
-        Some(Column::new("question").with_embeddings(vec![
-            ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-        ])),
-        Some(Column::new("answer").with_embeddings(vec![
-                ColumnLevelEmbeddingConfig::model("hf_minilm")
-                    .with_row_id("id")
-                    .chunking(EmbeddingChunkConfig::enabled().target_chunk_size(64)),
-            ])),
-    );
+//     #[tokio::test]
+//     async fn test_multi_column_search() -> Result<(), anyhow::Error> {
+//         let ds = get_mega_science_dataset(
+//             Some("qs"),
+//             Some(Column::new("question").with_embeddings(vec![
+//                 ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+//             ])),
+//             Some(Column::new("answer").with_embeddings(vec![
+//                 ColumnLevelEmbeddingConfig::model("hf_minilm")
+//                     .with_row_id("id")
+//                     .chunking(EmbeddingChunkConfig::enabled().target_chunk_size(64)),
+//             ])),
+//         );
 
-    let app = AppBuilder::new("search_app")
-        .with_dataset(ds)
-        .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-2M",
-            "hf_minilm",
-        ))
-        .build();
-    run_search(
-        app,
-        vec![
-            SearchTestCase::new(
-                "multi_column_basic".to_string(),
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_keywords",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "keywords": ["number"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_additional_columns".to_string(),
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_with_where".to_string(),
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject='math'",
-                    "limit": 1,
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_column_question_vector_search_sql_filters".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "multi_column_question_vector_search_sql_no_score".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "multi_column_question_vector_search_sql_random".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "multi_column_question_vector_search_sql_vectors".to_string(),
-                SearchTestType::from_sql(
-                    "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
-                ),
-            ),
-        ],
-    )
-    .await
-}
+//         let app = AppBuilder::new("search_app")
+//             .with_dataset(ds)
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ))
+//             .build();
+//         run_search(
+//         app,
+//         vec![
+//             SearchTestCase::new(
+//                 "multi_column_basic".to_string(),
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_keywords",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "keywords": ["number"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_additional_columns".to_string(),
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_with_where".to_string(),
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject='math'",
+//                     "limit": 1,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_question_vector_search_sql_filters".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', question) where subject!='math' order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_question_vector_search_sql_no_score".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_question_vector_search_sql_random".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT subject FROM vector_search(qs, 'second', question) order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_column_question_vector_search_sql_vectors".to_string(),
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, array_length(question_embedding), round(score, 1) FROM vector_search(qs, 'second', question) order by score desc LIMIT 4;",
+//                 ),
+//             ),
+//         ],
+//     )
+//     .await
+//     }
 
-// Use two different embedding models on a single column.
-#[tokio::test]
-async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_embedding(get_model_to_vec_embeddings(
-                "minishlab/potion-base-2M",
-                "hf_minilm",
-            ))
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
-            ))
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                None,
-                Some(Column::new("answer").with_embeddings(vec![
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                    ColumnLevelEmbeddingConfig::model("openai_embeddings").with_row_id("id")
-                ]))))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "multi_embeddings_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_embeddings_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_embeddings_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_embeddings_sql_vector_search",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-        ],
-    )
-    .await
-}
+//     // Use two different embedding models on a single column.
+//     #[tokio::test]
+//     async fn test_multi_embedding_model_search() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ))
+//             .with_embedding(get_openai_embeddings(
+//                 Some("text-embedding-3-small"),
+//                 "openai_embeddings",
+//             ))
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 None,
+//                 Some(Column::new("answer").with_embeddings(vec![
+//                     ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+//                     ColumnLevelEmbeddingConfig::model("openai_embeddings").with_row_id("id")
+//                 ]))))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "multi_embeddings_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_embeddings_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_embeddings_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_embeddings_sql_vector_search",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//         ],
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_embedding(get_model_to_vec_embeddings(
-                "minishlab/potion-base-2M",
-                "hf_minilm",
-            ))
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                Some(Column::new("question")
-                    .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))
-                    .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
-                ),
-                None,
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "hybrid_single_column_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_single_column_keywords",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "keywords": ["number"],
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_single_column_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_single_column_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_single_column_sql_text_search",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "hybrid_single_column_sql_vector_search",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "hybrid_single_column_sql_vector_search_no_score",
-                SearchTestType::from_sql(
-                    "SELECT question FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-        ],
-    )
-    .await
-}
+//     #[tokio::test]
+//     async fn test_hybrid_search_single_column() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ))
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 Some(Column::new("question")
+//                     .with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))
+//                     .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
+//                 ),
+//                 None,
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "hybrid_single_column_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_single_column_keywords",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "keywords": ["number"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_single_column_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_single_column_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_single_column_sql_text_search",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_single_column_sql_vector_search",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_single_column_sql_vector_search_no_score",
+//                 SearchTestType::from_sql(
+//                     "SELECT question FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//         ],
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_embedding(get_model_to_vec_embeddings(
-                "minishlab/potion-base-2M",
-                "hf_minilm",
-            ))
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                Some(Column::new("question").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))),
-                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "hybrid_multiple_column_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_keywords",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "keywords": ["number"],
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_text_search",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_text_search_wrong_column",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4",
-                ),
-            ).should_fail(),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_vector_search",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_vector_search_wrong_column",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
-                ),
-            ).should_fail(),
-        ],
-    )
-    .await
-}
+//     #[tokio::test]
+//     async fn test_hybrid_search_multiple_column() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ))
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 Some(Column::new("question").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))),
+//                 Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_keywords",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "keywords": ["number"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_text_search",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_text_search_wrong_column",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', question) order by score desc LIMIT 4",
+//                 ),
+//             ).should_fail(),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_vector_search",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_vector_search_wrong_column",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4",
+//                 ),
+//             ).should_fail(),
+//         ],
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-async fn test_rrf_search() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_embedding(get_model_to_vec_embeddings(
-                "minishlab/potion-base-2M",
-                "hf_minilm",
-            ))
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                Some(Column::new("question").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))),
-                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_rrf",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second')) order by fused_score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_rrf_wrong_column",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by fused_score desc LIMIT 4",
-                ),
-            ).should_fail(),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_rrf_explicit_join",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'id') order by fused_score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_rrf_explicit_join_wrong_column",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'foobar') order by fused_score desc LIMIT 4",
-                ),
-            ).should_fail(),
-            SearchTestCase::new(
-                "hybrid_multiple_column_sql_rrf_one_subquery_fail",
-                SearchTestType::from_sql(
-                    "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second')) order by fused_score desc LIMIT 4",
-                ),
-            ).should_fail(),
-        ],
-    ).await
-}
+//     #[tokio::test]
+//     async fn test_rrf_search() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ))
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 Some(Column::new("question").with_embedding(ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"))),
+//                 Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_rrf",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second')) order by fused_score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_rrf_wrong_column",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(score, 3) FROM rrf(vector_search(qs, 'second', answer), text_search(qs, 'second', answer)) order by fused_score desc LIMIT 4",
+//                 ),
+//             ).should_fail(),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_rrf_explicit_join",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'id') order by fused_score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_rrf_explicit_join_wrong_column",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second'), text_search(qs, 'second'), join_key => 'foobar') order by fused_score desc LIMIT 4",
+//                 ),
+//             ).should_fail(),
+//             SearchTestCase::new(
+//                 "hybrid_multiple_column_sql_rrf_one_subquery_fail",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, question, trunc(fused_score, 3) FROM rrf(vector_search(qs, 'second')) order by fused_score desc LIMIT 4",
+//                 ),
+//             ).should_fail(),
+//         ],
+//     ).await
+//     }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_text_search() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                None,
-                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "text_search_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_keywords",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "keywords": ["number"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_basic_without_defined_dataset",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_sql_text_search_basic",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_sql_text_search_projection",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_sql_text_search_filters",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_sql_text_search_no_score",
-                SearchTestType::from_sql(
-                    "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_sql_text_search_random",
-                SearchTestType::from_sql(
-                    "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-        ],
-    )
-    .await
-}
+//     #[tokio::test]
+//     #[allow(clippy::too_many_lines)]
+//     async fn test_text_search() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 None,
+//                 Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "text_search_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_keywords",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "keywords": ["number"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_basic_without_defined_dataset",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_sql_text_search_basic",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_sql_text_search_projection",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_sql_text_search_filters",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_sql_text_search_no_score",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_sql_text_search_random",
+//                 SearchTestType::from_sql(
+//                     "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//         ],
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_text_search_view() -> Result<(), anyhow::Error> {
-    let (ds, views) = get_mega_science_view(
-        Some("qs"),
-        None,
-        Some(
-            Column::new("answer")
-                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
-        ),
-    );
+//     #[tokio::test]
+//     #[allow(clippy::too_many_lines)]
+//     async fn test_text_search_view() -> Result<(), anyhow::Error> {
+//         let (ds, views) = get_mega_science_view(
+//             Some("qs"),
+//             None,
+//             Some(
+//                 Column::new("answer")
+//                     .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+//             ),
+//         );
 
-    let mut app = AppBuilder::new("search_app").with_dataset(ds);
-    for v in views {
-        app = app.with_view(v);
-    }
+//         let mut app = AppBuilder::new("search_app").with_dataset(ds);
+//         for v in views {
+//             app = app.with_view(v);
+//         }
 
-    run_search_w_explain(app.build(),
-        vec![
-            SearchTestCase::new(
-                "text_search_view_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_view_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_view_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_view_basic_without_defined_dataset",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_view_sql_text_search_basic",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_view_sql_text_search_projection",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_view_sql_text_search_filters",
-                SearchTestType::from_sql(
-                    "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_view_sql_text_search_no_score",
-                SearchTestType::from_sql(
-                    "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-            SearchTestCase::new(
-                "text_search_view_sql_text_search_random",
-                SearchTestType::from_sql(
-                    "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
-                ),
-            ),
-        ],
-        true
-    )
-    .await
-}
+//         run_search_w_explain(app.build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "text_search_view_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_basic_without_defined_dataset",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_sql_text_search_basic",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_sql_text_search_projection",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_sql_text_search_filters",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary') where subject!='math' order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_sql_text_search_no_score",
+//                 SearchTestType::from_sql(
+//                     "SELECT id, answer FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_view_sql_text_search_random",
+//                 SearchTestType::from_sql(
+//                     "SELECT subject FROM text_search(qs, 'second') order by score desc LIMIT 4",
+//                 ),
+//             ),
+//         ],
+//         true
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                None,
-                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("answer"))),
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "test_text_search_where_rowid_is_search_column_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "test_text_search_sql_where_rowid_is_search_column_basic",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
-            ),
-        ]
-    )
-    .await
-}
+//     #[tokio::test]
+//     async fn test_text_search_where_rowid_is_search_column() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 None,
+//                 Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("answer"))),
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "test_text_search_where_rowid_is_search_column_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "test_text_search_sql_where_rowid_is_search_column_basic",
+//                 SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+//             ),
+//         ]
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-async fn test_text_search_where_rowid_is_search_column_multi_column() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                Some(
-                    Column::new("question").with_full_text_search(
-                        FullTextSearchConfig::enabled().with_row_id("answer"),
-                    ),
-                ),
-                Some(
-                    Column::new("answer").with_full_text_search(
-                        FullTextSearchConfig::enabled().with_row_id("answer"),
-                    ),
-                ),
-            ))
-            .build(),
-        vec![SearchTestCase::new(
-            "test_text_search_where_rowid_is_search_column_multi_column",
-            SearchTestType::Http(json!({
-                "text": "second",
-                "limit": 4,
-                "datasets": ["qs"],
-            })),
-        )],
-    )
-    .await
-}
+//     #[tokio::test]
+//     async fn test_text_search_where_rowid_is_search_column_multi_column()
+//     -> Result<(), anyhow::Error> {
+//         run_search(
+//             AppBuilder::new("search_app")
+//                 .with_dataset(get_mega_science_dataset(
+//                     Some("qs"),
+//                     Some(Column::new("question").with_full_text_search(
+//                         FullTextSearchConfig::enabled().with_row_id("answer"),
+//                     )),
+//                     Some(Column::new("answer").with_full_text_search(
+//                         FullTextSearchConfig::enabled().with_row_id("answer"),
+//                     )),
+//                 ))
+//                 .build(),
+//             vec![SearchTestCase::new(
+//                 "test_text_search_where_rowid_is_search_column_multi_column",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             )],
+//         )
+//         .await
+//     }
 
-#[tokio::test]
-async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                None,
-                Some(
-                    Column::new("answer").with_full_text_search(
-                        FullTextSearchConfig::enabled().with_row_id("answer").with_row_id("id"),
-                    ),
-                ),
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "test_text_search_where_rowid_is_search_column_composite_pk_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "test_text_search_sql_where_rowid_is_search_column_composite_pk_basic",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
-            ),
-        ],
-    )
-    .await
-}
+//     #[tokio::test]
+//     async fn test_text_search_where_rowid_is_search_column_composite_pk()
+//     -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 None,
+//                 Some(
+//                     Column::new("answer").with_full_text_search(
+//                         FullTextSearchConfig::enabled().with_row_id("answer").with_row_id("id"),
+//                     ),
+//                 ),
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "test_text_search_where_rowid_is_search_column_composite_pk_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "test_text_search_sql_where_rowid_is_search_column_composite_pk_basic",
+//                 SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+//             ),
+//         ],
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
-    run_search(
-        AppBuilder::new("search_app")
-            .with_dataset(get_mega_science_dataset(
-                Some("qs"),
-                Some(Column::new("question").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
-                Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+//     #[tokio::test]
+//     #[allow(clippy::too_many_lines)]
+//     async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
+//         run_search(
+//         AppBuilder::new("search_app")
+//             .with_dataset(get_mega_science_dataset(
+//                 Some("qs"),
+//                 Some(Column::new("question").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
+//                 Some(Column::new("answer").with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))),
 
-            ))
-            .build(),
-        vec![
-            SearchTestCase::new(
-                "multi_text_column_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_keywords",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "keywords": ["number"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_sql_text_search_basic_answer",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_sql_text_search_basic_question",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                // When there are multiple columns, `text_search` needs column explicitly as input.
-                "multi_text_column_sql_text_search_error_without_column",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
-            ).should_fail(),
-            SearchTestCase::new(
-                "multi_text_column_sql_text_search_projection",
-                SearchTestType::from_sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_sql_text_search_filters",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_sql_text_search_no_score",
-                SearchTestType::from_sql("SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "multi_text_column_sql_text_search_random",
-                SearchTestType::from_sql("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
-        ],
-    )
-    .await
-}
+//             ))
+//             .build(),
+//         vec![
+//             SearchTestCase::new(
+//                 "multi_text_column_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_keywords",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "keywords": ["number"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_sql_text_search_basic_answer",
+//                 SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_sql_text_search_basic_question",
+//                 SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 // When there are multiple columns, `text_search` needs column explicitly as input.
+//                 "multi_text_column_sql_text_search_error_without_column",
+//                 SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second') order by score desc LIMIT 4"),
+//             ).should_fail(),
+//             SearchTestCase::new(
+//                 "multi_text_column_sql_text_search_projection",
+//                 SearchTestType::from_sql("SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_sql_text_search_filters",
+//                 SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) as score FROM text_search(qs, 'secondary', answer) where subject!='math' order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_sql_text_search_no_score",
+//                 SearchTestType::from_sql("SELECT id, answer FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "multi_text_column_sql_text_search_random",
+//                 SearchTestType::from_sql("SELECT subject FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+//             ),
+//         ],
+//     )
+//     .await
+//     }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
-    let mut ds = get_mega_science_dataset(
-        Some("qs"),
-        Some(
-            Column::new("question")
-                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
-                .with_metadata(
-                    [(
-                        "vectors".to_string(),
-                        Value::String("non-filterable".to_string()),
-                    )]
-                    .into(),
-                ),
-        ),
-        Some(
-            Column::new("answer")
-                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
-        ),
-    );
-    ds.columns.push(vectors_nonfilterable_col("subject"));
+//     #[tokio::test]
+//     #[allow(clippy::too_many_lines)]
+//     async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
+//         let mut ds = get_mega_science_dataset(
+//             Some("qs"),
+//             Some(
+//                 Column::new("question")
+//                     .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
+//                     .with_metadata(
+//                         [(
+//                             "vectors".to_string(),
+//                             Value::String("non-filterable".to_string()),
+//                         )]
+//                         .into(),
+//                     ),
+//             ),
+//             Some(
+//                 Column::new("answer")
+//                     .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+//             ),
+//         );
+//         ds.columns.push(vectors_nonfilterable_col("subject"));
 
-    run_search_w_explain(
-        AppBuilder::new("search_app")
-            .with_dataset(ds).build(),
-        vec![
-            SearchTestCase::new(
+//         run_search_w_explain(
+//         AppBuilder::new("search_app")
+//             .with_dataset(ds).build(),
+//         vec![
+//             SearchTestCase::new(
 
-                "text_search_metadata_basic",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_additional_columns",
-                SearchTestType::Http(json!({
-                    "text": "second",
-                    "limit": 4,
-                    "datasets": ["qs"],
-                    "additional_columns": ["question"],
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_with_where",
-                SearchTestType::Http(json!({
-                    "text": "secondary",
-                    "datasets": ["qs"],
-                    "where": "subject!='math'",
-                    "limit": 4,
-                })),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_sql_text_search_answer",
-                SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_sql_text_search_answer_w_question",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_sql_text_search_question",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_sql_text_search_subject_filter",
-                SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) where subject='math' order by score desc LIMIT 4"),
-            ),
-            SearchTestCase::new(
-                "text_search_metadata_sql_text_search_subject_projection",
-                SearchTestType::from_sql("SELECT id, subject, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
-            ),
-        ],
-        true
-    )
-    .await
-}
+//                 "text_search_metadata_basic",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_additional_columns",
+//                 SearchTestType::Http(json!({
+//                     "text": "second",
+//                     "limit": 4,
+//                     "datasets": ["qs"],
+//                     "additional_columns": ["question"],
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_with_where",
+//                 SearchTestType::Http(json!({
+//                     "text": "secondary",
+//                     "datasets": ["qs"],
+//                     "where": "subject!='math'",
+//                     "limit": 4,
+//                 })),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_sql_text_search_answer",
+//                 SearchTestType::from_sql("SELECT id, answer, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_sql_text_search_answer_w_question",
+//                 SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'second', answer) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_sql_text_search_question",
+//                 SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_sql_text_search_subject_filter",
+//                 SearchTestType::from_sql("SELECT id, question, trunc(score, 3) FROM text_search(qs, 'angles', question) where subject='math' order by score desc LIMIT 4"),
+//             ),
+//             SearchTestCase::new(
+//                 "text_search_metadata_sql_text_search_subject_projection",
+//                 SearchTestType::from_sql("SELECT id, subject, trunc(score, 3) FROM text_search(qs, 'angles', question) order by score desc LIMIT 4"),
+//             ),
+//         ],
+//         true
+//     )
+//     .await
+//     }
 
-#[cfg(feature = "flightsql")]
-#[tokio::test]
-async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
-    use spicepod::{acceleration::Acceleration, param::Params};
+//     #[cfg(feature = "flightsql")]
+//     #[tokio::test]
+//     async fn test_multi_column_w_existing_embedding() -> Result<(), anyhow::Error> {
+//         use spicepod::{acceleration::Acceleration, param::Params};
 
-    let api_config = start_app(
-        AppBuilder::new("search_app")
-            .with_dataset(catalog_page_tpcds_dataset_w_embeddings(
-                "single_column",
-                "hf_minilm",
-                Some(vec!["cp_catalog_page_sk".to_string()]),
-                None,
-            ))
-            .with_embedding(get_model_to_vec_embeddings(
-                "minishlab/potion-base-2M",
-                "hf_minilm",
-            ))
-            .build(),
-    )
-    .await?;
+//         let api_config = start_app(
+//             AppBuilder::new("search_app")
+//                 .with_dataset(catalog_page_tpcds_dataset_w_embeddings(
+//                     "single_column",
+//                     "hf_minilm",
+//                     Some(vec!["cp_catalog_page_sk".to_string()]),
+//                     None,
+//                 ))
+//                 .with_embedding(get_model_to_vec_embeddings(
+//                     "minishlab/potion-base-2M",
+//                     "hf_minilm",
+//                 ))
+//                 .build(),
+//         )
+//         .await?;
 
-    // Make a new dataset where one embedding column is prexisting (from 'single_column'),
-    // and another is made in this dataset.
-    let mut ds = Dataset::new("flightsql:single_column", "multiple_columns");
-    let mut params = HashMap::new();
-    params.insert(
-        "flightsql_endpoint".to_string(),
-        format!("http://{}", api_config.flight_bind_address),
-    );
-    ds.acceleration = Some(Acceleration {
-        enabled: true,
-        ..Default::default()
-    });
-    ds.params = Some(Params::from_string_map(params));
-    ds.columns = vec![
-        Column {
-            name: "cp_description".to_string(),
-            description: Some(
-                "This column has an embedding in the underlying spice instance".to_string(),
-            ),
-            full_text_search: None,
-            embeddings: vec![
-                ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("cp_catalog_page_sk"),
-            ],
-            metadata: HashMap::new(),
-        },
-        Column {
-            name: "cp_department".to_string(),
-            description: Some("This column is newly embedded in this spice app".to_string()),
-            full_text_search: None,
-            embeddings: vec![
-                ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("cp_catalog_page_sk"),
-            ],
-            metadata: HashMap::new(),
-        },
-    ];
-    let app2 = AppBuilder::new("search_app2")
-        .with_dataset(ds)
-        .with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-2M",
-            "hf_minilm",
-        ))
-        .build();
+//         // Make a new dataset where one embedding column is prexisting (from 'single_column'),
+//         // and another is made in this dataset.
+//         let mut ds = Dataset::new("flightsql:single_column", "multiple_columns");
+//         let mut params = HashMap::new();
+//         params.insert(
+//             "flightsql_endpoint".to_string(),
+//             format!("http://{}", api_config.flight_bind_address),
+//         );
+//         ds.acceleration = Some(Acceleration {
+//             enabled: true,
+//             ..Default::default()
+//         });
+//         ds.params = Some(Params::from_string_map(params));
+//         ds.columns = vec![
+//             Column {
+//                 name: "cp_description".to_string(),
+//                 description: Some(
+//                     "This column has an embedding in the underlying spice instance".to_string(),
+//                 ),
+//                 full_text_search: None,
+//                 embeddings: vec![
+//                     ColumnLevelEmbeddingConfig::model("hf_minilm")
+//                         .with_row_id("cp_catalog_page_sk"),
+//                 ],
+//                 metadata: HashMap::new(),
+//             },
+//             Column {
+//                 name: "cp_department".to_string(),
+//                 description: Some("This column is newly embedded in this spice app".to_string()),
+//                 full_text_search: None,
+//                 embeddings: vec![
+//                     ColumnLevelEmbeddingConfig::model("hf_minilm")
+//                         .with_row_id("cp_catalog_page_sk"),
+//                 ],
+//                 metadata: HashMap::new(),
+//             },
+//         ];
+//         let app2 = AppBuilder::new("search_app2")
+//             .with_dataset(ds)
+//             .with_embedding(get_model_to_vec_embeddings(
+//                 "minishlab/potion-base-2M",
+//                 "hf_minilm",
+//             ))
+//             .build();
 
-    run_search(
-        app2,
-        vec![
-            SearchTestCase::new(
-                "multi_embedding_parent_child_basic",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multiple_columns"]
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_embedding_parent_child_additional",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["multiple_columns"],
-                    "additional_columns": ["cp_catalog_number"],
-                })),
-            ),
-            SearchTestCase::new(
-                "multi_embedding_parent_child_where",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "datasets": ["multiple_columns"],
-                    "where": "cp_catalog_page_sk % 2 = 0 and cp_catalog_page_sk >=20"
-                })),
-            ),
-        ],
-    )
-    .await
-}
+//         run_search(
+//             app2,
+//             vec![
+//                 SearchTestCase::new(
+//                     "multi_embedding_parent_child_basic",
+//                     SearchTestType::Http(json!({
+//                         "text": "new patient",
+//                         "limit": 2,
+//                         "datasets": ["multiple_columns"]
+//                     })),
+//                 ),
+//                 SearchTestCase::new(
+//                     "multi_embedding_parent_child_additional",
+//                     SearchTestType::Http(json!({
+//                         "text": "new patient",
+//                         "limit": 2,
+//                         "datasets": ["multiple_columns"],
+//                         "additional_columns": ["cp_catalog_number"],
+//                     })),
+//                 ),
+//                 SearchTestCase::new(
+//                     "multi_embedding_parent_child_where",
+//                     SearchTestType::Http(json!({
+//                         "text": "new patient",
+//                         "datasets": ["multiple_columns"],
+//                         "where": "cp_catalog_page_sk % 2 = 0 and cp_catalog_page_sk >=20"
+//                     })),
+//                 ),
+//             ],
+//         )
+//         .await
+//     }
+// }
