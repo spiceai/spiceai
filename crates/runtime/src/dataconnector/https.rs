@@ -66,7 +66,10 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("password").secret(),
         ParameterSpec::component("port").description("The port to connect to."),
         ParameterSpec::runtime("client_timeout")
-            .description("The timeout setting for HTTP(S) client."),
+            .description("The timeout setting for HTTP(S) client. Defines the maximum time to wait for a response. Supports durations like '30s', '1m', '500ms'. Default: 30 seconds."),
+        ParameterSpec::runtime("http_headers")
+            .description("Custom HTTP headers to include in requests. Format: 'Header-Name: value' separated by semicolons or commas. Example: 'Authorization: Bearer token; X-Custom-Header: value'.")
+            .secret(),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -165,7 +168,7 @@ impl ListingTableConnector for Https {
 
         u.set_fragment(Some(&listing::build_fragments(
             &self.params,
-            vec!["client_timeout"],
+            vec!["client_timeout", "http_headers"],
         )));
 
         Ok(u)
