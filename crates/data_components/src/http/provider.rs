@@ -46,7 +46,10 @@ use std::{
 };
 use tokio::sync::RwLock;
 use url::Url;
-use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+use util::{
+    RetryError, retry,
+    retry_strategy::{BackoffMethod, RetryBackoff, RetryBackoffBuilder},
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -122,7 +125,7 @@ pub struct HttpTableProvider {
     constraints: Constraints,
     cache: Arc<RwLock<HashMap<String, CachedResponse>>>,
     acceleration_enabled: bool,
-    retry_strategy: util::fibonacci_backoff::FibonacciBackoff,
+    retry_strategy: RetryBackoff,
     content_type: Option<String>,
 }
 
@@ -153,15 +156,53 @@ impl HttpTableProvider {
             constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1, 2])]),
             cache: Arc::new(RwLock::new(HashMap::new())),
             acceleration_enabled,
-            retry_strategy: FibonacciBackoffBuilder::new().max_retries(Some(3)).build(),
+            retry_strategy: RetryBackoffBuilder::new()
+                .method(BackoffMethod::Fibonacci)
+                .max_retries(Some(3))
+                .build(),
             content_type: None,
         }
     }
 
     #[must_use]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.retry_strategy = FibonacciBackoffBuilder::new()
+        self.retry_strategy = RetryBackoffBuilder::new()
+            .method(self.retry_strategy.method)
             .max_retries(Some(max_retries as usize))
+            .randomization_factor(self.retry_strategy.randomization_factor)
+            .build();
+        self
+    }
+
+    #[must_use]
+    pub fn with_backoff_method(mut self, method: BackoffMethod) -> Self {
+        self.retry_strategy = RetryBackoffBuilder::new()
+            .method(method)
+            .max_retries(self.retry_strategy.max_retries)
+            .max_duration(self.retry_strategy.max_duration)
+            .randomization_factor(self.retry_strategy.randomization_factor)
+            .build();
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_retry_duration(mut self, max_duration: Option<Duration>) -> Self {
+        self.retry_strategy = RetryBackoffBuilder::new()
+            .method(self.retry_strategy.method)
+            .max_retries(self.retry_strategy.max_retries)
+            .max_duration(max_duration)
+            .randomization_factor(self.retry_strategy.randomization_factor)
+            .build();
+        self
+    }
+
+    #[must_use]
+    pub fn with_retry_jitter(mut self, jitter: f64) -> Self {
+        self.retry_strategy = RetryBackoffBuilder::new()
+            .method(self.retry_strategy.method)
+            .max_retries(self.retry_strategy.max_retries)
+            .max_duration(self.retry_strategy.max_duration)
+            .randomization_factor(jitter)
             .build();
         self
     }

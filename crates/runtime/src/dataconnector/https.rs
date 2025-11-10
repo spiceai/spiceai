@@ -101,14 +101,40 @@ impl DataConnector for Https {
 
         let acceleration_enabled = dataset.is_accelerated();
 
-        // Handle http_max_retries parameter with default of 3
+        // Handle max_retries parameter with default of 3
         let max_retries = self
             .params
-            .get("http_max_retries")
+            .get("max_retries")
             .expose()
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3);
+
+        // Handle retry_backoff_method parameter with default of fibonacci
+        let backoff_method = self
+            .params
+            .get("retry_backoff_method")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<util::retry_strategy::BackoffMethod>().ok())
+            .unwrap_or(util::retry_strategy::BackoffMethod::Fibonacci);
+
+        // Handle retry_max_duration parameter (supports duration strings like "30s", "5m", etc.)
+        let max_retry_duration = self
+            .params
+            .get("retry_max_duration")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok());
+
+        // Handle retry_jitter parameter with default of 0.3 (30% randomization)
+        let retry_jitter = self
+            .params
+            .get("retry_jitter")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.3);
 
         // Handle http_post_content_type parameter for POST requests
         let content_type = self
@@ -125,6 +151,9 @@ impl DataConnector for Https {
             acceleration_enabled,
         )
         .with_max_retries(max_retries)
+        .with_backoff_method(backoff_method)
+        .with_max_retry_duration(max_retry_duration)
+        .with_retry_jitter(retry_jitter)
         .with_content_type(content_type);
 
         let provider = Arc::new(provider);
@@ -171,10 +200,16 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("port").description("The port to connect to."),
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for HTTP(S) client."),
-        ParameterSpec::runtime("http_max_retries")
+        ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
+        ParameterSpec::runtime("retry_backoff_method")
+            .description("Retry backoff method: 'fibonacci' (default), 'linear', or 'exponential'."),
+        ParameterSpec::runtime("retry_max_duration")
+            .description("Maximum total duration for all retries (e.g., '30s', '5m'). If not set, retries will continue up to max_retries."),
+        ParameterSpec::runtime("retry_jitter")
+            .description("Randomization factor for retry delays (0.0 to 1.0). Default: 0.3 (30% randomization). Set to 0 for no jitter."),
         ParameterSpec::runtime("http_post_content_type")
-            .description("Content-Type header for POST requests when using _body filter. Defaults to 'application/json'."),
+            .description("Content-Type header for POST requests when using request_body filter. Defaults to 'application/json'."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters

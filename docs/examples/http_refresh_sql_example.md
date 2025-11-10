@@ -1,6 +1,6 @@
 # HTTP Data Connector with refresh_sql Filters
 
-This example demonstrates how to use `refresh_sql` with filters in the HTTP data connector. When a refresh_sql query includes filters on the `_path`, `_query`, or `_body` columns, the HTTP connector will use those filters to construct the appropriate HTTP requests.
+This example demonstrates how to use `refresh_sql` with filters in the HTTP data connector. When a refresh_sql query includes filters on the `request_path`, `request_query`, or `request_body` columns, the HTTP connector will use those filters to construct the appropriate HTTP requests.
 
 ## Basic Example
 
@@ -14,9 +14,9 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM api_data 
-        WHERE _path = '/api/v1/users'
+        WHERE request_path = '/api/v1/users'
 ```
 
 In this example, when the dataset refreshes, it will fetch data from `https://api.example.com/api/v1/users`.
@@ -33,9 +33,9 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM multi_endpoint 
-        WHERE _path IN ('/api/v1/users', '/api/v1/posts', '/api/v1/comments')
+        WHERE request_path IN ('/api/v1/users', '/api/v1/posts', '/api/v1/comments')
 ```
 
 This will make three separate HTTP requests:
@@ -60,10 +60,10 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM paginated_data 
-        WHERE _path = '/api/v1/users' 
-          AND _query IN ('page=1&limit=100', 'page=2&limit=100')
+        WHERE request_path = '/api/v1/users' 
+          AND request_query IN ('page=1&limit=100', 'page=2&limit=100')
 ```
 
 This will make two requests:
@@ -81,10 +81,10 @@ datasets:
       enabled: true
       refresh_mode: full
       refresh_sql: |
-        SELECT _path, _query, content 
+        SELECT request_path, request_query, content 
         FROM cross_product 
-        WHERE _path IN ('/api/users', '/api/posts')
-          AND _query IN ('status=active', 'status=inactive')
+        WHERE request_path IN ('/api/users', '/api/posts')
+          AND request_query IN ('status=active', 'status=inactive')
 ```
 
 This creates a cross product, making four requests:
@@ -96,25 +96,25 @@ This creates a cross product, making four requests:
 
 ## Supported Filter Expressions
 
-The HTTP connector's `refresh_sql` supports the following filter expressions on `_path`, `_query`, and `_body` columns:
+The HTTP connector's `refresh_sql` supports the following filter expressions on `request_path`, `request_query`, and `request_body` columns:
 
-1. **Equality (`=`)**: `WHERE _path = '/api/users'`
-2. **IN Lists**: `WHERE _path IN ('/api/users', '/api/posts')`
-3. **OR expressions**: `WHERE _path = '/api/users' OR _path = '/api/posts'`
-4. **AND expressions**: `WHERE _path = '/api/users' AND _query = 'limit=10'`
-5. **POST requests**: `WHERE _body = '{"key": "value"}'` (triggers POST with `http_post_content_type`)
+1. **Equality (`=`)**: `WHERE request_path = '/api/users'`
+2. **IN Lists**: `WHERE request_path IN ('/api/users', '/api/posts')`
+3. **OR expressions**: `WHERE request_path = '/api/users' OR request_path = '/api/posts'`
+4. **AND expressions**: `WHERE request_path = '/api/users' AND request_query = 'limit=10'`
+5. **POST requests**: `WHERE request_body = '{"key": "value"}'` (triggers POST with `http_post_content_type`)
 6. **Combinations**: Complex combinations of the above
 
 ## How It Works
 
-1. **Filter Pushdown**: When refresh_sql contains filters on `_path`, `_query`, or `_body` columns, DataFusion pushes these filters down to the HTTP table provider's `scan` method.
+1. **Filter Pushdown**: When refresh_sql contains filters on `request_path`, `request_query`, or `request_body` columns, DataFusion pushes these filters down to the HTTP table provider's `scan` method.
 
-2. **Partition Extraction**: The `extract_partitions` method recursively analyzes the filter expressions to extract all unique `(_path, _query, _body)` combinations.
+2. **Partition Extraction**: The `extract_partitions` method recursively analyzes the filter expressions to extract all unique `(request_path, request_query, request_body)` combinations.
 
 3. **HTTP Request Construction**: For each partition, the provider constructs the appropriate HTTP request by:
-   - Appending the `_path` filter value to the base URL's path
-   - Adding the `_query` filter value as the query string
-   - Using POST method with `_body` content if `_body` filter is present
+   - Appending the `request_path` filter value to the base URL's path
+   - Adding the `request_query` filter value as the query string
+   - Using POST method with `request_body` content if `request_body` filter is present
 
 4. **Content Parsing**: Response content is parsed based on format:
    - **JSON arrays**: Each element becomes a separate row
@@ -134,19 +134,22 @@ The HTTP connector's `refresh_sql` supports the following filter expressions on 
 
 The HTTP connector provides four metadata columns:
 
-- `_path` (String, NOT NULL): The path portion of the URL used for this row's request
-- `_query` (String, NOT NULL): The query string portion of the URL (empty string if none)
-- `_body` (String, NOT NULL): The request body for POST requests (empty string if none)
+- `request_path` (String, NOT NULL): The path portion of the URL used for this row's request
+- `request_query` (String, NOT NULL): The query string portion of the URL (empty string if none)
+- `request_body` (String, NOT NULL): The request body for POST requests (empty string if none)
 - `content` (String, NOT NULL): The parsed content from the response
 
-**Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `_path`, `_query`, and `_body` values but different `content`.
+**Row Expansion**: When a response contains a JSON array or newline-delimited JSON (NDJSON), each item becomes a separate row with the same `request_path`, `request_query`, and `request_body` values but different `content`.
 
 ## Notes
 
-- If no `_path` filter is provided, the base URL's path is used as-is
-- If no `_query` filter is provided, no query string is added
-- If no `_body` filter is provided, GET method is used
-- When `_body` filter is present, POST method is used with `http_post_content_type` parameter (default: `application/json`)
+- If no `request_path` filter is provided, the base URL's path is used as-is
+- If no `request_query` filter is provided, no query string is added
+- If no `request_body` filter is provided, GET method is used
+- When `request_body` filter is present, POST method is used with `http_post_content_type` parameter (default: `application/json`)
 - The `file_format` parameter must be omitted or set to `json` or `auto` to use the filter-based approach
 - For other formats (CSV, Parquet, etc.), use the listing table connector approach
-- Use `http_max_retries` parameter to configure retry attempts (default: 3)
+- Use `max_retries` parameter to configure retry attempts (default: 3)
+- Use `retry_backoff_method` parameter to configure retry strategy: 'fibonacci' (default), 'linear', or 'exponential'
+- Use `retry_max_duration` parameter to limit the total time spent retrying (e.g., '30s', '5m')
+- Use `retry_jitter` parameter to add randomization to retry delays (0.0 to 1.0, default: 0.3)
