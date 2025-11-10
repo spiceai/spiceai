@@ -227,7 +227,7 @@ pub struct HttpListingConnector {
 }
 
 impl HttpListingConnector {
-    #[must_use] 
+    #[must_use]
     pub fn new(params: Parameters, tokio_io_runtime: Handle) -> Self {
         HttpListingConnector {
             params,
