@@ -267,22 +267,22 @@ url = "2.5"
 util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
-vortex = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-alp = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-array = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-dict = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-sequence = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-session = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-sparse = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
-vortex-zigzag = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-alp = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-array = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-dict = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-sequence = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-session = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-sparse = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex-zigzag = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
