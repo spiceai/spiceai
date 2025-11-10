@@ -50,39 +50,12 @@ impl std::fmt::Display for Https {
     }
 }
 
-#[async_trait]
-impl DataConnector for Https {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn read_provider(
+impl Https {
+    /// Create HTTP table provider for JSON API endpoints
+    fn create_http_table_provider(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        // Determine file format - default to "auto" if not specified
-        let file_format = self
-            .params
-            .get("file_format")
-            .expose()
-            .ok()
-            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
-
-        // For structured file formats (parquet, csv, arrow, avro), delegate to ListingTableConnector
-        // which properly handles file parsing with correct schemas
-        let is_structured_format = matches!(
-            file_format.as_str(),
-            "parquet" | "csv" | "tsv" | "arrow" | "avro"
-        );
-
-        if is_structured_format {
-            // Use ListingTableConnector for file-based structured formats
-            let listing_connector =
-                HttpListingConnector::new(self.params.clone(), Handle::current());
-            return ListingTableConnector::read_provider(&listing_connector, dataset).await;
-        }
-
-        // For JSON API endpoints and other formats, use HttpTableProvider
         let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),
@@ -104,7 +77,7 @@ impl DataConnector for Https {
             .user_agent("spice")
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(timeout_secs))
-            .pool_max_idle_per_host(10) // Allow connection reuse
+            .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .boxed()
@@ -114,7 +87,6 @@ impl DataConnector for Https {
                 source: e,
             })?;
 
-        // Determine file format - default to "auto" if not specified
         let file_format = self
             .params
             .get("file_format")
@@ -124,7 +96,6 @@ impl DataConnector for Https {
 
         let acceleration_enabled = dataset.is_accelerated();
 
-        // Handle max_retries parameter with default of 3
         let max_retries = self
             .params
             .get("max_retries")
@@ -133,7 +104,6 @@ impl DataConnector for Https {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3);
 
-        // Handle retry_backoff_method parameter with default of fibonacci
         let backoff_method = self
             .params
             .get("retry_backoff_method")
@@ -142,7 +112,6 @@ impl DataConnector for Https {
             .and_then(|v| v.parse::<util::retry_strategy::BackoffMethod>().ok())
             .unwrap_or(util::retry_strategy::BackoffMethod::Fibonacci);
 
-        // Handle retry_max_duration parameter (supports duration strings like "30s", "5m", etc.)
         let max_retry_duration = self
             .params
             .get("retry_max_duration")
@@ -150,7 +119,6 @@ impl DataConnector for Https {
             .ok()
             .and_then(|v| fundu::parse_duration(v).ok());
 
-        // Handle retry_jitter parameter with default of 0.3 (30% randomization)
         let retry_jitter = self
             .params
             .get("retry_jitter")
@@ -159,7 +127,6 @@ impl DataConnector for Https {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.3);
 
-        // Handle http_post_content_type parameter for POST requests
         let content_type = self
             .params
             .get("http_post_content_type")
@@ -197,6 +164,43 @@ impl DataConnector for Https {
         });
 
         Ok(provider)
+    }
+}
+
+#[async_trait]
+impl DataConnector for Https {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // Determine file format - default to "auto" if not specified
+        let file_format = self
+            .params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
+
+        // For structured file formats (parquet, csv, arrow, avro), delegate to ListingTableConnector
+        // which properly handles file parsing with correct schemas
+        let is_structured_format = matches!(
+            file_format.as_str(),
+            "parquet" | "csv" | "tsv" | "arrow" | "avro"
+        );
+
+        if is_structured_format {
+            // Use ListingTableConnector for file-based structured formats
+            let listing_connector =
+                HttpListingConnector::new(self.params.clone(), Handle::current());
+            return listing_connector.read_provider(dataset).await;
+        }
+
+        // For JSON API endpoints and other formats, use HttpTableProvider
+        self.create_http_table_provider(dataset)
     }
 }
 
