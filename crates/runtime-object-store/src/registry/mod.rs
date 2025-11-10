@@ -28,7 +28,6 @@ use object_store::{
     ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
     client::SpawnedReqwestConnector, http::HttpBuilder,
 };
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
 
@@ -170,45 +169,6 @@ impl SpiceObjectStoreRegistry {
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
                     DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
                 })?);
-        }
-
-        // Parse custom HTTP headers if provided
-        let mut headers = HeaderMap::new();
-        if let Some(http_headers) = params.get("http_headers") {
-            // Headers can be separated by semicolons or commas
-            let header_pairs = http_headers
-                .split([';', ','])
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-
-            for header_pair in header_pairs {
-                if let Some((name, value)) = header_pair.split_once(':') {
-                    let name = name.trim();
-                    let value = value.trim();
-
-                    let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                        DataFusionError::Configuration(format!(
-                            "Invalid HTTP header name '{name}': {e}"
-                        ))
-                    })?;
-
-                    let header_value = HeaderValue::from_str(value).map_err(|e| {
-                        DataFusionError::Configuration(format!(
-                            "Invalid HTTP header value for '{name}': {e}"
-                        ))
-                    })?;
-
-                    headers.insert(header_name, header_value);
-                } else {
-                    tracing::warn!(
-                        "Ignoring invalid HTTP header format (expected 'Name: Value'): {header_pair}"
-                    );
-                }
-            }
-        }
-
-        if !headers.is_empty() {
-            client_options = client_options.with_default_headers(headers);
         }
 
         let builder = HttpBuilder::new()
