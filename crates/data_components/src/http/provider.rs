@@ -196,7 +196,7 @@ impl HttpTableProvider {
         use rand::distr::Alphanumeric;
 
         // Generate a random path that should return 404
-        let random_suffix: String = rand::rng()
+        let random_suffix: String = rand::thread_rng()
             .sample_iter(Alphanumeric)
             .take(16)
             .map(char::from)
