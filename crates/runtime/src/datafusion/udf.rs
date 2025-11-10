@@ -84,7 +84,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udf(INSTANCE.clone());
 }
 
-/// Cached list of JSON function names to avoid repeated SessionContext creation.
+/// Cached list of JSON function names to avoid repeated `SessionContext` creation.
 /// This is initialized once at startup and reused for all accelerator configurations.
 static JSON_FUNCTIONS: Lazy<Vec<String>> = Lazy::new(|| {
     let mut ctx = SessionContext::new();

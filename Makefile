@@ -68,13 +68,15 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-.PHONY: lint lint-go lint-rust
+.PHONY: lint lint-go lint-rust lint-cuda lint-metal lint-fix
 lint: lint-go lint-rust
+
+lint-fix: lint-go-fix lint-rust-fix
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	## All features except metal, cuda (which require specific hardware/toolchains), and allocators
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,postgres-write,release,mcp,xxhash,cluster,tpc-extension,dev --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -85,8 +87,8 @@ lint-rust:
 
 lint-rust-fix:
 	cargo fmt --all
-	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	## All features except metal, cuda (which require specific hardware/toolchains), and allocators
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,postgres-write,release,mcp,xxhash,cluster,tpc-extension,dev --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -94,9 +96,36 @@ lint-rust-fix:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions
 
+lint-cuda:
+	cargo fmt --all -- --check
+	## Lint with CUDA feature (requires CUDA 13.0+ toolkit)
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,postgres-write,release,mcp,xxhash,cluster,tpc-extension,dev,cuda --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures
+
+lint-metal:
+	cargo fmt --all -- --check
+	## Lint with Metal feature (requires macOS with Metal framework)
+	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,postgres-write,release,mcp,xxhash,cluster,tpc-extension,dev,metal --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures
+
 lint-go:
 	go vet ./...
 	golangci-lint run
+
+lint-go-fix:
+	golangci-lint run --fix
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
