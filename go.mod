@@ -3,7 +3,7 @@ module github.com/spiceai/spiceai
 go 1.25.3
 
 require (
-	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0
+	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0
 	github.com/apache/arrow/go/v17 v17.0.0
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
 	github.com/dustin/go-humanize v1.0.1
