@@ -194,10 +194,10 @@ impl DataConnectorFactory for HttpsFactory {
             .get("file_format")
             .expose()
             .ok()
-            .map(|s| s.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
 
         match file_format.as_deref() {
-            Some("json") | Some("jsonl") | Some("auto") => Box::pin(async move {
+            Some("json" | "jsonl" | "auto") => Box::pin(async move {
                 Ok(Arc::new(Https {
                     params: params.parameters,
                 }) as Arc<dyn DataConnector>)
@@ -227,6 +227,7 @@ pub struct HttpListingConnector {
 }
 
 impl HttpListingConnector {
+    #[must_use] 
     pub fn new(params: Parameters, tokio_io_runtime: Handle) -> Self {
         HttpListingConnector {
             params,
