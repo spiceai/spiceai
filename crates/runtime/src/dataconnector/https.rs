@@ -187,10 +187,28 @@ impl DataConnector for Https {
 
         // For structured file formats (parquet, csv, arrow, avro), delegate to ListingTableConnector
         // which properly handles file parsing with correct schemas
-        let is_structured_format = matches!(
+        let mut is_structured_format = matches!(
             file_format.as_str(),
             "parquet" | "csv" | "tsv" | "arrow" | "avro"
         );
+
+        // If file_format is "auto", try to detect from URL extension
+        if file_format == "auto"
+            && let Ok(url) = Url::parse(&dataset.from)
+            && let Some(mut path) = url.path_segments()
+            && let Some(last_segment) = path.next_back()
+        {
+            let extension = last_segment
+                .split('.')
+                .next_back()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+
+            is_structured_format = matches!(
+                extension.as_str(),
+                "parquet" | "csv" | "tsv" | "arrow" | "avro"
+            );
+        }
 
         if is_structured_format {
             // Use ListingTableConnector for file-based structured formats
