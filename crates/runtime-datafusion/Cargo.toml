@@ -23,8 +23,13 @@ tracing.workspace = true
 xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 
 [dev-dependencies]
+criterion = "0.5"
 datafusion-datasource.workspace = true
 tokio.workspace = true
+
+[[bench]]
+name = "duplicate_plan_node"
+harness = false
 
 [features]
 cluster = []

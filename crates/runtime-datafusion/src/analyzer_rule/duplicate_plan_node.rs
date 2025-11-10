@@ -472,3 +472,219 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod benches {
+    use super::*;
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema},
+        common::DFSchema,
+        logical_expr::{Extension, LogicalPlanBuilder, UserDefinedLogicalNodeCore},
+    };
+    use std::fmt;
+
+    extern crate test;
+    use test::Bencher;
+
+    /// A simple test extension node for benchmarking
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct BenchExtension {
+        name: &'static str,
+        id: usize,
+    }
+
+    impl UserDefinedLogicalNodeCore for BenchExtension {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn inputs(&self) -> Vec<&LogicalPlan> {
+            vec![]
+        }
+
+        fn schema(&self) -> &DFSchema {
+            static SCHEMA: std::sync::OnceLock<DFSchema> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                DFSchema::try_from(Schema::new(vec![Field::new(
+                    "bench",
+                    DataType::Int64,
+                    false,
+                )]))
+                .expect("valid schema")
+            })
+        }
+
+        fn expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
+            vec![]
+        }
+
+        fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "BenchExtension({}, {})", self.name, self.id)
+        }
+
+        fn with_exprs_and_inputs(
+            &self,
+            _exprs: Vec<datafusion::logical_expr::Expr>,
+            _inputs: Vec<LogicalPlan>,
+        ) -> datafusion::common::Result<Self> {
+            Ok(self.clone())
+        }
+    }
+
+    fn create_complex_plan_tree(depth: usize, extension_name: &'static str) -> LogicalPlan {
+        let mut plan = LogicalPlanBuilder::empty(false)
+            .build()
+            .expect("valid base plan");
+
+        // Create a tree with multiple levels and extension nodes
+        for i in 0..depth {
+            // Add extension node at each level
+            if i % 3 == 0 {
+                plan = LogicalPlan::Extension(Extension {
+                    node: Arc::new(BenchExtension {
+                        name: extension_name,
+                        id: i,
+                    }),
+                });
+            }
+
+            // Wrap in a projection or other logical plan node
+            plan = LogicalPlanBuilder::from(plan)
+                .build()
+                .expect("valid nested plan");
+        }
+
+        plan
+    }
+
+    #[bench]
+    fn bench_collect_matching_nodes_10_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(10, "bench_ext");
+        let checker = make_duplicate_extension_checker("bench_ext");
+
+        b.iter(|| {
+            let result = collect_matching_nodes(&plan, &checker);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_collect_matching_nodes_50_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(50, "bench_ext");
+        let checker = make_duplicate_extension_checker("bench_ext");
+
+        b.iter(|| {
+            let result = collect_matching_nodes(&plan, &checker);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_collect_matching_nodes_100_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(100, "bench_ext");
+        let checker = make_duplicate_extension_checker("bench_ext");
+
+        b.iter(|| {
+            let result = collect_matching_nodes(&plan, &checker);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_collect_matching_nodes_500_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(500, "bench_ext");
+        let checker = make_duplicate_extension_checker("bench_ext");
+
+        b.iter(|| {
+            let result = collect_matching_nodes(&plan, &checker);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_analyze_full_10_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(10, "bench_ext");
+        let rule = DuplicateLogicalPlanNode::extension_nodes("bench_ext");
+        let config = ConfigOptions::default();
+
+        b.iter(|| {
+            let result = rule.analyze(plan.clone(), &config);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_analyze_full_50_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(50, "bench_ext");
+        let rule = DuplicateLogicalPlanNode::extension_nodes("bench_ext");
+        let config = ConfigOptions::default();
+
+        b.iter(|| {
+            let result = rule.analyze(plan.clone(), &config);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_analyze_full_100_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(100, "bench_ext");
+        let rule = DuplicateLogicalPlanNode::extension_nodes("bench_ext");
+        let config = ConfigOptions::default();
+
+        b.iter(|| {
+            let result = rule.analyze(plan.clone(), &config);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_analyze_full_500_nodes(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(500, "bench_ext");
+        let rule = DuplicateLogicalPlanNode::extension_nodes("bench_ext");
+        let config = ConfigOptions::default();
+
+        b.iter(|| {
+            let result = rule.analyze(plan.clone(), &config);
+            test::black_box(result)
+        });
+    }
+
+    #[bench]
+    fn bench_xxh3_hash_set_insert(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(100, "bench_ext");
+        let plan_ptr = &plan as *const LogicalPlan;
+
+        b.iter(|| {
+            let mut set = XxHashSet::with_capacity_and_hasher(32, Xxh3Builder::new());
+            for i in 0..100 {
+                // Simulate inserting different pointers
+                let ptr = unsafe { plan_ptr.offset(i % 10) };
+                set.insert(ptr);
+            }
+            test::black_box(set)
+        });
+    }
+
+    #[bench]
+    fn bench_xxh3_hash_set_lookup(b: &mut Bencher) {
+        let plan = create_complex_plan_tree(100, "bench_ext");
+        let plan_ptr = &plan as *const LogicalPlan;
+
+        let mut set = XxHashSet::with_capacity_and_hasher(100, Xxh3Builder::new());
+        for i in 0..100 {
+            let ptr = unsafe { plan_ptr.offset(i % 10) };
+            set.insert(ptr);
+        }
+
+        b.iter(|| {
+            let mut count = 0;
+            for i in 0..100 {
+                let ptr = unsafe { plan_ptr.offset(i % 10) };
+                if set.contains(&ptr) {
+                    count += 1;
+                }
+            }
+            test::black_box(count)
+        });
+    }
+}
