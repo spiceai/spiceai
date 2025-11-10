@@ -19328,8 +19328,3 @@ checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "ballista"
-version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990#5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"
