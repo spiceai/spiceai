@@ -54,20 +54,37 @@ impl std::fmt::Display for Https {
 }
 
 impl Https {
-    /// Create HTTP table provider for JSON API endpoints
-    fn create_http_table_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
-            DataConnectorError::InvalidConfiguration {
-                dataconnector: "https".to_string(),
-                message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https", dataset.from),
-                connector_component: ConnectorComponent::from(dataset),
-                source: e,
-            }
-        })?;
+    /// Parse HTTP headers from the `http_headers` parameter
+    fn parse_custom_headers(&self, dataset_name: &str) -> HeaderMap {
+        let mut custom_headers = HeaderMap::new();
+        if let Some(headers_str) = self.params.get("http_headers").expose().ok() {
+            for header in headers_str.split(',') {
+                let parts: Vec<&str> = header.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    let name = parts[0].trim();
+                    let value = parts[1].trim();
 
+                    if let (Ok(header_name), Ok(header_value)) =
+                        (HeaderName::try_from(name), HeaderValue::from_str(value))
+                    {
+                        custom_headers.insert(header_name, header_value);
+                    } else {
+                        tracing::warn!(
+                            "Invalid HTTP header in dataset '{dataset_name}': '{header}'. Skipping this header."
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Malformed HTTP header in dataset '{dataset_name}': '{header}'. Expected format 'Name: Value'. Skipping this header."
+                    );
+                }
+            }
+        }
+        custom_headers
+    }
+
+    /// Build HTTP client with configured timeouts and connection pool settings
+    fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -100,7 +117,7 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
-        let client = Client::builder()
+        Client::builder()
             .user_agent("spice")
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
@@ -112,7 +129,24 @@ impl Https {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: e,
-            })?;
+            })
+    }
+
+    /// Create HTTP table provider for JSON API endpoints
+    fn create_http_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https", dataset.from),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            }
+        })?;
+
+        let client = self.build_http_client(dataset)?;
 
         let file_format = self
             .params
@@ -154,35 +188,7 @@ impl Https {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.3);
 
-        // Parse custom HTTP headers
-        let mut custom_headers = HeaderMap::new();
-        if let Some(headers_str) = self.params.get("http_headers").expose().ok() {
-            for header in headers_str.split(',') {
-                let parts: Vec<&str> = header.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    let name = parts[0].trim();
-                    let value = parts[1].trim();
-
-                    if let (Ok(header_name), Ok(header_value)) =
-                        (HeaderName::try_from(name), HeaderValue::from_str(value))
-                    {
-                        custom_headers.insert(header_name, header_value);
-                    } else {
-                        tracing::warn!(
-                            "Invalid HTTP header in dataset '{}': '{}'. Skipping this header.",
-                            dataset.name,
-                            header
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        "Malformed HTTP header in dataset '{}': '{}'. Expected format 'Name: Value'. Skipping this header.",
-                        dataset.name,
-                        header
-                    );
-                }
-            }
-        }
+        let custom_headers = self.parse_custom_headers(&dataset.name.to_string());
 
         let provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
