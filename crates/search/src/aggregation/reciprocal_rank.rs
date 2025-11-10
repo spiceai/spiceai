@@ -28,9 +28,11 @@ use async_trait::async_trait;
 use datafusion::common::Column;
 use datafusion::datasource::MemTable;
 use datafusion::functions_window::expr_fn::row_number;
-use datafusion::logical_expr::{JoinType, Operator, binary_expr, lit, col};
+use datafusion::logical_expr::{
+    Expr as LogicalExpr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder,
+};
+use datafusion::logical_expr::{JoinType, Operator, binary_expr, col, lit};
 use datafusion::prelude::{SessionContext, coalesce};
-use datafusion::logical_expr::{Expr as LogicalExpr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use snafu::ResultExt;
 
@@ -142,9 +144,13 @@ impl CandidateAggregation for ReciprocalRankFusion {
         .context(DatafusionSnafu)?;
 
         tracing::debug!("Running RRF logical plan: {plan:?}");
-        let df = ctx.execute_logical_plan(plan).await.context(DatafusionSnafu)?;
-
-        let data = df.execute_stream().await.context(DatafusionSnafu)?;
+        let data = ctx
+            .execute_logical_plan(plan)
+            .await
+            .context(DatafusionSnafu)?
+            .execute_stream()
+            .await
+            .context(DatafusionSnafu)?;
 
         Ok(AggregationResult {
             data,
@@ -260,6 +266,7 @@ fn ith_search_value_column(i: usize) -> String {
 ///
 /// This function takes already-registered table names from a SessionContext and builds
 /// a logical plan that performs reciprocal rank fusion across them.
+#[allow(clippy::cast_precision_loss)]
 async fn reciprocal_rank_fusion_plan(
     ctx: &SessionContext,
     tables: &[String],
@@ -338,8 +345,11 @@ async fn reciprocal_rank_fusion_plan(
         .iter()
         .enumerate()
         .map(|(i, (table_name, _))| {
-            col(Column::new(Some(table_name.clone()), SEARCH_VALUE_COLUMN_NAME))
-                .alias(ith_search_value_column(i))
+            col(Column::new(
+                Some(table_name.clone()),
+                SEARCH_VALUE_COLUMN_NAME,
+            ))
+            .alias(ith_search_value_column(i))
         })
         .collect();
 
@@ -350,21 +360,14 @@ async fn reciprocal_rank_fusion_plan(
         .map(|col_name| {
             let col_refs: Vec<LogicalExpr> = ranked_plans
                 .iter()
-                .map(|(table_name, _)| {
-                    col(Column::new(Some(table_name.clone()), col_name.clone()))
-                })
+                .map(|(table_name, _)| col(Column::new(Some(table_name.clone()), col_name.clone())))
                 .collect();
             coalesce(col_refs).alias(col_name.clone())
         })
         .collect();
 
     // 7) Project: score, value columns, coalesced columns
-    let projection: Vec<LogicalExpr> = [
-        vec![rrf_score_final],
-        value_cols,
-        coalesced_cols,
-    ]
-    .concat();
+    let projection: Vec<LogicalExpr> = [vec![rrf_score_final], value_cols, coalesced_cols].concat();
 
     builder = builder.project(projection)?;
 
