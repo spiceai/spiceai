@@ -21,7 +21,6 @@ use parameterized::{ParameterValue, add_tpch_parameters};
 
 use crate::flight::{PreparedStatementParamColumn, create_param_batch};
 
-pub mod integration_http;
 pub mod parameterized;
 pub mod scenario;
 pub mod validation;
@@ -192,8 +191,6 @@ pub enum QuerySet {
     Tpcds,
     Clickbench,
     ParameterizedTpch,
-    /// Integration test for HTTP connector
-    IntegrationHttp,
     /// Scenario query set loaded from a file
     Scenario {
         queries: Vec<Query>,
@@ -235,7 +232,6 @@ impl QuerySet {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
             QuerySet::Clickbench => get_clickbench_test_queries(overrides),
-            QuerySet::IntegrationHttp => integration_http::get_queries(),
             QuerySet::Scenario { queries, .. } => queries.clone(),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
@@ -270,7 +266,7 @@ impl QuerySet {
     #[must_use]
     pub fn row_counts(&self) -> Vec<TableWithRowCount> {
         match self {
-            QuerySet::IntegrationHttp | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", 150_000),
                 ("lineitem", 6_001_215),
@@ -323,7 +319,7 @@ impl QuerySet {
     #[must_use]
     pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
-            QuerySet::IntegrationHttp | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", "c_created_at"),
                 ("lineitem", "l_created_at"),
@@ -401,7 +397,6 @@ impl Display for QuerySet {
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
-            QuerySet::IntegrationHttp => write!(f, "integration[http]"),
             QuerySet::Scenario { scenario_set, .. } => {
                 if let Some(name) = &scenario_set.name {
                     write!(f, "scenario[{name}]")

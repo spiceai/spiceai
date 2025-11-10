@@ -10,7 +10,8 @@ The HTTP connector uses the built-in integration test suite:
 cargo run -p testoperator -- run bench \
   -p ./test/spicepods/http/basic.yaml \
   -s spiced \
-  --query-set integration[http]
+  --query-set scenario \
+  --scenario-query-file test/scenario/http/basic.yaml
 ```
 
 Integration test queries are defined in `crates/test-framework/src/queries/integration_http/` following the TPC-H pattern.
