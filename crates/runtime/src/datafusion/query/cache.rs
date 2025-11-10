@@ -119,7 +119,7 @@ impl Query {
             ..
         } = match Self::try_get_cached_result(
             df,
-            Arc::clone(&request_context),
+            &request_context,
             tracker,
             &sql_or_user_cache_key,
             sql,
@@ -134,6 +134,7 @@ impl Query {
         };
 
         // Always use CacheKey::Query when checking the plan cache
+        // Only compute this hash if we need it for the plan cache lookup
         let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
         let plan = match df
             .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
@@ -167,7 +168,7 @@ impl Query {
             ..
         } = match Self::try_get_cached_result(
             df,
-            Arc::clone(&request_context),
+            &request_context,
             tracker,
             &CacheKey::LogicalPlan(&plan),
             sql,
@@ -211,7 +212,7 @@ impl Query {
     #[allow(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
-        request_context: Arc<RequestContext>,
+        request_context: &Arc<RequestContext>,
         mut tracker: Option<QueryTracker>,
         key: &'a CacheKey<'a>,
         sql: &str,
@@ -317,6 +318,7 @@ impl Query {
                     sql,
                     &request_context,
                     plan,
+                    raw_key,
                 );
             }
         }
@@ -327,7 +329,7 @@ impl Query {
             CacheResult::Hit(QueryResult::new(
                 attach_query_tracker_to_stream(
                     Span::current(),
-                    request_context,
+                    Arc::clone(request_context),
                     tracker,
                     Box::pin(record_batch_stream),
                 ),
@@ -360,9 +362,9 @@ impl Query {
     /// If a `LogicalPlan` is provided, it will be used directly to avoid re-parsing the SQL.
     /// This is more efficient when the plan is already available (e.g., from a plan cache hit).
     ///
-    /// Uses lock-free deduplication to ensure only one revalidation task runs per query.
-    /// Multiple concurrent requests for the same stale cache entry will not spawn redundant
-    /// background tasks.
+    /// Uses lock-free deduplication based on the cache key to ensure only one revalidation
+    /// task runs per cache entry. Multiple concurrent requests for the same stale cache entry
+    /// will not spawn redundant background tasks.
     ///
     /// The background task will be automatically cancelled if:
     /// - The `DataFusion` context is dropped (runtime shutdown)
@@ -372,21 +374,33 @@ impl Query {
         sql: &str,
         request_context: &Arc<RequestContext>,
         plan: Option<&LogicalPlan>,
+        cache_key: RawCacheKey,
     ) {
-        // Static map to track ongoing revalidation tasks
-        static REVALIDATION_TASKS: OnceLock<DashMap<String, ()>> = OnceLock::new();
+        // Static map to track ongoing revalidation tasks by cache key
+        static REVALIDATION_TASKS: OnceLock<DashMap<RawCacheKey, ()>> = OnceLock::new();
         let tasks = REVALIDATION_TASKS.get_or_init(DashMap::new);
 
+        let cache_key_u64 = cache_key.as_u64(); // Save for logging before moving cache_key
+
+        // Try to insert a marker for this cache key - if it already exists, another task is running
+        // Use entry API for atomic check-and-insert
+        use dashmap::mapref::entry::Entry;
+        match tasks.entry(cache_key) {
+            Entry::Occupied(_) => {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation already in progress for this cache key, skipping duplicate"
+                );
+                return;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
+
+        // Only allocate the SQL string if we're actually going to spawn the task
         let sql = sql.to_string();
         let plan = plan.cloned();
-
-        // Try to insert a marker for this query - if it already exists, another task is running
-        if tasks.insert(sql.clone(), ()).is_some() {
-            tracing::debug!(
-                "Background revalidation already in progress for this query, skipping duplicate"
-            );
-            return;
-        }
 
         // Create a background request context that will cache results
         // Use the same cache key type as the original request, but remove stale-while-revalidate
@@ -410,33 +424,69 @@ impl Query {
         tokio::spawn(async move {
             // Ensure we remove the task marker when done, even if the task panics
             let _guard = scopeguard::guard((), |()| {
-                tasks.remove(&sql);
-            });
-
-            // Execute the query through the full Query pipeline to ensure cache population
-            let query = if let Some(logical_plan) = plan {
+                tasks.remove(&cache_key);
+            }); // Execute the query through the full Query pipeline to ensure cache population
+            let (query, input_tables) = if let Some(logical_plan) = plan {
                 tracing::debug!("Background revalidation: re-executing query with existing plan");
-                super::Query::from_logical_plan(&df, &logical_plan)
+                let input_tables = cache::get_logical_plan_input_tables(&logical_plan);
+                (
+                    super::Query::from_logical_plan(&df, &logical_plan),
+                    input_tables,
+                )
             } else {
                 tracing::debug!("Background revalidation: re-executing query (will re-parse SQL)");
-                super::QueryBuilder::new(&sql, df).build()
+                // We don't have the plan, so we'll need to parse it to get input tables
+                // For now, use an empty set - the query will still execute and cache correctly
+                (
+                    super::QueryBuilder::new(&sql, Arc::clone(&df)).build(),
+                    std::collections::HashSet::new(),
+                )
             };
+            let input_tables = Arc::new(input_tables);
+
             let result = background_context
                 .scope(async move { query.run().await })
                 .await;
 
             match result {
                 Ok(query_result) => {
-                    // Drain the stream to ensure the query executes and cache is populated
+                    let schema = query_result.data.schema();
+                    // Drain the stream and collect batches for explicit caching
                     match query_result.data.try_collect::<Vec<_>>().await {
                         Ok(batches) => {
-                            tracing::debug!(
-                                "Background revalidation completed successfully, {} batches cached",
-                                batches.len()
-                            );
+                            // Explicitly cache the results using the exact cache key that served stale data
+                            if let Some(cache_provider) = df.results_cache_provider() {
+                                let cached_at = std::time::Instant::now();
+                                let cached_result = cache::result::query::CachedQueryResult::new(
+                                    Arc::new(batches),
+                                    schema,
+                                    input_tables,
+                                    cached_at,
+                                );
+
+                                if let Err(e) =
+                                    cache_provider.put_raw_key(&cache_key, cached_result).await
+                                {
+                                    tracing::debug!(
+                                        cache_key = cache_key_u64,
+                                        "Background revalidation failed to cache results: {}",
+                                        e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        cache_key = cache_key_u64,
+                                        "Background revalidation completed successfully and cached"
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "Background revalidation completed but cache provider unavailable"
+                                );
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(
+                                cache_key = cache_key_u64,
                                 "Background revalidation failed during collection: {}",
                                 e
                             );
@@ -444,7 +494,11 @@ impl Query {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("Background revalidation query failed: {}", e);
+                    tracing::debug!(
+                        cache_key = cache_key_u64,
+                        "Background revalidation query failed: {}",
+                        e
+                    );
                 }
             }
         });
@@ -862,6 +916,7 @@ mod tests {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("5s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            max_stale_while_revalidate: Some("0s".to_string()), // Disable stale-while-revalidate for this test
             ..Default::default()
         }))
         .await;
@@ -930,6 +985,11 @@ mod tests {
         // Run out the TTL
         tokio::time::sleep(Duration::from_secs(5)).await;
 
+        // Force Moka to run pending eviction tasks
+        if let Some(cache_provider) = df.results_cache_provider() {
+            cache_provider.run_pending_tasks().await;
+        }
+
         // Make a request with the same "SELECT 2" query, but after expiry
         let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df));
         let query = query_builder.build();
@@ -957,6 +1017,113 @@ mod tests {
                         .expect("must read i64 array")
                         .value(0),
                     2
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_stale_while_revalidate_cache_ttl_extension() {
+        // This test validates that when stale-while-revalidate is configured,
+        // the cache TTL is extended by the max_stale_while_revalidate duration
+        // to allow serving stale data during the revalidation window.
+
+        // Configure cache with 2s TTL and 3s max stale-while-revalidate
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("2s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            max_stale_while_revalidate: Some("3s".to_string()),
+            ..Default::default()
+        }))
+        .await;
+
+        let request_context = create_test_request_context(
+            CacheControl::CacheWithStaleWhileRevalidate(
+                CacheKeyType::ClientSupplied,
+                Duration::from_secs(3),
+            ),
+            Some("ttl-test-key".to_string()),
+        );
+
+        // First request - populate cache
+        let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let _ = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+            })
+            .await;
+
+        // Wait 2.5s (past TTL but within stale window)
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        // Request should get stale data (cache hit) because we're within TTL + max_stale
+        let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df)); // Different query, same cache key
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                // Should be a cache hit serving stale data
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                // Verify we got the cached result from the first query (1, not 2)
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    1
+                );
+            })
+            .await;
+
+        // Wait another 5s (total 7.5s, beyond TTL + max_stale window of 5s)
+        // Add extra time for Moka's async eviction to complete
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Force Moka to run pending eviction tasks
+        if let Some(cache_provider) = df.results_cache_provider() {
+            cache_provider.run_pending_tasks().await;
+        }
+
+        // Request should now be a cache miss because the entry should have been evicted
+        let query_builder = QueryBuilder::new("SELECT 3", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                // Should be a cache miss - entry evicted after TTL + max_stale
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                // Verify the query actually ran (got 3, not the cached 1)
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    3
                 );
             })
             .await;
