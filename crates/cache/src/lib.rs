@@ -342,13 +342,14 @@ impl QueryResultsCacheProvider {
         };
 
         // If max_stale_while_revalidate is configured, extend the cache TTL
-        // to allow entries to remain in cache during the stale-while-revalidate window
-        // Default is 5 seconds if not specified
+        // to allow entries to remain in cache during the stale-while-revalidate window.
+        // Default is ZERO (disabled) when not specified to avoid unexpectedly extending
+        // cache TTL beyond the configured item_ttl.
         let stale_duration = match &config.max_stale_while_revalidate {
             Some(max_stale) => {
                 fundu::parse_duration(max_stale).context(FailedToParseItemTtlSnafu)?
             }
-            None => std::time::Duration::from_secs(5),
+            None => std::time::Duration::ZERO,
         };
         let cache_ttl = ttl + stale_duration;
 
