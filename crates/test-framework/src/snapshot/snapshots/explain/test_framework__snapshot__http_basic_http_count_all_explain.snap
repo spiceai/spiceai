@@ -1,0 +1,20 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: http_count_all"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                              |
++---------------+-------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: count(httpbin_json._path) AS row_count                                                                |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(httpbin_json._path)]]                                                     |
+|               |     TableScan: httpbin_json projection=[_path]                                                                    |
+| physical_plan | ProjectionExec: expr=[count(httpbin_json._path)@0 as row_count]                                                   |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[count(httpbin_json._path)]                                             |
+|               |     CoalescePartitionsExec                                                                                        |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[count(httpbin_json._path)]                                       |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                     |
+|               |           CooperativeExec                                                                                         |
+|               |             BytesProcessedExec                                                                                    |
+|               |               HttpExec: base_url=https://httpbin.org/json, format=auto, partitions=[(path="", query="", body="")] |
+|               |                                                                                                                   |
++---------------+-------------------------------------------------------------------------------------------------------------------+

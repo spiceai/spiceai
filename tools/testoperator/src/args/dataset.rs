@@ -63,6 +63,9 @@ pub enum QuerySetArg {
     #[value(name = "tpch[parameterized]")]
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
+    #[value(name = "integration[http]")]
+    #[serde(rename = "integration[http]")]
+    IntegrationHttp,
     /// Scenario query set loaded from a file (use --scenario-query-file)
     Scenario,
 }
@@ -112,6 +115,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
+            QuerySetArg::IntegrationHttp => QuerySet::IntegrationHttp,
             QuerySetArg::Scenario => {
                 panic!(
                     "Scenario query set requires loading from file - use DatasetTestArgs::load_query_set() instead"
