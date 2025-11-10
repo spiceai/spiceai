@@ -117,7 +117,9 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
             QuerySetArg::IntegrationHttp => QuerySet::IntegrationHttp,
             QuerySetArg::Scenario => {
-                panic!(
+                // This should never be reached - callers must use DatasetTestArgs::load_query_set()
+                // for Scenario query sets as they require loading from a file.
+                unreachable!(
                     "Scenario query set requires loading from file - use DatasetTestArgs::load_query_set() instead"
                 )
             }
