@@ -179,8 +179,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path())?;
 
-    telemetry.emit().await?;
-
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
@@ -188,6 +186,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     // Stop and process metrics scraper if enabled
     super::process_spiced_metrics(metrics_scraper, args.common.metrics, &[]).await;
+
+    telemetry.emit().await?;
 
     spiced_instance.stop()?;
     let health_report = health_report?;

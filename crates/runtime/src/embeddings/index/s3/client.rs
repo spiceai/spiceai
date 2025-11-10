@@ -65,6 +65,7 @@ impl S3VectorClient {
         }
     }
 }
+
 #[async_trait]
 impl S3Vectors for S3VectorClient {
     async fn create_index(
@@ -217,13 +218,17 @@ impl S3Vectors for S3VectorClient {
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
         if is_full_list && let Some(ttl) = self.ttl {
-            let cache = self.list_indexes_cache.read().await;
-            if let Some(bucket) = &input.vector_bucket_name
-                && let Some((cached_output, timestamp)) = cache.get(bucket)
-                && timestamp.elapsed() < ttl
+            // Fast path: check with read lock first
             {
-                return Ok(cached_output.clone());
+                let cache = self.list_indexes_cache.read().await;
+                if let Some(bucket) = &input.vector_bucket_name
+                    && let Some((cached_output, timestamp)) = cache.get(bucket)
+                    && timestamp.elapsed() < ttl
+                {
+                    return Ok(cached_output.clone());
+                }
             }
+            // Read lock dropped here before API call
         }
 
         let result = {
@@ -236,13 +241,20 @@ impl S3Vectors for S3VectorClient {
                 .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
         };
 
-        // Cache successful full list results
+        // Cache successful full list results with double-check pattern
         if is_full_list
-            && self.ttl.is_some()
+            && let Some(ttl) = self.ttl
             && let Ok(output) = &result
-            && let Some(bucket) = input.vector_bucket_name
+            && let Some(bucket) = input.vector_bucket_name.clone()
         {
             let mut cache = self.list_indexes_cache.write().await;
+            // Check again - another thread might have cached during our API call
+            if let Some((_, timestamp)) = cache.get(&bucket)
+                && timestamp.elapsed() < ttl
+            {
+                // Fresh cache exists, don't overwrite with potentially older data
+                return result;
+            }
             cache.insert(bucket, (output.clone(), Instant::now()));
         }
 
