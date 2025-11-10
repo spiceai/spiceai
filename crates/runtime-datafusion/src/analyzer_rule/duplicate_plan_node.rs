@@ -60,7 +60,7 @@ pub type DuplicateNodeFn = Box<dyn Fn(&LogicalPlan, &LogicalPlan) -> bool + Send
 /// ## Measured Impact
 /// - Baseline: 100-node plan = ~10,000 comparisons (O(N²))
 /// - Optimized: 100-node plan = ~200 operations (O(N))
-/// - Memory: Pre-allocated FxHashSet reduces allocations by ~70%
+/// - Memory: Pre-allocated XxHashSet reduces allocations by ~70%
 /// - Throughput: ~50-100x faster for complex query plans (100+ nodes)
 pub struct DuplicateLogicalPlanNode {
     is_duplicate: Arc<DuplicateNodeFn>,
