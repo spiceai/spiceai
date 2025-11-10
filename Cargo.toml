@@ -102,7 +102,6 @@ aws-smithy-runtime = "1.9.3"
 aws-smithy-runtime-api = "1.9.1"
 aws-smithy-types = "1.3.3"
 axum = { version = "0.8", features = ["macros"] }
-ballista = "50.0.0"
 ballista-core = "50.0.0"
 ballista-executor = "50.0.0"
 ballista-scheduler = { version = "50.0.0" }
@@ -322,7 +321,6 @@ datafusion-table-providers = { git = "https://github.com/datafusion-contrib/data
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a99494a6f3bad72faa7daecd4477ef42f4e9c046" } # jeadie/25-10-31/temp
 
-ballista = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }           # spiceai/spiceai-50
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }  # spiceai/spiceai-50
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" } # spiceai/spiceai-50
