@@ -8,18 +8,17 @@ description: "Query: clickbench_q21"
 | logical_plan  | Projection: count(Int64(1)) AS count(*)                                                                                                                           |
 |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                               |
 |               |     Projection:                                                                                                                                                   |
-|               |       BytesProcessedNode                                                                                                                                          |
-|               |         Filter: hits.URL LIKE LargeUtf8("%google%")                                                                                                               |
-|               |           TableScan: hits projection=[URL]                                                                                                                        |
+|               |       Filter: hits.URL LIKE LargeUtf8("%google%")                                                                                                                 |
+|               |         TableScan: hits projection=[URL]                                                                                                                          |
 | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as count(*)]                                                                                                              |
 |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                                       |
 |               |     CoalescePartitionsExec                                                                                                                                        |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                                 |
 |               |         ProjectionExec: expr=[]                                                                                                                                   |
-|               |           BytesProcessedExec                                                                                                                                      |
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
-|               |               FilterExec: URL@0 LIKE %google%                                                                                                                     |
-|               |                 SchemaCastScanExec                                                                                                                                |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |             FilterExec: URL@0 LIKE %google%                                                                                                                       |
+|               |               SchemaCastScanExec                                                                                                                                  |
+|               |                 BytesProcessedExec                                                                                                                                |
 |               |                   DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                                   |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
