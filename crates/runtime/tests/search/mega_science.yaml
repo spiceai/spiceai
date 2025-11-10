@@ -1,0 +1,73 @@
+# Column configurations for MEGA_SCIENCE tests
+# Each key represents a configured set of columns to use in `.views[].columns` or `.datasets[].columns`.
+
+basic:
+  - name: answer
+    embeddings:
+      - from: hf_minilm
+        row_id: id
+
+multi_column:
+  - name: question
+    embeddings:
+      - from: hf_minilm
+        row_id: id
+  - name: answer
+    embeddings:
+      - from: hf_minilm
+        row_id: id
+
+hybrid_single_column:
+  - name: answer
+    embeddings:
+      - from: hf_minilm
+        row_id: id
+    full_text_search:
+      enabled: true
+      row_id: id
+
+hybrid_multiple_column:
+  - name: question
+    embeddings:
+      - from: hf_minilm
+        row_id: id
+  - name: answer
+    full_text_search:
+      enabled: true
+      row_id: id
+
+text_search:
+  - name: answer
+    full_text_search:
+      enabled: true
+      row_id: id
+
+multi_text_column:
+  - name: question
+    full_text_search:
+      enabled: true
+      row_id: id
+  - name: answer
+    full_text_search:
+      enabled: true
+      row_id: id
+
+text_search_metadata:
+  - name: answer
+    full_text_search:
+      enabled: true
+      row_id: id
+    metadata:
+      searchable_fields:
+        - subject
+  - name: subject
+    metadata:
+      vectors: non-filterable
+
+multi_embeddings:
+  - name: answer
+    embeddings:
+      - from: hf_minilm
+        row_id: id
+      - from: openai_embeddings
+        row_id: id

@@ -13077,6 +13077,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_yaml",
  "snafu",
  "snowflake-api",
  "spice-cloud",

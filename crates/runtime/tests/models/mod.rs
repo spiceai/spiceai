@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod bedrock;
 mod embedding;
-mod hf;
+pub(crate) mod hf;
 mod local;
 mod models_http_endpoint;
 pub(crate) mod openai;
@@ -141,7 +141,7 @@ mod nsql {
     }
 }
 
-fn create_api_bindings_config() -> Config {
+pub(crate) fn create_api_bindings_config() -> Config {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
@@ -401,7 +401,7 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
 }
 
 /// Sorts the keys of a JSON object in place for consistent snapshot testing
-fn sort_json_keys(value: &mut Value) {
+pub(crate) fn sort_json_keys(value: &mut Value) {
     match value {
         Value::Object(map) => {
             let mut sorted_map = serde_json::Map::new();

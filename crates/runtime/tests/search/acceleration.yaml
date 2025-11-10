@@ -1,0 +1,22 @@
+# acceleration configurations for search tests. Each key represents a configured acceleration
+# to use in `.views[].acceleration` or `.datasets[].acceleration`.
+
+no_acceleration:
+  enabled: false
+
+arrow:
+  enabled: true
+  engine: arrow
+
+duckdb:
+  enabled: true
+  engine: duckdb
+
+duckdb_file:
+  enabled: true
+  engine: duckdb
+  mode: file
+
+cayenne:
+  enabled: true
+  engine: cayenne

@@ -201,6 +201,7 @@ paste.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
+serde_yaml.workspace = true
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tempfile.workspace = true
