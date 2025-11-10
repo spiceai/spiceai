@@ -50,7 +50,7 @@ use crate::args::CommonArgs;
 /// 3. Adds validation data for scenario queries when validation is enabled
 ///
 /// # Returns
-/// Tuple of (QuerySet, Vec<Query>, NotStarted builder)
+/// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
 pub(crate) fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
@@ -65,13 +65,12 @@ pub(crate) fn build_test_with_validation(
     let mut test_builder = test_builder.with_query_set(queries);
 
     // Add validation data if this is a scenario query set with validation enabled
-    if args.validate {
-        if let Some(validation_data) =
+    if args.validate
+        && let Some(validation_data) =
             query_set.get_validation_data(args.scenario_query_file.as_deref())?
         {
             test_builder = test_builder.with_validation_data(validation_data);
         }
-    }
 
     Ok((query_set, test_builder))
 }

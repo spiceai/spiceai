@@ -22,14 +22,12 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
-use tokio::runtime::Handle;
 use url::Url;
 
 use super::{ConnectorComponent, ConnectorParams};
 use super::{
     DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec,
     Parameters,
-    listing::{self, ListingTableConnector},
 };
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -41,7 +39,6 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
-    tokio_io_runtime: Handle,
 }
 
 impl std::fmt::Display for Https {
@@ -97,8 +94,7 @@ impl DataConnector for Https {
             .get("file_format")
             .expose()
             .ok()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "auto".to_string());
+            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
 
         let acceleration_enabled = dataset.is_accelerated();
 
@@ -193,7 +189,6 @@ impl DataConnectorFactory for HttpsFactory {
         Box::pin(async move {
             Ok(Arc::new(Https {
                 params: params.parameters,
-                tokio_io_runtime: params.io_runtime,
             }) as Arc<dyn DataConnector>)
         })
     }

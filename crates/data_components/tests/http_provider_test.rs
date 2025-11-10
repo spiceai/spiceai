@@ -792,7 +792,7 @@ async fn test_ndjson_format() {
     assert!(!results.is_empty(), "Should have results");
 }
 
-/// Test CSV format with dynamic filters (request_path)
+/// Test CSV format with dynamic filters (`request_path`)
 #[tokio::test]
 async fn test_csv_with_dynamic_filter() {
     // Base URL pointing to a directory structure
