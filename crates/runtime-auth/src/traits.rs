@@ -25,6 +25,7 @@ pub type AuthPrincipalRef = Arc<dyn AuthPrincipal + Sync + Send>;
 pub trait AuthPrincipal {
     fn username(&self) -> &str; // The username as presented during auth
     fn groups(&self) -> &[&str]; // Group memberships
+    fn as_any(&self) -> &dyn std::any::Any; // Allow downcasting for type-specific operations
 }
 pub trait AuthRequestContext {
     /// Sets the current authentication principal for the request context.
@@ -58,6 +59,10 @@ impl AuthPrincipal for ApiKey {
             ApiKey::ReadOnly { .. } => &["read"],
             ApiKey::ReadWrite { .. } => &["read_write"],
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

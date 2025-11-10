@@ -13191,6 +13191,7 @@ name = "runtime-datafusion-udfs"
 version = "1.9.0-unstable"
 dependencies = [
  "ahash 0.8.12",
+ "app",
  "arrow",
  "arrow-schema",
  "async-openai",
@@ -13200,6 +13201,7 @@ dependencies = [
  "futures",
  "insta",
  "llms",
+ "runtime-auth",
  "runtime-request-context",
  "snafu",
  "tokio",

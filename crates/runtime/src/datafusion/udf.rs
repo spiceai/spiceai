@@ -33,6 +33,7 @@ use runtime_datafusion_udfs::{
 use runtime_datafusion_udfs::{
     alias::ScalarUDFAlias,
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
+    client_id::{CLIENT_ID_UDF_NAME, ClientId},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
     embed::EMBED_UDF_NAME,
@@ -43,6 +44,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
     ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
     ctx.register_udf(Bucket::new().into());
+    ctx.register_udf(ClientId::new().into());
     ctx.register_udf(CosineDistance::new().into());
     ctx.register_udf(Truncate::new().into());
 
@@ -88,6 +90,7 @@ pub fn deny_spice_specific_functions() -> FunctionSupport {
     let builtin = [
         "rand",
         BUCKET_SCALAR_UDF_NAME,
+        CLIENT_ID_UDF_NAME,
         COSINE_DISTANCE_UDF_NAME,
         TRUNCATE_SCALAR_UDF_NAME,
         EMBED_UDF_NAME,
