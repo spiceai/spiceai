@@ -74,7 +74,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let table_count_result = check_table_counts(
         &spiced_instance,
-        query_set,
+        &query_set,
         args.scale_factor.unwrap_or(1.0),
     )
     .await;
@@ -121,7 +121,7 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
 
 async fn check_table_counts(
     spiced: &SpicedInstance,
-    query_set: QuerySet,
+    query_set: &QuerySet,
     scale_factor: f64,
 ) -> anyhow::Result<()> {
     let spice_client = spiced.spice_client(None, false).await?;

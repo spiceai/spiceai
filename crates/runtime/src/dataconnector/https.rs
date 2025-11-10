@@ -189,26 +189,11 @@ impl DataConnectorFactory for HttpsFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let file_format = params
-            .parameters
-            .get("file_format")
-            .expose()
-            .ok()
-            .map(str::to_ascii_lowercase);
-
-        match file_format.as_deref() {
-            Some("json" | "jsonl" | "auto") => Box::pin(async move {
-                Ok(Arc::new(Https {
-                    params: params.parameters,
-                }) as Arc<dyn DataConnector>)
-            }),
-            _ => Box::pin(async move {
-                Ok(Arc::new(HttpListingConnector::new(
-                    params.parameters,
-                    params.io_runtime,
-                )) as Arc<dyn DataConnector>)
-            }),
-        }
+        Box::pin(async move {
+            Ok(Arc::new(Https {
+                params: params.parameters,
+            }) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {
