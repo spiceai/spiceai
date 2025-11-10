@@ -244,6 +244,11 @@ fn get_random_value_from_interval(
     random: f64,
     current_interval: Duration,
 ) -> Duration {
+    // Avoid floating-point operations when there's no randomization
+    if randomization_factor == 0.0 {
+        return current_interval;
+    }
+
     let current_interval_nanos = duration_to_nanos(current_interval);
 
     let delta = randomization_factor * current_interval_nanos;
@@ -302,17 +307,48 @@ mod tests {
             .max_retries(Some(5))
             .build();
 
-        // First interval should be around 1000ms
-        let interval = backoff.next_backoff().expect("backoff should exist");
-        assert!(interval >= Duration::from_millis(900) && interval <= Duration::from_millis(1100));
+        // With no randomization, intervals should be exact values from the Fibonacci sequence
+        // The BACKOFF_INTERVALS_MS array is: [1000, 1000, 2000, 3000, 5000, 8000, ...]
+        // num_retries starts at 0, increments before indexing, so:
+        // - First call: num_retries becomes 1, returns BACKOFF_INTERVALS_MS[1] = 1000ms
+        // - Second call: num_retries becomes 2, returns BACKOFF_INTERVALS_MS[2] = 2000ms
+        // - Third call: num_retries becomes 3, returns BACKOFF_INTERVALS_MS[3] = 3000ms
+        assert_eq!(
+            backoff.next_backoff(),
+            Some(Duration::from_millis(1000)),
+            "First interval should be exactly 1000ms"
+        );
 
-        // Second interval should be around 1000ms
-        let interval = backoff.next_backoff().expect("backoff should exist");
-        assert!(interval >= Duration::from_millis(900) && interval <= Duration::from_millis(1100));
+        assert_eq!(
+            backoff.next_backoff(),
+            Some(Duration::from_millis(2000)),
+            "Second interval should be exactly 2000ms"
+        );
 
-        // Third interval should be around 2000ms
-        let interval = backoff.next_backoff().expect("backoff should exist");
-        assert!(interval >= Duration::from_millis(1900) && interval <= Duration::from_millis(2100));
+        assert_eq!(
+            backoff.next_backoff(),
+            Some(Duration::from_millis(3000)),
+            "Third interval should be exactly 3000ms"
+        );
+
+        assert_eq!(
+            backoff.next_backoff(),
+            Some(Duration::from_millis(5000)),
+            "Fourth interval should be exactly 5000ms"
+        );
+
+        assert_eq!(
+            backoff.next_backoff(),
+            Some(Duration::from_millis(8000)),
+            "Fifth interval should be exactly 8000ms"
+        );
+
+        // After max_retries, should return None
+        assert_eq!(
+            backoff.next_backoff(),
+            None,
+            "Should return None after max retries"
+        );
     }
 
     #[test]
