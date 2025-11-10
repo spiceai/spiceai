@@ -267,22 +267,22 @@ url = "2.5"
 util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
-vortex = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-alp = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-array = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-dict = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-sequence = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-session = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-sparse = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
-vortex-zigzag = { git = "https://github.com/spiceai/vortex", rev = "e5c9d43a0578266a86214b40632ea4d80e707515" }
+vortex = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-alp = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-array = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-dict = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-sequence = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-session = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-sparse = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
+vortex-zigzag = { git = "https://github.com/spiceai/vortex", rev = "05284cd046e45992f81332be0857a67734d48aa4" }
 x509-certificate = "0.23.1"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
@@ -298,25 +298,25 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }                       # spiceai/spiceai-50
-datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }               # spiceai/spiceai-50
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }                # spiceai/spiceai-50
-datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }        # spiceai/spiceai-50
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }            # spiceai/spiceai-50
-datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }    # spiceai/spiceai-50
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }             # spiceai/spiceai-50
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }                  # spiceai/spiceai-50
-datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }           # spiceai/spiceai-50
-datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }             # spiceai/spiceai-50
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }         # spiceai/spiceai-50
-datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" } # spiceai/spiceai-50
-datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }  # spiceai/spiceai-50
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }         # spiceai/spiceai-50
-datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }                 # spiceai/spiceai-50
-datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }          # spiceai/spiceai-50
-datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }               # spiceai/spiceai-50
-datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }               # spiceai/spiceai-50
-datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "97adc94dd48dab0ac1e8c5c8020e1777b344bd55" }                   # spiceai/spiceai-50
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }                       # spiceai/spiceai-50
+datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }               # spiceai/spiceai-50
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }                # spiceai/spiceai-50
+datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }        # spiceai/spiceai-50
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }            # spiceai/spiceai-50
+datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }    # spiceai/spiceai-50
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }             # spiceai/spiceai-50
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }                  # spiceai/spiceai-50
+datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }           # spiceai/spiceai-50
+datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }             # spiceai/spiceai-50
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }         # spiceai/spiceai-50
+datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" } # spiceai/spiceai-50
+datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }  # spiceai/spiceai-50
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }         # spiceai/spiceai-50
+datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }                 # spiceai/spiceai-50
+datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }          # spiceai/spiceai-50
+datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }               # spiceai/spiceai-50
+datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }               # spiceai/spiceai-50
+datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "251010e26c8529bd345cc2cea28ef56e5d9aaf65" }                   # spiceai/spiceai-50
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "3e4ffad496923cb27e9f98b60fe811d21c0431e6" } # spiceai
 
