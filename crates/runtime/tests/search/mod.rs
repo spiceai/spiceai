@@ -323,13 +323,6 @@ macro_rules! generate_search_tests {
         }
     };
 }
-pub mod twoz {
-    pub use super::*;
-    generate_search_tests!([
-        "arrow-s3_vectors-view_union_all_join-basic",
-        "arrow-no_vector_engine-dataset-basic",
-    ]);
-}
 
 async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
     let mut headers = HeaderMap::new();
@@ -546,6 +539,10 @@ pub(crate) async fn run_search_w_explain(
         })
         .await
 }
+
+// Test patterns are expanded at build time by `build.rs` (see `build_search_test_cases`).
+// Requires the existance of `generate_search_tests` macro wherever it is included.
+include!("generated_search_tests.rs");
 
 /// Returns common test cases for vector search on the [`get_mega_science_dataset`] dataset
 ///

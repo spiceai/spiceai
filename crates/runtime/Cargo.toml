@@ -182,6 +182,9 @@ uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
+[build-dependencies]
+serde_yaml.workspace = true
+
 [dev-dependencies]
 anyhow = "1.0.99"
 async-graphql = "7.0.16"

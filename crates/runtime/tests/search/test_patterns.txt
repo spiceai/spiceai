@@ -1,0 +1,6 @@
+# Search test patterns
+# Format: engine,vector_engine,table_component,column_config
+# Use * for wildcards to expand to all options
+
+arrow,no_vector_engine,dataset,basic
+*,no_vector_engine,view_union_all_join,*
