@@ -17,10 +17,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
-use opentelemetry_sdk::metrics::MetricError;
+use opentelemetry_sdk::error::OTelSdkResult;
 use snafu::prelude::*;
+use std::time::Duration;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -97,28 +97,32 @@ pub struct TelemetryExporter {
     service_name: Arc<str>,
 }
 
-#[async_trait]
 impl otel_arrow::ArrowExporter for TelemetryExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
-        let Some(mut flight_client) = self.flight_client.clone() else {
-            return Ok(());
-        };
+    fn export(
+        &self,
+        metrics: RecordBatch,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        async move {
+            let Some(mut flight_client) = self.flight_client.clone() else {
+                return Ok(());
+            };
 
-        if let Err(e) = flight_client
-            .publish(&self.service_name, vec![metrics])
-            .await
-        {
-            tracing::trace!("Unable to publish telemetry: {e}");
+            if let Err(e) = flight_client
+                .publish(&self.service_name, vec![metrics])
+                .await
+            {
+                tracing::trace!("Unable to publish telemetry: {e}");
+            }
+
+            Ok(())
         }
+    }
 
+    fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
-        Ok(())
-    }
-
-    fn shutdown(&self) -> Result<(), MetricError> {
+    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
         Ok(())
     }
 }

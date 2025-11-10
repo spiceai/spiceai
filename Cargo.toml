@@ -179,17 +179,17 @@ mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
 num_cpus = "1.16"
 object_store = { version = "0.12", features = ["aws", "gcp", "azure", "http"] }
 odbc-api = { version = "14" }
-opentelemetry = { version = "0.27", default-features = false, features = [
+opentelemetry = { version = "0.31", default-features = false, features = [
     "metrics",
     "trace",
 ] }
-opentelemetry-http = { version = "0.27", features = ["reqwest-rustls"] }
-opentelemetry-prometheus = "0.27"
-opentelemetry-zipkin = { version = "0.27", default-features = false, features = [
+opentelemetry-http = { version = "0.31", features = ["reqwest-rustls"] }
+opentelemetry-prometheus = "0.29.1"
+opentelemetry-zipkin = { version = "0.31", default-features = false, features = [
     "reqwest",
     "reqwest-rustls",
 ] }
-opentelemetry_sdk = { version = "0.27", default-features = false, features = [
+opentelemetry_sdk = { version = "0.31", default-features = false, features = [
     "metrics",
     "rt-tokio",
     "trace",
@@ -243,17 +243,17 @@ tokio-postgres = { version = "0.7.15", features = [
 tokio-rusqlite = "0.5.1"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
-tonic = { version = "0.13", features = [
+tonic = { version = "0.14", features = [
     "gzip",
     "tls-ring",
     "tls-native-roots",
 ] }
-tonic-health = { version = "0.13" }
+tonic-health = { version = "0.14" }
 tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tract-core = "0.22.0"
 turso = "0.3.0"

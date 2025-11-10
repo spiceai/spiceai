@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::{
     InstrumentKind, ManualReader, Pipeline, Temporality, data::ResourceMetrics,
     reader::MetricReader,
@@ -46,16 +48,16 @@ impl MetricReader for InitialReader {
         self.reader.register_pipeline(pipeline);
     }
 
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
+    fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
         self.reader.collect(rm)
     }
 
-    fn force_flush(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
+    fn force_flush(&self) -> OTelSdkResult {
         self.reader.force_flush()
     }
 
-    fn shutdown(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.shutdown()
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.reader.shutdown_with_timeout(timeout)
     }
 
     fn temporality(&self, kind: InstrumentKind) -> Temporality {

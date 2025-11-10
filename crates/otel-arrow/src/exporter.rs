@@ -15,25 +15,37 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
-use async_trait::async_trait;
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::{
-    MetricError, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
+    Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
 };
+use std::time::Duration;
 
 use crate::converter::OtelToArrowConverter;
 
-#[async_trait]
 pub trait ArrowExporter: Send + Sync + 'static {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError>;
+    fn export(
+        &self,
+        metrics: RecordBatch,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send;
 
-    async fn force_flush(&self) -> Result<(), MetricError>;
+    fn force_flush(&self) -> OTelSdkResult;
 
-    /// Shutdown the exporter.
+    /// Shutdown the exporter with a timeout.
     ///
     /// # Errors
     ///
     /// This function will return an error if the shutdown couldn't complete successfully.
-    fn shutdown(&self) -> Result<(), MetricError>;
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult;
+
+    /// Shutdown the exporter with the default timeout of 5 seconds.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the shutdown couldn't complete successfully.
+    fn shutdown(&self) -> OTelSdkResult {
+        self.shutdown_with_timeout(Duration::from_secs(5))
+    }
 }
 
 pub struct OtelArrowExporter<E: ArrowExporter> {
@@ -54,21 +66,27 @@ impl<E: ArrowExporter> OtelArrowExporter<E> {
     }
 }
 
-#[async_trait]
 impl<E: ArrowExporter> PushMetricExporter for OtelArrowExporter<E> {
-    async fn export(&self, metrics: &mut ResourceMetrics) -> Result<(), MetricError> {
-        let mut converter = OtelToArrowConverter::new(metrics.scope_metrics.len());
-        let batch = converter.convert(metrics)?;
+    fn export(
+        &self,
+        metrics: &ResourceMetrics,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        async move {
+            // Estimate capacity based on scope metrics count
+            let capacity: usize = metrics.scope_metrics().count();
+            let mut converter = OtelToArrowConverter::new(capacity);
+            let batch = converter.convert(metrics)?;
 
-        self.exporter.export(batch).await
+            self.exporter.export(batch).await
+        }
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
-        self.exporter.force_flush().await
+    fn force_flush(&self) -> OTelSdkResult {
+        self.exporter.force_flush()
     }
 
-    fn shutdown(&self) -> Result<(), MetricError> {
-        self.exporter.shutdown()
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.exporter.shutdown_with_timeout(timeout)
     }
 
     fn temporality(&self) -> Temporality {

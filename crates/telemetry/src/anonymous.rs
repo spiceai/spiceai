@@ -60,13 +60,16 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
-    Resource::new(telemetry_properties.into_iter().chain(vec![
-        KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
-        KeyValue::new("name", "spiced"),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-        KeyValue::new("service.instance.id", instance_id),
-        KeyValue::new("spicepod.id", spicepod_id),
-    ]))
+    Resource::builder_empty()
+        .with_attributes(telemetry_properties)
+        .with_attributes(vec![
+            KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
+            KeyValue::new("name", "spiced"),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            KeyValue::new("service.instance.id", instance_id),
+            KeyValue::new("spicepod.id", spicepod_id),
+        ])
+        .build()
 }
 
 pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
@@ -84,9 +87,8 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
 
     let oss_telemetry_exporter = OtelArrowExporter::new(exporter);
 
-    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
+    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone())
         .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
-        .with_timeout(Duration::from_secs(TELEMETRY_TIMEOUT_SECONDS))
         .build();
 
     let initial_reader = InitialReader::new();
@@ -109,10 +111,7 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
     // Send an initial telemetry event to indicate the start of telemetry collection
     crate::QUERY_COUNT.add(0, &[]);
 
-    let mut rm = ResourceMetrics {
-        resource,
-        scope_metrics: vec![],
-    };
+    let mut rm = ResourceMetrics::default();
 
     if let Err(err) = initial_reader.collect(&mut rm) {
         tracing::trace!("Failed to collect initial telemetry: {:?}", err);
