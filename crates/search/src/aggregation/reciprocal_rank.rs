@@ -50,7 +50,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
-        primary_key: Vec<String>,
+        primary_key: Vec<Column>,
         limit: usize,
     ) -> Result<AggregationResult> {
         let num_inputs = data.len();
@@ -70,7 +70,7 @@ impl CandidateAggregation for ReciprocalRankFusion {
         let () = verify_schema_compatibility(schemas.as_slice())?;
 
         let ctx = SessionContext::new();
-        let mut table_names: Vec<String> = Vec::with_capacity(num_inputs);
+        let mut table_names: Vec<TableReference> = Vec::with_capacity(num_inputs);
 
         // Find all additional columns in the schema that are not part of the primary key or the expected
         // search columns.
@@ -106,15 +106,17 @@ impl CandidateAggregation for ReciprocalRankFusion {
                     matches.insert(derived_from.clone(), vec![ith_search_value_column(i)]);
                 });
 
-            let table_name = format!("search_candidates_{i}");
+            let table_name = TableReference::bare(format!("search_candidates_{i}"));
             table_names.push(table_name.clone());
             let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
             let _ = ctx
-                .register_table(TableReference::bare(table_name), Arc::new(table))
+                .register_table(table_name, Arc::new(table))
                 .context(DatafusionSnafu)?;
 
             i += 1;
         }
+
+        let primary_key_str: Vec<String> = primary_key.iter().map(datafusion::prelude::Column::flat_name).collect();
 
         // Now that we've filtered empty generation data, again check for <=1 inputs.
         if table_names.len() <= 1 {
@@ -123,9 +125,9 @@ impl CandidateAggregation for ReciprocalRankFusion {
 
             return result_from_table(
                 &ctx,
-                tbl.as_str(),
+                &tbl,
                 match_keys.first().ok_or(Error::NoCandidatesGenerated)?,
-                primary_key.as_slice(),
+                primary_key_str.as_slice(),
             )
             .await;
         }
@@ -154,8 +156,8 @@ impl CandidateAggregation for ReciprocalRankFusion {
 
         Ok(AggregationResult {
             data,
-            primary_key,
-            data_columns: additional_columns.into_iter().collect(),
+            primary_key: primary_key_str,
+            data_columns: additional_columns.iter().map(datafusion::prelude::Column::flat_name).collect(),
             matches,
         })
     }
@@ -164,11 +166,11 @@ impl CandidateAggregation for ReciprocalRankFusion {
 // Construct a [`AggregationResult`] from a single table in a [`SessionContext`].
 async fn result_from_table(
     ctx: &SessionContext,
-    tbl: &str,
+    tbl: &TableReference,
     match_field: &str,
     primary_key: &[String],
 ) -> Result<AggregationResult> {
-    let df = ctx.table(tbl).await.context(DatafusionSnafu)?;
+    let df = ctx.table(tbl.clone()).await.context(DatafusionSnafu)?;
     let data_columns = df
         .schema()
         .columns()
@@ -200,18 +202,19 @@ async fn result_from_table(
 
 /// Returns a list of additional columns in the schema that are not part of the primary key or the expected
 /// search columns (i.e. score or underlying value).
-fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[String]) -> Vec<String> {
+fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[Column]) -> Vec<Column> {
     schema
         .fields()
         .iter()
         .filter_map(|f| {
             let name = f.name();
+            let col = Column::from_qualified_name(f.name());
             if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str())
-                || primary_key.contains(f.name())
+                || primary_key.contains(&col)
             {
                 return None;
             }
-            Some(name.clone())
+            Some(col)
         })
         .collect()
 }
@@ -269,19 +272,19 @@ fn ith_search_value_column(i: usize) -> String {
 #[allow(clippy::cast_precision_loss)]
 async fn reciprocal_rank_fusion_plan(
     ctx: &SessionContext,
-    tables: &[String],
-    primary_key: &[String],
-    additional_columns: &[String],
+    tables: &[TableReference],
+    primary_key: &[Column],
+    additional_columns: &[Column],
     offset: usize,
     limit: usize,
 ) -> datafusion::error::Result<LogicalPlan> {
     // 1) Build CTEs that add explicit rank per table, ranking by SEARCH_SCORE_COLUMN_NAME
     //    Equivalent to: SELECT *, ROW_NUMBER() OVER (ORDER BY score) AS rank FROM table
-    let mut ranked_plans: Vec<(String, LogicalPlan)> = Vec::with_capacity(tables.len());
+    let mut ranked_plans: Vec<(TableReference, LogicalPlan)> = Vec::with_capacity(tables.len());
 
     for table_name in tables {
         // Get the table from the context
-        let table = ctx.table(table_name.as_str()).await?;
+        let table = ctx.table(table_name.clone()).await?;
         let table_provider = table.into_unoptimized_plan();
 
         // Build: SELECT *, ROW_NUMBER() OVER (ORDER BY score DESC) AS rank FROM table
@@ -292,7 +295,7 @@ async fn reciprocal_rank_fusion_plan(
 
         let ranked = LogicalPlanBuilder::from(table_provider)
             .window(vec![window_expr])?
-            .alias(table_name)?
+            .alias(table_name.clone())?
             .build()?;
 
         ranked_plans.push((table_name.clone(), ranked));
@@ -307,17 +310,21 @@ async fn reciprocal_rank_fusion_plan(
 
     // 3) FULL OUTER JOIN remaining tables on primary key columns
     for (table_name, plan) in ranked_plans.iter().skip(1) {
-        let left_keys: Vec<Column> = primary_key
-            .iter()
-            .map(|pk| Column::new(Some(first_table_name.clone()), pk.clone()))
-            .collect();
-
-        let right_keys: Vec<Column> = primary_key
-            .iter()
-            .map(|pk| Column::new(Some(table_name.clone()), pk.clone()))
-            .collect();
-
-        builder = builder.join(plan.clone(), JoinType::Full, (left_keys, right_keys), None)?;
+        builder = builder.join(
+            plan.clone(),
+            JoinType::Full,
+            (
+                primary_key
+                    .iter()
+                    .map(|pk| pk.clone().with_relation(first_table_name.clone()))
+                    .collect(),
+                primary_key
+                    .iter()
+                    .map(|pk| pk.clone().with_relation(table_name.clone()))
+                    .collect(),
+            ),
+            None,
+        )?;
     }
 
     // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + offset), 0)) across all tables
@@ -360,9 +367,9 @@ async fn reciprocal_rank_fusion_plan(
         .map(|col_name| {
             let col_refs: Vec<LogicalExpr> = ranked_plans
                 .iter()
-                .map(|(table_name, _)| col(Column::new(Some(table_name.clone()), col_name.clone())))
+                .map(|(table_name, _)| col(col_name.clone().with_relation(table_name.clone())))
                 .collect();
-            coalesce(col_refs).alias(col_name.clone())
+            coalesce(col_refs).alias(col_name.to_string())
         })
         .collect();
 
@@ -397,10 +404,10 @@ mod tests {
             Field::new("pk", DataType::Utf8, false),
             Field::new("additional", DataType::Int8, false),
         ]));
-        let primary_keys = vec!["pk".to_string()];
+        let primary_keys = vec![Column::from_name("pk")];
         assert_eq!(
             additional_columns_of_schema(&schema, primary_keys.as_slice()),
-            vec!["additional".to_string()]
+            vec![Column::from_name("additional")]
         );
     }
 }

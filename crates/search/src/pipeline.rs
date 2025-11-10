@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use datafusion::{
     catalog::TableProvider,
+    common::Column,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::SendableRecordBatchStream,
@@ -28,7 +29,7 @@ use datafusion::{
         },
     },
 };
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, ident, lit};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
 
@@ -101,12 +102,12 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
         tbl: &TableReference,
         opt_filter: Option<Expr>,
         addition_projection: Vec<Expr>,
-        primary_keys: Vec<String>,
+        primary_keys: Vec<Column>,
         keywords: Vec<String>,
         limit: usize,
     ) -> std::result::Result<Option<AggregationResult>, Error> {
         let columns: Vec<_> = [
-            primary_keys.iter().map(|pk| ident(pk.clone())).collect(),
+            primary_keys.iter().map(|c| col(c.clone())).collect(),
             addition_projection,
             vec![ident(SEARCH_SCORE_COLUMN_NAME)],
         ]
