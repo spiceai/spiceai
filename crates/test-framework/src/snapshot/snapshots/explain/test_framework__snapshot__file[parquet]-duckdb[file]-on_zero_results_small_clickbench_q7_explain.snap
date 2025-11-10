@@ -7,19 +7,18 @@ description: "Query: clickbench_q7"
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Aggregate: groupBy=[[]], aggr=[[min(__common_expr_1 AS to_timestamp(hits.EventDate * Int64(86400))), max(__common_expr_1 AS to_timestamp(hits.EventDate * Int64(86400)))]] |
 |               |   Projection: to_timestamp(CAST(hits.EventDate AS Int64) * Int64(86400)) AS __common_expr_1                                                                                |
-|               |     BytesProcessedNode                                                                                                                                                     |
-|               |       TableScan: hits projection=[EventDate]                                                                                                                               |
+|               |     TableScan: hits projection=[EventDate]                                                                                                                                 |
 | physical_plan | AggregateExec: mode=Final, gby=[], aggr=[min(to_timestamp(hits.EventDate * Int64(86400))), max(to_timestamp(hits.EventDate * Int64(86400)))]                               |
 |               |   CoalescePartitionsExec                                                                                                                                                   |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[min(to_timestamp(hits.EventDate * Int64(86400))), max(to_timestamp(hits.EventDate * Int64(86400)))]                         |
 |               |       ProjectionExec: expr=[to_timestamp(CAST(EventDate@0 AS Int64) * 86400) as __common_expr_1]                                                                           |
-|               |         BytesProcessedExec                                                                                                                                                 |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                              |
 |               |           SchemaCastScanExec                                                                                                                                               |
-|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                          |
-|               |               FallbackOnZeroResultsScanExec                                                                                                                                |
-|               |                 CoalescePartitionsExec                                                                                                                                     |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                    |
-|               |                     CooperativeExec                                                                                                                                        |
+|               |             FallbackOnZeroResultsScanExec                                                                                                                                  |
+|               |               CoalescePartitionsExec                                                                                                                                       |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                      |
+|               |                   CooperativeExec                                                                                                                                          |
+|               |                     BytesProcessedExec                                                                                                                                     |
 |               |                       DuckSqlExec sql= SELECT "EventDate" FROM hits                                                                                                        |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
