@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+cluster = ["runtime/cluster"]
 event_stream = { path = "../../crates/event_stream" }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
@@ -49,7 +50,6 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
-cluster = ["runtime/cluster"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
