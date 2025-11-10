@@ -68,9 +68,9 @@ pub(crate) fn build_test_with_validation(
     if args.validate
         && let Some(validation_data) =
             query_set.get_validation_data(args.scenario_query_file.as_deref())?
-        {
-            test_builder = test_builder.with_validation_data(validation_data);
-        }
+    {
+        test_builder = test_builder.with_validation_data(validation_data);
+    }
 
     Ok((query_set, test_builder))
 }
