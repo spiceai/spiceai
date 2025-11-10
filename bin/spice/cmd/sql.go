@@ -290,6 +290,8 @@ func runCloudREPL(cmd *cobra.Command, apiKey string) error {
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 
@@ -366,6 +368,8 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 
@@ -656,6 +660,8 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows%s. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, cachedStr, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 

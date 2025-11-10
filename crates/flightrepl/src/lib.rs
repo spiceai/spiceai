@@ -473,6 +473,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     "{} Unexpected Flight error: {e}. Check connection or query syntax.",
                     Colour::Red.paint("Error:")
                 );
+                let _ = std::io::stdout().flush();
             }
         }
     }
@@ -648,6 +649,7 @@ fn display_records(
             if from_cache { " (cached)" } else { "" }
         );
     }
+    let _ = std::io::stdout().flush();
     Ok(pretty_batches)
 }
 
@@ -786,6 +788,7 @@ fn display_grpc_error(err: &Status) {
         "{} {user_err_msg}",
         Colour::Red.paint(format!("{error_type}:"))
     );
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
