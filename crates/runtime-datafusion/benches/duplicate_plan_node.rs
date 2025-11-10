@@ -115,7 +115,7 @@ fn create_plan_tree(depth: usize, extension_name: &'static str) -> LogicalPlan {
 fn bench_analyze_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("duplicate_plan_node_analyze");
 
-    for size in [10, 50, 100, 200, 500].iter() {
+    for size in &[10, 50, 100, 200, 500] {
         let plan = create_plan_tree(*size, "bench_ext");
         let rule = DuplicateLogicalPlanNode::extension_nodes("bench_ext");
         let config = ConfigOptions::default();
