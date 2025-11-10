@@ -17,6 +17,7 @@ limitations under the License.
 use crate::queries::Query;
 
 /// HTTP connector integration test queries
+#[must_use]
 pub fn get_queries() -> Vec<Query> {
     vec![
         Query::new(

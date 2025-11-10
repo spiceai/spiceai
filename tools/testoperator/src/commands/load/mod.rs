@@ -105,7 +105,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_http_client(args.test_args.http_clients),
     )?;
 
-    let queries = query_set.get_queries(None);
+    // Use the same query overrides that were applied in build_test_with_validation
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(test_framework::queries::QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides);
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)

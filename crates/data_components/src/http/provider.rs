@@ -56,8 +56,10 @@ pub enum Error {
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
-    #[snafu(display("All retry attempts failed for HTTP request"))]
-    AllRetriesFailed,
+    #[snafu(display(
+        "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
+    ))]
+    AllRetriesFailed { max_retries: usize, url: String },
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
@@ -79,9 +81,11 @@ impl From<Error> for DataFusionError {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
             // Retry exhaustion is an external error
-            Error::AllRetriesFailed => DataFusionError::External(Box::new(std::io::Error::other(
-                "All retry attempts failed for HTTP request",
-            ))),
+            Error::AllRetriesFailed { max_retries, url } => {
+                DataFusionError::External(Box::new(std::io::Error::other(format!(
+                    "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
+                ))))
+            }
             // All other errors are internal/external errors
             Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
@@ -196,7 +200,7 @@ impl HttpTableProvider {
         use rand::distr::Alphanumeric;
 
         // Generate a random path that should return 404
-        let random_suffix: String = rand::thread_rng()
+        let random_suffix: String = rand::rng()
             .sample_iter(Alphanumeric)
             .take(16)
             .map(char::from)

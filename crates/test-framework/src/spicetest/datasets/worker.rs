@@ -164,14 +164,14 @@ impl SpiceTestQueryWorker {
         actual_batches: &[RecordBatch],
     ) -> Result<QueryValidationResult> {
         // Check if we have custom validation data for this query
-        if let Some(validation_data) = &self.validation_data {
-            if let Some(expected_batches) = validation_data.get(&query.name) {
-                return validation::validate_with_expected_batches(
-                    &query.name,
-                    actual_batches,
-                    expected_batches,
-                );
-            }
+        if let Some(validation_data) = &self.validation_data
+            && let Some(expected_batches) = validation_data.get(&query.name)
+        {
+            return validation::validate_with_expected_batches(
+                &query.name,
+                actual_batches,
+                expected_batches,
+            );
         }
 
         // Fall back to TPCH validation (which handles TPCH, parameterized TPCH, etc.)

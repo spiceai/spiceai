@@ -375,7 +375,6 @@ impl QuerySet {
 
     /// Get validation data for queries that support it
     /// Returns None if the query set doesn't support validation or if no validation data is available
-    #[must_use]
     pub fn get_validation_data(
         &self,
         base_path: Option<&std::path::Path>,
