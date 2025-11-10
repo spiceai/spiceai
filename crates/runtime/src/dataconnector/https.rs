@@ -15,13 +15,16 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
+use crate::dataconnector::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
+};
 
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use tokio::runtime::Handle;
 use url::Url;
 
 use super::{ConnectorComponent, ConnectorParams};
@@ -186,11 +189,26 @@ impl DataConnectorFactory for HttpsFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            Ok(Arc::new(Https {
-                params: params.parameters,
-            }) as Arc<dyn DataConnector>)
-        })
+        let file_format = params
+            .parameters
+            .get("file_format")
+            .expose()
+            .ok()
+            .map(|s| s.to_ascii_lowercase());
+
+        match file_format.as_deref() {
+            Some("json") | Some("jsonl") | Some("auto") => Box::pin(async move {
+                Ok(Arc::new(Https {
+                    params: params.parameters,
+                }) as Arc<dyn DataConnector>)
+            }),
+            _ => Box::pin(async move {
+                Ok(Arc::new(HttpListingConnector::new(
+                    params.parameters,
+                    params.io_runtime,
+                )) as Arc<dyn DataConnector>)
+            }),
+        }
     }
 
     fn prefix(&self) -> &'static str {
@@ -199,5 +217,97 @@ impl DataConnectorFactory for HttpsFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         &PARAMETERS
+    }
+}
+
+#[derive(Debug)]
+pub struct HttpListingConnector {
+    params: Parameters,
+    tokio_io_runtime: Handle,
+}
+
+impl HttpListingConnector {
+    pub fn new(params: Parameters, tokio_io_runtime: Handle) -> Self {
+        HttpListingConnector {
+            params,
+            tokio_io_runtime,
+        }
+    }
+}
+
+impl std::fmt::Display for HttpListingConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "http_listing")
+    }
+}
+
+impl ListingTableConnector for HttpListingConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_params(&self) -> &Parameters {
+        &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        self.tokio_io_runtime.clone()
+    }
+
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let url = url.unwrap_or(dataset.from.as_str());
+        let mut u = Url::parse(url).boxed().map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            }
+        })?;
+
+        if let Some(p) = self.params.get("port").expose().ok() {
+            let n = match p.parse::<u16>() {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "https".to_string(),
+                        message: "The specified `https_port` parameter was invalid. Specify a valid port number and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https#parameters".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    });
+                }
+            };
+            let _ = u.set_port(Some(n));
+        }
+
+        if let Some(p) = self.params.get("password").expose().ok()
+            && u.set_password(Some(p)).is_err()
+        {
+            return Err(
+                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
+        }
+
+        if let Some(p) = self.params.get("username").expose().ok()
+            && u.set_username(p).is_err()
+        {
+            return Err(
+                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
+        }
+
+        u.set_fragment(Some(&build_fragments(&self.params, vec!["client_timeout"])));
+
+        Ok(u)
     }
 }

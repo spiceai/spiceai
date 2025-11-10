@@ -8,6 +8,7 @@ datasets:
     name: create_post
     params:
       http_post_content_type: application/json
+      file_format: auto
     acceleration:
       enabled: true
       engine: duckdb
@@ -23,6 +24,7 @@ datasets:
     name: post_form
     params:
       http_post_content_type: application/x-www-form-urlencoded
+      file_format: auto
     acceleration:
       enabled: true
       engine: duckdb
@@ -36,6 +38,8 @@ datasets:
   # POST request with default JSON content type
   - from: https://httpbin.org
     name: post_json_default
+    params:
+      file_format: auto
     acceleration:
       enabled: true
       engine: duckdb
@@ -50,6 +54,7 @@ datasets:
   - from: https://jsonplaceholder.typicode.com
     name: multiple_posts
     params:
+      file_format: auto
       http_post_content_type: application/json
     acceleration:
       enabled: true

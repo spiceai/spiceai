@@ -6,14 +6,22 @@ datasets:
   # Basic GET request - httpbin.org/json
   - from: https://httpbin.org/json
     name: httpbin_json
+    params:
+      file_format: auto
 
   # GET with query parameters
   - from: https://httpbin.org/get?param1=value1&param2=value2
     name: httpbin_get
+    params:
+      file_format: auto
 
   # Status code endpoints
   - from: https://httpbin.org/status/200
     name: httpbin_status_200
+    params:
+      file_format: auto
 
   - from: https://httpbin.org/status/201
     name: httpbin_status_201
+    params:
+      file_format: auto

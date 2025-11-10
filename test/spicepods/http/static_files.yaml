@@ -46,8 +46,6 @@ datasets:
   # Test auto-detection with CSV
   - from: https://raw.githubusercontent.com/mwaskom/seaborn-data/master/diamonds.csv
     name: diamonds_auto
-    params:
-      file_format: auto
     acceleration:
       enabled: true
       engine: duckdb

@@ -185,8 +185,9 @@ impl Query {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum QuerySet {
+    #[default]
     Tpch,
     Tpcds,
     Clickbench,
