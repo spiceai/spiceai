@@ -45,7 +45,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let append_test = SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_query_set(query_set, query_overrides)
+            .with_query_set(query_set.clone(), query_overrides)
             .with_parallel_count(1)
             .with_end_duration(Duration::from_secs(60 * 60))
             .with_tempdir_path(start_request.get_tempdir_path()),
