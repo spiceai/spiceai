@@ -64,27 +64,16 @@ or:
 cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
 ```
 
-##### Run HTTP connector integration tests
-
-Integration query sets are built-in test suites for specific connectors, following the same pattern as TPC-H/TPC-DS. Queries and expected results are defined in `crates/test-framework/src/queries/integration_*`.
-
-```sh
-testoperator run bench \
-  -p ./test/spicepods/http/basic.yaml \
-  -s spiced \
-  --query-set integration[http]
-```
-
 ##### Run a custom scenario query set with validation
 
 Scenario query sets allow you to define custom queries in a YAML file. This is useful for ad-hoc testing or when you need custom validation that doesn't fit the standard integration test pattern.
 
 ```sh
 testoperator run bench \
-  -p ./test/spicepods/http/basic.yaml \
+  -p test/spicepods/http/post_requests.yaml \
   -s spiced \
   --query-set scenario \
-  --scenario-query-file ./test/spicepods/http/queries.yaml \
+  --scenario-query-file test/scenario/http/post_requests.yaml \
   --validate
 ```
 

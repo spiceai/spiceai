@@ -10,6 +10,7 @@ datasets:
       file_format: csv
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
 
   # Direct path to a JSON array file
@@ -19,6 +20,7 @@ datasets:
       file_format: json
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
 
   # Another CSV example - Tips dataset
@@ -28,6 +30,7 @@ datasets:
       file_format: csv
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
 
   # Parquet file example - using publicly available parquet dataset
@@ -37,6 +40,7 @@ datasets:
       file_format: parquet
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
 
   # Test auto-detection with CSV
@@ -46,4 +50,5 @@ datasets:
       file_format: auto
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full

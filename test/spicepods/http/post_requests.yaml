@@ -10,10 +10,11 @@ datasets:
       http_post_content_type: application/json
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
       refresh_sql: |
-        SELECT request_path, request_query, request_body, content 
-        FROM create_post 
+        SELECT request_path, request_query, request_body, content
+        FROM create_post
         WHERE request_path = '/posts'
           AND request_body = '{"title": "foo", "body": "bar", "userId": 1}'
 
@@ -24,10 +25,11 @@ datasets:
       http_post_content_type: application/x-www-form-urlencoded
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
       refresh_sql: |
-        SELECT request_path, request_body, content 
-        FROM post_form 
+        SELECT request_path, request_body, content
+        FROM post_form
         WHERE request_path = '/post'
           AND request_body = 'key1=value1&key2=value2'
 
@@ -36,10 +38,11 @@ datasets:
     name: post_json_default
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
       refresh_sql: |
-        SELECT request_path, request_body, content 
-        FROM post_json_default 
+        SELECT request_path, request_body, content
+        FROM post_json_default
         WHERE request_path = '/post'
           AND request_body = '{"test": "data"}'
 
@@ -50,10 +53,11 @@ datasets:
       http_post_content_type: application/json
     acceleration:
       enabled: true
+      engine: duckdb
       refresh_mode: full
       refresh_sql: |
-        SELECT request_path, request_body, content 
-        FROM multiple_posts 
+        SELECT request_path, request_body, content
+        FROM multiple_posts
         WHERE request_path = '/posts'
           AND request_body IN (
             '{"title": "foo", "body": "bar", "userId": 1}',
