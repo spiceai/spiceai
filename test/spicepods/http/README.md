@@ -22,7 +22,7 @@ Integration test queries are defined in `crates/test-framework/src/queries/integ
 Primary spicepod for integration tests using httpbin.org:
 
 - **httpbin_json**: Basic GET request returning JSON object
-- **httpbin_get**: GET with query parameters  
+- **httpbin_get**: GET with query parameters
 - **httpbin_status_200/201**: Multiple status code endpoints
 
 Designed to work with the `integration[http]` query set.
@@ -40,7 +40,7 @@ Tests direct file access (CSV, JSON, Parquet):
 Tests HTTP POST request functionality:
 
 - **create_post**: POST with JSON body
-- **post_form**: POST with form-encoded data  
+- **post_form**: POST with form-encoded data
 - **post_json_default**: POST with default content-type
 - **multiple_posts**: Multiple POST requests with IN clause
 
@@ -82,11 +82,11 @@ The integration tests in `crates/data_components/tests/http_provider_test.rs` co
 
 ## Test Coverage
 
-| Feature                    | Spicepod              | Unit Test | Integration Query Set |
-| -------------------------- | --------------------- | --------- | --------------------- |
-| Single JSON object (GET)   | ✅ basic.yaml         | ✅        | ✅ integration[http]  |
-| GET with query parameters  | ✅ basic.yaml         | ✅        | ✅ integration[http]  |
-| POST with JSON body        | ✅ post_requests.yaml | ✅        | -                     |
-| POST with custom type      | ✅ post_requests.yaml | ✅        | -                     |
-| Direct CSV file access     | ✅ static_files.yaml  | -         | -                     |
-| Direct JSON file access    | ✅ static_files.yaml  | -         | -                     |
+| Feature                   | Spicepod              | Unit Test | Integration Query Set |
+| ------------------------- | --------------------- | --------- | --------------------- |
+| Single JSON object (GET)  | ✅ basic.yaml         | ✅        | ✅ integration[http]  |
+| GET with query parameters | ✅ basic.yaml         | ✅        | ✅ integration[http]  |
+| POST with JSON body       | ✅ post_requests.yaml | ✅        | -                     |
+| POST with custom type     | ✅ post_requests.yaml | ✅        | -                     |
+| Direct CSV file access    | ✅ static_files.yaml  | -         | -                     |
+| Direct JSON file access   | ✅ static_files.yaml  | -         | -                     |

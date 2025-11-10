@@ -11,7 +11,7 @@ datasets:
   - from: https://httpbin.org/get?param1=value1&param2=value2
     name: httpbin_get
 
-  # Status code endpoints  
+  # Status code endpoints
   - from: https://httpbin.org/status/200
     name: httpbin_status_200
 
