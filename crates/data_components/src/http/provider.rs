@@ -35,7 +35,10 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use reqwest::{Client, header::CACHE_CONTROL};
+use reqwest::{
+    Client,
+    header::{CACHE_CONTROL, HeaderMap},
+};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::{
@@ -127,6 +130,7 @@ pub struct HttpTableProvider {
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
+    custom_headers: HeaderMap,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -161,6 +165,7 @@ impl HttpTableProvider {
                 .max_retries(Some(3))
                 .build(),
             content_type: None,
+            custom_headers: HeaderMap::new(),
         }
     }
 
@@ -210,6 +215,12 @@ impl HttpTableProvider {
     #[must_use]
     pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
         self.content_type = content_type;
+        self
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.custom_headers = headers;
         self
     }
 
@@ -399,6 +410,7 @@ impl HttpTableProvider {
         let retry_strategy = self.retry_strategy.clone();
         let client = self.client.clone();
         let content_type = self.content_type.clone();
+        let custom_headers = self.custom_headers.clone();
         let body_owned = body.map(String::from);
         let cache = Arc::clone(&self.cache);
         let path_owned = path.to_string();
@@ -406,7 +418,7 @@ impl HttpTableProvider {
 
         retry(retry_strategy, || async {
             // Build request based on whether body is present
-            let request_builder = if let Some(ref body_content) = body_owned {
+            let mut request_builder = if let Some(ref body_content) = body_owned {
                 let mut req = client.post(url.clone());
 
                 // Set Content-Type header, defaulting to application/json if not specified
@@ -417,6 +429,11 @@ impl HttpTableProvider {
             } else {
                 client.get(url.clone())
             };
+
+            // Add custom headers
+            for (name, value) in &custom_headers {
+                request_builder = request_builder.header(name, value);
+            }
 
             // Reqwest automatically handles compression (gzip, br/brotli, zstd, deflate)
             // It adds Accept-Encoding header and decompresses responses automatically

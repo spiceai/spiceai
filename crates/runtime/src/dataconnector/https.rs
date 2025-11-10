@@ -34,7 +34,10 @@ use super::{
 };
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use reqwest::Client;
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
@@ -73,12 +76,36 @@ impl Https {
             .and_then(|t| t.parse::<u64>().ok())
             .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
 
+        let connect_timeout_secs = self
+            .params
+            .get("connect_timeout")
+            .expose()
+            .ok()
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(10);
+
+        let pool_max_idle_per_host = self
+            .params
+            .get("pool_max_idle_per_host")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10);
+
+        let pool_idle_timeout_secs = self
+            .params
+            .get("pool_idle_timeout")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(90);
+
         let client = Client::builder()
             .user_agent("spice")
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(pool_max_idle_per_host)
+            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
@@ -127,12 +154,35 @@ impl Https {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.3);
 
-        let content_type = self
-            .params
-            .get("http_post_content_type")
-            .expose()
-            .ok()
-            .map(std::string::ToString::to_string);
+        // Parse custom HTTP headers
+        let mut custom_headers = HeaderMap::new();
+        if let Some(headers_str) = self.params.get("http_headers").expose().ok() {
+            for header in headers_str.split(',') {
+                let parts: Vec<&str> = header.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    let name = parts[0].trim();
+                    let value = parts[1].trim();
+
+                    if let (Ok(header_name), Ok(header_value)) =
+                        (HeaderName::try_from(name), HeaderValue::from_str(value))
+                    {
+                        custom_headers.insert(header_name, header_value);
+                    } else {
+                        tracing::warn!(
+                            "Invalid HTTP header in dataset '{}': '{}'. Skipping this header.",
+                            dataset.name,
+                            header
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Malformed HTTP header in dataset '{}': '{}'. Expected format 'Name: Value'. Skipping this header.",
+                        dataset.name,
+                        header
+                    );
+                }
+            }
+        }
 
         let provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
@@ -144,7 +194,7 @@ impl Https {
         .with_backoff_method(backoff_method)
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
-        .with_content_type(content_type);
+        .with_headers(custom_headers);
 
         let provider = Arc::new(provider);
 
@@ -244,7 +294,15 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("password").secret(),
         ParameterSpec::component("port").description("The port to connect to."),
         ParameterSpec::runtime("client_timeout")
-            .description("The timeout setting for HTTP(S) client."),
+            .description("The timeout setting for HTTP(S) client requests (in seconds). Default: 30"),
+        ParameterSpec::runtime("connect_timeout")
+            .description("The timeout for establishing HTTP(S) connections (in seconds). Default: 10"),
+        ParameterSpec::runtime("pool_max_idle_per_host")
+            .description("Maximum number of idle connections to keep alive per host. Default: 10"),
+        ParameterSpec::runtime("pool_idle_timeout")
+            .description("Timeout for idle connections in the pool (in seconds). Default: 90"),
+        ParameterSpec::runtime("http_headers")
+            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests."),
         ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("retry_backoff_method")
@@ -253,8 +311,6 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum total duration for all retries (e.g., '30s', '5m'). If not set, retries will continue up to max_retries."),
         ParameterSpec::runtime("retry_jitter")
             .description("Randomization factor for retry delays (0.0 to 1.0). Default: 0.3 (30% randomization). Set to 0 for no jitter."),
-        ParameterSpec::runtime("http_post_content_type")
-            .description("Content-Type header for POST requests when using request_body filter. Defaults to 'application/json'."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
