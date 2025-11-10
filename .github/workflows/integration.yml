@@ -71,7 +71,7 @@ jobs:
       - name: Check for relevant changes
         id: check_changes
         run: |
-          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+          echo "relevant_changes=true" >> $GITHUB_OUTPUT
 
   build:
     name: Build Test Binary
