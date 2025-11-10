@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema},
@@ -62,7 +64,7 @@ impl UserDefinedLogicalNodeCore for BenchExtension {
                     DataType::Int64,
                     false,
                 )]))
-                .expect("valid schema"),
+                .expect("failed to create benchmark DFSchema from Arrow Schema with single non-nullable Int64 field"),
             )
         })
     }
@@ -87,7 +89,7 @@ impl UserDefinedLogicalNodeCore for BenchExtension {
 fn create_plan_tree(depth: usize, extension_name: &'static str) -> LogicalPlan {
     let mut plan = LogicalPlanBuilder::empty(false)
         .build()
-        .expect("valid base plan");
+        .expect("failed to build base plan for benchmark");
 
     // Create a tree with multiple levels, adding extension nodes periodically
     for i in 0..depth {
@@ -104,7 +106,7 @@ fn create_plan_tree(depth: usize, extension_name: &'static str) -> LogicalPlan {
         // Wrap in another logical plan node
         plan = LogicalPlanBuilder::from(plan)
             .build()
-            .expect("valid nested plan");
+            .expect("failed to build nested plan in benchmark");
     }
 
     plan
@@ -135,7 +137,7 @@ fn bench_analyze_with_duplicates(c: &mut Criterion) {
     // Create plan with many duplicate extension nodes
     let mut plan = LogicalPlanBuilder::empty(false)
         .build()
-        .expect("valid base plan");
+        .expect("failed to build base plan for benchmark");
 
     // Add 100 nested duplicate extensions
     for i in 0..100 {
@@ -178,62 +180,10 @@ fn bench_analyze_no_duplicates(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_xxh3_performance(c: &mut Criterion) {
-    let mut group = c.benchmark_group("xxh3_hash_operations");
-
-    use std::collections::HashSet;
-    use xxhash_rust::xxh3::Xxh3Builder;
-
-    let plan = create_plan_tree(100, "bench");
-    let plan_ptr = &plan as *const LogicalPlan;
-
-    group.bench_function("insert_100_pointers", |b| {
-        b.iter(|| {
-            let mut set: HashSet<*const LogicalPlan, Xxh3Builder> =
-                HashSet::with_capacity_and_hasher(100, Xxh3Builder::new());
-
-            for i in 0..100 {
-                // Simulate different pointers
-                let offset = (i % 10) as isize;
-                let ptr = unsafe { plan_ptr.offset(offset) };
-                set.insert(ptr);
-            }
-
-            black_box(set)
-        });
-    });
-
-    group.bench_function("lookup_100_pointers", |b| {
-        let mut set: HashSet<*const LogicalPlan, Xxh3Builder> =
-            HashSet::with_capacity_and_hasher(100, Xxh3Builder::new());
-
-        for i in 0..100 {
-            let offset = (i % 10) as isize;
-            let ptr = unsafe { plan_ptr.offset(offset) };
-            set.insert(ptr);
-        }
-
-        b.iter(|| {
-            let mut count = 0;
-            for i in 0..100 {
-                let offset = (i % 10) as isize;
-                let ptr = unsafe { plan_ptr.offset(offset) };
-                if set.contains(&ptr) {
-                    count += 1;
-                }
-            }
-            black_box(count)
-        });
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_analyze_scaling,
     bench_analyze_with_duplicates,
-    bench_analyze_no_duplicates,
-    bench_xxh3_performance
+    bench_analyze_no_duplicates
 );
 criterion_main!(benches);
