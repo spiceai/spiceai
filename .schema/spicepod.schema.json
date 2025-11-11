@@ -1681,6 +1681,13 @@
             "string",
             "null"
           ]
+        },
+        "stale_while_revalidate_ttl": {
+          "description": "Maximum age for serving stale cached results while revalidating in the background.\n When set, cached results past their TTL (but within this additional window) will be\n served immediately while a background refresh is triggered.\n Format: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

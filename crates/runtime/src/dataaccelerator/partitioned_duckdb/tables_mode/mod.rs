@@ -345,7 +345,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
             .with_dialect(new_duckdb_dialect())
-            .with_schema(Arc::clone(&self.schema));
+            .with_schema(Arc::clone(&self.schema))
+            .with_indexes(self.table_definition.indexes().to_vec());
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {
