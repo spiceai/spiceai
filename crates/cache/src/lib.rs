@@ -56,6 +56,9 @@ pub enum Error {
     #[snafu(display("Failed to parse item_ttl value: {source}"))]
     FailedToParseItemTtl { source: ParseError },
 
+    #[snafu(display("Failed to parse stale_while_revalidate_ttl value: {source}"))]
+    FailedToParseDuration { source: ParseError },
+
     #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
     FailedToInvalidateCache {
         source: moka::PredicateError,
@@ -302,6 +305,7 @@ pub struct QueryResultsCacheProvider {
     cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
+    stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
 }
@@ -311,6 +315,10 @@ impl std::fmt::Debug for QueryResultsCacheProvider {
         f.debug_struct("QueryResultsCacheProvider")
             .field("cache_max_size", &self.cache_max_size)
             .field("ttl", &self.ttl)
+            .field(
+                "stale_while_revalidate_ttl",
+                &self.stale_while_revalidate_ttl,
+            )
             .field("ignore_schemas", &self.ignore_schemas)
             .finish_non_exhaustive()
     }
@@ -336,6 +344,13 @@ impl QueryResultsCacheProvider {
             None => std::time::Duration::from_secs(1),
         };
 
+        let stale_while_revalidate_ttl = match &config.stale_while_revalidate_ttl {
+            Some(stale_ttl_str) => {
+                Some(fundu::parse_duration(stale_ttl_str).context(FailedToParseDurationSnafu)?)
+            }
+            None => None,
+        };
+
         let hash_builder = get_hash_builder(config.hashing_algorithm)?;
         let cache = Arc::new(LruCache::new(cache_max_size, ttl, hash_builder));
 
@@ -343,6 +358,7 @@ impl QueryResultsCacheProvider {
             cache,
             cache_max_size,
             ttl,
+            stale_while_revalidate_ttl,
             ignore_schemas,
         };
 
@@ -417,6 +433,11 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub fn ttl(&self) -> std::time::Duration {
         self.ttl
+    }
+
+    #[must_use]
+    pub fn stale_while_revalidate_ttl(&self) -> Option<std::time::Duration> {
+        self.stale_while_revalidate_ttl
     }
 
     #[must_use]

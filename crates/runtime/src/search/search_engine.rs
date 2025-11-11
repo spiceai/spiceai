@@ -218,7 +218,10 @@ impl SearchEngine {
                     )
                 }
                 (
-                    CacheControl::Cache(_) | CacheControl::CacheWithStaleWhileRevalidate(_, _),
+                    CacheControl::Cache(_)
+                    | CacheControl::MaxStale(_, _)
+                    | CacheControl::MinFresh(_, _)
+                    | CacheControl::OnlyIfCached(_),
                     None,
                 ) => {
                     tracing::trace!("Search cache miss");
@@ -229,7 +232,10 @@ impl SearchEngine {
                     )
                 }
                 (
-                    CacheControl::Cache(_) | CacheControl::CacheWithStaleWhileRevalidate(_, _),
+                    CacheControl::Cache(_)
+                    | CacheControl::MaxStale(_, _)
+                    | CacheControl::MinFresh(_, _)
+                    | CacheControl::OnlyIfCached(_),
                     Some(cached_result),
                 ) => {
                     tracing::trace!("Search cache hit");

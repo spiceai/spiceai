@@ -108,6 +108,12 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    /// Maximum age for serving stale cached results while revalidating in the background.
+    /// When set, cached results past their TTL (but within this additional window) will be
+    /// served immediately while a background refresh is triggered.
+    /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_while_revalidate_ttl: Option<String>,
 }
 
 // serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
@@ -121,6 +127,7 @@ impl Default for SQLResultsCacheConfig {
             eviction_policy: None,
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
+            stale_while_revalidate_ttl: None,
         }
     }
 }
@@ -162,6 +169,7 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             eviction_policy: val.eviction_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
+            stale_while_revalidate_ttl: None,
         }
     }
 }

@@ -183,9 +183,9 @@ impl Query {
 
         let request_raw_cache_key = match request_context.cache_control() {
             CacheControl::Cache(CacheKeyType::Default)
-            | CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, _) => {
-                plan_raw_cache_key
-            }
+            | CacheControl::MaxStale(CacheKeyType::Default, _)
+            | CacheControl::MinFresh(CacheKeyType::Default, _)
+            | CacheControl::OnlyIfCached(CacheKeyType::Default) => plan_raw_cache_key,
             _ => sql_or_client_raw_key,
         }
         .unwrap_or(sql_raw_cache_key);
@@ -229,17 +229,23 @@ impl Query {
         match (cache_control, &key) {
             (
                 CacheControl::Cache(CacheKeyType::Default)
-                | CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, _),
+                | CacheControl::MaxStale(CacheKeyType::Default, _)
+                | CacheControl::MinFresh(CacheKeyType::Default, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::Default),
                 CacheKey::LogicalPlan(_),
             )
             | (
                 CacheControl::Cache(CacheKeyType::Raw)
-                | CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Raw, _),
+                | CacheControl::MaxStale(CacheKeyType::Raw, _)
+                | CacheControl::MinFresh(CacheKeyType::Raw, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::Raw),
                 CacheKey::Query(_, _),
             )
             | (
                 CacheControl::Cache(CacheKeyType::ClientSupplied)
-                | CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::ClientSupplied, _),
+                | CacheControl::MaxStale(CacheKeyType::ClientSupplied, _)
+                | CacheControl::MinFresh(CacheKeyType::ClientSupplied, _)
+                | CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied),
                 CacheKey::ClientSupplied(_),
             ) => { /* Valid cache key type for this cache control */ }
             (CacheControl::NoCache, _) => {
@@ -272,13 +278,14 @@ impl Query {
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
         };
 
-        // For stale-while-revalidate, check if the entry is beyond the allowed staleness window
-        if let CacheControl::CacheWithStaleWhileRevalidate(_, stale_while_revalidate_duration) =
-            cache_control
-        {
+        // Determine cache status based on stale-while-revalidate configuration
+        let mut cache_status = CacheStatus::CacheHit;
+
+        // Check if stale-while-revalidate is enabled in the cache provider configuration
+        if let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl() {
             let ttl = cache_provider.ttl();
             let now = std::time::Instant::now();
-            let max_age = ttl + stale_while_revalidate_duration;
+            let max_age = ttl + stale_duration;
 
             // If beyond the stale-while-revalidate window, treat as cache miss
             if cached_result.is_stale(max_age, now) {
@@ -292,21 +299,14 @@ impl Query {
                         .with_raw_key(Some(raw_key)),
                 );
             }
-        }
 
-        tracker = tracker.map(|t| {
-            t.datasets(Arc::clone(&cached_result.input_tables))
-                .results_cache_hit(true)
-        });
-
-        // If stale-while-revalidate is enabled, check if data is stale (beyond TTL) and trigger background revalidation
-        if let CacheControl::CacheWithStaleWhileRevalidate(_, _) = cache_control {
-            let ttl = cache_provider.ttl();
-            let now = std::time::Instant::now();
+            // If stale (beyond TTL but within stale-while-revalidate window), trigger background revalidation
             if cached_result.is_stale(ttl, now) {
                 tracing::debug!(
                     "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
                 );
+                cache_status = CacheStatus::CacheStaleWhileRevalidate;
+
                 // Extract plan from cache key if available to avoid re-parsing
                 let plan = match key {
                     CacheKey::LogicalPlan(p) => Some(*p),
@@ -321,6 +321,11 @@ impl Query {
             }
         }
 
+        tracker = tracker.map(|t| {
+            t.datasets(Arc::clone(&cached_result.input_tables))
+                .results_cache_hit(true)
+        });
+
         let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
 
         Ok(CacheResponse::from(
@@ -331,9 +336,9 @@ impl Query {
                     tracker,
                     Box::pin(record_batch_stream),
                 ),
-                CacheStatus::CacheHit,
+                cache_status,
             )),
-            CacheStatus::CacheHit,
+            cache_status,
         )
         .with_raw_key(Some(raw_key)))
     }
@@ -389,14 +394,8 @@ impl Query {
         }
 
         // Create a background request context that will cache results
-        // Use the same cache key type as the original request, but remove stale-while-revalidate
-        // to ensure the query executes normally and populates the cache
-        let cache_control = match request_context.cache_control() {
-            CacheControl::CacheWithStaleWhileRevalidate(key_type, _) => {
-                CacheControl::Cache(key_type)
-            }
-            other => other,
-        };
+        // Use the same cache key type as the original request
+        let cache_control = request_context.cache_control();
         let client_supplied_key = request_context.client_supplied_cache_key().clone();
         let background_context = Arc::new(
             RequestContext::builder(Protocol::Internal)
@@ -970,60 +969,5 @@ mod tests {
             ..Default::default()
         }))
         .await;
-
-        // Test that CacheWithStaleWhileRevalidate validation accepts ClientSupplied cache keys
-        // This verifies the validation logic works correctly  (testing actual timing behavior
-        // is complex with moka's async eviction and is prone to flakiness)
-        let request_context = create_test_request_context(
-            CacheControl::CacheWithStaleWhileRevalidate(
-                CacheKeyType::ClientSupplied,
-                Duration::from_secs(5),
-            ),
-            Some("stale-test-key".to_string()),
-        );
-
-        // First request - cache miss, populates cache
-        let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
-        let query = query_builder.build();
-        Arc::clone(&request_context)
-            .scope(async move {
-                let result = query.run().await.expect("query should succeed");
-                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
-                assert_eq!(records.len(), 1);
-                assert_eq!(records[0].num_rows(), 1);
-            })
-            .await;
-
-        // Second request - cache hit (fresh data)
-        let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df)); // Different query, same cache key
-        let query = query_builder.build();
-        Arc::clone(&request_context)
-            .scope(async move {
-                let result = query.run().await.expect("query should succeed");
-                assert_eq!(result.cache_status, CacheStatus::CacheHit);
-                let records = result
-                    .data
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .expect("should collect");
-                assert_eq!(records.len(), 1);
-                assert_eq!(records[0].num_rows(), 1);
-                // Cached result from first query
-                assert_eq!(
-                    records[0]
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("must read i64 array")
-                        .value(0),
-                    1
-                );
-            })
-            .await;
     }
 }
