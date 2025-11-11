@@ -53,8 +53,8 @@ pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
-    #[snafu(display("Failed to parse item_ttl value: {source}"))]
-    FailedToParseItemTtl { source: ParseError },
+    #[snafu(display("Failed to parse {field} value: {source}"))]
+    FailedToParseDuration { source: ParseError, field: String },
 
     #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
     FailedToInvalidateCache {
@@ -337,7 +337,11 @@ impl QueryResultsCacheProvider {
         };
 
         let ttl = match &config.item_ttl {
-            Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
+            Some(item_ttl) => {
+                fundu::parse_duration(item_ttl).context(FailedToParseDurationSnafu {
+                    field: "item_ttl".to_string(),
+                })?
+            }
             None => std::time::Duration::from_secs(1),
         };
 
@@ -347,7 +351,9 @@ impl QueryResultsCacheProvider {
         // cache TTL beyond the configured item_ttl.
         let stale_duration = match &config.max_stale_while_revalidate {
             Some(max_stale) => {
-                fundu::parse_duration(max_stale).context(FailedToParseItemTtlSnafu)?
+                fundu::parse_duration(max_stale).context(FailedToParseDurationSnafu {
+                    field: "max_stale_while_revalidate".to_string(),
+                })?
             }
             None => std::time::Duration::ZERO,
         };
