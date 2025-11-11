@@ -224,6 +224,7 @@ cluster = [
     "dep:ballista-scheduler",
     "dep:ballista-executor",
     "dep:datafusion-proto",
+    "runtime-datafusion/cluster",
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
