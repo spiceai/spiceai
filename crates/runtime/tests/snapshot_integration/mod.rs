@@ -372,7 +372,8 @@ async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(SNAPSHOT_BUCKET)
         .with_region(SNAPSHOT_REGION)
-        .with_client_options(ClientOptions::default());
+        .with_client_options(ClientOptions::default())
+        .with_list_versions(true);
 
     if let (Ok(key), Ok(secret)) = (
         env::var("AWS_SNAPSHOT_KEY"),

@@ -64,7 +64,8 @@ impl SpiceObjectStoreRegistry {
         let mut s3_builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket_name)
             .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
-            .with_allow_http(true);
+            .with_allow_http(true)
+            .with_list_versions(true);
         let mut client_options = ClientOptions::default();
 
         let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())

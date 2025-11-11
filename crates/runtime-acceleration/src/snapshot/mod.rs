@@ -1371,7 +1371,8 @@ async fn build_s3_object_store(
     let mut s3_builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
         .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
-        .with_allow_http(allow_http);
+        .with_allow_http(allow_http)
+        .with_list_versions(true);
     let mut client_options = ClientOptions::default();
 
     if let Some(region) = s3_region {
