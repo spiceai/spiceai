@@ -9,8 +9,7 @@ description: "Query: clickbench_q9"
 |               |   Projection: hits.RegionID, count(alias1) AS u                                                               |
 |               |     Aggregate: groupBy=[[hits.RegionID]], aggr=[[count(alias1)]]                                              |
 |               |       Aggregate: groupBy=[[hits.RegionID, hits.UserID AS alias1]], aggr=[[]]                                  |
-|               |         BytesProcessedNode                                                                                    |
-|               |           TableScan: hits projection=[RegionID, UserID]                                                       |
+|               |         TableScan: hits projection=[RegionID, UserID]                                                         |
 | physical_plan | SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[false]                                      |
 |               |   CoalescePartitionsExec                                                                                      |
 |               |     ProjectionExec: expr=[RegionID@0 as RegionID, count(alias1)@1 as u]                                       |
@@ -23,12 +22,12 @@ description: "Query: clickbench_q9"
 |               |                   RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 16), input_partitions=16         |
 |               |                     AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID, UserID@1 as alias1], aggr=[]    |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                   |
-|               |                         BytesProcessedExec                                                                    |
-|               |                           SchemaCastScanExec                                                                  |
-|               |                             FallbackOnZeroResultsScanExec                                                     |
-|               |                               CoalescePartitionsExec                                                          |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1         |
-|               |                                   CooperativeExec                                                             |
+|               |                         SchemaCastScanExec                                                                    |
+|               |                           FallbackOnZeroResultsScanExec                                                       |
+|               |                             CoalescePartitionsExec                                                            |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1           |
+|               |                                 CooperativeExec                                                               |
+|               |                                   BytesProcessedExec                                                          |
 |               |                                     DuckSqlExec sql= SELECT "RegionID", "UserID" FROM hits                    |
 |               |                                                                                                               |
 +---------------+---------------------------------------------------------------------------------------------------------------+

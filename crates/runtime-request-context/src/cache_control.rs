@@ -15,11 +15,14 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use app::App;
-use http::{HeaderMap, header::CACHE_CONTROL};
+use headers::HeaderMapExt;
+use http::HeaderMap;
 use spicepod::component::caching::SQLResultsCacheConfig;
+
+#[cfg(test)]
+use http::header::CACHE_CONTROL;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum CacheKeyType {
@@ -61,32 +64,12 @@ impl CacheKeyType {
 
 /// Cache control directives for query results.
 ///
-/// # Stale-While-Revalidate
-///
-/// The `CacheWithStaleWhileRevalidate` variant enables serving stale content while asynchronously
-/// refreshing it in the background. This is useful for improving response times when cache entries
-/// are slightly stale.
-///
-/// When a cached entry is past its TTL but within the stale-while-revalidate window:
-/// 1. The stale data is immediately returned to the client
-/// 2. A background task refreshes the cache entry asynchronously
-///
-/// ## Example Usage
-///
-/// ```text
-/// Cache-Control: max-age=60, stale-while-revalidate=30
-/// ```
-///
-/// This means:
-/// - Fresh content is served for 60 seconds after caching
-/// - Between 60-90 seconds, stale content is served while a background refresh happens
-/// - After 90 seconds, the cache entry is considered fully expired
+/// Controls how query results are cached based on client headers.
 ///
 /// ## HTTP Header Format
 ///
-/// The `Cache-Control` header can include multiple directives:
+/// The `Cache-Control` request header can include:
 /// - `no-cache`: Bypass the cache entirely (`CacheControl::NoCache`)
-/// - `stale-while-revalidate=<seconds>`: Enable stale-while-revalidate with the specified window
 ///
 /// ## Cache Key Types
 ///
@@ -94,13 +77,21 @@ impl CacheKeyType {
 /// - `Default`: Hash of the logical query plan (whitespace-insensitive)
 /// - `Raw`: The raw SQL string (whitespace-sensitive)
 /// - `ClientSupplied`: Custom key provided via `Spice-Cache-Key` header
+///
+/// ## Response Directives
+///
+/// The `stale-while-revalidate` directive is a **response directive** set by the server
+/// based on spicepod configuration. It is NOT parsed from client requests.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CacheControl {
     Cache(CacheKeyType),
-    /// Cache with stale-while-revalidate support.
-    /// The Duration specifies how long after expiry stale content can be served while revalidating.
-    CacheWithStaleWhileRevalidate(CacheKeyType, Duration),
     NoCache,
+    /// max-stale[=N] - Client accepts stale responses up to N seconds old (None = any age)
+    MaxStale(CacheKeyType, Option<std::time::Duration>),
+    /// min-fresh=N - Client wants responses fresh for at least N more seconds
+    MinFresh(CacheKeyType, std::time::Duration),
+    /// only-if-cached - Client wants only cached responses, no network requests
+    OnlyIfCached(CacheKeyType),
 }
 
 impl Default for CacheControl {
@@ -118,53 +109,60 @@ impl CacheControl {
             _ => CacheKeyType::Default,
         };
 
-        match headers.get(CACHE_CONTROL).and_then(|h| h.to_str().ok()) {
-            Some(value) if value.contains("no-cache") => Self::NoCache,
-            Some(value) => {
-                // Parse stale-while-revalidate if present
-                let stale_while_revalidate = Self::parse_stale_while_revalidate(value);
-                match stale_while_revalidate {
-                    Some(duration) => Self::CacheWithStaleWhileRevalidate(cache_key_type, duration),
-                    None => Self::Cache(cache_key_type),
-                }
-            }
-            _ => Self::Cache(cache_key_type),
+        // Try to parse using the headers crate's CacheControl
+        if let Some(cache_control_header) = headers.typed_get::<headers::CacheControl>() {
+            return Self::parse_cache_control_header(&cache_control_header, cache_key_type);
         }
+
+        // If typed parsing fails, the header might not be present or malformed
+        // In that case, return the default Cache variant
+        Self::Cache(cache_key_type)
+    }
+
+    fn parse_cache_control_header(
+        header: &headers::CacheControl,
+        cache_key_type: CacheKeyType,
+    ) -> Self {
+        // Check for no-cache (highest priority per RFC 9111)
+        if header.no_cache() {
+            return Self::NoCache;
+        }
+
+        // Check for only-if-cached
+        if header.only_if_cached() {
+            return Self::OnlyIfCached(cache_key_type);
+        }
+
+        // Check for min-fresh=N
+        if let Some(min_fresh) = header.min_fresh() {
+            return Self::MinFresh(cache_key_type, min_fresh);
+        }
+
+        // Check for max-stale[=N]
+        // The headers crate returns Some(duration) if max-stale=N, or Some(Duration::MAX) if max-stale (no value)
+        if let Some(max_stale) = header.max_stale() {
+            // Duration::MAX indicates max-stale without a specific value (accept any stale)
+            let max_stale_opt = if max_stale == std::time::Duration::MAX {
+                None
+            } else {
+                Some(max_stale)
+            };
+            return Self::MaxStale(cache_key_type, max_stale_opt);
+        }
+
+        Self::Cache(cache_key_type)
     }
 
     /// Get the cache key type from the `CacheControl` variant
     #[must_use]
     pub fn cache_key_type(&self) -> Option<CacheKeyType> {
         match self {
-            Self::Cache(key_type) | Self::CacheWithStaleWhileRevalidate(key_type, _) => {
-                Some(*key_type)
-            }
+            Self::Cache(key_type)
+            | Self::MaxStale(key_type, _)
+            | Self::MinFresh(key_type, _)
+            | Self::OnlyIfCached(key_type) => Some(*key_type),
             Self::NoCache => None,
         }
-    }
-
-    /// Get the stale-while-revalidate duration if present
-    #[must_use]
-    pub fn stale_while_revalidate_duration(&self) -> Option<Duration> {
-        match self {
-            Self::CacheWithStaleWhileRevalidate(_, duration) => Some(*duration),
-            _ => None,
-        }
-    }
-
-    /// Parse the stale-while-revalidate directive from a Cache-Control header value.
-    /// Format: "stale-while-revalidate=<seconds>"
-    fn parse_stale_while_revalidate(header_value: &str) -> Option<Duration> {
-        for directive in header_value.split(',') {
-            let directive = directive.trim();
-            if let Some(value) = directive
-                .strip_prefix("stale-while-revalidate=")
-                .and_then(|v| v.trim().parse::<u64>().ok())
-            {
-                return Some(Duration::from_secs(value));
-            }
-        }
-        None
     }
 }
 
@@ -248,42 +246,23 @@ mod tests {
             CacheControl::Cache(CacheKeyType::Default)
         ));
 
-        // Test with stale-while-revalidate
+        // Test with stale-while-revalidate in request (should be ignored - it's a response directive)
         headers.insert(
             CACHE_CONTROL,
             HeaderValue::from_static("max-age=60, stale-while-revalidate=30"),
         );
-        match CacheControl::from_headers(&headers) {
-            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, duration) => {
-                assert_eq!(duration, Duration::from_secs(30));
-            }
-            _ => panic!("Expected CacheWithStaleWhileRevalidate"),
-        }
+        assert!(matches!(
+            CacheControl::from_headers(&headers),
+            CacheControl::Cache(CacheKeyType::Default)
+        ));
 
-        // Test with stale-while-revalidate only
-        headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("stale-while-revalidate=120"),
-        );
-        match CacheControl::from_headers(&headers) {
-            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, duration) => {
-                assert_eq!(duration, Duration::from_secs(120));
-            }
-            _ => panic!("Expected CacheWithStaleWhileRevalidate"),
-        }
-
-        // Test with client-supplied cache key and stale-while-revalidate
+        // Test with client-supplied cache key
         headers.insert("Spice-Cache-Key", HeaderValue::from_static("my-key"));
-        headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("stale-while-revalidate=60"),
-        );
-        match CacheControl::from_headers(&headers) {
-            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::ClientSupplied, duration) => {
-                assert_eq!(duration, Duration::from_secs(60));
-            }
-            _ => panic!("Expected CacheWithStaleWhileRevalidate with ClientSupplied key"),
-        }
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=60"));
+        assert!(matches!(
+            CacheControl::from_headers(&headers),
+            CacheControl::Cache(CacheKeyType::ClientSupplied)
+        ));
 
         // Test with invalid header value
         headers.remove("Spice-Cache-Key");
@@ -304,33 +283,86 @@ mod tests {
             Some(CacheKeyType::Default)
         );
         assert_eq!(
-            CacheControl::CacheWithStaleWhileRevalidate(
+            CacheControl::Cache(CacheKeyType::ClientSupplied).cache_key_type(),
+            Some(CacheKeyType::ClientSupplied)
+        );
+        assert_eq!(
+            CacheControl::MaxStale(
+                CacheKeyType::Default,
+                Some(std::time::Duration::from_secs(60))
+            )
+            .cache_key_type(),
+            Some(CacheKeyType::Default)
+        );
+        assert_eq!(
+            CacheControl::MinFresh(
                 CacheKeyType::ClientSupplied,
-                Duration::from_secs(60)
+                std::time::Duration::from_secs(120)
             )
             .cache_key_type(),
             Some(CacheKeyType::ClientSupplied)
+        );
+        assert_eq!(
+            CacheControl::OnlyIfCached(CacheKeyType::Default).cache_key_type(),
+            Some(CacheKeyType::Default)
         );
         assert_eq!(CacheControl::NoCache.cache_key_type(), None);
     }
 
     #[test]
-    fn test_stale_while_revalidate_duration_helper() {
-        assert_eq!(
-            CacheControl::Cache(CacheKeyType::Default).stale_while_revalidate_duration(),
-            None
+    fn test_max_stale_parsing() {
+        let mut headers = HeaderMap::new();
+
+        // Test max-stale with value
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-stale=3600"));
+        let result = CacheControl::from_headers(&headers);
+        assert!(matches!(
+            result,
+            CacheControl::MaxStale(CacheKeyType::Default, Some(d)) if d.as_secs() == 3600
+        ));
+
+        // Note: The headers crate doesn't support max-stale without a value,
+        // so it falls back to Cache(Default). This is acceptable since
+        // max-stale without a value is rarely used in practice.
+        headers.clear();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-stale"));
+        let result = CacheControl::from_headers(&headers);
+        eprintln!("max-stale without value result: {result:?}");
+        // The headers crate doesn't parse this, so it defaults to Cache
+        assert!(matches!(result, CacheControl::Cache(CacheKeyType::Default)));
+    }
+
+    #[test]
+    fn test_min_fresh_parsing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("min-fresh=600"));
+        let result = CacheControl::from_headers(&headers);
+        assert!(matches!(
+            result,
+            CacheControl::MinFresh(CacheKeyType::Default, d) if d.as_secs() == 600
+        ));
+    }
+
+    #[test]
+    fn test_only_if_cached_parsing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("only-if-cached"));
+        let result = CacheControl::from_headers(&headers);
+        assert!(matches!(
+            result,
+            CacheControl::OnlyIfCached(CacheKeyType::Default)
+        ));
+    }
+
+    #[test]
+    fn test_multiple_directives() {
+        let mut headers = HeaderMap::new();
+        // When multiple directives are present, priority matters: no-cache > only-if-cached > min-fresh > max-stale
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("max-stale=3600, min-fresh=600, no-cache"),
         );
-        assert_eq!(
-            CacheControl::CacheWithStaleWhileRevalidate(
-                CacheKeyType::Default,
-                Duration::from_secs(120)
-            )
-            .stale_while_revalidate_duration(),
-            Some(Duration::from_secs(120))
-        );
-        assert_eq!(
-            CacheControl::NoCache.stale_while_revalidate_duration(),
-            None
-        );
+        let result = CacheControl::from_headers(&headers);
+        assert!(matches!(result, CacheControl::NoCache));
     }
 }

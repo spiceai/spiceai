@@ -28,6 +28,7 @@ use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
 };
 
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -137,6 +138,9 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
+            ParameterSpec::component("versioning")
+                .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
+                .default("enabled"),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
             ParameterSpec::runtime("allow_http")
@@ -163,6 +167,17 @@ impl DataConnectorFactory for S3Factory {
                 "endpoint".to_string(),
                 endpoint.trim_end_matches('/').to_string().into(),
             );
+        }
+
+        if let Some(versioning) = params.parameters.get("versioning").expose().ok()
+            && !matches!(versioning, "enabled" | "disabled")
+        {
+            tracing::warn!(
+                "Invalid S3 versioning setting '{versioning}'. Defaulting to 'enabled'."
+            );
+            params
+                .parameters
+                .insert("versioning".to_string(), "enabled".to_string().into());
         }
 
         Box::pin(async move {
@@ -219,6 +234,14 @@ impl std::fmt::Display for S3 {
 }
 
 impl ListingTableConnector for S3 {
+    fn object_versioning_type(&self) -> Option<ObjectVersionType> {
+        if let Some("disabled") = self.params.get("versioning").expose().ok() {
+            return None;
+        }
+
+        Some(ObjectVersionType::Version)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

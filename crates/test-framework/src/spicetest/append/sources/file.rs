@@ -62,16 +62,14 @@ impl AppendableSource for FileAppendableSource {
         }
 
         let dest_db_file = self.dest_db_file.clone();
-        let query_set = config.query_set;
+        let query_set = config.query_set.clone();
         let load_steps = config.load_steps;
         let tables = self.tables.clone();
         let temp_directory = config.temp_directory.clone();
 
         tokio::task::spawn_blocking(move || {
             let dest_conn = Connection::open(&dest_db_file)?;
-            println!(
-                "Loading initial data for {query_set} benchmark suite"
-            );
+            println!("Loading initial data for {query_set} benchmark suite");
             match query_set {
                 QuerySet::Tpch => {
                     let mut sql = format!(
@@ -82,10 +80,11 @@ impl AppendableSource for FileAppendableSource {
                     );
 
                     for TableWithTimeColumn { name, column } in &tables {
+                        use std::fmt::Write;
                         let parquet_path = temp_directory.join(format!("{name}.parquet"));
-                        sql += &format!(
+                        write!(&mut sql,
                                     "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                             COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                             COPY {name} TO '{}' (FORMAT 'parquet');\n", parquet_path.to_string_lossy()).ok();
                     }
 
                     sql += "COMMIT;";
@@ -102,13 +101,14 @@ impl AppendableSource for FileAppendableSource {
                     for TableWithTimeColumn { name, column } in &tables {
                         // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
                         // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
-                        setup_sql += &format!(
+                        use std::fmt::Write;
+                        write!(&mut setup_sql,
                             "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                              ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                              INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
                              LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
                              COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n"
-                        );
+                        ).ok();
                     }
 
                     setup_sql += "COMMIT;";
@@ -126,8 +126,7 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(setup_sql)?;
                 }
-                QuerySet::ParameterizedTpch => todo!(),
-                QuerySet::ParameterizedSaffron => todo!(),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ParameterizedSaffron => todo!(),
             }
 
             drop(dest_conn);
@@ -150,7 +149,7 @@ impl AppendableSource for FileAppendableSource {
         );
 
         let dest_db_file = self.dest_db_file.clone();
-        let query_set = config.query_set;
+        let query_set = config.query_set.clone();
         let load_steps = config.load_steps;
         let tables = self.tables.clone();
         let temp_directory = config.temp_directory.clone();
@@ -168,11 +167,12 @@ impl AppendableSource for FileAppendableSource {
                     );
 
                     for TableWithTimeColumn { name, column } in &tables {
+                        use std::fmt::Write;
                         let parquet_path = temp_directory.join(format!("{name}.parquet"));
-                        sql += &format!("ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        write!(&mut sql, "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                                          INSERT INTO {name} SELECT * FROM {name}_new;
                                          DROP TABLE {name}_new;
-                                         COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                                         COPY {name} TO '{}' (FORMAT 'parquet');\n", parquet_path.to_string_lossy()).ok();
                     }
 
                     sql += "COMMIT;";
@@ -183,11 +183,12 @@ impl AppendableSource for FileAppendableSource {
                     let mut sql = "BEGIN;\n".to_string();
 
                     for TableWithTimeColumn { name, column } in &tables {
-                        sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
+                        use std::fmt::Write;
+                        write!(&mut sql, "INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
                                          FROM {name}_gen
                                          LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
                                          OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
-                                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n");
+                                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n").ok();
                     }
 
                     sql += "COMMIT;";
@@ -205,8 +206,7 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(&sql)?;
                 }
-                QuerySet::ParameterizedTpch => todo!(),
-                QuerySet::ParameterizedSaffron => todo!(),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ParameterizedSaffron => todo!(),
             }
 
             Ok::<(), anyhow::Error>(())

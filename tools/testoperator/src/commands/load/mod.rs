@@ -90,19 +90,20 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .cloned()
         .collect();
 
-    let baseline_test = SpiceTest::new(
-        app.name.clone(),
+    let (_query_set, test_builder) = super::build_test_with_validation(
+        &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_query_set(baseline_queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.test_args.common.disable_progress_bars)
-    .start()
-    .await?;
+    )?;
+
+    let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.test_args.common.disable_progress_bars)
+        .start()
+        .await?;
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test
@@ -120,21 +121,31 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     // load test
     println!("Running load test");
-    let throughput_test = SpiceTest::<NotStarted>::new(
-        app.name.clone(),
+
+    let (query_set, test_builder) = super::build_test_with_validation(
+        &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_query_set(queries.clone())
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
                 args.test_args.common.duration,
             )))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.test_args.common.disable_progress_bars)
-    .start()
-    .await?;
+    )?;
+
+    // Use the same query overrides that were applied in build_test_with_validation
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(test_framework::queries::QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides, None, None).await?;
+
+    let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.test_args.common.disable_progress_bars)
+        .start()
+        .await?;
 
     let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let test_durations = test.get_query_durations().statistical_set()?;

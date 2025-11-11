@@ -83,10 +83,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
             Some("BytesProcessedExec") => {
                 // TODO: Make RequestContext serializable
-                Ok(Arc::new(BytesProcessedExec::new(
-                    Arc::clone(&inputs[0]),
-                    Arc::new(Box::new(track_bytes_processed)),
-                )))
+                Ok(Arc::new(
+                    BytesProcessedExec::new(
+                        Arc::clone(&inputs[0]),
+                        Arc::new(Box::new(track_bytes_processed)),
+                    )
+                    .fallback_to_new_context(),
+                ))
             }
             _ => exec_err!("Unsupported spice.exec.name"),
         }
