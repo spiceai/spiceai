@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion_expr::LogicalPlan;
 use datafusion_federation::FederationProvider;
 
 #[allow(clippy::struct_field_names)]
