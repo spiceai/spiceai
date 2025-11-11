@@ -87,6 +87,10 @@ pub enum Error {
     #[snafu(display("Failed to build catalog: {source}"))]
     #[snafu(visibility(pub(crate)))]
     UnableToBuildCatalog { source: iceberg::Error },
+
+    #[snafu(display("Failed to build catalog client: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalogClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

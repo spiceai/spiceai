@@ -75,9 +75,8 @@ impl EditorHelper {
 
         let handle = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(refresh_interval));
-
-            // Initial refresh
-            refresh_schema(client.clone(), &schema_cache, api_key.as_ref(), &user_agent).await;
+            // Skip the first tick since interval.tick() returns immediately the first time
+            interval.tick().await;
 
             loop {
                 tokio::select! {

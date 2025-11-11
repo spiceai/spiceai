@@ -253,6 +253,11 @@ impl SpicedInstance {
         {
             anyhow::bail!("Spiced instance not ready within {timeout:?}");
         }
+
+        // Give Flight server a moment to finish starting up after HTTP is ready
+        // Flight starts asynchronously and may not be available immediately
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
         Ok(())
     }
 
