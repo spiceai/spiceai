@@ -56,7 +56,7 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 
 func DownloadRuntimeAsset(flavor constants.Flavor, release *RepoRelease, downloadPath string, allowAccelerator bool) error {
 	assetName := GetRuntimeAssetName(flavor, allowAccelerator)
-	slog.Info(fmt.Sprintf("Downloading the Spice runtime..., %s", assetName))
+	slog.Info(fmt.Sprintf("Downloading Spice runtime (%s)...", assetName))
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 

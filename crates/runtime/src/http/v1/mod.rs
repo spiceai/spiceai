@@ -51,7 +51,10 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
-use http::{HeaderValue, header::CONTENT_TYPE};
+use http::{
+    HeaderValue,
+    header::{CACHE_CONTROL, CONTENT_TYPE},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
@@ -59,6 +62,8 @@ use snafu::ResultExt;
 use futures::TryStreamExt;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
+
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -264,6 +269,7 @@ pub async fn to_http_response(
         &mut headers,
         cache_status,
         request_context.client_supplied_cache_key().is_some(),
+        &request_context,
     );
 
     (StatusCode::OK, headers, body)
@@ -273,6 +279,7 @@ fn attach_cache_headers(
     headers: &mut HeaderMap,
     results_cache_status: CacheStatus,
     user_key_specified: bool,
+    request_context: &RequestContext,
 ) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
@@ -288,6 +295,26 @@ fn attach_cache_headers(
     // Tell CDN entry is unique per user cache key
     if user_key_specified {
         headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+    }
+
+    // Add Cache-Control response header with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = request_context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            let max_age = cache_provider.ttl().as_secs();
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
+                headers.insert(CACHE_CONTROL, header_value);
+            }
+        }
     }
 }
 

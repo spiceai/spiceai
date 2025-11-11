@@ -302,7 +302,7 @@ pub struct QueryResultsCacheProvider {
     cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
-    max_stale_while_revalidate: std::time::Duration, // Max stale period added to TTL for cache eviction
+    stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
 }
@@ -313,8 +313,8 @@ impl std::fmt::Debug for QueryResultsCacheProvider {
             .field("cache_max_size", &self.cache_max_size)
             .field("ttl", &self.ttl)
             .field(
-                "max_stale_while_revalidate",
-                &self.max_stale_while_revalidate,
+                "stale_while_revalidate_ttl",
+                &self.stale_while_revalidate_ttl,
             )
             .field("ignore_schemas", &self.ignore_schemas)
             .finish_non_exhaustive()
@@ -345,28 +345,26 @@ impl QueryResultsCacheProvider {
             None => std::time::Duration::from_secs(1),
         };
 
-        // If max_stale_while_revalidate is configured, extend the cache TTL
-        // to allow entries to remain in cache during the stale-while-revalidate window.
-        // Default is ZERO (disabled) when not specified to avoid unexpectedly extending
-        // cache TTL beyond the configured item_ttl.
-        let stale_duration = match &config.max_stale_while_revalidate {
-            Some(max_stale) => {
-                fundu::parse_duration(max_stale).context(FailedToParseDurationSnafu {
-                    field: "max_stale_while_revalidate".to_string(),
-                })?
-            }
-            None => std::time::Duration::ZERO,
+        let stale_while_revalidate_ttl = match &config.stale_while_revalidate_ttl {
+            Some(stale_ttl_str) => Some(fundu::parse_duration(stale_ttl_str).context(
+                FailedToParseDurationSnafu {
+                    field: "stale_while_revalidate_ttl".to_string(),
+                },
+            )?),
+            None => None,
         };
-        let cache_ttl = ttl + stale_duration;
 
         let hash_builder = get_hash_builder(config.hashing_algorithm)?;
+        // Cache TTL should be the base TTL plus the stale-while-revalidate window
+        // so entries aren't evicted before they can be served as stale
+        let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
         let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
 
         let cache_provider = QueryResultsCacheProvider {
             cache,
             cache_max_size,
-            ttl,                                        // Keep the base TTL for staleness checks
-            max_stale_while_revalidate: stale_duration, // Store the stale period
+            ttl,
+            stale_while_revalidate_ttl,
             ignore_schemas,
         };
 
@@ -447,20 +445,25 @@ impl QueryResultsCacheProvider {
     /// Returns the maximum stale-while-revalidate duration.
     #[must_use]
     pub fn max_stale_while_revalidate(&self) -> std::time::Duration {
-        self.max_stale_while_revalidate
+        self.stale_while_revalidate_ttl.unwrap_or_default()
     }
 
     /// Returns the actual cache TTL (base TTL + stale-while-revalidate period).
     /// This is the duration after which entries are evicted from the cache.
     #[must_use]
     pub fn cache_ttl(&self) -> std::time::Duration {
-        self.ttl + self.max_stale_while_revalidate
+        self.ttl + self.stale_while_revalidate_ttl.unwrap_or_default()
     }
 
     /// Runs pending cache maintenance tasks (e.g., eviction of expired entries).
     /// This is useful in tests to ensure eviction happens immediately.
     pub async fn run_pending_tasks(&self) {
         self.cache.checkpoint().await;
+    }
+
+    #[must_use]
+    pub fn stale_while_revalidate_ttl(&self) -> Option<std::time::Duration> {
+        self.stale_while_revalidate_ttl
     }
 
     #[must_use]

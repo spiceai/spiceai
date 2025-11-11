@@ -22,13 +22,46 @@ use tonic::{
 
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
-pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status: CacheStatus) {
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
+
+pub fn attach_cache_metadata<T>(
+    response: &mut Response<T>,
+    results_cache_status: CacheStatus,
+    context: &RequestContext,
+) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         response.metadata_mut().insert("x-cache", val);
     }
 
     if let Some(val) = status_to_results_cache_value(results_cache_status) {
         response.metadata_mut().insert("results-cache-status", val);
+    }
+
+    // Add Cache-Control response metadata with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            let max_age = cache_provider.ttl().as_secs();
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(metadata_value) = cache_control_value.parse() {
+                response
+                    .metadata_mut()
+                    .insert("cache-control", metadata_value);
+            } else {
+                tracing::warn!(
+                    "Failed to parse cache-control metadata value: {}",
+                    cache_control_value
+                );
+            }
+        }
     }
 }
 

@@ -83,7 +83,7 @@ async fn do_get_simple(
             let mut response =
                 Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
 
-            attach_cache_metadata(&mut response, cache_status);
+            attach_cache_metadata(&mut response, cache_status, &context);
 
             Ok(response)
         }
