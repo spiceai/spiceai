@@ -29,18 +29,6 @@ use serde_json::{Map, Value, json};
 use std::{borrow::Cow, future::Future, ops::Deref, sync::Arc};
 use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
-/// Calculate the maximum depth of a JSON object to prevent stack overflow attacks.
-///
-/// This is a specialized version for `Map<String, Value>` that delegates to the
-/// shared `get_json_depth` utility after wrapping in a `Value::Object`.
-fn get_json_depth_from_object(obj: &Map<String, Value>) -> usize {
-    if obj.is_empty() {
-        1
-    } else {
-        get_json_depth(&Value::Object(obj.clone()))
-    }
-}
-
 #[derive(Clone)]
 pub struct RuntimeServer(Arc<Runtime>);
 impl Deref for RuntimeServer {
@@ -116,7 +104,11 @@ impl ServerHandler for RuntimeServer {
 
                 // Security: Validate arguments JSON depth before proxying
                 if let Some(ref args) = arguments {
-                    let depth = get_json_depth_from_object(args);
+                    let depth = if args.is_empty() {
+                        1
+                    } else {
+                        1 + args.values().map(get_json_depth).max().unwrap_or(0)
+                    };
                     if depth > MAX_SAFE_JSON_DEPTH {
                         return Err(McpError::invalid_params(
                             format!(

@@ -202,6 +202,19 @@ impl ModelSource for Huggingface {
     }
 }
 
+/// Resolves a model file path relative to a base directory, enforcing that the resulting path
+/// does not escape the specified root directory. This function is security-critical: it prevents
+/// directory traversal attacks by rejecting absolute paths, root-prefixed paths, and parent directory
+/// components that would escape the root. Returns an error if the resolved path is invalid or outside
+/// the root directory. Use this function whenever accepting user-supplied or external file paths.
+///
+/// # Parameters
+/// - `root_dir`: The root directory that resolved paths must remain within.
+/// - `base_dir`: The base directory from which relative paths are resolved.
+/// - `file`: The file path to resolve (relative, not absolute).
+///
+/// # Errors
+/// Returns `Error::InvalidModelFilePath` if the path is empty, absolute, escapes the root, or contains invalid components.
 fn resolve_model_file_path(root_dir: &Path, base_dir: &Path, file: &str) -> super::Result<PathBuf> {
     let trimmed = file.trim();
     ensure!(

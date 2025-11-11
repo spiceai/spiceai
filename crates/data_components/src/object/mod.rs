@@ -47,15 +47,26 @@ impl ObjectStoreContext {
         let filename_regex = filename_regex_opt
             .map(|regex| {
                 // Prevent ReDoS attacks by limiting regex complexity
+                // Length check catches obviously malicious patterns
                 const MAX_REGEX_LENGTH: usize = 1000;
                 if regex.len() > MAX_REGEX_LENGTH {
                     return Err(format!(
-                        "Regex pattern too long ({} chars). Maximum allowed: {}",
-                        regex.len(),
-                        MAX_REGEX_LENGTH
+                        "Regex pattern too long ({} chars). Maximum allowed: {MAX_REGEX_LENGTH}",
+                        regex.len()
                     )
                     .into());
                 }
+
+                // Additional ReDoS protection: detect dangerous patterns
+                // Check for nested quantifiers like (a+)+ or (a*)* which cause exponential backtracking
+                if regex.contains(")+") || regex.contains(")*") || regex.contains("}+") || regex.contains("}*") {
+                    return Err(
+                        "Regex pattern contains nested quantifiers which can cause exponential backtracking (ReDoS). Please simplify the pattern."
+                            .to_string()
+                            .into(),
+                    );
+                }
+
                 Regex::new(&regex).boxed()
             })
             .transpose()?;

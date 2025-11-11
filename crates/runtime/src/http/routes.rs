@@ -188,8 +188,13 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 }
 
 // Request body size limits to prevent DoS attacks
-// 10MB default for all authenticated endpoints (queries, chat, embeddings, evals)
+// Applied at two levels:
+// 1. DEFAULT_REQUEST_BODY_LIMIT (10 MiB) - for authenticated endpoints (queries, chat, embeddings, evals)
+//    Applied per-route to enforce stricter limits on user-facing endpoints
+// 2. MAX_BODY_SIZE (128 MiB) - global limit for all routes including unauthenticated health checks
+//    Applied to the entire router to prevent any request from exceeding this size
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MiB
+const MAX_BODY_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
@@ -199,11 +204,6 @@ pub(crate) fn routes(
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
 ) -> Router {
-    // Set a reasonable request body size limit to prevent DoS attacks through memory exhaustion
-    // 16MB is sufficient for most legitimate requests including large SQL queries, JSON payloads,
-    // and embeddings, while preventing abuse
-    const MAX_BODY_SIZE: usize = 16 * 1024 * 1024; // 16 MB
-
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
         .route("/v1/status", get(v1::status::get))

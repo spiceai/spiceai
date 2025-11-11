@@ -107,12 +107,28 @@ impl McpToolCatalog {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security: Validate command path to prevent command injection
-                // Only allow absolute paths or commands without path separators
-                if command.contains("..") || (command.contains('/') && !command.starts_with('/')) {
+                // Use Path::components() to properly validate on all platforms (Windows/Unix)
+                use std::path::{Component, Path};
+                let path = Path::new(command);
+                for component in path.components() {
+                    match component {
+                        Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {}
+                        Component::ParentDir | Component::CurDir => {
+                            return Err(Error::CouldNotConstructTool {
+                                name: "mcp_stdio".to_string(),
+                                e: format!(
+                                    "Invalid command path '{command}'. Path traversal components (.., .) not allowed"
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Reject relative paths that could be ambiguous
+                if !path.is_absolute() && path.components().count() > 1 {
                     return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
-                            "Invalid command path '{command}'. Only absolute paths or simple commands allowed"
+                            "Invalid command path '{command}'. Only absolute paths or simple command names allowed"
                         ),
                     });
                 }

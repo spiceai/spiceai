@@ -695,8 +695,7 @@ impl Runtime {
                 self_ref,
                 cloned_config.into(),
                 cloned_tls_config,
-                auth.clone()
-                    .unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth {})),
+                auth.unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth {})),
                 Some(http_shutdown),
             )
             .map_err(Error::from),
@@ -1058,6 +1057,13 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
+    ///
+    /// This function is a regular `fn` returning `impl Future` rather than an `async fn`
+    /// to ensure that task registration is non-blocking and does not hold async locks
+    /// across `.await` points. This pattern is used to avoid blocking the async runtime
+    /// during task registration, in line with Spice.ai's architectural principle that
+    /// async code must reach `.await` within 10-100 microseconds and never block the runtime.
+    /// See: docs/PRINCIPLES.md and docs/dev/style_guide.md for details.
     fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
