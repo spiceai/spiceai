@@ -1077,9 +1077,11 @@ impl HttpTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
+    use std::sync::Arc;
     use url::Url;
 
     #[test]
@@ -1387,10 +1389,6 @@ mod tests {
 
     #[test]
     fn test_get_projected_schema() {
-        use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-        use datafusion::common::Result as DataFusionResult;
-        use std::sync::Arc;
-
         // Create a base schema as would be returned by base_table_schema
         let schema = Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
