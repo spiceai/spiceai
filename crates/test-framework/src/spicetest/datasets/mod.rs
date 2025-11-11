@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -28,6 +28,7 @@ use crate::{
     queries::Query,
 };
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
@@ -68,6 +69,7 @@ pub struct NotStarted {
     disable_caching: bool,
     scale_factor: f64,
     http_client: bool,
+    validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
 }
 
 impl NotStarted {
@@ -116,6 +118,15 @@ impl NotStarted {
     #[must_use]
     pub fn with_http_client(mut self, http_client: bool) -> Self {
         self.http_client = http_client;
+        self
+    }
+
+    #[must_use]
+    pub fn with_validation_data(
+        mut self,
+        validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Self {
+        self.validation_data = Some(validation_data);
         self
     }
 }
@@ -209,6 +220,10 @@ impl SpiceTest<NotStarted> {
 
             if self.state.http_client {
                 worker = worker.with_http_client(http_client.clone());
+            }
+
+            if let Some(validation_data) = &self.state.validation_data {
+                worker = worker.with_validation_data(validation_data.clone());
             }
 
             query_workers.push(worker.start());

@@ -396,6 +396,11 @@ pub mod tests {
         let plan = create_data_source_exec(files);
 
         let mut config_with_max_stages = DEFAULT_CONFIG_OPTIONS.clone();
+        // Set target_partitions to ensure deterministic test behavior
+        // With target_partitions=25, stage_size=50, we get exactly 200 stages from 10000 files
+        config_with_max_stages
+            .set("datafusion.execution.target_partitions", "25")
+            .expect("Must set target_partitions");
         config_with_max_stages
             .set("spice.execution.file_scan_expand_max_stages", "200")
             .expect("Must set config");

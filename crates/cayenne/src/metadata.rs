@@ -150,6 +150,11 @@ pub struct VortexConfig {
     pub footer_cache_mb: usize,
     /// Segment cache size in MB
     pub segment_cache_mb: usize,
+    /// Target size for individual Vortex files in MB. When writes exceed this size,
+    /// a new Vortex file will be created in the same listing directory. This allows
+    /// for better parallelism and more granular statistics for query optimization.
+    /// Defaults to 256 MB.
+    pub target_vortex_file_size_mb: usize,
 }
 
 impl Default for VortexConfig {
@@ -167,6 +172,8 @@ impl Default for VortexConfig {
             // Cache configuration
             footer_cache_mb: 128,
             segment_cache_mb: 32,
+            // Target file size: 256 MB
+            target_vortex_file_size_mb: 256,
         }
     }
 }

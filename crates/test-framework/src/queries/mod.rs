@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
-use serde::{Deserialize, Serialize};
 
 use crate::flight::{PreparedStatementParamColumn, create_param_batch};
 
 pub mod parameterized;
+pub mod scenario;
 pub mod validation;
 
 #[macro_export]
@@ -185,17 +185,18 @@ impl Query {
     }
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum QuerySet {
     #[default]
-    #[serde(rename = "tpch")]
     Tpch,
-    #[serde(rename = "tpcds")]
     Tpcds,
-    #[serde(rename = "clickbench")]
     Clickbench,
-    #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
+    /// Scenario query set loaded from a file
+    Scenario {
+        queries: Vec<Query>,
+        scenario_set: scenario::ScenarioQuerySet,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +233,7 @@ impl QuerySet {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
             QuerySet::Clickbench => get_clickbench_test_queries(overrides),
+            QuerySet::Scenario { queries, .. } => queries.clone(),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
                     "parameterized",
@@ -265,6 +267,7 @@ impl QuerySet {
     #[must_use]
     pub fn row_counts(&self) -> Vec<TableWithRowCount> {
         match self {
+            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", 150_000),
                 ("lineitem", 6_001_215),
@@ -317,6 +320,7 @@ impl QuerySet {
     #[must_use]
     pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
+            QuerySet::Scenario { .. } => vec![],
             QuerySet::Tpch | QuerySet::ParameterizedTpch => [
                 ("customer", "c_created_at"),
                 ("lineitem", "l_created_at"),
@@ -365,6 +369,26 @@ impl QuerySet {
                 .collect(),
         }
     }
+
+    /// Get validation data for queries that support it
+    /// Returns None if the query set doesn't support validation or if no validation data is available
+    pub fn get_validation_data(
+        &self,
+        base_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<Option<HashMap<Arc<str>, Vec<RecordBatch>>>> {
+        match self {
+            QuerySet::Scenario { scenario_set, .. } => {
+                let validation_data = scenario_set.get_expected_results(base_path)?;
+                if validation_data.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(validation_data))
+                }
+            }
+            // TPCH and other query sets use built-in validation
+            _ => Ok(None),
+        }
+    }
 }
 
 impl Display for QuerySet {
@@ -374,6 +398,13 @@ impl Display for QuerySet {
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
+            QuerySet::Scenario { scenario_set, .. } => {
+                if let Some(name) = &scenario_set.name {
+                    write!(f, "scenario[{name}]")
+                } else {
+                    write!(f, "scenario")
+                }
+            }
         }
     }
 }

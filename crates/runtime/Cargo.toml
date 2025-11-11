@@ -229,6 +229,7 @@ cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
+    "cluster",
     "keyring-secret-store",
     "aws-secrets-manager",
     "sharepoint",

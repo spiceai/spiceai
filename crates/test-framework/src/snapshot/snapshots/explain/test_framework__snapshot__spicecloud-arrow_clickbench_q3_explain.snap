@@ -7,14 +7,13 @@ description: "Query: clickbench_q3"
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Projection: sum(hits.AdvEngineID), count(Int64(1)) AS count(*), avg(hits.ResolutionWidth)                                                                        |
 |               |   Aggregate: groupBy=[[]], aggr=[[sum(CAST(hits.AdvEngineID AS Int64)), count(Int64(1)), avg(CAST(hits.ResolutionWidth AS Float64))]]                            |
-|               |     BytesProcessedNode                                                                                                                                           |
-|               |       TableScan: hits projection=[ResolutionWidth, AdvEngineID]                                                                                                  |
+|               |     TableScan: hits projection=[ResolutionWidth, AdvEngineID]                                                                                                    |
 | physical_plan | ProjectionExec: expr=[sum(hits.AdvEngineID)@0 as sum(hits.AdvEngineID), count(Int64(1))@1 as count(*), avg(hits.ResolutionWidth)@2 as avg(hits.ResolutionWidth)] |
 |               |   AggregateExec: mode=Final, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                                    |
 |               |     CoalescePartitionsExec                                                                                                                                       |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                              |
-|               |         BytesProcessedExec                                                                                                                                       |
-|               |           SchemaCastScanExec                                                                                                                                     |
+|               |         SchemaCastScanExec                                                                                                                                       |
+|               |           BytesProcessedExec                                                                                                                                     |
 |               |             DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529]      |
 |               |                                                                                                                                                                  |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
