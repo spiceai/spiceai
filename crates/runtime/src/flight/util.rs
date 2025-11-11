@@ -35,7 +35,9 @@ pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<MetadataValue<Ascii>> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
@@ -48,6 +50,7 @@ fn status_to_results_cache_value(
         CacheStatus::CacheHit => "HIT".parse().ok(),
         CacheStatus::CacheMiss => "MISS".parse().ok(),
         CacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        CacheStatus::CacheStaleWhileRevalidate => "STALE".parse().ok(),
         CacheStatus::CacheDisabled => None,
     }
 }

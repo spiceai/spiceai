@@ -294,7 +294,9 @@ fn attach_cache_headers(
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
