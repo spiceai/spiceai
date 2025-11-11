@@ -63,14 +63,9 @@ impl ModelSource for Huggingface {
         let local_path = super::ensure_model_path(name.as_str())?;
         let local_path = PathBuf::from(local_path);
 
-        // Get the parent directory as the root for security boundary checks.
-        // This ensures files cannot escape the model's parent directory.
-        let root_dir = local_path.parent().context(super::UnableToLoadConfigSnafu {
-            reason: format!(
-                "Model path has no parent directory: {}. Expected path structure like /path/to/models/<model_name>",
-                local_path.display()
-            ),
-        })?;
+        // Use the model directory itself as the root for security boundary checks.
+        // This ensures files cannot escape the current model's directory into sibling models.
+        let root_dir = &local_path;
 
         let remote_path = params
             .get("path")
