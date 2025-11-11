@@ -141,7 +141,7 @@ datafusion-proto = { version = "50.3.0", features = ["json"] }
 datafusion-pruning = "50.3.0"
 datafusion-spark = "50.3.0"
 datafusion-table-providers = "0.1"
-delta_kernel = { version = "0.14", features = [
+delta_kernel = { version = "0.16.0", features = [
     "default-engine-rustls",
     "arrow-56",
     "internal-api",
@@ -325,7 +325,7 @@ ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", re
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }  # spiceai/spiceai-50
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" } # spiceai/spiceai-50
 
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "283730fdfcec53575aa14fb1ab084004a16db69c" } # spiceai-0.16.0
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d" } # spiceai-0.16.0
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "8dd41445963c24a62fc522d795edcd22392fe8de" } # spiceai-1.4.1
 
