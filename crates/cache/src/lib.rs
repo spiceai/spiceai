@@ -53,8 +53,8 @@ pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
-    #[snafu(display("Failed to parse item_ttl value: {source}"))]
-    FailedToParseItemTtl { source: ParseError },
+    #[snafu(display("Failed to parse {field} value: {source}"))]
+    FailedToParseDuration { source: ParseError, field: String },
 
     #[snafu(display("Failed to parse stale_while_revalidate_ttl value: {source}"))]
     FailedToParseDuration { source: ParseError },
@@ -340,7 +340,11 @@ impl QueryResultsCacheProvider {
         };
 
         let ttl = match &config.item_ttl {
-            Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
+            Some(item_ttl) => {
+                fundu::parse_duration(item_ttl).context(FailedToParseDurationSnafu {
+                    field: "item_ttl".to_string(),
+                })?
+            }
             None => std::time::Duration::from_secs(1),
         };
 
@@ -352,7 +356,7 @@ impl QueryResultsCacheProvider {
         };
 
         let hash_builder = get_hash_builder(config.hashing_algorithm)?;
-        let cache = Arc::new(LruCache::new(cache_max_size, ttl, hash_builder));
+        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
 
         let cache_provider = QueryResultsCacheProvider {
             cache,
@@ -430,9 +434,29 @@ impl QueryResultsCacheProvider {
         self.cache.item_count()
     }
 
+    /// Returns the base TTL for cache entries (used for staleness checks).
     #[must_use]
     pub fn ttl(&self) -> std::time::Duration {
         self.ttl
+    }
+
+    /// Returns the maximum stale-while-revalidate duration.
+    #[must_use]
+    pub fn max_stale_while_revalidate(&self) -> std::time::Duration {
+        self.max_stale_while_revalidate
+    }
+
+    /// Returns the actual cache TTL (base TTL + stale-while-revalidate period).
+    /// This is the duration after which entries are evicted from the cache.
+    #[must_use]
+    pub fn cache_ttl(&self) -> std::time::Duration {
+        self.ttl + self.max_stale_while_revalidate
+    }
+
+    /// Runs pending cache maintenance tasks (e.g., eviction of expired entries).
+    /// This is useful in tests to ensure eviction happens immediately.
+    pub async fn run_pending_tasks(&self) {
+        self.cache.checkpoint().await;
     }
 
     #[must_use]
