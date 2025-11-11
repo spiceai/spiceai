@@ -1063,7 +1063,7 @@ impl Runtime {
     /// across `.await` points. This pattern is used to avoid blocking the async runtime
     /// during task registration, in line with Spice.ai's architectural principle that
     /// async code must reach `.await` within 10-100 microseconds and never block the runtime.
-    /// See: docs/PRINCIPLES.md and docs/dev/style_guide.md for details.
+    /// See: `docs/PRINCIPLES.md` and `docs/dev/style_guide.md` for details.
     fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,

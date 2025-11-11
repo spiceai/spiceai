@@ -99,6 +99,7 @@ impl McpToolCatalog {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
         // Security constants
         const MAX_ARGS: usize = 100;
