@@ -1400,7 +1400,7 @@ mod tests {
         // Projection includes all
         let all_fields = vec![0, 1, 2, 3];
         let projected_schema =
-            HttpTableProvider::get_projected_schema(&schema, Some(&all_fields)).unwrap();
+            HttpTableProvider::get_projected_schema(&schema, Some(&all_fields)).expect("schema");
         let projected_field_names: Vec<_> =
             projected_schema.fields().iter().map(|f| f.name()).collect();
         assert_eq!(
@@ -1411,7 +1411,7 @@ mod tests {
         // Projection with some fields
         let some_fields = vec![0, 3];
         let projected_schema =
-            HttpTableProvider::get_projected_schema(&schema, Some(&some_fields)).unwrap();
+            HttpTableProvider::get_projected_schema(&schema, Some(&some_fields)).expect("schema");
         let projected_field_names: Vec<_> =
             projected_schema.fields().iter().map(|f| f.name()).collect();
         assert_eq!(projected_field_names, &["request_path", "content"]);
@@ -1419,13 +1419,14 @@ mod tests {
         // Empty projection triggers fallback to "content"
         let empty_fields: Vec<usize> = vec![];
         let projected_schema =
-            HttpTableProvider::get_projected_schema(&schema, Some(&empty_fields)).unwrap();
+            HttpTableProvider::get_projected_schema(&schema, Some(&empty_fields)).expect("schema");
         let projected_field_names: Vec<_> =
             projected_schema.fields().iter().map(|f| f.name()).collect();
         assert_eq!(projected_field_names, &["content"]);
 
         // None projection defaults to all fields
-        let projected_schema = HttpTableProvider::get_projected_schema(&schema, None).unwrap();
+        let projected_schema =
+            HttpTableProvider::get_projected_schema(&schema, None).expect("schema");
         let projected_field_names: Vec<_> =
             projected_schema.fields().iter().map(|f| f.name()).collect();
         assert_eq!(
