@@ -56,9 +56,6 @@ pub enum Error {
     #[snafu(display("Failed to parse {field} value: {source}"))]
     FailedToParseDuration { source: ParseError, field: String },
 
-    #[snafu(display("Failed to parse stale_while_revalidate_ttl value: {source}"))]
-    FailedToParseDuration { source: ParseError },
-
     #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
     FailedToInvalidateCache {
         source: moka::PredicateError,
@@ -349,13 +346,18 @@ impl QueryResultsCacheProvider {
         };
 
         let stale_while_revalidate_ttl = match &config.stale_while_revalidate_ttl {
-            Some(stale_ttl_str) => {
-                Some(fundu::parse_duration(stale_ttl_str).context(FailedToParseDurationSnafu)?)
-            }
+            Some(stale_ttl_str) => Some(fundu::parse_duration(stale_ttl_str).context(
+                FailedToParseDurationSnafu {
+                    field: "stale_while_revalidate_ttl".to_string(),
+                },
+            )?),
             None => None,
         };
 
         let hash_builder = get_hash_builder(config.hashing_algorithm)?;
+        // Cache TTL should be the base TTL plus the stale-while-revalidate window
+        // so entries aren't evicted before they can be served as stale
+        let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
         let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
 
         let cache_provider = QueryResultsCacheProvider {
@@ -443,14 +445,14 @@ impl QueryResultsCacheProvider {
     /// Returns the maximum stale-while-revalidate duration.
     #[must_use]
     pub fn max_stale_while_revalidate(&self) -> std::time::Duration {
-        self.max_stale_while_revalidate
+        self.stale_while_revalidate_ttl.unwrap_or_default()
     }
 
     /// Returns the actual cache TTL (base TTL + stale-while-revalidate period).
     /// This is the duration after which entries are evicted from the cache.
     #[must_use]
     pub fn cache_ttl(&self) -> std::time::Duration {
-        self.ttl + self.max_stale_while_revalidate
+        self.ttl + self.stale_while_revalidate_ttl.unwrap_or_default()
     }
 
     /// Runs pending cache maintenance tasks (e.g., eviction of expired entries).

@@ -282,8 +282,17 @@ impl Query {
         // Determine cache status based on stale-while-revalidate configuration
         let mut cache_status = CacheStatus::CacheHit;
 
-        // Check if stale-while-revalidate is enabled in the cache provider configuration
-        if let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl() {
+        // Determine the effective stale-while-revalidate duration from either:
+        // 1. The request's max-stale directive (client explicitly willing to accept stale data)
+        // 2. The cache provider's stale_while_revalidate_ttl configuration (server-side policy)
+        let stale_duration = match cache_control {
+            CacheControl::MaxStale(_, Some(duration)) => Some(duration),
+            CacheControl::MaxStale(_, None) => None, // max-stale without value means accept any staleness
+            _ => cache_provider.stale_while_revalidate_ttl(),
+        };
+
+        // Check if stale-while-revalidate is enabled (from request or cache provider config)
+        if let Some(stale_duration) = stale_duration {
             let ttl = cache_provider.ttl();
             let now = std::time::Instant::now();
             let max_age = ttl + stale_duration;
@@ -391,12 +400,14 @@ impl Query {
         let cache_key_str = cache_key.as_u64().to_string();
 
         // Convert the original cache control to use ClientSupplied cache key type
+        // For background revalidation, we want to STORE fresh results, so convert
+        // MaxStale to Cache to avoid serving stale data during revalidation
         let background_cache_control = match request_context.cache_control() {
-            CacheControl::CacheWithStaleWhileRevalidate(_, duration) => {
-                CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::ClientSupplied, duration)
-            }
+            CacheControl::MaxStale(_, _) => CacheControl::Cache(CacheKeyType::ClientSupplied),
             CacheControl::Cache(_) => CacheControl::Cache(CacheKeyType::ClientSupplied),
             other @ CacheControl::NoCache => other,
+            other @ CacheControl::MinFresh(_, _) => other,
+            other @ CacheControl::OnlyIfCached(_) => other,
         };
 
         Arc::new(
@@ -495,16 +506,12 @@ impl Query {
             }
         }
 
-        // Create a background request context that will cache results
-        // Use the same cache key type as the original request
-        let cache_control = request_context.cache_control();
-        let client_supplied_key = request_context.client_supplied_cache_key().clone();
-        let background_context = Arc::new(
-            RequestContext::builder(Protocol::Internal)
-                .with_cache_control(cache_control)
-                .with_client_supplied_cache_key(client_supplied_key)
-                .build(),
-        );
+        // Create a background request context that will cache results using the same cache key
+        let background_context = Self::create_background_context(request_context, cache_key);
+
+        // Clone sql and plan for the async block
+        let sql_owned = sql.to_string();
+        let plan_owned = plan.cloned();
 
         // Spawn a detached task for background revalidation
         tokio::spawn(async move {
@@ -521,7 +528,8 @@ impl Query {
                 );
             });
 
-            let (query, input_tables) = Self::prepare_revalidation_query(&df, &sql, plan);
+            let (query, input_tables) =
+                Self::prepare_revalidation_query(&df, &sql_owned, plan_owned);
 
             let result = background_context
                 .scope(async move { query.run().await })
@@ -983,7 +991,7 @@ mod tests {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("5s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
-            max_stale_while_revalidate: Some("0s".to_string()), // Disable stale-while-revalidate for this test
+            stale_while_revalidate_ttl: Some("0s".to_string()), // Disable stale-while-revalidate for this test
             ..Default::default()
         }))
         .await;
@@ -1104,16 +1112,13 @@ mod tests {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("3s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
-            max_stale_while_revalidate: Some("5s".to_string()),
+            stale_while_revalidate_ttl: Some("5s".to_string()),
             ..Default::default()
         }))
         .await;
 
         let request_context = create_test_request_context(
-            CacheControl::CacheWithStaleWhileRevalidate(
-                CacheKeyType::ClientSupplied,
-                Duration::from_secs(5),
-            ),
+            CacheControl::MaxStale(CacheKeyType::ClientSupplied, Some(Duration::from_secs(5))),
             Some("lifecycle-test-key".to_string()),
         );
 
@@ -1162,8 +1167,8 @@ mod tests {
                 let result = query.run().await.expect("query should succeed");
                 assert_eq!(
                     result.cache_status,
-                    CacheStatus::CacheHit,
-                    "Should be a cache hit serving stale data"
+                    CacheStatus::CacheStaleWhileRevalidate,
+                    "Should be serving stale data with background revalidation"
                 );
                 let records = result
                     .data
@@ -1324,11 +1329,165 @@ mod tests {
 
     #[tokio::test]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
+        // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
-            item_ttl: Some("5s".to_string()),
+            item_ttl: Some("2s".to_string()),
+            stale_while_revalidate_ttl: Some("3s".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
             ..Default::default()
         }))
         .await;
+
+        let request_context = create_test_request_context(
+            CacheControl::Cache(CacheKeyType::ClientSupplied),
+            Some("stale-test-key".to_string()),
+        );
+
+        // Step 1: First request - cache MISS (non-cached)
+        let query_builder = QueryBuilder::new("SELECT 1", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    1
+                );
+            })
+            .await;
+
+        // Step 2: Second request - cache HIT (cached, fresh)
+        let query_builder = QueryBuilder::new("SELECT 2", Arc::clone(&df)); // Different query, same cache key
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                // Cached result from first query (SELECT 1)
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    1
+                );
+            })
+            .await;
+
+        // Step 3: Wait for TTL to expire (2s) but stay within stale-while-revalidate window (2s + 3s = 5s total)
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Step 4: Third request - STALE (beyond TTL, within stale-while-revalidate window)
+        // This should return stale data and trigger background revalidation
+        let query_builder = QueryBuilder::new("SELECT 3", Arc::clone(&df)); // Different query again
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                // Still serving stale cached result from first query
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    1
+                );
+            })
+            .await;
+
+        // Step 5: Wait a bit for background revalidation to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Step 6: Fourth request - HIT (cached after revalidation)
+        // The background revalidation should have refreshed the cache with SELECT 3
+        let query_builder = QueryBuilder::new("SELECT 4", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheHit);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                // Now serving revalidated cached result from SELECT 3
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    3
+                );
+            })
+            .await;
+
+        // Step 7: Wait for the revalidated entry to become stale (but still within window)
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Step 8: Fifth request - STALE again (beyond TTL of revalidated entry, within stale window)
+        //   The revalidated entry from step 4 is now stale, so this should trigger another revalidation
+        let query_builder = QueryBuilder::new("SELECT 5", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                // Should still get stale value from the previous revalidation (3)
+                // The new query (SELECT 5) is executing in background
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    3
+                );
+            })
+            .await;
     }
 }

@@ -327,7 +327,7 @@ mod tests {
         headers.clear();
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-stale"));
         let result = CacheControl::from_headers(&headers);
-        eprintln!("max-stale without value result: {:?}", result);
+        eprintln!("max-stale without value result: {result:?}");
         // The headers crate doesn't parse this, so it defaults to Cache
         assert!(matches!(result, CacheControl::Cache(CacheKeyType::Default)));
     }
