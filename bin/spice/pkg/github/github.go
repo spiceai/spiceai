@@ -219,7 +219,27 @@ func (g *GitHubClient) callWithProgress(method string, url string, payload []byt
 		req.Header.Add("Authorization", "Bearer "+g.token)
 	}
 
-	response, err := http.DefaultClient.Do(req)
+	// Create a custom client that preserves headers on redirect
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			// Preserve Accept header on redirects
+			if accept != "" {
+				req.Header.Set("Accept", accept)
+			}
+			// Preserve Authorization header on redirects to GitHub domains
+			if g.token != "" && len(via) > 0 {
+				if strings.Contains(req.URL.Host, "github.com") || strings.Contains(req.URL.Host, "githubusercontent.com") {
+					req.Header.Set("Authorization", "Bearer "+g.token)
+				}
+			}
+			return nil
+		},
+	}
+
+	response, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
