@@ -552,6 +552,18 @@ impl HttpTableProvider {
         // Fetch fresh content
         self.fetch_and_cache(path, query, body).await
     }
+
+    fn get_projected_schema(
+        schema: &SchemaRef,
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<SchemaRef> {
+        let mut projected_schema = project_schema(schema, projection)?;
+        if projected_schema.fields.is_empty() {
+            let idx = schema.index_of("content")?;
+            projected_schema = SchemaRef::from(schema.project(&[idx])?);
+        }
+        Ok(projected_schema)
+    }
 }
 
 #[async_trait]
@@ -617,9 +629,8 @@ impl TableProvider for HttpTableProvider {
             );
         }
 
-        let projected_schema = project_schema(&self.schema, projection)?;
         Ok(Arc::new(HttpExec::new(
-            projected_schema,
+            Self::get_projected_schema(&self.schema, projection)?,
             Arc::new(self.clone()),
             partitions,
         )))
@@ -1066,9 +1077,11 @@ impl HttpTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
+    use std::sync::Arc;
     use url::Url;
 
     #[test]
@@ -1372,5 +1385,53 @@ mod tests {
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
+    }
+
+    #[test]
+    fn test_get_projected_schema() {
+        // Create a base schema as would be returned by base_table_schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+
+        // Projection includes all
+        let all_fields = vec![0, 1, 2, 3];
+        let projected_schema =
+            HttpTableProvider::get_projected_schema(&schema, Some(&all_fields)).expect("schema");
+        let projected_field_names: Vec<_> =
+            projected_schema.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(
+            projected_field_names,
+            &["request_path", "request_query", "request_body", "content"]
+        );
+
+        // Projection with some fields
+        let some_fields = vec![0, 3];
+        let projected_schema =
+            HttpTableProvider::get_projected_schema(&schema, Some(&some_fields)).expect("schema");
+        let projected_field_names: Vec<_> =
+            projected_schema.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(projected_field_names, &["request_path", "content"]);
+
+        // Empty projection triggers fallback to "content"
+        let empty_fields: Vec<usize> = vec![];
+        let projected_schema =
+            HttpTableProvider::get_projected_schema(&schema, Some(&empty_fields)).expect("schema");
+        let projected_field_names: Vec<_> =
+            projected_schema.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(projected_field_names, &["content"]);
+
+        // None projection defaults to all fields
+        let projected_schema =
+            HttpTableProvider::get_projected_schema(&schema, None).expect("schema");
+        let projected_field_names: Vec<_> =
+            projected_schema.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(
+            projected_field_names,
+            &["request_path", "request_query", "request_body", "content"]
+        );
     }
 }
