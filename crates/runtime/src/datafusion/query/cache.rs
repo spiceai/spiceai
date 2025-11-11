@@ -403,11 +403,12 @@ impl Query {
         // For background revalidation, we want to STORE fresh results, so convert
         // MaxStale to Cache to avoid serving stale data during revalidation
         let background_cache_control = match request_context.cache_control() {
-            CacheControl::MaxStale(_, _) => CacheControl::Cache(CacheKeyType::ClientSupplied),
-            CacheControl::Cache(_) => CacheControl::Cache(CacheKeyType::ClientSupplied),
-            other @ CacheControl::NoCache => other,
-            other @ CacheControl::MinFresh(_, _) => other,
-            other @ CacheControl::OnlyIfCached(_) => other,
+            CacheControl::MaxStale(_, _) | CacheControl::Cache(_) => {
+                CacheControl::Cache(CacheKeyType::ClientSupplied)
+            }
+            other @ (CacheControl::NoCache
+            | CacheControl::MinFresh(_, _)
+            | CacheControl::OnlyIfCached(_)) => other,
         };
 
         Arc::new(
@@ -1328,6 +1329,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
         // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {

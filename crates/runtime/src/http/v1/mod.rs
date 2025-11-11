@@ -301,18 +301,18 @@ fn attach_cache_headers(
     // Access the DataFusion instance to get the pre-parsed cache configuration
     if let Some(df_ext) = request_context.extension::<DataFusionContextExtension>() {
         let df = df_ext.datafusion();
-        if let Some(cache_provider) = df.results_cache_provider() {
-            if let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl() {
-                let max_age = cache_provider.ttl().as_secs();
-                let cache_control_value = format!(
-                    "max-age={}, stale-while-revalidate={}",
-                    max_age,
-                    stale_duration.as_secs()
-                );
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            let max_age = cache_provider.ttl().as_secs();
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
 
-                if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
-                    headers.insert(CACHE_CONTROL, header_value);
-                }
+            if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
+                headers.insert(CACHE_CONTROL, header_value);
             }
         }
     }

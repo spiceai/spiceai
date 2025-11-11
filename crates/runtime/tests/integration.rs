@@ -61,7 +61,6 @@ mod flight;
 mod github;
 mod glue;
 mod graphql;
-mod http;
 mod iceberg;
 mod iceberg_api;
 
