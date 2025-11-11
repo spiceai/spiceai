@@ -598,9 +598,10 @@ fn project_delta_schema(
             .filter_map(|i| schema.field(arrow_schema.field(*i).name()))
             .cloned()
             .collect::<Vec<_>>();
-        Ok(
-            Arc::new(delta_kernel::schema::Schema::try_new(projected_fields).map_err(map_delta_error_to_datafusion_err)?)
-        )
+        Ok(Arc::new(
+            delta_kernel::schema::Schema::try_new(projected_fields)
+                .map_err(map_delta_error_to_datafusion_err)?,
+        ))
     } else {
         Ok(schema)
     }
