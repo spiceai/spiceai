@@ -97,7 +97,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )?;
+    )
+    .await?;
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
@@ -131,7 +132,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             )))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )?;
+    )
+    .await?;
 
     // Use the same query overrides that were applied in build_test_with_validation
     let query_overrides = args
@@ -139,7 +141,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides, None, None).await?;
+    let _queries = query_set.get_queries(query_overrides, None, None).await?;
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)

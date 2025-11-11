@@ -135,6 +135,20 @@ impl From<QuerySetArg> for QuerySet {
     }
 }
 
+impl PartialEq<QuerySet> for QuerySetArg {
+    fn eq(&self, other: &QuerySet) -> bool {
+        match (self, other) {
+            (QuerySetArg::Tpch, QuerySet::Tpch) => true,
+            (QuerySetArg::Tpcds, QuerySet::Tpcds) => true,
+            (QuerySetArg::Clickbench, QuerySet::Clickbench) => true,
+            (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch) => true,
+            (QuerySetArg::ParameterizedSaffron, QuerySet::ParameterizedSaffron) => true,
+            (QuerySetArg::Scenario, QuerySet::Scenario { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
 impl DatasetTestArgs {
     /// Load the query set, handling scenario query sets from files
     pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {

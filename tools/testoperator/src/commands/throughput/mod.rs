@@ -55,7 +55,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .with_end_condition(EndCondition::QuerySetCompleted(6))
             .with_disable_caching(args.disable_caching)
             .with_http_client(args.http_clients),
-    )?;
+    )
+    .await?;
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
@@ -78,7 +79,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .with_end_condition(EndCondition::QuerySetCompleted(2))
             .with_disable_caching(args.disable_caching)
             .with_http_client(args.http_clients),
-    )?;
+    )
+    .await?;
 
     let throughput_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)

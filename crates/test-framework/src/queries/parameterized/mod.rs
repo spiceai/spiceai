@@ -22,7 +22,7 @@ use super::Query;
 
 // DataFusion has ParamValues which can define a list of `Vec<ScalarValue>`
 // This is a scaled down equivalent to the `ScalarValue` enum, but we don't want to import DataFusion just for this.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParameterValue {
     String(Arc<str>),
     Number(i64),

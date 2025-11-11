@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use super::Query;
 
 /// A scenario query definition that can be loaded from a YAML file
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ScenarioQueryDefinition {
     /// Unique name for the query
     pub name: String,
@@ -37,7 +37,7 @@ pub struct ScenarioQueryDefinition {
 }
 
 /// Expected results for query validation
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum ExpectedResults {
     /// Path to a CSV file containing expected results
@@ -54,7 +54,7 @@ pub enum ExpectedResults {
 }
 
 /// A collection of scenario queries loaded from a file
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ScenarioQuerySet {
     /// Optional name for the query set
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -51,7 +51,7 @@ use crate::args::CommonArgs;
 ///
 /// # Returns
 /// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
-pub(crate) fn build_test_with_validation(
+pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
 ) -> anyhow::Result<(QuerySet, NotStarted)> {
@@ -60,7 +60,7 @@ pub(crate) fn build_test_with_validation(
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+    let queries = query_set.get_queries(query_overrides, None, None).await?;
 
     let mut test_builder = test_builder.with_query_set(queries);
 

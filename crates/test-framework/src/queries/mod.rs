@@ -18,6 +18,7 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     flight::{PreparedStatementParamColumn, create_param_batch},
@@ -194,7 +195,7 @@ macro_rules! generate_saffron_duckdb_cte_queries {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
     pub sql: Arc<str>,
@@ -260,7 +261,8 @@ impl Query {
     }
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum QuerySet {
     #[default]
     Tpch,
@@ -271,6 +273,7 @@ pub enum QuerySet {
     ParameterizedSaffron,
     /// Scenario query set loaded from a file
     Scenario {
+        #[serde(skip)]
         queries: Vec<Query>,
         scenario_set: scenario::ScenarioQuerySet,
     },
@@ -314,7 +317,7 @@ impl QuerySet {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
-            QuerySet::Scenario { queries, .. } => queries.clone(),
+            QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
             QuerySet::ParameterizedSaffron => {
                 get_saffron_test_queries(overrides, instance, random_param_set_count).await
             }
