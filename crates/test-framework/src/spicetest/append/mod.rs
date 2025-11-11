@@ -130,7 +130,7 @@ impl SpiceTest<NotStarted> {
 
         let append_config = AppendConfig::new(
             self.state.end_duration,
-            self.state.query_set,
+            self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
         );
         let append_source = FileAppendableSource::new(&append_config);

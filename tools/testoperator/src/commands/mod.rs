@@ -16,13 +16,15 @@ limitations under the License.
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::args::CommonArgs;
+use crate::args::DatasetTestArgs;
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
+    queries::QuerySet,
     spiced::StartRequest,
     spicepod::Spicepod,
     spicepod_utils::from_app,
+    spicetest::datasets::NotStarted,
 };
 
 #[cfg(feature = "append")]
@@ -37,6 +39,41 @@ pub(crate) mod search;
 pub(crate) mod throughput;
 mod util;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
+
+use crate::args::CommonArgs;
+
+/// Build a test configuration with validation data if applicable
+///
+/// This is a common helper for bench, throughput, and load tests that:
+/// 1. Loads the query set from args
+/// 2. Applies query overrides if specified
+/// 3. Adds validation data for scenario queries when validation is enabled
+///
+/// # Returns
+/// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
+pub(crate) fn build_test_with_validation(
+    args: &DatasetTestArgs,
+    test_builder: NotStarted,
+) -> anyhow::Result<(QuerySet, NotStarted)> {
+    let query_set = args.load_query_set()?;
+    let query_overrides = args
+        .query_overrides
+        .clone()
+        .map(test_framework::queries::QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides);
+
+    let mut test_builder = test_builder.with_query_set(queries);
+
+    // Add validation data if this is a scenario query set with validation enabled
+    if args.validate
+        && let Some(validation_data) =
+            query_set.get_validation_data(args.scenario_query_file.as_deref())?
+    {
+        test_builder = test_builder.with_validation_data(validation_data);
+    }
+
+    Ok((query_set, test_builder))
+}
 
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,

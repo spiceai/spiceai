@@ -20,10 +20,11 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 
 Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In addition to the common options, this command supports the following options:
 
-- `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`.
+- `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`, `integration[http]`, `scenario`.
+- `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
 - `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
-- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Only supported for `tpch` or `tpch[parameterized]` query sets, and only supported for scale factor 1.
+- `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
 - `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
 
@@ -62,6 +63,52 @@ or:
 ```sh
 cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced --query-set tpch --query-overrides postgresql --validate
 ```
+
+##### Run a custom scenario query set with validation
+
+Scenario query sets allow you to define custom queries in a YAML file. This is useful for ad-hoc testing or when you need custom validation that doesn't fit the standard integration test pattern.
+
+```sh
+testoperator run bench \
+  -p test/spicepods/http/post_requests.yaml \
+  -s spiced \
+  --query-set scenario \
+  --scenario-query-file test/scenario/http/post_requests.yaml \
+  --validate
+```
+
+The scenario query file format:
+
+```yaml
+name: my_custom_queries # Optional name for the query set
+
+queries:
+  # Query without validation
+  - name: basic_select
+    sql: SELECT * FROM my_table
+
+  # Query with row count validation
+  - name: count_check
+    sql: SELECT COUNT(*) FROM my_table
+    expected_results:
+      row_count: 100
+
+  # Query with inline expected results
+  - name: specific_values
+    sql: SELECT id, name FROM users ORDER BY id LIMIT 2
+    expected_results:
+      columns: 'id, name'
+      rows:
+        - '1, Alice'
+        - '2, Bob'
+
+  # Query with external CSV file validation
+  # - name: full_dataset
+  #   sql: SELECT * FROM my_table ORDER BY id
+  #   expected_results: ./expected/full_dataset.csv
+```
+
+For more examples, see `test/spicepods/http/queries.yaml`.
 
 ### Running Throughput Tests
 

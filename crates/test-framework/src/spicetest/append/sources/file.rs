@@ -61,7 +61,7 @@ impl AppendableSource for FileAppendableSource {
         }
 
         let dest_db_file = self.dest_db_file.clone();
-        let query_set = config.query_set;
+        let query_set = config.query_set.clone();
         let load_steps = config.load_steps;
         let tables = self.tables.clone();
         let temp_directory = config.temp_directory.clone();
@@ -128,7 +128,7 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(setup_sql)?;
                 }
-                QuerySet::ParameterizedTpch => todo!(),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => todo!(),
             }
 
             drop(dest_conn);
@@ -150,7 +150,7 @@ impl AppendableSource for FileAppendableSource {
         );
 
         let dest_db_file = self.dest_db_file.clone();
-        let query_set = config.query_set;
+        let query_set = config.query_set.clone();
         let load_steps = config.load_steps;
         let tables = self.tables.clone();
         let temp_directory = config.temp_directory.clone();
@@ -208,7 +208,7 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(&sql)?;
                 }
-                QuerySet::ParameterizedTpch => todo!(),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => todo!(),
             }
 
             Ok::<(), anyhow::Error>(())
