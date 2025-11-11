@@ -3009,7 +3009,7 @@ dependencies = [
  "futures",
  "insta",
  "paste",
- "roaring 0.11.2",
+ "roaring",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3386,10 +3386,11 @@ dependencies = [
 
 [[package]]
 name = "comfy-table"
-version = "7.2.1"
+version = "7.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b03b7db8e0b4b2fdad6c551e634134e99ec000e5c8c3b6856c65e8bbaded7a3b"
+checksum = "4a65ebfec4fb190b6f90e944a817d60499ee0744e582530e2c9900a22e591d9a"
 dependencies = [
+ "crossterm 0.28.1",
  "unicode-segmentation",
  "unicode-width 0.2.2",
 ]
@@ -3729,6 +3730,19 @@ dependencies = [
  "parking_lot 0.12.5",
  "signal-hook",
  "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
+dependencies = [
+ "bitflags 2.10.0",
+ "crossterm_winapi",
+ "parking_lot 0.12.5",
+ "rustix 0.38.44",
  "winapi",
 ]
 
@@ -4968,12 +4982,13 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.14.0"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=283730fdfcec53575aa14fb1ab084004a16db69c#283730fdfcec53575aa14fb1ab084004a16db69c"
+version = "0.16.0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d#8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d"
 dependencies = [
  "arrow",
  "bytes",
  "chrono",
+ "comfy-table",
  "delta_kernel_derive",
  "futures",
  "indexmap 2.12.0",
@@ -4981,7 +4996,7 @@ dependencies = [
  "object_store",
  "parquet",
  "reqwest",
- "roaring 0.10.12",
+ "roaring",
  "rustc_version",
  "serde",
  "serde_json",
@@ -4996,8 +5011,8 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.14.0"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=283730fdfcec53575aa14fb1ab084004a16db69c#283730fdfcec53575aa14fb1ab084004a16db69c"
+version = "0.16.0"
+source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d#8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7512,7 +7527,7 @@ dependencies = [
  "reqsign",
  "reqwest",
  "reqwest-middleware 0.4.2",
- "roaring 0.11.2",
+ "roaring",
  "rust_decimal",
  "serde",
  "serde_bytes",
@@ -12817,16 +12832,6 @@ dependencies = [
 
 [[package]]
 name = "roaring"
-version = "0.10.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19e8d2cfa184d94d0726d650a9f4a1be7f9b76ac9fdb954219878dc00c1c1e7b"
-dependencies = [
- "bytemuck",
- "byteorder",
-]
-
-[[package]]
-name = "roaring"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f08d6a905edb32d74a5d5737a0c9d7e950c312f3c46cb0ca0a2ca09ea11878a0"
@@ -16416,7 +16421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa2d2932240205a99b65f15d9861992c95fbb8c9fb280b3a1f17a92db6dc611f"
 dependencies = [
  "anyhow",
- "crossterm",
+ "crossterm 0.25.0",
  "once_cell",
 ]
 
@@ -16827,7 +16832,7 @@ dependencies = [
  "rand 0.9.2",
  "regex",
  "regex-syntax",
- "roaring 0.11.2",
+ "roaring",
  "rustc-hash 2.1.1",
  "rustix 1.1.2",
  "ryu",
