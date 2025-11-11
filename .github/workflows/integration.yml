@@ -202,7 +202,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     strategy:
       fail-fast: false
       matrix:
