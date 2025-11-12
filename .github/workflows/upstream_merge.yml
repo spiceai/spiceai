@@ -155,6 +155,15 @@ jobs:
             echo "conflict_files=$FILES_LIST" >> $GITHUB_OUTPUT
           fi
 
+      - name: Replace runner references in workflow files
+        if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          # Find all GitHub workflow YAML files and replace runner references
+          find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) -exec sed -i '' \
+            -e 's/spiceai-dev-runners/spicehq-dev-runners/g' \
+            -e 's/spiceai-dev-large-runners/spicehq-dev-large-runners/g' \
+            {} +
+
       - name: Finalise merge commit
         if: steps.check_pr.outputs.has_open == 'false'
         run: |
