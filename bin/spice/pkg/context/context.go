@@ -558,13 +558,28 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
+	// Separate positional arguments from flags
+	positionalArgs := []string{}
+	flagArgs := []string{}
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			flagArgs = append(flagArgs, arg)
+		} else {
+			positionalArgs = append(positionalArgs, arg)
+		}
+	}
+
 	spiceArgs := []string{
 		"--pods-watcher-enabled",
 	}
 
-	args = append(spiceArgs, c.getRuntimeArgsFromFlags(args)...)
+	// Append positional arguments first (spicepod path if provided)
+	spiceArgs = append(spiceArgs, positionalArgs...)
 
-	cmd := exec.Command(spiceCMD, args...)
+	// Then append processed flags
+	spiceArgs = append(spiceArgs, c.getRuntimeArgsFromFlags(flagArgs)...)
+
+	cmd := exec.Command(spiceCMD, spiceArgs...)
 
 	return cmd, nil
 }
