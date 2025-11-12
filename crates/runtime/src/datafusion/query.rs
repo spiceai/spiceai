@@ -21,7 +21,7 @@ use std::{fmt::Display, sync::Arc};
 use ::cache::{
     get_logical_plan_input_tables,
     key::CacheKey,
-    result::{query::QueryResult, CacheStatus},
+    result::{CacheStatus, query::QueryResult},
 };
 use arrow::{array::RecordBatch, datatypes::Schema};
 use arrow_schema::{Field, SchemaBuilder};
@@ -33,7 +33,7 @@ use datafusion::{
     execution::SendableRecordBatchStream,
     execution::TaskContext,
     logical_expr::LogicalPlan,
-    physical_plan::{execute_stream, stream::RecordBatchStreamAdapter, ExecutionPlan},
+    physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -65,18 +65,18 @@ use datafusion::execution::SessionState;
 use async_stream::stream;
 use futures::StreamExt;
 
-use super::{error::find_datafusion_root, SPICE_RUNTIME_SCHEMA};
+use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
 use crate::datafusion::{
-    query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations, DataFusion,
+    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
-use runtime_request_context::{AsyncMarker, RequestContext};
-use tokio::runtime::Handle;
 #[cfg(feature = "cluster")]
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
+use runtime_request_context::{AsyncMarker, RequestContext};
+use tokio::runtime::Handle;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

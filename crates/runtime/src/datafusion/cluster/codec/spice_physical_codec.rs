@@ -112,26 +112,6 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 );
             }
             "BytesProcessedExec" => { /* no-op */ }
-            "DataSourceExec" => {
-                let Some(concrete) = node.as_any().downcast_ref::<DataSourceExec>() else {
-                    return exec_err!("Unable to serialize plan node");
-                };
-
-                let data_source = concrete.data_source();
-
-                // Clearer error message instead of "unsupported plan"
-                if data_source
-                    .as_any()
-                    .downcast_ref::<MemorySourceConfig>()
-                    .is_some()
-                {
-                    return exec_err!(
-                        "Memory source scans cannot be distributed across cluster nodes. Use file-based or remote data sources instead."
-                    );
-                }
-
-                return self.inner.try_encode(node, buf);
-            }
             _ => return self.inner.try_encode(node, buf),
         }
 

@@ -1,11 +1,8 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
-use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
-use datafusion_optimizer_rules::physical_plan::cluster::union_projection_pushdown::UnionProjectionPushdownOptimizer;
 use crate::status::ComponentStatus;
-use crate::{FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, Runtime};
+use crate::{FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToInitializeDataConnectorSnafu};
 use app::App;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
@@ -26,14 +23,24 @@ use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionConfig;
+use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
+use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
+use datafusion_optimizer_rules::physical_plan::cluster::union_projection_pushdown::UnionProjectionPushdownOptimizer;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
+use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use snafu::ResultExt;
 use std::env;
 use std::sync::Arc;
+use datafusion_datasource::ListingTableUrl;
 use tokio::net::TcpListener;
+use url::Url;
 use uuid::Uuid;
+use crate::component::dataset::builder::DatasetBuilder;
+use crate::dataconnector::listing;
+use crate::dataconnector::parameters::ConnectorParamsBuilder;
+use crate::http::v1::eval::list;
 
 pub mod codec;
 pub mod datafusion_scheduler_ext;
@@ -209,8 +216,7 @@ async fn create_scheduler_server(
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env(io_runtime.clone()))
-                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
-                    .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
+                    .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
                     .build(),
             )
         })),
@@ -277,10 +283,43 @@ async fn executor_bind_app(
         *rt.app.write().await = Some(Arc::new(app_def));
     }
 
+    executor_bind_object_stores(Arc::clone(&rt)).await?;
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
+
+    Ok(())
+}
+
+async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
+    let app = rt.app();
+    let app = app.read().await;
+    let Some(ref app) = *app else {
+        return Err(FailedToStartClusterExecutor { source: "Runtime did not bind an App.".into() })
+    };
+    for dataset in Arc::clone(&rt).get_valid_datasets(app, LogErrors(true)) {
+        let params = ConnectorParamsBuilder::new(dataset.source().into(), (&dataset).into())
+            .build(Arc::clone(&rt.secrets), rt.tokio_io_runtime())
+            .await
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        let url = dataset.from.as_str();
+        let mut parsed = Url::parse(url).boxed().context(FailedToStartClusterExecutorSnafu)?;
+
+        if parsed.scheme() == "file" {
+            continue
+        }
+
+        let unprefixed = params.parameters.into_iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>();
+        parsed.set_fragment(Some(listing::build_fragments(&params.parameters, unprefixed).as_str()));
+
+        let listing_table_url = ListingTableUrl::parse(parsed).expect("Must parse URL");
+
+        println!("listing table url {:?}", listing_table_url);
+
+        let store = rt.df.ctx.runtime_env().object_store(&listing_table_url).expect("must store");
+    }
 
     Ok(())
 }
