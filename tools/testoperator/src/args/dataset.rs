@@ -69,6 +69,7 @@ pub enum QuerySetArg {
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
     #[value(name = "saffron[parameterized]")]
+    #[serde(rename = "saffron[parameterized]")]
     ParameterizedSaffron,
     /// Scenario query set loaded from a file (use --scenario-query-file)
     Scenario,
