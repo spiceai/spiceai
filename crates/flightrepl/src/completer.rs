@@ -13,8 +13,18 @@ use tonic::transport::Channel;
 
 #[derive(Debug, Clone)]
 struct StringValue {
-    pub original: Arc<str>,
-    pub lower: Arc<str>,
+    original: Arc<str>,
+    lower: Arc<str>,
+}
+
+impl StringValue {
+    fn original(&self) -> &str {
+        &self.original
+    }
+
+    fn lower(&self) -> &str {
+        &self.lower
+    }
 }
 
 impl From<String> for StringValue {
@@ -29,6 +39,7 @@ impl From<String> for StringValue {
 pub struct SchemaCache {
     udfs: Vec<String>,
     udtfs: Vec<String>,
+    builtin_functions: Vec<String>,
     schemas: Vec<StringValue>,
     tables: Vec<StringValue>,
     columns: Vec<StringValue>,
@@ -41,6 +52,7 @@ impl SchemaCache {
         Self {
             udfs: Vec::new(),
             udtfs: Vec::new(),
+            builtin_functions: Vec::new(),
             schemas: Vec::new(),
             tables: Vec::new(),
             columns: Vec::new(),
@@ -66,6 +78,10 @@ impl SchemaCache {
 
     fn update_udtfs(&mut self, udtfs: Vec<String>) {
         self.udtfs = udtfs;
+    }
+
+    fn update_builtin_functions(&mut self, builtin_functions: Vec<String>) {
+        self.builtin_functions = builtin_functions;
     }
 }
 
@@ -133,6 +149,27 @@ impl EditorHelper {
     }
 }
 
+/// Helper function to add table completions with proper quoting and deduplication
+fn suggest_tables(
+    tables: &[StringValue],
+    word_lower: &str,
+    seen: &mut std::collections::HashSet<String>,
+    matches: &mut Vec<Pair>,
+) {
+    for table in tables {
+        if table.lower().starts_with(word_lower) {
+            let quoted_name = quote_identifier_if_needed(table.original());
+            let replacement = format!("{quoted_name} ");
+            if seen.insert(replacement.clone()) {
+                matches.push(Pair {
+                    display: table.original().to_string(),
+                    replacement,
+                });
+            }
+        }
+    }
+}
+
 impl Completer for EditorHelper {
     type Candidate = Pair;
 
@@ -178,19 +215,8 @@ impl Completer for EditorHelper {
             };
 
         if should_suggest_only_tables {
-            // Only suggest tables
-            for table in &cache.tables {
-                if table.lower.starts_with(&word_lower) {
-                    let quoted_name = quote_identifier_if_needed(&table.original);
-                    let replacement = format!("{quoted_name} ");
-                    if seen.insert(replacement.clone()) {
-                        matches.push(Pair {
-                            display: table.original.to_string(),
-                            replacement,
-                        });
-                    }
-                }
-            }
+            // Only suggest tables after FROM or JOIN
+            suggest_tables(&cache.tables, &word_lower, &mut seen, &mut matches);
         } else {
             // Suggest keywords
             for keyword in &cache.keywords {
@@ -215,6 +241,16 @@ impl Completer for EditorHelper {
                 }
             }
 
+            // Suggest built-in functions
+            for func_name in &cache.builtin_functions {
+                if func_name.starts_with(&word_lower) && seen.insert(func_name.to_lowercase()) {
+                    matches.push(Pair {
+                        display: func_name.to_lowercase(),
+                        replacement: func_name.to_lowercase(),
+                    });
+                }
+            }
+
             // Suggest UDTFs
             for udtf_name in &cache.udtfs {
                 if udtf_name.starts_with(&word_lower) && seen.insert(udtf_name.to_lowercase()) {
@@ -227,12 +263,12 @@ impl Completer for EditorHelper {
 
             // Suggest schemas
             for schema in &cache.schemas {
-                if schema.lower.starts_with(&word_lower) {
-                    let quoted_name = quote_identifier_if_needed(&schema.original);
+                if schema.lower().starts_with(&word_lower) {
+                    let quoted_name = quote_identifier_if_needed(schema.original());
                     let replacement = format!("{quoted_name}.");
                     if seen.insert(replacement.clone()) {
                         matches.push(Pair {
-                            display: schema.original.to_string(),
+                            display: schema.original().to_string(),
                             replacement,
                         });
                     }
@@ -240,27 +276,16 @@ impl Completer for EditorHelper {
             }
 
             // Suggest tables
-            for table in &cache.tables {
-                if table.lower.starts_with(&word_lower) {
-                    let quoted_name = quote_identifier_if_needed(&table.original);
-                    let replacement = format!("{quoted_name} ");
-                    if seen.insert(replacement.clone()) {
-                        matches.push(Pair {
-                            display: table.original.to_string(),
-                            replacement,
-                        });
-                    }
-                }
-            }
+            suggest_tables(&cache.tables, &word_lower, &mut seen, &mut matches);
 
             // Suggest columns
             for column in &cache.columns {
-                if column.lower.starts_with(&word_lower) {
-                    let quoted_name = quote_identifier_if_needed(&column.original);
+                if column.lower().starts_with(&word_lower) {
+                    let quoted_name = quote_identifier_if_needed(column.original());
                     let replacement = format!("{quoted_name} ");
                     if seen.insert(replacement.clone()) {
                         matches.push(Pair {
-                            display: column.original.to_string(),
+                            display: column.original().to_string(),
                             replacement,
                         });
                     }
@@ -285,55 +310,48 @@ impl Completer for EditorHelper {
             }
         }
 
-        // Filter matches to only include valid SQL by testing with DataFusion parser
-        // Only validate statements that look reasonably complete
+        // Filter matches: for complete statements, only include if valid SQL.
+        // For partial completions, always include.
         let valid_matches: Vec<Pair> = matches
             .into_iter()
-            .filter(|pair| should_validate_sql(&pair.replacement))
+            .filter(|pair| {
+                if is_complete_sql(&pair.replacement) {
+                    is_valid_sql(&pair.replacement)
+                } else {
+                    true
+                }
+            })
             .collect();
 
         Ok((start, valid_matches))
     }
 }
 
-/// Determines if a SQL completion should be validated
-/// Only validate complete-looking statements to avoid filtering out partial completions
-fn should_validate_sql(sql: &str) -> bool {
+/// Determines if a SQL completion looks complete enough to validate.
+/// Returns true if the statement should be validated for SQL correctness.
+fn is_complete_sql(sql: &str) -> bool {
     let trimmed = sql.trim().to_lowercase();
 
-    // Always allow if it doesn't contain a statement keyword at all
-    if !trimmed.contains("select")
-        && !trimmed.contains("insert")
-        && !trimmed.contains("update")
-        && !trimmed.contains("delete")
-        && !trimmed.contains("with")
-        && !trimmed.contains("show")
-        && !trimmed.contains("describe")
-        && !trimmed.contains("explain")
-    {
+    // If it has semicolon, it's trying to be a complete statement
+    if trimmed.contains(';') {
         return true;
     }
 
-    // If it has semicolon, it's trying to be a complete statement - validate it
-    if trimmed.contains(';') {
-        return is_valid_sql(sql);
-    }
-
-    // If it's a SELECT and has FROM clause, validate it
+    // If it's a SELECT and has FROM clause, treat as complete
     if trimmed.contains("select") && trimmed.contains("from") {
-        return is_valid_sql(sql);
+        return true;
     }
 
-    // If it's INSERT/UPDATE/DELETE and looks complete, validate it
+    // If it's INSERT/UPDATE/DELETE and looks complete
     if (trimmed.contains("insert") && trimmed.contains("into"))
         || (trimmed.contains("update") && trimmed.contains("set"))
         || (trimmed.contains("delete") && trimmed.contains("from"))
     {
-        return is_valid_sql(sql);
+        return true;
     }
 
-    // Otherwise, it's a partial completion - allow it without validation
-    true
+    // Otherwise, treat as partial completion
+    false
 }
 
 /// Validates that a SQL string can be parsed by `DataFusion`
@@ -342,6 +360,7 @@ fn is_valid_sql(sql: &str) -> bool {
     DFParser::parse_sql(sql).is_ok()
 }
 
+#[allow(clippy::similar_names)]
 async fn refresh_schema(
     client: FlightServiceClient<Channel>,
     schema_cache: &Arc<RwLock<SchemaCache>>,
@@ -352,15 +371,23 @@ async fn refresh_schema(
     let mut client2 = client.clone();
     let mut client3 = client.clone();
     let mut client4 = client.clone();
-    let mut client5 = client;
+    let mut client5 = client.clone();
+    let mut client6 = client;
 
-    #[allow(clippy::similar_names)]
-    let (tables_result, schemas_result, columns_result, udfs_result, udtfs_result) = tokio::join!(
+    let (
+        tables_result,
+        schemas_result,
+        columns_result,
+        udfs_result,
+        udtfs_result,
+        builtin_functions_result,
+    ) = tokio::join!(
         get_tables(&mut client1, api_key, user_agent),
         get_schemas(&mut client2, api_key, user_agent),
         get_columns(&mut client3, api_key, user_agent),
         get_udfs(&mut client4, api_key, user_agent),
-        get_udtfs(&mut client5, api_key, user_agent)
+        get_udtfs(&mut client5, api_key, user_agent),
+        get_builtin_functions(&mut client6, api_key, user_agent)
     );
 
     if let Ok(mut cache) = schema_cache.try_write() {
@@ -383,19 +410,28 @@ async fn refresh_schema(
         if let Ok(udtfs) = udtfs_result {
             cache.update_udtfs(udtfs);
         }
+
+        if let Ok(builtin_functions) = builtin_functions_result {
+            cache.update_builtin_functions(builtin_functions);
+        }
     }
 }
+
+/// Prefix for autocomplete metadata queries to help the runtime identify and potentially optimize these queries
+const AUTOCOMPLETE_PREFIX: &str = "--autocomplete\n";
 
 async fn get_tables(
     client: &mut FlightServiceClient<Channel>,
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let query = "--autocomplete\nSELECT table_schema || '.' || table_name as full_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') UNION SELECT table_schema || '.' || table_name FROM information_schema.views WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY full_name";
+    let query = format!(
+        "{AUTOCOMPLETE_PREFIX}SELECT table_schema || '.' || table_name as full_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') UNION SELECT table_schema || '.' || table_name FROM information_schema.views WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY full_name"
+    );
 
     let records = crate::get_records(
         client.clone(),
-        query,
+        &query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -431,11 +467,14 @@ async fn get_schemas(
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let query = "--autocomplete\nSELECT DISTINCT table_schema FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime')";
+    // Query schemata to include all schemas, not just those with tables
+    let query = format!(
+        "{AUTOCOMPLETE_PREFIX}SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'runtime')"
+    );
 
     let records = crate::get_records(
         client.clone(),
-        query,
+        &query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -459,11 +498,11 @@ async fn get_columns(
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let query = "--autocomplete\nSELECT column_name FROM information_schema.columns";
+    let query = format!("{AUTOCOMPLETE_PREFIX}SELECT column_name FROM information_schema.columns");
 
     let records = crate::get_records(
         client.clone(),
-        query,
+        &query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -487,11 +526,11 @@ async fn get_udfs(
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let query = "--autocomplete\nSELECT name FROM list_udfs()";
+    let query = format!("{AUTOCOMPLETE_PREFIX}SELECT name FROM list_udfs()");
 
     let records = crate::get_records(
         client.clone(),
-        query,
+        &query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -515,11 +554,11 @@ async fn get_udtfs(
     api_key: Option<&String>,
     user_agent: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let query = "--autocomplete\nSELECT name FROM list_udtfs()";
+    let query = format!("{AUTOCOMPLETE_PREFIX}SELECT name FROM list_udtfs()");
 
     let records = crate::get_records(
         client.clone(),
-        query,
+        &query,
         api_key,
         user_agent,
         crate::cache_control::CacheControl::NoCache,
@@ -538,38 +577,54 @@ async fn get_udtfs(
     Ok(udtfs)
 }
 
-/// Quote an identifier if it contains uppercase letters, reserved keywords, or special characters
+async fn get_builtin_functions(
+    client: &mut FlightServiceClient<Channel>,
+    api_key: Option<&String>,
+    user_agent: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let query =
+        format!("{AUTOCOMPLETE_PREFIX}SELECT routine_name FROM information_schema.routines");
+
+    let records = crate::get_records(
+        client.clone(),
+        &query,
+        api_key,
+        user_agent,
+        crate::cache_control::CacheControl::NoCache,
+    )
+    .await?;
+
+    let mut functions = Vec::new();
+    for batch in records.0 {
+        if let Some(array) = batch.column(0).as_any().downcast_ref::<StringArray>() {
+            for func_name in array.iter().flatten() {
+                functions.push(func_name.to_string());
+            }
+        }
+    }
+
+    Ok(functions)
+}
+
+/// Quote an identifier if it contains uppercase letters or special characters.
+/// Handles schema-qualified names by quoting each part independently.
 fn quote_identifier_if_needed(identifier: &str) -> String {
-    // Check if identifier needs quoting
-    let needs_quoting = identifier.chars().any(char::is_uppercase)
-        || identifier.contains('.')  // Already qualified, handle parts separately
-        || identifier.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '.');
-
-    if !needs_quoting {
-        return identifier.to_string();
-    }
-
-    // Handle schema-qualified names (e.g., "MySchema"."MyTable")
-    if identifier.contains('.') {
-        let parts: Vec<&str> = identifier.split('.').collect();
-        let quoted_parts: Vec<String> = parts
-            .iter()
-            .map(|part| {
-                if part
-                    .chars()
-                    .any(|c| c.is_uppercase() || !c.is_alphanumeric() && c != '_')
-                {
-                    format!("\"{part}\"")
-                } else {
-                    (*part).to_string()
-                }
-            })
-            .collect();
-        quoted_parts.join(".")
-    } else {
-        // Single identifier
-        format!("\"{identifier}\"")
-    }
+    // Always split on dots and quote each part as needed
+    let parts: Vec<&str> = identifier.split('.').collect();
+    let quoted_parts: Vec<String> = parts
+        .iter()
+        .map(|part| {
+            if part
+                .chars()
+                .any(|c| c.is_uppercase() || !c.is_alphanumeric() && c != '_')
+            {
+                format!("\"{part}\"")
+            } else {
+                (*part).to_string()
+            }
+        })
+        .collect();
+    quoted_parts.join(".")
 }
 
 fn extract_word(line: &str, pos: usize) -> (usize, &str) {
@@ -727,6 +782,7 @@ mod tests {
         let schema_cache = Arc::new(RwLock::new(SchemaCache {
             udfs: vec!["count".to_string(), "sum".to_string(), "concat".to_string()],
             udtfs: vec!["generate_series".to_string(), "unnest".to_string()],
+            builtin_functions: vec!["avg".to_string(), "max".to_string(), "min".to_string()],
             schemas: vec!["public".to_string(), "analytics".to_string()]
                 .into_iter()
                 .map(StringValue::from)

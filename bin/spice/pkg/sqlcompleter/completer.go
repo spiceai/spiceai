@@ -110,6 +110,12 @@ func (c *Completer) RefreshMetadata(ctx context.Context) error {
 		c.udtfs = udtfs
 	}
 
+	// Fetch built-in functions from information_schema.routines
+	builtinFunctions, err := c.fetcher(ctx, "--autocomplete\nSELECT routine_name FROM information_schema.routines ORDER BY routine_name")
+	if err == nil {
+		c.udfs = append(c.udfs, builtinFunctions...)
+	}
+
 	// Fetch DataFusion keywords - use SQL standard keywords if query fails
 	keywords, err := c.fetcher(ctx, "--autocomplete\nSELECT keyword FROM information_schema.df_settings WHERE name = 'datafusion.sql_parser.keywords'")
 	if err == nil && len(keywords) > 0 {
