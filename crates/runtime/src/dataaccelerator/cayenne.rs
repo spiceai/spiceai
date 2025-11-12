@@ -328,7 +328,7 @@ impl CayenneAccelerator {
             // Parse file size options
             config.target_vortex_file_size_mb = parse_usize("cayenne_target_file_size_mb", 256);
 
-            tracing::info!(
+            tracing::debug!(
                 "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB",
                 config.enable_alp,
                 config.enable_fsst,

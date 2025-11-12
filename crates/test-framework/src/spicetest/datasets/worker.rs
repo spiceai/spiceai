@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     panic,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use dashmap::DashMap;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
@@ -32,10 +33,7 @@ use crate::constants::{HTTP_BASE_URL, SQL_ENDPOINT};
 
 use crate::{
     metrics::QueryStatus,
-    queries::{
-        Query,
-        validation::{self, QueryValidationResult},
-    },
+    queries::{Query, validation, validation::QueryValidationResult},
     snapshot::record_explain_plan,
 };
 
@@ -53,6 +51,8 @@ pub(crate) struct SpiceTestQueryWorker {
     scale_factor: f64,
     spice_client: Arc<SpiceClient>,
     http_client: Option<reqwest::Client>,
+    /// Optional custom validation data for scenario queries
+    validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -111,6 +111,7 @@ impl SpiceTestQueryWorker {
             validate: false,
             scale_factor: 1.0,
             http_client: None,
+            validation_data: None,
         }
     }
 
@@ -145,6 +146,36 @@ impl SpiceTestQueryWorker {
     pub fn with_progress_bar(mut self, progress_bar: ProgressBar) -> Self {
         self.progress_bar = Some(progress_bar);
         self
+    }
+
+    pub fn with_validation_data(
+        mut self,
+        validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Self {
+        self.validation_data = Some(validation_data);
+        self
+    }
+
+    /// Validate query results against expected data
+    /// Uses TPCH validation for TPCH queries, custom validation data for scenario queries
+    fn validate_query_results(
+        &self,
+        query: &Query,
+        actual_batches: &[RecordBatch],
+    ) -> Result<QueryValidationResult> {
+        // Check if we have custom validation data for this query
+        if let Some(validation_data) = &self.validation_data
+            && let Some(expected_batches) = validation_data.get(&query.name)
+        {
+            return validation::validate_with_expected_batches(
+                &query.name,
+                actual_batches,
+                expected_batches,
+            );
+        }
+
+        // Fall back to TPCH validation (which handles TPCH, parameterized TPCH, etc.)
+        validation::validate_tpch_query(query, actual_batches)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -487,7 +518,7 @@ impl SpiceTestQueryWorker {
 
         if validate {
             // Validate the query results
-            let validation_result = validation::validate_tpch_query(query, &validation_records)?;
+            let validation_result = self.validate_query_results(query, &validation_records)?;
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
                     "{} FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",

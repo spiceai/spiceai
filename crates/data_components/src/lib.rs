@@ -76,6 +76,7 @@ pub mod rate_limit;
 pub mod cdc;
 pub mod delete;
 pub mod graphql;
+pub mod http;
 #[cfg(feature = "imap")]
 pub mod imap;
 pub mod object;
