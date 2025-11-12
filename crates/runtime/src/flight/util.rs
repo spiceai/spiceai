@@ -44,7 +44,14 @@ pub fn attach_cache_metadata<T>(
         if let Some(cache_provider) = df.results_cache_provider()
             && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
         {
-            let max_age = cache_provider.ttl().as_secs();
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The results-cache-status metadata will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
             let cache_control_value = format!(
                 "max-age={}, stale-while-revalidate={}",
                 max_age,
