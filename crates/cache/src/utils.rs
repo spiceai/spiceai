@@ -47,19 +47,21 @@ pub fn to_cached_record_batch_stream(
 
         while let Some(batch_result) = stream.next().await {
             if records_size < cache_max_size && let Ok(batch) = &batch_result {
-                    records.push(batch.clone());
-                    records_size += batch.get_array_memory_size();
+                records.push(batch.clone());
+                records_size += batch.get_array_memory_size();
             }
 
             yield batch_result;
         }
 
         if records_size < cache_max_size {
-            let cached_result = CachedQueryResult {
-                records: Arc::new(records),
-                schema: schema_copy,
+            let cached_at = std::time::Instant::now();
+            let cached_result = CachedQueryResult::new(
+                Arc::new(records),
+                schema_copy,
                 input_tables,
-            };
+                cached_at,
+            );
 
             if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
                 tracing::error!("Failed to cache query results: {e}");

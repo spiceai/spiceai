@@ -25,6 +25,7 @@ on:
           - 'embedding'
           - 'hybrid'
           - 'full_text'
+          - 's3_vectors'
         default: 'embedding'
   schedule:
     - cron: '0 4 * * 2,5' # Every Monday and Thursday at 8pm PST (4am UTC next day)
@@ -46,7 +47,8 @@ jobs:
         with:
           install_to_system_path: 'false'
           upload_artifact: 'true'
-
+          force_rebuild: 'true'
+          download_from_minio: 'false'
   build-spiced:
     name: Build spiced
     runs-on: 'spiceai-macos'
@@ -132,8 +134,13 @@ jobs:
                     return m;
                 });
               }
+              if (search_option === 's3vectors') {
+                filtered = filtered.map((m) => {
+                    m.spicepod = "./test/spicepods/financebench/embedding[s3vector].yaml";
+                    return m;
+                });
+              }
             }
-
             return filtered;
 
   run-testoperator:
@@ -171,6 +178,9 @@ jobs:
           SPICEAI_FINANCEBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_FINANCEBENCH_API_KEY}}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_REGION: 'us-east-1'
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \

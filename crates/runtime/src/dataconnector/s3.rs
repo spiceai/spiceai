@@ -28,6 +28,7 @@ use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
 };
 
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -137,6 +138,9 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
+            ParameterSpec::component("versioning")
+                .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
+                .default("enabled"),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
             ParameterSpec::runtime("allow_http")
@@ -165,17 +169,43 @@ impl DataConnectorFactory for S3Factory {
             );
         }
 
+        if let Some(versioning) = params.parameters.get("versioning").expose().ok()
+            && !matches!(versioning, "enabled" | "disabled")
+        {
+            tracing::warn!(
+                "Invalid S3 versioning setting '{versioning}'. Defaulting to 'enabled'."
+            );
+            params
+                .parameters
+                .insert("versioning".to_string(), "enabled".to_string().into());
+        }
+
         Box::pin(async move {
             for validator in VALIDATORS.iter() {
                 validator.validate(&mut params).await?;
             }
 
-            // `initialize_sdk_config` emits a warning if the credentials provider cannot be initialized
-            // so we skip it if the auth method is public.
-            match params.parameters.get("auth").expose().ok() {
-                None | Some("public") => (),
+            // Initialize AWS SDK credentials for IAM role authentication.
+            // Skip initialization for 'public' and 'key' auth methods which use explicit credentials.
+            // Default to 'public' if no auth method is specified.
+            let auth = params
+                .parameters
+                .get("auth")
+                .expose()
+                .ok()
+                .unwrap_or("public");
+
+            match auth {
+                "public" | "key" => {
+                    // Skip AWS SDK initialization - use explicit auth method directly
+                }
                 _ => {
-                    let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
+                    // Initialize AWS SDK for IAM role or any other auth method
+                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                        tracing::warn!(
+                            "Unable to initialize AWS credentials for S3 connector: {err}"
+                        );
+                    }
                 }
             }
 
@@ -204,6 +234,14 @@ impl std::fmt::Display for S3 {
 }
 
 impl ListingTableConnector for S3 {
+    fn object_versioning_type(&self) -> Option<ObjectVersionType> {
+        if let Some("disabled") = self.params.get("versioning").expose().ok() {
+            return None;
+        }
+
+        Some(ObjectVersionType::Version)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

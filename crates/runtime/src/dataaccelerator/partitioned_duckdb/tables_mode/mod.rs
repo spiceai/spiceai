@@ -63,7 +63,7 @@ use crate::{
             ExpectedAccelerationSourceSnafu, FailedToCreateConnectionPoolSnafu, FileModeOnlySnafu,
         },
     },
-    datafusion::dialect::new_duckdb_dialect,
+    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
 };
@@ -345,7 +345,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
             .with_dialect(new_duckdb_dialect())
-            .with_schema(Arc::clone(&self.schema));
+            .with_schema(Arc::clone(&self.schema))
+            .with_indexes(self.table_definition.indexes().to_vec());
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {
@@ -407,6 +408,7 @@ fn create_factory() -> DuckDBTableProviderFactory {
         .with_settings_registry(
             DuckDBSettingsRegistry::new().with_setting(Box::new(OrderByNonIntegerLiteral)),
         )
+        .with_function_support(deny_spice_specific_functions())
 }
 
 async fn get_pool(

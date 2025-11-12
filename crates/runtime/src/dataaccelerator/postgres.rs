@@ -27,7 +27,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::parameters::ParameterSpec;
+use crate::{datafusion::udf::deny_spice_specific_functions, parameters::ParameterSpec};
 
 use super::{AccelerationSource, DataAccelerator};
 
@@ -65,7 +65,8 @@ impl PostgresAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            postgres_factory: PostgresTableProviderFactory::new(),
+            postgres_factory: PostgresTableProviderFactory::new()
+                .with_function_support(deny_spice_specific_functions()),
         }
     }
 }

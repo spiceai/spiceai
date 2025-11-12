@@ -17,9 +17,9 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::{TestType, queries::QuerySet};
+use test_framework::TestType;
 
-use super::dataset::QueryOverridesArg;
+use super::dataset::{QueryOverridesArg, QuerySetArg};
 
 use super::HttpTestArgs;
 
@@ -94,7 +94,7 @@ pub struct DispatchTests {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
-    pub query_set: QuerySet,
+    pub query_set: QuerySetArg,
     pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
@@ -107,6 +107,8 @@ pub struct BenchArgs {
         serialize_with = "serialize_scale_factor"
     )]
     pub scale_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrape_spiced_metrics: Option<bool>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -160,11 +162,37 @@ impl From<bool> for UpdateSnapshots {
 }
 
 /// Load workflow arguments, defined in the test files
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
     pub duration: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for LoadArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct LoadArgsHelper {
+            #[serde(flatten)]
+            bench_args: BenchArgs,
+            duration: Option<u64>,
+        }
+
+        let mut helper = LoadArgsHelper::deserialize(deserializer)?;
+
+        // Default scrape_spiced_metrics to true for load tests if not specified
+        if helper.bench_args.scrape_spiced_metrics.is_none() {
+            helper.bench_args.scrape_spiced_metrics = Some(true);
+        }
+
+        Ok(LoadArgs {
+            bench_args: helper.bench_args,
+            duration: helper.duration,
+        })
+    }
 }
 
 /// Represents the type of runner to use in the action

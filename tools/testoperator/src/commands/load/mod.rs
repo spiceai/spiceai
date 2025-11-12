@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::LoadTestArgs, health::HealthMonitor, wait_test_and_memory};
+use crate::{
+    args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper, wait_test_and_memory,
+};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
-    queries::{QueryOverrides, QuerySet},
+    opentelemetry::KeyValue,
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
@@ -39,14 +41,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    let query_set = QuerySet::from(args.test_args.query_set.clone());
-    let query_overrides = args
-        .test_args
-        .query_overrides
-        .clone()
-        .map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
-
     let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
@@ -55,24 +49,33 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .await?;
     let health_monitor = HealthMonitor::spawn()?;
 
+    // Start metrics scraper if enabled
+    let metrics_scraper = if args.test_args.common.scrape_spiced_metrics {
+        Some(MetricsScraper::spawn()?)
+    } else {
+        None
+    };
+
     let test_duration = Duration::from_secs(args.test_args.common.duration);
     let test_hours = (test_duration.as_secs() / 60 / 60).max(1);
 
     // baseline run
     println!("Running baseline throughput test");
-    let baseline_test = SpiceTest::new(
-        app.name.clone(),
+
+    let (_query_set, test_builder) = super::build_test_with_validation(
+        &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.test_args.common.disable_progress_bars)
-    .start()
-    .await?;
+    )?;
+
+    let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.test_args.common.disable_progress_bars)
+        .start()
+        .await?;
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test
@@ -90,21 +93,31 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     // load test
     println!("Running load test");
-    let throughput_test = SpiceTest::<NotStarted>::new(
-        app.name.clone(),
+
+    let (query_set, test_builder) = super::build_test_with_validation(
+        &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_query_set(queries.clone())
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
                 args.test_args.common.duration,
             )))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_progress_bars(!args.test_args.common.disable_progress_bars)
-    .start()
-    .await?;
+    )?;
+
+    // Use the same query overrides that were applied in build_test_with_validation
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(test_framework::queries::QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides);
+
+    let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.test_args.common.disable_progress_bars)
+        .start()
+        .await?;
 
     let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let test_durations = test.get_query_durations().statistical_set()?;
@@ -121,6 +134,12 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;
+
+    // Stop and process metrics scraper if enabled
+    let attributes = vec![KeyValue::new("test", "load")];
+    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
+        .await;
+
     spiced_instance.stop()?;
     let health_report = health_report?;
 

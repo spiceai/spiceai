@@ -87,6 +87,10 @@ pub enum Error {
     #[snafu(display("Failed to build catalog: {source}"))]
     #[snafu(visibility(pub(crate)))]
     UnableToBuildCatalog { source: iceberg::Error },
+
+    #[snafu(display("Failed to build catalog client: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalogClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -296,6 +300,7 @@ impl CatalogConnector for IcebergCatalog {
                 "s3_session_token",
                 &self.params,
             )
+            .await
             .map_err(|e| super::Error::InvalidConfiguration {
                 connector: "iceberg".into(),
                 message: e.to_string(),

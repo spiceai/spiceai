@@ -2,24 +2,23 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q26"
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                   |
-+---------------+------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: hits.SearchPhrase ASC NULLS LAST, fetch=10                                                                       |
-|               |   BytesProcessedNode                                                                                                   |
-|               |     Filter: CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                        |
-|               |       TableScan: hits projection=[SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")] |
-| physical_plan | SortExec: TopK(fetch=10), expr=[SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[false]                          |
-|               |   CoalescePartitionsExec                                                                                               |
-|               |     BytesProcessedExec                                                                                                 |
-|               |       CoalesceBatchesExec: target_batch_size=8192                                                                      |
-|               |         FilterExec: CAST(SearchPhrase@0 AS Utf8View) !=                                                                |
-|               |           SchemaCastScanExec                                                                                           |
-|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                      |
-|               |               FallbackOnZeroResultsScanExec                                                                            |
-|               |                 CoalescePartitionsExec                                                                                 |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                |
-|               |                     CooperativeExec                                                                                    |
-|               |                       DuckSqlExec sql= SELECT "SearchPhrase" FROM hits WHERE (CAST("SearchPhrase" AS VARCHAR) <> '')   |
-|               |                                                                                                                        |
-+---------------+------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                  |
++---------------+-----------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: hits.SearchPhrase ASC NULLS LAST, fetch=10                                                                      |
+|               |   Filter: CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")                                                         |
+|               |     TableScan: hits projection=[SearchPhrase], partial_filters=[CAST(hits.SearchPhrase AS Utf8View) != Utf8View("")]  |
+| physical_plan | SortExec: TopK(fetch=10), expr=[SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[false]                         |
+|               |   CoalescePartitionsExec                                                                                              |
+|               |     CoalesceBatchesExec: target_batch_size=8192                                                                       |
+|               |       FilterExec: CAST(SearchPhrase@0 AS Utf8View) !=                                                                 |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                         |
+|               |           SchemaCastScanExec                                                                                          |
+|               |             FallbackOnZeroResultsScanExec                                                                             |
+|               |               CoalescePartitionsExec                                                                                  |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                 |
+|               |                   CooperativeExec                                                                                     |
+|               |                     BytesProcessedExec                                                                                |
+|               |                       DuckSqlExec sql= SELECT "SearchPhrase" FROM hits WHERE (CAST("SearchPhrase" AS VARCHAR) <> '')  |
+|               |                                                                                                                       |
++---------------+-----------------------------------------------------------------------------------------------------------------------+

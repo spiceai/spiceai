@@ -283,6 +283,7 @@ mod tests {
             primary_key: vec!["id".to_string()],
             current_snapshot_id: Uuid::now_v7().to_string(),
             partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
         }
     }
 

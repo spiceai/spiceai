@@ -1,4 +1,3 @@
-use crate::concrete;
 use crate::datafusion::cluster::config::SpiceClusterConfig;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
@@ -14,6 +13,7 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
+use datafusion_optimizer_rules::concrete;
 use itertools::Itertools;
 use std::cmp::max;
 use std::sync::Arc;
@@ -276,13 +276,13 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::datafusion::cluster::common::plan_node_key::PlanNodeKey;
-    use crate::datafusion::cluster::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
+    use datafusion_optimizer_rules::common::plan_node_key::PlanNodeKey;
+    use datafusion_optimizer_rules::common::search_visitor::SearchVisitor;
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;
@@ -396,6 +396,11 @@ pub mod tests {
         let plan = create_data_source_exec(files);
 
         let mut config_with_max_stages = DEFAULT_CONFIG_OPTIONS.clone();
+        // Set target_partitions to ensure deterministic test behavior
+        // With target_partitions=25, stage_size=50, we get exactly 200 stages from 10000 files
+        config_with_max_stages
+            .set("datafusion.execution.target_partitions", "25")
+            .expect("Must set target_partitions");
         config_with_max_stages
             .set("spice.execution.file_scan_expand_max_stages", "200")
             .expect("Must set config");

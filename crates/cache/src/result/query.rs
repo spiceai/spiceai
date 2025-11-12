@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -38,6 +39,37 @@ pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
     pub input_tables: Arc<HashSet<TableReference>>,
+    /// Timestamp when the result was cached.
+    cached_at: Instant,
+}
+
+impl CachedQueryResult {
+    /// Create a new cached query result with the provided cached-at timestamp.
+    #[must_use]
+    pub fn new(
+        records: Arc<Vec<RecordBatch>>,
+        schema: Arc<Schema>,
+        input_tables: Arc<HashSet<TableReference>>,
+        cached_at: Instant,
+    ) -> Self {
+        Self {
+            records,
+            schema,
+            input_tables,
+            cached_at,
+        }
+    }
+
+    /// Check if the cached data is stale (older than the given TTL).
+    #[must_use]
+    pub fn is_stale(&self, ttl: Duration, now: Instant) -> bool {
+        now.duration_since(self.cached_at) > ttl
+    }
+
+    #[must_use]
+    pub fn cached_at(&self) -> Instant {
+        self.cached_at
+    }
 }
 
 impl Sizeable for CachedQueryResult {
