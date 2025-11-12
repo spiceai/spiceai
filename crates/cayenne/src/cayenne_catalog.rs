@@ -326,14 +326,22 @@ impl MetadataCatalog for CayenneCatalog {
             // Generate initial snapshot UUID
             let initial_snapshot_id = uuid::Uuid::now_v7().to_string();
 
+            // Serialize Vortex config to JSON
+            let vortex_config_json =
+                serde_json::to_string(&options.vortex_config).map_err(|e| {
+                    CatalogError::InvalidOperation {
+                        message: format!("Failed to serialize vortex config: {e}"),
+                    }
+                })?;
+
             // Insert table metadata with initial snapshot
             self.execute_helper(ExecuteParams {
                 sql: r"
                     INSERT INTO cayenne_table (
                         table_id, table_uuid,
                         table_name, path, path_is_relative, schema_json, primary_key_json,
-                        current_snapshot_id, partition_column
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                        current_snapshot_id, partition_column, vortex_config_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ",
                 params: vec![
                     MetastoreValue::Integer(table_id),
@@ -345,6 +353,7 @@ impl MetadataCatalog for CayenneCatalog {
                     primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(initial_snapshot_id.clone()),
                     partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    MetastoreValue::Text(vortex_config_json),
                 ],
             })
             .await?;
@@ -397,7 +406,7 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                     SELECT table_id, table_uuid,
                            table_name, path, path_is_relative, schema_json, primary_key_json,
-                           current_snapshot_id, partition_column
+                           current_snapshot_id, partition_column, vortex_config_json
                     FROM cayenne_table
                     WHERE table_name = ?1
                     LIMIT 1
@@ -414,6 +423,7 @@ impl MetadataCatalog for CayenneCatalog {
                 let primary_key_json = row.get_optional_string(6)?;
                 let current_snapshot_id = row.get_string(7)?;
                 let partition_column = row.get_optional_string(8)?;
+                let vortex_config_json = row.get_optional_string(9)?;
 
                 // Deserialize schema using Arrow IPC format
                 let schema = {
@@ -438,9 +448,22 @@ impl MetadataCatalog for CayenneCatalog {
 
                 // Parse primary key
                 let primary_key = if let Some(pk_json) = primary_key_json {
-                    serde_json::from_str(&pk_json).unwrap_or_default()
+                    serde_json::from_str(&pk_json).map_err(|e| CatalogError::InvalidOperation {
+                        message: format!("Failed to deserialize primary key: {e}"),
+                    })?
                 } else {
                     vec![]
+                };
+
+                // Parse vortex config
+                let vortex_config = if let Some(config_json) = vortex_config_json {
+                    serde_json::from_str(&config_json).map_err(|e| {
+                        CatalogError::InvalidOperation {
+                            message: format!("Failed to deserialize vortex config: {e}"),
+                        }
+                    })?
+                } else {
+                    super::metadata::VortexConfig::default()
                 };
 
                 Ok(TableMetadata {
@@ -453,6 +476,7 @@ impl MetadataCatalog for CayenneCatalog {
                     primary_key,
                     current_snapshot_id,
                     partition_column,
+                    vortex_config,
                 })
             },
         )

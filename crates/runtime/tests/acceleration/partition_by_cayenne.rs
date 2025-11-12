@@ -93,12 +93,12 @@ async fn get_physical_plan(
         .map_err(|e| anyhow::anyhow!("Failed to create physical plan: {e}"))
 }
 
-/// Test partition_by with bucket() expression for Cayenne acceleration
+/// Test `partition_by` with `bucket()` expression for Cayenne acceleration
 ///
 /// This test verifies that:
-/// 1. partition_by: bucket(3, id) correctly partitions data into 3 buckets
+/// 1. `partition_by`: bucket(3, id) correctly partitions data into 3 buckets
 /// 2. Queries with filters on the partition column use partition pruning
-/// 3. Physical plans show CayenneTableScan with appropriate partition filters
+/// 3. Physical plans show `CayenneTableScan` with appropriate partition filters
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
@@ -122,9 +122,9 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             }
 
             // Create a temp directory for Cayenne data
-            let _temp_dir = tempfile::tempdir()
+            let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
-            let cayenne_path = _temp_dir.path().to_path_buf();
+            let cayenne_path = temp_dir.path().to_path_buf();
 
             crate::configure_test_datafusion();
 
@@ -170,7 +170,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             // Test 1: Query all data - should scan all partitions
             let result = execute_rt_sql(&rt, "SELECT * FROM bucket_test ORDER BY id").await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 10, "Should have 10 rows total");
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test").await?;
@@ -180,7 +180,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             // Test 2: Query with id = 1 filter - should only scan partition containing id=1
             let result = execute_rt_sql(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 1, "Should have 1 row for id=1");
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
@@ -194,7 +194,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
                 "SELECT * FROM bucket_test WHERE id IN (1, 5) ORDER BY id",
             )
             .await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 2, "Should have 2 rows");
 
             let plan =
@@ -207,7 +207,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             // because bucket partitions contain multiple values
             let result =
                 execute_rt_sql(&rt, "SELECT * FROM bucket_test WHERE id >= 5 ORDER BY id").await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 6, "Should have 6 rows with id >= 5");
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id >= 5").await?;
@@ -221,7 +221,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
                 "SELECT * FROM bucket_test WHERE score > 85 ORDER BY id",
             )
             .await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 5, "Should have 5 rows with score > 85");
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE score > 85").await?;
@@ -234,14 +234,14 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test partition_by with multiple bucket() expressions
+/// Test `partition_by` with multiple `bucket()` expressions
 ///
 /// This test verifies that multiple partition expressions work together:
-/// - partition_by: [bucket(3, id), bucket(2, score)]
+/// - `partition_by`: [bucket(3, id), bucket(2, score)]
 ///
 /// NOTE: This test is currently disabled due to data duplication issues.
-/// The single bucket partition test (test_cayenne_partition_by_bucket) validates
-/// the core functionality of partition_by with bucket() expressions.
+/// The single bucket partition test (`test_cayenne_partition_by_bucket`) validates
+/// the core functionality of `partition_by` with `bucket()` expressions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 #[ignore = "Data duplication issue with multiple partition expressions - needs investigation"]
@@ -256,9 +256,9 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
                 .join("tests/acceleration/data/partition_test.csv");
 
             // Create a temp directory for Cayenne data
-            let _temp_dir = tempfile::tempdir()
+            let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
-            let cayenne_path = _temp_dir.path().to_path_buf();
+            let cayenne_path = temp_dir.path().to_path_buf();
 
             crate::configure_test_datafusion();
 
@@ -313,7 +313,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             // Test 1: Query all data
             let result =
                 execute_rt_sql(&rt, "SELECT * FROM multi_partition_test ORDER BY id").await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 10, "Should have 10 rows total");
 
             let plan = get_physical_plan(&rt, "SELECT * FROM multi_partition_test").await?;
@@ -324,7 +324,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             // Test 2: Filter on first partition column (id)
             let result =
                 execute_rt_sql(&rt, "SELECT * FROM multi_partition_test WHERE id = 1").await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 1, "Should have 1 row for id=1");
 
             let plan =
@@ -339,7 +339,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
                 "SELECT * FROM multi_partition_test WHERE score >= 80 AND score < 90 ORDER BY id",
             )
             .await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 4, "Should have 4 rows in score range [80, 90)");
 
             let plan = get_physical_plan(
@@ -357,7 +357,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
                 "SELECT * FROM multi_partition_test WHERE id = 1 AND score >= 80",
             )
             .await?;
-            let count = result.iter().map(|b| b.num_rows()).sum::<usize>();
+            let count = result.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(count, 1, "Should have 1 row matching both filters");
 
             let plan = get_physical_plan(

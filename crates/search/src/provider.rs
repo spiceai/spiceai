@@ -24,7 +24,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Column, DFSchemaRef, JoinType},
+    common::{Column, Constraint, Constraints, DFSchemaRef, JoinType},
     datasource::{DefaultTableSource, TableType},
     error::DataFusionError,
     logical_expr::{
@@ -49,6 +49,7 @@ pub struct SearchQueryProvider {
     pub table_provider: Arc<dyn TableProvider>,
     pub search_column: String,
     pub primary_key: Vec<String>,
+    pub constraints: Option<Constraints>,
     pub pre_limit: Option<usize>,
     /// Optional callback invoked before a table scan is performed.
     ///
@@ -78,14 +79,32 @@ impl SearchQueryProvider {
         primary_key: Vec<String>,
         pre_limit: Option<usize>,
     ) -> Self {
-        Self {
+        let mut slf = Self {
             search_index_query,
             table_provider,
             search_column,
             primary_key,
             pre_limit,
             scan_callback: None,
-        }
+            constraints: None,
+        };
+
+        // Create `constraints` based on [`Self::schema`]
+        slf.constraints = Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            slf.schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    if slf.primary_key.contains(f.name()) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )]));
+        slf
     }
 
     /// `func` will be called at the beginning of any [`Self::scan`].
@@ -349,6 +368,10 @@ impl SearchQueryProvider {
 impl TableProvider for SearchQueryProvider {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints.as_ref()
     }
 
     fn schema(&self) -> SchemaRef {

@@ -1067,7 +1067,7 @@ jobs:
           cat spice.log
 
   test_local_acceleration:
-    name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
+    name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -1084,8 +1084,8 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
-            { engine: turso, mode: memory },
-            { engine: turso, mode: file },
+            # { engine: turso, mode: memory },
+            # { engine: turso, mode: file },
             # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}

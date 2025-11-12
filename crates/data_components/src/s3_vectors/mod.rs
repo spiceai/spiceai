@@ -18,8 +18,8 @@ use arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, ListIndexesError, ListIndexesInput, PutVectorsError, QueryVectorsError,
-    S3Vectors,
+    GetVectorBucketError, GetVectorsError, ListIndexesError, ListIndexesInput, PutVectorsError,
+    QueryVectorsError, S3Vectors,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
 use snafu::{ResultExt as _, Snafu};
@@ -56,6 +56,9 @@ pub enum Error {
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
     S3VectorQueryVectorsError { source: Box<QueryVectorsError> },
+
+    #[snafu(display("Failed to get vectors from S3 Vectors. {source}"))]
+    S3VectorGetVectorsError { source: Box<GetVectorsError> },
 
     #[snafu(display(
         "Failed to query vectors from S3 Vectors due to an unsupported filter: {filter_pre} {filter:?}"
@@ -206,4 +209,24 @@ pub async fn list_index_names(
         .iter()
         .map(|idx| idx.index_name().to_string())
         .collect())
+}
+
+async fn fetch_all_index_names(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: Option<&str>,
+    index_name: Option<&str>,
+) -> Result<Option<Vec<String>>, DataFusionError> {
+    if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
+        // Use the base name (without spill suffix) as prefix to get all related indexes
+        let base_name = if let Ok(Some(spill)) = SpillIndex::parse(index_name) {
+            spill.base_name
+        } else {
+            index_name.to_string()
+        };
+        Ok(Some(
+            list_index_names(client, bucket_name, &base_name).await?,
+        ))
+    } else {
+        Ok(None)
+    }
 }

@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: verify_form_body"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                      |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                 |
+|               |  Projection: post_form.request_path, post_form.request_body                                                                                                                                                               |
+|               |   TableScan: post_form projection=[request_path, request_body], full_filters=[post_form.request_body = Utf8("key1=value1&key2=value2")]                                                                                   |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                        |
+|               |   CooperativeExec                                                                                                                                                                                                         |
+|               |     BytesProcessedExec                                                                                                                                                                                                    |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "post_form"."request_path", "post_form"."request_body" FROM "post_form" WHERE ("post_form"."request_body" = 'key1=value1&key2=value2') |
+|               |                                                                                                                                                                                                                           |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -1,0 +1,41 @@
+name: integration_http
+queries:
+  - name: single_object
+    sql: |
+      SELECT request_path, content
+      FROM httpbin_json
+
+  - name: multi_object
+    sql: |
+      SELECT request_path, request_query, content
+      FROM httpbin_get
+    expected_results:
+      row_count: 1
+
+  - name: combined_endpoints
+    sql: |
+      SELECT request_path, content
+      FROM httpbin_status_200
+      UNION ALL
+      SELECT request_path, content
+      FROM httpbin_status_201
+
+  - name: multiple_ids
+    sql: |
+      SELECT request_path, content
+      FROM httpbin_status_200
+      WHERE request_path LIKE '/status/%'
+
+  - name: verify_structure
+    sql: |
+      SELECT request_path,
+             content
+      FROM httpbin_json
+      WHERE content IS NOT NULL
+
+  - name: count_all
+    sql: |
+      SELECT count(request_path) as row_count
+      FROM httpbin_json
+    expected_results:
+      row_count: 1

@@ -5,14 +5,13 @@ description: "Query: clickbench_q4"
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                         |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                           |
-|               |   Federated                                                                                                                                                  |
+| logical_plan  | Federated                                                                                                                                                    |
 |               |  Projection: avg(hits.UserID)                                                                                                                                |
 |               |   Aggregate: groupBy=[[]], aggr=[[avg(hits.UserID)]]                                                                                                         |
 |               |     TableScan: hits projection=[UserID]                                                                                                                      |
-| physical_plan | BytesProcessedExec                                                                                                                                           |
-|               |   SchemaCastScanExec                                                                                                                                         |
-|               |     CooperativeExec                                                                                                                                          |
+| physical_plan | SchemaCastScanExec                                                                                                                                           |
+|               |   CooperativeExec                                                                                                                                            |
+|               |     BytesProcessedExec                                                                                                                                       |
 |               |       VirtualExecutionPlan name=duckdb compute_context=//data/accelerated_duckdb.db initial_sql=SELECT avg("hits"."UserID") FROM "hits" |
 |               |                                                                                                                                                              |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+

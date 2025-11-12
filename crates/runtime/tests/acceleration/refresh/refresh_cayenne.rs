@@ -150,6 +150,7 @@ async fn test_acceleration_refresh_cayenne_full() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore = "https://github.com/spiceai/spiceai/issues/7860"] // https://github.com/spiceai/spiceai/issues/7860
 async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

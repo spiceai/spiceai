@@ -1,0 +1,26 @@
+name: 'Setup Oracle ODPI-C'
+description: 'Install Oracle ODPI-C'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Oracle Instant Client
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libaio1
+
+        # Download and extract Oracle Instant Client
+        curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
+        mkdir linux
+        unzip basic.zip -d linux -x "META-INF/*"
+        IC_DIR=$PWD/$(ls -d linux/instantclient*)
+
+        # Handle both old and new libaio naming conventions for maximum compatibility
+        # Ubuntu 24.04+ renamed libaio.so.1 to libaio.so.1t64
+        if [ -f /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ] && [ ! -f $IC_DIR/libaio.so.1 ]; then
+          ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 $IC_DIR/libaio.so.1
+        fi
+
+        # Set up library path for Oracle Instant Client
+        echo "LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+        echo "Oracle ODPI-C setup completed. Library path: $IC_DIR"

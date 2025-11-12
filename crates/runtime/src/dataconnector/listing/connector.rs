@@ -35,6 +35,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
@@ -59,6 +60,10 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 
 #[async_trait]
 pub trait ListingTableConnector: DataConnector {
+    fn object_versioning_type(&self) -> Option<ObjectVersionType> {
+        None
+    }
+
     fn as_any(&self) -> &dyn Any;
 
     /// Retrieves the object store URL for a given dataset.
@@ -577,7 +582,11 @@ pub trait ListingTableConnector: DataConnector {
             sanitized_url = schema_infer_url.sanitized_url(),
         );
 
-        let mut options = ListingOptions::new(file_format).with_file_extension(extension);
+        let session_state = ctx.state();
+        let mut options = ListingOptions::new(file_format)
+            .with_file_extension(extension)
+            .with_object_versioning_type(self.object_versioning_type())
+            .with_session_config_options(session_state.config());
 
         let resolved_schema = options
             .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())

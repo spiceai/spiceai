@@ -1,9 +1,9 @@
 [package]
-name = "runtime-table-partition"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
+name = "runtime-table-partition"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -16,7 +16,6 @@ datafusion.workspace = true
 futures.workspace = true
 parking_lot = "0.12"
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
-serde.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }

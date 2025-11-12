@@ -2,9 +2,11 @@
 source: crates/runtime/tests/acceleration/partition_by_cayenne.rs
 expression: sanitized_plan
 ---
-BytesProcessedExec
-  SchemaCastScanExec
-    UnionExec
+SchemaCastScanExec
+  UnionExec
+    BytesProcessedExec
       DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+    BytesProcessedExec
       DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+    BytesProcessedExec
       DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex

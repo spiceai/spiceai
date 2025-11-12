@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: post_form_urlencoded"
+snapshot_kind: text
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                              |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                         |
+|               |  Projection: post_form.request_path, post_form.request_body, post_form.content                                                                                                    |
+|               |   TableScan: post_form projection=[request_path, request_body, content]                                                                                                           |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                |
+|               |   CooperativeExec                                                                                                                                                                 |
+|               |     BytesProcessedExec                                                                                                                                                            |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "post_form"."request_path", "post_form"."request_body", "post_form"."content" FROM "post_form" |
+|               |                                                                                                                                                                                   |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

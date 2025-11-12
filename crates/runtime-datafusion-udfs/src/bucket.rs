@@ -79,7 +79,7 @@ impl Default for Bucket {
         Self::new()
     }
 }
-
+pub static BUCKET_SCALAR_UDF_NAME: &str = "bucket";
 impl Bucket {
     #[must_use]
     pub fn new() -> Self {
@@ -95,7 +95,7 @@ impl ScalarUDFImpl for Bucket {
     }
 
     fn name(&self) -> &'static str {
-        "bucket"
+        BUCKET_SCALAR_UDF_NAME
     }
 
     fn signature(&self) -> &Signature {
