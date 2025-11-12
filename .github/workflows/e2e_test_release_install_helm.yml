@@ -79,6 +79,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # Set up Docker
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       # The aarch64 runner does not have tools pre-installed
       - name: Install missing tools (aarch64)
         if: matrix.target.target_arch == 'aarch64'
