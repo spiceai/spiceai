@@ -695,7 +695,7 @@ impl Runtime {
                 self_ref,
                 cloned_config.into(),
                 cloned_tls_config,
-                auth.unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth {})),
+                auth,
                 Some(http_shutdown),
             )
             .map_err(Error::from),
