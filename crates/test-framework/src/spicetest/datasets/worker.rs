@@ -606,21 +606,33 @@ impl SpiceTestQueryWorker {
                 ));
             }
 
-            let duration = query_start.elapsed();
-
             // Extract row count from response
             let response_text = http_response.text().await?;
-            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text)
-                && let Some(row_count) = response_json
+
+            let duration = query_start.elapsed();
+
+            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                if let Some(row_count) = response_json
                     .get("row_count")
                     .and_then(serde_json::Value::as_u64)
-            {
-                #[allow(clippy::cast_possible_truncation)]
-                let row_count_usize = row_count as usize;
-                http_row_counts
-                    .entry(Arc::clone(&query.name))
-                    .or_default()
-                    .push(row_count_usize);
+                {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let row_count_usize = row_count as usize;
+                    http_row_counts
+                        .entry(Arc::clone(&query.name))
+                        .or_default()
+                        .push(row_count_usize);
+                } else {
+                    eprintln!(
+                        "Warning: No row_count field in HTTP response for query '{}'",
+                        query.name
+                    );
+                }
+            } else {
+                eprintln!(
+                    "Warning: Failed to parse HTTP response as JSON for query '{}'",
+                    query.name
+                );
             }
 
             query_durations
@@ -670,7 +682,8 @@ impl SpiceTestQueryWorker {
                             query.name
                         );
                         return Err(anyhow::anyhow!(
-                            "Query '{}' returned 0 rows in both HTTP and Flight",
+                            "Worker {} - Query '{}' returned 0 rows in both HTTP and Flight",
+                            self.id,
                             query.name
                         ));
                     }
@@ -686,7 +699,11 @@ impl SpiceTestQueryWorker {
                             flight_count
                         );
                         return Err(anyhow::anyhow!(
-                            "Row count mismatch between HTTP ({http_count}) and Flight ({flight_count})"
+                            "Worker {} - Query '{}' row count mismatch between HTTP ({}) and Flight ({})",
+                            self.id,
+                            query.name,
+                            http_count,
+                            flight_count
                         ));
                     }
                 }
