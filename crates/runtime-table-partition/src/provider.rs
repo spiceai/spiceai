@@ -154,54 +154,20 @@ impl TableProvider for PartitionTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        // Split filters into partition filters (for pruning) and data filters (for partition scans)
-        // Partition filters are those that can be evaluated using only the partition expression columns
-        let partition_columns = self.partition_by.expression.column_refs();
-
-        // Pre-compute column references for all filters to avoid repeated expression tree traversals
-        let filter_columns_cache: Vec<_> =
-            filters.iter().map(|filter| filter.column_refs()).collect();
-
-        let (partition_filters, data_filters): (Vec<_>, Vec<_>) = filters
-            .iter()
-            .cloned()
-            .zip(filter_columns_cache.iter())
-            .partition(|(_, filter_columns)| {
-                // A filter is a partition filter if:
-                // 1. It has no column references (constant expression like WHERE true), OR
-                // 2. All its column references are in the partition expression columns
-                filter_columns.is_empty()
-                    || filter_columns
-                        .iter()
-                        .all(|col| partition_columns.contains(col))
-            });
-
-        // Extract just the filters (without the cached column refs)
-        let partition_filters: Vec<_> = partition_filters.into_iter().map(|(f, _)| f).collect();
-        let data_filters: Vec<_> = data_filters.into_iter().map(|(f, _)| f).collect();
-
-        tracing::debug!(
-            "Partition pruning: {} partition filters, {} data filters",
-            partition_filters.len(),
-            data_filters.len()
-        );
-
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            // Use partition filters for pruning
             if prune_partition(
-                &partition_filters,
+                filters,
                 &self.partition_by.expression,
                 &partition.partition_value,
                 &self.schema,
             )? {
                 continue;
             }
-            // Only pass data filters to partition scan (partition filters are redundant after pruning)
             let plan = partition
                 .table_provider
-                .scan(state, projection, &data_filters, limit)
+                .scan(state, projection, filters, limit)
                 .await?;
             plans.push(plan);
         }
