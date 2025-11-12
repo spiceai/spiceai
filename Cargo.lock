@@ -4667,11 +4667,14 @@ dependencies = [
  "async-trait",
  "cache",
  "datafusion",
+ "datafusion-datasource",
  "datafusion-expr",
  "datafusion-table-providers",
  "duckdb",
  "futures",
+ "itertools 0.14.0",
  "r2d2",
+ "runtime-datafusion",
  "tracing",
 ]
 

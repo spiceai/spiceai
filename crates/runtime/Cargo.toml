@@ -225,6 +225,7 @@ cluster = [
     "dep:ballista-executor",
     "dep:datafusion-proto",
     "runtime-datafusion/cluster",
+    "datafusion-optimizer-rules/cluster"
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]

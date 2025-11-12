@@ -1,9 +1,9 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
-use crate::datafusion::cluster::config::SpiceClusterConfig;
-use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer;
-use crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdownOptimizer;
+use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
+use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
+use datafusion_optimizer_rules::physical_plan::cluster::union_projection_pushdown::UnionProjectionPushdownOptimizer;
 use crate::status::ComponentStatus;
 use crate::{FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, Runtime};
 use app::App;
@@ -36,9 +36,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 pub mod codec;
-pub mod config;
 pub mod datafusion_scheduler_ext;
-pub mod physical_plan;
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
