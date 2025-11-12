@@ -182,3 +182,8 @@ func (m *Manager) GetCompleter() liner.Completer {
 		return matches
 	}
 }
+
+// GetHistoryEntries returns the history entries for use by other completers
+func (m *Manager) GetHistoryEntries() []string {
+	return m.entries
+}

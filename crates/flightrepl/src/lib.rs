@@ -315,6 +315,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent.to_string(),
     )));
     if let Some(helper) = rl.helper_mut() {
+        // Perform initial refresh to populate autocomplete immediately
+        helper.refresh_now().await;
+        // Start background refresh task for updates
         helper.start_refreshing(300);
     }
 
