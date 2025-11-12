@@ -1,7 +1,6 @@
 use crate::EditorHelper;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use datafusion::arrow::array::{Array, StringArray};
-use datafusion::sql::parser::DFParser;
 use rustyline::Context;
 use rustyline::completion::{Completer, Pair};
 use rustyline::history::SearchDirection;
@@ -310,54 +309,8 @@ impl Completer for EditorHelper {
             }
         }
 
-        // Filter matches: for complete statements, only include if valid SQL.
-        // For partial completions, always include.
-        let valid_matches: Vec<Pair> = matches
-            .into_iter()
-            .filter(|pair| {
-                if is_complete_sql(&pair.replacement) {
-                    is_valid_sql(&pair.replacement)
-                } else {
-                    true
-                }
-            })
-            .collect();
-
-        Ok((start, valid_matches))
+        Ok((start, matches))
     }
-}
-
-/// Determines if a SQL completion looks complete enough to validate.
-/// Returns true if the statement should be validated for SQL correctness.
-fn is_complete_sql(sql: &str) -> bool {
-    let trimmed = sql.trim().to_lowercase();
-
-    // If it has semicolon, it's trying to be a complete statement
-    if trimmed.contains(';') {
-        return true;
-    }
-
-    // If it's a SELECT and has FROM clause, treat as complete
-    if trimmed.contains("select") && trimmed.contains("from") {
-        return true;
-    }
-
-    // If it's INSERT/UPDATE/DELETE and looks complete
-    if (trimmed.contains("insert") && trimmed.contains("into"))
-        || (trimmed.contains("update") && trimmed.contains("set"))
-        || (trimmed.contains("delete") && trimmed.contains("from"))
-    {
-        return true;
-    }
-
-    // Otherwise, treat as partial completion
-    false
-}
-
-/// Validates that a SQL string can be parsed by `DataFusion`
-fn is_valid_sql(sql: &str) -> bool {
-    // Try to parse the SQL with DataFusion's parser
-    DFParser::parse_sql(sql).is_ok()
 }
 
 #[allow(clippy::similar_names)]
