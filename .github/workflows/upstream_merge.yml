@@ -135,6 +135,7 @@ jobs:
       - name: Attempt automated conflict resolution
         if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
         id: llm
+        timeout-minutes: 15
         env:
           OPENAI_API_KEY: ${{ secrets.SPICE_OPENAI_API_KEY }}
           LLM_MODEL: ${{ vars.UPSTREAM_MERGE_LLM_MODEL }}
