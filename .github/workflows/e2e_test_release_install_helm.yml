@@ -76,17 +76,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # The aarch64 runner does not have tools pre-installed
-      - name: Install missing tools (aarch64)
-        if: matrix.target.target_arch == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
-
       # Install kubectl
       - name: Install kubectl
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${{ matrix.target.target_arch == 'x86_64' && 'amd64' || 'arm64' }}/kubectl"
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
           kubectl version --client
@@ -94,12 +87,7 @@ jobs:
       # Install kind (Kubernetes in Docker)
       - name: Install kind
         run: |
-          # For Linux ARM64, we need to use a compatible release
-          if [ "${{ matrix.target.target_arch }}" = "aarch64" ]; then
-            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-arm64
-          else
-            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
-          fi
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
           kind version
