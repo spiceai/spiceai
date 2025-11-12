@@ -105,7 +105,6 @@ views:
       mode: file
       refresh_on_startup: auto
       params:
-        query_federation: disabled
         partition_mode: tables
         duckdb_file: number_info_with_cap.duckdb
         duckdb_preserve_insertion_order: true
