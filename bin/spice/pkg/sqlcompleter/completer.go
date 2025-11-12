@@ -71,14 +71,14 @@ func (c *Completer) RefreshMetadata(ctx context.Context) error {
 		for _, fullName := range tablesWithSchema {
 			// Always add the fully qualified name
 			tableMap[fullName] = true
-			
+
 			// For public schema, also add unqualified name
 			if len(fullName) > 7 && fullName[:7] == "public." {
 				unqualifiedName := fullName[7:] // Remove "public." prefix
 				tableMap[unqualifiedName] = true
 			}
 		}
-		
+
 		// Convert map to slice
 		c.tables = make([]string, 0, len(tableMap))
 		for name := range tableMap {
@@ -123,7 +123,7 @@ func (c *Completer) RefreshMetadata(ctx context.Context) error {
 		} else {
 			allKeywords = keywords
 		}
-		
+
 		// Filter to only include useful statement keywords and common clauses
 		// Exclude reserved words that aren't useful as autocomplete suggestions
 		c.keywords = filterUsefulKeywords(allKeywords)
@@ -154,51 +154,51 @@ func filterUsefulKeywords(allKeywords []string) []string {
 		// Query statements
 		"select": true, "from": true, "where": true, "having": true, "order": true, "group": true,
 		"limit": true, "offset": true, "distinct": true, "union": true, "intersect": true, "except": true,
-		
+
 		// Join types
 		"join": true, "inner": true, "left": true, "right": true, "full": true, "cross": true,
 		"outer": true, "natural": true, "on": true, "using": true,
-		
+
 		// Boolean operators
 		"and": true, "or": true, "not": true, "in": true, "exists": true, "between": true,
 		"like": true, "ilike": true, "is": true, "null": true,
-		
+
 		// Common keywords
 		"as": true, "asc": true, "desc": true, "by": true, "all": true, "any": true,
 		"case": true, "when": true, "then": true, "else": true, "end": true,
-		
+
 		// DML statements
 		"insert": true, "into": true, "values": true, "update": true, "set": true, "delete": true,
-		
+
 		// DDL statements
 		"create": true, "alter": true, "drop": true, "truncate": true,
 		"table": true, "view": true, "index": true, "schema": true, "database": true,
-		
+
 		// Constraints and keys
 		"primary": true, "foreign": true, "key": true, "references": true,
 		"unique": true, "constraint": true, "check": true, "default": true,
-		
+
 		// Functions and casts
 		"cast": true, "extract": true, "interval": true, "current_date": true, "current_time": true,
 		"current_timestamp": true,
-		
+
 		// CTEs and subqueries
 		"with": true, "recursive": true,
-		
+
 		// SHOW commands
 		"show": true, "tables": true, "schemas": true, "columns": true, "databases": true,
-		
+
 		// DESCRIBE/EXPLAIN
 		"describe": true, "explain": true, "analyze": true,
 	}
-	
+
 	var filtered []string
 	for _, kw := range allKeywords {
 		if useful[kw] {
 			filtered = append(filtered, kw)
 		}
 	}
-	
+
 	// If filtering resulted in too few keywords, use the fallback list
 	if len(filtered) < 20 {
 		return []string{
@@ -214,7 +214,7 @@ func filterUsefulKeywords(allKeywords []string) []string {
 			"show", "tables", "databases", "schemas", "columns",
 		}
 	}
-	
+
 	return filtered
 }
 

@@ -251,7 +251,7 @@ func TestCompleterComplete(t *testing.T) {
 
 func TestPublicSchemaUnqualified(t *testing.T) {
 	c := New()
-	
+
 	// Mock metadata fetcher with public and non-public schemas
 	c.SetMetadataFetcher(func(ctx context.Context, query string) ([]string, error) {
 		switch {
@@ -262,18 +262,18 @@ func TestPublicSchemaUnqualified(t *testing.T) {
 			return []string{}, nil
 		}
 	})
-	
+
 	// Refresh metadata
 	err := c.RefreshMetadata(context.Background())
 	if err != nil {
 		t.Fatalf("RefreshMetadata failed: %v", err)
 	}
-	
+
 	// Verify we have both qualified and unqualified for public schema
 	hasQualified := false
 	hasUnqualified := false
 	hasNonPublic := false
-	
+
 	for _, table := range c.tables {
 		if table == "public.tvmaze" {
 			hasQualified = true
@@ -289,7 +289,7 @@ func TestPublicSchemaUnqualified(t *testing.T) {
 			t.Error("Should not have unqualified 'metrics' from analytics schema")
 		}
 	}
-	
+
 	if !hasQualified {
 		t.Error("Should have qualified name 'public.tvmaze'")
 	}
@@ -299,7 +299,7 @@ func TestPublicSchemaUnqualified(t *testing.T) {
 	if !hasNonPublic {
 		t.Error("Should have qualified name 'analytics.metrics'")
 	}
-	
+
 	// Test completion
 	results := c.Complete("select * from tv")
 	found := false
@@ -317,7 +317,7 @@ func TestPublicSchemaUnqualified(t *testing.T) {
 
 func TestTabCompletionFromClause(t *testing.T) {
 	c := New()
-	
+
 	// Set up completer with a public.tvmaze table
 	c.SetMetadataFetcher(func(ctx context.Context, query string) ([]string, error) {
 		switch {
@@ -327,22 +327,22 @@ func TestTabCompletionFromClause(t *testing.T) {
 			return []string{}, nil
 		}
 	})
-	
+
 	err := c.RefreshMetadata(context.Background())
 	if err != nil {
 		t.Fatalf("RefreshMetadata failed: %v", err)
 	}
-	
+
 	// Debug: print what tables we have
 	t.Logf("Available tables: %v", c.tables)
-	
+
 	// Test the exact use case: "select * from tv" should complete to "select * from tvmaze "
 	input := "select * from tv"
 	results := c.Complete(input)
-	
+
 	t.Logf("Input: %q", input)
 	t.Logf("Results: %v", results)
-	
+
 	// Check that we get a completion with tvmaze
 	found := false
 	var matchedResult string
@@ -353,7 +353,7 @@ func TestTabCompletionFromClause(t *testing.T) {
 			break
 		}
 	}
-	
+
 	if !found {
 		t.Errorf("Tab completion failed for 'select * from tv'\nExpected: completion containing 'tvmaze' (not 'public.tvmaze')\nGot: %v", results)
 	} else {
@@ -363,10 +363,10 @@ func TestTabCompletionFromClause(t *testing.T) {
 
 func TestSimpleTabCompletion(t *testing.T) {
 	c := New()
-	
+
 	// Directly set tables - bypass metadata fetcher to test core logic
 	c.SetTables([]string{"public.tvmaze", "tvmaze", "public.users", "users"})
-	
+
 	tests := []struct {
 		name     string
 		input    string
@@ -388,13 +388,13 @@ func TestSimpleTabCompletion(t *testing.T) {
 			wantWord: "tvmaze",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			results := c.Complete(tt.input)
 			t.Logf("Input: %q", tt.input)
 			t.Logf("Results: %v", results)
-			
+
 			found := false
 			for _, result := range results {
 				if strings.Contains(result, tt.wantWord+" ") && !strings.Contains(result, "public."+tt.wantWord) {
@@ -402,7 +402,7 @@ func TestSimpleTabCompletion(t *testing.T) {
 					break
 				}
 			}
-			
+
 			if !found {
 				t.Errorf("Expected completion containing %q (unqualified), got: %v", tt.wantWord, results)
 			}
@@ -414,7 +414,7 @@ func TestCTECompletion(t *testing.T) {
 	c := New()
 	c.SetKeywords([]string{"with", "as", "select", "from"})
 	c.SetTables([]string{"users", "orders"})
-	
+
 	tests := []struct {
 		name     string
 		input    string
@@ -431,7 +431,7 @@ func TestCTECompletion(t *testing.T) {
 			wantWord: "users",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			results := c.Complete(tt.input)

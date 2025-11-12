@@ -21,10 +21,7 @@ impl From<String> for StringValue {
     fn from(s: String) -> Self {
         let original: Arc<str> = Arc::from(s.into_boxed_str());
         let lower: Arc<str> = Arc::from(original.to_lowercase());
-        Self {
-            original,
-            lower,
-        }
+        Self { original, lower }
     }
 }
 
@@ -308,32 +305,38 @@ impl Completer for EditorHelper {
 /// Only validate complete-looking statements to avoid filtering out partial completions
 fn should_validate_sql(sql: &str) -> bool {
     let trimmed = sql.trim().to_lowercase();
-    
+
     // Always allow if it doesn't contain a statement keyword at all
-    if !trimmed.contains("select") && !trimmed.contains("insert") && 
-       !trimmed.contains("update") && !trimmed.contains("delete") && 
-       !trimmed.contains("with") && !trimmed.contains("show") &&
-       !trimmed.contains("describe") && !trimmed.contains("explain") {
+    if !trimmed.contains("select")
+        && !trimmed.contains("insert")
+        && !trimmed.contains("update")
+        && !trimmed.contains("delete")
+        && !trimmed.contains("with")
+        && !trimmed.contains("show")
+        && !trimmed.contains("describe")
+        && !trimmed.contains("explain")
+    {
         return true;
     }
-    
+
     // If it has semicolon, it's trying to be a complete statement - validate it
     if trimmed.contains(';') {
         return is_valid_sql(sql);
     }
-    
+
     // If it's a SELECT and has FROM clause, validate it
     if trimmed.contains("select") && trimmed.contains("from") {
         return is_valid_sql(sql);
     }
-    
+
     // If it's INSERT/UPDATE/DELETE and looks complete, validate it
-    if (trimmed.contains("insert") && trimmed.contains("into")) ||
-       (trimmed.contains("update") && trimmed.contains("set")) ||
-       (trimmed.contains("delete") && trimmed.contains("from")) {
+    if (trimmed.contains("insert") && trimmed.contains("into"))
+        || (trimmed.contains("update") && trimmed.contains("set"))
+        || (trimmed.contains("delete") && trimmed.contains("from"))
+    {
         return is_valid_sql(sql);
     }
-    
+
     // Otherwise, it's a partial completion - allow it without validation
     true
 }
@@ -405,7 +408,7 @@ async fn get_tables(
 
     let mut tables = Vec::new();
     let mut table_set = std::collections::HashSet::new();
-    
+
     for batch in records.0 {
         if let Some(array) = batch.column(0).as_any().downcast_ref::<StringArray>() {
             for full_name in array.iter().flatten() {
@@ -413,7 +416,7 @@ async fn get_tables(
                 if table_set.insert(full_name.to_string()) {
                     tables.push(full_name.to_string());
                 }
-                
+
                 // For public schema, also add unqualified name
                 if let Some(unqualified) = full_name.strip_prefix("public.") {
                     if table_set.insert(unqualified.to_string()) {
@@ -545,18 +548,21 @@ fn quote_identifier_if_needed(identifier: &str) -> String {
     let needs_quoting = identifier.chars().any(|c| c.is_uppercase())
         || identifier.contains('.')  // Already qualified, handle parts separately
         || identifier.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '.');
-    
+
     if !needs_quoting {
         return identifier.to_string();
     }
-    
+
     // Handle schema-qualified names (e.g., "MySchema"."MyTable")
     if identifier.contains('.') {
         let parts: Vec<&str> = identifier.split('.').collect();
         let quoted_parts: Vec<String> = parts
             .iter()
             .map(|part| {
-                if part.chars().any(|c| c.is_uppercase() || !c.is_alphanumeric() && c != '_') {
+                if part
+                    .chars()
+                    .any(|c| c.is_uppercase() || !c.is_alphanumeric() && c != '_')
+                {
                     format!("\"{}\"", part)
                 } else {
                     (*part).to_string()
@@ -619,46 +625,100 @@ fn is_word_boundary(ch: char) -> bool {
 fn filter_useful_keywords() -> Vec<String> {
     let useful_keywords = [
         // Query statements
-        "select", "from", "where", "having", "order", "group",
-        "limit", "offset", "distinct", "union", "intersect", "except",
-        
+        "select",
+        "from",
+        "where",
+        "having",
+        "order",
+        "group",
+        "limit",
+        "offset",
+        "distinct",
+        "union",
+        "intersect",
+        "except",
         // Join types
-        "join", "inner", "left", "right", "full", "cross",
-        "outer", "natural", "on", "using",
-        
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "outer",
+        "natural",
+        "on",
+        "using",
         // Boolean operators
-        "and", "or", "not", "in", "exists", "between",
-        "like", "ilike", "is", "null",
-        
+        "and",
+        "or",
+        "not",
+        "in",
+        "exists",
+        "between",
+        "like",
+        "ilike",
+        "is",
+        "null",
         // Common keywords
-        "as", "asc", "desc", "by", "all", "any",
-        "case", "when", "then", "else", "end",
-        
+        "as",
+        "asc",
+        "desc",
+        "by",
+        "all",
+        "any",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
         // DML statements
-        "insert", "into", "values", "update", "set", "delete",
-        
+        "insert",
+        "into",
+        "values",
+        "update",
+        "set",
+        "delete",
         // DDL statements
-        "create", "alter", "drop", "truncate",
-        "table", "view", "index", "schema", "database",
-        
+        "create",
+        "alter",
+        "drop",
+        "truncate",
+        "table",
+        "view",
+        "index",
+        "schema",
+        "database",
         // Constraints and keys
-        "primary", "foreign", "key", "references",
-        "unique", "constraint", "check", "default",
-        
+        "primary",
+        "foreign",
+        "key",
+        "references",
+        "unique",
+        "constraint",
+        "check",
+        "default",
         // Functions and casts
-        "cast", "extract", "interval", "current_date", "current_time",
+        "cast",
+        "extract",
+        "interval",
+        "current_date",
+        "current_time",
         "current_timestamp",
-        
         // CTEs and subqueries
-        "with", "recursive",
-        
+        "with",
+        "recursive",
         // SHOW commands
-        "show", "tables", "schemas", "columns", "databases",
-        
+        "show",
+        "tables",
+        "schemas",
+        "columns",
+        "databases",
         // DESCRIBE/EXPLAIN
-        "describe", "explain", "analyze",
+        "describe",
+        "explain",
+        "analyze",
     ];
-    
+
     useful_keywords.iter().map(|&s| s.to_string()).collect()
 }
 
@@ -899,15 +959,24 @@ mod tests {
         // Lowercase identifiers don't need quoting
         assert_eq!(quote_identifier_if_needed("users"), "users");
         assert_eq!(quote_identifier_if_needed("my_table"), "my_table");
-        
+
         // Uppercase identifiers need quoting
         assert_eq!(quote_identifier_if_needed("MyTable"), "\"MyTable\"");
         assert_eq!(quote_identifier_if_needed("USERS"), "\"USERS\"");
-        
+
         // Schema-qualified names with uppercase
-        assert_eq!(quote_identifier_if_needed("MySchema.MyTable"), "\"MySchema\".\"MyTable\"");
-        assert_eq!(quote_identifier_if_needed("public.MyTable"), "public.\"MyTable\"");
-        assert_eq!(quote_identifier_if_needed("MySchema.users"), "\"MySchema\".users");
+        assert_eq!(
+            quote_identifier_if_needed("MySchema.MyTable"),
+            "\"MySchema\".\"MyTable\""
+        );
+        assert_eq!(
+            quote_identifier_if_needed("public.MyTable"),
+            "public.\"MyTable\""
+        );
+        assert_eq!(
+            quote_identifier_if_needed("MySchema.users"),
+            "\"MySchema\".users"
+        );
         assert_eq!(quote_identifier_if_needed("public.users"), "public.users");
     }
 
@@ -915,12 +984,12 @@ mod tests {
     fn test_uppercase_table_completion() {
         let mut cache = SchemaCache::new();
         cache.update_tables(vec![
-            "MyTable".to_string(), 
-            "users".to_string(), 
-            "MyView".to_string(),  // Unqualified version
-            "public.MyView".to_string()
+            "MyTable".to_string(),
+            "users".to_string(),
+            "MyView".to_string(), // Unqualified version
+            "public.MyView".to_string(),
         ]);
-        
+
         let helper = EditorHelper {
             schema_cache: Arc::new(RwLock::new(cache)),
             flight_client: None,
@@ -933,15 +1002,26 @@ mod tests {
         // Test that uppercase table is quoted
         let sql = "select * from My";
         let completions = get_completions(&helper, sql, sql.len());
-        assert!(completions.iter().any(|c| c.contains("\"MyTable\"")), 
-                "Should suggest quoted MyTable, got: {:?}", completions);
-        assert!(completions.iter().any(|c| c.contains("\"MyView\"")), 
-                "Should suggest quoted MyView, got: {:?}", completions);
-        
+        assert!(
+            completions.iter().any(|c| c.contains("\"MyTable\"")),
+            "Should suggest quoted MyTable, got: {:?}",
+            completions
+        );
+        assert!(
+            completions.iter().any(|c| c.contains("\"MyView\"")),
+            "Should suggest quoted MyView, got: {:?}",
+            completions
+        );
+
         // Test lowercase table is not quoted
         let sql2 = "select * from user";
         let completions = get_completions(&helper, sql2, sql2.len());
-        assert!(completions.iter().any(|c| c.contains("users ") && !c.contains("\"")), 
-                "Should suggest unquoted users, got: {:?}", completions);
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.contains("users ") && !c.contains("\"")),
+            "Should suggest unquoted users, got: {:?}",
+            completions
+        );
     }
 }
