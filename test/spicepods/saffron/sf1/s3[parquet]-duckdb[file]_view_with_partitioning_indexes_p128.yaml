@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_view_indexes.yaml
+name: s3[parquet]-duckdb[file]_view_with_partitioning_indexes
 
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
@@ -33,7 +33,7 @@ datasets:
         duckdb_preserve_insertion_order: false
 
   - from: s3://benchmarks/saffron/sender_info_sf1
-    name: sender_info
+    name: sender_info_by_arrival
     params: *params_s3
     acceleration:
       enabled: true
@@ -43,6 +43,39 @@ datasets:
         duckdb_preserve_insertion_order: false
 
 views:
+  - name: sender_info
+    sql: |
+      select
+      AutoId,
+      AccountSid,
+      NumberPoolSid,
+      SenderSid,
+      SenderIdentity,
+      Region,
+      Rate,
+      sendertype as SenderType,
+      DateCreated,
+      DateUpdated,
+      LastUsed
+      from sender_info_by_arrival
+      order by AccountSid, NumberPoolSid
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_on_startup: auto
+      params:
+        partition_mode: tables
+        query_federation: disabled
+        duckdb_file: sender_info.duckdb
+        duckdb_preserve_insertion_order: true
+        duckdb_partitioned_write_flush_threshold: 256000
+      partition_by:
+        - bucket(128, AccountSid)
+      indexes:
+        '(AccountSid, NumberPoolSid, SenderType)': enabled
+        '(AccountSid, NumberPoolSid, SenderType, Region)': enabled
+
   - name: number_info_with_cap
     sql: |
       select
@@ -74,8 +107,11 @@ views:
       params:
         query_federation: disabled
         duckdb_preserve_insertion_order: true
+        partition_mode: tables
         duckdb_partitioned_write_flush_threshold: 256000
         duckdb_file: number_info_with_cap.duckdb
+      partition_by:
+        - bucket(128, AccountSid)
       indexes:
         '(AccountSid, NumberPoolSid, Capability)': enabled
         '(AccountSid, NumberPoolSid, NumberRegion, AreaCodeRegion)': enabled

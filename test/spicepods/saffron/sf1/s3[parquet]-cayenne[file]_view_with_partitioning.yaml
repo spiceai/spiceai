@@ -16,24 +16,21 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
-      params:
-        duckdb_preserve_insertion_order: false
-
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
     params: *params_s3
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
-      params:
-        duckdb_preserve_insertion_order: false
+      partition_by:
+        - bucket(32, AccountSid)
 
   - from: s3://benchmarks/saffron/sender_info_sf1
-    name: sender_info
+    name: sender_info_by_arrival
     params: *params_s3
     acceleration:
       enabled: true
@@ -41,9 +38,50 @@ datasets:
       mode: file
 
 views:
+  - name: sender_info
+    sql: |
+      select
+      AutoId,
+      AccountSid,
+      NumberPoolSid,
+      SenderSid,
+      SenderIdentity,
+      Region,
+      Rate,
+      sendertype as SenderType,
+      DateCreated,
+      DateUpdated,
+      LastUsed
+      from sender_info_by_arrival
+      order by AccountSid, NumberPoolSid
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_on_startup: auto
+      partition_by:
+        - bucket(32, AccountSid)
+
   - name: number_info_with_cap
     sql: |
-      select ni.*, nc.Capability from number_info ni
+      select
+      ni.DateCreated,
+      ni.DateUpdated,
+      ni.AccountSid,
+      ni.NumberPoolSid,
+      ni.NumberSid,
+      ni.MaxRate,
+      ni.NumberDid,
+      ni.NumberType,
+      ni.SupportedDestRegion,
+      ni.NumberRegion,
+      ni.CurrentRate,
+      ni.IsAvailable,
+      ni.ProviderSid,
+      ni.AreaCodeRegion,
+      ni.AvailableForNumberSelection,
+      nc.Capability
+      from number_info ni
       inner join number_caps nc
       on ni.NumberSid = nc.NumberSid
       order by ni.AccountSid, ni.NumberPoolSid

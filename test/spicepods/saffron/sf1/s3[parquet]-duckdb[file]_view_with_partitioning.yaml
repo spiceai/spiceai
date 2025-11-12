@@ -33,7 +33,7 @@ datasets:
         duckdb_preserve_insertion_order: false
 
   - from: s3://benchmarks/saffron/sender_info_sf1
-    name: sender_info
+    name: sender_info_by_arrival
     params: *params_s3
     acceleration:
       enabled: true
@@ -43,19 +43,68 @@ datasets:
         duckdb_preserve_insertion_order: false
 
 views:
-  - name: number_info_with_cap
+  - name: sender_info
     sql: |
-      select ni.*, nc.Capability from number_info ni
-      inner join number_caps nc
-      on ni.NumberSid = nc.NumberSid
-      order by ni.AccountSid, ni.NumberPoolSid
+      select
+      AutoId,
+      AccountSid,
+      NumberPoolSid,
+      SenderSid,
+      SenderIdentity,
+      Region,
+      Rate,
+      sendertype as SenderType,
+      DateCreated,
+      DateUpdated,
+      LastUsed
+      from sender_info_by_arrival
+      order by AccountSid, NumberPoolSid
     acceleration:
       enabled: true
       engine: duckdb
       mode: file
       refresh_on_startup: auto
-      params: 
+      params:
         partition_mode: tables
-        duckdb_partitioned_write_flush_threshold: 522880
+        query_federation: disabled
+        duckdb_file: sender_info.duckdb
+        duckdb_preserve_insertion_order: true
+        duckdb_partitioned_write_flush_threshold: 256000
+      partition_by:
+        - bucket(32, AccountSid)
+
+  - name: number_info_with_cap
+    sql: |
+      select
+      ni.DateCreated,
+      ni.DateUpdated,
+      ni.AccountSid,
+      ni.NumberPoolSid,
+      ni.NumberSid,
+      ni.MaxRate,
+      ni.NumberDid,
+      ni.NumberType,
+      ni.SupportedDestRegion,
+      ni.NumberRegion,
+      ni.CurrentRate,
+      ni.IsAvailable,
+      ni.ProviderSid,
+      ni.AreaCodeRegion,
+      ni.AvailableForNumberSelection,
+      nc.Capability
+      from number_info ni
+      inner join number_caps nc
+      on ni.NumberSid = nc.NumberSid
+      order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_on_startup: auto
+      params:
+        partition_mode: tables
+        duckdb_file: number_info_with_cap.duckdb
+        duckdb_preserve_insertion_order: true
+        duckdb_partitioned_write_flush_threshold: 256000
       partition_by:
         - bucket(32, AccountSid)
