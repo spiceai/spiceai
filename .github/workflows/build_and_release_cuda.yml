@@ -73,31 +73,31 @@ jobs:
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spicehq-dev-large-runners",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spicehq-dev-large-runners",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spicehq-dev-large-runners",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spicehq-dev-large-runners",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spicehq-dev-large-runners",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               }
@@ -179,9 +179,9 @@ jobs:
     needs: build
     env:
       ARTIFACT_DIR: ./release
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+      MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
       COMMIT_SHA: ${{ github.sha }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
