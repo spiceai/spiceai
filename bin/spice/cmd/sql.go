@@ -448,11 +448,6 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 	return runREPLWithMetadata(grpcEndpoint, grpcExecutor, metadataFetcher)
 }
 
-// runREPL provides a common REPL experience for all SQL execution modes
-func runREPL(endpoint string, executor QueryExecutor) error {
-	return runREPLWithMetadata(endpoint, executor, nil)
-}
-
 // runREPLWithMetadata provides a common REPL experience with metadata fetching support
 func runREPLWithMetadata(endpoint string, executor QueryExecutor, metadataFetcher sqlcompleter.MetadataFetcher) error {
 	return runREPLWithHealthAndMetadata(endpoint, executor, metadataFetcher, 0, false)

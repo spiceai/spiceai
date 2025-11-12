@@ -27,17 +27,17 @@ func TestRefreshMetadata(t *testing.T) {
 
 	// Mock metadata fetcher
 	c.SetMetadataFetcher(func(ctx context.Context, query string) ([]string, error) {
-		switch {
-		case query == "--autocomplete\nSELECT table_schema || '.' || table_name as full_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') UNION SELECT table_schema || '.' || table_name FROM information_schema.views WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY full_name":
+		switch query {
+		case "--autocomplete\nSELECT table_schema || '.' || table_name as full_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') UNION SELECT table_schema || '.' || table_name FROM information_schema.views WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY full_name":
 			// Return schema-qualified names (simulating public.users, analytics.products, etc.)
 			return []string{"public.users", "analytics.products", "public.orders"}, nil
-		case query == "--autocomplete\nSELECT DISTINCT table_schema FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY table_schema":
+		case "--autocomplete\nSELECT DISTINCT table_schema FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY table_schema":
 			return []string{"public", "analytics"}, nil
-		case query == "--autocomplete\nSELECT DISTINCT column_name FROM information_schema.columns ORDER BY column_name":
+		case "--autocomplete\nSELECT DISTINCT column_name FROM information_schema.columns ORDER BY column_name":
 			return []string{"id", "name", "email", "price"}, nil
-		case query == "--autocomplete\nSELECT name FROM list_udfs() ORDER BY name":
+		case "--autocomplete\nSELECT name FROM list_udfs() ORDER BY name":
 			return []string{"count", "sum", "avg"}, nil
-		case query == "--autocomplete\nSELECT name FROM list_udtfs() ORDER BY name":
+		case "--autocomplete\nSELECT name FROM list_udtfs() ORDER BY name":
 			return []string{"generate_series", "unnest"}, nil
 		default:
 			// For keywords query, return fallback
@@ -254,8 +254,8 @@ func TestPublicSchemaUnqualified(t *testing.T) {
 
 	// Mock metadata fetcher with public and non-public schemas
 	c.SetMetadataFetcher(func(ctx context.Context, query string) ([]string, error) {
-		switch {
-		case query == "--autocomplete\nSELECT table_schema || '.' || table_name as full_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') UNION SELECT table_schema || '.' || table_name FROM information_schema.views WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY full_name":
+		switch query {
+		case "--autocomplete\nSELECT table_schema || '.' || table_name as full_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'runtime') UNION SELECT table_schema || '.' || table_name FROM information_schema.views WHERE table_schema NOT IN ('information_schema', 'runtime') ORDER BY full_name":
 			// Return mix of public and non-public tables
 			return []string{"public.tvmaze", "public.users", "analytics.metrics", "scp.task_history"}, nil
 		default:

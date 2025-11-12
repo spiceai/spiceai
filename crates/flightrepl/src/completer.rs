@@ -136,6 +136,7 @@ impl EditorHelper {
 impl Completer for EditorHelper {
     type Candidate = Pair;
 
+    #[allow(clippy::too_many_lines)]
     fn complete(
         &self,
         line: &str,
@@ -181,7 +182,7 @@ impl Completer for EditorHelper {
             for table in &cache.tables {
                 if table.lower.starts_with(&word_lower) {
                     let quoted_name = quote_identifier_if_needed(&table.original);
-                    let replacement = format!("{} ", quoted_name);
+                    let replacement = format!("{quoted_name} ");
                     if seen.insert(replacement.clone()) {
                         matches.push(Pair {
                             display: table.original.to_string(),
@@ -206,25 +207,21 @@ impl Completer for EditorHelper {
 
             // Suggest UDFs
             for udf_name in &cache.udfs {
-                if udf_name.starts_with(&word_lower) {
-                    if seen.insert(udf_name.to_lowercase()) {
-                        matches.push(Pair {
-                            display: udf_name.to_lowercase(),
-                            replacement: udf_name.to_lowercase(),
-                        });
-                    }
+                if udf_name.starts_with(&word_lower) && seen.insert(udf_name.to_lowercase()) {
+                    matches.push(Pair {
+                        display: udf_name.to_lowercase(),
+                        replacement: udf_name.to_lowercase(),
+                    });
                 }
             }
 
             // Suggest UDTFs
             for udtf_name in &cache.udtfs {
-                if udtf_name.starts_with(&word_lower) {
-                    if seen.insert(udtf_name.to_lowercase()) {
-                        matches.push(Pair {
-                            display: udtf_name.to_lowercase(),
-                            replacement: udtf_name.to_lowercase(),
-                        });
-                    }
+                if udtf_name.starts_with(&word_lower) && seen.insert(udtf_name.to_lowercase()) {
+                    matches.push(Pair {
+                        display: udtf_name.to_lowercase(),
+                        replacement: udtf_name.to_lowercase(),
+                    });
                 }
             }
 
@@ -232,7 +229,7 @@ impl Completer for EditorHelper {
             for schema in &cache.schemas {
                 if schema.lower.starts_with(&word_lower) {
                     let quoted_name = quote_identifier_if_needed(&schema.original);
-                    let replacement = format!("{}.", quoted_name);
+                    let replacement = format!("{quoted_name}.");
                     if seen.insert(replacement.clone()) {
                         matches.push(Pair {
                             display: schema.original.to_string(),
@@ -246,7 +243,7 @@ impl Completer for EditorHelper {
             for table in &cache.tables {
                 if table.lower.starts_with(&word_lower) {
                     let quoted_name = quote_identifier_if_needed(&table.original);
-                    let replacement = format!("{} ", quoted_name);
+                    let replacement = format!("{quoted_name} ");
                     if seen.insert(replacement.clone()) {
                         matches.push(Pair {
                             display: table.original.to_string(),
@@ -260,7 +257,7 @@ impl Completer for EditorHelper {
             for column in &cache.columns {
                 if column.lower.starts_with(&word_lower) {
                     let quoted_name = quote_identifier_if_needed(&column.original);
-                    let replacement = format!("{} ", quoted_name);
+                    let replacement = format!("{quoted_name} ");
                     if seen.insert(replacement.clone()) {
                         matches.push(Pair {
                             display: column.original.to_string(),
@@ -278,13 +275,11 @@ impl Completer for EditorHelper {
             for idx in (0..history.len()).rev() {
                 if let Ok(Some(result)) = history.get(idx, SearchDirection::Reverse) {
                     let entry_str = result.entry.as_ref();
-                    if !entry_str.is_empty() {
-                        if seen.insert(entry_str.to_string()) {
-                            matches.push(Pair {
-                                display: entry_str.to_string(),
-                                replacement: entry_str.to_string(),
-                            });
-                        }
+                    if !entry_str.is_empty() && seen.insert(entry_str.to_string()) {
+                        matches.push(Pair {
+                            display: entry_str.to_string(),
+                            replacement: entry_str.to_string(),
+                        });
                     }
                 }
             }
@@ -341,7 +336,7 @@ fn should_validate_sql(sql: &str) -> bool {
     true
 }
 
-/// Validates that a SQL string can be parsed by DataFusion
+/// Validates that a SQL string can be parsed by `DataFusion`
 fn is_valid_sql(sql: &str) -> bool {
     // Try to parse the SQL with DataFusion's parser
     DFParser::parse_sql(sql).is_ok()
@@ -359,6 +354,7 @@ async fn refresh_schema(
     let mut client4 = client.clone();
     let mut client5 = client;
 
+    #[allow(clippy::similar_names)]
     let (tables_result, schemas_result, columns_result, udfs_result, udtfs_result) = tokio::join!(
         get_tables(&mut client1, api_key, user_agent),
         get_schemas(&mut client2, api_key, user_agent),
@@ -418,10 +414,10 @@ async fn get_tables(
                 }
 
                 // For public schema, also add unqualified name
-                if let Some(unqualified) = full_name.strip_prefix("public.") {
-                    if table_set.insert(unqualified.to_string()) {
-                        tables.push(unqualified.to_string());
-                    }
+                if let Some(unqualified) = full_name.strip_prefix("public.")
+                    && table_set.insert(unqualified.to_string())
+                {
+                    tables.push(unqualified.to_string());
                 }
             }
         }
@@ -545,7 +541,7 @@ async fn get_udtfs(
 /// Quote an identifier if it contains uppercase letters, reserved keywords, or special characters
 fn quote_identifier_if_needed(identifier: &str) -> String {
     // Check if identifier needs quoting
-    let needs_quoting = identifier.chars().any(|c| c.is_uppercase())
+    let needs_quoting = identifier.chars().any(char::is_uppercase)
         || identifier.contains('.')  // Already qualified, handle parts separately
         || identifier.chars().any(|c| !c.is_alphanumeric() && c != '_' && c != '.');
 
@@ -563,7 +559,7 @@ fn quote_identifier_if_needed(identifier: &str) -> String {
                     .chars()
                     .any(|c| c.is_uppercase() || !c.is_alphanumeric() && c != '_')
                 {
-                    format!("\"{}\"", part)
+                    format!("\"{part}\"")
                 } else {
                     (*part).to_string()
                 }
@@ -572,7 +568,7 @@ fn quote_identifier_if_needed(identifier: &str) -> String {
         quoted_parts.join(".")
     } else {
         // Single identifier
-        format!("\"{}\"", identifier)
+        format!("\"{identifier}\"")
     }
 }
 
@@ -621,7 +617,7 @@ fn is_word_boundary(ch: char) -> bool {
     }
 }
 
-/// Filter DataFusion's full keyword list to only include useful autocomplete suggestions
+/// Filter `DataFusion`'s full keyword list to only include useful autocomplete suggestions
 fn filter_useful_keywords() -> Vec<String> {
     let useful_keywords = [
         // Query statements
@@ -1004,13 +1000,11 @@ mod tests {
         let completions = get_completions(&helper, sql, sql.len());
         assert!(
             completions.iter().any(|c| c.contains("\"MyTable\"")),
-            "Should suggest quoted MyTable, got: {:?}",
-            completions
+            "Should suggest quoted MyTable, got: {completions:?}"
         );
         assert!(
             completions.iter().any(|c| c.contains("\"MyView\"")),
-            "Should suggest quoted MyView, got: {:?}",
-            completions
+            "Should suggest quoted MyView, got: {completions:?}"
         );
 
         // Test lowercase table is not quoted
@@ -1019,9 +1013,8 @@ mod tests {
         assert!(
             completions
                 .iter()
-                .any(|c| c.contains("users ") && !c.contains("\"")),
-            "Should suggest unquoted users, got: {:?}",
-            completions
+                .any(|c| c.contains("users ") && !c.contains('"')),
+            "Should suggest unquoted users, got: {completions:?}"
         );
     }
 }
