@@ -28,7 +28,8 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_federation::{
-    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
+    FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
+    FederationProvider,
 };
 
 use crate::delete::DeletionTableProvider;
@@ -98,8 +99,9 @@ impl FederationProvider for PolyTableProvider {
             .and_then(|f| f.compute_context())
     }
 
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
-        self.get_federation_provider().and_then(|f| f.analyzer())
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+        self.get_federation_provider()
+            .and_then(|f| f.analyzer(plan))
     }
 }
 
