@@ -703,7 +703,8 @@ impl SpiceTestQueryWorker {
                     query.name
                 );
                 return Err(anyhow::anyhow!(
-                    "Query '{}' returned 0 rows via Flight",
+                    "Worker {} - Query '{}' returned 0 rows via Flight",
+                    self.id,
                     query.name
                 ));
             }
