@@ -71,7 +71,7 @@ views:
         duckdb_preserve_insertion_order: true
         duckdb_partitioned_write_flush_threshold: 256000
       partition_by:
-        - bucket(32, AccountSid)
+        - bucket(128, AccountSid)
       indexes:
         '(AccountSid, NumberPoolSid, SenderType)': enabled
         '(AccountSid, NumberPoolSid, SenderType, Region)': enabled
