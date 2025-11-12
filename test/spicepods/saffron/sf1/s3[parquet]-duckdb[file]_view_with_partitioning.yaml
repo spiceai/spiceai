@@ -72,9 +72,6 @@ views:
         duckdb_partitioned_write_flush_threshold: 256000
       partition_by:
         - bucket(32, AccountSid)
-      indexes:
-        '(AccountSid, NumberPoolSid, SenderType)': enabled
-        '(AccountSid, NumberPoolSid, SenderType, Region)': enabled
 
   - name: number_info_with_cap
     sql: |
@@ -98,7 +95,7 @@ views:
       from number_info ni
       inner join number_caps nc
       on ni.NumberSid = nc.NumberSid
-      order by ni.AccountSid, ni.NumberPoolSid
+      order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
     acceleration:
       enabled: true
       engine: duckdb

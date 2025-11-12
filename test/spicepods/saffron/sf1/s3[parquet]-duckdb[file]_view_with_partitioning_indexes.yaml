@@ -98,7 +98,7 @@ views:
       from number_info ni
       inner join number_caps nc
       on ni.NumberSid = nc.NumberSid
-      order by ni.AccountSid, ni.NumberPoolSid
+      order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
     acceleration:
       enabled: true
       engine: duckdb
@@ -113,7 +113,8 @@ views:
       partition_by:
         - bucket(32, AccountSid)
       indexes:
-        '(AccountSid, NumberPoolSid, NumberType)': enabled
-        '(NumberPoolSid, SupportedDestRegion, IsAvailable)': enabled
-        '(NumberPoolSid, NumberRegion)': enabled
-        '(AreaCodeRegion, NumberType)': enabled
+        '(AccountSid, NumberPoolSid, Capability)': enabled
+        '(AccountSid, NumberPoolSid, NumberRegion, AreaCodeRegion)': enabled
+        '(AccountSid, NumberPoolSid, SupportedDestRegion, IsAvailable)': enabled
+        '(AccountSid, NumberPoolSid, NumberRegion)': enabled
+        '(AccountSid, AreaCodeRegion, NumberType)': enabled
