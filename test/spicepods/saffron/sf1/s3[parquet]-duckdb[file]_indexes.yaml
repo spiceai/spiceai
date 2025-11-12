@@ -22,8 +22,11 @@ datasets:
       params:
         duckdb_preserve_insertion_order: false
       indexes:
-        '(AccountSid, NumberPoolSid)': enabled
-  
+        '(AccountSid, NumberPoolSid, NumberType)': enabled
+        '(NumberPoolSid, SupportedDestRegion, IsAvailable)': enabled
+        '(NumberPoolSid, NumberRegion)': enabled
+        '(AreaCodeRegion, NumberType)': enabled
+
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
     params: *params_s3

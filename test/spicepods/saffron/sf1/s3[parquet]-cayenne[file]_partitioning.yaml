@@ -28,6 +28,8 @@ datasets:
       enabled: true
       engine: cayenne
       mode: file
+      partition_by:
+        - bucket(32, AccountSid)
 
   - from: s3://benchmarks/saffron/sender_info_sf1
     name: sender_info
@@ -36,3 +38,5 @@ datasets:
       enabled: true
       engine: cayenne
       mode: file
+      partition_by:
+        - bucket(32, AccountSid)

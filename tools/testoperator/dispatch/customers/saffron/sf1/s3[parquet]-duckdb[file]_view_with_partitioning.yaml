@@ -23,3 +23,21 @@ tests:
       duration: 900
       random_param_set_count: 1000
       http_clients: true
+    - spicepod_path: s3[parquet]-duckdb[file]_view_with_partitioning_indexes.yaml
+      query_set: saffron[parameterized]
+      query_overrides: saffron-views
+      ready_wait: 300
+      runner_type: spicehq-dev-runners
+      concurrency: 128
+      duration: 900
+      random_param_set_count: 1000
+      http_clients: true
+    - spicepod_path: s3[parquet]-duckdb[file]_view_with_partitioning_indexes_p128.yaml
+      query_set: saffron[parameterized]
+      query_overrides: saffron-views
+      ready_wait: 300
+      runner_type: spicehq-dev-runners
+      concurrency: 128
+      duration: 900
+      random_param_set_count: 1000
+      http_clients: true
