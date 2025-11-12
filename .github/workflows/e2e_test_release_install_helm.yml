@@ -20,7 +20,6 @@ on:
         options:
           - 'all'
           - 'Linux x64'
-          - 'Linux aarch64'
         default: 'all'
 
 jobs:
@@ -42,12 +41,6 @@ jobs:
                 runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
-              },
-              {
-                name: "Linux aarch64",
-                runner: "hosted-linux-arm-runner",
-                target_os: "linux",
-                target_arch: "aarch64"
               }
             ];
 
