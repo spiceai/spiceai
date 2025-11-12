@@ -1,4 +1,4 @@
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
+use crate::concrete;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -13,8 +13,8 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
-use crate::concrete;
 use itertools::Itertools;
+use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use std::cmp::max;
 use std::sync::Arc;
 
@@ -276,13 +276,13 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::common::plan_node_key::PlanNodeKey;
+    use crate::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
-    use crate::common::plan_node_key::PlanNodeKey;
-    use crate::common::search_visitor::SearchVisitor;
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;

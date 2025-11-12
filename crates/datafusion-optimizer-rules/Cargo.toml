@@ -22,11 +22,11 @@ tracing.workspace = true
 futures.workspace = true
 cache = { path = "../cache" }
 itertools = { optional = true, workspace = true }
-
+url = { optional = true, workspace = true }
 [features]
 duckdb = [
     "datafusion-table-providers/duckdb",
     "dep:duckdb",
     "dep:r2d2"
 ]
-cluster = ["dep:itertools", "dep:datafusion-datasource", "dep:runtime-datafusion"]
+cluster = ["dep:itertools", "dep:datafusion-datasource", "dep:runtime-datafusion", "dep:url"]
