@@ -1,0 +1,70 @@
+version: v1
+kind: Spicepod
+name: http_post_requests
+
+datasets:
+  # POST request with JSON body
+  - from: https://jsonplaceholder.typicode.com
+    name: create_post
+    params:
+      http_post_content_type: application/json
+      file_format: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, request_query, request_body, content
+        FROM create_post
+        WHERE request_path = '/posts'
+          AND request_body = '{"title": "foo", "body": "bar", "userId": 1}'
+
+  # POST request with custom content type
+  - from: https://httpbin.org
+    name: post_form
+    params:
+      http_post_content_type: application/x-www-form-urlencoded
+      file_format: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, request_body, content
+        FROM post_form
+        WHERE request_path = '/post'
+          AND request_body = 'key1=value1&key2=value2'
+
+  # POST request with default JSON content type
+  - from: https://httpbin.org
+    name: post_json_default
+    params:
+      file_format: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, request_body, content
+        FROM post_json_default
+        WHERE request_path = '/post'
+          AND request_body = '{"test": "data"}'
+
+  # POST with multiple different bodies (IN list)
+  - from: https://jsonplaceholder.typicode.com
+    name: multiple_posts
+    params:
+      file_format: auto
+      http_post_content_type: application/json
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, request_body, content
+        FROM multiple_posts
+        WHERE request_path = '/posts'
+          AND request_body IN (
+            '{"title": "foo", "body": "bar", "userId": 1}',
+            '{"title": "test", "body": "content", "userId": 2}'
+          )

@@ -9,9 +9,8 @@ description: "Query: clickbench_q12"
 |               |   Projection: hits.MobilePhone, hits.MobilePhoneModel, count(alias1) AS u                                                                                                |
 |               |     Aggregate: groupBy=[[hits.MobilePhone, hits.MobilePhoneModel]], aggr=[[count(alias1)]]                                                                               |
 |               |       Aggregate: groupBy=[[hits.MobilePhone, hits.MobilePhoneModel, hits.UserID AS alias1]], aggr=[[]]                                                                   |
-|               |         BytesProcessedNode                                                                                                                                               |
-|               |           Filter: CAST(hits.MobilePhoneModel AS Utf8View) != Utf8View("")                                                                                                |
-|               |             TableScan: hits projection=[UserID, MobilePhone, MobilePhoneModel], partial_filters=[CAST(hits.MobilePhoneModel AS Utf8View) != Utf8View("")]                |
+|               |         Filter: CAST(hits.MobilePhoneModel AS Utf8View) != Utf8View("")                                                                                                  |
+|               |           TableScan: hits projection=[UserID, MobilePhone, MobilePhoneModel], partial_filters=[CAST(hits.MobilePhoneModel AS Utf8View) != Utf8View("")]                  |
 | physical_plan | SortExec: TopK(fetch=10), expr=[u@2 DESC], preserve_partitioning=[false]                                                                                                 |
 |               |   CoalescePartitionsExec                                                                                                                                                 |
 |               |     ProjectionExec: expr=[MobilePhone@0 as MobilePhone, MobilePhoneModel@1 as MobilePhoneModel, count(alias1)@2 as u]                                                    |
@@ -23,15 +22,15 @@ description: "Query: clickbench_q12"
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                   RepartitionExec: partitioning=Hash([MobilePhone@0, MobilePhoneModel@1, alias1@2], 16), input_partitions=16                                             |
 |               |                     AggregateExec: mode=Partial, gby=[MobilePhone@1 as MobilePhone, MobilePhoneModel@2 as MobilePhoneModel, UserID@0 as alias1], aggr=[]                 |
-|               |                       BytesProcessedExec                                                                                                                                 |
-|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
-|               |                           FilterExec: CAST(MobilePhoneModel@2 AS Utf8View) !=                                                                                            |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
+|               |                         FilterExec: CAST(MobilePhoneModel@2 AS Utf8View) !=                                                                                              |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                          |
 |               |                             SchemaCastScanExec                                                                                                                           |
-|               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                      |
-|               |                                 FallbackOnZeroResultsScanExec                                                                                                            |
-|               |                                   CoalescePartitionsExec                                                                                                                 |
-|               |                                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                |
-|               |                                       CooperativeExec                                                                                                                    |
+|               |                               FallbackOnZeroResultsScanExec                                                                                                              |
+|               |                                 CoalescePartitionsExec                                                                                                                   |
+|               |                                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                  |
+|               |                                     CooperativeExec                                                                                                                      |
+|               |                                       BytesProcessedExec                                                                                                                 |
 |               |                                         DuckSqlExec sql= SELECT "UserID", "MobilePhone", "MobilePhoneModel" FROM hits WHERE (CAST("MobilePhoneModel" AS VARCHAR) <> '')  |
 |               |                                                                                                                                                                          |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

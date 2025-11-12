@@ -1404,13 +1404,24 @@ async fn build_s3_object_store(
 
     if load_credentials_from_environment {
         tracing::trace!("Loading S3 credentials from environment");
-        if let Some(sdk_config) = aws_sdk_credential_bridge::initialize_sdk_config().await
-            && sdk_config.credentials_provider().is_some()
-        {
-            tracing::trace!("Using S3 credentials provider from SDK config");
-            s3_builder = s3_builder.with_credentials(Arc::new(
-                S3CredentialProvider::from_config(sdk_config).context(EnvLoadSnafu)?,
-            ));
+        match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+            Ok(Some(sdk_config)) => {
+                if sdk_config.credentials_provider().is_some() {
+                    tracing::trace!("Using S3 credentials provider from SDK config");
+                    s3_builder = s3_builder.with_credentials(Arc::new(
+                        S3CredentialProvider::from_config(sdk_config.as_ref())
+                            .context(EnvLoadSnafu)?,
+                    ));
+                }
+            }
+            Ok(None) => {
+                tracing::trace!(
+                    "No AWS SDK credentials available for snapshot store; assuming public access"
+                );
+            }
+            Err(err) => {
+                tracing::warn!("Unable to initialize AWS credentials for snapshot store: {err}");
+            }
         }
     }
 

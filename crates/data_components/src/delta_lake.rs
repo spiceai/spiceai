@@ -104,7 +104,7 @@ impl Read for DeltaTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
         let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.clone(), self.io_runtime.clone()).boxed()?;
+            DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime).boxed()?;
         Ok(Arc::new(delta))
     }
 }
@@ -121,7 +121,7 @@ impl DeltaTable {
     pub fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
-        io_runtime: Handle,
+        io_runtime: &Handle,
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
@@ -139,26 +139,41 @@ impl DeltaTable {
             }
         }
 
-        let mut load_credentials_from_environment = true;
-        if let (Some(_), Some(_)) = (
-            storage_options.get("aws_access_key_id"),
-            storage_options.get("aws_secret_access_key"),
-        ) {
-            load_credentials_from_environment = false;
-        }
+        let table_object_store = if table_url.scheme() == "s3" {
+            let region = storage_options.get("aws_region").map(ToString::to_string);
 
-        let table_object_store = match (
-            load_credentials_from_environment,
-            aws_sdk_credential_bridge::get_sdk_config(),
-        ) {
-            (true, Some(sdk_config)) => {
-                let region = storage_options.get("aws_region").map(ToString::to_string);
-                aws_sdk_credential_bridge::from_s3_url_and_config(
-                    &table_url, region, sdk_config, io_runtime,
-                )
-                .ok()
+            if let Some(sdk_config) = aws_sdk_credential_bridge::should_use_sdk_credentials(
+                &storage_options,
+                "aws_access_key_id",
+                "aws_secret_access_key",
+            ) {
+                // Use AWS SDK credential bridge for IAM role or environment-based authentication.
+                // This allows dynamic credential fetching from IAM roles, environment variables,
+                // or other AWS credential sources at query time.
+                tracing::trace!("Using AWS SDK credentials provider for Delta Lake table");
+                match aws_sdk_credential_bridge::from_s3_url_and_config(
+                    &table_url,
+                    region,
+                    sdk_config.as_ref(),
+                    io_runtime.clone(),
+                ) {
+                    Ok(object_store) => Some(object_store),
+                    Err(err) => {
+                        tracing::debug!(
+                            "Unable to create S3 object store with AWS SDK credentials for Delta Lake table at {}: {err}",
+                            table_url
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::trace!(
+                    "Using delta_kernel's built-in AWS credential resolution for Delta Lake table"
+                );
+                None
             }
-            _ => None,
+        } else {
+            None
         };
 
         let engine = match table_object_store {
@@ -176,7 +191,8 @@ impl DeltaTable {
             ),
         };
 
-        let snapshot = Snapshot::try_new(table_url.clone(), engine.as_ref(), None)
+        let snapshot = Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())
             .map_err(handle_delta_error)?;
 
         let arrow_schema = Self::get_schema(&snapshot);
@@ -361,7 +377,8 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        let snapshot = Snapshot::try_new(self.table_url.clone(), self.engine.as_ref(), None)
+        let snapshot = Snapshot::builder_for(self.table_url.clone())
+            .build(self.engine.as_ref())
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
@@ -380,7 +397,7 @@ impl TableProvider for DeltaTable {
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
             projection,
-        );
+        )?;
         let engine = Arc::clone(&self.engine);
 
         // Clone the filters since we need to move them into the spawn_blocking closure
@@ -393,7 +410,7 @@ impl TableProvider for DeltaTable {
                 // partition pruning is already handled separately later in the code
 
                 let mut scan_builder =
-                    ScanBuilder::new(Arc::new(snapshot)).with_schema(projected_delta_schema);
+                    ScanBuilder::new(snapshot).with_schema(projected_delta_schema);
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_predicate(&filters_clone) {
@@ -574,16 +591,19 @@ fn project_delta_schema(
     arrow_schema: &SchemaRef,
     schema: delta_kernel::schema::SchemaRef,
     projections: Option<&Vec<usize>>,
-) -> delta_kernel::schema::SchemaRef {
+) -> Result<delta_kernel::schema::SchemaRef, DataFusionError> {
     if let Some(projections) = projections {
         let projected_fields = projections
             .iter()
             .filter_map(|i| schema.field(arrow_schema.field(*i).name()))
             .cloned()
             .collect::<Vec<_>>();
-        Arc::new(delta_kernel::schema::Schema::new(projected_fields))
+        Ok(Arc::new(
+            delta_kernel::schema::Schema::try_new(projected_fields)
+                .map_err(map_delta_error_to_datafusion_err)?,
+        ))
     } else {
-        schema
+        Ok(schema)
     }
 }
 

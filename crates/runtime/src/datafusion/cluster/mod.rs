@@ -36,8 +36,8 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 pub mod codec;
-pub mod common;
 pub mod config;
+pub mod datafusion_scheduler_ext;
 pub mod physical_plan;
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status

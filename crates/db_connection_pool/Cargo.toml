@@ -9,14 +9,14 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-arrow-odbc = { workspace = true, optional = true }
 arrow.workspace = true
+arrow-odbc = { workspace = true, optional = true }
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 async-stream = { workspace = true, optional = true }
 async-trait.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
-datafusion-table-providers = { workspace = true }
 datafusion.workspace = true
+datafusion-table-providers = { workspace = true }
 dyn-clone = { version = "1.0.17", optional = true }
 futures.workspace = true
 odbc-api = { workspace = true, optional = true }
@@ -27,7 +27,7 @@ pkcs8 = { version = "0.10.2", features = [
 ], optional = true }
 secrecy.workspace = true
 serde_json = { workspace = true, optional = true }
-sha2 = { version = "0.10.8", optional = true }
+sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
@@ -36,7 +36,7 @@ tracing.workspace = true
 util = { path = "../util" }
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [features]
 clickhouse = [
@@ -44,7 +44,10 @@ clickhouse = [
   "arrow_sql_gen/clickhouse",
   "dep:async-stream",
 ]
-duckdb = ["datafusion-table-providers/duckdb", "datafusion-table-providers/duckdb-federation"]
+duckdb = [
+  "datafusion-table-providers/duckdb",
+  "datafusion-table-providers/duckdb-federation",
+]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = [
   "dep:odbc-api",
@@ -58,7 +61,10 @@ postgres = [
   "dep:tokio",
   "dep:async-stream",
   "datafusion-table-providers/postgres",
-  "datafusion-table-providers/postgres-federation"
+  "datafusion-table-providers/postgres-federation",
 ]
 snowflake = ["dep:snowflake-api", "dep:pkcs8", "dep:serde_json"]
-sqlite = ["datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]
+sqlite = [
+  "datafusion-table-providers/sqlite",
+  "datafusion-table-providers/sqlite-federation",
+]

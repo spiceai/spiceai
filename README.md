@@ -203,15 +203,16 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Accelerators
 
-| Name       | Description                      | Status            | Engine Modes     |
-| ---------- | -------------------------------- | ----------------- | ---------------- |
-| `arrow`    | [In-Memory Arrow Records][arrow] | Stable            | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]        | Stable            | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate | N/A              |
-| `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate | `memory`, `file` |
-| `turso`    | Embedded [Turso][turso]          | Alpha             | `memory`, `file` |
+| Name       | Description                      | Status               | Engine Modes     |
+| ---------- | -------------------------------- | -------------------- | ---------------- |
+| `arrow`    | [In-Memory Arrow Records][arrow] | Stable               | `memory`         |
+| `cayenne`  | [Cayenne][cayenne]               | Alpha (v1.9.0-rc.1+) | `file`           |
+| `duckdb`   | Embedded [DuckDB][duckdb]        | Stable               | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate    | N/A              |
+| `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate    | `memory`, `file` |
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
+[cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
 [duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
 [postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
 [sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite

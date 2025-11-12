@@ -22,7 +22,13 @@ use tonic::{
 
 use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 
-pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status: CacheStatus) {
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
+
+pub fn attach_cache_metadata<T>(
+    response: &mut Response<T>,
+    results_cache_status: CacheStatus,
+    context: &RequestContext,
+) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         response.metadata_mut().insert("x-cache", val);
     }
@@ -30,12 +36,48 @@ pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status
     if let Some(val) = status_to_results_cache_value(results_cache_status) {
         response.metadata_mut().insert("results-cache-status", val);
     }
+
+    // Add Cache-Control response metadata with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The results-cache-status metadata will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(metadata_value) = cache_control_value.parse() {
+                response
+                    .metadata_mut()
+                    .insert("cache-control", metadata_value);
+            } else {
+                tracing::warn!(
+                    "Failed to parse cache-control metadata value: {}",
+                    cache_control_value
+                );
+            }
+        }
+    }
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<MetadataValue<Ascii>> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
@@ -48,6 +90,7 @@ fn status_to_results_cache_value(
         CacheStatus::CacheHit => "HIT".parse().ok(),
         CacheStatus::CacheMiss => "MISS".parse().ok(),
         CacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        CacheStatus::CacheStaleWhileRevalidate => "STALE".parse().ok(),
         CacheStatus::CacheDisabled => None,
     }
 }

@@ -43,8 +43,10 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	rtcontext "github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
+	"github.com/spiceai/spiceai/bin/spice/pkg/history"
 	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/input"
+	"github.com/spiceai/spiceai/bin/spice/pkg/sqlcompleter"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -289,11 +291,48 @@ func runCloudREPL(cmd *cobra.Command, apiKey string) error {
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 
-	// Use the consolidated REPL
-	return runREPL("spice-cloud", cloudExecutor)
+	// Create metadata fetcher for autocomplete
+	cloudMetadataFetcher := func(ctx context.Context, query string) ([]string, error) {
+		reader, err := spiceClient.Query(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Release()
+
+		var results []string
+		for reader.Next() {
+			record := reader.Record()
+			if record.NumCols() == 0 {
+				continue
+			}
+
+			// Get the first column
+			col := record.Column(0)
+
+			// Convert to string array
+			if stringArray, ok := col.(*array.String); ok {
+				for i := 0; i < stringArray.Len(); i++ {
+					if !stringArray.IsNull(i) {
+						results = append(results, stringArray.Value(i))
+					}
+				}
+			}
+		}
+
+		if err := reader.Err(); err != nil {
+			return nil, err
+		}
+
+		return results, nil
+	}
+
+	// Use the consolidated REPL with metadata support
+	return runREPLWithMetadata("spice-cloud", cloudExecutor, cloudMetadataFetcher)
 }
 
 func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint string) error {
@@ -365,34 +404,111 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 
-	// Use the consolidated REPL
-	return runREPL(grpcEndpoint, grpcExecutor)
+	// Create metadata fetcher for autocomplete
+	metadataFetcher := func(ctx context.Context, query string) ([]string, error) {
+		reader, err := spiceClient.Query(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Release()
+
+		var results []string
+		for reader.Next() {
+			record := reader.Record()
+			if record.NumCols() == 0 {
+				continue
+			}
+
+			// Get the first column
+			col := record.Column(0)
+
+			// Convert to string array
+			if stringArray, ok := col.(*array.String); ok {
+				for i := 0; i < stringArray.Len(); i++ {
+					if !stringArray.IsNull(i) {
+						results = append(results, stringArray.Value(i))
+					}
+				}
+			}
+		}
+
+		if err := reader.Err(); err != nil {
+			return nil, err
+		}
+
+		return results, nil
+	}
+
+	// Use the consolidated REPL with metadata support
+	return runREPLWithMetadata(grpcEndpoint, grpcExecutor, metadataFetcher)
 }
 
-// runREPL provides a common REPL experience for all SQL execution modes
-func runREPL(endpoint string, executor QueryExecutor) error {
-	return runREPLWithHealth(endpoint, executor, 0, false)
+// runREPLWithMetadata provides a common REPL experience with metadata fetching support
+func runREPLWithMetadata(endpoint string, executor QueryExecutor, metadataFetcher sqlcompleter.MetadataFetcher) error {
+	return runREPLWithHealthAndMetadata(endpoint, executor, metadataFetcher, 0, false)
 }
 
 // runREPLWithHealth provides a common REPL experience with optional health check info
 func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration time.Duration, healthOk bool) error {
+	return runREPLWithHealthAndMetadata(endpoint, executor, nil, checkDuration, healthOk)
+}
+
+// runREPLWithHealthAndMetadata provides a common REPL experience with optional health check info and metadata fetching
+func runREPLWithHealthAndMetadata(endpoint string, executor QueryExecutor, metadataFetcher sqlcompleter.MetadataFetcher, checkDuration time.Duration, healthOk bool) error {
 	fmt.Println("Welcome to the Spice.ai SQL REPL! Type 'help' for help.")
 	fmt.Println()
 	if endpoint == "spice-cloud" {
 		fmt.Println("Connected to Spice Cloud")
 	}
 
+	// Initialize history manager
+	historyMgr, err := history.NewManager(history.QueryHistory)
+	if err != nil {
+		slog.Warn("failed to initialize query history", "error", err)
+		historyMgr = nil
+	}
+
 	// Setup liner for REPL
 	line := liner.NewLiner()
 	line.SetCtrlCAborts(true)
 	defer func() {
+		// Save history before closing
+		if historyMgr != nil {
+			if err := historyMgr.Save(); err != nil {
+				slog.Warn("failed to save query history", "error", err)
+			}
+		}
 		if err := line.Close(); err != nil {
 			slog.Error("closing line", "error", err)
 		}
 	}()
+
+	// Load history into liner and setup SQL-aware completer
+	if historyMgr != nil {
+		historyMgr.LoadIntoLiner(line)
+
+		// Create SQL-aware completer
+		sqlComp := sqlcompleter.New()
+		sqlComp.SetHistoryCompleter(historyMgr.GetCompleter())
+
+		// Set metadata fetcher if provided
+		if metadataFetcher != nil {
+			sqlComp.SetMetadataFetcher(metadataFetcher)
+			// Perform initial metadata refresh synchronously to ensure autocomplete works immediately
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := sqlComp.RefreshMetadata(ctx); err != nil {
+				slog.Debug("failed to refresh metadata for autocomplete", "error", err)
+			}
+			cancel()
+		}
+
+		line.SetCompleter(sqlComp.Complete)
+	}
 
 	// Set up signal handling for query cancellation
 	sigChan := make(chan os.Signal, 1)
@@ -403,6 +519,7 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 	var queryMutex sync.Mutex
 	var cancelQuery context.CancelFunc
 	var isQueryRunning bool
+	var exitRequested bool
 
 	// Handle signals in a goroutine
 	go func() {
@@ -412,12 +529,35 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 				// Cancel the running query
 				cancelQuery()
 				fmt.Println("\nQuery cancelled.")
+				exitRequested = false // Reset exit request after cancelling query
+			} else {
+				// Not running a query, exit on next Ctrl+C
+				if exitRequested {
+					// Second Ctrl+C, force exit
+					fmt.Println("\nForce exiting...")
+					if historyMgr != nil {
+						_ = historyMgr.Save()
+					}
+					os.Exit(0)
+				}
+				exitRequested = true
+				fmt.Println("\nPress Ctrl+C again to exit, or continue entering commands.")
 			}
 			queryMutex.Unlock()
 		}
 	}()
 
 	for {
+		// Check if exit was requested
+		queryMutex.Lock()
+		shouldExit := exitRequested
+		queryMutex.Unlock()
+
+		if shouldExit {
+			fmt.Println()
+			return nil
+		}
+
 		// Multi-line input support: read lines until we get a semicolon or special command
 		queryStr, err := input.ReadMultiLineInput(line, "sql> ")
 		if err == io.EOF {
@@ -434,8 +574,37 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		}
 
 		if strings.ToLower(queryStr) == "help" {
-			fmt.Println("Enter SQL queries to execute against the remote Spice instance.")
+			fmt.Println("Available commands:")
+			fmt.Println()
+			fmt.Println("  .exit, exit, quit, q - Exit the REPL")
+			fmt.Println("  .error               - Show details of the last error")
+			fmt.Println("  .clear               - Clear the screen")
+			fmt.Println("  .clear history       - Clear the query history")
+			fmt.Println("  help                 - Show this help message")
+			fmt.Println()
+			fmt.Println("Other lines will be interpreted as SQL")
+			fmt.Println()
 			fmt.Println("Press Ctrl+C to cancel a running query or Ctrl+D to exit.")
+			continue
+		}
+
+		if strings.ToLower(queryStr) == ".clear" {
+			// Clear the screen using ANSI escape codes
+			fmt.Print("\033[H\033[2J")
+			continue
+		}
+
+		if strings.ToLower(queryStr) == ".clear history" {
+			if historyMgr != nil {
+				historyMgr.Clear()
+				if err := historyMgr.Save(); err != nil {
+					fmt.Printf("\033[31mError:\033[0m Failed to clear history: %v\n", err)
+				} else {
+					fmt.Println("Query history cleared.")
+				}
+			} else {
+				fmt.Println("History is not available.")
+			}
 			continue
 		}
 
@@ -444,6 +613,14 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		}
 
 		line.AppendHistory(queryStr)
+
+		// Add to persistent history and save immediately
+		if historyMgr != nil {
+			historyMgr.Add(queryStr)
+			if err := historyMgr.Save(); err != nil {
+				slog.Warn("failed to save query history", "error", err)
+			}
+		}
 
 		// Create a cancellable context for this query
 		var queryContext context.Context
@@ -574,6 +751,8 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows%s. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, cachedStr, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 

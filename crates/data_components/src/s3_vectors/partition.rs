@@ -124,10 +124,10 @@ impl PartitionedIndexName {
     #[must_use]
     pub fn to_index_name(&self) -> String {
         [
-            self.index_name.clone(),
-            self.column_name_hash.clone(),
-            self.partition_by_hash.clone(),
-            self.partition_value_hash.clone(),
+            self.index_name.as_str(),
+            self.column_name_hash.as_str(),
+            self.partition_by_hash.as_str(),
+            self.partition_value_hash.as_str(),
         ]
         .join(PARTS_SEPARATOR)
     }
