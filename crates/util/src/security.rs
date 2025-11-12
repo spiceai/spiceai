@@ -22,7 +22,7 @@ limitations under the License.
 //! - Malicious filenames with special characters
 //! - SQL injection via unquoted table identifiers
 
-use datafusion::{common::utils::quote_identifier, sql::TableReference};
+use datafusion::sql::TableReference;
 use std::path::Path;
 
 /// The maximum safe nesting depth for JSON values.
@@ -132,13 +132,14 @@ pub fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), Strin
 /// Safely quotes a table reference for use in SQL queries, preventing SQL injection.
 ///
 /// This function handles all forms of table references (bare, partial, full) and properly
-/// quotes each component using `DataFusion`'s `quote_identifier`. This prevents SQL injection
-/// attacks where malicious table names could break out of identifier context.
+/// quotes each component by wrapping them in double quotes and escaping any embedded quotes.
+/// This prevents SQL injection attacks where malicious table names could break out of
+/// identifier context.
 ///
 /// # Security Guarantees
 ///
 /// - Prevents SQL injection via malicious table/schema/catalog names
-/// - Properly escapes special characters and SQL keywords
+/// - Properly escapes embedded double quotes by doubling them (SQL standard)
 /// - Handles multi-part identifiers (catalog.schema.table) correctly
 ///
 /// # Arguments
@@ -169,13 +170,18 @@ pub fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), Strin
 /// ```
 #[must_use = "quoted table reference must be used in SQL queries to prevent injection"]
 pub fn quote_table_reference(tbl: &TableReference) -> String {
+    /// Quotes a single identifier with double quotes, escaping any embedded quotes.
+    fn quote_part(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+
     match tbl {
-        TableReference::Bare { table } => quote_identifier(table.as_ref()).to_string(),
+        TableReference::Bare { table } => quote_part(table.as_ref()),
         TableReference::Partial { schema, table } => {
             format!(
                 "{}.{}",
-                quote_identifier(schema.as_ref()),
-                quote_identifier(table.as_ref())
+                quote_part(schema.as_ref()),
+                quote_part(table.as_ref())
             )
         }
         TableReference::Full {
@@ -185,9 +191,9 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
         } => {
             format!(
                 "{}.{}.{}",
-                quote_identifier(catalog.as_ref()),
-                quote_identifier(schema.as_ref()),
-                quote_identifier(table.as_ref())
+                quote_part(catalog.as_ref()),
+                quote_part(schema.as_ref()),
+                quote_part(table.as_ref())
             )
         }
     }
@@ -379,33 +385,30 @@ mod tests {
     #[test]
     fn test_quote_table_reference_bare() {
         let tbl = TableReference::bare("users");
-        assert_eq!(quote_table_reference(&tbl), "\"users\"");
+        assert_eq!(quote_table_reference(&tbl), r#""users""#);
 
         let tbl = TableReference::bare("my_table");
-        assert_eq!(quote_table_reference(&tbl), "\"my_table\"");
+        assert_eq!(quote_table_reference(&tbl), r#""my_table""#);
     }
 
     #[test]
     fn test_quote_table_reference_partial() {
         let tbl = TableReference::partial("public", "users");
-        assert_eq!(quote_table_reference(&tbl), "\"public\".\"users\"");
+        assert_eq!(quote_table_reference(&tbl), r#""public"."users""#);
 
         let tbl = TableReference::partial("my_schema", "my_table");
-        assert_eq!(quote_table_reference(&tbl), "\"my_schema\".\"my_table\"");
+        assert_eq!(quote_table_reference(&tbl), r#""my_schema"."my_table""#);
     }
 
     #[test]
     fn test_quote_table_reference_full() {
         let tbl = TableReference::full("catalog", "public", "users");
-        assert_eq!(
-            quote_table_reference(&tbl),
-            "\"catalog\".\"public\".\"users\""
-        );
+        assert_eq!(quote_table_reference(&tbl), r#""catalog"."public"."users""#);
 
         let tbl = TableReference::full("my_cat", "my_schema", "my_table");
         assert_eq!(
             quote_table_reference(&tbl),
-            "\"my_cat\".\"my_schema\".\"my_table\""
+            r#""my_cat"."my_schema"."my_table""#
         );
     }
 

@@ -127,7 +127,7 @@ snapshot_kind: text
           "properties": {
             "additional_columns": {
               "default": [],
-              "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
+              "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\nreturned within the response under `.primary_key`, not `.data`.",
               "items": {
                 "type": "string"
               },
