@@ -54,9 +54,6 @@ assignees: ''
      - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `bench`
        - All other values left empty.
-   - [ ] Verify [E2E Test CLI](https://github.com/spicehq/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
-     - Parameters: Branch: `trunk`
-     - Build CLI: `true`
    - [ ] Verify [Throughput Tests](https://github.com/spicehq/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
      - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `throughput`
@@ -93,12 +90,11 @@ assignees: ''
 
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spicehq/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1-enterprise`). Leave the body empty so automation can populate it from the checked-in notes.
+- [ ] After both [build_and_release](https://github.com/spicehq/spiceai/actions/workflows/build_and_release.yml) and [build_and_release_cuda](https://github.com/spicehq/spiceai/actions/workflows/build_and_release_cuda.yml) workflows complete successfully, trigger the [spiced_docker_enterprise](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker_enterprise.yml) workflow.
 
-### Post-Docker builds
+### Post-Docker Build Steps
 
-Upon the completion of the [spiced_docker](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) run associated with the above create Github release:
-
-- [ ] Ensure the [docker image build](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker.yml) is completed and the image [was promoted](https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml) to all stamps and environments
+- [ ] Ensure the [spiced_docker_enterprise](https://github.com/spicehq/spiceai/actions/workflows/spiced_docker_enterprise.yml) is completed and the image [was promoted](https://github.com/spicehq/ai-platform/actions/workflows/publish-spiceai-enterprise.yaml) to all stamps and environments
 - [ ] Ask @lukekim, @phillipleblanc, or @ewgenius to add released tag to the `versions` and `default_tag` in [SCP Config in Vercel](https://vercel.com/spice/~/stores/edge-config/ecfg_pbglo8zol8rij7koia8ijd6t2fwe/items) for **dev**.
 - [ ] Deploy the new docker image to several apps in dev [SCP](https://dev.spice.ai/). Confirm upgrade and functionality.
   - [ ] SQL Query
