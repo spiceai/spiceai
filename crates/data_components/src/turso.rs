@@ -104,6 +104,7 @@ use arrow::{
     },
 };
 use async_trait::async_trait;
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use std::ops::ControlFlow;
 
 use datafusion::{
@@ -477,6 +478,7 @@ pub struct TursoTableProvider {
     schema: SchemaRef,
     table_name: String,
     pool: Arc<TursoConnectionPool>,
+    pub(crate) function_support: Option<FunctionSupport>,
 }
 
 impl TursoTableProvider {
@@ -492,7 +494,14 @@ impl TursoTableProvider {
             schema,
             table_name,
             pool,
+            function_support: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 
     /// Converts Turso database rows to Arrow RecordBatch, matching the exact schema types.

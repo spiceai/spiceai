@@ -28,6 +28,8 @@ pub enum CacheStatus {
     CacheHit,
     // The request was a cache miss.
     CacheMiss,
+    // The request was a cache hit, but the entry is stale and being revalidated in the background.
+    CacheStaleWhileRevalidate,
 }
 
 impl CacheStatus {
@@ -38,6 +40,7 @@ impl CacheStatus {
             CacheStatus::CacheBypass => Some("BYPASS".to_string()),
             CacheStatus::CacheHit => Some("HIT".to_string()),
             CacheStatus::CacheMiss => Some("MISS".to_string()),
+            CacheStatus::CacheStaleWhileRevalidate => Some("STALE".to_string()),
         }
     }
 }

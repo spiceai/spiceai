@@ -8,9 +8,8 @@ description: "Query: clickbench_q22"
 | logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                                    |
 |               |   Projection: hits.SearchPhrase, min(hits.URL), count(Int64(1)) AS c                                                                                                  |
 |               |     Aggregate: groupBy=[[hits.SearchPhrase]], aggr=[[min(hits.URL), count(Int64(1))]]                                                                                 |
-|               |       BytesProcessedNode                                                                                                                                              |
-|               |         Filter: hits.URL LIKE LargeUtf8("%google%") AND hits.SearchPhrase != LargeUtf8("")                                                                            |
-|               |           TableScan: hits projection=[URL, SearchPhrase]                                                                                                              |
+|               |       Filter: hits.URL LIKE LargeUtf8("%google%") AND hits.SearchPhrase != LargeUtf8("")                                                                              |
+|               |         TableScan: hits projection=[URL, SearchPhrase]                                                                                                                |
 | physical_plan | SortPreservingMergeExec: [c@2 DESC], fetch=10                                                                                                                         |
 |               |   SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]                                                                                             |
 |               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(hits.URL)@1 as min(hits.URL), count(Int64(1))@2 as c]                                                   |
@@ -18,10 +17,10 @@ description: "Query: clickbench_q22"
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                   |
 |               |           RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                                                               |
 |               |             AggregateExec: mode=Partial, gby=[SearchPhrase@1 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]                                                  |
-|               |               BytesProcessedExec                                                                                                                                      |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
-|               |                   FilterExec: URL@0 LIKE %google% AND SearchPhrase@1 !=                                                                                               |
-|               |                     SchemaCastScanExec                                                                                                                                |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |                 FilterExec: URL@0 LIKE %google% AND SearchPhrase@1 !=                                                                                                 |
+|               |                   SchemaCastScanExec                                                                                                                                  |
+|               |                     BytesProcessedExec                                                                                                                                |
 |               |                       DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                                       |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+

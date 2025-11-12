@@ -62,6 +62,7 @@ impl From<TruncateError> for DataFusionError {
         DataFusionError::External(val.to_string().into())
     }
 }
+pub static TRUNCATE_SCALAR_UDF_NAME: &str = "truncate";
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Truncate {
@@ -114,7 +115,7 @@ impl ScalarUDFImpl for Truncate {
     }
 
     fn name(&self) -> &'static str {
-        "truncate"
+        TRUNCATE_SCALAR_UDF_NAME
     }
 
     fn signature(&self) -> &Signature {

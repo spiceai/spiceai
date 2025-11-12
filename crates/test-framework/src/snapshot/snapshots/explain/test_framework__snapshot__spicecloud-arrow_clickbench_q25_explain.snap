@@ -8,17 +8,16 @@ description: "Query: clickbench_q25"
 | logical_plan  | Projection: hits.SearchPhrase                                                                                                                                   |
 |               |   Sort: to_timestamp(hits.EventTime) ASC NULLS LAST, fetch=10                                                                                                   |
 |               |     Projection: hits.SearchPhrase, hits.EventTime                                                                                                               |
-|               |       BytesProcessedNode                                                                                                                                        |
-|               |         Filter: hits.SearchPhrase != LargeUtf8("")                                                                                                              |
-|               |           TableScan: hits projection=[EventTime, SearchPhrase]                                                                                                  |
+|               |       Filter: hits.SearchPhrase != LargeUtf8("")                                                                                                                |
+|               |         TableScan: hits projection=[EventTime, SearchPhrase]                                                                                                    |
 | physical_plan | ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase]                                                                                                           |
 |               |   SortPreservingMergeExec: [to_timestamp(EventTime@1) ASC NULLS LAST], fetch=10                                                                                 |
 |               |     SortExec: TopK(fetch=10), expr=[to_timestamp(EventTime@1) ASC NULLS LAST], preserve_partitioning=[true]                                                     |
 |               |       ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, EventTime@0 as EventTime]                                                                           |
-|               |         BytesProcessedExec                                                                                                                                      |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
-|               |             FilterExec: SearchPhrase@1 !=                                                                                                                       |
-|               |               SchemaCastScanExec                                                                                                                                |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |           FilterExec: SearchPhrase@1 !=                                                                                                                         |
+|               |             SchemaCastScanExec                                                                                                                                  |
+|               |               BytesProcessedExec                                                                                                                                |
 |               |                 DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                                 |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------+

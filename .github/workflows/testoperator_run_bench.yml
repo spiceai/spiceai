@@ -154,15 +154,7 @@ jobs:
 
       - name: Install Oracle ODPI-C
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libaio1
-
-          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
-          mkdir linux
-          unzip basic.zip -d linux -x "META-INF/*"
-          IC_DIR=$PWD/$(ls -d linux/instantclient*)
-          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
+        uses: ./.github/actions/setup-oracle-odpi
 
       - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}

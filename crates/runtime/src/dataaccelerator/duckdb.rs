@@ -24,7 +24,7 @@ use crate::{
         view::View,
     },
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    datafusion::dialect::new_duckdb_dialect,
+    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
@@ -121,7 +121,8 @@ impl DuckDBAccelerator {
                         .with_setting(Box::new(settings::IndexScanPercentage))
                         .with_setting(Box::new(settings::IndexScanMaxCount))
                         .with_setting(Box::new(settings::TimeZone)),
-                ),
+                )
+                .with_function_support(deny_spice_specific_functions()),
         }
     }
 
@@ -506,6 +507,7 @@ pub(crate) async fn create_table_provider(
     on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
+
     let table_provider = duckdb_factory
         .create(&ctx.state(), cmd)
         .await

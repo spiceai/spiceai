@@ -17,9 +17,9 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::{TestType, queries::QuerySet};
+use test_framework::TestType;
 
-use super::dataset::QueryOverridesArg;
+use super::dataset::{QueryOverridesArg, QuerySetArg};
 
 use super::HttpTestArgs;
 
@@ -94,7 +94,7 @@ pub struct DispatchTests {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
-    pub query_set: QuerySet,
+    pub query_set: QuerySetArg,
     pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,

@@ -797,23 +797,31 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
 // Public wrappers for benchmarking with standard hasher
 #[cfg(feature = "bench")]
 pub mod bench_wrappers {
-    use super::*;
-    use std::collections::hash_map::RandomState;
+    use std::collections::{HashSet, hash_map::RandomState};
+
+    use super::{
+        RecordBatch, Result,
+        check_and_filter_non_null_unique_primary_keys as check_and_filter_pks_impl,
+        check_and_filter_unique_constraint as check_constraint_impl,
+        extract_primary_keys_str as extract_pks_impl, filter_existing as filter_existing_impl,
+    };
 
     /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
+    #[allow(clippy::implicit_hasher)]
     pub fn check_and_filter_non_null_unique_primary_keys(
         pks: &[Option<String>],
         existing_pks: Option<&HashSet<String>>,
     ) -> Result<HashSet<String>> {
-        super::check_and_filter_non_null_unique_primary_keys::<RandomState>(pks, existing_pks)
+        check_and_filter_pks_impl::<RandomState>(pks, existing_pks)
     }
 
     /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
+    #[allow(clippy::implicit_hasher)]
     pub fn check_and_filter_unique_constraint(
         ids: &[&str],
         existing_ids: Option<&HashSet<String>>,
     ) -> Result<HashSet<String>> {
-        super::check_and_filter_unique_constraint::<RandomState>(ids, existing_ids)
+        check_constraint_impl::<RandomState>(ids, existing_ids)
     }
 
     /// Public wrapper for benchmarking `extract_primary_keys_str`
@@ -821,16 +829,17 @@ pub mod bench_wrappers {
         batch: &RecordBatch,
         pk_indices_ordered: &[usize],
     ) -> Result<Vec<Option<String>>> {
-        super::extract_primary_keys_str(batch, pk_indices_ordered)
+        extract_pks_impl(batch, pk_indices_ordered)
     }
 
     /// Public wrapper for benchmarking `filter_existing`
+    #[allow(clippy::implicit_hasher)]
     pub fn filter_existing(
         existing_batches: &mut Vec<RecordBatch>,
         overwriting_primary_keys: &HashSet<String>,
         pk_indices_ordered: &[usize],
     ) -> Result<()> {
-        super::filter_existing::<RandomState>(
+        filter_existing_impl::<RandomState>(
             existing_batches,
             overwriting_primary_keys,
             pk_indices_ordered,

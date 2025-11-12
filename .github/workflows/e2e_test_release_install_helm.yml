@@ -1,0 +1,363 @@
+name: E2E Test Release Installation (Helm)
+
+on:
+  workflow_dispatch:
+    inputs:
+      helm_version:
+        description: 'Helm version to test (e.g., v3.13.0, v3.14.0, or "latest")'
+        required: false
+        default: 'latest'
+        type: string
+      chart_version:
+        description: 'Spice Chart version to test (e.g., 1.9.0-unstable, or "latest" for latest release)'
+        required: false
+        default: 'latest'
+        type: string
+      platform_option:
+        description: 'Which platform to run on?'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'Linux x64'
+          - 'Linux aarch64'
+        default: 'all'
+
+jobs:
+  setup-matrix:
+    name: Setup matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v8
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "spiceai-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                name: "Linux aarch64",
+                runner: "hosted-linux-arm-runner",
+                target_os: "linux",
+                target_arch: "aarch64"
+              }
+            ];
+
+            const platform_option = context.payload.inputs.platform_option || 'all';
+            let filtered = matrix;
+
+            if (platform_option !== 'all') {
+              filtered = filtered.filter(m => m.name === platform_option);
+            }
+
+            return filtered;
+
+  test-helm-install:
+    name: ${{ matrix.target.name }}
+    runs-on: ${{ matrix.target.runner }}
+    needs: setup-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - name: System info
+        run: |
+          uname -m
+          echo "OS: $(uname -s)"
+          echo "Arch: $(uname -m)"
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # The aarch64 runner does not have tools pre-installed
+      - name: Install missing tools (aarch64)
+        if: matrix.target.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      # Install kubectl
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${{ matrix.target.target_arch == 'x86_64' && 'amd64' || 'arm64' }}/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          kubectl version --client
+
+      # Install kind (Kubernetes in Docker)
+      - name: Install kind
+        run: |
+          # For Linux ARM64, we need to use a compatible release
+          if [ "${{ matrix.target.target_arch }}" = "aarch64" ]; then
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-arm64
+          else
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          fi
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      # Install Helm
+      - name: Install Helm (latest)
+        if: inputs.helm_version == 'latest' || inputs.helm_version == ''
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Install Helm (specific version)
+        if: inputs.helm_version != 'latest' && inputs.helm_version != ''
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --version ${{ inputs.helm_version }}
+          helm version
+
+      # Create kind cluster
+      - name: Create kind cluster
+        run: |
+          kind create cluster --name spice-test --wait 300s
+          kubectl cluster-info --context kind-spice-test
+          kubectl get nodes
+
+      # Wait for cluster to be ready
+      - name: Wait for cluster ready
+        run: |
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+      # Determine chart version to install
+      - name: Determine chart version
+        id: chart-version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHART_VERSION="${{ inputs.chart_version }}"
+          
+          if [ "$CHART_VERSION" = "latest" ] || [ -z "$CHART_VERSION" ]; then
+            # Get latest release tag from GitHub
+            RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
+            echo "Using latest release version: $RELEASE_VERSION"
+            echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            echo "source=github-release" >> $GITHUB_OUTPUT
+          else
+            echo "Using specified version: $CHART_VERSION"
+            echo "version=$CHART_VERSION" >> $GITHUB_OUTPUT
+            echo "source=local" >> $GITHUB_OUTPUT
+          fi
+
+      # Package local chart (for testing unreleased versions or local chart)
+      - name: Package local chart
+        if: steps.chart-version.outputs.source == 'local'
+        run: |
+          cd deploy/chart
+          helm package .
+          CHART_FILE=$(ls spiceai-*.tgz)
+          echo "CHART_FILE=$CHART_FILE" >> $GITHUB_ENV
+          echo "Packaged chart: $CHART_FILE"
+
+      # Install Spice using Helm (from local chart)
+      - name: Install Spice with Helm (local chart)
+        if: steps.chart-version.outputs.source == 'local'
+        run: |
+          helm install spice-test ./deploy/chart/${{ env.CHART_FILE }} \
+            --namespace spice-system \
+            --create-namespace \
+            --set image.repository=ghcr.io/spiceai/spiceai \
+            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set replicaCount=1 \
+            --set service.type=ClusterIP \
+            --wait \
+            --timeout 5m
+
+      # Install Spice using Helm (from GitHub release)
+      - name: Install Spice with Helm (GitHub release)
+        if: steps.chart-version.outputs.source == 'github-release'
+        run: |
+          # For released versions, we would use the Helm repository
+          # For now, package the local chart and override the image tag
+          cd deploy/chart
+          helm package .
+          CHART_FILE=$(ls spiceai-*.tgz)
+          cd ../..
+          
+          helm install spice-test ./deploy/chart/$CHART_FILE \
+            --namespace spice-system \
+            --create-namespace \
+            --set image.repository=ghcr.io/spiceai/spiceai \
+            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set replicaCount=1 \
+            --set service.type=ClusterIP \
+            --wait \
+            --timeout 5m
+
+      # Verify deployment
+      - name: Verify deployment
+        run: |
+          echo "Checking deployment status..."
+          kubectl get deployments -n spice-system
+          kubectl get pods -n spice-system
+          kubectl get services -n spice-system
+          
+          # Wait for pod to be ready
+          kubectl wait --for=condition=Ready pod -l app=spice-test -n spice-system --timeout=300s
+
+      # Check pod logs
+      - name: Check pod logs
+        if: always()
+        run: |
+          echo "=== Pod Logs ==="
+          kubectl logs -l app=spice-test -n spice-system --tail=100 || true
+
+      # Test health endpoint
+      - name: Test health endpoint
+        run: |
+          POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
+          echo "Testing health endpoint on pod: $POD_NAME"
+          
+          # Port forward in background
+          kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
+          PF_PID=$!
+          
+          # Wait for port forward to be ready
+          sleep 5
+          
+          # Test health endpoint
+          for i in {1..30}; do
+            if curl -s http://localhost:8090/health | grep -q "ok"; then
+              echo "Health check passed!"
+              kill $PF_PID || true
+              exit 0
+            fi
+            echo "Attempt $i: Health check not ready yet..."
+            sleep 2
+          done
+          
+          kill $PF_PID || true
+          echo "Health check failed after 30 attempts"
+          exit 1
+
+      # Test ready endpoint
+      - name: Test ready endpoint
+        run: |
+          POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
+          echo "Testing ready endpoint on pod: $POD_NAME"
+          
+          # Port forward in background
+          kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
+          PF_PID=$!
+          
+          # Wait for port forward to be ready
+          sleep 5
+          
+          # Test ready endpoint
+          for i in {1..30}; do
+            if curl -s http://localhost:8090/v1/ready | grep -q "ready"; then
+              echo "Ready check passed!"
+              kill $PF_PID || true
+              exit 0
+            fi
+            echo "Attempt $i: Ready check not ready yet..."
+            sleep 2
+          done
+          
+          kill $PF_PID || true
+          echo "Ready check failed after 30 attempts"
+          exit 1
+
+      # Test SQL query endpoint
+      - name: Test SQL query endpoint
+        run: |
+          POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
+          echo "Testing SQL query endpoint on pod: $POD_NAME"
+          
+          # Port forward in background
+          kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
+          PF_PID=$!
+          
+          # Wait for port forward to be ready
+          sleep 5
+          
+          # Test simple SQL query
+          RESPONSE=$(curl -s -X POST http://localhost:8090/v1/sql \
+            -H "Content-Type: application/json" \
+            -d '{"query": "SELECT 1 as test"}')
+          
+          echo "Query response: $RESPONSE"
+          
+          if echo "$RESPONSE" | jq -e '.[] | select(.test == 1)' > /dev/null; then
+            echo "SQL query test passed!"
+            kill $PF_PID || true
+            exit 0
+          else
+            echo "SQL query test failed!"
+            kill $PF_PID || true
+            exit 1
+          fi
+
+      # Verify Helm release status
+      - name: Verify Helm release
+        run: |
+          helm list -n spice-system
+          helm status spice-test -n spice-system
+          
+          # Check if release is deployed
+          if helm status spice-test -n spice-system | grep -q "STATUS: deployed"; then
+            echo "Helm release is deployed successfully!"
+          else
+            echo "Helm release deployment failed!"
+            exit 1
+          fi
+
+      # Test Helm upgrade (verify chart can be upgraded)
+      - name: Test Helm upgrade
+        run: |
+          echo "Testing Helm upgrade..."
+          
+          # Upgrade with same values (should be idempotent)
+          helm upgrade spice-test ./deploy/chart \
+            --namespace spice-system \
+            --set image.repository=ghcr.io/spiceai/spiceai \
+            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set replicaCount=1 \
+            --set service.type=ClusterIP \
+            --wait \
+            --timeout 5m
+          
+          # Verify upgrade succeeded
+          if helm status spice-test -n spice-system | grep -q "STATUS: deployed"; then
+            echo "Helm upgrade test passed!"
+          else
+            echo "Helm upgrade test failed!"
+            exit 1
+          fi
+
+      # Cleanup - Get final status before deletion
+      - name: Get final status
+        if: always()
+        run: |
+          echo "=== Final Deployment Status ==="
+          kubectl get all -n spice-system || true
+          echo "=== Final Pod Description ==="
+          kubectl describe pods -n spice-system || true
+          echo "=== Final Pod Logs ==="
+          kubectl logs -l app=spice-test -n spice-system --tail=200 || true
+
+      # Cleanup - Uninstall Helm release
+      - name: Uninstall Helm release
+        if: always()
+        run: |
+          helm uninstall spice-test -n spice-system || true
+          kubectl delete namespace spice-system || true
+
+      # Cleanup - Delete kind cluster
+      - name: Delete kind cluster
+        if: always()
+        run: |
+          kind delete cluster --name spice-test || true

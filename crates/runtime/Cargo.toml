@@ -136,6 +136,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
+scopeguard = "1.2.0"
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -223,11 +224,13 @@ cluster = [
     "dep:ballista-scheduler",
     "dep:ballista-executor",
     "dep:datafusion-proto",
+    "runtime-datafusion/cluster",
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
+    "cluster",
     "keyring-secret-store",
     "aws-secrets-manager",
     "sharepoint",
