@@ -8617,7 +8617,7 @@ dependencies = [
  "reqwest",
  "reqwest-eventsource",
  "runtime-rate-control",
- "schemars 1.0.4",
+ "schemars 1.1.0",
  "secrecy",
  "serde",
  "serde_json",
@@ -13026,7 +13026,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "s3_vectors",
  "scheduler",
- "schemars 1.0.4",
+ "schemars 1.1.0",
  "scopeguard",
  "search",
  "secrecy",
@@ -13773,13 +13773,13 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.0.5"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1317c3bf3e7df961da95b0a56a172a02abead31276215a0497241a7624b487ce"
+checksum = "9558e172d4e8533736ba97870c4b2cd63f84b382a3d6eb063da41b91cce17289"
 dependencies = [
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.0.4",
+ "schemars_derive 1.1.0",
  "serde",
  "serde_json",
 ]
@@ -13798,9 +13798,9 @@ dependencies = [
 
 [[package]]
 name = "schemars_derive"
-version = "1.0.4"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33d020396d1d138dc19f1165df7545479dcd58d93810dc5d646a16e55abefa80"
+checksum = "301858a4023d78debd2353c7426dc486001bddc91ae31a76fb1f55132f7e2633"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14171,7 +14171,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.12.0",
  "schemars 0.9.0",
- "schemars 1.0.5",
+ "schemars 1.1.0",
  "serde_core",
  "serde_json",
  "serde_with_macros",
@@ -14675,7 +14675,7 @@ dependencies = [
  "futures",
  "object_store",
  "regex",
- "schemars 1.0.4",
+ "schemars 1.1.0",
  "serde",
  "serde-value",
  "serde_json",
@@ -14690,7 +14690,7 @@ dependencies = [
 name = "spicepodschema"
 version = "1.9.0-unstable"
 dependencies = [
- "schemars 1.0.4",
+ "schemars 1.1.0",
  "serde_json",
  "spicepod",
 ]
@@ -15673,7 +15673,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.0",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark",
