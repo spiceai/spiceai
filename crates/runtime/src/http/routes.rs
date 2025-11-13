@@ -59,7 +59,7 @@ use super::{metrics, v1};
 use axum::{
     Extension,
     body::Body,
-    extract::{DefaultBodyLimit, MatchedPath},
+    extract::MatchedPath,
     http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
@@ -188,17 +188,16 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 }
 
 // Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
-// Applied at two levels:
-// 1. DEFAULT_REQUEST_BODY_LIMIT (10 MiB) - for authenticated endpoints (queries, chat, embeddings, evals)
-//    Applied per-route to enforce stricter limits on user-facing endpoints
-// 2. MAX_BODY_SIZE (128 MiB) - global limit for all routes, including unauthenticated endpoints (e.g., health checks)
-//    Applied to the entire router to prevent any request from exceeding this size
-//    The global MAX_BODY_SIZE is intentionally set much higher than DEFAULT_REQUEST_BODY_LIMIT to ensure
-//    unauthenticated endpoints (such as health checks) can accept large payloads if needed (e.g., for cluster probes,
-//    diagnostics, or compatibility with external systems). Authenticated endpoints are more strictly limited to reduce
-//    risk of abuse. If you change these limits, review threat models and DoS risk for all endpoints.
-const DEFAULT_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MiB
-const MAX_BODY_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
+// Applied at three levels:
+// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for authenticated endpoints (queries, chat, embeddings, evals)
+//    Applied per-route to allow reasonable payload sizes for SQL INSERT operations and LLM requests
+// 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
+//    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
+// 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
+//    Applied to unauthenticated routes to prevent DoS via health check endpoints
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
+const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
+const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
@@ -297,6 +296,13 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let _cancellation_token =
             sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+
+        // Apply MCP-specific request body limit before merging
+        tracing::info!(
+            "MCP request body size limit set to {} bytes",
+            MCP_REQUEST_BODY_LIMIT
+        );
+        let mcp_router = mcp_router.route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -323,7 +329,8 @@ pub(crate) fn routes(
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
-        .layer(Extension(Arc::clone(&rt.status)));
+        .layer(Extension(Arc::clone(&rt.status)))
+        .route_layer(RequestBodyLimitLayer::new(HEALTH_REQUEST_BODY_LIMIT));
 
     unauthenticated_router
         .merge(authenticated_router)
@@ -334,7 +341,6 @@ pub(crate) fn routes(
         ))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
 }
 
 async fn track_metrics(
