@@ -120,7 +120,7 @@ impl Embed {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let first_embedding = embedding.first().ok_or_else(|| {
-            DataFusionError::Internal(
+            DataFusionError::Execution(
                 "Embedding model returned empty result for input text (contract violation)"
                     .to_string(),
             )
