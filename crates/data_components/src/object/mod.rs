@@ -169,10 +169,12 @@ mod tests {
         let result = ObjectStoreContext::try_new(store, &url, Some(long_pattern));
 
         assert!(result.is_err());
-        assert!(result
-            .expect_err("should be an error")
-            .to_string()
-            .contains("too long"));
+        assert!(
+            result
+                .expect_err("should be an error")
+                .to_string()
+                .contains("too long")
+        );
     }
 
     #[test]
