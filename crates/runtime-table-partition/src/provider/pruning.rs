@@ -17,6 +17,19 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_schema::{Field, Schema};
+
+// Constants for bucket enumeration limits
+const MAX_BUCKET_ENUMERATION_I32: i32 = 10_000;
+const MAX_BUCKET_ENUMERATION_I64: i64 = 10_000;
+
+// Constants for date_trunc granularity calculations
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
+const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
+const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
+const NANOS_PER_WEEK: i64 = 7 * NANOS_PER_DAY;
+const NANOS_PER_MONTH: i64 = 30 * NANOS_PER_DAY; // Approximate
+const NANOS_PER_YEAR: i64 = 365 * NANOS_PER_DAY; // Approximate
 use datafusion::{
     common::{
         Column, ToDFSchema as _,
@@ -438,7 +451,8 @@ fn evaluate_inequality(
 }
 
 /// Special handler for bucket inequality that needs access to all filters to determine bounded ranges.
-/// This is called from prune_partition when we detect a bucket expression.
+/// This is called from `prune_partition` when we detect a bucket expression.
+#[allow(clippy::too_many_lines)]
 fn evaluate_bucket_inequality(
     filters: &[Expr],
     col: &Column,
@@ -484,92 +498,102 @@ fn evaluate_bucket_inequality(
         // Only handle integer types for now (can extend to other types)
         match (&lower, &upper) {
             (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(u))) => {
-                let start = if lower_inc { *l } else { l + 1 };
-                let end = if upper_inc { *u } else { u - 1 };
+                #[allow(clippy::items_after_statements, clippy::cast_sign_loss)]
+                {
+                    let start = if lower_inc { *l } else { l + 1 };
+                    let end = if upper_inc { *u } else { u - 1 };
 
-                // Early exit if range is invalid
-                if start > end {
-                    return Ok(true); // Prune - empty range
-                }
-
-                // Limit enumeration to reasonable range to avoid performance issues
-                const MAX_ENUMERATION: i32 = 10_000;
-                if end - start > MAX_ENUMERATION {
-                    return Ok(false); // Conservative: don't prune for very large ranges
-                }
-
-                // Use vectorized approach: build array once
-                use datafusion::arrow::array::Int32Array;
-                let range_size = (end - start + 1) as usize;
-                let values: Int32Array = (start..=end).collect();
-
-                // Extract partition value for fast comparison (avoid repeated ScalarValue operations)
-                let target_bucket = if let ScalarValue::Int32(Some(pv)) = partition_value {
-                    *pv
-                } else {
-                    return Ok(false); // Conservative if partition value isn't Int32
-                };
-
-                // Batch process: check if any value hashes to target bucket
-                // Loop is SIMD-friendly (compiler can auto-vectorize value access)
-                for i in 0..range_size {
-                    let hashed = call(
-                        func,
-                        vec![
-                            bucket_count.clone(),
-                            ScalarValue::Int32(Some(values.value(i))),
-                        ],
-                    )?;
-                    if let ScalarValue::Int32(Some(h)) = hashed
-                        && h == target_bucket
-                    {
-                        return Ok(false); // Early exit - found matching bucket
+                    // Early exit if range is invalid
+                    if start > end {
+                        return Ok(true); // Prune - empty range
                     }
+
+                    // Limit enumeration to reasonable range to avoid performance issues
+                    if end - start > MAX_BUCKET_ENUMERATION_I32 {
+                        return Ok(false); // Conservative: don't prune for very large ranges
+                    }
+
+                    // Use vectorized approach: build array once
+                    use datafusion::arrow::array::Int32Array;
+
+                    let range_size = (end - start + 1) as usize;
+                    let values: Int32Array = (start..=end).collect();
+
+                    // Extract partition value for fast comparison (avoid repeated ScalarValue operations)
+                    let target_bucket = if let ScalarValue::Int32(Some(pv)) = partition_value {
+                        *pv
+                    } else {
+                        return Ok(false); // Conservative if partition value isn't Int32
+                    };
+
+                    // Batch process: check if any value hashes to target bucket
+                    // Loop is SIMD-friendly (compiler can auto-vectorize value access)
+                    for i in 0..range_size {
+                        let hashed = call(
+                            func,
+                            vec![
+                                bucket_count.clone(),
+                                ScalarValue::Int32(Some(values.value(i))),
+                            ],
+                        )?;
+                        if let ScalarValue::Int32(Some(h)) = hashed
+                            && h == target_bucket
+                        {
+                            return Ok(false); // Early exit - found matching bucket
+                        }
+                    }
+                    return Ok(true); // Prune - no values in range hash to this partition
                 }
-                return Ok(true); // Prune - no values in range hash to this partition
             }
             (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(u))) => {
-                let start = if lower_inc { *l } else { l + 1 };
-                let end = if upper_inc { *u } else { u - 1 };
+                #[allow(
+                    clippy::items_after_statements,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation
+                )]
+                {
+                    let start = if lower_inc { *l } else { l + 1 };
+                    let end = if upper_inc { *u } else { u - 1 };
 
-                // Early exit if range is invalid
-                if start > end {
-                    return Ok(true); // Prune - empty range
-                }
-
-                const MAX_ENUMERATION: i64 = 10_000;
-                if end - start > MAX_ENUMERATION {
-                    return Ok(false);
-                }
-
-                // Use vectorized approach: build array once
-                use datafusion::arrow::array::Int64Array;
-                let range_size = (end - start + 1) as usize;
-                let values: Int64Array = (start..=end).collect();
-
-                // Extract partition value for fast comparison
-                let target_bucket = if let ScalarValue::Int32(Some(pv)) = partition_value {
-                    *pv
-                } else {
-                    return Ok(false); // Conservative if partition value isn't Int32
-                };
-
-                // Batch process with early exit
-                for i in 0..range_size {
-                    let hashed = call(
-                        func,
-                        vec![
-                            bucket_count.clone(),
-                            ScalarValue::Int64(Some(values.value(i))),
-                        ],
-                    )?;
-                    if let ScalarValue::Int32(Some(h)) = hashed
-                        && h == target_bucket
-                    {
-                        return Ok(false); // Early exit - found matching bucket
+                    // Early exit if range is invalid
+                    if start > end {
+                        return Ok(true); // Prune - empty range
                     }
+
+                    if end - start > MAX_BUCKET_ENUMERATION_I64 {
+                        return Ok(false);
+                    }
+
+                    // Use vectorized approach: build array once
+                    use datafusion::arrow::array::Int64Array;
+
+                    let range_size = (end - start + 1) as usize;
+                    let values: Int64Array = (start..=end).collect();
+
+                    // Extract partition value for fast comparison
+                    let target_bucket = if let ScalarValue::Int32(Some(pv)) = partition_value {
+                        *pv
+                    } else {
+                        return Ok(false); // Conservative if partition value isn't Int32
+                    };
+
+                    // Batch process with early exit
+                    for i in 0..range_size {
+                        let hashed = call(
+                            func,
+                            vec![
+                                bucket_count.clone(),
+                                ScalarValue::Int64(Some(values.value(i))),
+                            ],
+                        )?;
+                        if let ScalarValue::Int32(Some(h)) = hashed
+                            && h == target_bucket
+                        {
+                            return Ok(false); // Early exit - found matching bucket
+                        }
+                    }
+                    return Ok(true);
                 }
-                return Ok(true);
             }
             _ => {}
         }
@@ -580,8 +604,8 @@ fn evaluate_bucket_inequality(
 }
 
 /// Evaluates inequality for modulo partitions using statistics-based pruning.
-/// For col % divisor = partition_value, the values that map to this partition form
-/// an arithmetic sequence: partition_value, partition_value + divisor, partition_value + 2*divisor, ...
+/// For col % divisor = `partition_value`, the values that map to this partition form
+/// an arithmetic sequence: `partition_value`, `partition_value` + divisor, `partition_value` + 2*divisor, ...
 /// We can prune if we know the filter range doesn't contain any values from this sequence.
 fn evaluate_modulo_inequality(
     divisor: &ScalarValue,
@@ -648,7 +672,7 @@ fn evaluate_modulo_inequality(
 }
 
 /// Evaluates inequality for truncate(step, col) partitions.
-/// Partition value represents range [partition_value, partition_value + step).
+/// Partition value represents range [`partition_value`, `partition_value` + step).
 fn evaluate_truncate_inequality(
     step: &ScalarValue,
     partition_value: &ScalarValue,
@@ -664,8 +688,7 @@ fn evaluate_truncate_inequality(
         ) => {
             let partition_upper = pv + s;
             let overlaps = match op {
-                Operator::Gt => partition_upper > *fv,
-                Operator::GtEq => partition_upper > *fv,
+                Operator::Gt | Operator::GtEq => partition_upper > *fv,
                 Operator::Lt => *pv < *fv,
                 Operator::LtEq => *pv <= *fv,
                 _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
@@ -679,8 +702,7 @@ fn evaluate_truncate_inequality(
         ) => {
             let partition_upper = pv + s;
             let overlaps = match op {
-                Operator::Gt => partition_upper > *fv,
-                Operator::GtEq => partition_upper > *fv,
+                Operator::Gt | Operator::GtEq => partition_upper > *fv,
                 Operator::Lt => *pv < *fv,
                 Operator::LtEq => *pv <= *fv,
                 _ => return Err(DataFusionError::Plan("Unsupported operator".to_string())),
@@ -717,7 +739,7 @@ fn evaluate_truncate_inequality(
     Ok(!overlaps) // Prune if no overlap
 }
 
-/// Evaluates inequality for date_trunc(granularity, col) partitions.
+/// Evaluates inequality for `date_trunc(granularity`, col) partitions.
 /// Partition value represents the start of a temporal range based on granularity.
 fn evaluate_date_trunc_inequality(
     granularity: &ScalarValue,
@@ -728,15 +750,6 @@ fn evaluate_date_trunc_inequality(
     let ScalarValue::Utf8(Some(gran)) = granularity else {
         return Ok(false); // Conservative: don't prune if granularity not a string
     };
-
-    // Precomputed constants for common granularities (compiler will optimize)
-    const NANOS_PER_SECOND: i64 = 1_000_000_000;
-    const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
-    const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
-    const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
-    const NANOS_PER_WEEK: i64 = 7 * NANOS_PER_DAY;
-    const NANOS_PER_MONTH: i64 = 30 * NANOS_PER_DAY; // Approximate
-    const NANOS_PER_YEAR: i64 = 365 * NANOS_PER_DAY; // Approximate
 
     // Extract timestamp from partition_value
     let partition_ts = match partition_value {
@@ -1666,6 +1679,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn test_prune_partition_modulo_all_operators() -> Result<(), DataFusionError> {
         // Test all inequality operators with modulo - should correctly prune based on value ranges
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
@@ -1694,6 +1708,7 @@ mod tests {
         // Greater than or equal: a >= 25
         // Partition 5: 25, 35, 45... satisfy -> should NOT prune
         // Partition 3: 33, 43, 53... satisfy -> should NOT prune
+        #[allow(clippy::similar_names)]
         let filters_gte = &[col("a").gt_eq(lit(25))];
         assert!(!prune_partition(
             &filters_gte[..],
@@ -1711,6 +1726,7 @@ mod tests {
         // Less than: a < 20
         // Partition 5: 5, 15 satisfy -> should NOT prune
         // Partition 3: 3, 13 satisfy -> should NOT prune
+        #[allow(clippy::similar_names)]
         let filters_lt = &[col("a").lt(lit(20))];
         assert!(!prune_partition(
             &filters_lt[..],
@@ -1728,6 +1744,7 @@ mod tests {
         // Less than or equal: a <= 15
         // Partition 5: 5, 15 satisfy -> should NOT prune
         // Partition 3: 3, 13 satisfy -> should NOT prune
+        #[allow(clippy::similar_names)]
         let filters_lte = &[col("a").lt_eq(lit(15))];
         assert!(!prune_partition(
             &filters_lte[..],

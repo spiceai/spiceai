@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -34,9 +37,11 @@ use runtime_table_partition::{
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+type PartitionsData = Arc<RwLock<Vec<(ScalarValue, Arc<dyn TableProvider>)>>>;
+
 #[derive(Debug)]
 struct MockCreator {
-    partitions_data: Arc<RwLock<Vec<(ScalarValue, Arc<dyn TableProvider>)>>>,
+    partitions_data: PartitionsData,
 }
 
 #[async_trait]
@@ -75,11 +80,13 @@ fn create_test_batch(region: &str, size: usize) -> RecordBatch {
         Field::new("region", DataType::Utf8, false),
     ]));
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let ids: Vec<i32> = (0..size as i32).collect();
     let id_array = Arc::new(Int32Array::from(ids));
     let region_array = Arc::new(StringArray::from(vec![region; size]));
 
-    RecordBatch::try_new(schema, vec![id_array, region_array]).expect("failed to create test batch")
+    RecordBatch::try_new(schema, vec![id_array, region_array])
+        .unwrap_or_else(|e| panic!("failed to create test batch: {e}"))
 }
 
 fn create_provider_with_partitions(
@@ -93,13 +100,13 @@ fn create_provider_with_partitions(
 
     let partitions_data: Vec<_> = (0..num_partitions)
         .map(|i| {
-            let region = format!("region-{}", i);
+            let region = format!("region-{i}");
             let batch = create_test_batch(&region, rows_per_partition);
             (
                 ScalarValue::Utf8(Some(region)),
                 Arc::new(
                     MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-                        .expect("failed to create MemTable"),
+                        .unwrap_or_else(|e| panic!("failed to create MemTable: {e}")),
                 ) as Arc<dyn TableProvider>,
             )
         })
@@ -114,11 +121,12 @@ fn create_provider_with_partitions(
         expression: col("region"),
     };
 
-    let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
     rt.block_on(async {
         PartitionTableProvider::new(creator, vec![partition_by], schema)
             .await
-            .expect("failed to create provider")
+            .unwrap_or_else(|e| panic!("failed to create provider: {e}"))
     })
 }
 
@@ -145,13 +153,13 @@ fn create_provider_with_bucket_partitions(
                     Arc::new(Int32Array::from(user_ids)),
                 ],
             )
-            .expect("failed to create batch");
+            .unwrap_or_else(|e| panic!("failed to create batch: {e}"));
 
             (
                 ScalarValue::Int32(Some(i as i32)),
                 Arc::new(
                     MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-                        .expect("failed to create MemTable"),
+                        .unwrap_or_else(|e| panic!("failed to create MemTable: {e}")),
                 ) as Arc<dyn TableProvider>,
             )
         })
@@ -170,15 +178,16 @@ fn create_provider_with_bucket_partitions(
     });
 
     let partition_by = PartitionedBy {
-        name: format!("bucket_{}_user_id", num_partitions),
+        name: format!("bucket_{num_partitions}_user_id"),
         expression: partition_expr,
     };
 
-    let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
     rt.block_on(async {
         PartitionTableProvider::new(creator, vec![partition_by], schema)
             .await
-            .expect("failed to create provider")
+            .unwrap_or_else(|e| panic!("failed to create provider: {e}"))
     })
 }
 
@@ -190,16 +199,19 @@ fn bench_scan_no_filters(c: &mut Criterion) {
         let session_state = datafusion::execution::context::SessionContext::new().state();
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_partitions", num_partitions)),
+            BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(tokio::runtime::Runtime::new().expect("failed to create runtime"))
-                    .iter(|| async {
-                        provider
-                            .scan(&session_state, None, &[], None)
-                            .await
-                            .expect("scan failed")
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
+                )
+                .iter(|| async {
+                    provider
+                        .scan(&session_state, None, &[], None)
+                        .await
+                        .unwrap_or_else(|e| panic!("scan failed: {e}"))
+                });
             },
         );
     }
@@ -216,18 +228,21 @@ fn bench_scan_with_pruning(c: &mut Criterion) {
         let filters = vec![col("region").eq(lit("region-0"))];
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_partitions", num_partitions)),
+            BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(tokio::runtime::Runtime::new().expect("failed to create runtime"))
-                    .iter(|| async {
-                        black_box(
-                            provider
-                                .scan(&session_state, None, &filters, None)
-                                .await
-                                .expect("scan failed"),
-                        )
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
+                )
+                .iter(|| async {
+                    black_box(
+                        provider
+                            .scan(&session_state, None, &filters, None)
+                            .await
+                            .unwrap_or_else(|e| panic!("scan failed: {e}")),
+                    )
+                });
             },
         );
     }
@@ -252,18 +267,21 @@ fn bench_scan_with_complex_expression(c: &mut Criterion) {
         let filters = vec![partition_expr.eq(lit(0i32))];
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_partitions", num_partitions)),
+            BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(tokio::runtime::Runtime::new().expect("failed to create runtime"))
-                    .iter(|| async {
-                        black_box(
-                            provider
-                                .scan(&session_state, None, &filters, None)
-                                .await
-                                .expect("scan failed"),
-                        )
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
+                )
+                .iter(|| async {
+                    black_box(
+                        provider
+                            .scan(&session_state, None, &filters, None)
+                            .await
+                            .unwrap_or_else(|e| panic!("scan failed: {e}")),
+                    )
+                });
             },
         );
     }
@@ -280,18 +298,21 @@ fn bench_scan_prune_all(c: &mut Criterion) {
         let filters = vec![col("region").eq(lit("nonexistent-region"))];
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_partitions", num_partitions)),
+            BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(tokio::runtime::Runtime::new().expect("failed to create runtime"))
-                    .iter(|| async {
-                        black_box(
-                            provider
-                                .scan(&session_state, None, &filters, None)
-                                .await
-                                .expect("scan failed"),
-                        )
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
+                )
+                .iter(|| async {
+                    black_box(
+                        provider
+                            .scan(&session_state, None, &filters, None)
+                            .await
+                            .unwrap_or_else(|e| panic!("scan failed: {e}")),
+                    )
+                });
             },
         );
     }
@@ -308,18 +329,21 @@ fn bench_scan_with_projection(c: &mut Criterion) {
         let projection = vec![0]; // Only project the id column
 
         group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_partitions", num_partitions)),
+            BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(tokio::runtime::Runtime::new().expect("failed to create runtime"))
-                    .iter(|| async {
-                        black_box(
-                            provider
-                                .scan(&session_state, Some(&projection), &[], None)
-                                .await
-                                .expect("scan failed"),
-                        )
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
+                )
+                .iter(|| async {
+                    black_box(
+                        provider
+                            .scan(&session_state, Some(&projection), &[], None)
+                            .await
+                            .unwrap_or_else(|e| panic!("scan failed: {e}")),
+                    )
+                });
             },
         );
     }

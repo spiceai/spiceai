@@ -284,9 +284,11 @@ mod tests {
         scalar::ScalarValue,
     };
 
+    type PartitionsData = Arc<RwLock<Vec<(ScalarValue, Arc<dyn TableProvider>)>>>;
+
     #[derive(Debug)]
     struct MockCreator {
-        partitions_data: Arc<RwLock<Vec<(ScalarValue, Arc<dyn TableProvider>)>>>,
+        partitions_data: PartitionsData,
     }
 
     #[async_trait]

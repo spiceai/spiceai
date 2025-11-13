@@ -1229,6 +1229,7 @@ async fn test_truncate_partition_inequality_snapshot() -> Result<(), Box<dyn std
         let start = truncated_value;
         let end = truncated_value + 999;
         let sales: Vec<i64> = (start..=end).step_by(100).collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ids: Vec<i32> = (0..sales.len() as i32).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1320,6 +1321,7 @@ async fn test_date_trunc_partition_inequality_snapshot() -> Result<(), Box<dyn s
             .map(|hour| partition_ts + hour * 3600 * 1_000_000_000)
             .collect();
         let ids: Vec<i32> = (0..24).collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let values: Vec<i32> = vec![idx as i32 * 100; 24];
 
         let batch = RecordBatch::try_new(
