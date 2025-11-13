@@ -20,10 +20,33 @@ pub mod filter;
 pub mod metadata;
 pub mod text;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use object_store::{ObjectMeta, ObjectStore};
 use regex::Regex;
 use snafu::ResultExt;
+use std::sync::LazyLock;
 use url::Url;
+
+/// Glob patterns for detecting dangerous regex patterns (`ReDoS`)
+const DANGEROUS_REGEX_PATTERNS: &[&str] = &[
+    "*)+*",   // Nested quantifier: ()+ followed by another quantifier
+    "*)**",   // Nested quantifier: ()* followed by another quantifier
+    "*}+*",   // Nested quantifier: {n,m}+ pattern
+    "*}**",   // Nested quantifier: {n,m}* pattern
+    "*(+)+*", // Direct nested: (+)+
+    "*(*)**", // Direct nested: (*)*
+];
+
+/// Pre-compiled glob set for `ReDoS` detection
+static DANGEROUS_REGEX_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in DANGEROUS_REGEX_PATTERNS {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
+});
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectStoreContext {
@@ -57,13 +80,11 @@ impl ObjectStoreContext {
                     .into());
                 }
 
-                // Additional ReDoS protection: detect dangerous patterns
+                // Additional ReDoS protection: detect dangerous patterns using pre-compiled globs
                 // Check for nested quantifiers like (a+)+ or (a*)* which cause exponential backtracking
-                // Note: This simple check may produce false positives for legitimate patterns like (foo)+bar
-                // or (a|b)*c. If a valid pattern is rejected, consider using a more specific filename filter.
-                if regex.contains(")+") || regex.contains(")*") || regex.contains("}+") || regex.contains("}*") {
+                if DANGEROUS_REGEX_GLOB_SET.is_match(&regex) {
                     return Err(
-                        "Regex pattern contains nested quantifiers which can cause exponential backtracking (ReDoS). Please simplify the pattern. Note: This check may reject some valid patterns to protect against malicious regexes."
+                        "Regex pattern contains nested quantifiers which can cause exponential backtracking (ReDoS). Please simplify the pattern."
                             .to_string()
                             .into(),
                     );

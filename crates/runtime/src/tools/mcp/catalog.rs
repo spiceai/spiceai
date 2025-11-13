@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
     model::{
@@ -28,7 +29,10 @@ use rmcp::{
     transport::{ConfigureCommandExt, SseClientTransport, TokioChildProcess},
 };
 use snafu::ResultExt;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tokio::{
     process::Command,
     sync::RwLock,
@@ -40,6 +44,29 @@ use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 use super::{Error, MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
+
+/// Glob patterns for detecting dangerous path components
+const DANGEROUS_PATH_PATTERNS: &[&str] = &[
+    "*/..*",  // Unix parent directory traversal
+    "*..*",   // Parent at start (Unix)
+    "*\\..*", // Windows parent directory traversal
+    "/.*",    // Unix current directory reference
+    "*\\.*",  // Windows current directory reference
+    "/*",     // Unix absolute path
+    "?:*",    // Windows drive letter (C:, D:, etc.)
+    "\\\\*",  // Windows UNC path
+];
+
+/// Pre-compiled glob set for path validation
+static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in DANGEROUS_PATH_PATTERNS {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
+});
 
 /// Check if a hostname is localhost
 fn is_localhost(host: &str) -> bool {
@@ -108,25 +135,14 @@ impl McpToolCatalog {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security: Validate command path to prevent command injection
-                // Use Path::components() to properly validate on all platforms (Windows/Unix)
-                // Only Normal components (file/directory names) are allowed
-                use std::path::{Component, Path};
-                let path = Path::new(command);
-                for component in path.components() {
-                    match component {
-                        Component::Normal(_) => {}
-                        Component::ParentDir
-                        | Component::CurDir
-                        | Component::RootDir
-                        | Component::Prefix(_) => {
-                            return Err(Error::CouldNotConstructTool {
-                                name: "mcp_stdio".to_string(),
-                                e: format!(
-                                    "Invalid command path '{command}'. Only relative paths with normal components allowed (no .., ., absolute paths, or drive prefixes)"
-                                ),
-                            });
-                        }
-                    }
+                // Use pre-compiled glob patterns to detect path traversal on all platforms (Windows/Unix)
+                if DANGEROUS_PATH_GLOB_SET.is_match(command) {
+                    return Err(Error::CouldNotConstructTool {
+                        name: "mcp_stdio".to_string(),
+                        e: format!(
+                            "Invalid command path '{command}'. Path contains dangerous components (path traversal, absolute paths, or special characters not allowed)"
+                        ),
+                    });
                 }
 
                 // Security: Limit number of arguments to prevent resource exhaustion
