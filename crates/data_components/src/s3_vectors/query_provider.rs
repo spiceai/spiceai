@@ -64,7 +64,6 @@ pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 /// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static S3_VECTOR_MAX_TOPK: i32 = 30;
 
-
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
 pub struct S3VectorsQueryTable {
@@ -111,7 +110,7 @@ fn create_spill_plan_query(
 
             let query_table = S3VectorsQueryTable::new(
                 index_table,
-                Arc::new(CachedQueryVector::new(Arc::clone(&table.compute_vector), table.query.clone())),
+                Arc::clone(&table.compute_vector),
                 table.query.clone(),
                 table.column_name.clone(),
                 vec![],
@@ -217,7 +216,7 @@ async fn create_partition_plan_query(
 
         let query_table = S3VectorsQueryTable::new(
             index_table,
-            Arc::new(CachedQueryVector::new(Arc::clone(&table.compute_vector), table.query.clone())),
+            Arc::clone(&table.compute_vector),
             table.query.clone(),
             table.column_name.clone(),
             vec![],

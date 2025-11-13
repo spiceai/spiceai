@@ -152,7 +152,7 @@ impl SearchQueryProvider {
         base_table_cols.extend(self.primary_key.clone());
 
         // Also include any columns needed for filters on base table.
-        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
+        base_table_cols.extend(partition_columns_missing_from(filters, search_index_schema).0);
         let base_table_cols: Vec<_> = base_table_cols.into_iter().collect();
         let mut base_proj =
             projection_from_columns(&self.table_provider.schema(), &base_table_cols);
@@ -357,13 +357,16 @@ impl SearchQueryProvider {
             .collect();
 
         let has_all_columns = search_index_columns.is_superset(&columns_requested);
-        if !has_all_columns {
-            // Early exit.
-            return Ok(false);
-        }
 
         // Ensure filters do not reference column not in search index.
-        Ok(columns_missing_from(filters, search_index_schema).is_empty())
+        let (columns_only_in_filters, filter_cols_from_search_index) =
+            partition_columns_missing_from(filters, search_index_schema);
+
+        let is_sufficient = has_all_columns && columns_only_in_filters.is_empty();
+        let columns_needed =
+            columns_requested.union(filter_cols_from_search_index.into_iter().collect());
+
+        Ok((is_sufficient, columns.into_iter().collect()))
     }
 }
 
@@ -474,11 +477,14 @@ impl TableProvider for SearchQueryProvider {
             .alias("search_index")?
             .limit(0, self.pre_limit)?;
 
-        let just_use_index = self.search_index_table_is_sufficient(
+        let (just_use_index, search_cols_to_use) = self.search_index_table_is_sufficient(
             &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
             filters,
         )?;
+        search_lp =
+            search_lp.project(search_cols_to_use.into_iter().map(|c| ident(c)).collect())?;
+
         search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
             (true, None) => search_lp.limit(0, limit)?,
             (true, Some(filter)) => search_lp.filter(filter)?.limit(0, limit)?,
