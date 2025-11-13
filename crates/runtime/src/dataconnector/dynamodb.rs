@@ -22,7 +22,6 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
-use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::fmt::Debug;

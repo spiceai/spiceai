@@ -17,11 +17,11 @@ use snafu::Snafu;
 use std::sync::Arc;
 
 mod arrow;
-mod conversion;
 pub mod provider;
 mod request_builder;
 mod request_plan;
 mod schema;
+mod stream;
 mod table_schema;
 mod unnest;
 mod utils;

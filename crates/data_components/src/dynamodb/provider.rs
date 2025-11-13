@@ -15,24 +15,18 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, DowncastBuilderSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
+    DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::arrow::struct_builder::StructBuilder;
-use crate::cdc;
-use crate::cdc::{
-    ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, changes_schema,
-};
-use crate::dynamodb::arrow::{append_item_to_struct_builder, dynamodb_items_to_arrow};
-use crate::dynamodb::conversion::streams_to_dynamodb_item;
+use crate::cdc::{ChangesStream, changes_schema};
+use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
+use crate::dynamodb::stream::process_batch;
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
-use crate::dynamodb::unnest::{unnest_dynamodb_item, unnest_dynamodb_items};
+use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
-use arrow_array::RecordBatch;
-use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder};
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
@@ -40,7 +34,6 @@ use aws_sdk_dynamodb::{
     error::SdkError,
     types::{AttributeValue, KeyType, TableStatus},
 };
-use aws_sdk_dynamodbstreams::types::OperationType;
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
 use datafusion::common::{Constraint, Constraints, DFSchema};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -240,136 +233,21 @@ impl DynamoDBTableProvider {
         }
     }
 
-    pub async fn changes_stream_from_latest(&self) -> ChangesStream {
+    #[must_use] 
+    pub fn changes_stream_from_latest(&self) -> ChangesStream {
         let record_schema = Arc::clone(self.table_schema.schema());
         let changes_schema = changes_schema(&record_schema).clone();
 
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
 
-        let stream = self.streams_client.stream_from_latest().map(move |batch| {
-
-            // TODO: What if a batch is empty?
-
-            let mut changes_struct_builder =
-                StructBuilder::from_fields(changes_schema.fields().clone(), batch.len());
-
-            for record in &batch {
-
-                let (op_str, item_data) = match (&record.event_name, &record.dynamodb) {
-                    (Some(event_name), Some(dynamodb)) => {
-                        match event_name {
-                            OperationType::Insert | OperationType::Modify => {
-                                let Some(item) = &dynamodb.new_image else {
-                                    continue;
-                                };
-                                let streams_item = streams_to_dynamodb_item(item.clone());
-
-                                let (unnested_streams_item, _) = match unnest_depth {
-                                    None => (streams_item, HashSet::new()),
-                                    Some(depth) => {
-                                        unnest_dynamodb_item(&streams_item, depth)
-                                            .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
-                                    }
-                                };
-
-                                let op = if matches!(event_name, OperationType::Insert) {
-                                    "c"
-                                } else {
-                                    "u"
-                                };
-
-                                (op, unnested_streams_item)
-                            }
-                            OperationType::Remove => {
-                                let Some(keys_item) = &dynamodb.keys else {
-                                    continue;
-                                };
-                                let streams_keys_item = streams_to_dynamodb_item(keys_item.clone());
-                                ("d", streams_keys_item)
-                            }
-                            _ => continue,
-                        }
-                    }
-                    _ => continue,
-                };
-
-                // Append row to changes struct
-                changes_struct_builder.append(true);
-
-                // Populate each field in the changes schema
-                for (idx, field) in changes_schema.fields().iter().enumerate() {
-                    let field_builder = changes_struct_builder.field_builder_array(idx);
-
-                    match field.name().as_str() {
-                        "op" => {
-                            let str_builder = downcast_builder::<StringBuilder>(field_builder)
-                                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
-                            str_builder.append_value(op_str);
-                        }
-                        "primary_keys" => {
-                            let list_builder =
-                                downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)
-                                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
-                            if primary_keys.is_empty() {
-                                list_builder.append(false);
-                            } else {
-                                let str_builder = downcast_builder::<StringBuilder>(list_builder.values())
-                                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
-                                for key in &primary_keys {
-                                    str_builder.append_value(key);
-                                }
-                                list_builder.append(true);
-                            }
-                        }
-                        "data" => {
-                            let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
-                                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
-                            append_item_to_struct_builder(&item_data, data_struct_builder)
-                                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
-                        }
-                        _ => unreachable!("Unexpected field in changes schema {}", field.name()),
-                    }
-                }
-            }
-
-            let struct_array = changes_struct_builder.finish();
-            let record_batch: RecordBatch = struct_array.into();
-
-            let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
-                unreachable!(
-                    "We constructed the record batch with the correct schema, so this shouldn't fail"
-                );
-            };
-
-            Ok(ChangeEnvelope::new(Box::new(DynamoDBStreamCommitter::new()), change_batch))
-        });
+        let stream = self
+            .streams_client
+            .stream_from_latest()
+            .map(move |batch| process_batch(&batch, &changes_schema, &primary_keys, unnest_depth));
 
         Box::pin(stream)
     }
-}
-
-struct DynamoDBStreamCommitter;
-
-impl DynamoDBStreamCommitter {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl CommitChange for DynamoDBStreamCommitter {
-    fn commit(&self) -> std::result::Result<(), CommitError> {
-        // println!("Committing changes");
-        Ok(())
-    }
-}
-
-pub(crate) fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T> {
-    let builder = builder
-        .as_any_mut()
-        .downcast_mut::<T>()
-        .context(DowncastBuilderSnafu)?;
-    Ok(builder)
 }
 
 #[async_trait]
@@ -382,12 +260,12 @@ impl TableProvider for DynamoDBTableProvider {
         Arc::clone(self.table_schema.schema())
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
     fn constraints(&self) -> Option<&Constraints> {
         self.constraints.as_ref()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
     }
 
     async fn scan(
