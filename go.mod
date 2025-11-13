@@ -3,7 +3,7 @@ module github.com/spiceai/spiceai
 go 1.25.3
 
 require (
-	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0
+	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0
 	github.com/apache/arrow/go/v17 v17.0.0
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
 	github.com/dustin/go-humanize v1.0.1
@@ -78,7 +78,7 @@ require (
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.10
 	github.com/subosito/gotenv v1.6.0 // indirect
-	golang.org/x/sys v0.37.0
+	golang.org/x/sys v0.38.0
 	golang.org/x/text v0.29.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1
 )

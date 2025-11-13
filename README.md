@@ -36,12 +36,12 @@ Spice provides four industry standard APIs in a lightweight, portable runtime (s
 
 Spice is primarily used for:
 
-- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/query-federation).
-- **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
-- **Enterprise Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and vector similarity search for structured and unstructured data.
-- **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://spiceai.org/docs/use-cases/rag).
+- **Data Federation**: SQL query across any database, data warehouse, or data lake. Deploy with single-node or distributed multi-node query execution. [Learn More](https://spiceai.org/docs/features/query-federation).
+- **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries with Arrow, DuckDB, SQLite, PostgreSQL, or Cayenne (Vortex+SQLite) for simplified multi-file acceleration. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
+- **Hybrid Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and petabyte-scale vector similarity search via Amazon S3 Vectors or pgvector for structured and unstructured data.
+- **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents with OpenAI-compatible APIs and MCP integration. [Learn More](https://spiceai.org/docs/use-cases/rag).
 
-If you want to build with DataFusion or using DuckDB, Spice provides a simple, flexible, and production-ready engine you can just use.
+If you want to build with DataFusion, DuckDB, or Vortex, Spice provides a simple, flexible, and production-ready engine you can just use.
 
 📣 Read the [Spice.ai 1.0-stable announcement](https://spiceai.org/blog/announcing-1.0-stable).
 
@@ -69,6 +69,14 @@ Spice is built-on industry leading technologies including [Apache DataFusion](ht
 </div>
 
 Spice simplifies building data-driven AI applications and agents by making it fast and easy to query, federate, and accelerate data from one or more sources using SQL, while grounding AI in real-time, reliable data. Co-locate datasets with apps and AI models to power AI feedback loops, enable RAG and search, and deliver fast, low-latency data-query and AI-inference with full control over cost and performance.
+
+### Latest Capabilities
+
+- **Spice Cayenne Data Accelerator (Beta)**: Simplified multi-file acceleration using the [Vortex columnar format](https://github.com/vortex-data/vortex) + SQLite metadata. Delivers DuckDB-comparable performance without single-file scaling limitations.
+- **Multi-Node Distributed Query (Preview)**: Scale query execution across multiple nodes with Apache Ballista integration for improved performance on large datasets.
+- **Acceleration Snapshots**: Bootstrap accelerations from S3 for fast cold starts (seconds vs. minutes). Supports ephemeral storage with persistent recovery.
+- **Iceberg Table Writes**: Write to Iceberg tables using standard SQL `INSERT INTO` for data ingestion and transformation—no Spark required.
+- **Petabyte-Scale Vector Search**: Native Amazon S3 Vectors integration manages the full vector lifecycle from ingestion to embedding to querying. SQL-integrated hybrid search with RRF.
 
 ### How is Spice different?
 
@@ -109,7 +117,7 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                 | ✅         | Limited          | Limited                       |
 | **LLM Memory**                | ✅                                       | ✅                 | ―          | ✅               | ―                             |
 | **Evaluations (Evals)**       | ✅                                       | Limited            | ―          | Limited          | ―                             |
-| **Search**                    | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                 | ✅         | Limited          | Limited                       |
+| **Hybrid Search**             | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                 | ✅         | Limited          | Limited                       |
 | **Caching**                   | ✅ (Query and results caching)           | Limited            | ―          | ―                | ―                             |
 | **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                 | ✅         | Limited          | ―                             |
 
@@ -121,21 +129,21 @@ Limited = Partial or restricted support
 
 ### Data-grounded Agentic AI Applications
 
-- **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
-- **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
-- **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows, including full-text search (FTS) via Tantivy-powered BM25 scoring and vector similarity search (VSS) integrated into SQL queries. Use SQL functions like `vector_search` for semantic search and `text_search` for keyword-based search. Supports multi-column vector search with reciprocal rank fusion for aggregated results. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
+- **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI, Amazon Bedrock) or deploy locally (Llama, NVIDIA NIM) with OpenAI Responses API support for advanced interactions. [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
+- **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval. Scale to distributed multi-node query execution with Apache Ballista. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
+- **Hybrid Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. Native Amazon S3 Vectors integration for petabyte-scale vector search. Full-text search (FTS) via Tantivy-powered BM25 and vector similarity search (VSS) integrated into SQL via `text_search` and `vector_search` UDTFs. Reciprocal rank fusion (RRF) for hybrid search. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability & Monitoring Features Documentation](https://spiceai.org/docs/features/observability)
 
 ### Database CDN and Query Mesh
 
-- **Data Acceleration**: Co-locate materialized datasets in Arrow, SQLite, and DuckDB with applications for sub-second query. [DuckDB Data Accelerator Recipe](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
-- **Resiliency and Local Dataset Replication**: Maintain application availability with local replicas of critical datasets. [Local Dataset Replication Recipe](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
-- **Responsive Dashboards**: Enable fast, real-time analytics by accelerating data for frontends and BI tools. [Sales BI Dashboard Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
+- **Data Acceleration**: Co-locate materialized datasets in Arrow, SQLite, DuckDB, PostgreSQL, or Cayenne (Vortex+SQLite) with applications for sub-second query. Bootstrap from snapshots stored in S3 for fast cold starts. Write to Iceberg tables with standard SQL `INSERT INTO`. [DuckDB Data Accelerator Recipe](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
+- **Resiliency and Local Dataset Replication**: Maintain application availability with local replicas of critical datasets. Recover from federated source outages using acceleration snapshots. [Local Dataset Replication Recipe](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
+- **Responsive Dashboards**: Enable fast, real-time analytics by accelerating data for frontends and BI tools with configurable refresh schedules. [Sales BI Dashboard Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
 - **Simplified Legacy Migration**: Use a single endpoint to unify legacy systems with modern infrastructure, including federated SQL querying across multiple sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 
 ### Retrieval-Augmented Generation (RAG)
 
-- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources, now with native support for Amazon S3 Vectors for petabyte-scale vector storage and querying. The Spice runtime manages the vector lifecycle: ingesting data from disparate sources, embedding it using models like Amazon Titan Embeddings or Cohere Embeddings via AWS Bedrock, or MiniLM L6 from HuggingFace, and storing in S3 Vector buckets. Supports distance metrics like cosine similarity, Euclidean distance, or dot product. Example SQL: `SELECT * FROM vector_search(my_table, 'search query', 10) WHERE condition ORDER BY score;`. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
+- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources with native Amazon S3 Vectors integration for petabyte-scale vector storage and querying. The Spice runtime manages the vector lifecycle: ingesting data, embedding it using AWS Bedrock (Amazon Titan, Cohere), HuggingFace models, or Model2Vec (500x faster static embeddings), and storing in S3 Vector buckets or pgvector. Supports cosine similarity, Euclidean distance, or dot product. SQL-integrated search via `vector_search` and `text_search` UDTFs with hybrid search using reciprocal rank fusion (RRF). Example: `SELECT * FROM vector_search(my_table, 'search query', 10) WHERE condition ORDER BY score;`. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://spiceai.org/docs/features/semantic-model)
 - **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
 - **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
@@ -184,11 +192,11 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
-| `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
+| `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV, JSON           |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
+| `mongodb`                          | MongoDB                               | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
-| `mongodb`                          | MongoDB                               | Coming Soon       |                              |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
@@ -203,20 +211,19 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Accelerators
 
-| Name       | Description                      | Status               | Engine Modes     |
-| ---------- | -------------------------------- | -------------------- | ---------------- |
-| `arrow`    | [In-Memory Arrow Records][arrow] | Stable               | `memory`         |
-| `cayenne`  | [Cayenne][cayenne]               | Alpha (v1.9.0-rc.1+) | `file`           |
-| `duckdb`   | Embedded [DuckDB][duckdb]        | Stable               | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate    | N/A              |
-| `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate    | `memory`, `file` |
+| Name       | Description                       | Status              | Engine Modes     |
+| ---------- | --------------------------------- | ------------------- | ---------------- |
+| `arrow`    | [In-Memory Arrow Records][arrow]  | Stable              | `memory`         |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Beta (v1.9.0-rc.2+) | `file`           |
+| `duckdb`   | Embedded [DuckDB][duckdb]         | Stable              | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate   | N/A              |
+| `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate   | `memory`, `file` |
 
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
 [duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
 [postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
 [sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite
-[turso]: https://github.com/tursodatabase/turso
 
 ## Supported Model Providers
 
@@ -227,6 +234,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
 | `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
+| `bedrock`     | Amazon Bedrock (Nova models)                 | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `anthropic`   | Models hosted on Anthropic                   | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `xai`         | Models hosted on xAI                         | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
@@ -237,6 +245,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `openai`      | OpenAI (or compatible) LLM endpoint | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
 | `file`        | Local filesystem                    | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace        | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
+| `model2vec`   | Static embeddings (500x faster)     | Release Candidate | Model2Vec    | -                               |
 | `azure`       | Azure OpenAI                        | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 | `bedrock`     | AWS Bedrock (e.g., Titan, Cohere)   | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
