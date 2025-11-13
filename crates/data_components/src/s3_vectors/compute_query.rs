@@ -45,7 +45,7 @@ impl CachedQueryVector {
     pub fn new(inner: Arc<dyn ComputeQueryVector>, query: String) -> Self {
         Self {
             inner,
-            query: Arc::from(query),
+            query: Arc::new(query),
             cached: Arc::new(OnceCell::new()),
         }
     }
