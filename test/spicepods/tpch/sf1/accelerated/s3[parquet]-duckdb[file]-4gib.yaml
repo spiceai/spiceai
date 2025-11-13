@@ -16,7 +16,7 @@ datasets:
       engine: duckdb
       mode: file
       params:
-        duckdb_memory_limit: '4GiB'
+        duckdb_memory_limit: 4GiB
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet
     name: lineitem
     params: *s3_params
