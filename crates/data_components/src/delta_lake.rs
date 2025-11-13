@@ -266,10 +266,11 @@ impl DeltaTable {
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
+        // Matches keying used by `ObjectStoreRegistry::get_url_key`
         let object_store_url = ObjectStoreUrl::parse(format!(
             "{}://{}",
             self.table_url.scheme(),
-            self.table_url.authority()
+            &self.table_url[url::Position::BeforeHost..url::Position::AfterPort]
         ))
         .context(DeltaTableExecutionSnafu)?;
 

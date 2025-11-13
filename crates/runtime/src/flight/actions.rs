@@ -201,6 +201,12 @@ pub(crate) async fn do_action(
                 )));
             }
 
+            tracing::trace!(
+                "ExpandSecret: expanding secret {} for executor {}",
+                request.key,
+                request.executor_id
+            );
+
             let Some(sctx) = context.extension::<SecretsContextExtension>() else {
                 return Err(Status::internal("Secrets context not available"));
             };

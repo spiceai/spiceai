@@ -1,22 +1,24 @@
+use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::http::v1::eval::list;
 use crate::status::ComponentStatus;
-use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
     UnableToInitializeDataConnectorSnafu,
 };
+use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::prelude::SessionConfig;
 use app::App;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
+use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::serde::BallistaCodec;
 use ballista_core::utils::create_grpc_client_connection;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
@@ -29,8 +31,6 @@ use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
-use ::datafusion::execution::SessionStateBuilder;
-use ::datafusion::prelude::SessionConfig;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;

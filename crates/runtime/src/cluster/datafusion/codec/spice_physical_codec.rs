@@ -15,8 +15,6 @@ use runtime_proto::{BytesProcessedExecNode, SchemaCastScanExecNode};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-const SPICE_EXEC_NAME: &str = "spice.exec.name";
-
 /// Serialization support for custom Spice execution nodes
 pub struct SpicePhysicalCodec {
     inner: Arc<dyn PhysicalExtensionCodec>,
