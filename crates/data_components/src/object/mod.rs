@@ -20,33 +20,10 @@ pub mod filter;
 pub mod metadata;
 pub mod text;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use object_store::{ObjectMeta, ObjectStore};
 use regex::Regex;
 use snafu::ResultExt;
-use std::sync::LazyLock;
 use url::Url;
-
-/// Glob patterns for detecting dangerous regex patterns (`ReDoS`)
-const DANGEROUS_REGEX_PATTERNS: &[&str] = &[
-    "*)+*",   // Nested quantifier: ()+ followed by another quantifier
-    "*)**",   // Nested quantifier: ()* followed by another quantifier
-    "*}+*",   // Nested quantifier: {n,m}+ pattern
-    "*}**",   // Nested quantifier: {n,m}* pattern
-    "*(+)+*", // Direct nested: (+)+
-    "*(*)**", // Direct nested: (*)*
-];
-
-/// Pre-compiled glob set for `ReDoS` detection
-static DANGEROUS_REGEX_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in DANGEROUS_REGEX_PATTERNS {
-        if let Ok(glob) = Glob::new(pattern) {
-            builder.add(glob);
-        }
-    }
-    builder.build().unwrap_or_else(|_| GlobSet::empty())
-});
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectStoreContext {
@@ -69,8 +46,10 @@ impl ObjectStoreContext {
         let (prefix, filename_regex_opt) = parse_prefix_and_regex(url, extension)?;
         let filename_regex = filename_regex_opt
             .map(|regex| {
-                // Prevent ReDoS attacks by limiting regex complexity
-                // Length check catches obviously malicious patterns
+                // The Rust `regex` crate uses a finite automaton approach that guarantees
+                // linear time complexity and is immune to catastrophic backtracking (ReDoS).
+                // However, we still limit regex length to prevent resource exhaustion during
+                // compilation and to catch obviously malicious patterns.
                 const MAX_REGEX_LENGTH: usize = 1000;
                 if regex.len() > MAX_REGEX_LENGTH {
                     return Err(format!(
@@ -78,16 +57,6 @@ impl ObjectStoreContext {
                         regex.len()
                     )
                     .into());
-                }
-
-                // Additional ReDoS protection: detect dangerous patterns using pre-compiled globs
-                // Check for nested quantifiers like (a+)+ or (a*)* which cause exponential backtracking
-                if DANGEROUS_REGEX_GLOB_SET.is_match(&regex) {
-                    return Err(
-                        "Regex pattern contains nested quantifiers which can cause exponential backtracking (ReDoS). Please simplify the pattern."
-                            .to_string()
-                            .into(),
-                    );
                 }
 
                 Regex::new(&regex).boxed()
@@ -185,5 +154,54 @@ mod tests {
         assert_eq!(prefix, "/path/to/file");
         assert_eq!(regex, Some(r"^.*\txt$".to_string()));
         Ok(())
+    }
+
+    #[test]
+    fn test_regex_length_limit() {
+        use super::*;
+        use std::sync::Arc;
+
+        // Create a very long regex pattern
+        let long_pattern = "a".repeat(1001);
+        let url = Url::parse("file:///tmp/").expect("valid url");
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let result = ObjectStoreContext::try_new(store, &url, Some(long_pattern));
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too long"));
+    }
+
+    #[test]
+    fn test_rust_regex_handles_complex_patterns() {
+        
+        use regex::Regex;
+
+        // The Rust `regex` crate uses a finite automaton that guarantees linear time
+        // and is immune to catastrophic backtracking (ReDoS). These patterns would be
+        // problematic in PCRE/JavaScript regex engines but are safe here.
+        let test_cases = vec![
+            (r"^.*(abc)+xyz$", "testabcabcxyz"), // Pattern with quantifier
+            (r"^.*(a|b)+c$", "aaabbbbc"),        // Alternation with quantifier
+            (r"^.*([a-z]+)@.*$", "user@example.com"), // Character class with quantifier
+            (r"^.*(test)+.*$", "mytesttestfile.txt"), // Multiple quantifiers
+        ];
+
+        for (pattern, test_str) in test_cases {
+            let result = Regex::new(pattern);
+            assert!(
+                result.is_ok(),
+                "Pattern '{}' should compile successfully: {:?}",
+                pattern,
+                result.err()
+            );
+
+            // Verify it actually matches the test string
+            let re = result.unwrap();
+            assert!(
+                re.is_match(test_str),
+                "Pattern '{pattern}' should match '{test_str}'"
+            );
+        }
     }
 }

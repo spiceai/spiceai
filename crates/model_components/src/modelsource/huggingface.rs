@@ -127,10 +127,10 @@ impl ModelSource for Huggingface {
                 caps["org"].to_owned(),
                 caps["model"].to_owned(),
                 revision,
-                file,
+                sanitized_file,
             );
 
-            let file_path = resolve_model_file_path(root_dir, &versioned_path, &file)?;
+            let file_path = resolve_model_file_path(root_dir, &versioned_path, &sanitized_file)?;
 
             if std::fs::metadata(&file_path).is_ok() {
                 tracing::info!(
