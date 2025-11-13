@@ -20,7 +20,6 @@ on:
         options:
           - 'all'
           - 'Linux x64'
-          - 'Linux aarch64'
         default: 'all'
 
 jobs:
@@ -42,12 +41,6 @@ jobs:
                 runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
-              },
-              {
-                name: "Linux aarch64",
-                runner: "hosted-linux-arm-runner",
-                target_os: "linux",
-                target_arch: "aarch64"
               }
             ];
 
@@ -79,17 +72,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # The aarch64 runner does not have tools pre-installed
-      - name: Install missing tools (aarch64)
-        if: matrix.target.target_arch == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl
+      # Set up Docker
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       # Install kubectl
       - name: Install kubectl
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${{ matrix.target.target_arch == 'x86_64' && 'amd64' || 'arm64' }}/kubectl"
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
           kubectl version --client
@@ -97,12 +87,7 @@ jobs:
       # Install kind (Kubernetes in Docker)
       - name: Install kind
         run: |
-          # For Linux ARM64, we need to use a compatible release
-          if [ "${{ matrix.target.target_arch }}" = "aarch64" ]; then
-            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-arm64
-          else
-            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
-          fi
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
           kind version
@@ -144,11 +129,16 @@ jobs:
             # Get latest release tag from GitHub
             RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
             echo "Using latest release version: $RELEASE_VERSION"
+            # Replace '+' with '-' for Docker image tag compatibility (Kubernetes doesn't allow + in image tags)
+            IMAGE_TAG="${RELEASE_VERSION}-models"
             echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=github-release" >> $GITHUB_OUTPUT
           else
             echo "Using specified version: $CHART_VERSION"
+            IMAGE_TAG="${CHART_VERSION}-models"
             echo "version=$CHART_VERSION" >> $GITHUB_OUTPUT
+            echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=local" >> $GITHUB_OUTPUT
           fi
 
@@ -170,7 +160,7 @@ jobs:
             --namespace spice-system \
             --create-namespace \
             --set image.repository=ghcr.io/spiceai/spiceai \
-            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set image.tag=${{ steps.chart-version.outputs.image_tag }} \
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \
@@ -191,7 +181,7 @@ jobs:
             --namespace spice-system \
             --create-namespace \
             --set image.repository=ghcr.io/spiceai/spiceai \
-            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set image.tag=${{ steps.chart-version.outputs.image_tag }} \
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \

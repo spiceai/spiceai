@@ -580,12 +580,14 @@ impl SpiceTestQueryWorker {
         &self,
         query: &Query,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
+        http_row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
     ) -> Result<()> {
         if let Some(http_client) = self.http_client.as_ref() {
             let query_start = Instant::now();
             let sql_url = format!("{HTTP_BASE_URL}{SQL_ENDPOINT}");
             let http_response = http_client
                 .post(&sql_url)
+                .header("Accept", "application/vnd.spiceai.sql.v1+json")
                 .body(query.sql.to_string())
                 .send()
                 .await?;
@@ -604,7 +606,34 @@ impl SpiceTestQueryWorker {
                 ));
             }
 
+            // Extract row count from response
+            let response_text = http_response.text().await?;
+
             let duration = query_start.elapsed();
+
+            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                if let Some(row_count) = response_json
+                    .get("row_count")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let row_count_usize = row_count as usize;
+                    http_row_counts
+                        .entry(Arc::clone(&query.name))
+                        .or_default()
+                        .push(row_count_usize);
+                } else {
+                    eprintln!(
+                        "Warning: No row_count field in HTTP response for query '{}'",
+                        query.name
+                    );
+                }
+            } else {
+                eprintln!(
+                    "Warning: Failed to parse HTTP response as JSON for query '{}'",
+                    query.name
+                );
+            }
 
             query_durations
                 .entry(Arc::clone(&query.name))
@@ -623,6 +652,8 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        let mut http_row_counts: BTreeMap<Arc<str>, Vec<usize>> = BTreeMap::new();
+
         futures::future::try_join(
             self.execute_flight(
                 query,
@@ -631,9 +662,70 @@ impl SpiceTestQueryWorker {
                 results_snapshot,
                 validate,
             ),
-            self.execute_http(query, Arc::clone(&query_durations)),
+            self.execute_http(query, Arc::clone(&query_durations), &mut http_row_counts),
         )
         .await?;
+
+        // Validate row counts if both HTTP and Flight are available
+        if let Some(http_counts) = http_row_counts.get(&query.name) {
+            if let Some(flight_counts) = row_counts.get(&query.name) {
+                // Compare the last row count from each
+                if let (Some(&http_count), Some(&flight_count)) =
+                    (http_counts.last(), flight_counts.last())
+                {
+                    // Check for zero row counts (indicates potential query execution issue)
+                    if http_count == 0 && flight_count == 0 {
+                        eprintln!(
+                            "{} FAIL - Worker {} - Query '{}' returned 0 rows in both HTTP and Flight",
+                            chrono::Utc::now(),
+                            self.id,
+                            query.name
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Worker {} - Query '{}' returned 0 rows in both HTTP and Flight",
+                            self.id,
+                            query.name
+                        ));
+                    }
+
+                    // Check if row counts match
+                    if http_count != flight_count {
+                        eprintln!(
+                            "{} FAIL - Worker {} - Query '{}' row count mismatch: HTTP={}, Flight={}",
+                            chrono::Utc::now(),
+                            self.id,
+                            query.name,
+                            http_count,
+                            flight_count
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Worker {} - Query '{}' row count mismatch between HTTP ({}) and Flight ({})",
+                            self.id,
+                            query.name,
+                            http_count,
+                            flight_count
+                        ));
+                    }
+                }
+            }
+        } else if let Some(flight_counts) = row_counts.get(&query.name) {
+            // Only Flight available, check for zero rows
+            if let Some(&flight_count) = flight_counts.last()
+                && flight_count == 0
+            {
+                eprintln!(
+                    "{} FAIL - Worker {} - Query '{}' returned 0 rows via Flight",
+                    chrono::Utc::now(),
+                    self.id,
+                    query.name
+                );
+                return Err(anyhow::anyhow!(
+                    "Worker {} - Query '{}' returned 0 rows via Flight",
+                    self.id,
+                    query.name
+                ));
+            }
+        }
 
         Ok(())
     }
