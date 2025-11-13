@@ -23,5 +23,10 @@ tokio-stream.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 insta = { workspace = true, features = ["json"] }
 tempfile.workspace = true
+
+[[bench]]
+name = "scan_benchmark"
+harness = false

@@ -199,6 +199,19 @@ pub(crate) fn prune_partition(
         match filter {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 match (left.as_ref(), op, right.as_ref()) {
+                    // Direct partition expression match: e.g., bucket(10, user_id) = 0
+                    (expr, Operator::Eq, Expr::Literal(lit, _)) if expr == partition_by => {
+                        // Direct comparison: does the partition value match the filter literal?
+                        if partition_value != lit {
+                            return Ok(true); // Prune this partition
+                        }
+                    }
+                    (Expr::Literal(lit, _), Operator::Eq, expr) if expr == partition_by => {
+                        // Direct comparison: does the partition value match the filter literal?
+                        if partition_value != lit {
+                            return Ok(true); // Prune this partition
+                        }
+                    }
                     (Expr::Column(col), Operator::Eq, Expr::Literal(lit, _))
                     | (Expr::Literal(lit, _), Operator::Eq, Expr::Column(col)) => {
                         if !filter_or_udf_value_matches(
