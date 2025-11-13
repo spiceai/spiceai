@@ -315,6 +315,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent.to_string(),
     )));
     if let Some(helper) = rl.helper_mut() {
+        // Perform initial refresh to populate autocomplete immediately with a 2-second timeout
+        let refresh_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), helper.refresh_now()).await;
+        if refresh_result.is_err() {
+            tracing::debug!("Initial autocomplete metadata refresh timed out after 2 seconds");
+        }
+        // Start background refresh task for updates
         helper.start_refreshing(300);
     }
 
