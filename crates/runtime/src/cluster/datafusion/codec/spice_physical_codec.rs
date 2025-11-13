@@ -4,28 +4,16 @@ use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use datafusion::common::{DataFusionError, Result, exec_err};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::ScalarUDF;
 use datafusion_expr::registry::FunctionRegistry;
+use datafusion_proto::generated::datafusion_common;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
-use serde_json::Value;
-use std::collections::HashMap;
+use runtime_proto::{BytesProcessedExecNode, SchemaCastScanExecNode};
 use std::fmt::Debug;
 use std::sync::Arc;
-
-macro_rules! deserialize {
-    ($map: ident, $key: expr, $t: ty) => {
-        $map.get($key)
-            .ok_or(DataFusionError::Execution(format!("{} is missing", $key)))
-            .and_then(|v| {
-                serde_json::from_value::<$t>(v.clone())
-                    .map_err(|e| DataFusionError::External(Box::new(e)))
-            })
-    };
-}
 
 const SPICE_EXEC_NAME: &str = "spice.exec.name";
 
@@ -68,56 +56,53 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             return Ok(plan);
         }
 
-        let exec_params = serde_json::from_slice::<HashMap<String, Value>>(buf)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let Ok(node) = SchemaCastScanExecNode::decode(buf) {
+            let schema = datafusion_common::Schema::decode(&*node.schema)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        match exec_params.get(SPICE_EXEC_NAME).and_then(|v| v.as_str()) {
-            Some("SchemaCastScanExec") => {
-                let schema = deserialize!(exec_params, "spice.exec.schema", Schema)?;
-                let exec = Arc::new(SchemaCastScanExec::new(
+            let exec = Arc::new(SchemaCastScanExec::new(
+                Arc::clone(&inputs[0]),
+                Arc::new(Schema::try_from(&schema)?),
+            ));
+
+            Ok(exec)
+        } else if let Ok(_) = BytesProcessedExecNode::decode(buf) {
+            Ok(Arc::new(
+                BytesProcessedExec::new(
                     Arc::clone(&inputs[0]),
-                    Arc::new(schema),
-                ));
-
-                Ok(exec)
-            }
-            Some("BytesProcessedExec") => {
-                // TODO: Make RequestContext serializable
-                Ok(Arc::new(
-                    BytesProcessedExec::new(
-                        Arc::clone(&inputs[0]),
-                        Arc::new(Box::new(track_bytes_processed)),
-                    )
-                    .fallback_to_new_context(),
-                ))
-            }
-            _ => exec_err!("Unsupported spice.exec.name"),
+                    Arc::new(Box::new(track_bytes_processed)),
+                )
+                .fallback_to_new_context(),
+            ))
+        } else {
+            exec_err!("Cannot deserialize unknown execution plan")
         }
     }
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
-        let mut map: HashMap<&str, Value> = HashMap::new();
-        map.insert(SPICE_EXEC_NAME, node.name().into());
-
         match node.name() {
             "SchemaCastScanExec" => {
                 let Some(concrete) = node.as_any().downcast_ref::<SchemaCastScanExec>() else {
                     return exec_err!("Unable to serialize plan node");
                 };
 
-                map.insert(
-                    "spice.exec.schema",
-                    serde_json::to_value(concrete.schema())
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?,
-                );
+                let mut schema_buf = vec![];
+                let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
+                serialized_schema
+                    .encode(&mut schema_buf)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                let node = SchemaCastScanExecNode { schema: schema_buf };
+                node.encode(buf)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
-            "BytesProcessedExec" => { /* no-op */ }
+            "BytesProcessedExec" => {
+                let node = BytesProcessedExecNode {};
+                node.encode(buf)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            }
             _ => return self.inner.try_encode(node, buf),
         }
-
-        let serialized =
-            serde_json::to_vec(&map).map_err(|e| DataFusionError::External(Box::new(e)))?;
-        buf.extend_from_slice(&serialized);
 
         Ok(())
     }

@@ -4676,6 +4676,7 @@ dependencies = [
  "r2d2",
  "runtime-datafusion",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -13055,6 +13056,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-proto",
  "runtime-rate-control",
  "runtime-request-context",
  "runtime-secrets",
@@ -13251,6 +13253,19 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "runtime-proto"
+version = "1.9.0-unstable"
+dependencies = [
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "datafusion-physical-plan",
+ "datafusion-proto",
+ "prost 0.13.5",
+ "prost-build",
 ]
 
 [[package]]

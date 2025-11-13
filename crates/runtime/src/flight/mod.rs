@@ -472,7 +472,7 @@ pub async fn start(
 
     #[allow(unused_mut)]
     let mut server = server
-        .layer(RequestContextLayer::new(app, rt.datafusion()))
+        .layer(RequestContextLayer::new(app, rt.datafusion(), rt.secrets()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
