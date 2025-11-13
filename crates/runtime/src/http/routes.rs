@@ -187,12 +187,16 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
-// Request body size limits to prevent DoS attacks
+// Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
 // Applied at two levels:
 // 1. DEFAULT_REQUEST_BODY_LIMIT (10 MiB) - for authenticated endpoints (queries, chat, embeddings, evals)
 //    Applied per-route to enforce stricter limits on user-facing endpoints
-// 2. MAX_BODY_SIZE (128 MiB) - global limit for all routes including unauthenticated health checks
+// 2. MAX_BODY_SIZE (128 MiB) - global limit for all routes, including unauthenticated endpoints (e.g., health checks)
 //    Applied to the entire router to prevent any request from exceeding this size
+//    The global MAX_BODY_SIZE is intentionally set much higher than DEFAULT_REQUEST_BODY_LIMIT to ensure
+//    unauthenticated endpoints (such as health checks) can accept large payloads if needed (e.g., for cluster probes,
+//    diagnostics, or compatibility with external systems). Authenticated endpoints are more strictly limited to reduce
+//    risk of abuse. If you change these limits, review threat models and DoS risk for all endpoints.
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MiB
 const MAX_BODY_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
 

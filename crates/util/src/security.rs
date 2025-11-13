@@ -208,14 +208,14 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
 /// # Security Guarantees
 ///
 /// - Prevents stack overflow from deeply nested JSON structures
-/// - Efficiently calculates depth without recursive stack consumption
+/// - Iteratively calculates depth without consuming call stack
 /// - Works with both objects and arrays at any nesting level
 ///
 /// # Performance
 ///
 /// - Time Complexity: O(n) where n is the total number of values in the JSON
-/// - Space Complexity: O(d) where d is the depth (stack frames)
-/// - Uses iterative `max()` to avoid extra allocations
+/// - Space Complexity: O(d) where d is the depth (explicit stack storage)
+/// - Uses iterative traversal to avoid recursive stack consumption
 ///
 /// # Arguments
 ///
@@ -274,23 +274,39 @@ pub fn quote_table_reference(tbl: &TableReference) -> String {
 /// ```
 #[must_use = "JSON depth must be validated to prevent stack overflow attacks"]
 pub fn get_json_depth(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                1
-            } else {
-                1 + arr.iter().map(get_json_depth).max().unwrap_or(0)
+    // Iterative implementation using an explicit stack to avoid recursion.
+    // Each stack entry is (current_value, current_depth).
+    let mut max_depth = 1;
+    let mut stack = Vec::new();
+    stack.push((value, 1));
+
+    while let Some((v, depth)) = stack.pop() {
+        match v {
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    max_depth = max_depth.max(depth);
+                } else {
+                    for item in arr {
+                        stack.push((item, depth + 1));
+                    }
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                if obj.is_empty() {
+                    max_depth = max_depth.max(depth);
+                } else {
+                    for value in obj.values() {
+                        stack.push((value, depth + 1));
+                    }
+                }
+            }
+            _ => {
+                max_depth = max_depth.max(depth);
             }
         }
-        serde_json::Value::Object(obj) => {
-            if obj.is_empty() {
-                1
-            } else {
-                1 + obj.values().map(get_json_depth).max().unwrap_or(0)
-            }
-        }
-        _ => 1,
     }
+
+    max_depth
 }
 
 #[cfg(test)]

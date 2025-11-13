@@ -115,10 +115,11 @@ RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_s
 # Create DuckDB directory in sandbox
 RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
+RUN chown -R 999:999 /spice_sandbox/.duckdb
 
 # Create HuggingFace cache directory in sandbox
 RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
-RUN chown -R 65534:65534 /spice_sandbox/.cache
+RUN chown -R 999:999 /spice_sandbox/.cache
 RUN chmod -R 755 /spice_sandbox/.cache
 
 # Create spiced user and group in sandbox
@@ -132,7 +133,7 @@ FROM scratch
 
 COPY --from=sandbox-setup /spice_sandbox/ /
 
-USER spiced
+USER 999:999
 
 EXPOSE 8090 50051
 

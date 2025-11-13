@@ -104,11 +104,7 @@ impl ServerHandler for RuntimeServer {
 
                 // Security: Validate arguments JSON depth before proxying
                 if let Some(ref args) = arguments {
-                    let depth = if args.is_empty() {
-                        1
-                    } else {
-                        1 + args.values().map(get_json_depth).max().unwrap_or(0)
-                    };
+                    let depth = get_json_depth(&Value::Object(args.clone()));
                     if depth > MAX_SAFE_JSON_DEPTH {
                         return Err(McpError::invalid_params(
                             format!(

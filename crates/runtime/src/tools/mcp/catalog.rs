@@ -124,15 +124,7 @@ impl McpToolCatalog {
                         }
                     }
                 }
-                // Reject relative paths that could be ambiguous
-                if !path.is_absolute() && path.components().count() > 1 {
-                    return Err(Error::CouldNotConstructTool {
-                        name: "mcp_stdio".to_string(),
-                        e: format!(
-                            "Invalid command path '{command}'. Only absolute paths or simple command names allowed"
-                        ),
-                    });
-                }
+                // Allow relative paths with multiple components as long as they don't contain path traversal
 
                 // Security: Limit number of arguments to prevent resource exhaustion
                 if args.len() > MAX_ARGS {

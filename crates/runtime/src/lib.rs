@@ -683,7 +683,10 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth
+            .http_auth
+            .clone()
+            .unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth));
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 

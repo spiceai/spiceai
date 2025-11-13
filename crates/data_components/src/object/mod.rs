@@ -59,9 +59,11 @@ impl ObjectStoreContext {
 
                 // Additional ReDoS protection: detect dangerous patterns
                 // Check for nested quantifiers like (a+)+ or (a*)* which cause exponential backtracking
+                // Note: This simple check may produce false positives for legitimate patterns like (foo)+bar
+                // or (a|b)*c. If a valid pattern is rejected, consider using a more specific filename filter.
                 if regex.contains(")+") || regex.contains(")*") || regex.contains("}+") || regex.contains("}*") {
                     return Err(
-                        "Regex pattern contains nested quantifiers which can cause exponential backtracking (ReDoS). Please simplify the pattern."
+                        "Regex pattern contains nested quantifiers which can cause exponential backtracking (ReDoS). Please simplify the pattern. Note: This check may reject some valid patterns to protect against malicious regexes."
                             .to_string()
                             .into(),
                     );
