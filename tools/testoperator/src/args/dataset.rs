@@ -138,15 +138,18 @@ impl From<QuerySetArg> for QuerySet {
 
 impl PartialEq<QuerySet> for QuerySetArg {
     fn eq(&self, other: &QuerySet) -> bool {
-        match (self, other) {
-            (QuerySetArg::Tpch, QuerySet::Tpch) => true,
-            (QuerySetArg::Tpcds, QuerySet::Tpcds) => true,
-            (QuerySetArg::Clickbench, QuerySet::Clickbench) => true,
-            (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch) => true,
-            (QuerySetArg::ParameterizedSaffron, QuerySet::ParameterizedSaffron) => true,
-            (QuerySetArg::Scenario, QuerySet::Scenario { .. }) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (QuerySetArg::Tpch, QuerySet::Tpch)
+                | (QuerySetArg::Tpcds, QuerySet::Tpcds)
+                | (QuerySetArg::Clickbench, QuerySet::Clickbench)
+                | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
+                | (
+                    QuerySetArg::ParameterizedSaffron,
+                    QuerySet::ParameterizedSaffron
+                )
+                | (QuerySetArg::Scenario, QuerySet::Scenario { .. })
+        )
     }
 }
 
