@@ -15,7 +15,7 @@ limitations under the License.
 */
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
-
+use std::sync::Arc;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -97,17 +97,18 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: app::App serialized as JSON bytes"
                 .into(),
     };
-    let expand_secret = FlightActionType {
+    let expand_secret_action_type = FlightActionType {
         r#type: ActionType::ExpandSecret.to_string(),
         description: "Used in cluster mode to ask the scheduler for the value of a secret\n
-            Request Message: N/A
-            Response Message: app::App serialized as JSON bytes"
+            Request Message: ExecutorExpandSecretRequest
+            Response Message: ExecutorExpandSecretResponse"
             .into(),
     };
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
         Ok(get_app_definition_action_type),
+        Ok(expand_secret_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);
@@ -167,12 +168,16 @@ pub(crate) async fn do_action(
                 return Err(Status::internal("DataFusion context not available"));
             };
 
-            let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
-                return Err(Status::internal("Cluster scheduler context cannot be read"));
-            };
+            let scheduler = {
+                let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
+                    return Err(Status::internal("Cluster scheduler context cannot be read"));
+                };
 
-            let Some(ref scheduler) = *maybe_scheduler else {
-                return Err(Status::internal("Cluster scheduler context not available"));
+                let Some(ref scheduler) = *maybe_scheduler else {
+                    return Err(Status::internal("Cluster scheduler context not available"));
+                };
+
+                Arc::clone(scheduler)
             };
 
             let request = ExecutorExpandSecretRequest::decode(&*request.get_ref().body)
