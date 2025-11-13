@@ -66,6 +66,7 @@ use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
+use vortex::session::VortexSession;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
 
@@ -408,10 +409,7 @@ impl CayenneTableProvider {
     /// allowing fine-grained control over compression vs performance tradeoffs.
     fn create_vortex_session(
         config: &super::metadata::VortexConfig,
-    ) -> vortex_session::VortexSession {
-        use vortex::VortexSessionDefault;
-        use vortex_session::VortexSession;
-
+    ) -> Arc<VortexSession> {
         // Use default session which registers all encodings
         // Note: If all encodings are enabled, this is optimal. Otherwise, the overhead
         // of unused encodings is minimal compared to the complexity of custom registration.
@@ -451,7 +449,7 @@ impl CayenneTableProvider {
             tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
         }
 
-        session
+        session.into()
     }
 
     /// Create a new `ListingTable` for a snapshot directory.
