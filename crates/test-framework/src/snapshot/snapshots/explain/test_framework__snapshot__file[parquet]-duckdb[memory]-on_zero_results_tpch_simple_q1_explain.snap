@@ -2,22 +2,21 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpch_simple_q1"
 ---
-+---------------+---------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                  |
-+---------------+---------------------------------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                            |
-|               |   BytesProcessedNode                                                                  |
-|               |     TableScan: lineitem projection=[l_orderkey]                                       |
-| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                    |
-|               |   CoalescePartitionsExec                                                              |
-|               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]              |
-|               |       BytesProcessedExec                                                              |
-|               |         SchemaCastScanExec                                                            |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1       |
-|               |             FallbackOnZeroResultsScanExec                                             |
-|               |               CoalescePartitionsExec                                                  |
-|               |                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
-|               |                   CooperativeExec                                                     |
-|               |                     DuckSqlExec sql= SELECT "l_orderkey" FROM lineitem                |
-|               |                                                                                       |
-+---------------+---------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                |
++---------------+-------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                          |
+|               |   TableScan: lineitem projection=[l_orderkey]                                       |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                  |
+|               |   CoalescePartitionsExec                                                            |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]            |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1         |
+|               |         SchemaCastScanExec                                                          |
+|               |           FallbackOnZeroResultsScanExec                                             |
+|               |             CoalescePartitionsExec                                                  |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
+|               |                 CooperativeExec                                                     |
+|               |                   BytesProcessedExec                                                |
+|               |                     DuckSqlExec sql= SELECT "l_orderkey" FROM lineitem              |
+|               |                                                                                     |
++---------------+-------------------------------------------------------------------------------------+
