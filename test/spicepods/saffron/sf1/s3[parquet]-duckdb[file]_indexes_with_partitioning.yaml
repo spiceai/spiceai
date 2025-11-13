@@ -49,3 +49,7 @@ datasets:
       mode: file
       params:
         duckdb_preserve_insertion_order: false
+      indexes:
+        AccountSid: enabled
+      partition_by:
+          - bucket(32, AccountSid)
