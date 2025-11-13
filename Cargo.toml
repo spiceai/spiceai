@@ -92,6 +92,7 @@ aws-sdk-bedrockruntime = "1.109.0"
 aws-sdk-cognitoidentity = "1.87.0"
 aws-sdk-cognitoidentityprovider = "1.100.0"
 aws-sdk-dynamodb = "1.95.0"
+aws-sdk-dynamodbstreams = "1.87.0"
 aws-sdk-glue = "1.124.0"
 aws-sdk-s3 = "1.108.0"
 aws-sdk-s3vectors = "1.11"
@@ -150,6 +151,7 @@ derive_builder = "0.20.2"
 dotenvy = "0.15"
 duckdb = "1.4.1"
 dyn-hash = "1.0.0"
+dynamo-subscriber = "0.1.1"
 fundu = "2.0.1"
 futures = "0.3.30"
 git2 = { version = "0.20", default-features = false, features = [
@@ -372,3 +374,5 @@ parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8
 turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296163b3241d6963a2e87d" }
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
+
+dynamo-subscriber = { git = "https://github.com/spiceai/dynamo-subscriber.git", rev = "8f2769dbefc789071fe8767d02d01ef7eb1a7a3b" }

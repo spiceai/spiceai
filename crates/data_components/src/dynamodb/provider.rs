@@ -15,24 +15,34 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
+    DescribeTableSnafu, DowncastBuilderSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::dynamodb::arrow::dynamodb_items_to_arrow;
+use crate::arrow::struct_builder::StructBuilder;
+use crate::cdc;
+use crate::cdc::{
+    ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, changes_schema,
+};
+use crate::dynamodb::arrow::{append_item_to_struct_builder, dynamodb_items_to_arrow};
+use crate::dynamodb::conversion::streams_to_dynamodb_item;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
-use crate::dynamodb::unnest::unnest_dynamodb_items;
+use crate::dynamodb::unnest::{unnest_dynamodb_item, unnest_dynamodb_items};
 use arrow::datatypes::SchemaRef;
+use arrow_array::RecordBatch;
+use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder};
 use async_trait::async_trait;
-use aws_sdk_dynamodb::types::KeyType;
+use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
-    Client,
+    Client as DbClient,
     error::SdkError,
-    types::{AttributeValue, TableStatus},
+    types::{AttributeValue, KeyType, TableStatus},
 };
+use aws_sdk_dynamodbstreams::types::OperationType;
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
+use datafusion::common::{Constraint, Constraints, DFSchema};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -48,18 +58,22 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use dynamo_subscriber::{Client as StreamsClient, SDKClient};
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::time::Duration;
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
-    client: Arc<Client>,
+    db_client: Arc<DbClient>,
+    streams_client: Arc<StreamsClient<SDKClient>>,
     table_schema: DynamoDBTableSchema,
+    constraints: Option<Constraints>,
     request_plan_builder: DynamoDBRequestPlanBuilder,
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
@@ -73,15 +87,22 @@ const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
     pub async fn try_new(
-        client: Arc<Client>,
+        sdk_config: SdkConfig,
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
     ) -> Result<Self, Error> {
+        let db_client = Arc::new(DbClient::new(&sdk_config));
+        let streams_client = Arc::new(
+            StreamsClient::builder(sdk_config, table_name.to_string())
+                .interval(Some(Duration::from_millis(200)))
+                .build(),
+        );
+
         let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
             Self::fetch_table_metadata(
-                Arc::clone(&client),
+                Arc::clone(&db_client),
                 &table_name,
                 unnest_depth,
                 schema_infer_max_records,
@@ -95,9 +116,31 @@ impl DynamoDBTableProvider {
             sort_key,
             flattened_fields,
         );
+
+        // Create constraints with the primary key indices
+        let Ok(df_schema) = DFSchema::try_from(Arc::clone(table_schema.schema())) else {
+            unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
+        };
+
+        let pk_indices: Vec<usize> = table_schema
+            .primary_keys()
+            .iter()
+            .filter_map(|pk| df_schema.index_of_column_by_name(None, pk))
+            .collect();
+
+        let constraints = if pk_indices.is_empty() {
+            None
+        } else {
+            Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                pk_indices,
+            )]))
+        };
+
         Ok(Self {
-            client,
+            db_client,
+            streams_client,
             table_schema: table_schema.clone(),
+            constraints,
             request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
             unnest_depth,
             config_partitions,
@@ -106,7 +149,7 @@ impl DynamoDBTableProvider {
     }
 
     async fn fetch_table_metadata(
-        client: Arc<Client>,
+        db_client: Arc<DbClient>,
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
@@ -117,7 +160,7 @@ impl DynamoDBTableProvider {
         HashSet<String>,
         Option<i64>,
     )> {
-        let response = client
+        let response = db_client
             .describe_table()
             .table_name(table_name)
             .send()
@@ -157,7 +200,7 @@ impl DynamoDBTableProvider {
             return Err(Error::MissingPartitionKey);
         };
 
-        let mut request = client.scan().table_name(table_name);
+        let mut request = db_client.scan().table_name(table_name);
 
         request = request.limit(schema_infer_max_records);
 
@@ -196,6 +239,137 @@ impl DynamoDBTableProvider {
             },
         }
     }
+
+    pub async fn changes_stream_from_latest(&self) -> ChangesStream {
+        let record_schema = Arc::clone(self.table_schema.schema());
+        let changes_schema = changes_schema(&record_schema).clone();
+
+        let primary_keys = self.table_schema.primary_keys().clone();
+        let unnest_depth = self.unnest_depth;
+
+        let stream = self.streams_client.stream_from_latest().map(move |batch| {
+
+            // TODO: What if a batch is empty?
+
+            let mut changes_struct_builder =
+                StructBuilder::from_fields(changes_schema.fields().clone(), batch.len());
+
+            for record in &batch {
+
+                let (op_str, item_data) = match (&record.event_name, &record.dynamodb) {
+                    (Some(event_name), Some(dynamodb)) => {
+                        match event_name {
+                            OperationType::Insert | OperationType::Modify => {
+                                let Some(item) = &dynamodb.new_image else {
+                                    continue;
+                                };
+                                let streams_item = streams_to_dynamodb_item(item.clone());
+
+                                let (unnested_streams_item, _) = match unnest_depth {
+                                    None => (streams_item, HashSet::new()),
+                                    Some(depth) => {
+                                        unnest_dynamodb_item(&streams_item, depth)
+                                            .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?
+                                    }
+                                };
+
+                                let op = if matches!(event_name, OperationType::Insert) {
+                                    "c"
+                                } else {
+                                    "u"
+                                };
+
+                                (op, unnested_streams_item)
+                            }
+                            OperationType::Remove => {
+                                let Some(keys_item) = &dynamodb.keys else {
+                                    continue;
+                                };
+                                let streams_keys_item = streams_to_dynamodb_item(keys_item.clone());
+                                ("d", streams_keys_item)
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+
+                // Append row to changes struct
+                changes_struct_builder.append(true);
+
+                // Populate each field in the changes schema
+                for (idx, field) in changes_schema.fields().iter().enumerate() {
+                    let field_builder = changes_struct_builder.field_builder_array(idx);
+
+                    match field.name().as_str() {
+                        "op" => {
+                            let str_builder = downcast_builder::<StringBuilder>(field_builder)
+                                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                            str_builder.append_value(op_str);
+                        }
+                        "primary_keys" => {
+                            let list_builder =
+                                downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)
+                                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                            if primary_keys.is_empty() {
+                                list_builder.append(false);
+                            } else {
+                                let str_builder = downcast_builder::<StringBuilder>(list_builder.values())
+                                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                                for key in &primary_keys {
+                                    str_builder.append_value(key);
+                                }
+                                list_builder.append(true);
+                            }
+                        }
+                        "data" => {
+                            let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
+                                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                            append_item_to_struct_builder(&item_data, data_struct_builder)
+                                .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                        }
+                        _ => unreachable!("Unexpected field in changes schema {}", field.name()),
+                    }
+                }
+            }
+
+            let struct_array = changes_struct_builder.finish();
+            let record_batch: RecordBatch = struct_array.into();
+
+            let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
+                unreachable!(
+                    "We constructed the record batch with the correct schema, so this shouldn't fail"
+                );
+            };
+
+            Ok(ChangeEnvelope::new(Box::new(DynamoDBStreamCommitter::new()), change_batch))
+        });
+
+        Box::pin(stream)
+    }
+}
+
+struct DynamoDBStreamCommitter;
+
+impl DynamoDBStreamCommitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl CommitChange for DynamoDBStreamCommitter {
+    fn commit(&self) -> std::result::Result<(), CommitError> {
+        // println!("Committing changes");
+        Ok(())
+    }
+}
+
+pub(crate) fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T> {
+    let builder = builder
+        .as_any_mut()
+        .downcast_mut::<T>()
+        .context(DowncastBuilderSnafu)?;
+    Ok(builder)
 }
 
 #[async_trait]
@@ -210,6 +384,10 @@ impl TableProvider for DynamoDBTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints.as_ref()
     }
 
     async fn scan(
@@ -260,7 +438,7 @@ impl TableProvider for DynamoDBTableProvider {
         );
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
-            Arc::clone(&self.client),
+            Arc::clone(&self.db_client),
             request_plan,
             self.unnest_depth,
             projected_schema,
@@ -277,7 +455,7 @@ impl TableProvider for DynamoDBTableProvider {
 }
 
 pub struct DynamoDBTableProviderExec {
-    client: Arc<Client>,
+    client: Arc<DbClient>,
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
@@ -287,7 +465,7 @@ pub struct DynamoDBTableProviderExec {
 impl DynamoDBTableProviderExec {
     #[must_use]
     pub fn new(
-        client: Arc<Client>,
+        client: Arc<DbClient>,
         request_plan: DynamoDBRequestPlan,
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
@@ -414,7 +592,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
 #[deny(unused_variables)]
 fn build_stream_from_plan(
-    client: &Arc<Client>,
+    client: &Arc<DbClient>,
     request: DynamoDBRequestPlan,
     segment: i32,
     total_segments: i32,

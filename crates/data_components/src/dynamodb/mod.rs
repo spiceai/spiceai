@@ -17,6 +17,7 @@ use snafu::Snafu;
 use std::sync::Arc;
 
 mod arrow;
+mod conversion;
 pub mod provider;
 mod request_builder;
 mod request_plan;
@@ -66,4 +67,7 @@ pub enum Error {
 
     #[snafu(display("Table has no partition key"))]
     MissingPartitionKey,
+
+    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    DowncastBuilder,
 }

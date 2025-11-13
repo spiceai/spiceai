@@ -1329,6 +1329,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-dynamodbstreams"
+version = "1.90.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e03b9e9ac22a1d956aee07873316b715ff1fb9d7282aa48f0b9d30ac367f999"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-glue"
 version = "1.128.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4079,9 +4101,11 @@ dependencies = [
  "arrow_tools",
  "async-stream",
  "async-trait",
+ "aws-config",
  "aws-credential-types",
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
  "aws-smithy-async",
  "base64 0.22.1",
  "bb8 0.9.0",
@@ -4102,6 +4126,7 @@ dependencies = [
  "delta_kernel",
  "document_parse",
  "duckdb",
+ "dynamo-subscriber",
  "flight_client",
  "futures",
  "git2",
@@ -5450,6 +5475,21 @@ checksum = "56e53799688f5632f364f8fb387488dd05db9fe45db7011be066fc20e7027f8b"
 dependencies = [
  "bytemuck",
  "reborrow",
+]
+
+[[package]]
+name = "dynamo-subscriber"
+version = "0.1.1"
+source = "git+https://github.com/spiceai/dynamo-subscriber.git?rev=8f2769dbefc789071fe8767d02d01ef7eb1a7a3b#8f2769dbefc789071fe8767d02d01ef7eb1a7a3b"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

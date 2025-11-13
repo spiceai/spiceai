@@ -20,11 +20,12 @@ use super::{
 };
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use aws_sdk_dynamodb::Client;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
@@ -131,8 +132,6 @@ impl DataConnector for DynamoDB {
         .load()
         .await;
 
-        let client = Client::new(&config);
-
         let schema_infer_max_records_str =
             match self.params.get("schema_infer_max_records").expose() {
                 ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
@@ -188,7 +187,7 @@ impl DataConnector for DynamoDB {
         };
 
         let provider = DynamoDBTableProvider::try_new(
-            Arc::new(client),
+            config,
             Arc::from(table_name),
             unnest_depth,
             schema_infer_max_records,

@@ -25,6 +25,7 @@ use std::sync::Arc;
 pub struct DynamoDBTableSchema {
     table_name: Arc<str>,
     table_schema: SchemaRef,
+    primary_keys: Vec<String>,
     partition_key: String,
     sort_key: Option<String>,
     flattened_fields: HashSet<String>,
@@ -38,9 +39,14 @@ impl DynamoDBTableSchema {
         sort_key: Option<String>,
         flattened_fields: HashSet<String>,
     ) -> Self {
+        let mut primary_keys = vec![partition_key.clone()];
+        if let Some(sort_key) = &sort_key {
+            primary_keys.push(sort_key.clone());
+        }
         Self {
             table_name,
             table_schema,
+            primary_keys,
             partition_key,
             sort_key,
             flattened_fields,
@@ -53,6 +59,10 @@ impl DynamoDBTableSchema {
 
     pub fn schema(&self) -> &SchemaRef {
         &self.table_schema
+    }
+
+    pub fn primary_keys(&self) -> &Vec<String> {
+        &self.primary_keys
     }
 
     pub fn partition_key(&self) -> &str {
