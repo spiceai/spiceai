@@ -368,8 +368,12 @@ impl RefreshTask {
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
-                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
-                    .await;
+                // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+                // This is expected and should not be logged as an error.
+                if !self.runtime_status.is_shutdown() {
+                    self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
+                        .await;
+                }
                 return Err(e);
             }
         };
