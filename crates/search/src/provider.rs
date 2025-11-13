@@ -323,12 +323,15 @@ impl SearchQueryProvider {
         input.project(input_with_match)
     }
 
+    /// Checks if the search index has all columns needed in the `projection`, and can support all `filters`.
+    ///
+    /// Returns all columns needed (if insufficient, returns required columns nonetheless).
     fn search_index_table_is_sufficient(
         &self,
         search_index_schema: &DFSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-    ) -> Result<bool, DataFusionError> {
+    ) -> Result<(bool, Vec<String>), DataFusionError> {
         let search_index_columns: HashSet<String> = search_index_schema
             .fields()
             .iter()
@@ -466,6 +469,7 @@ impl TableProvider for SearchQueryProvider {
             proj2
         });
 
+        // TODO: need to be able to push down projection to `search_lp`. Avoid getting vectors for vector indexes.
         let mut search_lp = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
             .alias("search_index")?
             .limit(0, self.pre_limit)?;
@@ -526,27 +530,25 @@ fn projection_from_columns(schema: &SchemaRef, cols: &[String]) -> Vec<usize> {
         .collect()
 }
 
-// Return the unqualified names of columns missing from those referenced by in `expr`.
-fn columns_missing_from(expr: &[Expr], schema: &DFSchemaRef) -> Vec<String> {
+// Partitions the unqualified names of columns in schema by whether they are referenced by in `expr`.
+//
+// Returns (columns in `expr` not in schema, columns in `expr` in schema).
+fn partition_columns_missing_from(
+    expr: &[Expr],
+    schema: &DFSchemaRef,
+) -> (Vec<String>, Vec<String>) {
     let schema_cols = schema
         .fields()
         .iter()
         .map(|f| f.name().clone())
         .collect::<HashSet<_>>();
 
-    expr.iter()
-        .flat_map(|e| {
-            let filter_cols = e
-                .column_refs()
-                .iter()
-                .map(|c| c.name().to_string())
-                .collect::<HashSet<_>>();
-            filter_cols
-                .difference(&schema_cols)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>()
+    let (expr_in_schema, expr_not_in_schema) = expr
+        .iter()
+        .flat_map(|e| e.column_refs().iter().map(|c| c.name().to_string()))
+        .partition(|c| schema_cols.contains(c));
+
+    Ok((expr_not_in_schema, expr_in_schema))
 }
 
 // Returns all expr in exprs that are supported by the `schema`.
