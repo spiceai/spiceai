@@ -169,12 +169,14 @@ mod tests {
         let result = ObjectStoreContext::try_new(store, &url, Some(long_pattern));
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too long"));
+        assert!(result
+            .expect_err("should be an error")
+            .to_string()
+            .contains("too long"));
     }
 
     #[test]
     fn test_rust_regex_handles_complex_patterns() {
-        
         use regex::Regex;
 
         // The Rust `regex` crate uses a finite automaton that guarantees linear time
@@ -197,7 +199,7 @@ mod tests {
             );
 
             // Verify it actually matches the test string
-            let re = result.unwrap();
+            let re = result.expect("regex should compile");
             assert!(
                 re.is_match(test_str),
                 "Pattern '{pattern}' should match '{test_str}'"
