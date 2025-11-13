@@ -47,7 +47,7 @@ views:
       SenderIdentity,
       Region,
       Rate,
-      sendertype as SenderType,
+      SenderType,
       DateCreated,
       DateUpdated,
       LastUsed

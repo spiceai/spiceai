@@ -53,7 +53,7 @@ views:
       SenderIdentity,
       Region,
       Rate,
-      sendertype as SenderType,
+      SenderType,
       DateCreated,
       DateUpdated,
       LastUsed
@@ -73,8 +73,7 @@ views:
       partition_by:
         - bucket(128, AccountSid)
       indexes:
-        '(AccountSid, NumberPoolSid, SenderType)': enabled
-        '(AccountSid, NumberPoolSid, SenderType, Region)': enabled
+        '(AccountSid, NumberPoolSid)': enabled
 
   - name: number_info_with_cap
     sql: |
@@ -113,8 +112,4 @@ views:
       partition_by:
         - bucket(128, AccountSid)
       indexes:
-        '(AccountSid, NumberPoolSid, Capability)': enabled
-        '(AccountSid, NumberPoolSid, NumberRegion, AreaCodeRegion)': enabled
-        '(AccountSid, NumberPoolSid, SupportedDestRegion, IsAvailable)': enabled
-        '(AccountSid, NumberPoolSid, NumberRegion)': enabled
-        '(AccountSid, AreaCodeRegion, NumberType)': enabled
+        '(AccountSid, NumberPoolSid)': enabled
