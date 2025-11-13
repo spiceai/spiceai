@@ -1,0 +1,81 @@
+version: v1
+kind: Spicepod
+name: dynamodb-arrow
+
+definitions:
+  - &acceleration
+    enabled: true
+    engine: arrow
+
+datasets:
+  - from: dynamodb:tpch_customer
+    name: customer
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 8
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_lineitem
+    name: lineitem
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 48
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_nation
+    name: nation
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 1
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_orders
+    name: orders
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 16
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_part
+    name: part
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 8
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_partsupp
+    name: partsupp
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 16
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_region
+    name: region
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 1
+    acceleration: *acceleration
+
+  - from: dynamodb:tpch_supplier
+    name: supplier
+    params:
+      dynamodb_aws_region: ap-northeast-2
+      dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
+      dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
+      scan_partitions: 4
+    acceleration: *acceleration
