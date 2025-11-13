@@ -109,22 +109,25 @@ impl McpToolCatalog {
             MCPConfig::Stdio { command, args, env } => {
                 // Security: Validate command path to prevent command injection
                 // Use Path::components() to properly validate on all platforms (Windows/Unix)
+                // Only Normal components (file/directory names) are allowed
                 use std::path::{Component, Path};
                 let path = Path::new(command);
                 for component in path.components() {
                     match component {
-                        Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {}
-                        Component::ParentDir | Component::CurDir => {
+                        Component::Normal(_) => {}
+                        Component::ParentDir
+                        | Component::CurDir
+                        | Component::RootDir
+                        | Component::Prefix(_) => {
                             return Err(Error::CouldNotConstructTool {
                                 name: "mcp_stdio".to_string(),
                                 e: format!(
-                                    "Invalid command path '{command}'. Path traversal components (.., .) not allowed"
+                                    "Invalid command path '{command}'. Only relative paths with normal components allowed (no .., ., absolute paths, or drive prefixes)"
                                 ),
                             });
                         }
                     }
                 }
-                // Allow relative paths with multiple components as long as they don't contain path traversal
 
                 // Security: Limit number of arguments to prevent resource exhaustion
                 if args.len() > MAX_ARGS {
