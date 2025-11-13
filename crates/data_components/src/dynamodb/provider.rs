@@ -233,7 +233,6 @@ impl DynamoDBTableProvider {
         }
     }
 
-    #[must_use] 
     pub fn changes_stream_from_latest(&self) -> ChangesStream {
         let record_schema = Arc::clone(self.table_schema.schema());
         let changes_schema = changes_schema(&record_schema).clone();
