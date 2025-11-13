@@ -603,25 +603,22 @@ impl SpiceTestQueryWorker {
             let http_response = http_client
                 .post(&sql_url)
                 .header("Accept", "application/vnd.spiceai.sql.v1+json")
-                .body(query.sql.to_string())
+                .body(sql_text.to_string())
                 .send()
                 .await?;
 
             let status = http_response.status();
-            let body = http_response.text().await.unwrap_or_default();
+            let response_text = http_response.text().await.unwrap_or_default();
 
             if !status.is_success() {
                 eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {status} - {body}",
+                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {status} - {response_text}",
                     chrono::Utc::now(),
                     self.id,
                     query.name,
                 );
                 return Err(anyhow::anyhow!("Query HTTP request failed: {status}",));
             }
-
-            // Extract row count from response
-            let response_text = http_response.text().await?;
 
             let duration = query_start.elapsed();
 
