@@ -1,27 +1,26 @@
-use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::http::v1::eval::list;
 use crate::status::ComponentStatus;
+use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
     UnableToInitializeDataConnectorSnafu,
 };
-use ::datafusion::execution::SessionStateBuilder;
-use ::datafusion::prelude::SessionConfig;
 use app::App;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
-use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
+use ballista_core::serde::BallistaCodec;
 use ballista_core::utils::create_grpc_client_connection;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
+use ballista_executor::execution_loop::poll_loop;
 use ballista_executor::executor::Executor;
 use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_scheduler::cluster::BallistaCluster;
@@ -30,6 +29,8 @@ use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
+use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::prelude::SessionConfig;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
@@ -38,10 +39,14 @@ use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
+use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::time::sleep;
 use url::Url;
 use uuid::Uuid;
 
@@ -71,8 +76,6 @@ pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
     tracing::warn!("Distributed Query (Alpha) is in preview and should not be used in production.");
-
-    executor_bind_app(&rt, rt.config.cluster.scheduler_url.to_string()).await?;
 
     let runtime_handle = Arc::clone(&rt);
 
@@ -175,15 +178,33 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    rt.status.update_cluster("executor", ComponentStatus::Ready);
-
-    Ok(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec).map_err(|e| {
-            FailedToStartClusterExecutor {
-                source: Box::new(e),
-            }
-        }),
+    // Bind app manifest to runtime
+    executor_bind_app(
+        &rt,
+        rt.config.cluster.scheduler_url.to_string(),
+        executor_id,
     )
+    .await?;
+
+    let (tx_ready, rx_ready) = oneshot::channel::<String>();
+
+    let executor_poll_loop = tokio::spawn(
+        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, Some(tx_ready)).map_err(
+            |e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            },
+        ),
+    );
+
+    Ok(async move {
+        let _ = rx_ready
+            .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+        rt.status.update_cluster("executor", ComponentStatus::Ready);
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
+        executor_poll_loop.await.expect("Must spawn poll loop")
+    })
 }
 
 async fn create_scheduler_server(
@@ -244,13 +265,15 @@ async fn create_scheduler_server(
     .context(FailedToStartClusterSchedulerSnafu)
 }
 
-/// Initializes relevant `App` runtime components retrieved from the scheduler node
+/// - Initializes relevant `App` runtime components retrieved from the scheduler node
+/// - Initializes and binds `SchedulerRPCSecretStore`
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
-    scheduler_flight_url: impl Into<Arc<str>>,
+    scheduler_flight_url: String,
+    executor_id: String,
 ) -> crate::Result<()> {
     let flight_client = flight_client::FlightClient::try_new(
-        scheduler_flight_url.into(),
+        scheduler_flight_url.clone().into(),
         flight_client::Credentials::anonymous(),
         None,
     )
@@ -285,7 +308,9 @@ async fn executor_bind_app(
         *rt.app.write().await = Some(Arc::new(app_def));
     }
 
-    executor_bind_object_stores(Arc::clone(&rt)).await?;
+    *rt.secrets.write().await =
+        Secrets::new_for_cluster_executor(scheduler_flight_url, executor_id);
+
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
@@ -294,6 +319,8 @@ async fn executor_bind_app(
     Ok(())
 }
 
+/// Traverses dataset definitions and reifies `ListingTableUrl`s, triggering object store
+/// registration for each.
 async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     let app = rt.app();
     let app = app.read().await;
@@ -309,9 +336,10 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
             .context(FailedToStartClusterExecutorSnafu)?;
 
         let url = dataset.from.as_str();
-        let mut parsed = Url::parse(url)
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
+
+        let Ok(mut parsed) = Url::parse(url) else {
+            continue;
+        };
 
         if parsed.scheme() == "file" {
             continue;

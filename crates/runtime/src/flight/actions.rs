@@ -13,10 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use prost::Message;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
-use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{

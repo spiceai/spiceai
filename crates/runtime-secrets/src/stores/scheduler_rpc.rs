@@ -1,9 +1,8 @@
-use async_trait::async_trait;
-use prost::{bytes, Message};
-use secrecy::SecretString;
-use snafu::ResultExt;
-use runtime_proto::{ExecutorExpandSecretRequest, ExecutorExpandSecretResponse};
 use crate::{AnyErrorResult, SecretStore};
+use async_trait::async_trait;
+use prost::{Message, bytes};
+use runtime_proto::{ExecutorExpandSecretRequest, ExecutorExpandSecretResponse};
+use secrecy::SecretString;
 
 /// Used by cluster mode to resolve secrets declared in the scheduler
 /// via flight RPC
@@ -14,7 +13,10 @@ pub struct SchedulerRPCSecretStore {
 
 impl SchedulerRPCSecretStore {
     pub fn new(scheduler_url: String, executor_id: String) -> Self {
-        Self { scheduler_url, executor_id }
+        Self {
+            scheduler_url,
+            executor_id,
+        }
     }
 }
 
@@ -26,7 +28,7 @@ impl SecretStore for SchedulerRPCSecretStore {
             flight_client::Credentials::anonymous(),
             None,
         )
-            .await?;
+        .await?;
 
         let request = ExecutorExpandSecretRequest {
             executor_id: self.executor_id.clone(),
@@ -34,25 +36,19 @@ impl SecretStore for SchedulerRPCSecretStore {
         };
 
         let action = arrow_flight::Action {
-            r#type: "GetAppDefinition".to_string(),
+            r#type: "ExpandSecret".to_string(),
             body: bytes::Bytes::from(request.encode_to_vec()),
         };
 
-        let response = flight_client
-            .client()
-            .clone()
-            .do_action(action)
-            .await?;
+        let response = flight_client.client().clone().do_action(action).await?;
 
         let mut stream = response.into_inner();
 
-        let Some(result) = stream
-            .message()
-            .await? else {
+        let Some(result) = stream.message().await? else {
             return Ok(None);
         };
 
-        let response = ExecutorExpandSecretResponse::decode(result.body)?;
+        let response = ExecutorExpandSecretResponse::decode(&*result.body)?;
         Ok(Some(SecretString::from(response.value)))
     }
 }
