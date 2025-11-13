@@ -408,6 +408,7 @@ impl RefreshTask {
         .inspect_err(|e| {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
+            println!("Error writing data");
             if !self.runtime_status.is_shutdown() {
                 tracing::warn!(
                     "Failed to load data for {} {}: {}",
