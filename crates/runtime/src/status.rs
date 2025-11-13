@@ -72,7 +72,7 @@ pub struct RuntimeStatus {
     /// Tracks components that have been in the Ready state at least once.
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
     /// Tracks if the runtime is in the process of shutting down.
-    is_shutdown: Arc<AtomicBool>,
+    pub is_shutdown: Arc<AtomicBool>,
 }
 
 impl RuntimeStatus {
@@ -274,5 +274,6 @@ impl RuntimeStatus {
     /// Sets the runtime to the shutting down state.
     pub fn mark_shutdown(&self) {
         self.is_shutdown.store(true, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 }

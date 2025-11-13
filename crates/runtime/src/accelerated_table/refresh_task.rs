@@ -238,6 +238,9 @@ impl RefreshTask {
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
     ) -> RefreshTaskBuilder {
+
+        println!("RefreshTask - shutdown status ptr: {:p}", Arc::as_ptr(&runtime_status.is_shutdown));
+
         RefreshTaskBuilder::new(
             runtime_status,
             dataset_name,

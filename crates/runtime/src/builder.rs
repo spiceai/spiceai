@@ -59,6 +59,10 @@ pub struct RuntimeBuilder {
 
 impl RuntimeBuilder {
     pub fn new() -> Self {
+        let arc = status::RuntimeStatus::new();
+
+        println!("RuntimeBuilder - shutdown status ptr: {:p}", Arc::as_ptr(&arc.is_shutdown));
+
         RuntimeBuilder {
             app: None,
             extensions: vec![],
@@ -67,7 +71,7 @@ impl RuntimeBuilder {
             metrics_endpoint: None,
             prometheus_registry: None,
             autoload_extensions: HashMap::new(),
-            runtime_status: status::RuntimeStatus::new(),
+            runtime_status: arc,
             rate_limits: None,
             io_runtime: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
