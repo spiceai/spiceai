@@ -35,7 +35,7 @@ pub fn process_batch(
                     let (unnested_streams_item, _) = match unnest_depth {
                         None => (streams_item, HashSet::new()),
                         Some(depth) => unnest_dynamodb_item(&streams_item, depth)
-                            .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?,
+                            .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?,
                     };
 
                     let op = if matches!(event_name, OperationType::Insert) {
@@ -68,18 +68,18 @@ pub fn process_batch(
             match field.name().as_str() {
                 "op" => {
                     let str_builder = downcast_builder::<StringBuilder>(field_builder)
-                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                        .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?;
                     str_builder.append_value(op_str);
                 }
                 "primary_keys" => {
                     let list_builder =
                         downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)
-                            .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                            .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?;
                     if primary_keys.is_empty() {
                         list_builder.append(false);
                     } else {
                         let str_builder = downcast_builder::<StringBuilder>(list_builder.values())
-                            .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                            .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?;
                         for key in primary_keys {
                             str_builder.append_value(key);
                         }
@@ -88,9 +88,9 @@ pub fn process_batch(
                 }
                 "data" => {
                     let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
-                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                        .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?;
                     append_item_to_struct_builder(&item_data, data_struct_builder)
-                        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+                        .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?;
                 }
                 _ => unreachable!("Unexpected field in changes schema {}", field.name()),
             }
@@ -100,11 +100,8 @@ pub fn process_batch(
     let struct_array = changes_struct_builder.finish();
     let record_batch: RecordBatch = struct_array.into();
 
-    let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
-        unreachable!(
-            "We constructed the record batch with the correct schema, so this shouldn't fail"
-        );
-    };
+    let change_batch = ChangeBatch::try_new(record_batch)
+        .map_err(|e| cdc::StreamError::DynamoDB(e.to_string()))?;
 
     Ok(ChangeEnvelope::new(
         Box::new(DynamoDBStreamCommitter::new()),

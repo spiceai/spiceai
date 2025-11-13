@@ -56,6 +56,8 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
+    /// Error from `DynamoDB`, such as failure during streaming or subscription.
+    DynamoDB(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -69,6 +71,7 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
+            StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
         }
     }
 }
