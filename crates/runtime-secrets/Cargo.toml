@@ -21,6 +21,10 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+flight_client = { optional = true, path = "../flight_client" }
+arrow-flight = { optional = true, workspace = true }
+runtime-proto = { optional = true, path = "../runtime-proto" }
+prost = { optional = true, workspace = true }
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }
@@ -46,3 +50,4 @@ aws-secrets-manager = [
 ]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 keyring-secret-store = ["dep:keyring"]
+cluster = ["dep:flight_client", "dep:arrow-flight", "dep:runtime-proto", "dep:prost"]
