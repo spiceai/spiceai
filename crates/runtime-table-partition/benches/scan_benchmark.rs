@@ -193,6 +193,8 @@ fn create_provider_with_bucket_partitions(
 
 fn bench_scan_no_filters(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_no_filters");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
 
     for num_partitions in [10, 50, 100] {
         let provider = create_provider_with_partitions(num_partitions, 1000);
@@ -202,11 +204,7 @@ fn bench_scan_no_filters(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(
-                    tokio::runtime::Runtime::new()
-                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
-                )
-                .iter(|| async {
+                b.to_async(&rt).iter(|| async {
                     provider
                         .scan(&session_state, None, &[], None)
                         .await
@@ -221,6 +219,8 @@ fn bench_scan_no_filters(c: &mut Criterion) {
 
 fn bench_scan_with_pruning(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_with_pruning");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
 
     for num_partitions in [10, 50, 100] {
         let provider = create_provider_with_partitions(num_partitions, 1000);
@@ -231,11 +231,7 @@ fn bench_scan_with_pruning(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(
-                    tokio::runtime::Runtime::new()
-                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
-                )
-                .iter(|| async {
+                b.to_async(&rt).iter(|| async {
                     black_box(
                         provider
                             .scan(&session_state, None, &filters, None)
@@ -252,6 +248,8 @@ fn bench_scan_with_pruning(c: &mut Criterion) {
 
 fn bench_scan_with_complex_expression(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_complex_expression");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
 
     for num_partitions in [10, 50, 100] {
         let provider = create_provider_with_bucket_partitions(num_partitions, 1000);
@@ -270,11 +268,7 @@ fn bench_scan_with_complex_expression(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(
-                    tokio::runtime::Runtime::new()
-                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
-                )
-                .iter(|| async {
+                b.to_async(&rt).iter(|| async {
                     black_box(
                         provider
                             .scan(&session_state, None, &filters, None)
@@ -291,6 +285,8 @@ fn bench_scan_with_complex_expression(c: &mut Criterion) {
 
 fn bench_scan_prune_all(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_prune_all");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
 
     for num_partitions in [10, 50, 100] {
         let provider = create_provider_with_partitions(num_partitions, 1000);
@@ -301,11 +297,7 @@ fn bench_scan_prune_all(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(
-                    tokio::runtime::Runtime::new()
-                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
-                )
-                .iter(|| async {
+                b.to_async(&rt).iter(|| async {
                     black_box(
                         provider
                             .scan(&session_state, None, &filters, None)
@@ -322,6 +314,8 @@ fn bench_scan_prune_all(c: &mut Criterion) {
 
 fn bench_scan_with_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_with_projection");
+    let rt =
+        tokio::runtime::Runtime::new().unwrap_or_else(|e| panic!("failed to create runtime: {e}"));
 
     for num_partitions in [10, 50, 100] {
         let provider = create_provider_with_partitions(num_partitions, 1000);
@@ -332,11 +326,7 @@ fn bench_scan_with_projection(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{num_partitions}_partitions")),
             &num_partitions,
             |b, _| {
-                b.to_async(
-                    tokio::runtime::Runtime::new()
-                        .unwrap_or_else(|e| panic!("failed to create runtime: {e}")),
-                )
-                .iter(|| async {
+                b.to_async(&rt).iter(|| async {
                     black_box(
                         provider
                             .scan(&session_state, Some(&projection), &[], None)

@@ -526,13 +526,15 @@ fn evaluate_bucket_inequality(
                         return Ok(false); // Conservative if partition value isn't Int32
                     };
 
+                    // Extract bucket_count once to avoid cloning on every iteration
+                    let bucket_count_value = bucket_count.clone();
+
                     // Batch process: check if any value hashes to target bucket
-                    // Loop is SIMD-friendly (compiler can auto-vectorize value access)
                     for i in 0..range_size {
                         let hashed = call(
                             func,
                             vec![
-                                bucket_count.clone(),
+                                bucket_count_value.clone(),
                                 ScalarValue::Int32(Some(values.value(i))),
                             ],
                         )?;
@@ -577,12 +579,15 @@ fn evaluate_bucket_inequality(
                         return Ok(false); // Conservative if partition value isn't Int32
                     };
 
+                    // Extract bucket_count once to avoid cloning on every iteration
+                    let bucket_count_value = bucket_count.clone();
+
                     // Batch process with early exit
                     for i in 0..range_size {
                         let hashed = call(
                             func,
                             vec![
-                                bucket_count.clone(),
+                                bucket_count_value.clone(),
                                 ScalarValue::Int64(Some(values.value(i))),
                             ],
                         )?;
