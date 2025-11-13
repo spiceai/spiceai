@@ -1,0 +1,15 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+expression: explain_plan
+---
+UnionExec
+  PartitionMemTableExec: partition_value=0
+  PartitionMemTableExec: partition_value=1
+  PartitionMemTableExec: partition_value=2
+  PartitionMemTableExec: partition_value=3
+  PartitionMemTableExec: partition_value=4
+  PartitionMemTableExec: partition_value=5
+  PartitionMemTableExec: partition_value=6
+  PartitionMemTableExec: partition_value=7
+  PartitionMemTableExec: partition_value=8
+  PartitionMemTableExec: partition_value=9
