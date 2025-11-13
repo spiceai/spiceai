@@ -217,19 +217,17 @@ impl TableProvider for PartitionTableProvider {
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            // Use partition filters for pruning
             if prune_partition(
-                &partition_filters,
+                filters,
                 &self.partition_by.expression,
                 &partition.partition_value,
                 &self.schema,
             )? {
                 continue;
             }
-            // Only pass data filters to partition scan (partition filters are redundant after pruning)
             let plan = partition
                 .table_provider
-                .scan(state, projection, &data_filters, limit)
+                .scan(state, projection, filters, limit)
                 .await?;
             plans.push(plan);
         }
