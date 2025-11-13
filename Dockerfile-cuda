@@ -49,8 +49,17 @@ FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS runtime
 ENV CUDA_NVCC_FLAGS=-fPIE
 ARG CARGO_FEATURES
 
+# Create spiced user and group
+RUN groupadd -g 999 spiced \
+    && useradd -u 999 -g spiced -s /usr/sbin/nologin -d /app spiced
+
 # Allow DuckDB to load extensions
-RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
+RUN mkdir /.duckdb/ && chown 999:999 /.duckdb/ && chmod 755 /.duckdb/
+
+# Create HuggingFace cache directory
+RUN mkdir -p /.cache/huggingface/hub \
+    && chown -R 999:999 /.cache \
+    && chmod -R 755 /.cache
 
 RUN apt update \
     && apt install --yes ca-certificates libssl3 --no-install-recommends \
@@ -65,6 +74,14 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
 COPY --from=build /root/spiced /usr/local/bin/spiced
 
 WORKDIR /app
+RUN chown -R 999:999 /app
+
+USER 999:999
+
+EXPOSE 80909
+
+ENV HF_HOME=/.cache/huggingface
+ENV HF_HUB_CACHE=/.cache/huggingface/hub
 
 EXPOSE 8090
 EXPOSE 9090

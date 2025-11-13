@@ -32,8 +32,17 @@ ENV CUDA_NVCC_FLAGS=-fPIE
 ARG CARGO_FEATURES=default
 ARG CUDA_COMPUTE_CAP=80
 
+# Create spiced user and group
+RUN groupadd -g 999 spiced \
+    && useradd -u 999 -g spiced -s /usr/sbin/nologin -d /app spiced
+
 # Allow DuckDB to load extensions
-RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
+RUN mkdir /.duckdb/ && chown 999:999 /.duckdb/ && chmod 755 /.duckdb/
+
+# Create HuggingFace cache directory
+RUN mkdir -p /.cache/huggingface/hub \
+    && chown -R 999:999 /.cache \
+    && chmod -R 755 /.cache
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
@@ -50,6 +59,12 @@ COPY --from=binary /root/spiced /usr/local/bin/spiced
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 WORKDIR /app
+RUN chown -R 999:999 /app
+
+USER 999:999
+
+ENV HF_HOME=/.cache/huggingface
+ENV HF_HUB_CACHE=/.cache/huggingface/hub
 
 EXPOSE 8090
 EXPOSE 9090
