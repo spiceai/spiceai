@@ -844,12 +844,12 @@ pub async fn get_saffron_test_queries(
 ) -> anyhow::Result<Vec<Query>> {
     let queries = match overrides {
         Some(QueryOverrides::SaffronViews) => {
-            generate_saffron_views_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11)
+            generate_saffron_views_queries!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
         }
         Some(QueryOverrides::SaffronDuckdbCTE) => {
             generate_saffron_duckdb_cte_queries!(4, 6)
         }
-        _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6, 7, 8, 11),
+        _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
     };
 
     match (random_param_set_count, instance) {
