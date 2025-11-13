@@ -71,3 +71,11 @@ pub enum Error {
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,
 }
+
+// type StreamResult<T, E = StreamError> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub enum StreamError {
+    #[snafu(display("Unable to receive message from Kafka: {source}"))]
+    UnableToReceiveMessage { source: Box<dyn std::error::Error + Send + Sync + 'static> },
+}

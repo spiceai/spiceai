@@ -56,8 +56,9 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
+    #[cfg(any(feature = "dynamodb"))]
     /// Error from `DynamoDB`, such as failure during streaming or subscription.
-    DynamoDB(String),
+    DynamoDB(crate::dynamodb::StreamError),
 }
 
 impl std::error::Error for StreamError {}
