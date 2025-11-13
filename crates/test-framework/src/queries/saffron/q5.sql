@@ -13,4 +13,4 @@ WHERE A.AccountSid = ?
   AND B.Capability = ?
   AND (CASE WHEN ? THEN A.AvailableForNumberSelection = 1 ELSE A.AvailableForNumberSelection IN (1, 0) END)
 GROUP BY A.MaxRate
-ORDER BY NULL
+ORDER BY A.MaxRate ASC;
