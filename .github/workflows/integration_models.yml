@@ -72,7 +72,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'darwin'
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -84,7 +84,7 @@ jobs:
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          FEATURES="flightsql,models,metal,s3_vectors,kafka"
+          FEATURES="flightsql,models,metal,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
@@ -110,7 +110,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -152,7 +152,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-  
+
   test-ai-udf:
     name: Test AI UDF
     needs: build
@@ -161,7 +161,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -251,7 +251,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin

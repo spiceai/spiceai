@@ -287,6 +287,7 @@ pub fn get_mega_science_view(
 
     v.acceleration = Some(Acceleration {
         enabled: true,
+        engine: Some("duckdb".to_string()),
         ..Default::default()
     });
     v.columns = [question_column, answer_column]
