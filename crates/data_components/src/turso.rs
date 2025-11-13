@@ -1307,7 +1307,7 @@ impl SQLExecutor for TursoTableProvider {
 
     fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
         // Default to not federate if [`Self::function_support`] provided, otherwise true.
-        self.function_support.as_ref().map_or(true, |func_supp| {
+        self.function_support.as_ref().is_none_or(|func_supp| {
             !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
         })
     }
