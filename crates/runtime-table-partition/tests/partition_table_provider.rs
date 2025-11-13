@@ -939,9 +939,13 @@ async fn test_partition_filter_splitting_bucket_snapshot() -> Result<(), Box<dyn
         .sql("SELECT * FROM test_table WHERE id = 5 AND value > 40")
         .await?;
     let physical_plan = df.create_physical_plan().await?;
-    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
         .indent(true)
         .to_string();
+    // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
+    explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("bucket_partition_with_data_filter", explain_plan);
 
     // Query with data filter only (should scan all partitions)
