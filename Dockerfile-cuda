@@ -78,8 +78,6 @@ RUN chown -R 999:999 /app
 
 USER 999:999
 
-EXPOSE 80909
-
 ENV HF_HOME=/.cache/huggingface
 ENV HF_HUB_CACHE=/.cache/huggingface/hub
 

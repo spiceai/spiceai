@@ -194,8 +194,11 @@ impl ModelSource for SpiceAI {
         })
         .await
         .map_err(|e| super::Error::UnableToLoadConfig {
+            reason: format!("Task panicked while writing model file: {e}"),
+        })?
+        .map_err(|e| super::Error::UnableToLoadConfig {
             reason: format!("Failed to write model file: {e}"),
-        })??;
+        })?;
 
         Ok(file_path.to_string_lossy().into_owned())
     }

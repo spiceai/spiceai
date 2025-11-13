@@ -187,8 +187,11 @@ impl ModelSource for Huggingface {
             })
             .await
             .map_err(|e| super::Error::UnableToLoadConfig {
+                reason: format!("Task panicked while writing model file: {e}"),
+            })?
+            .map_err(|e| super::Error::UnableToLoadConfig {
                 reason: format!("Failed to write model file: {e}"),
-            })??;
+            })?;
 
             tracing::info!("Downloaded: {}", file_path.display());
         }
@@ -234,13 +237,7 @@ fn resolve_model_file_path(root_dir: &Path, base_dir: &Path, file: &str) -> supe
             Component::CurDir => {}
             Component::Normal(segment) => candidate.push(segment),
             Component::ParentDir => {
-                if candidate == root_dir {
-                    return Err(super::InvalidModelFilePathSnafu {
-                        path: file.to_string(),
-                    }
-                    .build());
-                }
-                if !candidate.pop() {
+                if candidate == root_dir || !candidate.pop() {
                     return Err(super::InvalidModelFilePathSnafu {
                         path: file.to_string(),
                     }
