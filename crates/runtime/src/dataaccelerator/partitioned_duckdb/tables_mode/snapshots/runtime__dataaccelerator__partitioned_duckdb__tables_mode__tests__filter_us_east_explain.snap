@@ -2,11 +2,11 @@
 source: crates/runtime/src/dataaccelerator/partitioned_duckdb/tables_mode/mod.rs
 expression: explain_pretty
 ---
-+---------------+-----------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                |
-+---------------+-----------------------------------------------------------------------------------------------------+
-| logical_plan  | TableScan: test_table projection=[id, region], full_filters=[test_table.region = Utf8("us-east-1")] |
-| physical_plan | CooperativeExec                                                                                     |
-|               |   DuckSqlExec sql= SELECT "id", "region" FROM "region=us-east-1/test_table"                         |
-|               |                                                                                                     |
-+---------------+-----------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                        |
++---------------+-------------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: test_table projection=[id, region], full_filters=[test_table.region = Utf8("us-east-1")]         |
+| physical_plan | CooperativeExec                                                                                             |
+|               |   DuckSqlExec sql= SELECT "id", "region" FROM "region=us-east-1/test_table" WHERE ("region" = 'us-east-1')  |
+|               |                                                                                                             |
++---------------+-------------------------------------------------------------------------------------------------------------+
