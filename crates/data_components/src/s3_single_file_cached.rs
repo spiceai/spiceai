@@ -89,8 +89,9 @@ fn is_same_file_version(
 }
 
 /// A wrapper around `ListingTable` that caches file metadata (`ETag`, Version ID) for single S3 files.
-/// When scanning, it first checks if the file's metadata has changed. If unchanged, it returns
-/// an empty result, avoiding unnecessary S3 data fetching during full refreshes.
+/// The wrapper enables skipping refresh operations when the file's metadata hasn't changed,
+/// thereby avoiding unnecessary S3 data fetching during full refreshes. The scan operation itself
+/// always delegates to the inner `ListingTable` and does not perform metadata checks.
 #[derive(Debug)]
 pub struct S3SingleFileCached {
     inner: Arc<ListingTable>,
