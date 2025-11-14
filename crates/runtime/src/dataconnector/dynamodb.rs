@@ -24,7 +24,6 @@ use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
-use std::fmt::Debug;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 

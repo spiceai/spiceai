@@ -78,7 +78,7 @@ type DynamoDBItemStream =
 
 const DEFAULT_PARTITIONS: usize = 8;
 
-const DEFAULT_STREAM_POLL_INTERVAL: u64 = 0;
+const DEFAULT_STREAM_POLL_INTERVAL: u64 = 200;
 
 impl DynamoDBTableProvider {
     pub async fn try_new(

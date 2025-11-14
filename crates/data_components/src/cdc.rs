@@ -72,6 +72,7 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
+            #[cfg(feature = "dynamodb")]
             StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
         }
     }
