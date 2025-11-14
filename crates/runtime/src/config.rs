@@ -120,6 +120,14 @@ pub struct ClusterConfig {
         action
     )]
     pub scheduler_url: Url,
+
+    #[arg(
+        long = "allow-insecure-connections",
+        value_name = "ALLOW_INSECURE_CONNECTIONS",
+        required = false,
+        action
+    )]
+    pub allow_insecure_connections: bool,
 }
 
 #[cfg(feature = "cluster")]
@@ -133,6 +141,7 @@ impl Default for ClusterConfig {
         Self {
             mode: None,
             scheduler_url: url,
+            allow_insecure_connections: false,
         }
     }
 }

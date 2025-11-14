@@ -466,6 +466,18 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
+    #[cfg(feature = "cluster")]
+    if tls_config.is_none()
+        && rt.config.cluster.mode.is_some()
+        && !rt.config.cluster.allow_insecure_connections
+    {
+        panic!(
+            "Refusing to start in clustered mode without a valid TLS configuration. \
+            To acknowledge and override, pass --allow-insecure-connections as an argument to spiced.\
+            Both schedulers and executors must share the same TLS configuration."
+        );
+    }
+
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();

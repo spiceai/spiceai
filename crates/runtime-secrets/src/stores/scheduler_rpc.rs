@@ -23,6 +23,8 @@ impl SchedulerRPCSecretStore {
 #[async_trait]
 impl SecretStore for SchedulerRPCSecretStore {
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+        tracing::trace!("SchedulerRPCSecretStore: Requesting secret {}", key);
+
         let flight_client = flight_client::FlightClient::try_new(
             self.scheduler_url.clone().into(),
             flight_client::Credentials::anonymous(),

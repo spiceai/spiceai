@@ -160,6 +160,19 @@ pub(crate) async fn do_action(
         }
         ActionType::ExpandSecret => {
             tracing::trace!("do_action: ExpandSecret");
+
+            let request = ExecutorExpandSecretRequest::decode(&*request.get_ref().body)
+                .map_err(to_tonic_err)?;
+
+            let span = tracing::span!(
+                target: "task_history",
+                tracing::Level::INFO,
+                "cluster::expand_secret",
+                executor_id = %request.executor_id,
+                key = %request.key
+            );
+            let _guard = span.enter();
+
             let context = RequestContext::current(AsyncMarker::new().await);
             let Some(df) = context
                 .extension::<DataFusionContextExtension>()
@@ -180,9 +193,6 @@ pub(crate) async fn do_action(
                 Arc::clone(scheduler)
             };
 
-            let request = ExecutorExpandSecretRequest::decode(&*request.get_ref().body)
-                .map_err(to_tonic_err)?;
-
             let executor_state = scheduler
                 .state
                 .executor_manager
@@ -201,7 +211,7 @@ pub(crate) async fn do_action(
                 )));
             }
 
-            tracing::trace!(
+            tracing::debug!(
                 "ExpandSecret: expanding secret {} for executor {}",
                 request.key,
                 request.executor_id
@@ -218,6 +228,7 @@ pub(crate) async fn do_action(
                 .await
                 .map_err(to_tonic_err)?
             else {
+                tracing::error!(target: "task_history", "Secret not found");
                 return Err(Status::invalid_argument(format!(
                     "Unable to read secret {}",
                     request.key
@@ -226,9 +237,11 @@ pub(crate) async fn do_action(
 
             let exposed = value.expose_secret();
             let response = ExecutorExpandSecretResponse {
-                key: request.key,
+                key: request.key.clone(),
                 value: exposed.to_string(),
             };
+
+            tracing::debug!(target: "task_history", "Secret expanded successfully");
 
             let result = arrow_flight::Result::new(response.encode_to_vec());
             futures::stream::iter(vec![Ok(result)])
