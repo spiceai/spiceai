@@ -143,7 +143,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true; self.children().len()]
+        vec![false; self.children().len()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {

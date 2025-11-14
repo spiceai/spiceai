@@ -3877,9 +3877,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67773048316103656a637612c4a62477603b777d91d9c62ff2290f9cde178fdb"
+checksum = "3ffc71fcdcdb40d6f087edddf7f8f1f8f79e6cf922f555a9ee8779752d4819bd"
 dependencies = [
  "ctor-proc-macro",
  "dtor",
@@ -3887,9 +3887,9 @@ dependencies = [
 
 [[package]]
 name = "ctor-proc-macro"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
+checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "ctr"
@@ -4513,7 +4513,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=d6e7ebd853463acafaf8132dced23c98c45f7947#d6e7ebd853463acafaf8132dced23c98c45f7947"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=007c82d039220478f406d648417d28c0d40a7987#007c82d039220478f406d648417d28c0d40a7987"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -15088,9 +15088,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suppaftp"
-version = "5.4.0"
+version = "6.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb79a5b76543d896dbec5c0fd9a28c0ca9a0d4e764c438c37f8463c96e4a8bf2"
+checksum = "e9d869e942cc5f349ad91645925a9e6b570f62c4c170ad1c7b92b867bd16bd54"
 dependencies = [
  "async-std",
  "async-trait",
@@ -15099,7 +15099,7 @@ dependencies = [
  "lazy-regex",
  "log",
  "pin-project",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
