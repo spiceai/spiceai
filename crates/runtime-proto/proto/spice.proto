@@ -1,0 +1,24 @@
+syntax = "proto3";
+package spice.protobuf;
+
+option java_multiple_files = true;
+option java_package = "com.spiceai";
+option java_outer_classname = "SpiceProto";
+
+// RPC
+message ExecutorExpandSecretRequest {
+    string executor_id = 1;
+    string key = 2;
+}
+
+message ExecutorExpandSecretResponse {
+    string key = 1;
+    string value = 2;
+}
+
+// Physical plan
+message SchemaCastScanExecNode {
+    bytes schema = 1;
+}
+
+message BytesProcessedExecNode {}
