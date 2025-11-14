@@ -78,28 +78,22 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     }
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
-        match node.name() {
-            "SchemaCastScanExec" => {
-                let Some(concrete) = node.as_any().downcast_ref::<SchemaCastScanExec>() else {
-                    return exec_err!("Unable to serialize plan node");
-                };
+        if let Some(concrete) = node.as_any().downcast_ref::<SchemaCastScanExec>() {
+            let mut schema_buf = vec![];
+            let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
+            serialized_schema
+                .encode(&mut schema_buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let mut schema_buf = vec![];
-                let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
-                serialized_schema
-                    .encode(&mut schema_buf)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let node = SchemaCastScanExecNode { schema: schema_buf };
-                node.encode(buf)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            }
-            "BytesProcessedExec" => {
-                let node = BytesProcessedExecNode {};
-                node.encode(buf)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            }
-            _ => return self.inner.try_encode(node, buf),
+            let node = SchemaCastScanExecNode { schema: schema_buf };
+            node.encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        } else if node.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
+            let node = BytesProcessedExecNode {};
+            node.encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        } else {
+            return self.inner.try_encode(node, buf);
         }
 
         Ok(())

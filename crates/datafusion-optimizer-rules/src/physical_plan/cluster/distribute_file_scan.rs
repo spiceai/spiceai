@@ -41,8 +41,8 @@ use std::sync::Arc;
 ///     DataSourceExec: file_groups={1 group: [[wiki_a.parquet:43660370..87320740]]}, file_type=parquet
 /// ```
 ///
-/// Limits are handled by the default physical pushdown mechanism and are currently
-/// replicated per scan.
+/// If a `DataSourceExec` has a limit pushed down, then it is not split, but may be repartitioned
+/// for projections above it.
 #[derive(Debug)]
 pub struct DistributeFileScanOptimizer {}
 
@@ -226,16 +226,37 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let transformed = plan.transform_up(|plan| {
-            let maybe_file_scan = concrete!(plan, DataSourceExec)
+        let Some(spice_config) = config.extensions.get::<SpiceClusterConfig>() else {
+            return exec_err!(
+                "SpiceClusterConfig not bound. Did you forget `.with_option_extension(Arc::new(SpiceClusterConfig::default()))`?"
+            );
+        };
+
+        let transformed = plan.transform_up(|p| {
+            let maybe_file_scan = concrete!(p, DataSourceExec)
                 .and_then(|d| concrete!(d.data_source(), FileScanConfig));
 
             let Some(file_scan_config) = maybe_file_scan else {
-                return Ok(Transformed::no(plan));
+                return Ok(Transformed::no(p));
             };
 
+            // Only repartition sufficiently large LIMIT scans
+            // TODO: statistics + check upstream projections for transforms
+            match file_scan_config.limit {
+                Some(limit)
+                    if limit as u64 >= spice_config.execution.file_scan_min_repartition_limit =>
+                {
+                    return Ok(Transformed::yes(Self::with_stage_repartition(
+                        p,
+                        config.execution.target_partitions,
+                    )?));
+                }
+                Some(_) => return Ok(Transformed::no(p)),
+                None => {}
+            }
+
             let Some(new_stages) = Self::scan_to_stages(file_scan_config, config)? else {
-                return Ok(Transformed::no(plan));
+                return Ok(Transformed::no(p));
             };
 
             let exploded_scans = new_stages
