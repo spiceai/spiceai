@@ -87,8 +87,6 @@ impl DynamoDBTableProvider {
         config_partitions: Option<usize>,
         stream_poll_interval_ms: u64,
     ) -> Result<Self, Error> {
-        println!("stream_poll_interval_ms: {}", stream_poll_interval_ms);
-
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
