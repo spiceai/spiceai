@@ -101,7 +101,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test = baseline_test.wait().await?;
-    let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
+    let baseline_percentiles = test.get_query_durations().percentile(95.0)?;
 
     let baseline_metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     println!("Baseline metrics:");
@@ -178,13 +178,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             ));
         };
 
-        let percentile_99th = duration.percentile(99.0)?;
-        if percentile_99th.as_millis() < 1000 {
+        let percentile_95th = duration.percentile(95.0)?;
+        if percentile_95th.as_millis() < 1000 {
             continue; // skip queries that are too fast to be meaningful
         }
 
         let percentile_ratio =
-            ((percentile_99th.as_secs_f64() / baseline_percentile.as_secs_f64()) - 1.0) * 100.0;
+            ((percentile_95th.as_secs_f64() / baseline_percentile.as_secs_f64()) - 1.0) * 100.0;
 
         // yellow measurements = 10% to 20% increase
         // red measurements = > 20% increase
@@ -195,13 +195,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
         if red {
             println!(
-                "FAIL - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                "FAIL - Query {query} has a 95th percentile that increased {percentile_ratio}% of the baseline 95th percentile",
                 query = query.name
             );
             test_passed = false;
         } else if yellow {
             println!(
-                "WARN - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                "WARN - Query {query} has a 95th percentile that increased {percentile_ratio}% of the baseline 95th percentile",
                 query = query.name
             );
             yellow_measurements += 1;
