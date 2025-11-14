@@ -2,6 +2,15 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-duckdb[file]_indexes_with_partitioning
 
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: true
+    captured_output: plan
+    min_plan_duration: 50ms
+
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
     name: number_info
@@ -25,7 +34,7 @@ datasets:
         '(AccountSid, NumberPoolSid)': enabled
       partition_by:
         - bucket(32, AccountSid)
-  
+
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
     params: *params_s3
@@ -52,4 +61,4 @@ datasets:
       indexes:
         AccountSid: enabled
       partition_by:
-          - bucket(32, AccountSid)
+        - bucket(32, AccountSid)

@@ -2,6 +2,15 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-duckdb[file]_view_indexes
 
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: true
+    captured_output: plan
+    min_plan_duration: 50ms
+
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
     name: number_info
@@ -43,67 +52,67 @@ datasets:
         duckdb_preserve_insertion_order: false
 
 views:
-- name: sender_info
-  sql: |
-    select
-    AutoId,
-    AccountSid,
-    NumberPoolSid,
-    SenderSid,
-    SenderIdentity,
-    Region,
-    Rate,
-    SenderType,
-    DateCreated,
-    DateUpdated,
-    LastUsed
-    from sender_info_by_arrival
-    order by AccountSid, NumberPoolSid
-  acceleration:
-    enabled: true
-    engine: duckdb
-    mode: file
-    refresh_on_startup: auto
-    params:
-      # https://github.com/spicehq/spiceai/issues/559
-      # query_federation: disabled
-      duckdb_file: sender_info.duckdb
-      duckdb_preserve_insertion_order: true
-    indexes:
-      '(AccountSid, NumberPoolSid)': enabled
+  - name: sender_info
+    sql: |
+      select
+      AutoId,
+      AccountSid,
+      NumberPoolSid,
+      SenderSid,
+      SenderIdentity,
+      Region,
+      Rate,
+      SenderType,
+      DateCreated,
+      DateUpdated,
+      LastUsed
+      from sender_info_by_arrival
+      order by AccountSid, NumberPoolSid
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_on_startup: auto
+      params:
+        # https://github.com/spicehq/spiceai/issues/559
+        # query_federation: disabled
+        duckdb_file: sender_info.duckdb
+        duckdb_preserve_insertion_order: true
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled
 
-- name: number_info_with_cap
-  sql: |
-    select
-    ni.DateCreated,
-    ni.DateUpdated,
-    ni.AccountSid,
-    ni.NumberPoolSid,
-    ni.NumberSid,
-    ni.MaxRate,
-    ni.NumberDid,
-    ni.NumberType,
-    ni.SupportedDestRegion,
-    ni.NumberRegion,
-    ni.CurrentRate,
-    ni.IsAvailable,
-    ni.ProviderSid,
-    ni.AreaCodeRegion,
-    ni.AvailableForNumberSelection,
-    nc.Capability
-    from number_info ni
-    inner join number_caps nc
-    on ni.NumberSid = nc.NumberSid
-    order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
-  acceleration:
-    enabled: true
-    engine: duckdb
-    mode: file
-    refresh_on_startup: auto
-    params:
-      query_federation: disabled
-      duckdb_preserve_insertion_order: true
-      duckdb_partitioned_write_flush_threshold: 256000
-      duckdb_file: number_info_with_cap.duckdb
-    indexes:
-      '(AccountSid, NumberPoolSid)': enabled
+  - name: number_info_with_cap
+    sql: |
+      select
+      ni.DateCreated,
+      ni.DateUpdated,
+      ni.AccountSid,
+      ni.NumberPoolSid,
+      ni.NumberSid,
+      ni.MaxRate,
+      ni.NumberDid,
+      ni.NumberType,
+      ni.SupportedDestRegion,
+      ni.NumberRegion,
+      ni.CurrentRate,
+      ni.IsAvailable,
+      ni.ProviderSid,
+      ni.AreaCodeRegion,
+      ni.AvailableForNumberSelection,
+      nc.Capability
+      from number_info ni
+      inner join number_caps nc
+      on ni.NumberSid = nc.NumberSid
+      order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_on_startup: auto
+      params:
+        query_federation: disabled
+        duckdb_preserve_insertion_order: true
+        duckdb_partitioned_write_flush_threshold: 256000
+        duckdb_file: number_info_with_cap.duckdb
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled
