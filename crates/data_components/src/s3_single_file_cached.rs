@@ -192,7 +192,7 @@ impl S3SingleFileCached {
 #[async_trait]
 impl RefreshSkipTableProvider for S3SingleFileCached {
     async fn should_skip_refresh(&self) -> DataFusionResult<bool> {
-        Ok(self.is_file_unchanged().await?)
+        self.is_file_unchanged().await
     }
 }
 
