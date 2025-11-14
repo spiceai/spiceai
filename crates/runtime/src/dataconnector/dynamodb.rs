@@ -241,7 +241,7 @@ impl DataConnector for DynamoDB {
                 table_provider
                     .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()
-                    .map(|dynamodb| dynamodb.changes_stream_from_trim_horizon())
+                    .map(DynamoDBTableProvider::changes_stream_from_trim_horizon)
             })
             .filter_map(|opt| async move { opt })
             .flatten(),
