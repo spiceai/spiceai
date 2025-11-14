@@ -19,9 +19,12 @@ use super::{
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
 use crate::component::dataset::Dataset;
+use crate::federated_table::FederatedTable;
 use async_trait::async_trait;
+use data_components::cdc::ChangesStream;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
@@ -49,6 +52,7 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
+const DEFAULT_STREAM_POLL_INTERVAL_MS_STR: &str = "200";
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
@@ -73,6 +77,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("scan_segments")
         .description("Number of segments. 'auto' by default.")
         .default(SEGMENTS_AUTO_STR),
+    ParameterSpec::runtime("stream_poll_interval_ms")
+        .description("Interval in milliseconds between polling for new records in a DynamoDB stream.")
+        .default(DEFAULT_STREAM_POLL_INTERVAL_MS_STR),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -143,6 +150,28 @@ impl DataConnector for DynamoDB {
             connector_component: ConnectorComponent::from(dataset)
         })?;
 
+        let stream_poll_interval_ms_str = match self.params.get("stream_poll_interval_ms").expose()
+        {
+            ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
+            ExposedParamLookup::Absent(_) => DEFAULT_STREAM_POLL_INTERVAL_MS_STR,
+        };
+
+        let stream_poll_interval_ms = u64::from_str(stream_poll_interval_ms_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            dataconnector: "dynamodb".to_string(),
+            message: format!(
+                "DynamoDB parameter 'stream_poll_interval_ms' must be an integer, not {stream_poll_interval_ms_str}"),
+            connector_component: ConnectorComponent::from(dataset)
+        })?;
+
+        if stream_poll_interval_ms == 0 {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                message: "DynamoDB parameter 'stream_poll_interval_ms' must be positive"
+                    .to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            });
+        }
+
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                 dataconnector: "dynamodb".to_string(),
@@ -190,6 +219,7 @@ impl DataConnector for DynamoDB {
             unnest_depth,
             schema_infer_max_records,
             config_segments,
+            stream_poll_interval_ms,
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
@@ -198,5 +228,23 @@ impl DataConnector for DynamoDB {
             source: Box::new(e),
         })?;
         Ok(Arc::new(provider))
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        Some(Box::pin(
+            stream::once(async move {
+                let table_provider = federated_table.table_provider().await;
+                table_provider
+                    .as_any()
+                    .downcast_ref::<DynamoDBTableProvider>()
+                    .map(|dynamodb| dynamodb.changes_stream_from_trim_horizon())
+            })
+            .filter_map(|opt| async move { opt })
+            .flatten(),
+        ))
     }
 }

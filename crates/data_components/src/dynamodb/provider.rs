@@ -78,8 +78,6 @@ type DynamoDBItemStream =
 
 const DEFAULT_PARTITIONS: usize = 8;
 
-const DEFAULT_STREAM_POLL_INTERVAL: u64 = 200;
-
 impl DynamoDBTableProvider {
     pub async fn try_new(
         sdk_config: SdkConfig,
@@ -87,11 +85,14 @@ impl DynamoDBTableProvider {
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
+        stream_poll_interval_ms: u64,
     ) -> Result<Self, Error> {
+        println!("stream_poll_interval_ms: {}", stream_poll_interval_ms);
+
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
-                .interval(Some(Duration::from_millis(DEFAULT_STREAM_POLL_INTERVAL)))
+                .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
                 .build(),
         );
 
@@ -245,6 +246,23 @@ impl DynamoDBTableProvider {
             process_batch(batch, &table_schema, &primary_keys, unnest_depth)
                 .map_err(crate::cdc::StreamError::DynamoDB)
         });
+
+        Box::pin(stream)
+    }
+
+    #[must_use]
+    pub fn changes_stream_from_trim_horizon(&self) -> ChangesStream {
+        let table_schema = Arc::clone(self.table_schema.schema());
+        let primary_keys = self.table_schema.primary_keys().clone();
+        let unnest_depth = self.unnest_depth;
+
+        let stream = self
+            .streams_client
+            .stream_from_trim_horizon()
+            .map(move |batch| {
+                process_batch(batch, &table_schema, &primary_keys, unnest_depth)
+                    .map_err(crate::cdc::StreamError::DynamoDB)
+            });
 
         Box::pin(stream)
     }
