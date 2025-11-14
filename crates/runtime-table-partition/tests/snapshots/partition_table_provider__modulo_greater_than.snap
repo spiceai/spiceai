@@ -1,0 +1,15 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+expression: explain_plan
+---
+UnionExec
+  PartitionMemTableExec: partition_value=0, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=1, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=2, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=3, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=4, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=5, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=6, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=7, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=8, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_value=9, filters=[value > Int32(45)]
