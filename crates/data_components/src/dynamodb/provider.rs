@@ -241,11 +241,10 @@ impl DynamoDBTableProvider {
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
 
-        let stream = self
-            .streams_client
-            .stream_from_latest()
-            .map(move |batch| process_batch(batch, Arc::clone(&table_schema), &primary_keys, unnest_depth)
-                .map_err(crate::cdc::StreamError::DynamoDB));
+        let stream = self.streams_client.stream_from_latest().map(move |batch| {
+            process_batch(batch, &table_schema, &primary_keys, unnest_depth)
+                .map_err(crate::cdc::StreamError::DynamoDB)
+        });
 
         Box::pin(stream)
     }

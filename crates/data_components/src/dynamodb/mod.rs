@@ -75,7 +75,9 @@ pub enum Error {
 #[derive(Debug, Snafu)]
 pub enum StreamError {
     #[snafu(display("Failed to receive a DynamoDB Stream record : {source}"))]
-    FailedToReceiveMessage { source: dynamo_subscriber::error::Error },
+    FailedToReceiveMessage {
+        source: dynamo_subscriber::error::Error,
+    },
 
     #[snafu(display("Failed to deserialize a DynamoDB Stream record : {message}"))]
     DeserializationError { message: String },
