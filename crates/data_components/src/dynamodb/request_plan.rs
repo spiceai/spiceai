@@ -257,7 +257,7 @@ impl fmt::Debug for ScanParams {
 // Helper struct to format sorted maps
 struct DebugSortedMap<'a, K, V>(&'a [(&'a K, &'a V)]);
 
-impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for DebugSortedMap<'a, K, V> {
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for DebugSortedMap<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.0.iter().copied()).finish()
     }
