@@ -4700,9 +4700,11 @@ dependencies = [
 name = "datafusion-optimizer-rules"
 version = "1.9.0-unstable"
 dependencies = [
+ "arrow",
  "async-stream",
  "async-trait",
  "cache",
+ "chrono",
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
@@ -4710,6 +4712,7 @@ dependencies = [
  "duckdb",
  "futures",
  "itertools 0.14.0",
+ "object_store",
  "r2d2",
  "runtime-datafusion",
  "tracing",

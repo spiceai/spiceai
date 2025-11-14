@@ -337,8 +337,8 @@ pub mod tests {
         DataSourceExec::from_data_source(fsc)
     }
 
-    #[tokio::test]
-    async fn test_respects_byte_size_setting() {
+    #[test]
+    fn test_respects_byte_size_setting() {
         let optimizer = DistributeFileScanOptimizer::new();
 
         // Default = 128MB per filegroup
@@ -383,8 +383,8 @@ pub mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_respects_max_stages() {
+    #[test]
+    fn test_respects_max_stages() {
         let optimizer = DistributeFileScanOptimizer::new();
 
         let files = (0..10000)
@@ -417,8 +417,8 @@ pub mod tests {
         assert_eq!(data_source_execs.len(), 200);
     }
 
-    #[tokio::test]
-    async fn test_small_read_bail_out() {
+    #[test]
+    fn test_small_read_bail_out() {
         let optimizer = DistributeFileScanOptimizer::new();
 
         let plan = create_data_source_exec(vec![create_partitioned_file(

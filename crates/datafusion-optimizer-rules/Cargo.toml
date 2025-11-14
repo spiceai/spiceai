@@ -9,6 +9,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow = { optional = true, workspace = true }
+chrono = { optional = true, workspace = true }
+object_store = { optional = true, workspace = true }
 datafusion.workspace = true
 datafusion-datasource = { optional = true, workspace = true }
 datafusion-expr.workspace = true
@@ -29,4 +32,4 @@ duckdb = [
     "dep:duckdb",
     "dep:r2d2"
 ]
-cluster = ["dep:itertools", "dep:datafusion-datasource", "dep:runtime-datafusion", "dep:url"]
+cluster = ["dep:arrow", "dep:chrono", "dep:itertools", "dep:datafusion-datasource", "dep:object_store", "dep:runtime-datafusion", "dep:url"]

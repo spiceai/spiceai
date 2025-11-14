@@ -441,6 +441,10 @@ fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
     false
 }
 
+/// Starts flight service
+/// # Panics
+/// If running in clustered mode, will panic unless TLS is configured or user manually overrides
+/// this safety check, as RPC will transmit sensitive information to executors.
 pub async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,

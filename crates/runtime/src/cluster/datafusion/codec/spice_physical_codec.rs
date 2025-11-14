@@ -64,7 +64,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             ));
 
             Ok(exec)
-        } else if let Ok(_) = BytesProcessedExecNode::decode(buf) {
+        } else if BytesProcessedExecNode::decode(buf).is_ok() {
             Ok(Arc::new(
                 BytesProcessedExec::new(
                     Arc::clone(&inputs[0]),

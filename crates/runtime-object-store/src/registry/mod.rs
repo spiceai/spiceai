@@ -488,7 +488,6 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
         self.inner.get_store(url).or_else(|_| {
             let store = self.get_feature_store(url)?;
             self.inner.register_store(url, Arc::clone(&store));
-
             Ok(store)
         })
     }

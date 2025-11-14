@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub struct EnsureSupportedFileScan {}
 
 impl EnsureSupportedFileScan {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(EnsureSupportedFileScan {})
     }
@@ -23,7 +24,7 @@ impl EnsureSupportedFileScan {
         "EnsureSerializableFileScanOptimizer"
     }
 
-    fn validate(plan: Arc<dyn ExecutionPlan>) -> Result<()> {
+    fn validate(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
         let Some(data_source_exec) = concrete!(plan, DataSourceExec) else {
             return plan_err!(
                 "{} only operates on DataSourceExec. This is a bug.",
@@ -44,7 +45,7 @@ impl EnsureSupportedFileScan {
                 Self::name(),
                 std::any::type_name_of_val(data_source_exec.data_source().as_ref())
             );
-        };
+        }
 
         Ok(())
     }
@@ -58,7 +59,7 @@ impl PhysicalOptimizerRule for EnsureSupportedFileScan {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _ = SearchVisitor::collect_concrete_down::<DataSourceExec>(&plan)?
             .into_iter()
-            .map(Self::validate)
+            .map(|p| Self::validate(&p))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(plan)

@@ -12,6 +12,7 @@ pub struct SchedulerRPCSecretStore {
 }
 
 impl SchedulerRPCSecretStore {
+    #[must_use]
     pub fn new(scheduler_url: String, executor_id: String) -> Self {
         Self {
             scheduler_url,

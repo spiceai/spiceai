@@ -180,13 +180,13 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::physical_expr::expressions::col;
-    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
-    use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
-    use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::tests::create_partitioned_file;
-    use datafusion_optimizer_rules::physical_plan::cluster::distribute_file_scan::tests::{
+    use crate::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
+    use crate::physical_plan::cluster::distribute_file_scan::tests::create_partitioned_file;
+    use crate::physical_plan::cluster::distribute_file_scan::tests::{
         DEFAULT_CONFIG_OPTIONS, create_data_source_exec,
     };
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
     use std::sync::LazyLock;
 
     static OPTIMIZER: LazyLock<PhysicalOptimizer> = LazyLock::new(|| {
@@ -203,8 +203,8 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn test_projection_pushdown() {
+    #[test]
+    fn test_projection_pushdown() {
         let files = vec![
             create_partitioned_file("file:///file4.parquet", 256_000_000, None),
             create_partitioned_file("file:///file5.parquet", 256_000_000, None),
