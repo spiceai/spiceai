@@ -18,7 +18,8 @@ byte-unit.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
-moka.workspace = true
+parking_lot.workspace = true
+pingora-lru.workspace = true
 opentelemetry.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
@@ -27,8 +28,20 @@ tracing.workspace = true
 twox-hash = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+rand = "0.8"
 rstest = "0.25.0"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+twox-hash = { workspace = true }
 
 [features]
 default = []
 xxhash = ["dep:twox-hash"]
+
+[[bench]]
+name = "cache_throughput"
+harness = false
+
+[[bench]]
+name = "quick_comparison"
+harness = false
