@@ -532,6 +532,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
     }
 }
 
+/// Wraps a single [`S3Vectors::get_vectors`] for better input, output and error handling.
 async fn get_vectors_call(
     client: Arc<dyn S3Vectors + Send + Sync>,
     idx: &S3VectorIdentifier,
@@ -576,6 +577,7 @@ async fn get_vectors_call(
         .collect())
 }
 
+/// Wraps a single [`S3Vectors::query_vectors`] for better input, output and error handling.
 async fn query_vectors_call(
     client: Arc<dyn S3Vectors + Send + Sync>,
     idx: &S3VectorIdentifier,
