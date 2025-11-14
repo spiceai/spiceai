@@ -204,6 +204,7 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
         "q8" => Some(vec![
             ParameterValue::String(record.account_sid.clone().into()),
             ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String(record.number_type.clone().into()), // NumberType filter
             ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
             ParameterValue::String(record.capability.clone().into()),
             ParameterValue::Number(20), // LIMIT value
