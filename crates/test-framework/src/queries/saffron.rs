@@ -197,6 +197,7 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
             ParameterValue::String(record.number_region.clone().into()), // SupportedDestRegion filter
             ParameterValue::String(record.number_region.clone().into()), // NumberRegion filter
             ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+            ParameterValue::String(record.number_type.clone().into()), // NumberType filter
             ParameterValue::String(record.capability.clone().into()),
             ParameterValue::Number(20), // LIMIT value
         ]),
