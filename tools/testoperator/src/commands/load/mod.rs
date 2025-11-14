@@ -77,18 +77,19 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let spiced_instance = warm_up.wait().await?.end()?;
 
     let test_duration = Duration::from_secs(args.test_args.common.duration);
-    let query_set_iterations = (test_duration.as_secs() / 60 / 60).max(1);
+
+    // Calculate baseline duration: 10% of target time, min 1min, max 10min
+    let baseline_duration_secs = (test_duration.as_secs() / 10).clamp(60, 600);
+    let baseline_duration = Duration::from_secs(baseline_duration_secs);
 
     // baseline run
-    println!("Running baseline throughput test");
+    println!("Running baseline throughput test for {baseline_duration_secs}s",);
 
     let (_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_condition(EndCondition::QuerySetCompleted(
-                query_set_iterations.try_into()?,
-            ))
+            .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
     )?;
