@@ -37,9 +37,6 @@ Spice provides four industry standard APIs in a lightweight, portable runtime (s
 Spice's primary features include:
 
 - **Data Federation**: SQL query across any database, data warehouse, or data lake. Deploy with single-node or distributed multi-node query execution. [Learn More](https://spiceai.org/docs/features/query-federation).
-- **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries with Arrow, DuckDB, SQLite, PostgreSQL, or Cayenne (Vortex+SQLite) for simplified multi-file acceleration. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
-- **Hybrid Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and petabyte-scale vector similarity search via Amazon S3 Vectors or pgvector for structured and unstructured data.
-- **SQL LLM Inference**: Call LLMs directly from SQL. Generate, summarize, and enrich data using the Spice SQL AI function or Text-to-SQL. Use Spice as an AI-database powering retrieval-augmented generation (RAG) and intelligent agents with OpenAI-compatible APIs and MCP integration. [Learn More](https://spiceai.org/docs/use-cases/rag).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries with Arrow, DuckDB, SQLite, PostgreSQL, or Spice Cayenne (Vortex). [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
 - **Enterprise Search**: Keyword, vector, and full-text search with Tantivy-powered BM25 and petabyte-scale vector similarity search via Amazon S3 Vectors or pgvector for structured and unstructured data.
 - **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents with OpenAI-compatible APIs and MCP integration. [Learn More](https://spiceai.org/docs/use-cases/rag).
