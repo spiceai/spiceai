@@ -2,6 +2,15 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-cayenne[file]_partitioning
 
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: true
+    captured_output: plan
+    min_plan_duration: 50ms
+
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
     name: number_info
