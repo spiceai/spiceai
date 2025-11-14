@@ -643,6 +643,13 @@ impl Runtime {
             _ => None,
         };
 
+        #[cfg(feature = "cluster")]
+        if self.config.cluster.mode.is_some() {
+            tracing::warn!(
+                "Distributed Query (Alpha) is in preview and should not be used in production."
+            );
+        }
+
         // Start Flight server
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
