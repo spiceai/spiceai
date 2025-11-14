@@ -26,9 +26,6 @@ datasets:
       enabled: true
       engine: cayenne
       mode: file
-      partition_by:
-        - bucket(32, AccountSid)
-
   - from: s3://benchmarks/saffron/sender_info_sf1
     name: sender_info_by_arrival
     params: *params_s3
