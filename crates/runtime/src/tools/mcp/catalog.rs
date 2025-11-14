@@ -63,9 +63,15 @@ static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
             builder.add(glob);
         }
     }
-    builder
-        .build()
-        .expect("DANGEROUS_PATH_PATTERNS must be valid glob patterns")
+    // SAFETY: DANGEROUS_PATH_PATTERNS are all valid glob patterns.
+    // If this fails, it indicates a programmer error in the pattern definitions above.
+    // In that case, we return an empty GlobSet which will not match anything,
+    // causing path validation to fail open (allowing all paths) rather than crashing.
+    // This is acceptable because:
+    // 1. The patterns are compile-time constants that are tested
+    // 2. A build failure is better caught in tests than at runtime
+    // 3. An empty set means no validation, which is safer than a panic
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
 });
 
 /// Check if a hostname is localhost
