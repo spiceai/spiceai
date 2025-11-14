@@ -189,8 +189,8 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 
 // Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
 // Applied at three levels:
-// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for authenticated endpoints (queries, chat, embeddings, evals)
-//    Applied per-route to allow reasonable payload sizes for SQL INSERT operations and LLM requests
+// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings, evals)
+//    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
 // 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
 //    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
 // 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)

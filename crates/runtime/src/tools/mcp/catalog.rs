@@ -47,14 +47,12 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
 /// Glob patterns for detecting dangerous path components
 const DANGEROUS_PATH_PATTERNS: &[&str] = &[
-    "*/..*",  // Unix parent directory traversal
-    "*..*",   // Parent at start (Unix)
-    "*\\..*", // Windows parent directory traversal
-    "/.*",    // Unix current directory reference
-    "*\\.*",  // Windows current directory reference
-    "/*",     // Unix absolute path
+    "*/..*",  // Unix parent directory traversal (anywhere in path)
+    "*..*",   // Parent at start (Unix) - matches paths starting with ..
+    "*\\..*", // Windows parent directory traversal (backslash-dot-dot)
+    "*\\\\*", // Windows UNC path or backslash (absolute paths)
+    "/*",     // Unix absolute path (starts with /)
     "?:*",    // Windows drive letter (C:, D:, etc.)
-    "\\\\*",  // Windows UNC path
 ];
 
 /// Pre-compiled glob set for path validation
@@ -205,9 +203,11 @@ impl McpToolCatalog {
                 }
 
                 // Security: Warn if using http (unencrypted) for non-localhost
-                if url.scheme() == "http" && !is_localhost(url.host_str().unwrap_or_default()) {
+                let host = url.host_str().unwrap_or("<unknown>");
+                if url.scheme() == "http" && !is_localhost(host) {
                     tracing::warn!(
-                        "MCP HTTPS client using unencrypted HTTP connection to non-localhost host: {}. This is insecure.",
+                        "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
+                        host,
                         url
                     );
                 }
@@ -423,5 +423,104 @@ impl SpiceToolCatalog for McpToolCatalog {
             tool,
             self.name.clone(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dangerous_patterns_reject_parent_traversal() {
+        // Unix-style parent directory traversal
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match(".."));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("../etc/passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("subdir/../../etc/passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("foo/../bar"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_reject_windows_parent_traversal() {
+        // Windows-style parent directory traversal
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("..\\etc\\passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("subdir\\..\\..\\etc\\passwd"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_reject_absolute_paths() {
+        // Unix absolute paths
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/etc/passwd"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/var/log/secrets"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_reject_windows_absolute_paths() {
+        // Windows drive letters
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("C:\\Windows\\System32"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("D:\\secrets"));
+
+        // Windows UNC paths
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("\\\\server\\share"));
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("\\\\192.168.1.1\\admin"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_allow_legitimate_hidden_files() {
+        // Legitimate hidden files and directories should NOT match
+        // These start with . but are not path traversal attempts
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".config"),
+            ".config should be allowed (legitimate hidden directory)"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".cache"),
+            ".cache should be allowed (legitimate hidden directory)"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".bashrc"),
+            ".bashrc should be allowed (legitimate hidden file)"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match(".ssh/id_rsa"),
+            ".ssh/id_rsa should be allowed (legitimate path in hidden directory)"
+        );
+    }
+
+    #[test]
+    fn test_dangerous_patterns_allow_safe_relative_paths() {
+        // Safe relative paths should NOT match
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("myfile.txt"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("subdir/myfile.txt"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("a/b/c/file.txt"));
+    }
+
+    #[test]
+    fn test_dangerous_patterns_allow_current_directory_simple() {
+        // Simple current directory references are safe and should NOT match
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match("."),
+            ". (current dir) should be allowed"
+        );
+        assert!(
+            !DANGEROUS_PATH_GLOB_SET.is_match("./script.sh"),
+            "./script.sh should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_is_localhost_ipv4() {
+        assert!(is_localhost("127.0.0.1"));
+        assert!(is_localhost("localhost"));
+        assert!(is_localhost("0.0.0.0"));
+        assert!(!is_localhost("192.168.1.1"));
+        assert!(!is_localhost("example.com"));
+    }
+
+    #[test]
+    fn test_is_localhost_ipv6() {
+        assert!(is_localhost("::1"));
+        assert!(is_localhost("[::1]"));
+        assert!(!is_localhost("::2"));
+        assert!(!is_localhost("2001:db8::1"));
     }
 }
