@@ -18,7 +18,7 @@ use super::{
     DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::cdc::{ChangesStream, changes_schema};
+use crate::cdc::ChangesStream;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
@@ -78,6 +78,8 @@ type DynamoDBItemStream =
 
 const DEFAULT_PARTITIONS: usize = 8;
 
+const DEFAULT_STREAM_POLL_INTERVAL: u64 = 0;
+
 impl DynamoDBTableProvider {
     pub async fn try_new(
         sdk_config: SdkConfig,
@@ -89,7 +91,7 @@ impl DynamoDBTableProvider {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
-                .interval(Some(Duration::from_millis(200)))
+                .interval(Some(Duration::from_millis(DEFAULT_STREAM_POLL_INTERVAL)))
                 .build(),
         );
 
@@ -235,16 +237,15 @@ impl DynamoDBTableProvider {
 
     #[must_use]
     pub fn changes_stream_from_latest(&self) -> ChangesStream {
-        let record_schema = Arc::clone(self.table_schema.schema());
-        let changes_schema = changes_schema(&record_schema).clone();
-
+        let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
 
         let stream = self
             .streams_client
             .stream_from_latest()
-            .map(move |batch| process_batch(&batch, &changes_schema, &primary_keys, unnest_depth));
+            .map(move |batch| process_batch(batch, Arc::clone(&table_schema), &primary_keys, unnest_depth)
+                .map_err(crate::cdc::StreamError::DynamoDB));
 
         Box::pin(stream)
     }

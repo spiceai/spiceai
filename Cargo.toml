@@ -375,4 +375,4 @@ turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
 
-dynamo-subscriber = { git = "https://github.com/spiceai/dynamo-subscriber.git", rev = "8f2769dbefc789071fe8767d02d01ef7eb1a7a3b" }
+dynamo-subscriber = { git = "https://github.com/spiceai/dynamo-subscriber.git", rev = "24f78c6c07b33dee1698fe48c816f20af2e15d67" }

@@ -5479,7 +5479,7 @@ dependencies = [
 [[package]]
 name = "dynamo-subscriber"
 version = "0.1.1"
-source = "git+https://github.com/spiceai/dynamo-subscriber.git?rev=8f2769dbefc789071fe8767d02d01ef7eb1a7a3b#8f2769dbefc789071fe8767d02d01ef7eb1a7a3b"
+source = "git+https://github.com/spiceai/dynamo-subscriber.git?rev=24f78c6c07b33dee1698fe48c816f20af2e15d67#24f78c6c07b33dee1698fe48c816f20af2e15d67"
 dependencies = [
  "async-trait",
  "aws-config",
