@@ -27,7 +27,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::util::pretty::pretty_format_batches;
-use aws_sdk_credential_bridge::{S3CredentialProvider, initialize_sdk_config};
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use chrono::Utc;
 use datafusion::sql::TableReference;
 #[cfg(feature = "duckdb")]
@@ -385,14 +385,16 @@ async fn build_snapshot_store() -> Result<Arc<dyn ObjectStore>> {
             builder = builder.with_token(token);
         }
     } else {
-        let sdk_config = initialize_sdk_config().await;
-        let Some(config) = sdk_config.as_ref() else {
+        let config = get_or_init_sdk_config()
+            .await
+            .map_err(|err| anyhow!("Failed to initialize AWS credentials: {err}"))?;
+        let Some(config) = config else {
             return Err(anyhow!(
                 "AWS credentials are required to run snapshot integration tests. Provide AWS_SNAPSHOT_KEY/AWS_SNAPSHOT_SECRET or configure AWS_PROFILE."
             ));
         };
         builder = builder.with_credentials(Arc::new(
-            S3CredentialProvider::from_config(config)
+            S3CredentialProvider::from_config(config.as_ref())
                 .context("Loading AWS credentials from environment")?,
         ));
     }

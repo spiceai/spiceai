@@ -87,7 +87,7 @@ impl RuntimeStatus {
 
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.is_shutdown.load(Ordering::Relaxed)
+        self.is_shutdown.load(Ordering::SeqCst)
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
@@ -273,6 +273,6 @@ impl RuntimeStatus {
 
     /// Sets the runtime to the shutting down state.
     pub fn mark_shutdown(&self) {
-        self.is_shutdown.store(true, Ordering::Relaxed);
+        self.is_shutdown.store(true, Ordering::SeqCst);
     }
 }

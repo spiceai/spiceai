@@ -1,0 +1,5 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+expression: explain_plan
+---
+PartitionMemTableExec: partition_value=3, filters=[value = Int32(23)]

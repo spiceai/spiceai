@@ -10,7 +10,6 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
-arrow-schema = { workspace = true, features = ["serde"] }
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
@@ -18,20 +17,19 @@ chrono.workspace = true
 datafusion.workspace = true
 fundu.workspace = true
 futures.workspace = true
-itertools.workspace = true
 object_store.workspace = true
+opentelemetry.workspace = true
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-secrets = { path = "../runtime-secrets" }
-spicepod = { path = "../spicepod" }
-tracing.workspace = true
-snafu.workspace = true
-tokio = { workspace = true, features = ["fs"] }
-util = { path = "../util" }
-url.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-opentelemetry.workspace = true
+sha2.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tokio = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+url.workspace = true
+util = { path = "../util" }
 
 [features]
 default = []

@@ -47,6 +47,8 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+#[cfg(feature = "duckdb")]
+use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -54,10 +56,7 @@ use datafusion_optimizer_rules::{
     physical_plan::EmptyHashJoinExecPhysicalOptimization,
 };
 use runtime_datafusion::{
-    extension::{
-        ExtensionPlanQueryPlanner,
-        bytes_processed::{BytesProcessedExtensionPlanner, BytesProcessedOptimizerRule},
-    },
+    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
@@ -225,6 +224,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -244,15 +244,29 @@ impl DataFusionBuilder {
                 self.io_runtime.clone(),
             ))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
-            .build();
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        #[cfg(feature = "duckdb")]
+        {
+            state = state.with_physical_optimizer_rule(
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            );
+        }
+
+        let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
         }
 
+        if let Err(e) = datafusion_spark::register_all(&mut state) {
+            panic!("Unable to register Spark functions: {e}");
+        }
+
         let ctx = SessionContext::new_with_state(state);
-        ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
 
         // Add cache invalidation optimizer rule if caching is enabled
         if let Some(caching) = &self.caching {
@@ -450,10 +464,6 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
-        Arc::new(BytesProcessedExtensionPlanner::new(
-            Box::new(track_bytes_processed),
-            cfg!(feature = "cluster"),
-        )),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
     ]
 }

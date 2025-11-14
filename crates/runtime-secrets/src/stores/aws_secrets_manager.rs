@@ -24,10 +24,11 @@ use crate::SecretStore;
 
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 
-use aws_config::{self, BehaviorVersion};
 use aws_sdk_secretsmanager::{self};
 
 use snafu::{OptionExt, ResultExt, Snafu};
+
+use aws_sdk_credential_bridge::default_aws_config;
 
 const SPICE_KEY_PREFIX: &str = "spice_";
 
@@ -74,9 +75,7 @@ impl AwsSecretsManager {
     /// - If the AWS configuration cannot be loaded.
     /// - If the call to STS `get_caller_identity` fails, which might be due to invalid or expired AWS credentials.
     pub async fn init(&self) -> Result<()> {
-        let config = aws_config::defaults(BehaviorVersion::v2025_08_07())
-            .load()
-            .await;
+        let config = default_aws_config().load().await;
 
         let sts_client = aws_sdk_sts::Client::new(&config);
 
@@ -98,9 +97,7 @@ impl SecretStore for AwsSecretsManager {
             self.secret_name
         );
 
-        let config = aws_config::defaults(BehaviorVersion::v2025_08_07())
-            .load()
-            .await;
+        let config = default_aws_config().load().await;
 
         let asm = aws_sdk_secretsmanager::Client::new(&config);
 

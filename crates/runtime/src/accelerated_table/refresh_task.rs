@@ -31,7 +31,7 @@ use datafusion_table_providers::util::retriable_error::{
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
-use runtime_datafusion::extension::bytes_processed::BytesProcessedExtensionPlanner;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
@@ -368,6 +368,11 @@ impl RefreshTask {
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
+                // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+                // This is expected and should not be logged as an error.
+                if self.runtime_status.is_shutdown() {
+                    return Ok(());
+                }
                 self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
                     .await;
                 return Err(e);
@@ -396,27 +401,27 @@ impl RefreshTask {
                 (streaming_data_update, None)
             };
 
-        self.write_streaming_data_update(
-            Some(start_time),
-            streaming_data_update,
-            refresh.sql.as_deref(),
-        )
-        .await
-        .inspect_err(|e| {
+        if let Err(e) = self
+            .write_streaming_data_update(
+                Some(start_time),
+                streaming_data_update,
+                refresh.sql.as_deref(),
+            )
+            .await
+        {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
-            if !self.runtime_status.is_shutdown() {
-                tracing::warn!(
-                    "Failed to load data for {} {}: {}",
-                    self.component_type(),
-                    include_source_to_table_name(
-                        &self.dataset_name,
-                        self.federated_source.as_deref()
-                    ),
-                    inner_err_from_retry_ref(e)
-                );
+            if self.runtime_status.is_shutdown() {
+                return Ok(());
             }
-        })?;
+            tracing::warn!(
+                "Failed to load data for {} {}: {}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+                inner_err_from_retry_ref(&e)
+            );
+            return Err(e);
+        }
 
         // Only record metrics if a refresh was successful
         self.handle_metrics(
@@ -845,13 +850,8 @@ impl RefreshTask {
             .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
 
-        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
-            Arc::new(BytesProcessedExtensionPlanner::new(
-                Box::new(track_bytes_processed),
-                cfg!(feature = "cluster"),
-            )),
-            Arc::new(IndexTableScanExtensionPlanner::new()),
-        ];
+        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+            vec![Arc::new(IndexTableScanExtensionPlanner::new())];
 
         let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
@@ -868,6 +868,9 @@ impl RefreshTask {
                 ExtensionPlanQueryPlanner::from_extension_planners(extension_planners),
             ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
 

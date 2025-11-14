@@ -40,7 +40,7 @@ pub(super) async fn download_snapshot_if_needed(
     }
 
     if path.exists() {
-        tracing::debug!(
+        tracing::info!(
             "Acceleration already exists at {}, skipping snapshot download",
             path.display()
         );

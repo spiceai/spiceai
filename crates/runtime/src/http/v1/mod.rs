@@ -51,7 +51,10 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
-use http::{HeaderValue, header::CONTENT_TYPE};
+use http::{
+    HeaderValue,
+    header::{CACHE_CONTROL, CONTENT_TYPE},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
@@ -59,6 +62,8 @@ use snafu::ResultExt;
 use futures::TryStreamExt;
 
 use runtime_request_context::{AsyncMarker, RequestContext};
+
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -95,7 +100,7 @@ impl utoipa::IntoParams for Format {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The various formats that the Arrow data can be converted and returned from HTTP requests.
 pub enum ResponseMimeType {
@@ -131,13 +136,13 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
-    pub fn to_accept_header(&self) -> Option<http::HeaderValue> {
+    pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
-            ResponseMimeType::Json => "application/json",
-            ResponseMimeType::Csv => "text/csv",
-            ResponseMimeType::Plain => "text/plain",
-            ResponseMimeType::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
-            ResponseMimeType::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
+            Self::Json => "application/json",
+            Self::Csv => "text/csv",
+            Self::Plain => "text/plain",
+            Self::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
+            Self::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
         };
         HeaderValue::from_str(media_type).ok()
     }
@@ -254,6 +259,7 @@ pub async fn to_http_response(
         &mut headers,
         cache_status,
         request_context.client_supplied_cache_key().is_some(),
+        &request_context,
     );
 
     (StatusCode::OK, headers, body)
@@ -263,6 +269,7 @@ fn attach_cache_headers(
     headers: &mut HeaderMap,
     results_cache_status: CacheStatus,
     user_key_specified: bool,
+    request_context: &RequestContext,
 ) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
@@ -279,12 +286,41 @@ fn attach_cache_headers(
     if user_key_specified {
         headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
     }
+
+    // Add Cache-Control response header with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = request_context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The Results-Cache-Status header will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
+                headers.insert(CACHE_CONTROL, header_value);
+            }
+        }
+    }
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }

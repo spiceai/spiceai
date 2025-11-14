@@ -514,7 +514,7 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
 
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    test_request_context()
+    Box::pin(test_request_context()
         .scope(async {
             // Test 1: Index scan settings with custom file
             println!("\n=== Test 1: Index Scan Settings with Custom File ===");
@@ -804,6 +804,6 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
 
             println!("\n=== All DuckDB Settings Tests Passed ===");
             Ok(())
-        })
+        }))
         .await
 }

@@ -130,7 +130,7 @@ impl SpiceTest<NotStarted> {
 
         let append_config = AppendConfig::new(
             self.state.end_duration,
-            self.state.query_set,
+            self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
         );
         let append_source = FileAppendableSource::new(&append_config);
@@ -229,14 +229,14 @@ impl SpiceTest<Running> {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             Ok(Err(e)) => {
                 self.state.query_workers.iter().for_each(|worker| {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             _ => {}
         }

@@ -100,7 +100,9 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
 
     let ttl = match &cache_config.item_ttl {
         Some(item_ttl) => {
-            fundu::parse_duration(item_ttl).context(super::FailedToParseItemTtlSnafu)?
+            fundu::parse_duration(item_ttl).context(super::FailedToParseDurationSnafu {
+                field: "item_ttl".to_string(),
+            })?
         }
         None => std::time::Duration::from_secs(1),
     };
@@ -305,11 +307,12 @@ mod tests {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult {
-            records: Arc::new(vec![record_batch.clone()]),
-            schema: Arc::new(record_batch.schema().as_ref().to_owned()),
-            input_tables: Arc::new(input_tables),
-        }
+        CachedQueryResult::new(
+            Arc::new(vec![record_batch.clone()]),
+            Arc::new(record_batch.schema().as_ref().to_owned()),
+            Arc::new(input_tables),
+            std::time::Instant::now(),
+        )
     }
 
     fn create_test_cached_search_result() -> CachedSearchResult {

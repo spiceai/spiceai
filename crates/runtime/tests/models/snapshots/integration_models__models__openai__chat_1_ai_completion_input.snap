@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/openai.rs
 expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serialize task_input\")"
-snapshot_kind: text
 ---
 {
   "messages": [
@@ -127,7 +126,7 @@ snapshot_kind: text
           "properties": {
             "additional_columns": {
               "default": [],
-              "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
+              "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\nreturned within the response under `.primary_key`, not `.data`.",
               "items": {
                 "type": "string"
               },

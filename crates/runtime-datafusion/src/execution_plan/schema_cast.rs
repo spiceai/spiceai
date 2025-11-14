@@ -19,7 +19,7 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Statistics, internal_err};
+use datafusion::common::Statistics;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -143,7 +143,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true; self.children().len()]
+        vec![false; self.children().len()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -204,26 +204,16 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        None
+        self.input.metrics()
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema()))
+        #[allow(deprecated)]
+        self.input.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(idx) = partition {
-            // Validate partition index
-            let partition_count = self.properties().partitioning.partition_count();
-            if idx >= partition_count {
-                return internal_err!(
-                    "Invalid partition index: {}, the partition count is {}",
-                    idx,
-                    partition_count
-                );
-            }
-        }
-        Ok(Statistics::new_unknown(&self.schema()))
+        self.input.partition_statistics(partition)
     }
 
     // Allow optimizer to push limits through to inputs

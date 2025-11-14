@@ -21,6 +21,7 @@ use std::{
 };
 
 pub mod fibonacci_backoff;
+pub mod retry_strategy;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
@@ -59,6 +60,30 @@ pub fn pretty_print_number(num: usize) -> String {
         .collect::<Result<Vec<&str>, _>>()
         .unwrap_or(vec![])
         .join(",")
+}
+
+/// Parses a string parameter as an enabled/disabled boolean value.
+///
+/// Returns `true` if the value is "enabled" (case-insensitive), `false` otherwise.
+/// This is a common pattern across Spice configuration parameters.
+///
+/// # Arguments
+///
+/// * `value` - The string value to parse (typically from a configuration parameter)
+///
+/// # Examples
+///
+/// ```
+/// use util::parse_enabled;
+///
+/// assert_eq!(parse_enabled("enabled"), true);
+/// assert_eq!(parse_enabled("ENABLED"), true);
+/// assert_eq!(parse_enabled("disabled"), false);
+/// assert_eq!(parse_enabled("anything_else"), false);
+/// ```
+#[must_use]
+pub fn parse_enabled(value: &str) -> bool {
+    value.to_lowercase() == "enabled"
 }
 
 pub async fn shutdown_signal() {

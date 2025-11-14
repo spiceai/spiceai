@@ -11,7 +11,8 @@ import (
 // ReadMultiLineInput reads input from the user until a complete statement is detected.
 // A statement is considered complete when it:
 // - Ends with a semicolon, OR
-// - Is a special command (help, exit, quit) on the first line
+// - Is a special command (help, exit, quit) on the first line, OR
+// - Starts with a dot (.) for dot commands (.clear, .clear history, etc.)
 //
 // Returns the complete input string and any error encountered.
 // If Ctrl+C is pressed on an empty prompt, returns io.EOF to signal exit.
@@ -62,7 +63,7 @@ func ReadMultiLineInput(line *liner.State, prompt string) (string, error) {
 		lowerQuery := strings.ToLower(trimmedQuery)
 
 		// Check for special commands on first line only
-		if firstLine && (lowerQuery == "help" || lowerQuery == "exit" || lowerQuery == "quit") {
+		if firstLine && (lowerQuery == "help" || lowerQuery == "exit" || lowerQuery == "quit" || strings.HasPrefix(lowerQuery, ".")) {
 			break
 		}
 
