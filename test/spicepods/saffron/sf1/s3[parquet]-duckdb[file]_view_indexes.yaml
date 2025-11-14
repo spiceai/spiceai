@@ -65,8 +65,7 @@ views:
     mode: file
     refresh_on_startup: auto
     params:
-      # https://github.com/spicehq/spiceai/issues/559
-      # query_federation: disabled
+      query_federation: disabled
       duckdb_file: sender_info.duckdb
       duckdb_preserve_insertion_order: true
     indexes:

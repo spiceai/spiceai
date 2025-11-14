@@ -66,8 +66,7 @@ views:
       refresh_on_startup: auto
       params:
         partition_mode: tables
-        # https://github.com/spicehq/spiceai/issues/559
-        # query_federation: disabled
+        query_federation: disabled
         duckdb_file: sender_info.duckdb
         duckdb_preserve_insertion_order: true
         duckdb_partitioned_write_flush_threshold: 256000
