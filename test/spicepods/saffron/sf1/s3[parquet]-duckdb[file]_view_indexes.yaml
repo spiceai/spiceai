@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_view_indexes.yaml
+name: s3[parquet]-duckdb[file]_view_indexes
 
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
