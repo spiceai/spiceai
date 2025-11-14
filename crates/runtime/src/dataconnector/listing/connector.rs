@@ -633,7 +633,7 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
-        let config = ListingTableConfig::new(table_path)
+        let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
             .with_schema(expanded_schema);
 
@@ -647,7 +647,27 @@ pub trait ListingTableConnector: DataConnector {
                     code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
                 })?;
 
-        Ok(Arc::new(table))
+        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
+        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed
+        let table_arc = Arc::new(table);
+        if format!("{self}") == "s3"
+            && !table_path.is_collection()
+            && dataset.acceleration.is_some()
+            && let Some(cached_table) =
+                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+                    Arc::clone(&table_arc),
+                    Arc::clone(&object_store),
+                    dataset.name.to_string(),
+                )
+        {
+            tracing::debug!(
+                "Enabled S3 single-file ETag/Version caching for {}",
+                dataset.name
+            );
+            return Ok(Arc::new(cached_table));
+        }
+
+        Ok(table_arc)
     }
 }
 

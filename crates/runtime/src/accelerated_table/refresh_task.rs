@@ -340,6 +340,54 @@ impl RefreshTask {
             None
         };
 
+        // For single-file datasets with refresh skip support, check if the refresh can be skipped.
+        // This optimizes cases like S3 single-file datasets where ETag/Version/size/timestamp
+        // can indicate the file hasn't changed, avoiding unnecessary data fetching.
+        if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
+            let table_provider = self.federated.table_provider().await;
+            // Check if this is an S3SingleFileCached provider that implements RefreshSkipTableProvider
+            if let Some(s3_cached) = table_provider
+                .as_any()
+                .downcast_ref::<data_components::s3_single_file_cached::S3SingleFileCached>(
+            ) {
+                match data_components::refresh_skip::RefreshSkipTableProvider::should_skip_refresh(
+                    s3_cached,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        tracing::debug!(
+                            "Skipping refresh for {} - data unchanged",
+                            self.dataset_name
+                        );
+
+                        // Record metric for skipped data fetch
+                        for label_set in self.get_dataset_label_sets(&refresh.mode).await {
+                            metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, &label_set);
+                        }
+
+                        self.set_refresh_status(
+                            refresh.sql.as_deref(),
+                            status::ComponentStatus::Ready,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        // Data may have changed, proceed with refresh
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
+                            self.dataset_name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
