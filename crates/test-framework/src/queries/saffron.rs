@@ -66,7 +66,7 @@ async fn fetch_test_records(
     limit: usize,
     query_overrides: Option<super::QueryOverrides>,
 ) -> Result<Vec<NumberWithSenderInfoRecord>> {
-    println!("Fetching {limit} random NumberInfoRecord records...");
+    println!("Fetching {limit} random NumberWithSenderInfoRecord records...");
 
     let spice_client = Arc::new(instance.spice_client(None, false).await?);
 
