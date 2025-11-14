@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_view_with_partitioning_indexes
+name: s3[parquet]-duckdb[file]_view_with_partitioning_indexes_p128
 
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
