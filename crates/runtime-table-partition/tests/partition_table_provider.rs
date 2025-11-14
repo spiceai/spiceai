@@ -939,9 +939,13 @@ async fn test_partition_filter_splitting_bucket_snapshot() -> Result<(), Box<dyn
         .sql("SELECT * FROM test_table WHERE id = 5 AND value > 40")
         .await?;
     let physical_plan = df.create_physical_plan().await?;
-    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
         .indent(true)
         .to_string();
+    // Sort lines to make test deterministic (HashMap iteration order is non-deterministic)
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable(); // Sort all lines except the first (UnionExec)
+    explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("bucket_partition_with_data_filter", explain_plan);
 
     // Query with data filter only (should scan all partitions)
@@ -1045,6 +1049,404 @@ async fn test_constant_expression_filtering() -> Result<(), Box<dyn std::error::
         2,
         "Constant '1=1' should not prune any partitions"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_simple_column_partition_inequality_snapshot() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "age".to_string(),
+        expression: col("age"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert test data with different ages
+    for (age, ids, names) in [
+        (10, vec![1, 2, 3], vec!["Alice", "Bob", "Charlie"]),
+        (20, vec![4, 5, 6], vec!["David", "Eve", "Frank"]),
+        (30, vec![7, 8, 9], vec!["Grace", "Henry", "Ivy"]),
+        (40, vec![10, 11, 12], vec!["Jack", "Kate", "Leo"]),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(vec![age; 3])),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?;
+        let df = ctx.read_batch(batch)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Test 1: Equality (age = 20) - should only scan partition 20
+    let df = ctx.sql("SELECT * FROM test_table WHERE age = 20").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("simple_column_equality", explain_plan);
+
+    // Test 2: Greater than (age > 25) - should prune partitions 10 and 20
+    let df = ctx.sql("SELECT * FROM test_table WHERE age > 25").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("simple_column_greater_than", explain_plan);
+
+    // Test 3: Range (age >= 20 AND age < 40) - should only scan partitions 20 and 30
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE age >= 20 AND age < 40")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("simple_column_range", explain_plan);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_modulo_partition_inequality_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "value_mod_10".to_string(),
+        expression: col("value") % lit(10),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert test data - values 0-49, which will distribute across partitions 0-9
+    for remainder in 0..10 {
+        let values: Vec<i32> = (remainder..50).step_by(10).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(values.clone())),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )?;
+        let df = ctx.read_batch(batch)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Test 1: Equality (value = 23) - should only scan partition 3 (23 % 10 = 3)
+    let df = ctx.sql("SELECT * FROM test_table WHERE value = 23").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("modulo_equality", explain_plan);
+
+    // Test 2: Greater than (value > 45) - all partitions can have values > 45
+    let df = ctx.sql("SELECT * FROM test_table WHERE value > 45").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("modulo_greater_than", explain_plan);
+
+    // Test 3: Less than (value < 5) - only partitions 0-4 can have values < 5
+    let df = ctx.sql("SELECT * FROM test_table WHERE value < 5").await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("modulo_less_than", explain_plan);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_truncate_partition_inequality_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("sales", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let truncate_udf = Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new()));
+    let partition_by = vec![PartitionedBy {
+        name: "sales_trunc_1000".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: truncate_udf,
+            args: vec![lit(1000i64), col("sales")],
+        }),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into partitions truncated by 1000 (0-999, 1000-1999, 2000-2999, 3000-3999)
+    for truncated_value in [0i64, 1000, 2000, 3000] {
+        let start = truncated_value;
+        let end = truncated_value + 999;
+        let sales: Vec<i64> = (start..=end).step_by(100).collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ids: Vec<i32> = (0..sales.len() as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int64Array::from(sales)),
+            ],
+        )?;
+        let df = ctx.read_batch(batch)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Test 1: Equality (sales = 1500) - should only scan partition 1000
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE sales = 1500")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("truncate_equality", explain_plan);
+
+    // Test 2: Greater than (sales > 2500) - should scan partitions 2000 and 3000
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE sales > 2500")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("truncate_greater_than", explain_plan);
+
+    // Test 3: Range (sales >= 1000 AND sales < 2000) - should only scan partition 1000
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE sales >= 1000 AND sales < 2000")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("truncate_range", explain_plan);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_date_trunc_partition_inequality_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int32, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "day".to_string(),
+        expression: date_trunc(lit("day"), col("timestamp")),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data for 4 consecutive days
+    let dates = [
+        "2025-01-15 00:00:00",
+        "2025-01-16 00:00:00",
+        "2025-01-17 00:00:00",
+        "2025-01-18 00:00:00",
+    ];
+
+    for (idx, date) in dates.iter().enumerate() {
+        let partition_ts = timestamp_nanos(date);
+        // Create timestamps throughout the day
+        let timestamps: Vec<i64> = (0..24)
+            .map(|hour| partition_ts + hour * 3600 * 1_000_000_000)
+            .collect();
+        let ids: Vec<i32> = (0..24).collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let values: Vec<i32> = vec![idx as i32 * 100; 24];
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(TimestampNanosecondArray::from(timestamps)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )?;
+        let df = ctx.read_batch(batch)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Test 1: Exact date match (timestamp = '2025-01-16 10:30:00') - should scan partition for 2025-01-16
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE timestamp = '2025-01-16 10:30:00'::timestamp")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("date_trunc_equality", explain_plan);
+
+    // Test 2: Greater than (timestamp > '2025-01-16 12:00:00') - should scan partitions 2025-01-16, 2025-01-17, 2025-01-18
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE timestamp > '2025-01-16 12:00:00'::timestamp")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("date_trunc_greater_than", explain_plan);
+
+    // Test 3: Date range (between two days) - should only scan partition 2025-01-16
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE timestamp >= '2025-01-16 00:00:00'::timestamp AND timestamp < '2025-01-17 00:00:00'::timestamp")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("date_trunc_range", explain_plan);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bucket_partition_inequality_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+    let bucket_fn = Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new()));
+    let partition_by = vec![PartitionedBy {
+        name: "user_id_bucket_10".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::clone(&bucket_fn),
+            args: vec![lit(10i64), col("user_id")],
+        }),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data for user_ids 0-99
+    for i in 0..10 {
+        let start = i * 10;
+        let end = start + 10;
+        let user_ids: Vec<i32> = (start..end).collect();
+        let names: Vec<String> = user_ids.iter().map(|id| format!("User{id}")).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(user_ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )?;
+        let df = ctx.read_batch(batch)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Test 1: Range with inequalities (user_id > 50 AND user_id <= 70)
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE user_id > 50 AND user_id <= 70")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("bucket_inequality_range", explain_plan);
+
+    // Test 2: Single inequality (user_id > 80)
+    let df = ctx
+        .sql("SELECT * FROM test_table WHERE user_id > 80")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    lines[1..].sort_unstable();
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("bucket_inequality_unbounded", explain_plan);
 
     Ok(())
 }

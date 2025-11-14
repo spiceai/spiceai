@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q19"
+---
++--------------------+
+| revenue            |
++--------------------+
+| 3083843.0578000005 |
++--------------------+
