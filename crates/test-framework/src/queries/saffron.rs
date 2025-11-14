@@ -8,8 +8,9 @@ use arrow::{
 use std::sync::Arc;
 
 /// Creates a fixed `NumberInfoRecord` for consistent snapshotting
-fn create_fixed_number_info_record() -> NumberInfoRecord {
-    NumberInfoRecord {
+fn create_fixed_number_info_record() -> NumberWithSenderInfoRecord {
+    NumberWithSenderInfoRecord {
+        // Number info fields
         account_sid: "AC8ee2a82cf11c7c8860b192678c9e3066".to_string(),
         number_pool_sid: "NPe85ca269e9eb6b9268ffeab9d6ffaba9".to_string(),
         number_sid: "PNbd07a0546edbbd27fbf578fdf1581454".to_string(), // Not used in parameters
@@ -24,6 +25,11 @@ fn create_fixed_number_info_record() -> NumberInfoRecord {
         area_code_region: "617".to_string(),
         available_for_number_selection: 0, // Maps to selectA2pNumber flag = 0
         capability: "sms".to_string(),
+
+        // Sender info fields
+        sender_type: "shortcode".to_string(),
+        sender_region: "US".to_string(),
+        sender_identity: "55800".to_string(),
     }
 }
 
@@ -59,8 +65,8 @@ async fn fetch_test_records(
     instance: &SpicedInstance,
     limit: usize,
     query_overrides: Option<super::QueryOverrides>,
-) -> Result<Vec<NumberInfoRecord>> {
-    println!("Fetching {limit} random NumberInfoRecord records...");
+) -> Result<Vec<NumberWithSenderInfoRecord>> {
+    println!("Fetching {limit} random NumberWithSenderInfoRecord records...");
 
     let spice_client = Arc::new(instance.spice_client(None, false).await?);
 
@@ -68,11 +74,13 @@ async fn fetch_test_records(
         Some(super::QueryOverrides::SaffronViews) => {
             // Custom query for SaffronViews scenario
             format!(
-                "SELECT DateCreated, DateUpdated, AccountSid, NumberPoolSid, NumberSid, \
-                 MaxRate, NumberDid, NumberType, SupportedDestRegion, NumberRegion, \
-                 CurrentRate, IsAvailable, ProviderSid, AreaCodeRegion, \
-                 AvailableForNumberSelection, Capability \
-                 FROM number_info_with_cap \
+                "SELECT A.DateCreated, A.DateUpdated, A.AccountSid, A.NumberPoolSid, A.NumberSid, \
+                 A.MaxRate, A.NumberDid, A.NumberType, A.SupportedDestRegion, A.NumberRegion, \
+                 A.CurrentRate, A.IsAvailable, A.ProviderSid, A.AreaCodeRegion, \
+                 A.AvailableForNumberSelection, A.Capability, \
+                 S.SenderType, S.Region AS SenderRegion, S.SenderIdentity \
+                 FROM number_info_with_cap AS A \
+                 INNER JOIN sender_info AS S ON A.AccountSid = S.AccountSid AND A.NumberPoolSid = S.NumberPoolSid \
                  ORDER BY RAND() \
                  LIMIT {limit}"
             )
@@ -83,9 +91,11 @@ async fn fetch_test_records(
                 "SELECT A.DateCreated, A.DateUpdated, A.AccountSid, A.NumberPoolSid, A.NumberSid, \
                  A.MaxRate, A.NumberDid, A.NumberType, A.SupportedDestRegion, A.NumberRegion, \
                  A.CurrentRate, A.IsAvailable, A.ProviderSid, A.AreaCodeRegion, \
-                 A.AvailableForNumberSelection, B.Capability \
+                 A.AvailableForNumberSelection, B.Capability, \
+                 S.SenderType, S.Region AS SenderRegion, S.SenderIdentity \
                  FROM number_info AS A \
                  INNER JOIN number_caps AS B ON A.NumberSid = B.NumberSid \
+                 INNER JOIN sender_info AS S ON A.AccountSid = S.AccountSid AND A.NumberPoolSid = S.NumberPoolSid \
                  ORDER BY RAND() \
                  LIMIT {limit}"
             )
@@ -99,11 +109,12 @@ async fn fetch_test_records(
     let mut records = Vec::new();
     for (batch_idx, batch) in batches.iter().enumerate() {
         for row in 0..batch.num_rows() {
-            let record = NumberInfoRecord::from_record_batch(batch, row).map_err(|err| {
-                anyhow::anyhow!(
-                    "Failed to extract sample record for batch {batch_idx}, row {row}: {err}"
-                )
-            })?;
+            let record =
+                NumberWithSenderInfoRecord::from_record_batch(batch, row).map_err(|err| {
+                    anyhow::anyhow!(
+                        "Failed to extract sample record for batch {batch_idx}, row {row}: {err}"
+                    )
+                })?;
             records.push(record);
         }
     }
@@ -114,7 +125,7 @@ async fn fetch_test_records(
 /// Generate multiple queries for each record (parameter set).
 fn generate_queries_with_dynamic_parameters(
     queries: Vec<Query>,
-    records: &[NumberInfoRecord],
+    records: &[NumberWithSenderInfoRecord],
 ) -> Vec<Query> {
     queries
         .into_iter()
@@ -128,7 +139,7 @@ fn generate_queries_with_dynamic_parameters(
 
 /// Build a parameter set dynamically from a record and return the complete query.
 #[allow(clippy::too_many_lines)]
-fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) -> Query {
+fn create_query_with_parameter_set(mut query: Query, record: &NumberWithSenderInfoRecord) -> Query {
     let qtype = query.name.strip_prefix("saffron_").unwrap_or(&query.name);
 
     query.parameters = match qtype {
@@ -197,12 +208,14 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
             ParameterValue::String(record.number_region.clone().into()), // SupportedDestRegion filter
             ParameterValue::String(record.number_region.clone().into()), // NumberRegion filter
             ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
+            ParameterValue::String(record.number_type.clone().into()), // NumberType filter
             ParameterValue::String(record.capability.clone().into()),
             ParameterValue::Number(20), // LIMIT value
         ]),
         "q8" => Some(vec![
             ParameterValue::String(record.account_sid.clone().into()),
             ParameterValue::String(record.number_pool_sid.clone().into()),
+            ParameterValue::String(record.number_type.clone().into()), // NumberType filter
             ParameterValue::String("PN00000000000000000000000000000099".into()), // Throttled NumberSid (NOT IN)
             ParameterValue::String(record.capability.clone().into()),
             ParameterValue::Number(20), // LIMIT value
@@ -210,14 +223,14 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
         "q9" => Some(vec![
             ParameterValue::String(record.account_sid.clone().into()),
             ParameterValue::String(record.number_pool_sid.clone().into()),
-            ParameterValue::String(record.number_type.clone().into()), // SenderType
+            ParameterValue::String(record.sender_type.clone().into()),
             ParameterValue::Number(0), // OFFSET value (default to first record)
         ]),
         "q10" => Some(vec![
             ParameterValue::String(record.account_sid.clone().into()),
             ParameterValue::String(record.number_pool_sid.clone().into()),
-            ParameterValue::String(record.number_type.clone().into()), // SenderType
-            ParameterValue::String(record.number_region.clone().into()), // Region
+            ParameterValue::String(record.sender_type.clone().into()),
+            ParameterValue::String(record.sender_region.clone().into()),
             ParameterValue::Number(0), // OFFSET value (default to first record)
         ]),
         "q11" => Some(vec![
@@ -227,7 +240,7 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
         ]),
         "q12" => Some(vec![
             ParameterValue::String(record.account_sid.clone().into()),
-            ParameterValue::String(record.number_did.clone().into()), // NumberDid used as SenderIdentity
+            ParameterValue::String(record.sender_identity.clone().into()),
         ]),
         _ => None,
     };
@@ -236,7 +249,8 @@ fn create_query_with_parameter_set(mut query: Query, record: &NumberInfoRecord) 
 }
 
 #[derive(Debug, Clone)]
-pub struct NumberInfoRecord {
+pub struct NumberWithSenderInfoRecord {
+    // Number info fields
     pub account_sid: String,
     pub number_pool_sid: String,
     pub number_sid: String,
@@ -251,9 +265,14 @@ pub struct NumberInfoRecord {
     pub area_code_region: String,
     pub available_for_number_selection: i32,
     pub capability: String,
+
+    // Sender info fields
+    pub sender_type: String,     // Used in q9, q10 WHERE SenderType = ?
+    pub sender_region: String,   // Used in q10 WHERE Region = ?
+    pub sender_identity: String, // Used in q12 WHERE SenderIdentity = ?
 }
 
-impl NumberInfoRecord {
+impl NumberWithSenderInfoRecord {
     pub fn from_record_batch(batch: &RecordBatch, row: usize) -> Result<Self> {
         Ok(Self {
             account_sid: get_string(batch, "AccountSid", row)?,
@@ -270,6 +289,11 @@ impl NumberInfoRecord {
             area_code_region: get_string(batch, "AreaCodeRegion", row)?,
             available_for_number_selection: get_i32(batch, "AvailableForNumberSelection", row)?,
             capability: get_string(batch, "Capability", row)?,
+
+            // Sender info fields
+            sender_type: get_string(batch, "SenderType", row)?,
+            sender_region: get_string(batch, "SenderRegion", row)?,
+            sender_identity: get_string(batch, "SenderIdentity", row)?,
         })
     }
 }
