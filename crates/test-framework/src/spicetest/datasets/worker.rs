@@ -49,7 +49,7 @@ pub(crate) struct SpiceTestQueryWorker {
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
-    spice_client: Arc<SpiceClient>,
+    spice_client: Option<Arc<SpiceClient>>,
     http_client: Option<reqwest::Client>,
     /// Optional custom validation data for scenario queries
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
@@ -96,14 +96,13 @@ impl SpiceTestQueryWorker {
         id: usize,
         query_set: Vec<Query>,
         end_condition: EndCondition,
-        spice_client: SpiceClient,
         name: String,
     ) -> Self {
         Self {
             id,
             query_set,
             end_condition,
-            spice_client: Arc::new(spice_client),
+            spice_client: None,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
@@ -117,6 +116,11 @@ impl SpiceTestQueryWorker {
 
     pub fn with_http_client(mut self, http_client: reqwest::Client) -> Self {
         self.http_client = Some(http_client);
+        self
+    }
+
+    pub fn with_flight_client(mut self, spice_client: SpiceClient) -> Self {
+        self.spice_client = Some(Arc::new(spice_client));
         self
     }
 
@@ -265,10 +269,13 @@ impl SpiceTestQueryWorker {
                             ));
                         }
 
-                        if self.explain_plan_snapshot && self.id == 0 {
+                        if self.explain_plan_snapshot
+                            && self.id == 0
+                            && let Some(client) = &self.spice_client
+                        {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
-                                Arc::clone(&self.spice_client),
+                                Arc::clone(client),
                                 self.name.as_str(),
                                 query,
                                 self.scale_factor,
@@ -457,10 +464,13 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        let Some(spice_client) = self.spice_client.as_ref() else {
+            return Ok(());
+        };
+
         let query_start = Instant::now();
 
-        let mut result_stream = self
-            .spice_client
+        let mut result_stream = spice_client
             .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
             .await?;
 
