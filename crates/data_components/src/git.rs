@@ -111,7 +111,23 @@ impl GitTableProvider {
         } = config;
 
         let max_files = max_files.clamp(1, MAX_FILES_HARD_CAP);
+        if max_files != config.max_files {
+            tracing::warn!(
+                "Requested max_files {} exceeds hard cap {}, clamping to {}",
+                config.max_files,
+                MAX_FILES_HARD_CAP,
+                max_files
+            );
+        }
         let max_file_bytes = max_file_bytes.clamp(1, MAX_FILE_BYTES_HARD_CAP);
+        if max_file_bytes != config.max_file_bytes {
+            tracing::warn!(
+                "Requested max_file_bytes {} exceeds hard cap {}, clamping to {}",
+                config.max_file_bytes,
+                MAX_FILE_BYTES_HARD_CAP,
+                max_file_bytes
+            );
+        }
 
         let client = GitClient::new(
             repo_url,
@@ -258,7 +274,16 @@ impl GitClient {
         }
 
         if repo_url.starts_with("git@") {
-            if repo_url.split(':').count() < 2 {
+            let parts: Vec<&str> = repo_url.split(':').collect();
+            if parts.len() != 2 {
+                return Err(Error::InvalidConfiguration {
+                    message: "Invalid SSH repository URL. Expected format git@host:org/repo"
+                        .to_string(),
+                });
+            }
+            let host = parts[0].trim_start_matches("git@");
+            let path = parts[1];
+            if host.is_empty() || path.is_empty() {
                 return Err(Error::InvalidConfiguration {
                     message: "Invalid SSH repository URL. Expected format git@host:org/repo"
                         .to_string(),

@@ -235,10 +235,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("cache_path")
         .description("Custom path for the local Git repository cache. If not specified, uses system temp directory."),
     ParameterSpec::runtime("max_files")
-        .description("Maximum number of files to materialize from a Git repository. Default: 5000.")
+        .description("Maximum number of files to materialize from a Git repository. Default: 5000. Hard limit: 50000.")
         .default("5000"),
     ParameterSpec::runtime("max_file_bytes")
-        .description("Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288."),
+        .description("Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB)."),
 ];
 
 impl DataConnectorFactory for GitFactory {

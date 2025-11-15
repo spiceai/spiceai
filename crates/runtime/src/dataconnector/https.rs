@@ -450,11 +450,11 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("allowed_request_paths")
             .description("Comma-separated list of request_path values that users are allowed to query. Required to enable request_path filters."),
         ParameterSpec::runtime("allow_request_query_filters")
-            .description("Set to true to allow request_query filters to be pushed down to HTTP requests."),
+            .description("Set to true (1/true/yes/on) to allow request_query filters to be pushed down to HTTP requests."),
         ParameterSpec::runtime("max_request_query_length")
             .description("Maximum length (in characters) for request_query filter values. Default: 1024."),
         ParameterSpec::runtime("allow_request_body_filters")
-            .description("Set to true to allow request_body filters to be pushed down as HTTP request bodies."),
+            .description("Set to true (1/true/yes/on) to allow request_body filters to be pushed down as HTTP request bodies."),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
     ]);

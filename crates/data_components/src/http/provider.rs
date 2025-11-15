@@ -1272,13 +1272,13 @@ impl HttpTableProvider {
                 ),
             });
         }
-        if raw.chars().any(|c| c.is_control()) {
+        if raw.chars().any(char::is_control) {
             return Err(Error::FilterRejected {
                 message: "request_query cannot contain control characters".to_string(),
             });
         }
 
-        Ok(raw.trim_start_matches('?').to_string())
+        Ok(raw.strip_prefix('?').unwrap_or(raw).to_string())
     }
 
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {

@@ -95,7 +95,7 @@ async fn test_http_provider_with_real_endpoint() {
 
 /// Test with query parameters
 #[tokio::test]
-async fn test_http_provider_withrequest_query_params() {
+async fn test_http_provider_with_request_query_params() {
     let provider = build_provider("https://httpbin.org", "json", &["/get"], true, false);
 
     let ctx = SessionContext::new();
@@ -159,7 +159,7 @@ async fn test_http_provider_without_filters() {
 
 /// Test with base URL that has a path component
 #[tokio::test]
-async fn test_http_provider_with_baserequest_path() {
+async fn test_http_provider_with_base_request_path() {
     let provider = build_provider(
         "https://httpbin.org/anything/base",
         "json",
@@ -398,7 +398,7 @@ async fn test_tvmaze_combined_or_filter() {
 /// Tests using IN clause for multiple paths
 /// Expected: Returns rows from multiple different endpoints
 #[tokio::test]
-async fn test_tvmaze_in_listrequest_paths() {
+async fn test_tvmaze_in_list_request_paths() {
     let provider = build_provider(
         "https://api.tvmaze.com",
         "json",
@@ -483,7 +483,7 @@ async fn test_tvmaze_in_listrequest_paths() {
 
 /// Test POST request with `request_body` filter (default JSON content-type)
 #[tokio::test]
-async fn test_http_post_with_jsonrequest_body() {
+async fn test_http_post_with_json_request_body() {
     let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
     let ctx = SessionContext::new();
