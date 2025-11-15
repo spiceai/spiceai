@@ -108,6 +108,26 @@ struct SnapshotEntry {
     snapshot_size: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DatasetSnapshots {
+    pub dataset: String,
+    pub location: String,
+    pub last_updated_ms: Option<i64>,
+    pub current_snapshot_id: Option<u64>,
+    pub snapshots: Vec<SnapshotDetails>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotDetails {
+    pub snapshot_id: u64,
+    pub timestamp_ms: i64,
+    pub uri: String,
+    pub size_bytes: u64,
+    pub checksum: String,
+    pub checksum_algorithm: String,
+    pub is_current: bool,
+}
+
 impl SnapshotMetadata {
     fn empty(location: String, now_ms: i64) -> Self {
         Self {
@@ -292,6 +312,22 @@ impl From<MetadataLoadError> for SnapshotUploadError {
     }
 }
 
+impl From<MetadataLoadError> for SnapshotMetadataError {
+    fn from(err: MetadataLoadError) -> Self {
+        match err {
+            MetadataLoadError::Read { path, source } => {
+                SnapshotMetadataError::MetadataRead { path, source }
+            }
+            MetadataLoadError::Parse { path, source } => {
+                SnapshotMetadataError::MetadataParse { path, source }
+            }
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotMetadataError::MetadataUnsupportedVersion { path, version }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum SnapshotUploadError {
     #[snafu(display("Failed to open local snapshot file {}: {source}", path.display()))]
@@ -360,6 +396,46 @@ pub enum SnapshotUploadError {
     UploadMetadataSchemaMissing { dataset: String },
     #[snafu(display("Snapshot metadata schema conflict for dataset {dataset}"))]
     UploadSchemaMismatch { dataset: String },
+}
+
+#[derive(Debug, Snafu)]
+pub enum SnapshotMetadataError {
+    #[snafu(display("Failed to read snapshot metadata at {path}: {source}"))]
+    MetadataRead {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Snapshot metadata at {path} is invalid: {source}"))]
+    MetadataParse {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[snafu(display("Snapshot metadata at {path} has unsupported format version {version}"))]
+    MetadataUnsupportedVersion { path: String, version: u32 },
+    #[snafu(display("Snapshot metadata for dataset {dataset} is not initialized"))]
+    MetadataMissing { dataset: String },
+    #[snafu(display("Dataset {dataset} snapshot id {snapshot_id} not found"))]
+    MetadataSnapshotNotFound { dataset: String, snapshot_id: u64 },
+    #[snafu(display("Failed to write snapshot metadata at {path}: {source}"))]
+    MetadataWrite {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Failed to serialize snapshot metadata at {path}: {source}"))]
+    MetadataSerialize {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[snafu(display("Snapshot URI {uri} is invalid: {source}"))]
+    MetadataInvalidSnapshotUri {
+        uri: String,
+        source: url::ParseError,
+    },
+    #[snafu(display("Failed to delete snapshot object {path}: {source}"))]
+    SnapshotDelete {
+        path: String,
+        source: object_store::Error,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -950,6 +1026,125 @@ impl SnapshotManager {
         Ok(None)
     }
 
+    /// Returns the snapshot metadata listing for this dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotMetadataError`] if the metadata document cannot be
+    /// read, parsed, or does not contain this dataset.
+    pub async fn list_snapshots(&self) -> Result<DatasetSnapshots, SnapshotMetadataError> {
+        let Some(handle) = self.load_metadata().await? else {
+            return Err(SnapshotMetadataError::MetadataMissing {
+                dataset: self.dataset_name.clone(),
+            });
+        };
+
+        let metadata = handle.metadata;
+        let dataset_metadata = metadata
+            .datasets
+            .get(&self.dataset_name)
+            .cloned()
+            .ok_or_else(|| SnapshotMetadataError::MetadataMissing {
+                dataset: self.dataset_name.clone(),
+            })?;
+
+        let current_id = dataset_metadata.current_snapshot_id;
+        let snapshots = dataset_metadata
+            .snapshots
+            .iter()
+            .map(|entry| SnapshotDetails {
+                snapshot_id: entry.snapshot_id,
+                timestamp_ms: entry.timestamp_ms,
+                uri: entry.snapshot.clone(),
+                size_bytes: entry.snapshot_size,
+                checksum: entry.snapshot_checksum.clone(),
+                checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+                is_current: current_id == Some(entry.snapshot_id),
+            })
+            .collect();
+
+        Ok(DatasetSnapshots {
+            dataset: self.dataset_name.clone(),
+            location: metadata.location,
+            last_updated_ms: Some(metadata.last_updated_ms),
+            current_snapshot_id: current_id,
+            snapshots,
+        })
+    }
+
+    /// Updates the current snapshot pointer to `snapshot_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotMetadataError`] if metadata cannot be loaded or if the
+    /// requested snapshot id does not exist.
+    pub async fn set_current_snapshot(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<(), SnapshotMetadataError> {
+        self.modify_dataset_metadata(|dataset| {
+            if dataset
+                .snapshots
+                .iter()
+                .any(|entry| entry.snapshot_id == snapshot_id)
+            {
+                dataset.current_snapshot_id = Some(snapshot_id);
+                Ok(())
+            } else {
+                Err(SnapshotMetadataError::MetadataSnapshotNotFound {
+                    dataset: dataset.name.clone(),
+                    snapshot_id,
+                })
+            }
+        })
+        .await
+    }
+
+    /// Removes the given snapshot from metadata and deletes its object from
+    /// storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotMetadataError`] if metadata access fails or if deleting
+    /// the snapshot object from storage fails.
+    pub async fn delete_snapshot(&self, snapshot_id: u64) -> Result<(), SnapshotMetadataError> {
+        let removed_entry = self
+            .modify_dataset_metadata(|dataset| {
+                let Some(position) = dataset
+                    .snapshots
+                    .iter()
+                    .position(|entry| entry.snapshot_id == snapshot_id)
+                else {
+                    return Err(SnapshotMetadataError::MetadataSnapshotNotFound {
+                        dataset: dataset.name.clone(),
+                        snapshot_id,
+                    });
+                };
+
+                let entry = dataset.snapshots.remove(position);
+                if dataset.current_snapshot_id == Some(snapshot_id) {
+                    dataset.current_snapshot_id = dataset
+                        .snapshots
+                        .iter()
+                        .max_by_key(|snapshot| snapshot.snapshot_id)
+                        .map(|snapshot| snapshot.snapshot_id);
+                }
+                Ok(entry)
+            })
+            .await?;
+
+        let object_path = self.metadata_snapshot_uri_to_object_path(&removed_entry.snapshot)?;
+        let path_display = object_path.to_string();
+
+        match self.object_store.delete(&object_path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(source) => Err(SnapshotMetadataError::SnapshotDelete {
+                path: path_display,
+                source,
+            }),
+        }
+    }
+
     fn snapshot_uri_to_object_path(&self, uri: &str) -> Result<ObjectPath, SnapshotDownloadError> {
         let base_uri = self.snapshot_location_uri.trim_end_matches('/');
         if let Some(relative) = uri.strip_prefix(base_uri) {
@@ -983,6 +1178,128 @@ impl SnapshotManager {
                     })
                 } else {
                     Ok(ObjectPath::from(uri))
+                }
+            }
+        }
+    }
+
+    fn metadata_snapshot_uri_to_object_path(
+        &self,
+        uri: &str,
+    ) -> Result<ObjectPath, SnapshotMetadataError> {
+        let base_uri = self.snapshot_location_uri.trim_end_matches('/');
+        if let Some(relative) = uri.strip_prefix(base_uri) {
+            let relative = relative.trim_start_matches('/');
+            let combined = if relative.is_empty() {
+                self.snapshots_location.to_string()
+            } else {
+                format!("{}/{}", self.snapshots_location, relative)
+            };
+            return Ok(ObjectPath::from(combined));
+        }
+
+        match Url::parse(uri) {
+            Ok(parsed_uri) => {
+                let mut combined = self.snapshots_location.to_string();
+                if let Some(host) = parsed_uri.host_str() {
+                    combined = format!("{combined}/{host}");
+                }
+                let path = parsed_uri.path().trim_start_matches('/').trim();
+                if path.is_empty() {
+                    Ok(ObjectPath::from(combined))
+                } else {
+                    Ok(ObjectPath::from(format!("{combined}/{path}")))
+                }
+            }
+            Err(parse_err) => {
+                if uri.contains("://") {
+                    Err(SnapshotMetadataError::MetadataInvalidSnapshotUri {
+                        uri: uri.to_string(),
+                        source: parse_err,
+                    })
+                } else {
+                    Ok(ObjectPath::from(uri))
+                }
+            }
+        }
+    }
+
+    async fn modify_dataset_metadata<T, F>(
+        &self,
+        mut mutator: F,
+    ) -> Result<T, SnapshotMetadataError>
+    where
+        F: FnMut(&mut DatasetMetadata) -> Result<T, SnapshotMetadataError>,
+    {
+        let metadata_path = self.metadata_path();
+        let metadata_path_display = metadata_path.to_string();
+
+        loop {
+            let handle = self.load_metadata().await?.ok_or_else(|| {
+                SnapshotMetadataError::MetadataMissing {
+                    dataset: self.dataset_name.clone(),
+                }
+            })?;
+
+            let MetadataHandle {
+                mut metadata,
+                version,
+            } = handle;
+            let dataset_entry = metadata
+                .datasets
+                .get_mut(&self.dataset_name)
+                .ok_or_else(|| SnapshotMetadataError::MetadataMissing {
+                    dataset: self.dataset_name.clone(),
+                })?;
+
+            dataset_entry.name.clone_from(&self.dataset_name);
+
+            let result = mutator(dataset_entry)?;
+            metadata.last_updated_ms = Utc::now().timestamp_millis();
+
+            let serialized = serde_json::to_vec_pretty(&metadata).map_err(|source| {
+                SnapshotMetadataError::MetadataSerialize {
+                    path: metadata_path_display.clone(),
+                    source,
+                }
+            })?;
+
+            let put_mode = match version {
+                Some(version) => PutMode::Update(version),
+                None => PutMode::Overwrite,
+            };
+
+            let payload = PutPayload::from(serialized);
+
+            match self
+                .object_store
+                .put_opts(&metadata_path, payload.clone(), put_mode.clone().into())
+                .await
+            {
+                Ok(_) => return Ok(result),
+                Err(object_store::Error::Precondition { .. }) => {}
+                Err(object_store::Error::NotSupported { .. })
+                    if matches!(put_mode, PutMode::Update(_)) =>
+                {
+                    match self
+                        .object_store
+                        .put_opts(&metadata_path, payload, PutMode::Overwrite.into())
+                        .await
+                    {
+                        Ok(_) => return Ok(result),
+                        Err(source) => {
+                            return Err(SnapshotMetadataError::MetadataWrite {
+                                path: metadata_path_display.clone(),
+                                source,
+                            });
+                        }
+                    }
+                }
+                Err(source) => {
+                    return Err(SnapshotMetadataError::MetadataWrite {
+                        path: metadata_path_display.clone(),
+                        source,
+                    });
                 }
             }
         }
@@ -1563,6 +1880,24 @@ mod tests {
         }
     }
 
+    fn snapshot_entry(id: u64, timestamp_ms: i64, path: &ObjectPath, size: u64) -> SnapshotEntry {
+        SnapshotEntry {
+            snapshot_id: id,
+            timestamp_ms,
+            snapshot: snapshot_uri(path),
+            snapshot_checksum: format!("checksum-{id}"),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: size,
+        }
+    }
+
+    fn base_metadata(dataset: DatasetMetadata, last_updated_ms: i64) -> SnapshotMetadata {
+        let mut metadata =
+            SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), last_updated_ms);
+        metadata.datasets.insert(DATASET_NAME.to_string(), dataset);
+        metadata
+    }
+
     #[tokio::test]
     async fn download_latest_snapshot_returns_none_without_metadata() {
         let store = Arc::new(InMemory::new());
@@ -1803,6 +2138,189 @@ mod tests {
             .to_schema_ref()
             .expect("deserialize schema");
         assert_eq!(metadata_schema.as_ref(), schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn list_snapshots_returns_metadata_listing() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let ts1 = 1_700_000_000_000;
+        let ts2 = ts1 + 1_000;
+        let path1 =
+            layout.build_location(&base, Utc.timestamp_millis_opt(ts1).single().expect("ts1"));
+        let path2 =
+            layout.build_location(&base, Utc.timestamp_millis_opt(ts2).single().expect("ts2"));
+
+        let snapshots = vec![
+            snapshot_entry(1, ts1, &path1, 111),
+            snapshot_entry(2, ts2, &path2, 222),
+        ];
+        let dataset = dataset_metadata(&schema, snapshots, Some(2));
+        let metadata = base_metadata(dataset, ts2);
+        let metadata_path = manager.metadata_path();
+        write_metadata(store.as_ref(), &metadata_path, &metadata).await;
+
+        let listing = manager.list_snapshots().await.expect("listing");
+        assert_eq!(listing.dataset, DATASET_NAME);
+        assert_eq!(listing.location, SNAPSHOT_URI_PREFIX);
+        assert_eq!(listing.current_snapshot_id, Some(2));
+        assert_eq!(listing.snapshots.len(), 2);
+        assert!(
+            listing
+                .snapshots
+                .iter()
+                .any(|snap| snap.snapshot_id == 2 && snap.is_current)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_current_snapshot_updates_metadata() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let ts = 1_700_000_000_000;
+        let path1 =
+            layout.build_location(&base, Utc.timestamp_millis_opt(ts).single().expect("ts1"));
+        let path2 = layout.build_location(
+            &base,
+            Utc.timestamp_millis_opt(ts + 1_000).single().expect("ts2"),
+        );
+        let snapshots = vec![
+            snapshot_entry(1, ts, &path1, 100),
+            snapshot_entry(2, ts + 1_000, &path2, 200),
+        ];
+        let dataset = dataset_metadata(&schema, snapshots, Some(1));
+        let metadata = base_metadata(dataset, ts);
+        let metadata_path = manager.metadata_path();
+        write_metadata(store.as_ref(), &metadata_path, &metadata).await;
+
+        manager
+            .set_current_snapshot(2)
+            .await
+            .expect("set head succeeds");
+
+        let listing = manager.list_snapshots().await.expect("listing");
+        assert_eq!(listing.current_snapshot_id, Some(2));
+        assert!(
+            listing
+                .snapshots
+                .iter()
+                .any(|snap| snap.snapshot_id == 2 && snap.is_current)
+        );
+        assert!(
+            listing
+                .snapshots
+                .iter()
+                .any(|snap| snap.snapshot_id == 1 && !snap.is_current)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_current_snapshot_missing_returns_error() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let ts = 1_700_000_000_000;
+        let path1 =
+            layout.build_location(&base, Utc.timestamp_millis_opt(ts).single().expect("ts1"));
+        let snapshots = vec![snapshot_entry(1, ts, &path1, 100)];
+        let dataset = dataset_metadata(&schema, snapshots, Some(1));
+        let metadata = base_metadata(dataset, ts);
+        let metadata_path = manager.metadata_path();
+        write_metadata(store.as_ref(), &metadata_path, &metadata).await;
+
+        let err = manager
+            .set_current_snapshot(99)
+            .await
+            .expect_err("expected error");
+        assert!(matches!(
+            err,
+            SnapshotMetadataError::MetadataSnapshotNotFound {
+                snapshot_id: 99,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_removes_metadata_and_object() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+        );
+
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let ts = 1_700_000_000_000;
+        let instant1 = Utc.timestamp_millis_opt(ts).single().expect("ts1");
+        let instant2 = Utc.timestamp_millis_opt(ts + 1_000).single().expect("ts2");
+        let path1 = layout.build_location(&base, instant1);
+        let path2 = layout.build_location(&base, instant2);
+
+        store
+            .put(&path1, Bytes::from_static(b"snapshot-1").into())
+            .await
+            .expect("write snapshot 1");
+        store
+            .put(&path2, Bytes::from_static(b"snapshot-2").into())
+            .await
+            .expect("write snapshot 2");
+
+        let snapshots = vec![
+            snapshot_entry(1, ts, &path1, 100),
+            snapshot_entry(2, ts + 1_000, &path2, 200),
+        ];
+        let dataset = dataset_metadata(&schema, snapshots, Some(1));
+        let metadata = base_metadata(dataset, ts);
+        let metadata_path = manager.metadata_path();
+        write_metadata(store.as_ref(), &metadata_path, &metadata).await;
+
+        manager.delete_snapshot(1).await.expect("delete succeeds");
+
+        let listing = manager.list_snapshots().await.expect("listing");
+        assert_eq!(listing.snapshots.len(), 1);
+        assert_eq!(listing.snapshots[0].snapshot_id, 2);
+        assert_eq!(listing.current_snapshot_id, Some(2));
+
+        let head_err = store.head(&path1).await.expect_err("object deleted");
+        assert!(matches!(head_err, object_store::Error::NotFound { .. }));
     }
 
     #[tokio::test]

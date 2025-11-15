@@ -79,7 +79,7 @@ arrow-flight = "56.0.0"
 arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
 arrow-odbc = "18"
-arrow-schema = "56.0.0"
+arrow-schema = { version = "56.0.0", features = ["serde"] }
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "afaaba87a10e48853e59c809bf296aefbb08c9bd", features = [
     "byot",
 ] }
