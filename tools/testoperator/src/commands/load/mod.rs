@@ -94,9 +94,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )?;
+    )
+    .await?;
 
-    let warm_up = SpiceTest::new(app.name.clone(), test_builder)
+    let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
