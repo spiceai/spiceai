@@ -20,6 +20,16 @@ const CACHE_WEIGHT: u64 = 100_000;
 const KEY_SPACE: u64 = 100_000;
 const OPERATIONS_PER_THREAD: usize = 10_000;
 
+/// Creates a lightweight single-threaded runtime for benchmark worker threads.
+/// Using `current_thread` runtime instead of `multi_thread` reduces overhead
+/// since each thread only needs to run its own async operations.
+fn create_bench_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create benchmark runtime")
+}
+
 // Wrapper type for benchmarking LruCache
 #[derive(Clone)]
 struct BenchValue(String);
@@ -64,7 +74,7 @@ fn random_value(rng: &mut StdRng) -> String {
 
 fn bench_concurrent_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_get");
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+    let rt = create_bench_runtime();
 
     for thread_count in [1, 4, 8, 16, 32] {
         group.throughput(Throughput::Elements(
@@ -173,7 +183,7 @@ fn bench_concurrent_put(c: &mut Criterion) {
 
 fn bench_concurrent_mixed(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_mixed_80_20");
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+    let rt = create_bench_runtime();
 
     for thread_count in [1, 4, 8, 16, 32] {
         group.throughput(Throughput::Elements(
@@ -237,7 +247,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 
 fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_concurrent_get");
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+    let rt = create_bench_runtime();
 
     for backend in ["moka", "pingora"] {
         let engine = match backend {
@@ -364,7 +374,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
 
 fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_concurrent_mixed_80_20");
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+    let rt = create_bench_runtime();
 
     for backend in ["moka", "pingora"] {
         let engine = match backend {

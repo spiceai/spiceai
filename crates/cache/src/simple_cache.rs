@@ -78,7 +78,9 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     SimpleCache<V, T>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
-        let capacity_per_shard = ((cache_max_size / 1024) / NUM_SHARDS as u64).max(16) as usize;
+        // Estimate item count: assume average item size of 1KB for capacity calculation
+        let estimated_items = (cache_max_size / 1024).max(16);
+        let capacity_per_shard = (estimated_items / NUM_SHARDS as u64).max(16) as usize;
         let cache = Lru::with_capacity(
             usize::try_from(cache_max_size).unwrap_or(usize::MAX),
             capacity_per_shard,

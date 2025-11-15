@@ -52,7 +52,7 @@ pub enum CacheEngine {
     /// Moka cache engine (default) - stable, built-in TTL, no race conditions
     #[default]
     Moka,
-    /// Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL with rare race condition
+    /// Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL with rare race condition. Note: table-specific invalidation not currently supported.
     Pingora,
 }
 

@@ -135,7 +135,7 @@ impl<
                 CacheBackendType::Moka(MokaBackend::new(&builder, hasher.clone()))
             }
             CacheEngine::Pingora => {
-                tracing::info!("Using Pingora cache engine (2-3x faster, rare race condition)");
+                tracing::info!("Using Pingora cache engine (high-performance, lock-free)");
                 CacheBackendType::Pingora(PingoraBackend::new(&builder))
             }
         };
@@ -224,15 +224,35 @@ impl<
     }
 
     fn invalidate_all(&self) {
-        // Spawn async task to clear cache since this is a sync method
-        match &self.backend {
-            CacheBackendType::Moka(backend) => {
-                let b = backend.clone();
-                tokio::spawn(async move { b.clear().await });
-            }
-            CacheBackendType::Pingora(backend) => {
-                let b = backend.clone();
-                tokio::spawn(async move { b.clear().await });
+        // Block on async clear since this is a sync method that should complete before returning
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            // We're in a runtime, use block_in_place to avoid blocking the runtime
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    match &self.backend {
+                        CacheBackendType::Moka(backend) => backend.clear().await,
+                        CacheBackendType::Pingora(backend) => backend.clear().await,
+                    }
+                });
+            });
+        } else {
+            // Not in a runtime, create a new one
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    rt.block_on(async {
+                        match &self.backend {
+                            CacheBackendType::Moka(backend) => backend.clear().await,
+                            CacheBackendType::Pingora(backend) => backend.clear().await,
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create tokio runtime for cache invalidation: {}",
+                        e
+                    );
+                }
             }
         }
 
@@ -256,17 +276,39 @@ impl<
     }
 
     fn size_bytes(&self) -> u64 {
-        // For moka we can get actual weighted size, for pingora we estimate
-        // This is a sync method so we can't await, return approximate value
-        match &self.backend {
-            CacheBackendType::Moka(_) | CacheBackendType::Pingora(_) => 0,
+        // Both backends expose sync methods for size
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    match &self.backend {
+                        CacheBackendType::Moka(backend) => {
+                            // Moka doesn't expose weighted_size in async, use len as proxy
+                            backend.len().await as u64
+                        }
+                        CacheBackendType::Pingora(backend) => backend.len().await as u64,
+                    }
+                })
+            })
+        } else {
+            0 // Can't determine size without runtime
         }
     }
 
     fn item_count(&self) -> u64 {
-        // Similar issue - backends are async but this is sync
-        // Return 0 for now, metrics will be updated on put
-        0
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    match &self.backend {
+                        CacheBackendType::Moka(backend) => backend.len().await as u64,
+                        CacheBackendType::Pingora(backend) => backend.len().await as u64,
+                    }
+                })
+            })
+        } else {
+            0 // Can't determine count without runtime
+        }
     }
 
     fn max_size(&self) -> usize {
