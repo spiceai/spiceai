@@ -99,6 +99,9 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             let exported_events = execute_query(&data_endpoint_rt, "SELECT input, captured_output, error_message FROM runtime.task_history where input like '%test_event%' order by input ").await?;
             insta::assert_snapshot!("shutdown_export", pretty_format_batches(&exported_events)?);
 
+            // Shutdown the data endpoint runtime to prevent test hanging
+            data_endpoint_rt.shutdown().await;
+
             Ok(())
         })
         .await
