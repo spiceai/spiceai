@@ -27,6 +27,8 @@ import (
 	"strings"
 )
 
+const secureFilePerm os.FileMode = 0o600
+
 func SaveReaderToFile(reader io.Reader, fullFilePath string) error {
 	// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
 	fileHandle, err := os.OpenFile(fullFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -71,6 +73,24 @@ func ExtractZip(body []byte, downloadDir string) error {
 	}
 
 	for _, file := range zipReader.File {
+		cleanName := filepath.Clean(file.Name)
+		if err := SanitizeExtractPath(cleanName, downloadDir); err != nil {
+			return err
+		}
+
+		targetPath := filepath.Join(downloadDir, cleanName)
+
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return err
+		}
+
 		reader, err := file.Open()
 		if err != nil {
 			return err
@@ -82,11 +102,7 @@ func ExtractZip(body []byte, downloadDir string) error {
 			}
 		}()
 
-		fileName := file.FileInfo().Name()
-
-		fileToWrite := filepath.Join(downloadDir, fileName)
-
-		newFile, err := os.Create(fileToWrite)
+		newFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, file.Mode().Perm())
 		if err != nil {
 			return err
 		}
@@ -97,8 +113,7 @@ func ExtractZip(body []byte, downloadDir string) error {
 			}
 		}()
 
-		_, err = io.Copy(newFile, reader)
-		if err != nil {
+		if _, err := io.Copy(newFile, reader); err != nil {
 			return err
 		}
 	}
@@ -191,4 +206,26 @@ func CopyFile(src string, dst string) error {
 	}
 
 	return os.WriteFile(dst, data, perm)
+}
+
+func WriteSecureFile(filePath string, content []byte) error {
+	fileHandle, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, secureFilePerm)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := fileHandle.Close(); err != nil {
+			slog.Error("failed to close file", "file", filePath, "error", err)
+		}
+	}()
+
+	if _, err := fileHandle.Write(content); err != nil {
+		return err
+	}
+
+	if err := fileHandle.Chmod(secureFilePerm); err != nil {
+		return err
+	}
+
+	return nil
 }

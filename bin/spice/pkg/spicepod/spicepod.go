@@ -22,6 +22,7 @@ import (
 	"path"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -66,8 +67,7 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 	}
 
 	spicepodPath := path.Join(spicepodDir, "spicepod.yaml")
-	err = os.WriteFile(spicepodPath, skeletonPodContentBytes, 0744)
-	if err != nil {
+	if err := util.WriteSecureFile(spicepodPath, skeletonPodContentBytes); err != nil {
 		return "", fmt.Errorf("error writing spicepod.yaml: %w", err)
 	}
 
