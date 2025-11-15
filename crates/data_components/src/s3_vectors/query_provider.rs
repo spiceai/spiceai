@@ -33,7 +33,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, exec_err, project_schema},
+    common::{Constraints, HashMap, exec_err, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -50,8 +50,8 @@ use datafusion::{
     prelude::Expr,
 };
 use s3_vectors::{
-    Document, GetVectorsInput, GetVectorsOutput, QueryOutputVector, QueryVectorsInput,
-    QueryVectorsOutput, S3Vectors, SdkError, VectorData,
+    Document, GetVectorsInput, GetVectorsOutput, QueryOutputVector, QueryVectorsInput, S3Vectors,
+    SdkError, VectorData,
 };
 use s3_vectors_metadata_filter::{convert_datafusion_filters_to_s3_vectors, document_to_json_map};
 use snafu::ResultExt;
@@ -532,38 +532,63 @@ impl ExecutionPlan for S3VectorsQueryExec {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn query_vector_stream(
+/// Wraps a single [`S3Vectors::get_vectors`] for better input, output and error handling.
+async fn get_vectors_call(
     client: Arc<dyn S3Vectors + Send + Sync>,
-    idx: S3VectorIdentifier,
-    query: Vec<f32>,
-    schema: SchemaRef,
-    limit: i32,
-    filters: Vec<Expr>,
-    tx: Sender<DataFusionResult<RecordBatch, DataFusionError>>,
-) -> DataFusionResult<()> {
-    let start = std::time::Instant::now();
-
+    idx: &S3VectorIdentifier,
+    keys: Vec<String>,
+) -> DataFusionResult<HashMap<String, VectorData>> {
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let (json_schema, vector_sizes) = loosen_vector_schema(&schema);
-    let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
-
-    let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
-    let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
-
-    let combined_span = info_span!(
-        target: "task_history",
-        "s3_vector_query_and_get",
-        bucket_name = bucket_name,
-        index_name = index_name,
-        arn = arn,
-        top_k = limit
-    );
-
-    let QueryVectorsOutput {
-        vectors: mut query_vectors,
+    let GetVectorsOutput {
+        vectors: output_vectors,
         ..
     } = client
+        .get_vectors(
+            GetVectorsInput::builder()
+                .set_keys(Some(keys))
+                .set_vector_bucket_name(bucket_name.clone())
+                .set_index_arn(arn.clone())
+                .set_index_name(index_name.clone())
+                .set_return_data(Some(true))
+                .build()
+                .boxed()
+                .map_err(DataFusionError::External)?,
+        )
+        .instrument(info_span!(
+            target: "task_history",
+            "s3_get_vectors",
+            bucket_name = bucket_name,
+            index_name = index_name,
+            arn = arn,
+        ))
+        .await
+        .map_err(|e| {
+            DataFusionError::External(
+                Error::S3VectorGetVectorsError {
+                    source: Box::new(e.into_service_error()),
+                }
+                .into(),
+            )
+        })?;
+
+    Ok(output_vectors
+        .into_iter()
+        .filter_map(|v| Some((v.key, v.data?)))
+        .collect())
+}
+
+/// Wraps a single [`S3Vectors::query_vectors`] for better input, output and error handling.
+async fn query_vectors_call(
+    client: Arc<dyn S3Vectors + Send + Sync>,
+    idx: &S3VectorIdentifier,
+    query: Vec<f32>,
+    filters: Vec<Expr>,
+    limit: i32,
+) -> DataFusionResult<Vec<QueryOutputVector>> {
+    let (arn, bucket_name, index_name) = idx.index_identifier_variables();
+    let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
+    let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
+    let output = client
         .query_vectors(
             QueryVectorsInput::builder()
                 .query_vector(VectorData::Float32(query))
@@ -586,7 +611,6 @@ async fn query_vector_stream(
             arn = arn,
             top_k = limit
         ))
-        .instrument(combined_span.clone())
         .await
         .map_err(|e| {
             if let SdkError::ServiceError(service_error) = &e
@@ -614,59 +638,53 @@ async fn query_vector_stream(
             )
         })?;
 
-    let num_vectors = query_vectors.len();
+    Ok(output.vectors)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn query_vector_stream(
+    client: Arc<dyn S3Vectors + Send + Sync>,
+    idx: S3VectorIdentifier,
+    query: Vec<f32>,
+    schema: SchemaRef,
+    limit: i32,
+    filters: Vec<Expr>,
+    tx: Sender<DataFusionResult<RecordBatch, DataFusionError>>,
+) -> DataFusionResult<()> {
+    let start = std::time::Instant::now();
+
+    let (arn, bucket_name, index_name) = idx.index_identifier_variables();
+    let (json_schema, vector_sizes) = loosen_vector_schema(&schema);
+    let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
+
+    let combined_span = info_span!(
+        target: "task_history",
+        "s3_vector_query_and_get",
+        bucket_name = bucket_name,
+        index_name = index_name,
+        arn = arn,
+        top_k = limit
+    );
+
+    let mut query_vectors = query_vectors_call(Arc::clone(&client), &idx, query, filters, limit)
+        .instrument(combined_span.clone())
+        .await?;
 
     // Only fetch vector data if the embeddings column is in the projection.
     // Check if "data" column is present in the schema.
-    let needs_embeddings = schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some();
-
-    if needs_embeddings {
-        // Get the vector data for each output using GetVectors API.
-        let keys = query_vectors.iter().map(|v| v.key.clone()).collect();
-        let GetVectorsOutput {
-            vectors: output_vectors,
-            ..
-        } = client
-            .get_vectors(
-                GetVectorsInput::builder()
-                    .set_keys(Some(keys))
-                    .set_vector_bucket_name(bucket_name.clone())
-                    .set_index_arn(arn.clone())
-                    .set_index_name(index_name.clone())
-                    .set_return_data(Some(true))
-                    .build()
-                    .boxed()
-                    .map_err(DataFusionError::External)?,
-            )
-            .instrument(info_span!(
-                target: "task_history",
-                "s3_get_vectors",
-                bucket_name = bucket_name,
-                index_name = index_name,
-                arn = arn,
-            ))
-            .instrument(combined_span)
-            .await
-            .map_err(|e| {
-                DataFusionError::External(
-                    Error::S3VectorGetVectorsError {
-                        source: Box::new(e.into_service_error()),
-                    }
-                    .into(),
-                )
-            })?;
-
-        // Put the vector data in the query_vectors
-        // Use HashMap for O(n) lookup instead of O(n²) nested loop
-        let output_map: std::collections::HashMap<_, _> = output_vectors
-            .into_iter()
-            .map(|v| (v.key.clone(), v))
-            .collect();
+    if schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some() {
+        let mut vector_data = get_vectors_call(
+            Arc::clone(&client),
+            &idx,
+            query_vectors.iter().map(|v| v.key.clone()).collect(),
+        )
+        .instrument(combined_span.clone())
+        .await?;
 
         let mut missing_keys = Vec::new();
         for query_vector in &mut query_vectors {
-            if let Some(output_vector) = output_map.get(&query_vector.key) {
-                query_vector.data.clone_from(&output_vector.data);
+            if let Some(output_vector) = vector_data.remove(&query_vector.key) {
+                query_vector.data = Some(output_vector);
             } else {
                 missing_keys.push(&query_vector.key);
             }
@@ -706,7 +724,10 @@ async fn query_vector_stream(
         }
     }
     let duration = start.elapsed();
-    tracing::trace!("S3 Vectors Query retrieved {num_vectors} vectors in {duration:?}");
+    tracing::trace!(
+        "S3 Vectors Query retrieved {} vectors in {duration:?}",
+        rows.len()
+    );
     Ok(())
 }
 

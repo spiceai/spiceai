@@ -181,9 +181,9 @@ impl SpiceTest<AppendStarted> {
                     id,
                     self.state.queries.clone(),
                     EndCondition::Duration(self.state.end_duration),
-                    spice_client.clone(),
                     self.name.clone(),
                 )
+                .with_flight_client(spice_client.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
                 .with_results_snapshot(self.results_snapshot_predicate);
 

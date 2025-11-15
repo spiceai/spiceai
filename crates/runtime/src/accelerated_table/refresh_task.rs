@@ -444,15 +444,17 @@ impl RefreshTask {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
                 Ok(None) => None,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
-                        self.component_type(),
-                        include_source_to_table_name(
-                            &self.dataset_name,
-                            self.federated_source.as_deref()
-                        ),
-                        e
-                    );
+                    if !self.runtime_status.is_shutdown() {
+                        tracing::warn!(
+                            "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
+                            self.component_type(),
+                            include_source_to_table_name(
+                                &self.dataset_name,
+                                self.federated_source.as_deref()
+                            ),
+                            e
+                        );
+                    }
                     None
                 }
             }
@@ -675,7 +677,9 @@ impl RefreshTask {
                 Err(e) => Err(e),
             },
             Err(e) => {
-                tracing::error!("No latest timestamp is found: {e}");
+                if !self.runtime_status.is_shutdown() {
+                    tracing::error!("No latest timestamp is found: {e}");
+                }
                 Err(e)
             }
         }
