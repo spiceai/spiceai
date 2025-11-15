@@ -68,6 +68,24 @@ pub struct PartitionTableProvider {
 }
 
 impl PartitionTableProvider {
+    /// Checks if a filter expression contains or references the partition expression.
+    /// This is used to identify filters that can be used for partition pruning.
+    fn filter_contains_partition_expr(filter: &Expr, partition_expr: &Expr) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+        // Check if filter contains the partition expression
+        let mut contains = false;
+        let _ = filter.apply(|expr| {
+            if expr == partition_expr {
+                contains = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        });
+        contains
+    }
+
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
     /// the first expression in `partition_by`.
     ///
@@ -154,6 +172,48 @@ impl TableProvider for PartitionTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Split filters into partition filters (for pruning) and data filters (for partition scans)
+        let partition_columns = self.partition_by.expression.column_refs();
+
+        // Pre-compute column references for all filters to avoid repeated expression tree traversals
+        let filter_columns_cache: Vec<_> =
+            filters.iter().map(|filter| filter.column_refs()).collect();
+
+        let (partition_filters, data_filters): (Vec<_>, Vec<_>) = filters
+            .iter()
+            .cloned()
+            .zip(filter_columns_cache.iter())
+            .partition(|(filter, filter_columns)| {
+                // A filter is a partition filter if:
+                // 1. It has no column references (constant expression like WHERE true), OR
+                // 2. All its column references are in the partition expression columns, OR
+                // 3. The filter directly involves the partition expression itself
+                if filter_columns.is_empty() {
+                    return true;
+                }
+
+                if filter_columns
+                    .iter()
+                    .all(|col| partition_columns.contains(col))
+                {
+                    return true;
+                }
+
+                // Check if the filter contains the partition expression
+                // This handles cases like: bucket(10, user_id) = 0 where the partition expression is bucket(10, user_id)
+                Self::filter_contains_partition_expr(filter, &self.partition_by.expression)
+            });
+
+        // Extract just the filters (without the cached column refs)
+        let partition_filters: Vec<_> = partition_filters.into_iter().map(|(f, _)| f).collect();
+        let data_filters: Vec<_> = data_filters.into_iter().map(|(f, _)| f).collect();
+
+        tracing::debug!(
+            "Partition pruning: {} partition filters, {} data filters",
+            partition_filters.len(),
+            data_filters.len()
+        );
+
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
@@ -206,5 +266,396 @@ impl TableProvider for PartitionTableProvider {
         self.insert_strategy
             .execute_insert(input, insert_op, &ctx)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{
+        arrow::array::{Int32Array, StringArray},
+        arrow::record_batch::RecordBatch,
+        datasource::MemTable,
+        logical_expr::{ScalarUDF, expr::ScalarFunction},
+        prelude::{col, lit},
+        scalar::ScalarValue,
+    };
+
+    type PartitionsData = Arc<RwLock<Vec<(ScalarValue, Arc<dyn TableProvider>)>>>;
+
+    #[derive(Debug)]
+    struct MockCreator {
+        partitions_data: PartitionsData,
+    }
+
+    #[async_trait]
+    impl PartitionCreator for MockCreator {
+        async fn create_partition(
+            &self,
+            _partition_value: ScalarValue,
+        ) -> Result<Partition, super::super::creator::Error> {
+            unreachable!("create_partition not needed for scan tests")
+        }
+
+        async fn infer_existing_partitions(
+            &self,
+        ) -> Result<Vec<Partition>, super::super::creator::Error> {
+            let data = self.partitions_data.read().await;
+            Ok(data
+                .iter()
+                .map(|(val, provider)| Partition {
+                    partition_value: val.clone(),
+                    table_provider: Arc::clone(provider),
+                })
+                .collect())
+        }
+
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+            Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        }
+    }
+
+    fn create_test_batch(region: &str, ids: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let id_array = Arc::new(Int32Array::from(ids));
+        let region_array = Arc::new(StringArray::from(vec![region; id_array.len()]));
+
+        RecordBatch::try_new(schema, vec![id_array, region_array])
+            .expect("failed to create test batch")
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_multiple_partitions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let us_east_batch = create_test_batch("us-east-1", vec![1, 2, 3]);
+        let us_west_batch = create_test_batch("us-west-1", vec![4, 5, 6]);
+
+        let partitions_data = vec![
+            (
+                ScalarValue::Utf8(Some("us-east-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![us_east_batch]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+            (
+                ScalarValue::Utf8(Some("us-west-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![us_west_batch]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+        ];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let partition_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan failed");
+
+        // With 2 partitions and no filters, should produce a UnionExec
+        assert!(
+            plan.as_any().is::<UnionExec>(),
+            "Expected UnionExec for multiple partitions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_partition_pruning() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let us_east_batch = create_test_batch("us-east-1", vec![1, 2, 3]);
+        let us_west_batch = create_test_batch("us-west-1", vec![4, 5, 6]);
+
+        let partitions_data = vec![
+            (
+                ScalarValue::Utf8(Some("us-east-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![us_east_batch]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+            (
+                ScalarValue::Utf8(Some("us-west-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![us_west_batch]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+        ];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let partition_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Filter to only one partition
+        let filters = vec![col("region").eq(lit("us-east-1"))];
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &filters, None)
+            .await
+            .expect("scan failed");
+
+        // After pruning to single partition, should not be UnionExec
+        assert!(
+            !plan.as_any().is::<UnionExec>(),
+            "Expected single partition plan (not UnionExec) after pruning"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_limit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let us_east_batch = create_test_batch("us-east-1", vec![1, 2, 3]);
+
+        let partitions_data = vec![(
+            ScalarValue::Utf8(Some("us-east-1".to_string())),
+            Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![us_east_batch]])
+                    .expect("failed to create MemTable"),
+            ) as Arc<dyn TableProvider>,
+        )];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let partition_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &[], Some(10))
+            .await
+            .expect("scan failed");
+
+        // With a limit, should wrap in GlobalLimitExec
+        assert!(
+            plan.as_any().is::<GlobalLimitExec>(),
+            "Expected GlobalLimitExec when limit is provided"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_empty_result() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(vec![])),
+        });
+
+        let partition_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan failed");
+
+        // No partitions should return EmptyExec
+        assert!(
+            plan.as_any().is::<EmptyExec>(),
+            "Expected EmptyExec when no partitions exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_prune_all_partitions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+
+        let us_east_batch = create_test_batch("us-east-1", vec![1, 2, 3]);
+        let us_west_batch = create_test_batch("us-west-1", vec![4, 5, 6]);
+
+        let partitions_data = vec![
+            (
+                ScalarValue::Utf8(Some("us-east-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![us_east_batch]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+            (
+                ScalarValue::Utf8(Some("us-west-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![us_west_batch]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+        ];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let partition_by = PartitionedBy {
+            name: "region".to_string(),
+            expression: col("region"),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Filter that matches no partitions
+        let filters = vec![col("region").eq(lit("eu-central-1"))];
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &filters, None)
+            .await
+            .expect("scan failed");
+
+        // All partitions pruned should return EmptyExec
+        assert!(
+            plan.as_any().is::<EmptyExec>(),
+            "Expected EmptyExec when all partitions are pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_bucket_partition_expression() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("user_id", DataType::Int32, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![15, 25, 35])),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let partitions_data = vec![
+            (
+                ScalarValue::Int32(Some(0)),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch1]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+            (
+                ScalarValue::Int32(Some(1)),
+                Arc::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch2]])
+                        .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+        ];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        // Create a bucket partition expression: bucket(10, user_id)
+        let bucket_udf = Arc::new(ScalarUDF::new_from_impl(
+            runtime_datafusion_udfs::bucket::Bucket::new(),
+        ));
+        let partition_expr = Expr::ScalarFunction(ScalarFunction {
+            func: bucket_udf,
+            args: vec![lit(10i32), col("user_id")],
+        });
+
+        let partition_by = PartitionedBy {
+            name: "bucket_10_user_id".to_string(),
+            expression: partition_expr.clone(),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Filter using the bucket expression
+        let filters = vec![partition_expr.eq(lit(0i32))];
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let plan = provider
+            .scan(&session_state, None, &filters, None)
+            .await
+            .expect("scan failed");
+
+        // Should prune to single partition
+        assert!(
+            !plan.as_any().is::<UnionExec>(),
+            "Expected single partition plan after pruning with bucket expression"
+        );
     }
 }
