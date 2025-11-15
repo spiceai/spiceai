@@ -651,9 +651,8 @@ pub trait ListingTableConnector: DataConnector {
         // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
         let table_arc = Arc::new(table);
         let is_s3_connector = format!("{self}") == "s3";
-        let s3_refresh_skip_enabled = dataset.get_param("s3_refresh_skip_enabled", true);
         if is_s3_connector
-            && s3_refresh_skip_enabled
+            && refresh_skip_enabled(dataset)
             && !table_path.is_collection()
             && dataset.acceleration.is_some()
             && let Some(cached_table) =
@@ -724,6 +723,21 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
+    }
+}
+
+fn refresh_skip_enabled(dataset: &Dataset) -> bool {
+    match dataset.params.get("refresh_skip").map(String::as_str) {
+        None | Some("enabled") => true,
+        Some("disabled") => false,
+        Some(other) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                value = other,
+                "Invalid refresh_skip value; expected 'enabled' or 'disabled'. Defaulting to 'enabled'."
+            );
+            true
+        }
     }
 }
 
