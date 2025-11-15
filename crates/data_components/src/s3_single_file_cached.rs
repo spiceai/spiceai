@@ -97,7 +97,7 @@ pub struct S3SingleFileCached {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
     file_path: ObjectStorePath,
-    cached_metadata: Arc<RwLock<Option<object_store::ObjectMeta>>>,
+    cached_metadata: RwLock<Option<object_store::ObjectMeta>>,
     dataset_name: String,
 }
 
@@ -130,7 +130,7 @@ impl S3SingleFileCached {
             inner: listing_table,
             object_store,
             file_path,
-            cached_metadata: Arc::new(RwLock::new(None)),
+            cached_metadata: RwLock::new(None),
             dataset_name,
         })
     }
@@ -195,12 +195,6 @@ impl S3SingleFileCached {
         cached_metadata.size == current_metadata.size
             && cached_metadata.last_modified == current_metadata.last_modified
             && is_same_file_version(cached_metadata, current_metadata)
-    }
-    /// Public method to check if a refresh should be skipped for this file.
-    /// Returns `true` if the file's metadata (`ETag`, Version, size, timestamp) hasn't changed.
-    /// This should be called during refresh operations before fetching data.
-    pub async fn should_skip_refresh(&self) -> DataFusionResult<bool> {
-        self.is_file_unchanged().await
     }
 }
 
@@ -295,7 +289,7 @@ mod tests {
             inner: Arc::new(listing_table),
             object_store: store,
             file_path,
-            cached_metadata: Arc::new(RwLock::new(cached_meta)),
+            cached_metadata: RwLock::new(cached_meta),
             dataset_name: "test_dataset".to_string(),
         }
     }
