@@ -368,3 +368,64 @@ fn get_i32(batch: &RecordBatch, col: &str, row: usize) -> Result<i32> {
         ))
     }
 }
+
+/// Gets expected results for Saffron queries for validation
+pub fn get_saffron_expected_results(
+    _base_path: Option<&std::path::Path>,
+) -> Result<std::collections::HashMap<Arc<str>, Vec<RecordBatch>>> {
+    use arrow::{csv::ReaderBuilder, csv::reader::Format};
+    use std::{collections::HashMap, io::Seek};
+
+    macro_rules! generate_saffron_answers {
+        ( $( $i:literal ),* ) => {
+            [
+                $(
+                    (
+                        concat!("saffron_q", stringify!($i)),
+                        include_str!(concat!("./validation/saffron/q", stringify!($i), ".csv"))
+                    )
+                ),*
+            ]
+        }
+    }
+
+    let mut validation_data = HashMap::new();
+
+    // Load Saffron answers from CSV files, into RecordBatches
+    let answers = generate_saffron_answers!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+
+    for (query_name, csv_contents) in answers {
+        let mut string_reader = std::io::Cursor::new(csv_contents);
+        let format = Format::default().with_delimiter(b'|').with_header(true);
+        let (schema, _) = format
+            .infer_schema(&mut string_reader, None)
+            .with_context(|| {
+                format!("Should infer schema for saffron validation data: {query_name}")
+            })?;
+        string_reader
+            .rewind()
+            .with_context(|| format!("Should rewind file for {query_name}"))?;
+
+        // Create a reader
+        let reader = ReaderBuilder::new(Arc::new(schema))
+            .with_format(format.clone())
+            .build(string_reader)
+            .with_context(|| {
+                format!("Should build reader for saffron validation data: {query_name}")
+            })?;
+
+        // Read the batches
+        let mut batches = Vec::new();
+        for batch in reader {
+            let batch = batch.with_context(|| {
+                format!("Should read batch from saffron validation data: {query_name}")
+            })?;
+            batches.push(batch);
+        }
+
+        // Store the batches in the map
+        validation_data.insert(query_name.into(), batches);
+    }
+
+    Ok(validation_data)
+}

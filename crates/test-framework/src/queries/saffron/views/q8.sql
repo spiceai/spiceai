@@ -8,4 +8,5 @@ WHERE A.AccountSid = ?
   AND A.NumberType = ?
   AND A.NumberSid NOT IN (?)
   AND A.Capability = ?
+ORDER BY A.NumberSid, A.Capability
 LIMIT ?;

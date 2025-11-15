@@ -5,4 +5,5 @@
 SELECT A.* FROM number_info_with_cap AS A 
 WHERE A.AccountSid = ? 
   AND A.NumberPoolSid = ? 
-  AND A.NumberDid = ?;
+  AND A.NumberDid = ?
+ORDER BY A.NumberSid, A.Capability

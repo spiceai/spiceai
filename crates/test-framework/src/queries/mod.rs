@@ -474,6 +474,10 @@ impl QuerySet {
                     Ok(Some(validation_data))
                 }
             }
+            QuerySet::ParameterizedSaffron => {
+                let validation_data = saffron::get_saffron_expected_results(base_path)?;
+                Ok(Some(validation_data))
+            }
             // TPCH and other query sets use built-in validation
             _ => Ok(None),
         }
