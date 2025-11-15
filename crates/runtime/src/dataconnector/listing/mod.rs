@@ -60,6 +60,9 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
         .is_boolean(),
+    ParameterSpec::runtime("refresh_skip_enabled")
+        .description("Enable skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Defaults to true.")
+        .is_boolean(),
 ];
 
 pub enum DelimitedFormat {

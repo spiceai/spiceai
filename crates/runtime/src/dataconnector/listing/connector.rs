@@ -648,9 +648,12 @@ pub trait ListingTableConnector: DataConnector {
                 })?;
 
         // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
-        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed
+        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
         let table_arc = Arc::new(table);
-        if format!("{self}") == "s3"
+        let is_s3_connector = format!("{self}") == "s3";
+        let s3_refresh_skip_enabled = dataset.get_param("s3_refresh_skip_enabled", true);
+        if is_s3_connector
+            && s3_refresh_skip_enabled
             && !table_path.is_collection()
             && dataset.acceleration.is_some()
             && let Some(cached_table) =

@@ -166,10 +166,18 @@ impl S3SingleFileCached {
                 && current_metadata.last_modified == cached_meta.last_modified
                 && is_same_file_version(cached_meta, &current_metadata)
             {
-                tracing::debug!(
-                    "Skipping refresh for {} (file unchanged at {})",
+                let etag = normalize_optional_string(current_metadata.e_tag.as_ref())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let version = normalize_optional_string(current_metadata.version.as_ref())
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::info!(
+                    "Skipping refresh for {} (location: {}, size_bytes: {}, last_modified: {}, etag: {}, version: {})",
                     self.dataset_name,
-                    current_metadata.location
+                    current_metadata.location,
+                    current_metadata.size,
+                    current_metadata.last_modified,
+                    etag,
+                    version
                 );
                 return Ok(true);
             }
