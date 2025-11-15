@@ -2996,7 +2996,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
- "criterion",
+ "criterion 0.7.0",
  "data_components",
  "datafusion",
  "datafusion-catalog",
@@ -3601,6 +3601,34 @@ dependencies = [
 
 [[package]]
 name = "criterion"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
+dependencies = [
+ "anes",
+ "cast",
+ "ciborium",
+ "clap",
+ "criterion-plot 0.5.0",
+ "futures",
+ "is-terminal",
+ "itertools 0.10.5",
+ "num-traits",
+ "once_cell",
+ "oorandom",
+ "plotters",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tinytemplate",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1c047a62b0cc3e145fa84415a3191f628e980b194c2755aa12300a4e6cbd928"
@@ -3609,7 +3637,7 @@ dependencies = [
  "cast",
  "ciborium",
  "clap",
- "criterion-plot",
+ "criterion-plot 0.6.0",
  "itertools 0.13.0",
  "num-traits",
  "oorandom",
@@ -3621,6 +3649,16 @@ dependencies = [
  "tinytemplate",
  "tokio",
  "walkdir",
+]
+
+[[package]]
+name = "criterion-plot"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
+dependencies = [
+ "cast",
+ "itertools 0.10.5",
 ]
 
 [[package]]
@@ -3839,9 +3877,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67773048316103656a637612c4a62477603b777d91d9c62ff2290f9cde178fdb"
+checksum = "3ffc71fcdcdb40d6f087edddf7f8f1f8f79e6cf922f555a9ee8779752d4819bd"
 dependencies = [
  "ctor-proc-macro",
  "dtor",
@@ -3849,9 +3887,9 @@ dependencies = [
 
 [[package]]
 name = "ctor-proc-macro"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
+checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "ctr"
@@ -4090,7 +4128,7 @@ dependencies = [
  "charset",
  "chrono",
  "clickhouse-rs",
- "criterion",
+ "criterion 0.7.0",
  "ctor",
  "dataformat-json",
  "datafusion",
@@ -4475,7 +4513,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=d6e7ebd853463acafaf8132dced23c98c45f7947#d6e7ebd853463acafaf8132dced23c98c45f7947"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=007c82d039220478f406d648417d28c0d40a7987#007c82d039220478f406d648417d28c0d40a7987"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -5406,8 +5444,8 @@ checksum = "d3a5ccdfd6c5e7e2fea9c5cf256f2a08216047fab19c621c3da64e9ae4a1462d"
 
 [[package]]
 name = "duckdb"
-version = "1.4.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=8dd41445963c24a62fc522d795edcd22392fe8de#8dd41445963c24a62fc522d795edcd22392fe8de"
+version = "1.4.2"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=bcc1d9b77ac04709205e8e79b7ca3dec3d34ec48#bcc1d9b77ac04709205e8e79b7ca3dec3d34ec48"
 dependencies = [
  "arrow",
  "calamine",
@@ -8025,6 +8063,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "is-terminal"
+version = "0.4.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
+dependencies = [
+ "hermit-abi",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8417,8 +8466,8 @@ checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.4.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=8dd41445963c24a62fc522d795edcd22392fe8de#8dd41445963c24a62fc522d795edcd22392fe8de"
+version = "1.4.2"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=bcc1d9b77ac04709205e8e79b7ca3dec3d34ec48#bcc1d9b77ac04709205e8e79b7ca3dec3d34ec48"
 dependencies = [
  "cc",
  "flate2",
@@ -12973,7 +13022,7 @@ dependencies = [
  "chunking",
  "clap",
  "clickhouse-rs",
- "criterion",
+ "criterion 0.7.0",
  "csv",
  "dashmap",
  "data_components",
@@ -13312,6 +13361,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "chrono",
+ "criterion 0.5.1",
  "datafusion",
  "futures",
  "insta",
@@ -15038,9 +15088,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suppaftp"
-version = "5.4.0"
+version = "6.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb79a5b76543d896dbec5c0fd9a28c0ca9a0d4e764c438c37f8463c96e4a8bf2"
+checksum = "e9d869e942cc5f349ad91645925a9e6b570f62c4c170ad1c7b92b867bd16bd54"
 dependencies = [
  "async-std",
  "async-trait",
@@ -15049,7 +15099,7 @@ dependencies = [
  "lazy-regex",
  "log",
  "pin-project",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

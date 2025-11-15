@@ -15,6 +15,7 @@ limitations under the License.
 */
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Clone, Debug)]
 pub enum DynamoDBRequestPlan {
@@ -22,7 +23,7 @@ pub enum DynamoDBRequestPlan {
     Scan(ScanParams),
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct QueryParams {
     pub table_name: String,
     pub key_condition_expression: Option<String>,
@@ -104,7 +105,7 @@ impl QueryParamsBuilder {
 }
 
 // Same pattern for ScanParams
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct ScanParams {
     pub table_name: String,
     pub filter_expression: Option<String>,
@@ -173,5 +174,91 @@ impl ScanParamsBuilder {
             projection_expression: self.projection_expression,
             limit: self.limit,
         }
+    }
+}
+
+impl fmt::Debug for QueryParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("QueryParams");
+
+        debug_struct.field("table_name", &self.table_name);
+        debug_struct.field("key_condition_expression", &self.key_condition_expression);
+        debug_struct.field("filter_expression", &self.filter_expression);
+
+        // Sort expression_attribute_values
+        if let Some(ref values) = self.expression_attribute_values {
+            let mut sorted: Vec<_> = values.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            debug_struct.field("expression_attribute_values", &DebugSortedMap(&sorted));
+        } else {
+            debug_struct.field(
+                "expression_attribute_values",
+                &self.expression_attribute_values,
+            );
+        }
+
+        // Sort expression_attribute_names
+        if let Some(ref names) = self.expression_attribute_names {
+            let mut sorted: Vec<_> = names.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            debug_struct.field("expression_attribute_names", &DebugSortedMap(&sorted));
+        } else {
+            debug_struct.field(
+                "expression_attribute_names",
+                &self.expression_attribute_names,
+            );
+        }
+
+        debug_struct.field("projection_expression", &self.projection_expression);
+        debug_struct.field("limit", &self.limit);
+
+        debug_struct.finish()
+    }
+}
+
+impl fmt::Debug for ScanParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("ScanParams");
+
+        debug_struct.field("table_name", &self.table_name);
+        debug_struct.field("filter_expression", &self.filter_expression);
+
+        // Sort expression_attribute_values
+        if let Some(ref values) = self.expression_attribute_values {
+            let mut sorted: Vec<_> = values.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            debug_struct.field("expression_attribute_values", &DebugSortedMap(&sorted));
+        } else {
+            debug_struct.field(
+                "expression_attribute_values",
+                &self.expression_attribute_values,
+            );
+        }
+
+        // Sort expression_attribute_names
+        if let Some(ref names) = self.expression_attribute_names {
+            let mut sorted: Vec<_> = names.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            debug_struct.field("expression_attribute_names", &DebugSortedMap(&sorted));
+        } else {
+            debug_struct.field(
+                "expression_attribute_names",
+                &self.expression_attribute_names,
+            );
+        }
+
+        debug_struct.field("projection_expression", &self.projection_expression);
+        debug_struct.field("limit", &self.limit);
+
+        debug_struct.finish()
+    }
+}
+
+// Helper struct to format sorted maps
+struct DebugSortedMap<'a, K, V>(&'a [(&'a K, &'a V)]);
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for DebugSortedMap<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.0.iter().copied()).finish()
     }
 }
