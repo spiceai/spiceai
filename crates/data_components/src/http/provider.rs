@@ -1272,9 +1272,9 @@ impl HttpTableProvider {
                 ),
             });
         }
-        if raw.contains(['\n', '\r']) {
+        if raw.chars().any(|c| c.is_control()) {
             return Err(Error::FilterRejected {
-                message: "request_query cannot contain newline characters".to_string(),
+                message: "request_query cannot contain control characters".to_string(),
             });
         }
 
