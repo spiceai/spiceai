@@ -11,7 +11,8 @@ on:
         description: 'Optional suffix to append to the automation branch'
         required: false
   schedule:
-    - cron: '0 21 * * *' # Daily: 9PM UTC, 2PM PST, 6AM KST
+    - cron: '0 22 * * *' # Daily: 10PM UTC, 2PM PST, 6AM KST
+    - cron: '0 15 * * *' # Daily: 3PM UTC, 7AM PST, 11PM KST
 
 permissions:
   contents: write
@@ -29,6 +30,7 @@ jobs:
       UPSTREAM_REPO: https://github.com/spiceai/spiceai.git
       MERGE_LABEL: kind/upstream-merge
       REPORT_FILE: merge_conflict_report.md
+      RUN_CONFLICT_RESOLUTION: 'true'
     steps:
       - name: Configure authentication token
         shell: bash
@@ -165,15 +167,30 @@ jobs:
             -e 's/spiceai-dev-large-runners/spicehq-dev-large-runners/g' \
             {} +
 
-      - name: Finalise merge commit
+      - name: Detect repository changes
+        id: repo_changes
         if: steps.check_pr.outputs.has_open == 'false'
+        run: |
+          if git status --porcelain | grep -q .; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit when no changes detected
+        if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'false'
+        run: |
+          echo "Upstream merge produced no changes. Completing without creating a PR."
+
+      - name: Finalise merge commit
+        if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'true'
         run: |
           if git status --porcelain | grep -q .; then
             git commit --no-edit
           fi
 
       - name: Build PR body
-        if: steps.check_pr.outputs.has_open == 'false'
+        if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'true'
         run: |
           pr_body=pr_body.md
           echo "## Automated upstream merge" > "$pr_body"
@@ -208,12 +225,12 @@ jobs:
           fi
 
       - name: Push merge branch
-        if: steps.check_pr.outputs.has_open == 'false'
+        if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'true'
         run: |
           git push --set-upstream origin "$MERGE_BRANCH"
 
       - name: Create pull request
-        if: steps.check_pr.outputs.has_open == 'false'
+        if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ env.GH_TOKEN }}
         run: |
