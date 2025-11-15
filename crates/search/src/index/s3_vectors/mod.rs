@@ -19,10 +19,11 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
+use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
     list_provider::S3VectorsListTable, partition::PartitionedIndexName,
-    query_provider::ComputeQueryVector, query_provider::S3VectorsQueryTable,
+    query_provider::S3VectorsQueryTable,
 };
 
 use datafusion::common::DFSchema;
@@ -199,8 +200,11 @@ impl SearchIndex for S3Vector {
             "tbl",
             Arc::new(DefaultTableSource::new(Arc::new(S3VectorsQueryTable::new(
                 self.table.clone(),
-                Arc::new(EmbedQuery(Arc::clone(&self.compute_query)))
-                    as Arc<dyn ComputeQueryVector>,
+                // TODO: should be able to internalize the CachedQueryVector within S3VectorsQueryTable.
+                Arc::new(CachedQueryVector::new(
+                    Arc::new(EmbedQuery(Arc::clone(&self.compute_query))),
+                    query.to_string(),
+                )) as Arc<dyn ComputeQueryVector>,
                 query.to_string(),
                 self.embedded_column.clone(),
                 self.partition_by.clone(),
