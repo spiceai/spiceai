@@ -170,8 +170,6 @@ async fn create_data_export_endpoint() -> Result<DataExportEndpoint, anyhow::Err
     let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("auth_key_1:rw")]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-    let cloned_rt = Arc::clone(&rt);
-
     let server_shutdown = CancellationToken::new();
     let shutdown_token = server_shutdown.clone();
     let server_rt = Arc::clone(&rt);
