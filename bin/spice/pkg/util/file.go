@@ -27,6 +27,8 @@ import (
 	"strings"
 )
 
+const secureFilePerm os.FileMode = 0o600
+
 func SaveReaderToFile(reader io.Reader, fullFilePath string) error {
 	// Use 0644 (rw-r--r--) instead of 0766 to prevent world-writable files
 	fileHandle, err := os.OpenFile(fullFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -202,4 +204,26 @@ func CopyFile(src string, dst string) error {
 	}
 
 	return os.WriteFile(dst, data, perm)
+}
+
+func WriteSecureFile(filePath string, content []byte) error {
+	fileHandle, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, secureFilePerm)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := fileHandle.Close(); err != nil {
+			slog.Error("failed to close file", "file", filePath, "error", err)
+		}
+	}()
+
+	if _, err := fileHandle.Write(content); err != nil {
+		return err
+	}
+
+	if err := fileHandle.Chmod(secureFilePerm); err != nil {
+		return err
+	}
+
+	return nil
 }
