@@ -345,7 +345,7 @@ impl RefreshTask {
         // avoid unnecessary data fetching when the underlying data is unchanged.
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
-            
+
             match data_components::refresh_skip::should_skip_refresh_for_table_provider(
                 table_provider.as_ref(),
             )
