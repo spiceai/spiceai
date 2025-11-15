@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_view_indexes
+name: s3[parquet]-duckdb[file]_view
 
 runtime:
   caching:
@@ -74,11 +74,8 @@ views:
       mode: file
       refresh_on_startup: auto
       params:
-        query_federation: disabled
         duckdb_file: sender_info.duckdb
         duckdb_preserve_insertion_order: true
-      indexes:
-        '(AccountSid, NumberPoolSid)': enabled
 
   - name: number_info_with_cap
     sql: |
@@ -109,8 +106,5 @@ views:
       mode: file
       refresh_on_startup: auto
       params:
-        query_federation: disabled
         duckdb_preserve_insertion_order: true
         duckdb_file: number_info_with_cap.duckdb
-      indexes:
-        '(AccountSid, NumberPoolSid)': enabled
