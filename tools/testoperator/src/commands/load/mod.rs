@@ -75,11 +75,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         None
     };
 
-    let test_duration = Duration::from_secs(args.test_args.common.duration);
-    let test_hours = (test_duration.as_secs() / 60 / 60).max(1);
-
-    // baseline run
-    println!("Running baseline throughput test");
+    // warm up run
+    println!("Performing warm up");
 
     // Parameterized queries may contain variations of the same query with different parameters.
     // For the baseline run, we include only unique queries to avoid excessively long baseline durations.
@@ -94,7 +91,33 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
+            .with_end_condition(EndCondition::QuerySetCompleted(1))
+            .with_disable_caching(args.test_args.disable_caching)
+            .with_http_client(args.test_args.http_clients),
+    )?;
+
+    let warm_up = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_progress_bars(!args.test_args.common.disable_progress_bars)
+        .start()
+        .await?;
+
+    let spiced_instance = warm_up.wait().await?.end()?;
+
+    let test_duration = Duration::from_secs(args.test_args.common.duration);
+
+    // Calculate baseline duration: 10% of target time, min 1min, max 10min
+    let baseline_duration_secs = (test_duration.as_secs() / 10).clamp(60, 600);
+    let baseline_duration = Duration::from_secs(baseline_duration_secs);
+
+    // baseline run
+    println!("Running baseline throughput test for {baseline_duration_secs}s",);
+
+    let (_query_set, test_builder) = super::build_test_with_validation(
+        &args.test_args,
+        NotStarted::new()
+            .with_parallel_count(args.test_args.common.concurrency)
+            .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
     )
@@ -107,10 +130,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test = baseline_test.wait().await?;
-    let baseline_percentiles = test
-        .get_query_durations()
-        .statistical_set()?
-        .percentile(99.0)?;
+    let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
 
     let baseline_metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     println!("Baseline metrics:");

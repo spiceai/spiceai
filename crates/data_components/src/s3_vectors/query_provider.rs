@@ -24,7 +24,7 @@ use crate::s3_vectors::{
     vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
-use super::{Error, S3VectorIdentifier, SpillIndex};
+use super::{Error, S3VectorIdentifier, SpillIndex, compute_query::ComputeQueryVector};
 use arrow::{
     array::RecordBatch,
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -63,15 +63,6 @@ pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
 /// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static S3_VECTOR_MAX_TOPK: i32 = 30;
-
-/// [`ComputeQueryVector`] allows [`S3VectorsQueryTable`] to be instantiated in a non-async setting.
-#[async_trait]
-pub trait ComputeQueryVector: std::fmt::Debug + Send + Sync {
-    async fn compute_vector(
-        &self,
-        query: &str,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>>;
-}
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
