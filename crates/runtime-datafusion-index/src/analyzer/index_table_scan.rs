@@ -407,7 +407,10 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if b.schema().as_ref() != expected_schema.as_ref() {
+                                if !schemas_compatible(
+                                    b.schema().as_ref(),
+                                    expected_schema.as_ref(),
+                                ) {
                                     let exp = schema_signature(expected_schema.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
@@ -444,6 +447,27 @@ impl ExecutionPlan for IndexerExec {
             .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+/// Compares two schemas for compatibility, ignoring nullability differences.
+/// This is used for index validation where nullability differences are acceptable.
+fn schemas_compatible(a: &Schema, b: &Schema) -> bool {
+    if a.fields().len() != b.fields().len() {
+        return false;
+    }
+
+    for (field_a, field_b) in a.fields().iter().zip(b.fields().iter()) {
+        if field_a.name() != field_b.name() {
+            return false;
+        }
+
+        // Data types must match (nullability is ignored)
+        if field_a.data_type() != field_b.data_type() {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Helper for better diagnostics when schema is mismatched.
@@ -975,5 +999,77 @@ mod test {
         assert!(msg.contains("extra: Int64"));
 
         assert_eq!(1, idx_add.compute_index_calls());
+    }
+
+    #[tokio::test]
+    async fn pipeline_allows_nullability_differences() {
+        let ctx = get_ctx();
+
+        let idx = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch");
+                // Keep same data but make fields nullable
+                let id_data = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64")
+                    .values()
+                    .to_vec();
+                let region_data = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("string")
+                    .iter()
+                    .collect::<Vec<_>>();
+                let value_data = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64")
+                    .values()
+                    .to_vec();
+
+                let new_schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, true),    // nullable
+                    Field::new("region", DataType::Utf8, true), // nullable
+                    Field::new("value", DataType::Int64, true), // nullable
+                ]));
+                let out = RecordBatch::try_new(
+                    new_schema,
+                    vec![
+                        Arc::new(Int64Array::from(id_data)),
+                        Arc::new(StringArray::from(region_data)),
+                        Arc::new(Int64Array::from(value_data)),
+                    ],
+                )
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        let table = mem_table_from_batches(vec![one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+        ctx.register_table(
+            "schema_nullability",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid");
+
+        let df = ctx.table("schema_nullability").await.expect("valid");
+        let result = df
+            .collect()
+            .await
+            .expect("should succeed despite nullability difference");
+
+        // Verify we got the expected data back
+        assert_eq!(1, result.len());
+        assert_eq!(3, result[0].num_columns());
+
+        // Verify the index was called
+        assert_eq!(1, idx.compute_index_calls());
     }
 }
