@@ -15,7 +15,10 @@ datasets:
       enabled: true
       engine: duckdb
       mode: file
-      partition_by: bucket(32, c_name)
+      partition_by:
+        - bucket(32, c_name)
+      params:
+        partition_mode: tables
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet
     name: lineitem
     params: *s3_params
