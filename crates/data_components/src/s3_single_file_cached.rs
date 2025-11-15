@@ -56,13 +56,13 @@ fn is_same_file_version(
     let cached_etag = normalize_optional_string(cached.e_tag.as_ref());
     let current_etag = normalize_optional_string(current.e_tag.as_ref());
 
-    // Both version and etag are absent in both - no versioning info available, consider same
+    // Both version and etag are absent in both - no versioning info available, be conservative and assume different
     if cached_version.is_none()
         && current_version.is_none()
         && cached_etag.is_none()
         && current_etag.is_none()
     {
-        return true;
+        return false;
     }
 
     // Check if version or etag presence differs (one has it, other doesn't) - different files
@@ -157,39 +157,45 @@ impl S3SingleFileCached {
             return Ok(false); // Can't determine, assume changed
         };
 
-        let cached = self.cached_metadata.read().await;
+        let cached_metadata = {
+            let cached = self.cached_metadata.read().await;
+            cached.clone()
+        };
 
-        if let Some(cached_meta) = cached.as_ref() {
-            // Check if refresh should be skipped:
-            // Skip if size, last_modified, AND version info all match
-            if current_metadata.size == cached_meta.size
-                && current_metadata.last_modified == cached_meta.last_modified
-                && is_same_file_version(cached_meta, &current_metadata)
-            {
-                let etag = normalize_optional_string(current_metadata.e_tag.as_ref())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let version = normalize_optional_string(current_metadata.version.as_ref())
-                    .unwrap_or_else(|| "unknown".to_string());
-                tracing::info!(
-                    "Skipping refresh for {} (location: {}, size_bytes: {}, last_modified: {}, etag: {}, version: {})",
-                    self.dataset_name,
-                    current_metadata.location,
-                    current_metadata.size,
-                    current_metadata.last_modified,
-                    etag,
-                    version
-                );
-                return Ok(true);
-            }
+        if cached_metadata
+            .as_ref()
+            .is_some_and(|cached| Self::should_skip_with_metadata(cached, &current_metadata))
+        {
+            let etag = normalize_optional_string(current_metadata.e_tag.as_ref())
+                .unwrap_or_else(|| "unknown".to_string());
+            let version = normalize_optional_string(current_metadata.version.as_ref())
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::info!(
+                "Skipping refresh for {} (location: {}, size_bytes: {}, last_modified: {}, etag: {}, version: {})",
+                self.dataset_name,
+                current_metadata.location,
+                current_metadata.size,
+                current_metadata.last_modified,
+                etag,
+                version
+            );
+            return Ok(true);
         }
 
         // Update cache with new metadata
-        drop(cached);
         *self.cached_metadata.write().await = Some(current_metadata);
 
         Ok(false)
     }
 
+    fn should_skip_with_metadata(
+        cached_metadata: &object_store::ObjectMeta,
+        current_metadata: &object_store::ObjectMeta,
+    ) -> bool {
+        cached_metadata.size == current_metadata.size
+            && cached_metadata.last_modified == current_metadata.last_modified
+            && is_same_file_version(cached_metadata, current_metadata)
+    }
     /// Public method to check if a refresh should be skipped for this file.
     /// Returns `true` if the file's metadata (`ETag`, Version, size, timestamp) hasn't changed.
     /// This should be called during refresh operations before fetching data.
@@ -236,5 +242,223 @@ impl TableProvider for S3SingleFileCached {
         // Always delegate to inner ListingTable
         // The metadata check happens during refresh, not during scan
         self.inner.scan(state, projection, filters, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::Schema;
+    use chrono::{TimeZone, Utc};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{ListingOptions, ListingTableConfig, ListingTableUrl};
+    use futures::StreamExt;
+    use futures::stream::{self, BoxStream};
+    use object_store::{ObjectStore, path::Path};
+    use std::collections::VecDeque;
+    use tokio::sync::Mutex;
+
+    fn make_meta(
+        location: &str,
+        size: u64,
+        last_modified_secs: i64,
+        etag: Option<&str>,
+        version: Option<&str>,
+    ) -> object_store::ObjectMeta {
+        object_store::ObjectMeta {
+            location: ObjectStorePath::from(location),
+            last_modified: Utc
+                .timestamp_opt(last_modified_secs, 0)
+                .single()
+                .expect("valid timestamp"),
+            size,
+            e_tag: etag.map(std::string::ToString::to_string),
+            version: version.map(std::string::ToString::to_string),
+        }
+    }
+
+    fn build_cached_table(
+        store: Arc<dyn ObjectStore>,
+        cached_meta: Option<object_store::ObjectMeta>,
+    ) -> S3SingleFileCached {
+        let file_path = ObjectStorePath::from("dummy-file.parquet");
+        let schema = Arc::new(Schema::empty());
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+        let table_url = ListingTableUrl::parse("s3://dummy-bucket/dummy-file.parquet")
+            .expect("listing table url");
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(options)
+            .with_schema(Arc::clone(&schema));
+        let listing_table = ListingTable::try_new(config).expect("listing table");
+
+        S3SingleFileCached {
+            inner: Arc::new(listing_table),
+            object_store: store,
+            file_path,
+            cached_metadata: Arc::new(RwLock::new(cached_meta)),
+            dataset_name: "test_dataset".to_string(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct HeadOnlyObjectStore {
+        responses: Mutex<VecDeque<object_store::ObjectMeta>>,
+    }
+
+    impl HeadOnlyObjectStore {
+        fn new(responses: Vec<object_store::ObjectMeta>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    impl std::fmt::Display for HeadOnlyObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HeadOnlyObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for HeadOnlyObjectStore {
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            stream::empty().boxed()
+        }
+
+        async fn head(&self, _location: &Path) -> object_store::Result<object_store::ObjectMeta> {
+            let mut guard = self.responses.lock().await;
+            guard.pop_front().ok_or(object_store::Error::NotImplemented)
+        }
+
+        async fn put(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+
+        async fn get_opts(
+            &self,
+            _location: &Path,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+
+        fn delete_stream<'a>(
+            &'a self,
+            _locations: BoxStream<'a, object_store::Result<Path>>,
+        ) -> BoxStream<'a, object_store::Result<Path>> {
+            unimplemented!()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            unimplemented!()
+        }
+
+        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn test_is_same_file_version_prefers_version_id() {
+        let cached = make_meta("file", 100, 1, Some("etag-a"), Some("v1"));
+        let matching_version = make_meta("file", 100, 1, Some("etag-b"), Some("v1"));
+        let mismatched_version = make_meta("file", 100, 1, Some("etag-a"), Some("v2"));
+
+        assert!(is_same_file_version(&cached, &matching_version));
+        assert!(!is_same_file_version(&cached, &mismatched_version));
+    }
+
+    #[test]
+    fn test_is_same_file_version_falls_back_to_etag() {
+        let cached = make_meta("file", 100, 1, Some("etag-a"), None);
+        let matching_etag = make_meta("file", 100, 1, Some("etag-a"), None);
+        let mismatched_etag = make_meta("file", 100, 1, Some("etag-b"), None);
+
+        assert!(is_same_file_version(&cached, &matching_etag));
+        assert!(!is_same_file_version(&cached, &mismatched_etag));
+    }
+
+    #[tokio::test]
+    async fn test_should_skip_refresh_when_metadata_matches() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![meta.clone()])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        assert!(
+            cached_table
+                .should_skip_refresh()
+                .await
+                .expect("skip result")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_should_update_cache_when_metadata_changes() {
+        let old_meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let new_meta = make_meta("file", 256, 20, Some("etag2"), Some("v2"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![
+            new_meta.clone(),
+            new_meta.clone(),
+        ])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(old_meta));
+
+        assert!(
+            !cached_table
+                .should_skip_refresh()
+                .await
+                .expect("first attempt")
+        );
+        assert!(
+            cached_table
+                .should_skip_refresh()
+                .await
+                .expect("second attempt")
+        );
     }
 }
