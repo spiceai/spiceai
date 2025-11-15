@@ -89,7 +89,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
         }
 
         let iterations = durations.len();
-        let durations = durations.statistical_set()?;
+
         Ok(Self {
             query_name: name,
             query_status,

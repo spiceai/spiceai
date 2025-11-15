@@ -197,16 +197,10 @@ impl SpiceTest<NotStarted> {
 
         let mut query_workers = Vec::new();
         for id in 0..self.state.parallel_count {
-            let spice_client = self
-                .get_spiced()?
-                .spice_client(self.api_key.clone(), self.state.disable_caching)
-                .await?;
-
             let mut worker = SpiceTestQueryWorker::new(
                 id,
                 self.state.query_set.clone(),
                 self.state.end_condition,
-                spice_client,
                 self.name.clone(),
             )
             .with_explain_plan_snapshot(self.explain_plan_snapshot)
@@ -220,6 +214,12 @@ impl SpiceTest<NotStarted> {
 
             if self.state.http_client {
                 worker = worker.with_http_client(http_client.clone());
+            } else {
+                let spice_client = self
+                    .get_spiced()?
+                    .spice_client(self.api_key.clone(), self.state.disable_caching)
+                    .await?;
+                worker = worker.with_flight_client(spice_client);
             }
 
             if let Some(validation_data) = &self.state.validation_data {
