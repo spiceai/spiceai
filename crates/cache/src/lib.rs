@@ -32,15 +32,18 @@ use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
+mod backend;
 pub mod lru_cache;
-mod metrics;
+pub mod metrics;
 mod simple_cache;
 mod utils;
 
 pub mod key;
 pub mod result;
 
+pub use backend::{CacheBackend, CacheBackendBuilder, MokaBackend, PingoraBackend};
 pub use lru_cache::LruCache;
+pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
@@ -358,7 +361,12 @@ impl QueryResultsCacheProvider {
         // Cache TTL should be the base TTL plus the stale-while-revalidate window
         // so entries aren't evicted before they can be served as stale
         let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
-        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
+        let cache = Arc::new(LruCache::new(
+            cache_max_size,
+            cache_ttl,
+            hash_builder,
+            config.engine,
+        ));
 
         let cache_provider = QueryResultsCacheProvider {
             cache,
@@ -612,5 +620,26 @@ mod tests {
                 .expect("valid cache provider");
 
         assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_backend_configuration() {
+        use spicepod::component::caching::CacheEngine;
+
+        // Test Moka backend (default)
+        let config_moka = SQLResultsCacheConfig::default();
+        let _cache_moka = QueryResultsCacheProvider::try_new(&config_moka, Box::new([]))
+            .expect("valid cache provider with moka");
+
+        // Test Pingora backend
+        let config_pingora = SQLResultsCacheConfig {
+            engine: CacheEngine::Pingora,
+            ..Default::default()
+        };
+        let _cache_pingora = QueryResultsCacheProvider::try_new(&config_pingora, Box::new([]))
+            .expect("valid cache provider with pingora");
+
+        // Both should create successfully - that's the test
+        // (No public API to inspect which backend is used, but creation proves config works)
     }
 }

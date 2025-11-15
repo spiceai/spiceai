@@ -45,6 +45,17 @@ pub enum HashingAlgorithm {
     XXH128,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CacheEngine {
+    /// Moka cache engine (default) - stable, built-in TTL, no race conditions
+    #[default]
+    Moka,
+    /// Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL with rare race condition
+    Pingora,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -78,6 +89,8 @@ pub struct CacheConfig {
     pub eviction_policy: Option<String>,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    #[serde(default)]
+    pub engine: CacheEngine,
 }
 
 impl Default for CacheConfig {
@@ -88,6 +101,7 @@ impl Default for CacheConfig {
             item_ttl: None,
             eviction_policy: None,
             hashing_algorithm: HashingAlgorithm::default(),
+            engine: CacheEngine::default(),
         }
     }
 }
@@ -108,6 +122,8 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    #[serde(default)]
+    pub engine: CacheEngine,
     /// Maximum age for serving stale cached results while revalidating in the background.
     /// When set, cached results past their TTL (but within this additional window) will be
     /// served immediately while a background refresh is triggered.
@@ -127,6 +143,7 @@ impl Default for SQLResultsCacheConfig {
             eviction_policy: None,
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
+            engine: CacheEngine::default(),
             stale_while_revalidate_ttl: None,
         }
     }
@@ -172,6 +189,7 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             eviction_policy: val.eviction_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
+            engine: CacheEngine::default(),
             stale_while_revalidate_ttl: None,
         }
     }

@@ -40,7 +40,7 @@ use datafusion::{
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
-use moka::future::FutureExt;
+use futures::FutureExt;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
     provider::SearchQueryProvider,
