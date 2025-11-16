@@ -40,7 +40,6 @@ datasets:
   - from: s3://benchmarks/tpch_sf1/orders.parquet
     name: orders
     params: *s3_params
-    enabled: true
     engine: duckdb
     mode: file
     acceleration:
