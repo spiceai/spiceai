@@ -158,7 +158,6 @@ install: build
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
-	install -m 755 target/release/spicepod-validator ~/.spice/bin/spicepod-validator
 
 .PHONY: install-with-models
 install-with-models:
@@ -191,14 +190,12 @@ install-cli: build-cli
 install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
-install -m 755 target/release/spiced ~/.spice/bin/spiced
 
 .PHONY: install-with-models
 install-with-models:
-@@ -194,6 +200,7 @@ install-dev: build-dev
-mkdir -p ~/.spice/bin
-install -m 755 target/release/spice ~/.spice/bin/spice
-install -m 755 target/debug/spiced ~/.spice/bin/spiced
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev
