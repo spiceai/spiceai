@@ -26,9 +26,6 @@ datasets:
       enabled: true
       engine: duckdb
       mode: file
-      enabled: true
-      engine: duckdb
-      mode: file
       partition_by:
         - date_part('year', l_shipdate)
       params:
@@ -37,9 +34,6 @@ datasets:
     name: nation
     params: *s3_params
     acceleration: &acceleration
-      enabled: true
-      engine: duckdb
-      mode: file
       enabled: true
       engine: duckdb
       mode: file
