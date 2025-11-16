@@ -95,7 +95,6 @@ func ExtractZip(body []byte, downloadDir string) error {
 		if err != nil {
 			return err
 		}
-
 		defer func() {
 			if err := reader.Close(); err != nil {
 				slog.Error("failed to close reader", "error", err)
@@ -106,7 +105,6 @@ func ExtractZip(body []byte, downloadDir string) error {
 		if err != nil {
 			return err
 		}
-
 		defer func() {
 			if err := newFile.Close(); err != nil {
 				slog.Error("failed to close file", "error", err)
