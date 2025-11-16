@@ -63,7 +63,10 @@ static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
             builder.add(glob);
         }
     }
-    builder.build().expect("Failed to build dangerous path glob set")
+    // This should never fail since DANGEROUS_PATH_PATTERNS are hardcoded and validated
+    builder.build().unwrap_or_else(|e| {
+        unreachable!("Failed to build dangerous path glob set with hardcoded patterns: {e}")
+    })
 });
 
 /// Check if a hostname is localhost
