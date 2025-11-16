@@ -47,7 +47,12 @@ impl Default for ArrowAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_watcher")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::acceleration("sort_columns")
+        .description("Comma-separated list of columns to sort by during inserts. Enables zone map optimization for better query performance on range queries. Example: 'timestamp,user_id'")
+        .runtime(),
+];
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
@@ -62,8 +67,8 @@ impl DataAccelerator for ArrowAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: CreateExternalTable,
-        _source: Option<&dyn AccelerationSource>,
+        mut cmd: CreateExternalTable,
+        source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
@@ -72,6 +77,15 @@ impl DataAccelerator for ArrowAccelerator {
                 msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
+
+        // Extract sort_columns from acceleration params if provided
+        if let Some(source) = source {
+            if let Some(acceleration) = source.get_acceleration() {
+                if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
+                    cmd.options.insert("sort_columns".to_string(), sort_cols_str.clone());
+                }
+            }
+        }
 
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)

@@ -68,6 +68,11 @@ pub struct MemTable {
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
 
     pub on_conflict: Option<OnConflict>,
+    
+    /// Optional columns to sort by during insert operations.
+    /// When specified, data is sorted before being written to improve
+    /// zone map efficiency for range queries.
+    sort_columns: Vec<String>,
 }
 
 impl MemTable {
@@ -101,7 +106,14 @@ impl MemTable {
             column_defaults: HashMap::new(),
             sort_order: Arc::new(Mutex::new(vec![])),
             on_conflict: None,
+            sort_columns: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
+        self.sort_columns = sort_columns;
+        self
     }
 
     #[must_use]
@@ -296,6 +308,7 @@ impl TableProvider for MemTable {
             primary_key,
             self.schema(),
             self.on_conflict.clone(),
+            self.sort_columns.clone(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
@@ -315,6 +328,9 @@ struct MemSink {
     primary_key: Option<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
+    
+    /// Optional columns to sort by before writing
+    sort_columns: Vec<String>,
 }
 
 impl Debug for MemSink {
@@ -345,6 +361,7 @@ impl MemSink {
         primary_key: Option<Vec<usize>>,
         schema: SchemaRef,
         on_conflict: Option<OnConflict>,
+        sort_columns: Vec<String>,
     ) -> Self {
         Self {
             batches,
@@ -356,6 +373,7 @@ impl MemSink {
             }),
             schema,
             on_conflict,
+            sort_columns,
         }
     }
 }
@@ -879,16 +897,16 @@ impl DataSink for MemSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
 
-        // buffer up the data round robin style into num_partitions
-
+        // Collect data into partitions (round-robin distribution)
         let mut new_batches = vec![vec![]; num_partitions];
         let mut i = 0;
         let mut row_count = 0;
+        let mut data = data;
         while let Some(batch) = data
             .next()
             .await
@@ -945,6 +963,40 @@ impl DataSink for MemSink {
                     }
                 }
             }
+
+            // IMPORTANT: Sort happens AFTER deduplication/filtering to ensure we only sort
+            // the final data that will actually be written. This matches Cayenne's behavior
+            // where sorting happens after retention filters are applied.
+            if !self.sort_columns.is_empty() && !batches.is_empty() {
+                // Concatenate batches in this partition for sorting
+                let schema = batches[0].schema();
+                let combined_batch = if batches.len() == 1 {
+                    batches.into_iter().next().expect("checked len == 1")
+                } else {
+                    arrow::compute::concat_batches(&schema, &batches)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+                };
+
+                // Sort the combined batch
+                use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+                use futures::stream;
+                
+                let sorted_stream = RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    stream::iter(vec![Ok(combined_batch)]),
+                );
+
+                let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+                    Box::pin(sorted_stream),
+                    &self.sort_columns,
+                    context,
+                )
+                .await?;
+
+                // Collect sorted batches
+                batches = datafusion::physical_plan::common::collect(sorted_stream).await?;
+            }
+
             target.append(&mut batches);
         }
 

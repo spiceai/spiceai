@@ -1126,44 +1126,11 @@ impl CayenneTableProvider {
         &self,
         stream: SendableRecordBatchStream,
     ) -> CatalogResult<SendableRecordBatchStream> {
-        use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
-        use datafusion_physical_plan::sorts::sort::SortExec;
         use datafusion_execution::TaskContext;
 
-        let schema = stream.schema();
-
-        // Build sort expressions from configured sort_columns
-        let mut sort_exprs = Vec::with_capacity(self.vortex_config.sort_columns.len());
-        for col_name in &self.vortex_config.sort_columns {
-            // Validate column exists in schema
-            if schema.column_with_name(col_name).is_none() {
-                tracing::warn!(
-                    "Sort column '{}' not found in schema for table {}. Skipping sort.",
-                    col_name,
-                    self.table_metadata.table_name
-                );
-                return Ok(stream);
-            }
-
-            // Column existence validated above, so index_of will succeed
-            let column_index = schema.index_of(col_name).expect("column validated above");
-
-            sort_exprs.push(PhysicalSortExpr {
-                expr: Arc::new(datafusion_physical_expr::expressions::Column::new(
-                    col_name,
-                    column_index,
-                )),
-                options: arrow::compute::SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            });
-        }
-
-        let lex_ordering =
-            LexOrdering::new(sort_exprs).ok_or_else(|| CatalogError::InvalidOperation {
-                message: "Failed to create lex ordering: sort expressions cannot be empty".to_string(),
-            })?;
+        // Create a task context with default memory pool and runtime settings
+        // This will use the configured spill directory and compression settings
+        let task_ctx = Arc::new(TaskContext::default());
 
         tracing::debug!(
             "Sorting refresh data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
@@ -1171,25 +1138,16 @@ impl CayenneTableProvider {
             self.table_metadata.table_name
         );
 
-        // Create a streaming execution plan that yields the input stream
-        let stream_exec = Arc::new(StreamingExec::new(Arc::clone(&schema), stream));
-
-        // Wrap with SortExec for external sorting with disk spilling
-        let sort_exec = Arc::new(SortExec::new(lex_ordering, stream_exec));
-
-        // Create a task context with default memory pool and runtime settings
-        // This will use the configured spill directory and compression settings
-        let task_ctx = Arc::new(TaskContext::default());
-
-        // Execute the sort - this returns a stream that will:
-        // 1. Read batches from the input stream
-        // 2. Sort them using external merge sort (spilling to disk if needed)
-        // 3. Stream the sorted results
-        let sorted_stream = sort_exec
-            .execute(0, task_ctx)
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to execute sort: {e}"),
-            })?;
+        // Use the common stream sorting utility
+        let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+            stream,
+            &self.vortex_config.sort_columns,
+            &task_ctx,
+        )
+        .await
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: format!("Failed to execute sort: {e}"),
+        })?;
 
         Ok(sorted_stream)
     }
