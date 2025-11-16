@@ -48,7 +48,7 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 /// Glob patterns for detecting dangerous path components
 const DANGEROUS_PATH_PATTERNS: &[&str] = &[
     "*/..*",  // Unix parent directory traversal (anywhere in path)
-    "*..*",   // Parent at start (Unix) - matches paths starting with ..
+    "..*",    // Parent at start (Unix) - matches paths starting with ..
     "*\\..*", // Windows parent directory traversal (backslash-dot-dot)
     "*\\\\*", // Windows UNC path or backslash (absolute paths)
     "/*",     // Unix absolute path (starts with /)
@@ -63,15 +63,10 @@ static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
             builder.add(glob);
         }
     }
-    // SAFETY: DANGEROUS_PATH_PATTERNS are all valid glob patterns.
-    // If this fails, it indicates a programmer error in the pattern definitions above.
-    // In that case, we return an empty GlobSet which will not match anything,
-    // causing path validation to fail open (allowing all paths) rather than crashing.
-    // This is acceptable because:
-    // 1. The patterns are compile-time constants that are tested
-    // 2. A build failure is better caught in tests than at runtime
-    // 3. An empty set means no validation, which is safer than a panic
-    builder.build().unwrap_or_else(|_| GlobSet::empty())
+    // This should never fail since DANGEROUS_PATH_PATTERNS are hardcoded and validated
+    builder.build().unwrap_or_else(|e| {
+        unreachable!("Failed to build dangerous path glob set with hardcoded patterns: {e}")
+    })
 });
 
 /// Check if a hostname is localhost
@@ -134,26 +129,25 @@ impl McpToolCatalog {
 
     #[allow(clippy::too_many_lines)]
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
-        // Security constants
-        const MAX_ARGS: usize = 100;
-        const MAX_ARG_LENGTH: usize = 4096;
-
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
+                // Security constants
+                const MAX_ARGS: usize = 100;
+                const MAX_ARG_LENGTH: usize = 4096;
+
                 // Security: Validate command path to prevent command injection
-                // Use pre-compiled glob patterns to detect path traversal on all platforms (Windows/Unix)
                 if DANGEROUS_PATH_GLOB_SET.is_match(command) {
-                    return Err(Error::CouldNotConstructTool {
+                    return Err(super::Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
-                            "Invalid command path '{command}'. Path contains dangerous components (path traversal, absolute paths, or special characters not allowed)"
+                            "Invalid command path '{command}'. Path contains dangerous components"
                         ),
                     });
                 }
 
                 // Security: Limit number of arguments to prevent resource exhaustion
                 if args.len() > MAX_ARGS {
-                    return Err(Error::CouldNotConstructTool {
+                    return Err(super::Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
                             "Too many arguments ({}). Maximum allowed: {MAX_ARGS}",
@@ -165,7 +159,7 @@ impl McpToolCatalog {
                 // Security: Validate argument lengths to prevent buffer overflow attacks
                 for (i, arg) in args.iter().enumerate() {
                     if arg.len() > MAX_ARG_LENGTH {
-                        return Err(Error::CouldNotConstructTool {
+                        return Err(super::Error::CouldNotConstructTool {
                             name: "mcp_stdio".to_string(),
                             e: format!(
                                 "Argument {i} too long ({} bytes). Maximum allowed: {MAX_ARG_LENGTH} bytes",
@@ -174,13 +168,6 @@ impl McpToolCatalog {
                         });
                     }
                 }
-
-                tracing::info!(
-                    "Starting MCP stdio client: command={}, args_count={}, env_count={}",
-                    command,
-                    args.len(),
-                    env.len()
-                );
 
                 Ok(McpClient::Stdio(
                     serve_client(
@@ -199,7 +186,7 @@ impl McpToolCatalog {
             MCPConfig::Https { url } => {
                 // Security: Validate URL scheme (only https allowed, http for localhost testing)
                 if url.scheme() != "https" && url.scheme() != "http" {
-                    return Err(Error::CouldNotConstructTool {
+                    return Err(super::Error::CouldNotConstructTool {
                         name: "mcp_https".to_string(),
                         e: format!(
                             "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
@@ -217,8 +204,6 @@ impl McpToolCatalog {
                         url
                     );
                 }
-
-                tracing::info!("Starting MCP HTTPS client: url={}", url);
 
                 let transport = SseClientTransport::start(url.to_string())
                     .await
@@ -260,7 +245,7 @@ impl McpToolCatalog {
                 tracing::warn!(
                     "MCP tool listing exceeded maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
                 );
-                break; // Stop paginating instead of erroring
+                break;
             }
 
             let response = self
@@ -273,14 +258,13 @@ impl McpToolCatalog {
                 .await?;
 
             // Security: Validate total tools count to prevent memory exhaustion
-            if tools.len() + response.tools.len() > MAX_TOTAL_TOOLS {
+            if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
                 tracing::warn!(
                     "MCP tool listing exceeded maximum tools count ({MAX_TOTAL_TOOLS}), limiting results"
                 );
-                // Only add tools up to the limit
                 let remaining = MAX_TOTAL_TOOLS - tools.len();
                 tools.extend(response.tools.into_iter().take(remaining));
-                break; // Stop paginating
+                break;
             }
 
             tools.extend(response.tools);
@@ -296,17 +280,8 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
-        // Security: Validate tool name length and limit pagination
-        const MAX_TOOL_NAME_LENGTH: usize = 256;
+        // Security: Limit pagination to prevent infinite loops
         const MAX_PAGINATION_ITERATIONS: usize = 100;
-
-        if name.len() > MAX_TOOL_NAME_LENGTH {
-            tracing::warn!(
-                "Tool name too long ({} chars), maximum is {MAX_TOOL_NAME_LENGTH}. Returning None.",
-                name.len()
-            );
-            return Ok(None); // Tool name too long, treat as not found
-        }
 
         let mut cursor: Option<String> = None;
         let mut iterations = 0;
@@ -315,9 +290,9 @@ impl McpToolCatalog {
             iterations += 1;
             if iterations > MAX_PAGINATION_ITERATIONS {
                 tracing::warn!(
-                    "MCP get_tool pagination exceeded maximum iterations ({MAX_PAGINATION_ITERATIONS}), stopping search"
+                    "MCP get_tool pagination exceeded maximum iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
                 );
-                break; // Stop searching, return None
+                break;
             }
 
             let response = self

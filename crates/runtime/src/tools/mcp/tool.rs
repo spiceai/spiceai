@@ -84,9 +84,8 @@ impl SpiceModelTool for McpToolWrapper {
         const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1 MB
         if arg.len() > MAX_INPUT_SIZE {
             return Err(format!(
-                "Input too large ({} bytes). Maximum allowed: {} bytes",
-                arg.len(),
-                MAX_INPUT_SIZE
+                "Input too large ({} bytes). Maximum allowed: {MAX_INPUT_SIZE} bytes",
+                arg.len()
             )
             .into());
         }
