@@ -1047,23 +1047,23 @@ impl PartitionCreator for CayennePartitionCreator {
         // Partition pruning works for filters on partition columns, even though
         // Cayenne doesn't have native filter pushdown to the storage layer
         use datafusion::logical_expr::TableProviderFilterPushDown;
-        
+
         let partition_columns = self.partition_by.expression.column_refs();
-        
+
         Ok(filters
             .iter()
             .map(|filter| {
                 let filter_columns = filter.column_refs();
-                
+
                 // Check if filter columns match partition columns (ignoring table qualifiers)
                 // Both `order_date` and `table.order_date` should match partition column `order_date`
                 let matches_partition_cols = filter_columns.is_empty()
                     || filter_columns.iter().all(|filter_col| {
-                        partition_columns.iter().any(|part_col| {
-                            filter_col.name == part_col.name
-                        })
+                        partition_columns
+                            .iter()
+                            .any(|part_col| filter_col.name == part_col.name)
                     });
-                
+
                 // If filter references partition columns or contains the partition expression,
                 // it can be used for partition pruning
                 if matches_partition_cols {
