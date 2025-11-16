@@ -254,7 +254,7 @@ impl McpToolCatalog {
                 .await?;
 
             // Security: Validate total tools count to prevent memory exhaustion
-            if tools.len() + response.tools.len() > MAX_TOTAL_TOOLS {
+            if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
                 tracing::warn!(
                     "MCP tool listing exceeded maximum tools count ({MAX_TOTAL_TOOLS}), limiting results"
                 );
