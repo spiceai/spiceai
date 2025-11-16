@@ -53,7 +53,168 @@ impl std::fmt::Display for Https {
     }
 }
 
+struct HttpProviderParams {
+    file_format: String,
+    acceleration_enabled: bool,
+    max_retries: u32,
+    backoff_method: util::retry_strategy::BackoffMethod,
+    max_retry_duration: Option<Duration>,
+    retry_jitter: f64,
+    custom_headers: HeaderMap,
+    allowed_paths: Vec<String>,
+    allow_query_filters: bool,
+    max_query_length: usize,
+    allow_body_filters: bool,
+    max_body_bytes: usize,
+}
+
 impl Https {
+    fn parse_bool_flag(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    fn resolve_http_provider_params(&self, dataset: &Dataset) -> HttpProviderParams {
+        let file_format = self
+            .params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
+
+        let max_retries = self
+            .params
+            .get("max_retries")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
+
+        let backoff_method = self
+            .params
+            .get("retry_backoff_method")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<util::retry_strategy::BackoffMethod>().ok())
+            .unwrap_or(util::retry_strategy::BackoffMethod::Fibonacci);
+
+        let max_retry_duration = self
+            .params
+            .get("retry_max_duration")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok());
+
+        let retry_jitter = self
+            .params
+            .get("retry_jitter")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.3);
+
+        let custom_headers = self.parse_custom_headers(&dataset.name.to_string());
+
+        let allowed_paths = self
+            .params
+            .get("allowed_request_paths")
+            .expose()
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let allow_query_filters = self
+            .params
+            .get("allow_request_query_filters")
+            .expose()
+            .ok()
+            .is_some_and(Self::parse_bool_flag);
+
+        let max_query_length = self
+            .params
+            .get("max_request_query_length")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(data_components::http::provider::DEFAULT_MAX_QUERY_LENGTH);
+
+        let allow_body_filters = self
+            .params
+            .get("allow_request_body_filters")
+            .expose()
+            .ok()
+            .is_some_and(Self::parse_bool_flag);
+
+        let max_body_bytes = self
+            .params
+            .get("max_request_body_bytes")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
+
+        HttpProviderParams {
+            file_format,
+            acceleration_enabled: dataset.is_accelerated(),
+            max_retries,
+            backoff_method,
+            max_retry_duration,
+            retry_jitter,
+            custom_headers,
+            allowed_paths,
+            allow_query_filters,
+            max_query_length,
+            allow_body_filters,
+            max_body_bytes,
+        }
+    }
+
+    fn apply_allowed_paths(
+        dataset: &Dataset,
+        provider: data_components::http::provider::HttpTableProvider,
+        allowed_paths: Vec<String>,
+    ) -> DataConnectorResult<data_components::http::provider::HttpTableProvider> {
+        if allowed_paths.is_empty() {
+            return Ok(provider);
+        }
+
+        let component = ConnectorComponent::from(dataset);
+        provider.with_allowed_paths(allowed_paths).map_err(|e| {
+            let message = format!("Invalid allowed_request_paths configuration: {e}");
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                message,
+                connector_component: component,
+                source: Box::new(e),
+            }
+        })
+    }
+
+    fn spawn_endpoint_validation(
+        provider: Arc<data_components::http::provider::HttpTableProvider>,
+        dataset_name: String,
+    ) {
+        tokio::spawn(async move {
+            if let Err(e) = provider.validate_endpoint().await {
+                tracing::warn!(
+                    "HTTP endpoint validation failed for dataset '{}': {}. \
+                    The endpoint may be temporarily unavailable or misconfigured. \
+                    Queries will continue but may fail if the endpoint is not accessible.",
+                    dataset_name,
+                    e
+                );
+            }
+        });
+    }
+
     /// Parse HTTP headers from the `http_headers` parameter
     fn parse_custom_headers(&self, dataset_name: &str) -> HeaderMap {
         let mut custom_headers = HeaderMap::new();
@@ -148,49 +309,22 @@ impl Https {
 
         let client = self.build_http_client(dataset)?;
 
-        let file_format = self
-            .params
-            .get("file_format")
-            .expose()
-            .ok()
-            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
+        let HttpProviderParams {
+            file_format,
+            acceleration_enabled,
+            max_retries,
+            backoff_method,
+            max_retry_duration,
+            retry_jitter,
+            custom_headers,
+            allowed_paths,
+            allow_query_filters,
+            max_query_length,
+            allow_body_filters,
+            max_body_bytes,
+        } = self.resolve_http_provider_params(dataset);
 
-        let acceleration_enabled = dataset.is_accelerated();
-
-        let max_retries = self
-            .params
-            .get("max_retries")
-            .expose()
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
-
-        let backoff_method = self
-            .params
-            .get("retry_backoff_method")
-            .expose()
-            .ok()
-            .and_then(|v| v.parse::<util::retry_strategy::BackoffMethod>().ok())
-            .unwrap_or(util::retry_strategy::BackoffMethod::Fibonacci);
-
-        let max_retry_duration = self
-            .params
-            .get("retry_max_duration")
-            .expose()
-            .ok()
-            .and_then(|v| fundu::parse_duration(v).ok());
-
-        let retry_jitter = self
-            .params
-            .get("retry_jitter")
-            .expose()
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.3);
-
-        let custom_headers = self.parse_custom_headers(&dataset.name.to_string());
-
-        let provider = data_components::http::provider::HttpTableProvider::new(
+        let mut provider = data_components::http::provider::HttpTableProvider::new(
             base_url,
             client,
             file_format,
@@ -202,22 +336,18 @@ impl Https {
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers);
 
-        let provider = Arc::new(provider);
+        provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
-        // Validate the HTTP endpoint (non-blocking, log warnings only)
-        let provider_clone = Arc::clone(&provider);
-        let dataset_name = dataset.name.clone();
-        tokio::spawn(async move {
-            if let Err(e) = provider_clone.validate_endpoint().await {
-                tracing::warn!(
-                    "HTTP endpoint validation failed for dataset '{}': {}. \
-                    The endpoint may be temporarily unavailable or misconfigured. \
-                    Queries will continue but may fail if the endpoint is not accessible.",
-                    dataset_name,
-                    e
-                );
-            }
-        });
+        if allow_query_filters {
+            provider = provider.enable_query_filters(max_query_length);
+        }
+
+        if allow_body_filters {
+            provider = provider.enable_body_filters(max_body_bytes);
+        }
+
+        let provider = Arc::new(provider);
+        Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
 
         Ok(provider)
     }
@@ -317,6 +447,16 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum total duration for all retries (e.g., '30s', '5m'). If not set, retries will continue up to max_retries."),
         ParameterSpec::runtime("retry_jitter")
             .description("Randomization factor for retry delays (0.0 to 1.0). Default: 0.3 (30% randomization). Set to 0 for no jitter."),
+        ParameterSpec::runtime("allowed_request_paths")
+            .description("Comma-separated list of request_path values that users are allowed to query. Required to enable request_path filters."),
+        ParameterSpec::runtime("allow_request_query_filters")
+            .description("Set to true (1/true/yes/on) to allow request_query filters to be pushed down to HTTP requests."),
+        ParameterSpec::runtime("max_request_query_length")
+            .description("Maximum length (in characters) for request_query filter values. Default: 1024."),
+        ParameterSpec::runtime("allow_request_body_filters")
+            .description("Set to true (1/true/yes/on) to allow request_body filters to be pushed down as HTTP request bodies."),
+        ParameterSpec::runtime("max_request_body_bytes")
+            .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
