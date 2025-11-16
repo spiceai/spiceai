@@ -20,7 +20,9 @@ use crate::dataconnector::{
     DataConnectorResult, ParameterSpec, Parameters,
 };
 use async_trait::async_trait;
-use data_components::git::GitTableProvider;
+use data_components::git::{
+    DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES, GitTableConfig, GitTableProvider,
+};
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -144,23 +146,51 @@ impl Git {
             })
             .map(PathBuf::from);
 
+        let max_files = dataset
+            .params
+            .get("git_max_files")
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| {
+                self.params
+                    .get("max_files")
+                    .expose()
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .unwrap_or(DEFAULT_MAX_FILES);
+
+        let max_file_bytes = dataset
+            .params
+            .get("git_max_file_bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| {
+                self.params
+                    .get("max_file_bytes")
+                    .expose()
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+
         // Create a no-op rate limiter (Git operations are local after initial clone)
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(NoOpRateLimiter);
 
-        let table_provider = GitTableProvider::new(
-            &repo_url,
-            reference.as_deref(),
-            include,
+        let config = GitTableConfig {
             fetch_content,
             rate_limiter,
             cache_path,
-        )
-        .await
-        .map_err(|e| DataConnectorError::UnableToGetReadProvider {
-            dataconnector: "git".to_string(),
-            connector_component: component,
-            source: Box::new(e),
-        })?;
+            max_files,
+            max_file_bytes,
+        };
+
+        let table_provider =
+            GitTableProvider::new(&repo_url, reference.as_deref(), include, config)
+                .await
+                .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "git".to_string(),
+                    connector_component: component,
+                    source: Box::new(e),
+                })?;
 
         Ok(Arc::new(table_provider))
     }
@@ -204,6 +234,11 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("false"),
     ParameterSpec::runtime("cache_path")
         .description("Custom path for the local Git repository cache. If not specified, uses system temp directory."),
+    ParameterSpec::runtime("max_files")
+        .description("Maximum number of files to materialize from a Git repository. Default: 5000. Hard limit: 50000.")
+        .default("5000"),
+    ParameterSpec::runtime("max_file_bytes")
+        .description("Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB)."),
 ];
 
 impl DataConnectorFactory for GitFactory {

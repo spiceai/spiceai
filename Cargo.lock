@@ -17296,6 +17296,7 @@ dependencies = [
  "arrow-schema",
  "backoff",
  "ctrlc",
+ "datafusion",
  "humantime",
  "rand 0.9.2",
  "serde_json",

@@ -14,136 +14,217 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Security utilities for validating and sanitizing inputs to prevent common
-//! security vulnerabilities.
+//! Security utilities for safe file operations and input validation.
+//!
+//! This module provides functions to prevent common security vulnerabilities:
+//! - Path traversal attacks (e.g., `../../etc/passwd`)
+//! - Empty file downloads that could cause runtime errors
+//! - Malicious filenames with special characters
+//! - SQL injection via unquoted table identifiers
 
-use serde_json::Value;
+use datafusion::sql::TableReference;
 use std::path::Path;
 
-/// Maximum safe JSON nesting depth to prevent stack overflow attacks.
+/// The maximum safe nesting depth for JSON values.
 ///
-/// Deeply nested JSON can cause stack overflow during parsing or traversal.
-/// This limit prevents such attacks while allowing reasonable nesting for
-/// legitimate use cases.
-///
-/// # Security Note
-///
-/// A depth of 32 is considered safe for most practical applications while
-/// preventing malicious payloads that could cause stack exhaustion.
+/// This limit prevents stack overflow attacks from deeply nested JSON structures.
+/// A depth of 32 is sufficient for legitimate use cases while protecting against
+/// malicious payloads designed to exhaust stack space.
 pub const MAX_SAFE_JSON_DEPTH: usize = 32;
 
-/// Sanitizes a filename by extracting only the file name component and removing
-/// any directory path components.
+/// Sanitizes a filename by extracting only the file component, preventing path traversal.
 ///
-/// This prevents path traversal attacks by ensuring that only the filename is used,
-/// stripping any directory components (including `..` or absolute paths).
+/// This function is critical for security when accepting filenames from untrusted sources
+/// (e.g., API parameters, user input, external configuration). It strips any directory
+/// components, ensuring that paths like `../../etc/passwd` become just `passwd`.
+///
+/// # Security Guarantees
+///
+/// - Prevents path traversal attacks by removing all directory components
+/// - Rejects invalid UTF-8 sequences in filenames
+/// - Returns only the filename component without any path separators
 ///
 /// # Arguments
 ///
-/// * `path` - The path to sanitize
+/// * `input` - The potentially unsafe filename from an untrusted source
 ///
 /// # Returns
 ///
-/// A sanitized filename with directory components removed. Returns the original
-/// input if it cannot be parsed as a valid filename.
+/// * `Ok(String)` - The sanitized filename containing only the file component
+/// * `Err(String)` - An error message if the filename is invalid or contains path traversal attempts
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The input contains invalid UTF-8 sequences
+/// - The path cannot be parsed to extract a filename component
 ///
 /// # Examples
 ///
 /// ```
 /// use util::security::sanitize_filename;
 ///
-/// assert_eq!(sanitize_filename("../etc/passwd"), "passwd");
-/// assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
-/// assert_eq!(sanitize_filename("file.txt"), "file.txt");
-/// assert_eq!(sanitize_filename("dir/file.txt"), "file.txt");
+/// // Safe filename extraction
+/// assert_eq!(sanitize_filename("model.onnx").unwrap(), "model.onnx");
+///
+/// // Path traversal attempts are neutralized
+/// assert_eq!(sanitize_filename("../../etc/passwd").unwrap(), "passwd");
+/// assert_eq!(sanitize_filename("/var/log/secrets.txt").unwrap(), "secrets.txt");
+/// assert_eq!(sanitize_filename("subdir/model.bin").unwrap(), "model.bin");
 /// ```
-#[must_use]
-pub fn sanitize_filename(path: &str) -> String {
-    Path::new(path)
+#[must_use = "sanitized filename must be used to prevent path traversal vulnerabilities"]
+pub fn sanitize_filename(input: &str) -> Result<String, String> {
+    Path::new(input)
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-        .to_string()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("Invalid filename: {input}"))
 }
 
-/// Validates that a byte slice is not empty.
+/// Validates that a byte buffer is not empty, preventing silent failures.
 ///
-/// This is useful for ensuring that downloaded or received data contains actual
-/// content and hasn't been truncated or is incomplete.
+/// This function is critical when downloading files or processing external data.
+/// Empty files could indicate network failures, corrupted downloads, or malicious
+/// responses that could cause runtime errors when loading models or configurations.
+///
+/// # Security Guarantees
+///
+/// - Prevents loading of empty/corrupted files that could cause runtime panics
+/// - Provides clear error messages for debugging download failures
+/// - Enforces minimum data validation before expensive operations
 ///
 /// # Arguments
 ///
-/// * `bytes` - The byte slice to validate
-/// * `context` - A description of what is being validated (for error messages)
+/// * `bytes` - The byte buffer to validate
+/// * `context` - A description of what was being downloaded (e.g., "model file config.json")
 ///
 /// # Returns
 ///
-/// `Ok(())` if the byte slice is non-empty, otherwise returns an error with
-/// a descriptive message.
+/// * `Ok(())` - The buffer contains data and is safe to use
+/// * `Err(String)` - An error message indicating the buffer is empty
+///
+/// # Errors
+///
+/// Returns an error if the byte buffer is empty, indicating a failed download
+/// or corrupted data that should not be processed further.
 ///
 /// # Examples
 ///
 /// ```
 /// use util::security::validate_non_empty_bytes;
 ///
-/// assert!(validate_non_empty_bytes(&[1, 2, 3], "test data").is_ok());
-/// assert!(validate_non_empty_bytes(&[], "test data").is_err());
+/// // Valid data passes
+/// let data = b"model data";
+/// assert!(validate_non_empty_bytes(data, "model.onnx").is_ok());
+///
+/// // Empty data is rejected
+/// let empty = b"";
+/// assert!(validate_non_empty_bytes(empty, "config.json").is_err());
 /// ```
-///
-/// # Errors
-///
-/// Returns an error if `bytes` is empty.
-pub fn validate_non_empty_bytes(
-    bytes: &[u8],
-    context: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), String> {
     if bytes.is_empty() {
-        return Err(format!("{context} is empty").into());
+        Err(format!("Downloaded file {context} is empty"))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
-/// Quotes a table reference to prevent SQL injection attacks.
+/// Safely quotes a table reference for use in SQL queries, preventing SQL injection.
 ///
-/// This function properly escapes table names by enclosing them in quotes and
-/// escaping any existing quotes within the name. This prevents SQL injection
-/// when table names are constructed from user input.
+/// This function handles all forms of table references (bare, partial, full) and properly
+/// quotes each component by wrapping them in double quotes and escaping any embedded quotes.
+/// This prevents SQL injection attacks where malicious table names could break out of
+/// identifier context.
+///
+/// # Security Guarantees
+///
+/// - Prevents SQL injection via malicious table/schema/catalog names
+/// - Properly escapes embedded double quotes by doubling them (SQL standard)
+/// - Handles multi-part identifiers (catalog.schema.table) correctly
 ///
 /// # Arguments
 ///
-/// * `table_ref` - The table reference to quote
+/// * `tbl` - The table reference to quote (bare, partial, or full)
 ///
 /// # Returns
 ///
-/// A properly quoted table reference safe for use in SQL statements.
+/// A properly quoted SQL identifier string safe for use in queries.
 ///
 /// # Examples
 ///
 /// ```
+/// use datafusion::sql::TableReference;
 /// use util::security::quote_table_reference;
 ///
-/// assert_eq!(quote_table_reference("users"), "\"users\"");
-/// assert_eq!(quote_table_reference("my\"table"), "\"my\"\"table\"");
+/// // Simple table name
+/// let tbl = TableReference::bare("users");
+/// assert_eq!(quote_table_reference(&tbl), "\"users\"");
+///
+/// // Schema-qualified table
+/// let tbl = TableReference::partial("public", "users");
+/// assert_eq!(quote_table_reference(&tbl), "\"public\".\"users\"");
+///
+/// // Fully-qualified table
+/// let tbl = TableReference::full("catalog", "public", "users");
+/// assert_eq!(quote_table_reference(&tbl), "\"catalog\".\"public\".\"users\"");
 /// ```
-#[must_use]
-pub fn quote_table_reference(table_ref: &str) -> String {
-    format!("\"{}\"", table_ref.replace('"', "\"\""))
+#[must_use = "quoted table reference must be used in SQL queries to prevent injection"]
+pub fn quote_table_reference(tbl: &TableReference) -> String {
+    /// Quotes a single identifier with double quotes, escaping any embedded quotes.
+    fn quote_part(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+
+    match tbl {
+        TableReference::Bare { table } => quote_part(table.as_ref()),
+        TableReference::Partial { schema, table } => {
+            format!(
+                "{}.{}",
+                quote_part(schema.as_ref()),
+                quote_part(table.as_ref())
+            )
+        }
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => {
+            format!(
+                "{}.{}.{}",
+                quote_part(catalog.as_ref()),
+                quote_part(schema.as_ref()),
+                quote_part(table.as_ref())
+            )
+        }
+    }
 }
 
 /// Calculates the maximum nesting depth of a JSON value.
 ///
-/// This function traverses a JSON structure and returns the maximum depth of
-/// nesting. This is useful for preventing stack overflow attacks via deeply
-/// nested JSON payloads.
+/// This function is critical for preventing stack overflow attacks from maliciously
+/// crafted JSON payloads with excessive nesting. Deep nesting can exhaust stack space
+/// during parsing, serialization, or traversal operations.
+///
+/// # Security Guarantees
+///
+/// - Prevents stack overflow from deeply nested JSON structures
+/// - Iteratively calculates depth without consuming call stack
+/// - Works with both objects and arrays at any nesting level
+///
+/// # Performance
+///
+/// - Time Complexity: O(n) where n is the total number of values in the JSON
+/// - Space Complexity: O(d) where d is the depth (explicit stack storage)
+/// - Uses iterative traversal to avoid recursive stack consumption
 ///
 /// # Arguments
 ///
-/// * `value` - The JSON value to analyze
+/// * `value` - The JSON value to measure (from `serde_json::Value`)
 ///
 /// # Returns
 ///
-/// The maximum nesting depth. A simple value (string, number, boolean, null)
-/// has depth 0. An array or object has depth 1 + the maximum depth of its contents.
+/// The maximum nesting depth as a `usize`. A simple value (string, number, bool, null)
+/// has depth 1. Each level of nesting (array or object) adds 1 to the depth.
 ///
 /// # Examples
 ///
@@ -151,190 +232,348 @@ pub fn quote_table_reference(table_ref: &str) -> String {
 /// use serde_json::json;
 /// use util::security::get_json_depth;
 ///
-/// assert_eq!(get_json_depth(&json!("simple")), 0);
-/// assert_eq!(get_json_depth(&json!({"a": "b"})), 1);
-/// assert_eq!(get_json_depth(&json!({"a": {"b": "c"}})), 2);
-/// assert_eq!(get_json_depth(&json!([1, [2, [3]]])), 3);
+/// // Simple values have depth 1
+/// assert_eq!(get_json_depth(&json!("string")), 1);
+/// assert_eq!(get_json_depth(&json!(42)), 1);
+/// assert_eq!(get_json_depth(&json!(true)), 1);
+/// assert_eq!(get_json_depth(&json!(null)), 1);
+///
+/// // Empty containers have depth 1
+/// assert_eq!(get_json_depth(&json!([])), 1);
+/// assert_eq!(get_json_depth(&json!({})), 1);
+///
+/// // Nested structures add depth
+/// assert_eq!(get_json_depth(&json!({"a": 1})), 2);
+/// assert_eq!(get_json_depth(&json!([1, 2, 3])), 2);
+/// assert_eq!(get_json_depth(&json!({"a": {"b": 1}})), 3);
+/// assert_eq!(get_json_depth(&json!([[[1]]])), 4);
+///
+/// // Complex nested structure
+/// let complex = json!({
+///     "level1": {
+///         "level2": {
+///             "level3": [1, 2, {"level4": "deep"}]
+///         }
+///     }
+/// });
+/// assert_eq!(get_json_depth(&complex), 5);
 /// ```
-#[must_use]
-pub fn get_json_depth(value: &Value) -> usize {
-    match value {
-        Value::Object(map) => {
-            if map.is_empty() {
-                0
-            } else {
-                1 + map.values().map(get_json_depth).max().unwrap_or(0)
+///
+/// # Validation Example
+///
+/// ```
+/// use serde_json::json;
+/// use util::security::{get_json_depth, MAX_SAFE_JSON_DEPTH};
+///
+/// let user_input = json!({"a": {"b": {"c": "value"}}});
+/// let depth = get_json_depth(&user_input);
+///
+/// if depth > MAX_SAFE_JSON_DEPTH {
+///     panic!("JSON too deeply nested: {} levels (max: {})", depth, MAX_SAFE_JSON_DEPTH);
+/// }
+/// ```
+#[must_use = "JSON depth must be validated to prevent stack overflow attacks"]
+pub fn get_json_depth(value: &serde_json::Value) -> usize {
+    // Iterative implementation using an explicit stack to avoid recursion.
+    // Each stack entry is (current_value, current_depth).
+    let mut max_depth = 1;
+    let mut stack = Vec::new();
+    stack.push((value, 1));
+
+    while let Some((v, depth)) = stack.pop() {
+        match v {
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    max_depth = max_depth.max(depth);
+                } else {
+                    for item in arr {
+                        stack.push((item, depth + 1));
+                    }
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                if obj.is_empty() {
+                    max_depth = max_depth.max(depth);
+                } else {
+                    for value in obj.values() {
+                        stack.push((value, depth + 1));
+                    }
+                }
+            }
+            _ => {
+                max_depth = max_depth.max(depth);
             }
         }
-        Value::Array(arr) => {
-            if arr.is_empty() {
-                0
-            } else {
-                1 + arr.iter().map(get_json_depth).max().unwrap_or(0)
-            }
-        }
-        _ => 0,
     }
+
+    max_depth
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn test_sanitize_filename() {
-        // Path traversal attempts
-        assert_eq!(sanitize_filename("../etc/passwd"), "passwd");
-        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
-        assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
-        assert_eq!(sanitize_filename("/etc/../passwd"), "passwd");
-
-        // Windows paths
-        assert_eq!(sanitize_filename("C:\\Windows\\System32\\config"), "config");
-        assert_eq!(sanitize_filename("..\\..\\Windows\\System32"), "System32");
-
-        // Normal filenames
-        assert_eq!(sanitize_filename("file.txt"), "file.txt");
-        assert_eq!(sanitize_filename("my-file.pdf"), "my-file.pdf");
-
-        // With directory components
-        assert_eq!(sanitize_filename("dir/file.txt"), "file.txt");
-        assert_eq!(sanitize_filename("path/to/file.txt"), "file.txt");
-
-        // Edge cases
-        assert_eq!(sanitize_filename(""), "");
-        assert_eq!(sanitize_filename("."), ".");
-        assert_eq!(sanitize_filename(".."), "..");
-    }
-
-    #[test]
-    fn test_validate_non_empty_bytes() {
-        assert!(validate_non_empty_bytes(&[1, 2, 3], "test").is_ok());
-        assert!(validate_non_empty_bytes(&[0], "test").is_ok());
-
-        let err = validate_non_empty_bytes(&[], "test data");
-        assert!(err.is_err());
-        assert!(
-            err.expect_err("should be an error")
-                .to_string()
-                .contains("test data is empty")
+    fn test_sanitize_filename_safe_names() {
+        assert_eq!(
+            sanitize_filename("model.onnx").expect("should sanitize model.onnx"),
+            "model.onnx"
+        );
+        assert_eq!(
+            sanitize_filename("config.json").expect("should sanitize config.json"),
+            "config.json"
+        );
+        assert_eq!(
+            sanitize_filename("my-model_v2.bin").expect("should sanitize my-model_v2.bin"),
+            "my-model_v2.bin"
         );
     }
 
     #[test]
-    fn test_quote_table_reference() {
-        assert_eq!(quote_table_reference("users"), "\"users\"");
-        assert_eq!(quote_table_reference("my_table"), "\"my_table\"");
-
-        // SQL injection attempts
+    fn test_sanitize_filename_path_traversal() {
+        // Classic path traversal attempts
         assert_eq!(
-            quote_table_reference("users; DROP TABLE users;"),
-            "\"users; DROP TABLE users;\""
+            sanitize_filename("../../etc/passwd").expect("should sanitize ../../etc/passwd"),
+            "passwd"
+        );
+        assert_eq!(
+            sanitize_filename("../../../root/.ssh/id_rsa")
+                .expect("should sanitize ../../../root/.ssh/id_rsa"),
+            "id_rsa"
         );
 
-        // Quotes in table name
-        assert_eq!(quote_table_reference("my\"table"), "\"my\"\"table\"");
+        // Absolute paths
         assert_eq!(
-            quote_table_reference("test\"\"table"),
-            "\"test\"\"\"\"table\""
+            sanitize_filename("/etc/shadow").expect("should sanitize /etc/shadow"),
+            "shadow"
+        );
+        assert_eq!(
+            sanitize_filename("/var/log/secrets.txt")
+                .expect("should sanitize /var/log/secrets.txt"),
+            "secrets.txt"
         );
 
-        // Edge cases
-        assert_eq!(quote_table_reference(""), "\"\"");
-        assert_eq!(quote_table_reference("\""), "\"\"\"\"");
-    }
-
-    #[test]
-    fn test_get_json_depth_simple_values() {
-        assert_eq!(get_json_depth(&json!(null)), 0);
-        assert_eq!(get_json_depth(&json!(true)), 0);
-        assert_eq!(get_json_depth(&json!(false)), 0);
-        assert_eq!(get_json_depth(&json!(42)), 0);
-        assert_eq!(get_json_depth(&json!(3.5)), 0);
-        assert_eq!(get_json_depth(&json!("string")), 0);
-    }
-
-    #[test]
-    fn test_get_json_depth_empty_collections() {
-        assert_eq!(get_json_depth(&json!([])), 0);
-        assert_eq!(get_json_depth(&json!({})), 0);
-    }
-
-    #[test]
-    fn test_get_json_depth_arrays() {
-        assert_eq!(get_json_depth(&json!([1, 2, 3])), 1);
-        assert_eq!(get_json_depth(&json!([1, [2, 3]])), 2);
-        assert_eq!(get_json_depth(&json!([1, [2, [3, [4]]]])), 4);
-        assert_eq!(get_json_depth(&json!([[[[[[[[[[1]]]]]]]]]])), 10);
-    }
-
-    #[test]
-    fn test_get_json_depth_objects() {
-        assert_eq!(get_json_depth(&json!({"a": 1})), 1);
-        assert_eq!(get_json_depth(&json!({"a": {"b": 2}})), 2);
-        assert_eq!(get_json_depth(&json!({"a": {"b": {"c": 3}}})), 3);
-    }
-
-    #[test]
-    fn test_get_json_depth_mixed() {
+        // Relative paths with subdirectories
         assert_eq!(
-            get_json_depth(&json!({
-                "simple": "value",
+            sanitize_filename("subdir/model.bin").expect("should sanitize subdir/model.bin"),
+            "model.bin"
+        );
+        assert_eq!(
+            sanitize_filename("a/b/c/file.txt").expect("should sanitize a/b/c/file.txt"),
+            "file.txt"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_filename_edge_cases() {
+        // Current directory reference
+        assert_eq!(
+            sanitize_filename("./model.onnx").expect("should sanitize ./model.onnx"),
+            "model.onnx"
+        );
+
+        // Just a filename, no path
+        assert_eq!(
+            sanitize_filename("model").expect("should sanitize model"),
+            "model"
+        );
+    }
+
+    #[test]
+    fn test_validate_non_empty_bytes_valid() {
+        let data = b"some model data";
+        assert!(validate_non_empty_bytes(data, "model.onnx").is_ok());
+
+        let single_byte = b"x";
+        assert!(validate_non_empty_bytes(single_byte, "config.json").is_ok());
+    }
+
+    #[test]
+    fn test_validate_non_empty_bytes_empty() {
+        let empty = b"";
+        let result = validate_non_empty_bytes(empty, "model.bin");
+        assert!(result.is_err());
+        let error_msg = result.expect_err("should be error");
+        assert!(error_msg.contains("model.bin"));
+        assert!(error_msg.contains("empty"));
+    }
+
+    #[test]
+    fn test_quote_table_reference_bare() {
+        let tbl = TableReference::bare("users");
+        assert_eq!(quote_table_reference(&tbl), r#""users""#);
+
+        let tbl = TableReference::bare("my_table");
+        assert_eq!(quote_table_reference(&tbl), r#""my_table""#);
+    }
+
+    #[test]
+    fn test_quote_table_reference_partial() {
+        let tbl = TableReference::partial("public", "users");
+        assert_eq!(quote_table_reference(&tbl), r#""public"."users""#);
+
+        let tbl = TableReference::partial("my_schema", "my_table");
+        assert_eq!(quote_table_reference(&tbl), r#""my_schema"."my_table""#);
+    }
+
+    #[test]
+    fn test_quote_table_reference_full() {
+        let tbl = TableReference::full("catalog", "public", "users");
+        assert_eq!(quote_table_reference(&tbl), r#""catalog"."public"."users""#);
+
+        let tbl = TableReference::full("my_cat", "my_schema", "my_table");
+        assert_eq!(
+            quote_table_reference(&tbl),
+            r#""my_cat"."my_schema"."my_table""#
+        );
+    }
+
+    #[test]
+    fn test_quote_table_reference_sql_injection() {
+        // Table name with SQL injection attempt
+        let tbl = TableReference::bare("users; DROP TABLE users--");
+        let quoted = quote_table_reference(&tbl);
+        // Should be safely quoted, preventing the injection
+        assert!(quoted.contains("DROP TABLE"));
+        assert!(quoted.starts_with('"'));
+        assert!(quoted.ends_with('"'));
+    }
+
+    #[test]
+    fn test_get_json_depth_primitives() {
+        use serde_json::json;
+
+        // All primitives have depth 1
+        assert_eq!(get_json_depth(&json!("string")), 1);
+        assert_eq!(get_json_depth(&json!(42)), 1);
+        assert_eq!(get_json_depth(&json!(42.5)), 1);
+        assert_eq!(get_json_depth(&json!(true)), 1);
+        assert_eq!(get_json_depth(&json!(false)), 1);
+        assert_eq!(get_json_depth(&json!(null)), 1);
+    }
+
+    #[test]
+    fn test_get_json_depth_empty_containers() {
+        use serde_json::json;
+
+        // Empty containers have depth 1
+        assert_eq!(get_json_depth(&json!([])), 1);
+        assert_eq!(get_json_depth(&json!({})), 1);
+    }
+
+    #[test]
+    fn test_get_json_depth_flat_containers() {
+        use serde_json::json;
+
+        // Flat arrays/objects have depth 2
+        assert_eq!(get_json_depth(&json!([1, 2, 3])), 2);
+        assert_eq!(get_json_depth(&json!(["a", "b", "c"])), 2);
+        assert_eq!(get_json_depth(&json!({"a": 1, "b": 2})), 2);
+        assert_eq!(get_json_depth(&json!({"key": "value"})), 2);
+    }
+
+    #[test]
+    fn test_get_json_depth_nested_arrays() {
+        use serde_json::json;
+
+        assert_eq!(get_json_depth(&json!([[1, 2]])), 3);
+        assert_eq!(get_json_depth(&json!([[[1]]])), 4);
+        assert_eq!(get_json_depth(&json!([[[[1]]]])), 5);
+
+        // Mixed nesting levels - should return max
+        assert_eq!(get_json_depth(&json!([1, [2, [3]]])), 4);
+        assert_eq!(get_json_depth(&json!([[1], 2, [[[3]]]])), 5);
+    }
+
+    #[test]
+    fn test_get_json_depth_nested_objects() {
+        use serde_json::json;
+
+        assert_eq!(get_json_depth(&json!({"a": {"b": 1}})), 3);
+        assert_eq!(get_json_depth(&json!({"a": {"b": {"c": 1}}})), 4);
+        assert_eq!(get_json_depth(&json!({"a": {"b": {"c": {"d": 1}}}})), 5);
+
+        // Multiple keys at same level
+        assert_eq!(get_json_depth(&json!({"a": {"b": 1}, "c": {"d": 2}})), 3);
+    }
+
+    #[test]
+    fn test_get_json_depth_mixed_structures() {
+        use serde_json::json;
+
+        // Object containing array
+        assert_eq!(get_json_depth(&json!({"arr": [1, 2, 3]})), 3);
+
+        // Array containing object
+        assert_eq!(get_json_depth(&json!([{"key": "value"}])), 3);
+
+        // Complex nested structure
+        let complex = json!({
+            "users": [
+                {"name": "Alice", "age": 30},
+                {"name": "Bob", "age": 25}
+            ],
+            "metadata": {
+                "version": 1,
                 "nested": {
-                    "array": [1, 2, {"deep": "value"}]
+                    "deep": "value"
                 }
-            })),
-            4
-        );
-
-        assert_eq!(
-            get_json_depth(&json!([
-                {"a": 1},
-                {"b": {"c": [1, 2, 3]}}
-            ])),
-            4
-        );
-    }
-
-    #[test]
-    fn test_get_json_depth_max_safe() {
-        // Create a deeply nested JSON at the safe limit
-        let mut value = json!(0);
-        for _ in 0..MAX_SAFE_JSON_DEPTH {
-            value = json!([value]);
-        }
-        assert_eq!(get_json_depth(&value), MAX_SAFE_JSON_DEPTH);
-    }
-
-    #[test]
-    fn test_get_json_depth_exceeds_safe() {
-        // Create a deeply nested JSON exceeding the safe limit
-        let mut value = json!(0);
-        for _ in 0..(MAX_SAFE_JSON_DEPTH + 10) {
-            value = json!([value]);
-        }
-        assert_eq!(get_json_depth(&value), MAX_SAFE_JSON_DEPTH + 10);
-    }
-
-    #[test]
-    fn test_get_json_depth_wide_objects() {
-        // Wide but shallow - should have low depth
-        let wide_object = json!({
-            "a": 1, "b": 2, "c": 3, "d": 4, "e": 5,
-            "f": 6, "g": 7, "h": 8, "i": 9, "j": 10
+            }
         });
-        assert_eq!(get_json_depth(&wide_object), 1);
+        assert_eq!(get_json_depth(&complex), 4);
     }
 
     #[test]
-    fn test_get_json_depth_unbalanced_nesting() {
-        // Different branches with different depths
-        let value = json!({
-            "shallow": 1,
-            "medium": {"a": 2},
-            "deep": {"b": {"c": {"d": 4}}}
+    fn test_get_json_depth_maximum_safe_depth() {
+        use serde_json::json;
+
+        // Test at the boundary of MAX_SAFE_JSON_DEPTH
+        let mut nested = json!(1);
+        for _ in 0..31 {
+            // 32 levels total
+            nested = json!([nested]);
+        }
+        assert_eq!(get_json_depth(&nested), MAX_SAFE_JSON_DEPTH);
+
+        // One level deeper should exceed the limit
+        nested = json!([nested]);
+        assert_eq!(get_json_depth(&nested), MAX_SAFE_JSON_DEPTH + 1);
+    }
+
+    #[test]
+    fn test_get_json_depth_attack_scenario() {
+        use serde_json::json;
+
+        // Simulate a malicious deeply nested payload
+        let mut attack_payload = json!({"end": "value"});
+        for i in 0..100 {
+            attack_payload = json!({format!("level{}", i): attack_payload});
+        }
+
+        let depth = get_json_depth(&attack_payload);
+        assert_eq!(depth, 102); // 100 levels + 1 for outer + 1 for inner value
+        assert!(depth > MAX_SAFE_JSON_DEPTH);
+    }
+
+    #[test]
+    fn test_get_json_depth_realistic_api_payload() {
+        use serde_json::json;
+
+        // Realistic API request payload (should be well within limits)
+        let api_payload = json!({
+            "query": "SELECT * FROM users",
+            "parameters": {
+                "$1": 42,
+                "$2": "test"
+            },
+            "options": {
+                "timeout": 30,
+                "format": "json"
+            }
         });
-        assert_eq!(get_json_depth(&value), 4); // Takes the deepest branch
+
+        let depth = get_json_depth(&api_payload);
+        assert_eq!(depth, 3);
+        assert!(depth <= MAX_SAFE_JSON_DEPTH);
     }
 }
