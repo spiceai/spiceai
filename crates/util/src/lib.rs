@@ -22,6 +22,7 @@ use std::{
 
 pub mod fibonacci_backoff;
 pub mod retry_strategy;
+pub mod security;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
