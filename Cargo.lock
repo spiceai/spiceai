@@ -14775,6 +14775,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "spicepod-validator"
+version = "1.9.0-unstable"
+dependencies = [
+ "app",
+ "clap",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
 name = "spicepodschema"
 version = "1.9.0-unstable"
 dependencies = [

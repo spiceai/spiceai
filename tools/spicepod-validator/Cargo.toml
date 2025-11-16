@@ -1,0 +1,12 @@
+[package]
+description = "Validates spicepod.yaml files using the Spice runtime validation logic"
+edition.workspace = true
+license.workspace = true
+name = "spicepod-validator"
+version.workspace = true
+
+[dependencies]
+app = { path = "../../crates/app" }
+clap = { workspace = true, features = ["derive"] }
+snafu.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
