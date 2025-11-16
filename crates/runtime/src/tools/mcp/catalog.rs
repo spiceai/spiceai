@@ -48,7 +48,7 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 /// Glob patterns for detecting dangerous path components
 const DANGEROUS_PATH_PATTERNS: &[&str] = &[
     "*/..*",  // Unix parent directory traversal (anywhere in path)
-    "*..*",   // Parent at start (Unix) - matches paths starting with ..
+    "..*",    // Parent at start (Unix) - matches paths starting with ..
     "*\\..*", // Windows parent directory traversal (backslash-dot-dot)
     "*\\\\*", // Windows UNC path or backslash (absolute paths)
     "/*",     // Unix absolute path (starts with /)
