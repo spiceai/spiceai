@@ -18,6 +18,7 @@ limitations under the License.
 //! to avoid unnecessary re-scans when the file hasn't changed.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -26,6 +27,7 @@ use datafusion::catalog::Session;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use object_store::ObjectStore;
@@ -56,35 +58,27 @@ fn is_same_file_version(
     let cached_etag = normalize_optional_string(cached.e_tag.as_ref());
     let current_etag = normalize_optional_string(current.e_tag.as_ref());
 
-    // Both version and etag are absent in both - no versioning info available, be conservative and assume different
-    if cached_version.is_none()
-        && current_version.is_none()
-        && cached_etag.is_none()
-        && current_etag.is_none()
-    {
-        return false;
-    }
-
-    // Check if version or etag presence differs (one has it, other doesn't) - different files
-    if (cached_version.is_some() != current_version.is_some())
-        || (cached_etag.is_some() != current_etag.is_some())
-    {
-        return false;
-    }
-
-    // If version is present in BOTH and matches, it's the authoritative check
-    if let (Some(cv), Some(curv)) = (cached_version, current_version) {
+    // If version is present in BOTH, it's the authoritative check (regardless of etag)
+    if let (Some(cv), Some(curv)) = (&cached_version, &current_version) {
         return cv == curv;
     }
 
-    // If etag is present in BOTH and matches, files are the same
-    if let (Some(ce), Some(cure)) = (cached_etag, current_etag)
-        && ce == cure
-    {
-        return true;
+    // If version presence differs (one has it, other doesn't), files are different
+    if cached_version.is_some() != current_version.is_some() {
+        return false;
     }
 
-    // Otherwise, files are different
+    // Version is absent in both, fall back to etag comparison
+    if let (Some(ce), Some(cure)) = (&cached_etag, &current_etag) {
+        return ce == cure;
+    }
+
+    // If etag presence differs (one has it, other doesn't), files are different
+    if cached_etag.is_some() != current_etag.is_some() {
+        return false;
+    }
+
+    // Both version and etag are absent - no versioning info available, assume different to be safe
     false
 }
 
@@ -214,7 +208,34 @@ impl TableProvider for S3SingleFileCached {
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
+    fn statistics(&self) -> Option<datafusion::physical_plan::Statistics> {
+        self.inner.statistics()
+    }
 
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        overwrite: InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.inner.insert_into(state, input, overwrite).await
+    }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        self.inner.constraints()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
     fn table_type(&self) -> TableType {
         self.inner.table_type()
     }

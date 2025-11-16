@@ -650,7 +650,9 @@ pub trait ListingTableConnector: DataConnector {
         // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
         // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
         let table_arc = Arc::new(table);
-        let is_s3_connector = format!("{self}") == "s3";
+        let is_s3_connector = ListingTableConnector::as_any(self)
+            .downcast_ref::<crate::dataconnector::s3::S3>()
+            .is_some();
         if is_s3_connector
             && refresh_skip_enabled(dataset)
             && !table_path.is_collection()
