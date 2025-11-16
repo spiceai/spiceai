@@ -39,6 +39,7 @@ use datafusion_table_providers::{
 };
 use futures::StreamExt;
 use runtime_table_partition::{
+    creator::filename::encode_key,
     expression::PartitionedBy,
     insert::{InsertStrategy, PartitionContext, partition_batch},
 };
@@ -128,9 +129,27 @@ impl DuckDBPartitionedInsertStrategy {
                                     Ok(partitions) => {
                                         let partitions_map = partitions
                                             .into_iter()
-                                            .map(|p| (p.partition_value.to_string(), p))
-                                            .collect::<HashMap<_, _>>();
-                                        *partitions_lock.write().await = partitions_map;
+                                            .map(|p| {
+                                                let key = encode_key(&p.partition_value).map_err(
+                                                    |e| {
+                                                        DataFusionError::Execution(format!(
+                                                            "Failed to encode partition key: {e}"
+                                                        ))
+                                                    },
+                                                )?;
+                                                Ok((key, p))
+                                            })
+                                            .collect::<Result<HashMap<_, _>, DataFusionError>>();
+                                        match partitions_map {
+                                            Ok(map) => {
+                                                *partitions_lock.write().await = map;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to encode partition keys after insert: {e}"
+                                                );
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(

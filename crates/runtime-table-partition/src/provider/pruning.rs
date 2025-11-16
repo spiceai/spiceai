@@ -1785,4 +1785,493 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_prune_partition_date_part() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::functions::datetime::date_part;
+        use datafusion::prelude::*;
+
+        let schema = Schema::new(vec![Field::new("order_date", DataType::Date32, true)]);
+
+        // Partition by date_part('month', order_date)
+        let date_part_udf = date_part();
+        let partition_by = Expr::ScalarFunction(ScalarFunction::new_udf(
+            date_part_udf.clone(),
+            vec![lit("month"), col("order_date")],
+        ));
+
+        // Filter: date_part('month', order_date) = 3
+        let filter = Expr::ScalarFunction(ScalarFunction::new_udf(
+            date_part_udf,
+            vec![lit("month"), col("order_date")],
+        ))
+        .eq(lit(3_f64));
+
+        // Partition 3 should NOT be pruned
+        assert!(
+            !prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Float64(Some(3.0)),
+                &schema
+            )?,
+            "Partition 3 should not be pruned for date_part = 3"
+        );
+
+        // Partition 1 should be pruned
+        assert!(
+            prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Float64(Some(1.0)),
+                &schema
+            )?,
+            "Partition 1 should be pruned for date_part = 3"
+        );
+
+        // Partition 5 should be pruned
+        assert!(
+            prune_partition(
+                &[filter],
+                &partition_by,
+                &ScalarValue::Float64(Some(5.0)),
+                &schema
+            )?,
+            "Partition 5 should be pruned for date_part = 3"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_bucket_uuid_direct_filter() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::prelude::*;
+
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Utf8, true)]);
+
+        // Partition by bucket(5, user_id)
+        let partition_by = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(5_i64), col("user_id")],
+        });
+
+        // Test Case 1: Filter on the UUID column directly
+        // WHERE user_id = 'some-uuid-value'
+        //
+        // EXPECTED BEHAVIOR: Evaluate bucket(5, 'uuid-value') to determine which partition
+        // the UUID belongs to, then only scan that partition. This enables partition pruning!
+        let uuid_value = "550e8400-e29b-41d4-a716-446655440000";
+        let filter = col("user_id").eq(lit(uuid_value));
+
+        // Compute which bucket this UUID hashes to
+        let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
+        let ScalarValue::Int32(Some(expected_bucket)) = call(
+            &f,
+            vec![
+                ScalarValue::Int64(Some(5)),
+                ScalarValue::Utf8(Some(uuid_value.into())),
+            ],
+        )?
+        else {
+            panic!("expected Int32");
+        };
+
+        // Only the matching partition should NOT be pruned
+        for partition_value in 0..5_i32 {
+            let pruned = prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            let should_prune = partition_value != expected_bucket;
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (UUID hashes to bucket {})",
+                partition_value,
+                if should_prune { "" } else { " not" },
+                expected_bucket
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_bucket_uuid_bucket_filter() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::prelude::*;
+
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Utf8, true)]);
+
+        // Partition by bucket(5, user_id)
+        let partition_by = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(5_i64), col("user_id")],
+        });
+
+        // Test Case 2: Filter on the bucket expression itself
+        // WHERE bucket(5, user_id) = 2
+        // This SHOULD enable partition pruning
+        let filter = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(5_i64), col("user_id")],
+        })
+        .eq(lit(2_i64));
+
+        // Partition 2 should NOT be pruned
+        assert!(
+            !prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Int64(Some(2)),
+                &schema
+            )?,
+            "Partition 2 should not be pruned for bucket = 2"
+        );
+
+        // Partition 0 should be pruned
+        assert!(
+            prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Int64(Some(0)),
+                &schema
+            )?,
+            "Partition 0 should be pruned for bucket = 2"
+        );
+
+        // Partition 4 should be pruned
+        assert!(
+            prune_partition(
+                &[filter],
+                &partition_by,
+                &ScalarValue::Int64(Some(4)),
+                &schema
+            )?,
+            "Partition 4 should be pruned for bucket = 2"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_bucket_uuid_in_filter() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::prelude::*;
+
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Utf8, true)]);
+
+        // Partition by bucket(5, user_id)
+        let partition_by = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(5_i64), col("user_id")],
+        });
+
+        // Test Case 3: Filter with multiple UUID values
+        // WHERE user_id IN ('uuid1', 'uuid2', 'uuid3')
+        //
+        // EXPECTED BEHAVIOR: Evaluate bucket(5, uuid) for each UUID to determine which
+        // partitions contain these values, then only scan those partitions.
+        let uuids = vec![
+            "550e8400-e29b-41d4-a716-446655440000",
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        ];
+        let uuid_list: Vec<Expr> = uuids.iter().map(|u| lit(*u)).collect();
+        let filter = Expr::InList(InList {
+            expr: Box::new(col("user_id")),
+            list: uuid_list,
+            negated: false,
+        });
+
+        // Compute which buckets these UUIDs hash to
+        let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
+        let mut expected_buckets = std::collections::HashSet::new();
+        for uuid in &uuids {
+            let ScalarValue::Int32(Some(bucket)) = call(
+                &f,
+                vec![
+                    ScalarValue::Int64(Some(5)),
+                    ScalarValue::Utf8(Some((*uuid).into())),
+                ],
+            )?
+            else {
+                panic!("expected Int32");
+            };
+            expected_buckets.insert(bucket);
+        }
+
+        // Only partitions containing the UUIDs should NOT be pruned
+        for partition_value in 0..5_i32 {
+            let pruned = prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            let should_prune = !expected_buckets.contains(&partition_value);
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (UUIDs hash to buckets {:?})",
+                partition_value,
+                if should_prune { "" } else { " not" },
+                expected_buckets
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_bucket_integer_direct_filter() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::prelude::*;
+
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Int64, true)]);
+
+        // Partition by bucket(10, user_id)
+        let partition_by = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(10_i64), col("user_id")],
+        });
+
+        // Test Case 4: Filter on integer column directly
+        // WHERE user_id = 42
+        //
+        // EXPECTED BEHAVIOR: Evaluate bucket(10, 42) to determine which partition
+        // contains this value, then only scan that partition.
+        let filter = col("user_id").eq(lit(42_i64));
+
+        // Compute which bucket 42 hashes to
+        let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
+        let ScalarValue::Int32(Some(expected_bucket)) = call(
+            &f,
+            vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(42))],
+        )?
+        else {
+            panic!("expected Int32");
+        };
+
+        // Only the matching partition should NOT be pruned
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &[filter.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            let should_prune = partition_value != expected_bucket;
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (42 hashes to bucket {})",
+                partition_value,
+                if should_prune { "" } else { " not" },
+                expected_bucket
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_modulo_uses_arithmetic_not_hashing() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::prelude::*;
+
+        // Test that modulo partitioning uses arithmetic modulo (%), not hashing like bucket()
+        // This is critical because modulo is deterministic and predictable:
+        // - 12 % 10 = 2
+        // - 22 % 10 = 2
+        // - 32 % 10 = 2
+        // whereas bucket(10, 12) could hash to any bucket 0-9
+
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Int32, false)]);
+        let partition_by = col("user_id") % lit(10);
+
+        // Test Case 1: Filter user_id = 17
+        // 17 % 10 = 7, so only partition 7 should NOT be pruned
+        let filter_17 = col("user_id").eq(lit(17_i32));
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &[filter_17.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            let expected_partition = 17 % 10;
+            let should_prune = partition_value != expected_partition;
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (17 % 10 = {})",
+                partition_value,
+                if should_prune { "" } else { " not" },
+                expected_partition
+            );
+        }
+
+        // Test Case 2: Filter user_id = 42
+        // 42 % 10 = 2, so only partition 2 should NOT be pruned
+        let filter_42 = col("user_id").eq(lit(42_i32));
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &[filter_42.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            let expected_partition = 42 % 10;
+            let should_prune = partition_value != expected_partition;
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (42 % 10 = {})",
+                partition_value,
+                if should_prune { "" } else { " not" },
+                expected_partition
+            );
+        }
+
+        // Test Case 3: IN list with multiple values
+        // user_id IN (13, 23, 33) - all map to partition 3
+        let filter_in = in_list(col("user_id"), vec![lit(13_i32), lit(23_i32), lit(33_i32)], false);
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &[filter_in.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            // All values (13, 23, 33) map to partition 3
+            let should_prune = partition_value != 3;
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (13, 23, 33 all % 10 = 3)",
+                partition_value,
+                if should_prune { "" } else { " not" }
+            );
+        }
+
+        // Test Case 4: IN list with values mapping to different partitions
+        // user_id IN (11, 22, 33) -> partitions 1, 2, 3
+        let filter_in_multi = in_list(col("user_id"), vec![lit(11_i32), lit(22_i32), lit(33_i32)], false);
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &[filter_in_multi.clone()],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema
+            )?;
+            // 11 % 10 = 1, 22 % 10 = 2, 33 % 10 = 3
+            let should_prune = ![1, 2, 3].contains(&partition_value);
+            assert_eq!(
+                pruned,
+                should_prune,
+                "Partition {} should{} be pruned (11→1, 22→2, 33→3)",
+                partition_value,
+                if should_prune { "" } else { " not" }
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_modulo_vs_bucket_different_results() -> Result<(), DataFusionError> {
+        use arrow_schema::DataType;
+        use datafusion::prelude::*;
+
+        // Demonstrate that modulo and bucket produce DIFFERENT partition assignments
+        // for the same values, proving they use different algorithms
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        
+        // Modulo partitioning: id % 10
+        let partition_by_modulo = col("id") % lit(10);
+        
+        // Bucket partitioning: bucket(10, id)
+        let partition_by_bucket = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(10_i64), col("id")],
+        });
+
+        // For value 42:
+        // - Modulo: 42 % 10 = 2 (deterministic arithmetic)
+        // - Bucket: bucket(10, 42) = hash(42) % 10 (could be any value 0-9)
+        
+        let filter = col("id").eq(lit(42_i32));
+        
+        // Modulo should map to partition 2
+        let modulo_partition = 42 % 10;
+        assert_eq!(modulo_partition, 2, "42 % 10 should equal 2");
+        
+        assert_eq!(
+            prune_partition(
+                &[filter.clone()],
+                &partition_by_modulo,
+                &ScalarValue::Int32(Some(2)),
+                &schema
+            )?,
+            false,
+            "Modulo partition 2 should not be pruned for value 42"
+        );
+        
+        // Bucket maps to whatever the hash function returns
+        let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
+        let ScalarValue::Int32(Some(bucket_partition)) = call(
+            &f,
+            vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(42))],
+        )?
+        else {
+            panic!("expected Int32");
+        };
+        
+        assert_eq!(
+            prune_partition(
+                &[filter.clone()],
+                &partition_by_bucket,
+                &ScalarValue::Int32(Some(bucket_partition)),
+                &schema
+            )?,
+            false,
+            "Bucket partition {} should not be pruned for value 42",
+            bucket_partition
+        );
+        
+        // Verify that modulo and bucket produce different results for at least some values
+        // (they might coincidentally match for value 42, but shouldn't match for all values)
+        let test_values = [0, 1, 7, 13, 42, 99, 100, 123];
+        let mut differences_found = false;
+        
+        for &value in &test_values {
+            let modulo_result = value % 10;
+            let ScalarValue::Int32(Some(bucket_result)) = call(
+                &f,
+                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(value))],
+            )?
+            else {
+                panic!("expected Int32");
+            };
+            
+            if modulo_result != bucket_result {
+                differences_found = true;
+                break;
+            }
+        }
+        
+        assert!(
+            differences_found,
+            "Modulo and bucket should produce different partition assignments for at least some values"
+        );
+        
+        Ok(())
+    }
 }
+

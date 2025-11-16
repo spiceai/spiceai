@@ -34,6 +34,7 @@ use tokio::sync::RwLock;
 use crate::{
     Partition,
     creator::PartitionCreator,
+    creator::filename::encode_key,
     expression::{PartitionedBy, validate_scalar_compatibility},
     insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
@@ -108,18 +109,25 @@ impl PartitionTableProvider {
             .await
             .context(CreatingPartitionSnafu)?;
 
-        let partitions = partitions
+        let partitions: Result<HashMap<_, _>, Error> = partitions
             .into_iter()
             .map(|p| {
                 validate_scalar_compatibility(
                     &partition_by.expression,
                     &p.partition_value,
                     &df_schema,
-                )?;
-                Ok((p.partition_value.to_string(), p))
+                )
+                .context(ValidatingExpressionsSnafu)?;
+                let key = encode_key(&p.partition_value).map_err(|e| Error::CreatingPartition {
+                    source: crate::creator::Error::CreatePartition {
+                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                    },
+                })?;
+                Ok((key, p))
             })
-            .collect::<Result<HashMap<_, _>, _>>()
-            .context(ValidatingExpressionsSnafu)?;
+            .collect();
+
+        let partitions = partitions?;
 
         let partitions = Arc::new(RwLock::new(partitions));
 
@@ -208,17 +216,11 @@ impl TableProvider for PartitionTableProvider {
         let partition_filters: Vec<_> = partition_filters.into_iter().map(|(f, _)| f).collect();
         let data_filters: Vec<_> = data_filters.into_iter().map(|(f, _)| f).collect();
 
-        tracing::debug!(
-            "Partition pruning: {} partition filters, {} data filters",
-            partition_filters.len(),
-            data_filters.len()
-        );
-
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
             if prune_partition(
-                filters,
+                &partition_filters,
                 &self.partition_by.expression,
                 &partition.partition_value,
                 &self.schema,
@@ -227,7 +229,7 @@ impl TableProvider for PartitionTableProvider {
             }
             let plan = partition
                 .table_provider
-                .scan(state, projection, filters, limit)
+                .scan(state, projection, &data_filters, limit)
                 .await?;
             plans.push(plan);
         }
