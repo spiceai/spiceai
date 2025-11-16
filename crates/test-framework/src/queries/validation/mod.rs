@@ -142,7 +142,7 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
             // Allow timezone differences between None and Some("UTC")
             matches!(
                 (tz1.as_deref(), tz2.as_deref()),
-                (None, Some("UTC")) | (Some("UTC"), None)
+                (None, Some("UTC" | "+00:00")) | (Some("UTC" | "+00:00"), None)
             )
         }
         // Existing numeric and string type equivalences
