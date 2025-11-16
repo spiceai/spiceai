@@ -326,13 +326,6 @@ pub(crate) fn routes(
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
-    // Apply request body size limit to prevent DoS attacks via unbounded request payloads
-    tracing::info!(
-        "Request body size limit set to {} bytes",
-        DEFAULT_REQUEST_BODY_LIMIT
-    );
-    authenticated_router =
-        authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
 
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
