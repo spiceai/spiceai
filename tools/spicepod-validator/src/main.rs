@@ -56,9 +56,9 @@ async fn validate_spicepod(path: PathBuf) -> Result<(), app::spicepod::Error> {
     // - Duplicate component names
     // - Reserved keywords
     // - Dependencies
-    
+
     // Determine if we should use load (directory/spicepod.yaml) or load_exact (any file)
-    if let Ok(file_info) = std::fs::metadata(&path) {
+    if let Ok(file_info) = tokio::fs::metadata(&path).await {
         if file_info.is_file() {
             // For files, use load_exact which can handle any filename
             Spicepod::load_exact(&path).await?;
@@ -70,6 +70,6 @@ async fn validate_spicepod(path: PathBuf) -> Result<(), app::spicepod::Error> {
         // If metadata fails, try load_exact and let it produce the proper error
         Spicepod::load_exact(&path).await?;
     }
-    
+
     Ok(())
 }
