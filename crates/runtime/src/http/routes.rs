@@ -326,7 +326,6 @@ pub(crate) fn routes(
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
-
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
