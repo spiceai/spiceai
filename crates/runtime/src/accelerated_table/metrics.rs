@@ -38,6 +38,13 @@ pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub(crate) static REFRESH_DATA_FETCHES_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_data_fetches_skipped")
+        .with_description("Number of refresh data fetches skipped due to unchanged file metadata.")
+        .build()
+});
+
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("dataset_acceleration_last_refresh_time_ms")
