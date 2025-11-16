@@ -50,6 +50,7 @@ members = [
     "tools/otelpublisher/",
     "tools/spicepodschema/",
     "tools/spiceschema",
+    "tools/spicepod-validator",
     "tools/testoperator",
     "tools/parsley",
 ]

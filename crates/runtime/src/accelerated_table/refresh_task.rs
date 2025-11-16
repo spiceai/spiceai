@@ -313,6 +313,7 @@ impl RefreshTask {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
         self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
@@ -340,6 +341,44 @@ impl RefreshTask {
             None
         };
 
+        // For table providers with refresh skip support, check if the refresh can be skipped to
+        // avoid unnecessary data fetching when the underlying data is unchanged.
+        if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
+            let table_provider = self.federated.table_provider().await;
+
+            match data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                table_provider.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(true)) => {
+                    tracing::debug!(
+                        "Skipping refresh for {} - data unchanged",
+                        self.dataset_name
+                    );
+
+                    for label_set in &dataset_metrics_label_sets {
+                        metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                    }
+
+                    self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Ready)
+                        .await;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Data may have changed or provider does not support skipping; continue with refresh.
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
+                        self.dataset_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
