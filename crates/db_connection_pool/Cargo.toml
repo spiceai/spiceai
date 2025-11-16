@@ -19,7 +19,7 @@ datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 dyn-clone = { version = "1.0.17", optional = true }
 futures.workspace = true
-odbc-api = { version = "14", optional = true }
+odbc-api = { workspace = true, optional = true }
 pkcs8 = { version = "0.10.2", features = [
   "encryption",
   "pem",
