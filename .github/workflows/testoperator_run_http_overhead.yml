@@ -80,6 +80,17 @@ jobs:
           fi
           echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
 
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -98,17 +109,6 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Build spicepod validator
-        uses: ./.github/actions/build-spicepod-validator
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Validate spicepod
-        run: |
-          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
 
       - name: Set base parameters
         run: |
