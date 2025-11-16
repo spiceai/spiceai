@@ -63,7 +63,7 @@ event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
-globset = "0.4"
+globset.workspace = true
 governor.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
