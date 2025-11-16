@@ -11,26 +11,43 @@ datasets:
       s3_endpoint: ${secrets:S3_ENDPOINT}
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
-    acceleration: &acceleration
+    acceleration:
       enabled: true
       engine: duckdb
       mode: file
       partition_by:
-        - bucket(32, c_name)
+        - bucket(5, c_name)
       params:
         partition_mode: tables
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet
     name: lineitem
     params: *s3_params
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      partition_by:
+        - date_part('year', l_shipdate)
+      params:
+        partition_mode: tables
   - from: s3://benchmarks/tpch_sf1/nation.parquet
     name: nation
     params: *s3_params
-    acceleration: *acceleration
+    acceleration: &acceleration
+      enabled: true
+      engine: duckdb
+      mode: file
   - from: s3://benchmarks/tpch_sf1/orders.parquet
     name: orders
     params: *s3_params
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      partition_by:
+        - bucket(5, o_custkey)
+      params:
+        partition_mode: tables
   - from: s3://benchmarks/tpch_sf1/part.parquet
     name: part
     params: *s3_params
