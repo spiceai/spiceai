@@ -108,28 +108,27 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     rm -f basic.zip; \
     fi
 
-# Create spiced user and group in sandbox
-RUN echo 'spiced:x:999:999::/app:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
-    echo 'spiced:x:999:' > /spice_sandbox/etc/group
+# Minimal passwd & group for the nobody user
+RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_sandbox/etc/passwd && \
+    echo 'nogroup:x:65534:' > /spice_sandbox/etc/group
 
 # Create DuckDB directory in sandbox
 RUN mkdir -p /spice_sandbox/.duckdb
 RUN chmod 755 /spice_sandbox/.duckdb
-RUN chown -R 999:999 /spice_sandbox/.duckdb
+
+# Give the nobody user ownership of app dir
+RUN chown -R 65534:65534 /spice_sandbox/app
 
 # Create HuggingFace cache directory in sandbox
 RUN mkdir -p /spice_sandbox/.cache/huggingface/hub
-RUN chown -R 999:999 /spice_sandbox/.cache
+RUN chown -R 65534:65534 /spice_sandbox/.cache
 RUN chmod -R 755 /spice_sandbox/.cache
-
-# Give the spiced user ownership of app dir
-RUN chown -R 999:999 /spice_sandbox/app
 
 FROM scratch
 
 COPY --from=sandbox-setup /spice_sandbox/ /
 
-USER 999:999
+USER 65534:65534
 
 EXPOSE 8090 50051
 
