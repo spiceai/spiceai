@@ -6,5 +6,5 @@ SELECT AccountSid, NumberPoolSid, SenderSid, SenderIdentity, Region, Rate, Sende
 FROM sender_info
 WHERE AccountSid = ? 
   AND SenderIdentity = ?
-ORDER BY DateCreated ASC 
+ORDER BY DateCreated ASC, SenderSid ASC
 LIMIT 1;

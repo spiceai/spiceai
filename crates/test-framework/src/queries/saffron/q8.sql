@@ -13,4 +13,5 @@ WHERE A.AccountSid = ?
   AND A.NumberType = ?
   AND A.NumberSid NOT IN (?)
   AND B.Capability = ?
+ORDER BY A.NumberSid, B.Capability
 LIMIT ?;

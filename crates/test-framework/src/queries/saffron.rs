@@ -5,7 +5,60 @@ use arrow::{
     array::{Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray},
     record_batch::RecordBatch,
 };
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
+
+macro_rules! generate_saffron_answers {
+    ( $( $i:literal ),* ) => {
+        [
+            $(
+                (
+                    concat!("saffron_q", stringify!($i)),
+                    include_str!(concat!("./validation/saffron/q", stringify!($i), ".csv"))
+                )
+            ),*
+        ]
+    }
+}
+
+static SAFFRON_ANSWERS: LazyLock<HashMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    {
+        use arrow::{csv::ReaderBuilder, csv::reader::Format};
+        use std::io::Seek;
+
+        let mut map = HashMap::new();
+        // Load Saffron answers from CSV files, into RecordBatches
+        // and store them in the map with the query name as the key
+        let answers = generate_saffron_answers!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+
+        for (query_name, csv_contents) in answers {
+            let mut string_reader = std::io::Cursor::new(csv_contents);
+            let format = Format::default().with_delimiter(b'|').with_header(true);
+            let (schema, _) = format
+                .infer_schema(&mut string_reader, None)
+                .expect("Should infer schema");
+            string_reader.rewind().expect("Should rewind file");
+
+            let reader = ReaderBuilder::new(Arc::new(schema))
+                .with_format(format.clone())
+                .build(string_reader)
+                .expect("Should build reader");
+
+            let mut batches = Vec::new();
+            for batch in reader {
+                let batch = batch.expect("Should read batch");
+                batches.push(batch);
+            }
+
+            map.insert(query_name.into(), batches);
+        }
+
+        map
+    }
+});
 
 /// Creates a fixed `NumberInfoRecord` for consistent snapshotting
 fn create_fixed_number_info_record() -> NumberWithSenderInfoRecord {
@@ -367,4 +420,12 @@ fn get_i32(batch: &RecordBatch, col: &str, row: usize) -> Result<i32> {
             arr.data_type()
         ))
     }
+}
+
+/// Gets expected results for Saffron queries for validation
+pub fn get_saffron_expected_results(
+    _base_path: Option<&std::path::Path>,
+) -> Result<std::collections::HashMap<Arc<str>, Vec<RecordBatch>>> {
+    // Return a clone of the static HashMap
+    Ok(SAFFRON_ANSWERS.clone())
 }

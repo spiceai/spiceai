@@ -7,4 +7,5 @@ FROM sender_info
 WHERE AccountSid = ? 
   AND NumberPoolSid = ? 
   AND SenderType = ?
+ORDER BY SenderSid
 LIMIT 1 OFFSET ?;

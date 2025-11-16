@@ -8,4 +8,5 @@ WHERE AccountSid = ?
   AND NumberPoolSid = ? 
   AND SenderType = ? 
   AND Region = ?
+ORDER BY SenderSid
 LIMIT 1 OFFSET ?;

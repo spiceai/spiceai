@@ -132,25 +132,41 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
 
     // Check for logical equivalence, with a lenient set of rules
     // E.g. a number could be returned as a string, number, or float.
-    matches!(
-        (expected_type, actual_type),
-        (DataType::Float32, DataType::Float64)
-            | (
-                DataType::Float64 | DataType::Int64,
-                DataType::Decimal128(_, _)
+    match (&expected_type, &actual_type) {
+        // Handle timestamp timezone differences
+        (DataType::Timestamp(unit1, tz1), DataType::Timestamp(unit2, tz2)) => {
+            // Same time unit is required
+            if unit1 != unit2 {
+                return false;
+            }
+            // Allow timezone differences between None and Some("UTC")
+            matches!(
+                (tz1.as_deref(), tz2.as_deref()),
+                (None, Some("UTC" | "+00:00")) | (Some("UTC" | "+00:00"), None)
             )
-            | (DataType::Int32, DataType::Int64)
-            | (
-                DataType::Int64,
-                DataType::Int32
-                    | DataType::Float64
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-            )
-            | (DataType::Utf8, DataType::LargeUtf8)
-            | (DataType::LargeUtf8, DataType::Utf8)
-    )
+        }
+        // Existing numeric and string type equivalences
+        _ => matches!(
+            (expected_type, actual_type),
+            (DataType::Float32, DataType::Float64)
+                | (
+                    DataType::Float64 | DataType::Int64,
+                    DataType::Decimal128(_, _)
+                )
+                | (DataType::Int32, DataType::Int64)
+                | (
+                    DataType::Int64,
+                    DataType::Int32
+                        | DataType::Int8
+                        | DataType::Float64
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                )
+                | (DataType::Utf8, DataType::LargeUtf8)
+                | (DataType::LargeUtf8, DataType::Utf8)
+        ),
+    }
 }
 
 fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) -> bool {

@@ -15,4 +15,5 @@ WHERE A.NumberPoolSid = ?
   AND A.NumberSid NOT IN (?)
   AND A.NumberType = ?
   AND B.Capability = ?
+ORDER BY A.NumberSid, B.Capability
 LIMIT ?;
