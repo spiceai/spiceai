@@ -59,8 +59,10 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    Stream, TryFutureExt,
+    future::{join_all, try_join_all},
+};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
@@ -685,23 +687,27 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let http_auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth
+            .http_auth
+            .clone()
+            .unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth));
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
-                    http_auth,
+                    auth,
                     Some(http_shutdown),
                 )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
+                .map_err(Error::from),
+            )
             .await;
 
         // Start Metrics server
@@ -1161,4 +1167,17 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
     base_folder.extend(directory);
     std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
     Ok(base_folder)
+}
+
+impl From<http::Error> for Error {
+    fn from(err: http::Error) -> Self {
+        match err {
+            http::Error::UnableToBindServerToPort { source } => Error::UnableToStartHttpServer {
+                source: http::Error::UnableToBindServerToPort { source },
+            },
+            http::Error::UnableToStartHttpServer { source } => Error::UnableToStartHttpServer {
+                source: http::Error::UnableToStartHttpServer { source },
+            },
+        }
+    }
 }
