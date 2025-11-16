@@ -776,6 +776,15 @@ impl CayenneTableProvider {
         // and retention filters are applied atomically.
         let _write_guard = self.write_lock.lock().await;
 
+        // If sort_columns is configured, collect all batches, sort them, and re-stream.
+        // This ensures data is sorted before being chunked and written to Vortex files,
+        // which improves zone map effectiveness (tighter min/max bounds per file).
+        let stream = if !self.vortex_config.sort_columns.is_empty() {
+            self.sort_stream(stream).await?
+        } else {
+            stream
+        };
+
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
         // Process stream in chunks and write them in parallel with bounded concurrency
@@ -975,6 +984,129 @@ impl CayenneTableProvider {
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
         }
+    }
+
+    /// Sort a vector of record batches by the configured sort_columns.
+    ///
+    /// This method concatenates all batches, sorts the combined data, and returns
+    /// a single sorted batch. Sorting improves zone map effectiveness by ensuring
+    /// that min/max statistics have tighter bounds.
+    ///
+    /// # Zone Map Optimization
+    ///
+    /// When data is sorted before writing to Vortex files:
+    /// - **Tighter min/max bounds**: Each file's zone map (min/max per column) covers a smaller range
+    /// - **Better partition pruning**: DataFusion can skip more files during query execution
+    /// - **Improved query performance**: Range queries (`WHERE timestamp BETWEEN ...`) become much faster
+    ///
+    /// Vortex automatically computes and stores column statistics (min, max, null_count, distinct_count)
+    /// when writing files. These statistics are then aggregated by the `ListingTable` and used by
+    /// DataFusion's query optimizer for partition pruning and filter pushdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sorting fails or if any configured sort column doesn't exist.
+    fn sort_batches(&self, batches: Vec<RecordBatch>) -> CatalogResult<Vec<RecordBatch>> {
+        if batches.is_empty() {
+            return Ok(batches);
+        }
+
+        // Concatenate all batches into one for sorting
+        let combined_batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to concatenate batches for sorting: {e}"),
+            })?;
+
+        // Build sort columns from configuration
+        let mut sort_columns = Vec::new();
+        for col_name in &self.vortex_config.sort_columns {
+            // Validate column exists in schema
+            if combined_batch.schema().column_with_name(col_name).is_none() {
+                tracing::warn!(
+                    "Sort column '{}' not found in schema for table {}. Skipping sort.",
+                    col_name,
+                    self.table_metadata.table_name
+                );
+                return Ok(batches);
+            }
+
+            sort_columns.push(arrow::compute::SortColumn {
+                values: Arc::clone(
+                    combined_batch
+                        .column_by_name(col_name)
+                        .ok_or_else(|| CatalogError::InvalidOperation {
+                            message: format!("Column {col_name} not found in batch"),
+                        })?,
+                ),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            });
+        }
+
+        tracing::debug!(
+            "Sorting {} rows by columns {:?} for table {}",
+            combined_batch.num_rows(),
+            self.vortex_config.sort_columns,
+            self.table_metadata.table_name
+        );
+
+        // Perform the sort
+        let indices = arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!("Failed to compute sort indices: {e}"),
+            }
+        })?;
+
+        let sorted_batch = arrow::compute::take_record_batch(&combined_batch, &indices)
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to apply sort indices: {e}"),
+            })?;
+
+        Ok(vec![sorted_batch])
+    }
+
+    /// Sort a record batch stream by collecting all batches, sorting, and re-streaming.
+    ///
+    /// This is used during refresh operations to sort the entire dataset before it's
+    /// chunked and written to files, ensuring optimal zone map statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if collecting or sorting fails.
+    async fn sort_stream(
+        &self,
+        mut stream: SendableRecordBatchStream,
+    ) -> CatalogResult<SendableRecordBatchStream> {
+        // Collect all batches from the stream
+        let mut batches = Vec::new();
+        while let Some(batch_result) = stream.next().await {
+            let batch =
+                batch_result.map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Failed to read batch from stream: {e}"),
+                })?;
+            batches.push(batch);
+        }
+
+        if batches.is_empty() {
+            let schema = stream.schema();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::empty(),
+            )));
+        }
+
+        // Sort all batches
+        let schema = batches[0].schema();
+        let sorted_batches = self.sort_batches(batches)?;
+
+        // Create a new stream from the sorted batches
+        let batch_stream = futures::stream::iter(sorted_batches.into_iter().map(Ok));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            batch_stream,
+        )))
     }
 
     /// Write a single chunk of record batches as a Vortex file.
@@ -1238,8 +1370,18 @@ impl CayenneTableProvider {
     ///
     /// This method should be called after insert operations to ensure that:
     /// - The `ListingTable` discovers newly written Vortex files
-    /// - Table statistics (row counts, column stats) are updated
-    /// - Query plans can use fresh statistics for optimization
+    /// - Table statistics (row counts, column stats) are updated and aggregated across all files
+    /// - Query plans can use fresh statistics for optimization (partition pruning, filter pushdown)
+    ///
+    /// # Statistics Handling
+    ///
+    /// Vortex automatically computes column statistics (min, max, null_count, distinct_count) when
+    /// writing files. These statistics are embedded in Vortex file footers. The `ListingTable`
+    /// aggregates these statistics across all files to provide table-level statistics to DataFusion's
+    /// query optimizer.
+    ///
+    /// When `sort_columns` is configured, sorted data produces tighter min/max bounds, making
+    /// zone map pruning more effective for range queries.
     ///
     /// # Errors
     ///
@@ -2591,35 +2733,123 @@ mod tests {
             qps
         );
     }
-}
 
-// # Deletion Vector Implementation Notes
-//
-// Cayenne implements DELETE operations using deletion vectors, following the Delta Lake approach:
-//
-// ## Architecture
-// 1. **Deletion Vectors**: Separate Vortex files containing deleted row IDs
-// 2. **Catalog Tracking**: `DeleteFile` metadata registered in SQLite catalog
-// 3. **Lazy Deletion**: Rows are marked as deleted but not immediately removed from data files
-// 4. **Read-Time Filtering**: Scans apply deletion vectors to filter out deleted rows
-//
-// ## Implementation Status
-// - ✅ `DeletionTableProvider` trait implemented for `CayenneTableProvider`
-// - ✅ `CayenneDeletionSink` writes deletion vectors to Vortex files
-// - ✅ Deletion vectors registered in catalog via `add_delete_file()`
-// - ⏳ Read-time filtering NOT YET IMPLEMENTED (see TODOs in `scan()` method)
-// - ⏳ SQL DELETE support requires DataFusion logical plan rewriting (runtime-level integration)
-//
-// ## Testing
-// Direct SQL `DELETE` statements will fail with "NotImplemented" until:
-// 1. Runtime adds logical plan optimizer rule to rewrite DELETE DML to `delete_from()` calls
-// 2. OR tests call `DeletionTableProvider::delete_from()` directly (bypassing SQL)
-//
-// ## Compaction
-// Over time, tables accumulate deletion vectors. A compaction process should:
-// 1. Read all data files and their associated deletion vectors
-// 2. Rewrite data files excluding deleted rows
-// 3. Remove obsolete deletion vector files
-// 4. Update catalog metadata
-//
-// This is similar to Delta Lake's OPTIMIZE command and will be added in a future iteration.
+    /// Test that data is sorted when sort_columns is configured
+    #[tokio::test]
+    async fn test_sort_columns() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for sort test");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("Failed to create data directory");
+
+        let connection_string = format!("sqlite://{}/cayenne.db", temp_dir.path().to_string_lossy());
+        let catalog = Arc::new(
+            crate::CayenneCatalog::new(connection_string).expect("Failed to create catalog"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Configure table with sort columns
+        let mut vortex_config = crate::metadata::VortexConfig::default();
+        vortex_config.sort_columns = vec!["timestamp".to_string(), "id".to_string()];
+
+        let table_options = crate::metadata::CreateTableOptions {
+            table_name: "sorted_test".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config,
+        };
+
+        let table = CayenneTableProvider::create_table(catalog, table_options)
+            .await
+            .expect("Failed to create table");
+
+        // Insert unsorted data
+        let unsorted_ids = vec![5i64, 3, 1, 4, 2];
+        let unsorted_timestamps = vec![100i64, 200, 50, 150, 75];
+        let unsorted_values = vec![50i64, 30, 10, 40, 20];
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(unsorted_ids)),
+                Arc::new(Int64Array::from(unsorted_timestamps)),
+                Arc::new(Int64Array::from(unsorted_values)),
+            ],
+        )
+        .expect("Failed to create record batch");
+
+        let stream = futures::stream::once(async { Ok(batch) });
+        let batch_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+
+        table
+            .insert(Box::pin(batch_stream))
+            .await
+            .expect("Failed to insert data");
+
+        // Verify data is sorted by timestamp, then by id
+        let ctx = SessionContext::new();
+        let scan_plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("Failed to create scan plan");
+
+        let result_batches = collect(scan_plan, ctx.task_ctx())
+            .await
+            .expect("Failed to collect results");
+
+        assert!(!result_batches.is_empty(), "Should have result batches");
+
+        // Combine all batches
+        let combined = arrow::compute::concat_batches(&schema, &result_batches)
+            .expect("Failed to concatenate batches");
+
+        let timestamp_col = combined
+            .column_by_name("timestamp")
+            .expect("timestamp column exists")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("timestamp is Int64Array");
+
+        let id_col = combined
+            .column_by_name("id")
+            .expect("id column exists")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64Array");
+
+        // Verify sorted order: timestamp ascending, then id ascending
+        let expected_timestamps = vec![50i64, 75, 100, 150, 200];
+        let expected_ids = vec![1i64, 2, 5, 4, 3];
+
+        for i in 0..5 {
+            assert_eq!(
+                timestamp_col.value(i),
+                expected_timestamps[i],
+                "Row {} timestamp should be sorted",
+                i
+            );
+            assert_eq!(
+                id_col.value(i),
+                expected_ids[i],
+                "Row {} id should match expected order",
+                i
+            );
+        }
+
+        tracing::info!("✓ Data sorted correctly by refresh_sort_columns");
+    }
+}

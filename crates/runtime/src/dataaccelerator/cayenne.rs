@@ -328,8 +328,17 @@ impl CayenneAccelerator {
             // Parse file size options
             config.target_vortex_file_size_mb = parse_usize("cayenne_target_file_size_mb", 256);
 
+            // Parse sort columns
+            if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
+                config.sort_columns = sort_cols_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+
             tracing::debug!(
-                "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB",
+                "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}",
                 config.enable_alp,
                 config.enable_fsst,
                 config.enable_bitpacking,
@@ -340,7 +349,8 @@ impl CayenneAccelerator {
                 config.enable_zigzag,
                 config.footer_cache_mb,
                 config.segment_cache_mb,
-                config.target_vortex_file_size_mb
+                config.target_vortex_file_size_mb,
+                config.sort_columns
             );
         }
 
