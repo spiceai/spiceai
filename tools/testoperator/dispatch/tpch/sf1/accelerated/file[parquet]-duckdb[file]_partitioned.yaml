@@ -4,10 +4,12 @@ tests:
     query_set: tpch
     runner_type: spiceai-dev-runners
     validate_results: true
+    duration: 28800
   throughput:
     spicepod_path: accelerated/file[parquet]-duckdb[file]_partitioned.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
+    duration: 28800
   load:
     spicepod_path: accelerated/file[parquet]-duckdb[file]_partitioned.yaml
     query_set: tpch
