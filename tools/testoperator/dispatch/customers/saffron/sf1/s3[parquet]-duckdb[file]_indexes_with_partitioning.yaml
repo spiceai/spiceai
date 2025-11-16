@@ -3,6 +3,7 @@ tests:
     spicepod_path: s3[parquet]-duckdb[file]_indexes_with_partitioning.yaml
     query_set: saffron[parameterized]
     ready_wait: 300
+    validate_results: true
     runner_type: spicehq-dev-runners
   # Load tests are currently taking too long to complete
   # load:

@@ -8,7 +8,7 @@ runtime:
       enabled: false
   task_history:
     enabled: true
-    captured_output: plan
+    captured_plan: explain
     min_plan_duration: 50ms
 
 datasets:
