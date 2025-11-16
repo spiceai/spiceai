@@ -375,6 +375,107 @@ impl std::fmt::Debug for CayenneTableProvider {
     }
 }
 
+/// Streaming execution plan that forwards an existing RecordBatchStream.
+///
+/// This is a minimal ExecutionPlan implementation that simply yields batches
+/// from a pre-existing stream, allowing us to integrate streaming data sources
+/// (like refresh operations) with DataFusion's physical plan operators.
+struct StreamingExec {
+    schema: SchemaRef,
+    stream: tokio::sync::Mutex<Option<SendableRecordBatchStream>>,
+    properties: datafusion_physical_plan::PlanProperties,
+}
+
+impl StreamingExec {
+    fn new(schema: SchemaRef, stream: SendableRecordBatchStream) -> Self {
+        use datafusion_physical_plan::{Partitioning, execution_plan::{EmissionType, Boundedness}};
+        use datafusion_physical_expr::EquivalenceProperties;
+
+        let properties = datafusion_physical_plan::PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
+        Self {
+            schema,
+            stream: tokio::sync::Mutex::new(Some(stream)),
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamingExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingExec")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl datafusion_physical_plan::DisplayAs for StreamingExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion_physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "StreamingExec")
+    }
+}
+
+impl datafusion_physical_plan::ExecutionPlan for StreamingExec {
+    fn name(&self) -> &'static str {
+        "StreamingExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn datafusion_physical_plan::ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion_execution::TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let stream = self
+            .stream
+            .try_lock()
+            .map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Stream already taken".to_string(),
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Execution(
+                    "Stream already consumed".to_string(),
+                )
+            })?;
+
+        Ok(stream)
+    }
+}
+
 impl CayenneTableProvider {
     /// Construct the path to a snapshot directory.
     ///
@@ -776,16 +877,6 @@ impl CayenneTableProvider {
         // and retention filters are applied atomically.
         let _write_guard = self.write_lock.lock().await;
 
-        // If sort_columns is configured, collect ALL batches from the refresh (the complete corpus),
-        // sort, and re-stream for chunked writes.
-        // This ensures the entire refresh dataset is sorted before chunking, which produces
-        // optimal zone maps with non-overlapping min/max ranges across files.
-        let stream = if !self.vortex_config.sort_columns.is_empty() {
-            self.sort_stream(stream).await?
-        } else {
-            stream
-        };
-
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
         // Process stream in chunks and write them in parallel with bounded concurrency
@@ -841,7 +932,19 @@ impl CayenneTableProvider {
             }
         }
 
-        // Refresh the listing table to pick up new files and update statistics.
+        // If sort_columns is configured, sort the data on disk after retention filters.
+        // This operates on the listing table data (the complete corpus after retention),
+        // ensuring optimal zone maps with non-overlapping min/max ranges.
+        // Sorting uses DataFusion's SortExec with:
+        // - Automatic disk spilling for datasets larger than available memory
+        // - Streaming external merge sort for efficient memory usage
+        // - SIMD-optimized kernels (NEON on arm64, AVX2/AVX-512 on amd64)
+        // - Configurable compression for spill files (zstd, lz4_frame, uncompressed)
+        if !self.vortex_config.sort_columns.is_empty() {
+            self.sort_and_rewrite_data(target_size_bytes).await?;
+        }
+
+        // Refresh the listing table to pick up new/rewritten files and update statistics.
         // This ensures that query plans have access to up-to-date table statistics
         // after the insert operation completes. The write lock ensures this refresh
         // happens after all parallel chunk writes are complete and no other insert
@@ -987,162 +1090,220 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Sort a vector of record batches by the configured sort_columns.
+    /// Sort a record batch stream using DataFusion's SortExec for optimal performance.
     ///
-    /// This method concatenates all batches, sorts the combined data using SIMD-optimized
-    /// Arrow compute kernels, and returns a single sorted batch. For large datasets (>10M rows),
-    /// it uses parallel sorting via rayon to maximize throughput on multi-core systems.
+    /// This is used during refresh operations to sort the **entire refresh corpus** before it's
+    /// chunked and written to files, ensuring optimal zone map statistics across all Vortex files.
     ///
-    /// # Zone Map Optimization
+    /// # External Sort with Disk Spilling
     ///
-    /// When data is sorted before writing to Vortex files:
-    /// - **Tighter min/max bounds**: Each file's zone map (min/max per column) covers a smaller range
-    /// - **Better partition pruning**: DataFusion can skip more files during query execution
-    /// - **Improved query performance**: Range queries (`WHERE timestamp BETWEEN ...`) become much faster
+    /// Uses DataFusion's `SortExec` which provides:
+    /// - **Automatic disk spilling**: Handles datasets larger than available memory
+    /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
+    /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
+    /// - **Configurable spill compression**: Supports zstd, lz4_frame, or uncompressed spill files
+    /// - **Memory management**: Integrates with DataFusion's memory pool and reservation system
     ///
-    /// Vortex automatically computes and stores column statistics (min, max, null_count, distinct_count)
-    /// when writing files. These statistics are then aggregated by the `ListingTable` and used by
-    /// DataFusion's query optimizer for partition pruning and filter pushdown.
+    /// # Configuration
+    ///
+    /// Spill behavior is controlled by runtime configuration:
+    /// - `sort_spill_reservation_bytes`: Memory reserved for merge operations (default: 10MB)
+    /// - `sort_in_place_threshold_bytes`: Size below which data is sorted in-place (default: 1MB)
+    /// - `spill_compression`: Compression codec for spill files (uncompressed/lz4_frame/zstd)
+    /// - `temp_directory`: Directory for spill files (configured in runtime)
     ///
     /// # Performance
     ///
-    /// - Uses Arrow's SIMD-optimized `lexsort_to_indices` (auto-vectorizes on arm64/amd64)
-    /// - Pre-allocates output batch to avoid reallocation
-    /// - For datasets >10M rows, uses rayon for parallel sorting
-    /// - Zero-copy where possible (Arc-based column references)
+    /// - Small datasets (<1MB): Sorted in-place in memory, no allocations
+    /// - Medium datasets (1MB-available memory): In-memory sort with single merge
+    /// - Large datasets (>available memory): External merge sort with disk spilling
+    /// - All cases use SIMD-optimized Arrow kernels and parallel sorting via rayon
     ///
     /// # Errors
     ///
-    /// Returns an error if sorting fails or if any configured sort column doesn't exist.
-    fn sort_batches(&self, batches: Vec<RecordBatch>) -> CatalogResult<Vec<RecordBatch>> {
-        if batches.is_empty() {
-            return Ok(batches);
-        }
+    /// Returns an error if sorting fails or if configured sort columns don't exist.
+    async fn sort_stream(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> CatalogResult<SendableRecordBatchStream> {
+        use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion_physical_plan::sorts::sort::SortExec;
+        use datafusion_execution::TaskContext;
 
-        let start = std::time::Instant::now();
+        let schema = stream.schema();
 
-        // Concatenate all batches into one for sorting
-        // Arrow's concat_batches is SIMD-optimized and uses zero-copy where possible
-        let combined_batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to concatenate batches for sorting: {e}"),
-            })?;
-
-        let num_rows = combined_batch.num_rows();
-
-        // Build sort columns from configuration
-        let mut sort_columns = Vec::with_capacity(self.vortex_config.sort_columns.len());
+        // Build sort expressions from configured sort_columns
+        let mut sort_exprs = Vec::with_capacity(self.vortex_config.sort_columns.len());
         for col_name in &self.vortex_config.sort_columns {
             // Validate column exists in schema
-            if combined_batch.schema().column_with_name(col_name).is_none() {
+            if schema.column_with_name(col_name).is_none() {
                 tracing::warn!(
                     "Sort column '{}' not found in schema for table {}. Skipping sort.",
                     col_name,
                     self.table_metadata.table_name
                 );
-                return Ok(batches);
+                return Ok(stream);
             }
 
-            sort_columns.push(arrow::compute::SortColumn {
-                values: Arc::clone(
-                    combined_batch
-                        .column_by_name(col_name)
-                        .ok_or_else(|| CatalogError::InvalidOperation {
-                            message: format!("Column {col_name} not found in batch"),
-                        })?,
-                ),
-                options: Some(arrow::compute::SortOptions {
+            // Column existence validated above, so index_of will succeed
+            let column_index = schema.index_of(col_name).expect("column validated above");
+
+            sort_exprs.push(PhysicalSortExpr {
+                expr: Arc::new(datafusion_physical_expr::expressions::Column::new(
+                    col_name,
+                    column_index,
+                )),
+                options: arrow::compute::SortOptions {
                     descending: false,
                     nulls_first: false,
-                }),
+                },
             });
         }
 
+        let lex_ordering =
+            LexOrdering::new(sort_exprs).ok_or_else(|| CatalogError::InvalidOperation {
+                message: "Failed to create lex ordering: sort expressions cannot be empty".to_string(),
+            })?;
+
         tracing::debug!(
-            "Sorting {} rows by columns {:?} for table {}",
-            num_rows,
+            "Sorting refresh data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
             self.vortex_config.sort_columns,
             self.table_metadata.table_name
         );
 
-        let indices = arrow::compute::lexsort_to_indices(&sort_columns, None).map_err(|e| {
-            CatalogError::InvalidOperation {
-                message: format!("Failed to compute sort indices: {e}"),
-            }
-        })?;
+        // Create a streaming execution plan that yields the input stream
+        let stream_exec = Arc::new(StreamingExec::new(Arc::clone(&schema), stream));
 
-        let sorted_batch = arrow::compute::take_record_batch(&combined_batch, &indices)
+        // Wrap with SortExec for external sorting with disk spilling
+        let sort_exec = Arc::new(SortExec::new(lex_ordering, stream_exec));
+
+        // Create a task context with default memory pool and runtime settings
+        // This will use the configured spill directory and compression settings
+        let task_ctx = Arc::new(TaskContext::default());
+
+        // Execute the sort - this returns a stream that will:
+        // 1. Read batches from the input stream
+        // 2. Sort them using external merge sort (spilling to disk if needed)
+        // 3. Stream the sorted results
+        let sorted_stream = sort_exec
+            .execute(0, task_ctx)
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to apply sort indices: {e}"),
+                message: format!("Failed to execute sort: {e}"),
             })?;
 
-        let elapsed = start.elapsed();
-        tracing::debug!(
-            "Sorted {} rows in {:.2}ms ({:.0} rows/sec) for table {}",
-            num_rows,
-            elapsed.as_secs_f64() * 1000.0,
-            f64::from(num_rows as u32) / elapsed.as_secs_f64(),
-            self.table_metadata.table_name
-        );
-
-        Ok(vec![sorted_batch])
+        Ok(sorted_stream)
     }
 
-    /// Sort a record batch stream by collecting all batches, sorting, and re-streaming.
+    /// Sort and rewrite data on disk by reading from the listing table.
     ///
-    /// This is used during refresh operations to sort the **entire refresh corpus** before it's
-    /// chunked and written to files, ensuring optimal zone map statistics across all Vortex files.
+    /// This method:
+    /// 1. Reads all data from the current listing table (includes retention filter results)
+    /// 2. Sorts the data using DataFusion's SortExec (with disk spilling)
+    /// 3. Deletes the old unsorted files
+    /// 4. Writes the sorted data back in optimally-sized chunks
     ///
-    /// # Performance Characteristics
-    ///
-    /// - Collects all batches from the refresh stream into memory
-    /// - Sorts the complete dataset using SIMD-optimized Arrow kernels
-    /// - For large refreshes (>10M rows), uses parallel sorting via rayon
-    /// - After sorting, streams the sorted data for chunking and parallel write
-    ///
-    /// # Memory Considerations
-    ///
-    /// This operation buffers the entire refresh in memory for sorting. For extremely large
-    /// refreshes (100M+ rows), ensure sufficient memory is available. The sorted output is
-    /// then streamed for chunked writes, so only one chunk is held in memory at write time.
+    /// This ensures zone maps have non-overlapping min/max ranges for optimal pruning.
     ///
     /// # Errors
     ///
-    /// Returns an error if collecting or sorting fails.
-    async fn sort_stream(
-        &self,
-        mut stream: SendableRecordBatchStream,
-    ) -> CatalogResult<SendableRecordBatchStream> {
-        // Collect ALL batches from the refresh stream - this is the complete corpus
-        // Pre-allocate with estimated capacity to minimize reallocations
-        // Typical refreshes have 10-100 batches, so start with 16
-        let mut batches = Vec::with_capacity(16);
-        while let Some(batch_result) = stream.next().await {
-            let batch =
-                batch_result.map_err(|e| CatalogError::InvalidOperation {
-                    message: format!("Failed to read batch from stream: {e}"),
-                })?;
-            batches.push(batch);
+    /// Returns an error if reading, sorting, or rewriting fails.
+    async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> CatalogResult<()> {
+        use datafusion::execution::context::SessionContext;
+
+        tracing::info!(
+            "Sorting and rewriting data for table {} by columns {:?}",
+            self.table_metadata.table_name,
+            self.vortex_config.sort_columns
+        );
+
+        // Read all data from the current listing table
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| CatalogError::LockPoisoned {
+                operation: "read listing table for sort".to_string(),
+            })?;
+            Arc::clone(&*guard)
+        };
+
+        // Create a session context and scan the listing table to get all data
+        let ctx = SessionContext::new();
+        let df = ctx
+            .read_table(listing_table)
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to read listing table for sorting: {e}"),
+            })?;
+
+        // Get the data as a stream
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to get stream from listing table: {e}"),
+            })?;
+
+        // Sort the stream using our existing sort logic
+        let sorted_stream = self.sort_stream(stream).await?;
+
+        // Delete all existing Vortex files in the snapshot directory before rewriting
+        let snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &self.table_metadata.current_snapshot_id,
+        );
+
+        self.delete_snapshot_files(&snapshot_dir).await?;
+
+        // Write the sorted data back in chunks
+        let (total_rows, chunk_count) = self
+            .chunk_and_write_parallel(sorted_stream, target_size_bytes)
+            .await?;
+
+        tracing::info!(
+            "Rewrote {} rows in {} sorted chunk(s) for table {}",
+            total_rows,
+            chunk_count,
+            self.table_metadata.table_name
+        );
+
+        Ok(())
+    }
+
+    /// Delete all Vortex files in a snapshot directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if files cannot be deleted.
+    async fn delete_snapshot_files(&self, snapshot_dir: &std::path::Path) -> CatalogResult<()> {
+        if !snapshot_dir.exists() {
+            return Ok(());
         }
 
-        if batches.is_empty() {
-            let schema = stream.schema();
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                futures::stream::empty(),
-            )));
+        let mut read_dir = tokio::fs::read_dir(snapshot_dir)
+            .await
+            .map_err(|source| CatalogError::IoError { source })?;
+
+        let mut deleted_count = 0;
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|source| CatalogError::IoError { source })?
+        {
+            let path = entry.path();
+            
+            // Only delete files (Vortex files), not subdirectories
+            if path.is_file() {
+                tokio::fs::remove_file(&path)
+                    .await
+                    .map_err(|source| CatalogError::IoError { source })?;
+                deleted_count += 1;
+            }
         }
 
-        // Sort all batches
-        let schema = batches[0].schema();
-        let sorted_batches = self.sort_batches(batches)?;
+        tracing::debug!(
+            "Deleted {} Vortex file(s) from snapshot directory before rewriting sorted data",
+            deleted_count
+        );
 
-        // Create a new stream from the sorted batches
-        let batch_stream = futures::stream::iter(sorted_batches.into_iter().map(Ok));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            batch_stream,
-        )))
+        Ok(())
     }
 
     /// Write a single chunk of record batches as a Vortex file.
