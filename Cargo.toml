@@ -254,7 +254,7 @@ tonic = { version = "0.13", features = [
 ] }
 tonic-health = { version = "0.13" }
 tower = "0.5.2"
-tower-http = { version = "0.6.2", features = ["cors"] }
+tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
