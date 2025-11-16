@@ -16,7 +16,7 @@ datasets:
       engine: duckdb
       mode: file
       partition_by:
-        - bucket(32, c_name)
+        - bucket(5, c_name)
       params:
         partition_mode: tables
   - from: s3://benchmarks/tpch_sf1/lineitem.parquet
@@ -45,7 +45,7 @@ datasets:
       engine: duckdb
       mode: file
       partition_by:
-        - bucket(32, o_custkey)
+        - bucket(5, o_custkey)
       params:
         partition_mode: tables
   - from: s3://benchmarks/tpch_sf1/part.parquet
