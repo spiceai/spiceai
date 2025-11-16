@@ -50,7 +50,7 @@ impl ObjectStoreContext {
                 // linear time complexity and is immune to catastrophic backtracking (ReDoS).
                 // However, we still limit regex length to prevent resource exhaustion during
                 // compilation and to catch obviously malicious patterns.
-                const MAX_REGEX_LENGTH: usize = 1000;
+                const MAX_REGEX_LENGTH: usize = 100;
                 if regex.len() > MAX_REGEX_LENGTH {
                     return Err(format!(
                         "Regex pattern too long ({} chars). Maximum allowed: {MAX_REGEX_LENGTH}",
@@ -162,7 +162,7 @@ mod tests {
         use std::sync::Arc;
 
         // Create a very long regex pattern
-        let long_pattern = "a".repeat(1001);
+        let long_pattern = "a".repeat(101);
         let url = Url::parse("file:///tmp/").expect("valid url");
 
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());

@@ -94,7 +94,7 @@ impl DatabricksDelta {
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
         )
-        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+        .boxed()?;
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 

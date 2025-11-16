@@ -14,16 +14,51 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 use data_components::http::provider::HttpTableProvider;
 use datafusion::prelude::*;
 use reqwest::Client;
 use std::sync::Arc;
 
+fn build_provider(
+    base_url: &str,
+    format: &str,
+    allowed_paths: &[&str],
+    allow_query_filters: bool,
+    allow_body_filters: bool,
+) -> HttpTableProvider {
+    let mut provider = HttpTableProvider::new(
+        url::Url::parse(base_url).expect("valid URL"),
+        Client::new(),
+        format.to_string(),
+        false,
+    );
+
+    if !allowed_paths.is_empty() {
+        let paths: Vec<String> = allowed_paths.iter().map(|p| p.trim().to_string()).collect();
+        provider = provider
+            .with_allowed_paths(paths)
+            .expect("allowed paths are valid");
+    }
+
+    if allow_query_filters {
+        provider = provider
+            .enable_query_filters(data_components::http::provider::DEFAULT_MAX_QUERY_LENGTH);
+    }
+
+    if allow_body_filters {
+        provider =
+            provider.enable_body_filters(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
+    }
+
+    provider
+}
+
 /// Integration test that fetches real data from httpbin.org
 #[tokio::test]
 async fn test_http_provider_with_real_endpoint() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider("https://httpbin.org", "json", &["/json"], false, false);
 
     // Create a DataFusion context
     let ctx = SessionContext::new();
@@ -60,9 +95,8 @@ async fn test_http_provider_with_real_endpoint() {
 
 /// Test with query parameters
 #[tokio::test]
-async fn test_http_provider_withrequest_query_params() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+async fn test_http_provider_with_request_query_params() {
+    let provider = build_provider("https://httpbin.org", "json", &["/get"], true, false);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -104,8 +138,7 @@ async fn test_http_provider_withrequest_query_params() {
 /// Test scanning without filters (should use base URL)
 #[tokio::test]
 async fn test_http_provider_without_filters() {
-    let base_url = url::Url::parse("https://httpbin.org/get").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider("https://httpbin.org/get", "json", &[], false, false);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -126,9 +159,14 @@ async fn test_http_provider_without_filters() {
 
 /// Test with base URL that has a path component
 #[tokio::test]
-async fn test_http_provider_with_baserequest_path() {
-    let base_url = url::Url::parse("https://httpbin.org/anything/base").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+async fn test_http_provider_with_base_request_path() {
+    let provider = build_provider(
+        "https://httpbin.org/anything/base",
+        "json",
+        &["/extra"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -165,8 +203,13 @@ async fn test_http_provider_with_baserequest_path() {
 /// Expected: Returns a single JSON object (Breaking Bad show details)
 #[tokio::test]
 async fn test_tvmaze_single_object() {
-    let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider(
+        "https://api.tvmaze.com",
+        "json",
+        &["/shows/169"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
@@ -215,8 +258,13 @@ async fn test_tvmaze_single_object() {
 /// Expected: Returns a JSON array with multiple search results, each as a separate row
 #[tokio::test]
 async fn test_tvmaze_multi_object() {
-    let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider(
+        "https://api.tvmaze.com",
+        "json",
+        &["/search/people"],
+        true,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
@@ -292,8 +340,13 @@ async fn test_tvmaze_multi_object() {
 /// Expected: Returns rows from both endpoints combined
 #[tokio::test]
 async fn test_tvmaze_combined_or_filter() {
-    let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider(
+        "https://api.tvmaze.com",
+        "json",
+        &["/shows/169", "/search/people"],
+        true,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
@@ -345,9 +398,14 @@ async fn test_tvmaze_combined_or_filter() {
 /// Tests using IN clause for multiple paths
 /// Expected: Returns rows from multiple different endpoints
 #[tokio::test]
-async fn test_tvmaze_in_listrequest_paths() {
-    let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+async fn test_tvmaze_in_list_request_paths() {
+    let provider = build_provider(
+        "https://api.tvmaze.com",
+        "json",
+        &["/shows/169", "/shows/1", "/shows/82"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
@@ -425,9 +483,8 @@ async fn test_tvmaze_in_listrequest_paths() {
 
 /// Test POST request with `request_body` filter (default JSON content-type)
 #[tokio::test]
-async fn test_http_post_with_jsonrequest_body() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+async fn test_http_post_with_json_request_body() {
+    let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -475,8 +532,7 @@ async fn test_http_post_with_jsonrequest_body() {
 /// Test POST request with custom content-type
 #[tokio::test]
 async fn test_http_post_with_custom_content_type() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+    let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true)
         .with_content_type(Some("application/x-www-form-urlencoded".to_string()));
 
     let ctx = SessionContext::new();
@@ -522,8 +578,7 @@ async fn test_http_post_with_custom_content_type() {
 /// Test POST with multiple different bodies using IN clause
 #[tokio::test]
 async fn test_http_post_multiple_bodies() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -578,8 +633,7 @@ async fn test_http_post_multiple_bodies() {
 /// Test POST with OR expression combining different bodies
 #[tokio::test]
 async fn test_http_post_or_expression() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false);
+    let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -607,9 +661,8 @@ async fn test_http_post_or_expression() {
 /// Test with retries on transient failures
 #[tokio::test]
 async fn test_http_with_retries() {
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
-        .with_max_retries(5);
+    let provider =
+        build_provider("https://httpbin.org", "json", &["/json"], false, false).with_max_retries(5);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -635,7 +688,7 @@ async fn test_csv_static_file() {
     let base_url =
         url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv")
             .expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+    let provider = build_provider(base_url.as_str(), "csv", &[], false, false);
 
     let ctx = SessionContext::new();
     ctx.register_table("iris", Arc::new(provider))
@@ -678,7 +731,7 @@ async fn test_csv_column_selection() {
     let base_url =
         url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv")
             .expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+    let provider = build_provider(base_url.as_str(), "csv", &[], false, false);
 
     let ctx = SessionContext::new();
     ctx.register_table("iris", Arc::new(provider))
@@ -716,7 +769,7 @@ async fn test_auto_detect_csv() {
     let base_url =
         url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/tips.csv")
             .expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "auto".to_string(), false);
+    let provider = build_provider(base_url.as_str(), "auto", &[], false, false);
 
     let ctx = SessionContext::new();
     ctx.register_table("tips", Arc::new(provider))
@@ -748,8 +801,13 @@ async fn test_auto_detect_csv() {
 /// Test auto-detection format with JSON file
 #[tokio::test]
 async fn test_auto_detect_json() {
-    let base_url = url::Url::parse("https://api.tvmaze.com").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "auto".to_string(), false);
+    let provider = build_provider(
+        "https://api.tvmaze.com",
+        "auto",
+        &["/shows/169"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
@@ -773,8 +831,7 @@ async fn test_auto_detect_json() {
 async fn test_ndjson_format() {
     // Create a simple in-memory test - we'll use httpbin which returns JSON
     // and treat it as NDJSON for format testing
-    let base_url = url::Url::parse("https://httpbin.org").expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "ndjson".to_string(), false);
+    let provider = build_provider("https://httpbin.org", "ndjson", &["/json"], false, false);
 
     let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
@@ -796,9 +853,13 @@ async fn test_ndjson_format() {
 #[tokio::test]
 async fn test_csv_with_dynamic_filter() {
     // Base URL pointing to a directory structure
-    let base_url = url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master")
-        .expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+    let provider = build_provider(
+        "https://raw.githubusercontent.com/mwaskom/seaborn-data/master",
+        "csv",
+        &["/iris.csv"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("datasets", Arc::new(provider))
@@ -825,9 +886,13 @@ async fn test_csv_with_dynamic_filter() {
 /// Test multiple CSV files with IN clause
 #[tokio::test]
 async fn test_csv_multiple_files_in_clause() {
-    let base_url = url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master")
-        .expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "csv".to_string(), false);
+    let provider = build_provider(
+        "https://raw.githubusercontent.com/mwaskom/seaborn-data/master",
+        "csv",
+        &["/iris.csv", "/tips.csv"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("datasets", Arc::new(provider))
@@ -871,9 +936,13 @@ async fn test_csv_multiple_files_in_clause() {
 async fn test_mixed_format_csv_json_or() {
     // This tests that the provider can handle different formats in the same query
     // when using OR conditions with request_path
-    let base_url = url::Url::parse("https://raw.githubusercontent.com/mwaskom/seaborn-data/master")
-        .expect("valid URL");
-    let provider = HttpTableProvider::new(base_url, Client::new(), "auto".to_string(), false);
+    let provider = build_provider(
+        "https://raw.githubusercontent.com/mwaskom/seaborn-data/master",
+        "auto",
+        &["/iris.csv", "/tips.csv"],
+        false,
+        false,
+    );
 
     let ctx = SessionContext::new();
     ctx.register_table("data", Arc::new(provider))
