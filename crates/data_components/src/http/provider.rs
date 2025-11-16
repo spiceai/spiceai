@@ -136,7 +136,7 @@ impl CachedResponse {
 
 #[derive(Default)]
 struct PartitionAccumulator {
-    paths: Vec<String>,
+    paths: HashSet<String>,
     queries: Vec<Option<String>>,
     bodies: Vec<Option<String>>,
     has_path_filter: bool,
@@ -150,9 +150,7 @@ impl PartitionAccumulator {
     }
 
     fn record_path(&mut self, value: String) {
-        if !self.paths.contains(&value) {
-            self.paths.push(value);
-        }
+        self.paths.insert(value);
         self.has_path_filter = true;
     }
 
@@ -173,16 +171,21 @@ impl PartitionAccumulator {
     }
 
     fn finalize(mut self) -> (Vec<String>, Vec<Option<String>>, Vec<Option<String>>) {
-        if !self.has_path_filter {
-            self.paths.push(String::new());
-        }
+        let mut paths: Vec<String> = if self.has_path_filter {
+            self.paths.into_iter().collect()
+        } else {
+            vec![String::new()]
+        };
+        // Sort paths for deterministic ordering
+        paths.sort();
+
         if !self.has_query_filter {
             self.queries.push(None);
         }
         if !self.has_body_filter {
             self.bodies.push(None);
         }
-        (self.paths, self.queries, self.bodies)
+        (paths, self.queries, self.bodies)
     }
 }
 
@@ -847,37 +850,32 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
     ) -> DataFusionResult<RecordBatch> {
-        let (path, query, body) = &self.partitions[partition];
+        let (path, _query, _body) = &self.partitions[partition];
 
         // Use the filter path or empty string (base URL only)
         let path_val = path.as_deref().unwrap_or("");
-        let query_val = query.as_deref();
-        let body_val = body.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
+            "HttpExec fetching partition {}: request_path={:?}",
             partition,
-            path_val,
-            query_val,
-            body_val
+            path_val
         );
 
+        // Fetch content with only the path, no query or body
         let content = provider
-            .get_content(path_val, query_val, body_val)
+            .get_content(path_val, None, None)
             .await
             .map_err(DataFusionError::from)?;
 
-        // The path, query, and body values in the batch MUST match the filter values exactly
-        // so that DataFusion's FilterExec will keep these rows
+        // Set path from partition, but leave query and body empty
+        // DataFusion's FilterExec will filter based on these columns if needed
         let path_for_batch = path.as_deref().unwrap_or("");
-        let query_for_batch = query.as_deref().unwrap_or("");
-        let body_for_batch = body.as_deref().unwrap_or("");
+        let query_for_batch = "";
+        let body_for_batch = "";
 
         tracing::debug!(
-            "Creating batch with _path={:?}, _query={:?}, _body={:?}, content_len={}",
+            "Creating batch with request_path={:?}, content_len={}",
             path_for_batch,
-            query_for_batch,
-            body_for_batch,
             content.len()
         );
 
@@ -1049,7 +1047,7 @@ impl ExecutionPlan for HttpExec {
 }
 
 impl HttpTableProvider {
-    /// Extract all (path, query, body) pairs from filters, supporting =, IN, AND, and OR expressions
+    /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
         let mut accumulator = PartitionAccumulator::new();
 
@@ -1058,37 +1056,21 @@ impl HttpTableProvider {
                 .map_err(DataFusionError::from)?;
         }
 
-        let (paths, queries, bodies) = accumulator.finalize();
-        let mut partitions = Vec::new();
+        let (paths, _queries, _bodies) = accumulator.finalize();
 
-        for path in &paths {
-            for query in &queries {
-                for body in &bodies {
-                    partitions.push((
-                        if path.is_empty() {
-                            None
-                        } else {
-                            Some(path.clone())
-                        },
-                        query.clone(),
-                        body.clone(),
-                    ));
-                }
-            }
-        }
-
-        partitions.sort_by(|a, b| {
-            let path_cmp = a.0.cmp(&b.0);
-            if path_cmp != std::cmp::Ordering::Equal {
-                return path_cmp;
-            }
-            let query_cmp = a.1.cmp(&b.1);
-            if query_cmp != std::cmp::Ordering::Equal {
-                return query_cmp;
-            }
-            a.2.cmp(&b.2)
-        });
-        partitions.dedup();
+        // Create partitions only from paths, not from query/body combinations
+        // Query and body filters will be applied by DataFusion's FilterExec
+        // Paths are already deduplicated and sorted by the accumulator
+        let partitions = paths
+            .into_iter()
+            .map(|path| {
+                (
+                    if path.is_empty() { None } else { Some(path) },
+                    None, // No query in partition spec
+                    None, // No body in partition spec
+                )
+            })
+            .collect();
 
         Ok(partitions)
     }
@@ -1348,14 +1330,11 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
+        // Only path creates partition, query is validated but not used for partitioning
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (
-                Some("/singlesearch/shows".to_string()),
-                Some("q=South%20Park".to_string()),
-                None
-            )
+            (Some("/singlesearch/shows".to_string()), None, None)
         );
     }
 
@@ -1462,9 +1441,10 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(None, Some("limit=10".to_string()), None)));
-        assert!(partitions.contains(&(None, Some("limit=20".to_string()), None)));
+        // Query filters don't create partitions, only path filters do
+        // This will create a single partition with no path
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (None, None, None));
     }
 
     #[test]
@@ -1528,18 +1508,9 @@ mod tests {
 
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
-        // Should create cross product: 1 path * 2 queries = 2 partitions
-        assert_eq!(partitions.len(), 2);
-        assert!(partitions.contains(&(
-            Some("/api/users".to_string()),
-            Some("limit=10".to_string()),
-            None
-        )));
-        assert!(partitions.contains(&(
-            Some("/api/users".to_string()),
-            Some("limit=20".to_string()),
-            None
-        )));
+        // Only path creates partition; query filters are validated but don't create separate partitions
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
     }
 
     #[test]
