@@ -4,12 +4,12 @@ tests:
     query_set: saffron[parameterized]
     query_overrides: saffron-views
     ready_wait: 300
+    validate_results: true
     runner_type: spicehq-dev-runners
   load:
     - spicepod_path: s3[parquet]-duckdb[file]_view_with_partitioning_indexes_p128.yaml
       query_set: saffron[parameterized]
       query_overrides: saffron-views
-      ready_wait: 300
       runner_type: spicehq-dev-runners
       concurrency: 128
       duration: 900
@@ -17,7 +17,6 @@ tests:
     - spicepod_path: s3[parquet]-duckdb[file]_view_with_partitioning_indexes_p128.yaml
       query_set: saffron[parameterized]
       query_overrides: saffron-views
-      ready_wait: 300
       runner_type: spicehq-dev-runners
       concurrency: 128
       duration: 900

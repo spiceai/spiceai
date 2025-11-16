@@ -13,7 +13,7 @@ runtime:
       stale_while_revalidate_ttl: 1m
   task_history:
     enabled: true
-    captured_output: plan
+    captured_plan: explain
     min_plan_duration: 50ms
 
 datasets:
