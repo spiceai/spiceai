@@ -22,6 +22,7 @@ use std::{
 
 pub mod fibonacci_backoff;
 pub mod retry_strategy;
+pub mod security;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
@@ -29,7 +30,6 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
-pub mod security;
 
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
