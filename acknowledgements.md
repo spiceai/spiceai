@@ -6,11 +6,15 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Go Modules
 
-github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.5.0/LICENSE, MIT
+github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.6.0/LICENSE, MIT
 github.com/apache/arrow/go/v17, https://github.com/apache/arrow/blob/go/v17.0.0/go/LICENSE.txt, Apache-2.0
 github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/v4.3.0/LICENSE, MIT
 github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
+github.com/clipperhouse/displaywidth, https://github.com/clipperhouse/displaywidth/blob/v0.3.1/LICENSE, MIT
+github.com/clipperhouse/stringish, https://github.com/clipperhouse/stringish/blob/v0.1.1/LICENSE, MIT
+github.com/clipperhouse/uax29/v2, https://github.com/clipperhouse/uax29/blob/v2.2.0/LICENSE, MIT
 github.com/dustin/go-humanize, https://github.com/dustin/go-humanize/blob/v1.0.1/LICENSE, MIT
+github.com/fatih/color, https://github.com/fatih/color/blob/v1.16.0/LICENSE.md, MIT
 github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.9.0/LICENSE, BSD-3-Clause
 github.com/go-logr/logr, https://github.com/go-logr/logr/blob/v1.4.2/LICENSE, Apache-2.0
 github.com/go-logr/stdr, https://github.com/go-logr/stdr/blob/v1.2.2/LICENSE, Apache-2.0
@@ -29,13 +33,17 @@ github.com/klauspost/compress/zstd/internal/xxhash, https://github.com/klauspost
 github.com/kylelemons/godebug, https://github.com/kylelemons/godebug/blob/v1.1.0/LICENSE, Apache-2.0
 github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
 github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9.0/LICENSE.md, BSD-3-Clause
-github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.15/LICENSE, MIT
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v0.0.5/LICENSE.md, MIT
+github.com/mattn/go-colorable, https://github.com/mattn/go-colorable/blob/v0.1.13/LICENSE, MIT
+github.com/mattn/go-isatty, https://github.com/mattn/go-isatty/blob/v0.0.20/LICENSE, MIT
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.19/LICENSE, MIT
+github.com/olekukonko/cat, https://github.com/olekukonko/cat/blob/50322a0618f6/LICENSE, MIT
+github.com/olekukonko/errors, https://github.com/olekukonko/errors/blob/v1.1.0/LICENSE, MIT
+github.com/olekukonko/ll, https://github.com/olekukonko/ll/blob/v0.1.2/LICENSE, MIT
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v1.1.1/LICENSE.md, MIT
 github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.2.4/LICENSE, MIT
 github.com/peterh/liner, https://github.com/peterh/liner/blob/v1.2.2/COPYING, MIT
 github.com/pierrec/lz4/v4, https://github.com/pierrec/lz4/blob/v4.1.21/LICENSE, BSD-3-Clause
 github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
-github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/v0.4.6/LICENSE.txt, MIT
 github.com/sagikazarmark/locafero, https://github.com/sagikazarmark/locafero/blob/v0.11.0/LICENSE, MIT
 github.com/sourcegraph/conc, https://github.com/sourcegraph/conc/blob/5f936abd7ae8/LICENSE, MIT
 github.com/spf13/afero, https://github.com/spf13/afero/blob/v1.15.0/LICENSE.txt, Apache-2.0
@@ -54,7 +62,7 @@ go.yaml.in/yaml/v3, https://github.com/yaml/go-yaml/blob/v3.0.4/LICENSE, MIT
 golang.org/x/exp, https://cs.opensource.google/go/x/exp/+/f66d83c2:LICENSE, BSD-3-Clause
 golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.29.0:LICENSE, BSD-3-Clause
 golang.org/x/net, https://cs.opensource.google/go/x/net/+/v0.44.0:LICENSE, BSD-3-Clause
-golang.org/x/sys, https://cs.opensource.google/go/x/sys/+/v0.37.0:LICENSE, BSD-3-Clause
+golang.org/x/sys, https://cs.opensource.google/go/x/sys/+/v0.38.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.29.0:LICENSE, BSD-3-Clause
 golang.org/x/xerrors, https://cs.opensource.google/go/x/xerrors/+/7835f813:LICENSE, BSD-3-Clause
 google.golang.org/genproto/googleapis/rpc/status, https://github.com/googleapis/go-genproto/blob/324edc3d5d38/googleapis/rpc/LICENSE, Apache-2.0
@@ -181,7 +189,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - azure_core 0.21.0, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
-- azure_core 0.28.0, MIT 
+- azure_core 0.30.1, MIT 
   <br/>https://github.com/azure/azure-sdk-for-rust
 
 - azure_storage 0.21.0, MIT 
@@ -253,6 +261,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
+- criterion 0.5.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/bheisler/criterion.rs
+
 - criterion 0.7.0, Apache-2.0 OR MIT 
   <br/>https://github.com/bheisler/criterion.rs
 
@@ -262,7 +273,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - csv 1.4.0, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
-- ctor 0.5.0, Apache-2.0 OR MIT 
+- ctor 0.6.1, Apache-2.0 OR MIT 
   <br/>https://github.com/mmastrac/rust-ctor
 
 - ctrlc 3.5.1, Apache-2.0 OR MIT 
@@ -328,7 +339,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dotenvy 0.15.7, MIT 
   <br/>https://github.com/allan2/dotenvy
 
-- duckdb 1.4.1, MIT 
+- duckdb 1.4.2, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
 - dyn-clone 1.0.20, Apache-2.0 OR MIT 
@@ -655,7 +666,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - schemars 0.9.0, MIT 
   <br/>https://github.com/GREsau/schemars
 
-- schemars 1.0.5, MIT 
+- schemars 1.1.0, MIT 
   <br/>https://github.com/GREsau/schemars
 
 - scopeguard 1.2.0, Apache-2.0 OR MIT 
@@ -694,6 +705,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - spiceai 3.1.0, Apache-2.0 
   <br/>
 
+- spicepod-validator 1.9.0-unstable, Apache-2.0 
+  <br/>
+
 - ssh2 0.9.5, Apache-2.0 OR MIT 
   <br/>https://github.com/alexcrichton/ssh2-rs
 
@@ -703,7 +717,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - strsim 0.11.1, MIT 
   <br/>https://github.com/rapidfuzz/strsim-rs
 
-- suppaftp 5.4.0, Apache-2.0 
+- suppaftp 6.3.0, Apache-2.0 OR MIT 
   <br/>https://github.com/veeso/suppaftp
 
 - sysinfo 0.30.13, MIT 
