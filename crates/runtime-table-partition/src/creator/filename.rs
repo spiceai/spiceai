@@ -201,7 +201,7 @@ fn discover_partitions_recursive(
 
 macro_rules! parse_numeric_scalar {
     ($value_str:expr, $scalar_type:ident, $parse_type:ty) => {
-        if $value_str == "none" {
+        if $value_str == "none" || $value_str == "NULL" {
             ScalarValue::$scalar_type(None)
         } else {
             let parsed: $parse_type = $value_str.parse()?;
@@ -239,7 +239,7 @@ pub fn parse_partition_value(
         .map_err(|e| Error::Parsing { source: e.into() })?;
     let scalar_value = match data_type {
         DataType::Boolean => {
-            if value_str == "none" {
+            if value_str == "none" || value_str == "NULL" {
                 ScalarValue::Boolean(None)
             } else {
                 let b = value_str.parse()?;
@@ -267,7 +267,7 @@ pub fn parse_partition_value(
             }
         },
         DataType::Utf8 => {
-            if value_str == "none" {
+            if value_str == "none" || value_str == "NULL" {
                 ScalarValue::Utf8(None)
             } else {
                 ScalarValue::Utf8(Some(value_str.to_string()))
