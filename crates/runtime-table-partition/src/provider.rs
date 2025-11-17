@@ -219,14 +219,25 @@ impl TableProvider for PartitionTableProvider {
             .collect();
 
         // Collect data filters (applied to partition scans)
-        // For transform partitions, we exclude filters that EXACTLY match the partition expression
-        // For example: bucket(3, user_id) = 2 should NOT be a data filter, but user_id = 100 should be
+        // Exclude filters that are simple column filters matching the partition expression exactly
+        // For example, with partition_by region:
+        //   - WHERE region = 'us-east-1' should NOT be a data filter (partition handles it)
+        // But with partition_by bucket(3, user_id):
+        //   - WHERE user_id = 100 SHOULD be a data filter (partition only determines bucket)
         let data_filters: Vec<_> = filters
             .iter()
             .filter(|filter| {
-                // If the filter EXACTLY matches the partition expression (e.g., bucket(3, user_id) = 2),
-                // then it should NOT be a data filter - pruning handles this entirely
-                !Self::filter_contains_partition_expr(filter, &self.partition_by.expression)
+                // If the partition expression is just a simple column reference,
+                // and this filter is on that exact column, exclude it from data filters
+                if let Expr::Column(partition_col) = &self.partition_by.expression {
+                    // Check if this filter references only the partition column
+                    let filter_cols = filter.column_refs();
+                    if filter_cols.len() == 1 && filter_cols.iter().next() == Some(&partition_col) {
+                        return false; // Exclude from data filters
+                    }
+                }
+                // For all other cases (transform expressions, multiple columns, etc.), keep as data filter
+                true
             })
             .cloned()
             .collect();

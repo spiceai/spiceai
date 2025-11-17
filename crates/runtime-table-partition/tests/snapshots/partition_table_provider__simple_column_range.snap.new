@@ -1,0 +1,8 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+assertion_line: 1130
+expression: explain_plan
+---
+UnionExec
+  PartitionMemTableExec: partition_value=20, filters=[age >= Int32(20), age < Int32(40)]
+  PartitionMemTableExec: partition_value=30, filters=[age >= Int32(20), age < Int32(40)]
