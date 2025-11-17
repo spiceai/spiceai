@@ -1276,7 +1276,7 @@ impl HttpTableProvider {
                     "request_path '{raw}' is not included in allowed_request_paths. Allowed paths: {}",
                     allowed
                         .iter()
-                        .map(|s| s.as_str())
+                        .map(std::string::String::as_str)
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
