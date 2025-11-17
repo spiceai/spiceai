@@ -47,6 +47,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::Partition;
 use crate::creator::PartitionCreator;
+use crate::creator::filename::encode_key;
 use crate::expression::PartitionedBy;
 use crate::provider::ScalarValueString;
 
@@ -433,7 +434,9 @@ pub fn partition_batch(
     let mut value_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for partition in partitions.ranges() {
         let partition_value = ScalarValue::try_from_array(&array, partition.start)?;
-        let partition_key = partition_value.to_string();
+        let partition_key = encode_key(&partition_value).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
+        })?;
         let value_indices = value_to_indices.entry(partition_key.clone()).or_default();
         partition.into_iter().for_each(|i| value_indices.push(i));
     }

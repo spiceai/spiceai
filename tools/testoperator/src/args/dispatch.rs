@@ -166,12 +166,6 @@ impl BenchArgs {
         self.update_snapshots = Some(update_snapshots);
         self
     }
-
-    #[must_use]
-    pub fn with_validate(mut self, validate: bool) -> Self {
-        self.validate_results = Some(validate);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
