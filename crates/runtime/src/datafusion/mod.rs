@@ -981,9 +981,16 @@ impl DataFusion {
             source_schema
         };
 
-        let constraints = match &*source_table_provider {
-            FederatedTable::Immediate(table_provider) => table_provider.constraints(),
-            FederatedTable::Deferred(_) => None,
+        // Only pass constraints from the source table if we're not using refresh_sql
+        // When refresh_sql is used, the schema might have different column ordering,
+        // which would make the constraint indices invalid
+        let constraints = if refresh_sql.is_none() {
+            match &*source_table_provider {
+                FederatedTable::Immediate(table_provider) => table_provider.constraints(),
+                FederatedTable::Deferred(_) => None,
+            }
+        } else {
+            None
         };
 
         let accelerated_table_provider = self
