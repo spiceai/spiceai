@@ -581,7 +581,7 @@ pub(crate) fn get_primary_keys_from_constraints(
         .collect()
 }
 
-async fn get_registered_accelerator(
+pub(crate) async fn get_registered_accelerator(
     source: &dyn AccelerationSource,
     engine: Engine,
 ) -> Option<Arc<dyn DataAccelerator>> {

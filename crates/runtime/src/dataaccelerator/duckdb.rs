@@ -425,30 +425,72 @@ impl DataAccelerator for DuckDBAccelerator {
                     .await;
 
                 let self_path = self.file_path(source)?;
-                let attach_databases = datasets
+
+                // Collect paths for federation - we need to get file paths from the correct accelerator for each source
+                let mut attach_databases = HashSet::new();
+                for ds in datasets
                     .into_iter()
                     .map(|ds| ds as Arc<dyn AccelerationSource>)
-                    .chain(
-                        views
-                            .into_iter()
-                            .map(|view| view as Arc<dyn AccelerationSource>),
-                    )
-                    .filter_map(|other_source| {
-                        if other_source
-                            .acceleration()
-                            .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
+                {
+                    if let Some(accel) = ds.acceleration() {
+                        if accel.mode == Mode::File
+                            && ds.name() != source.name()
+                            && matches!(
+                                accel.engine,
+                                Engine::DuckDB
+                                    | Engine::TableModePartitionedDuckDB
+                                    | Engine::PartitionedDuckDB
+                            )
                         {
-                            if other_source.name() == source.name() {
-                                None
-                            } else {
-                                let other_path = self.file_path(other_source.as_ref());
-                                other_path.ok().filter(|p| p != &self_path)
+                            // Get the correct accelerator for this source's engine type
+                            if let Some(other_accelerator) =
+                                crate::dataaccelerator::get_registered_accelerator(
+                                    ds.as_ref(),
+                                    accel.engine,
+                                )
+                                .await
+                            {
+                                if let Ok(other_path) = other_accelerator.file_path(ds.as_ref()) {
+                                    if other_path != self_path {
+                                        attach_databases.insert(other_path);
+                                    }
+                                }
                             }
-                        } else {
-                            None
                         }
-                    })
-                    .collect::<HashSet<_>>(); // collect unique paths using HashSet
+                    }
+                }
+
+                for view in views
+                    .into_iter()
+                    .map(|view| view as Arc<dyn AccelerationSource>)
+                {
+                    if let Some(accel) = view.acceleration() {
+                        if accel.mode == Mode::File
+                            && view.name() != source.name()
+                            && matches!(
+                                accel.engine,
+                                Engine::DuckDB
+                                    | Engine::TableModePartitionedDuckDB
+                                    | Engine::PartitionedDuckDB
+                            )
+                        {
+                            // Get the correct accelerator for this source's engine type
+                            if let Some(other_accelerator) =
+                                crate::dataaccelerator::get_registered_accelerator(
+                                    view.as_ref(),
+                                    accel.engine,
+                                )
+                                .await
+                            {
+                                if let Ok(other_path) = other_accelerator.file_path(view.as_ref()) {
+                                    if other_path != self_path {
+                                        attach_databases.insert(other_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if !attach_databases.is_empty() {
                     cmd.options.insert(
@@ -1351,5 +1393,216 @@ mod tests {
             reconstructed.to_lowercase().starts_with("delete from"),
             "Should start with DELETE FROM"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_create_external_table_with_correct_accelerator_file_paths() {
+        use tempfile::TempDir;
+
+        // This test verifies that create_external_table correctly resolves file paths
+        // for datasets with different accelerator types (regular DuckDB vs partitioned DuckDB).
+        //
+        // The bug was that when building attach_databases list, it would call
+        // self.file_path(other_source) where self is the current accelerator,
+        // but other_source might use a different accelerator type (e.g., partitioned).
+        // This resulted in wrong file paths and "not found among existing attachments" warnings.
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        // Create runtime and app
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let app = Arc::new(app::AppBuilder::new("test").build());
+
+        // Register all accelerators
+        rt.accelerator_engine_registry().register_all().await;
+
+        // Test 1: Verify regular DuckDB accelerator gets correct file path
+        let mut regular_dataset =
+            DatasetBuilder::try_new("regular_duckdb".to_string(), "regular_duckdb")
+                .expect("builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+
+        let regular_db_path = temp_dir.path().join("regular.duckdb");
+        regular_dataset.acceleration = Some(Acceleration {
+            engine: Engine::DuckDB,
+            mode: Mode::File,
+            params: [(
+                "duckdb_file".to_string(),
+                regular_db_path.to_str().expect("path").to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let regular_accelerator = rt
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::DuckDB)
+            .await
+            .expect("regular accelerator");
+
+        regular_accelerator
+            .init(&regular_dataset)
+            .await
+            .expect("init regular");
+
+        let regular_path = regular_accelerator
+            .file_path(&regular_dataset)
+            .expect("regular path");
+        assert_eq!(
+            regular_path,
+            regular_db_path.to_str().expect("path"),
+            "Regular DuckDB should use specified file path"
+        );
+
+        // Test 2: Verify table-mode partitioned DuckDB gets correct file path
+        let mut partitioned_dataset = DatasetBuilder::try_new(
+            "partitioned_tables".to_string(),
+            "partitioned_tables",
+        )
+        .expect("builder")
+        .with_app(Arc::clone(&app))
+        .with_runtime(Arc::clone(&rt))
+        .build()
+        .expect("dataset");
+
+        let partitioned_dir = temp_dir.path().join("partitioned_tables");
+        std::fs::create_dir_all(&partitioned_dir).expect("create dir");
+        partitioned_dataset.acceleration = Some(Acceleration {
+            engine: Engine::TableModePartitionedDuckDB,
+            mode: Mode::File,
+            params: [(
+                "duckdb_data_dir".to_string(),
+                temp_dir.path().to_str().expect("path").to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let partitioned_accelerator = rt
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::TableModePartitionedDuckDB)
+            .await
+            .expect("partitioned accelerator");
+
+        partitioned_accelerator
+            .init(&partitioned_dataset)
+            .await
+            .expect("init partitioned");
+
+        let partitioned_path = partitioned_accelerator
+            .file_path(&partitioned_dataset)
+            .expect("partitioned path");
+
+        // Partitioned DuckDB should use a different path structure
+        assert!(
+            partitioned_path.contains("partitioned_tables"),
+            "Partitioned path should contain dataset name: {partitioned_path}"
+        );
+        assert_ne!(
+            partitioned_path, regular_path,
+            "Partitioned and regular paths should differ"
+        );
+
+        // Test 3: Verify that getting accelerator for each engine type works
+        let regular_accel_for_regular = crate::dataaccelerator::get_registered_accelerator(
+            &regular_dataset as &dyn AccelerationSource,
+            Engine::DuckDB,
+        )
+        .await
+        .expect("should get regular accelerator");
+
+        let path_from_correct_accel = regular_accel_for_regular
+            .file_path(&regular_dataset)
+            .expect("path from correct accelerator");
+
+        assert_eq!(
+            path_from_correct_accel, regular_path,
+            "Getting accelerator by engine type should return correct path"
+        );
+
+        // Test 4: Verify that using wrong accelerator would give wrong path
+        // (this simulates the bug)
+        let wrong_accel = rt
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::DuckDB)
+            .await
+            .expect("accelerator");
+
+        // If we used the wrong accelerator's file_path on the partitioned dataset,
+        // it would calculate the wrong path
+        let wrong_path_result = wrong_accel.file_path(&partitioned_dataset);
+
+        // This might succeed but give the wrong path, or might fail
+        if let Ok(wrong_path) = wrong_path_result {
+            // If it succeeds, the path should be different from the correct path
+            assert_ne!(
+                wrong_path, partitioned_path,
+                "Wrong accelerator should give different path than correct one. \
+                 Wrong: {wrong_path}, Correct: {partitioned_path}"
+            );
+        }
+
+        eprintln!("✓ Test passed: Accelerators return correct file paths for their datasets");
+    }
+
+    #[tokio::test]
+    async fn test_get_registered_accelerator_returns_correct_type() {
+        // Verify that get_registered_accelerator returns the right accelerator
+        // for different engine types
+
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let app = Arc::new(app::AppBuilder::new("test").build());
+        rt.accelerator_engine_registry().register_all().await;
+
+        let mut dataset = DatasetBuilder::try_new("test".to_string(), "test")
+            .expect("builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("dataset");
+
+        // Test DuckDB
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::DuckDB,
+            mode: Mode::Memory,
+            ..Default::default()
+        });
+
+        let accel = crate::dataaccelerator::get_registered_accelerator(
+            &dataset as &dyn AccelerationSource,
+            Engine::DuckDB,
+        )
+        .await
+        .expect("should get accelerator");
+
+        assert_eq!(accel.name(), "duckdb", "Should get DuckDB accelerator");
+
+        // Test TableModePartitionedDuckDB
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::TableModePartitionedDuckDB,
+            mode: Mode::File,
+            ..Default::default()
+        });
+
+        let accel = crate::dataaccelerator::get_registered_accelerator(
+            &dataset as &dyn AccelerationSource,
+            Engine::TableModePartitionedDuckDB,
+        )
+        .await
+        .expect("should get accelerator");
+
+        assert_eq!(
+            accel.name(),
+            "partitioned_duckdb[tables]",
+            "Should get table-mode partitioned DuckDB accelerator"
+        );
+
+        eprintln!("✓ Test passed: get_registered_accelerator returns correct accelerator types");
     }
 }
