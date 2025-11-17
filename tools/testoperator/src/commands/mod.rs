@@ -48,6 +48,7 @@ use crate::args::CommonArgs;
 /// 1. Loads the query set from args
 /// 2. Applies query overrides if specified
 /// 3. Adds validation data for scenario queries when validation is enabled
+/// 4. Adds reference schema for validation against known good tables
 ///
 /// # Returns
 /// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
@@ -70,6 +71,11 @@ pub(crate) fn build_test_with_validation(
             query_set.get_validation_data(args.scenario_query_file.as_deref())?
     {
         test_builder = test_builder.with_validation_data(validation_data);
+    }
+
+    // Add reference schema if provided for validation against known good tables
+    if let Some(ref_schema) = &args.reference_schema {
+        test_builder = test_builder.with_reference_schema(Some(ref_schema.clone()));
     }
 
     Ok((query_set, test_builder))

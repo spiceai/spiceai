@@ -53,6 +53,8 @@ pub(crate) struct SpiceTestQueryWorker {
     http_client: Option<reqwest::Client>,
     /// Optional custom validation data for scenario queries
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    /// Optional reference schema for validating against known good tables
+    reference_schema: Option<String>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -111,6 +113,7 @@ impl SpiceTestQueryWorker {
             scale_factor: 1.0,
             http_client: None,
             validation_data: None,
+            reference_schema: None,
         }
     }
 
@@ -157,6 +160,11 @@ impl SpiceTestQueryWorker {
         validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Self {
         self.validation_data = Some(validation_data);
+        self
+    }
+
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
         self
     }
 
@@ -527,15 +535,100 @@ impl SpiceTestQueryWorker {
         }
 
         if validate {
-            // Validate the query results
+            // Execute reference query if reference_schema is provided
+            let reference_batches = if let Some(ref_schema) = &self.reference_schema {
+                let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
+                println!(
+                    "Worker {} - Query '{}' - Executing reference query against {}.* tables",
+                    self.id, query.name, ref_schema
+                );
+
+                let mut ref_result_stream = spice_client
+                    .query_with_params(
+                        &reference_query.sql,
+                        reference_query.get_parameters_batch().transpose()?,
+                    )
+                    .await?;
+
+                let mut ref_batches = vec![];
+                while let Some(batch) = ref_result_stream.try_next().await? {
+                    ref_batches.push(batch);
+                }
+                Some(ref_batches)
+            } else {
+                None
+            };
+
+            // Validate against reference query results if available
+            if let Some(ref_batches) = reference_batches {
+                let validation_result = validation::validate_with_expected_batches(
+                    &query.name,
+                    &validation_records,
+                    &ref_batches,
+                )?;
+
+                if let QueryValidationResult::Fail(validation_reason) = validation_result {
+                    eprintln!(
+                        "\n{} FAIL - Worker {} - Query '{}' reference validation failed",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name
+                    );
+                    eprintln!("Query SQL: {}", query.sql);
+                    eprintln!("Validation failure reason: {validation_reason:?}");
+                    eprintln!("\nExpected results (from reference schema):");
+                    match arrow::util::pretty::pretty_format_batches(&ref_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                    eprintln!("\nActual results:");
+                    match arrow::util::pretty::pretty_format_batches(&validation_records) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                    }
+                    eprintln!();
+                    return Err(anyhow::anyhow!(
+                        "Query reference validation failed: {validation_reason:?}"
+                    ));
+                }
+            }
+
+            // Also validate using existing validation logic (TPCH or custom validation data)
             let validation_result = self.validate_query_results(query, &validation_records)?;
+
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
+                    "\n{} FAIL - Worker {} - Query '{}' validation failed",
                     chrono::Utc::now(),
                     self.id,
                     query.name
                 );
+                eprintln!("Query SQL: {}", query.sql);
+                eprintln!("Validation failure reason: {validation_reason:?}");
+
+                // Print expected results based on validation source
+                if let Some(validation_data) = &self.validation_data
+                    && let Some(expected_batches) = validation_data.get(&query.name)
+                {
+                    eprintln!("\nExpected results (from custom validation data):");
+                    match arrow::util::pretty::pretty_format_batches(expected_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                } else {
+                    eprintln!(
+                        "\nExpected results: See TPCH specification for query {}",
+                        query.name
+                    );
+                }
+
+                eprintln!("\nActual results:");
+                match arrow::util::pretty::pretty_format_batches(&validation_records) {
+                    Ok(pretty) => eprintln!("{pretty}"),
+                    Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                }
+                eprintln!();
+
                 return Err(anyhow::anyhow!(
                     "Query validation failed: {validation_reason:?}"
                 ));

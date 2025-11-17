@@ -70,6 +70,7 @@ pub struct NotStarted {
     scale_factor: f64,
     http_client: bool,
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    reference_schema: Option<String>,
 }
 
 impl NotStarted {
@@ -127,6 +128,12 @@ impl NotStarted {
         validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Self {
         self.validation_data = Some(validation_data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
         self
     }
 }
@@ -224,6 +231,10 @@ impl SpiceTest<NotStarted> {
 
             if let Some(validation_data) = &self.state.validation_data {
                 worker = worker.with_validation_data(validation_data.clone());
+            }
+
+            if let Some(reference_schema) = &self.state.reference_schema {
+                worker = worker.with_reference_schema(Some(reference_schema.clone()));
             }
 
             query_workers.push(worker.start());
