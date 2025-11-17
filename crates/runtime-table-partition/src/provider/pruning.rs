@@ -2323,13 +2323,13 @@ mod tests {
         // All results should be in range [0, 3)
         if let ScalarValue::Int32(Some(val)) = result_100 {
             assert!(
-                val >= 0 && val < 3,
+                (0..3).contains(&val),
                 "bucket result should be in [0, 3), got {val}"
             );
         }
         if let ScalarValue::Int32(Some(val)) = result_200 {
             assert!(
-                val >= 0 && val < 3,
+                (0..3).contains(&val),
                 "bucket result should be in [0, 3), got {val}"
             );
         }
@@ -2456,6 +2456,8 @@ mod tests {
 
     #[test]
     fn test_transform_and_evaluate_date_part() -> Result<(), DataFusionError> {
+        use datafusion::functions::datetime::date_part;
+
         let schema = Schema::new(vec![Field::new(
             "timestamp",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -2463,7 +2465,6 @@ mod tests {
         )]);
 
         // Use the correct function for date extraction
-        use datafusion::functions::datetime::date_part;
         let date_part_udf = date_part();
         let partition_expr = Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::clone(&date_part_udf),
