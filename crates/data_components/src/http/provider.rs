@@ -1059,21 +1059,20 @@ impl HttpTableProvider {
                 .map_err(DataFusionError::from)?;
         }
 
-        let (paths, _queries, _bodies) = accumulator.finalize();
+        let (paths, queries, bodies) = accumulator.finalize();
 
-        // Create partitions only from paths, not from query/body combinations
-        // Query and body filters will be applied by DataFusion's FilterExec
-        // Paths are already deduplicated and sorted by the accumulator
-        let partitions = paths
-            .into_iter()
-            .map(|path| {
-                (
-                    if path.is_empty() { None } else { Some(path) },
-                    None, // No query in partition spec
-                    None, // No body in partition spec
-                )
-            })
-            .collect();
+        let mut partitions = vec![];
+        for p in &paths {
+            for q in &queries {
+                for b in &bodies {
+                    partitions.push((
+                        if p.is_empty() { None } else { Some(p.clone()) },
+                        q.clone(),
+                        b.clone(),
+                    ));
+                }
+            }
+        }
 
         Ok(partitions)
     }
@@ -1394,7 +1393,11 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/singlesearch/shows".to_string()), None, None)
+            (
+                Some("/singlesearch/shows".to_string()),
+                Some("q=South%20Park".to_string()),
+                None
+            )
         );
     }
 
@@ -1503,8 +1506,9 @@ mod tests {
 
         // Query filters don't create partitions, only path filters do
         // This will create a single partition with no path
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (None, None, None));
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0], (None, Some("limit=10".to_string()), None));
+        assert_eq!(partitions[1], (None, Some("limit=20".to_string()), None));
     }
 
     #[test]
@@ -1569,8 +1573,23 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         // Only path creates partition; query filters are validated but don't create separate partitions
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(
+            partitions[0],
+            (
+                Some("/api/users".to_string()),
+                Some("limit=10".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            partitions[1],
+            (
+                Some("/api/users".to_string()),
+                Some("limit=20".to_string()),
+                None
+            )
+        );
     }
 
     #[test]
