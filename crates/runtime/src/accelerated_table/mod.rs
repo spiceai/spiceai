@@ -115,7 +115,7 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table. Is the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table: {source}. Is the 'time_column' parameter correct?"
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
