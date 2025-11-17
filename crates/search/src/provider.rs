@@ -391,9 +391,16 @@ impl TableProvider for SearchQueryProvider {
         }
 
         // Add `match` only if its a chunked search field.
-        if fields_map.contains_key(&ChunkedSearchIndex::chunking_offset_col(
-            self.search_column.as_str(),
-        )) && fields_map.contains_key(&self.search_column)
+        if self
+            .search_index_query
+            .schema()
+            .has_column_with_unqualified_name(&ChunkedSearchIndex::chunking_offset_col(
+                self.search_column.as_str(),
+            ))
+            && self
+                .search_index_query
+                .schema()
+                .has_column_with_unqualified_name(&self.search_column)
         {
             fields_map.insert(
                 SEARCH_MATCH_COLUMN_NAME.to_string(),
