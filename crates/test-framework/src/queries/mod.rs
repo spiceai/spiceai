@@ -183,6 +183,59 @@ impl Query {
             create_param_batch(columns)
         })
     }
+
+    /// Rewrite table references in the query to use a reference schema.
+    /// This is used for validation against known good tables.
+    ///
+    /// For example, if `reference_schema` is \"arrow\", the query:
+    ///   `SELECT * FROM customer WHERE c_custkey = 1`
+    /// becomes:
+    ///   `SELECT * FROM arrow.customer WHERE c_custkey = 1`
+    ///
+    /// Uses `DataFusion`'s SQL parser to parse the query, rewrite all table references,
+    /// and unparse back to SQL. This works with any valid SQL query.
+    #[must_use]
+    pub fn rewrite_with_reference_schema(&self, reference_schema: &str) -> Self {
+        use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
+        use datafusion::sql::sqlparser::parser::Parser;
+        use std::ops::ControlFlow;
+
+        // Parse the SQL query using sqlparser
+        let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
+        let Ok(mut statements) = Parser::parse_sql(&dialect, &self.sql) else {
+            // If parsing fails, return the original query unchanged
+            return self.clone();
+        };
+
+        // Should have exactly one statement
+        if statements.len() != 1 {
+            return self.clone();
+        }
+
+        let statement = &mut statements[0];
+
+        // Visit and rewrite all table references in the statement
+        let _ = visit_relations_mut(statement, |table_name| {
+            // Only rewrite if the table doesn't already have a schema prefix (single-part name)
+            if table_name.0.len() == 1 {
+                // Prepend the reference schema to the table name
+                table_name
+                    .0
+                    .insert(0, ObjectNamePart::Identifier(Ident::new(reference_schema)));
+            }
+            ControlFlow::<()>::Continue(())
+        });
+
+        // Unparse the modified statement back to SQL
+        let rewritten_sql = statement.to_string();
+
+        Self {
+            name: Arc::clone(&self.name),
+            sql: Arc::from(rewritten_sql),
+            overridden: self.overridden,
+            parameters: self.parameters.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
