@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]-partitioned
+name: s3[parquet]-cayenne[file]-partitioned
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer.parquet
     name: customer
@@ -13,7 +13,7 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       partition_by:
         - bucket(5, c_name)
@@ -24,7 +24,7 @@ datasets:
     params: *s3_params
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       partition_by:
         - date_part('year', l_shipdate)
@@ -35,14 +35,14 @@ datasets:
     params: *s3_params
     acceleration: &acceleration
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
   - from: s3://benchmarks/tpch_sf1/orders.parquet
     name: orders
     params: *s3_params
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       partition_by:
         - bucket(5, o_custkey)
