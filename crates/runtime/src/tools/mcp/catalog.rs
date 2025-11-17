@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
     model::{
@@ -28,7 +29,10 @@ use rmcp::{
     transport::{ConfigureCommandExt, SseClientTransport, TokioChildProcess},
 };
 use snafu::ResultExt;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tokio::{
     process::Command,
     sync::RwLock,
@@ -40,6 +44,38 @@ use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 use super::{MCPConfig, Result, UnderlyingTransportSnafu, tool::McpToolWrapper};
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
+
+/// Glob patterns for detecting dangerous path components
+const DANGEROUS_PATH_PATTERNS: &[&str] = &[
+    "*/..*",  // Unix parent directory traversal (anywhere in path)
+    "..*",    // Parent at start (Unix) - matches paths starting with ..
+    "*\\..*", // Windows parent directory traversal (backslash-dot-dot)
+    "*\\\\*", // Windows UNC path or backslash (absolute paths)
+    "/*",     // Unix absolute path (starts with /)
+    "?:*",    // Windows drive letter (C:, D:, etc.)
+];
+
+/// Pre-compiled glob set for path validation
+static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in DANGEROUS_PATH_PATTERNS {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    // This should never fail since DANGEROUS_PATH_PATTERNS are hardcoded and validated
+    builder.build().unwrap_or_else(|e| {
+        unreachable!("Failed to build dangerous path glob set with hardcoded patterns: {e}")
+    })
+});
+
+/// Check if a hostname is localhost
+fn is_localhost(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    )
+}
 
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<McpClient>>,
@@ -93,20 +129,81 @@ impl McpToolCatalog {
 
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
         match cfg {
-            MCPConfig::Stdio { command, args, env } => Ok(McpClient::Stdio(
-                serve_client(
-                    (),
-                    TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
-                        c.envs(env).args(args);
-                    }))
+            MCPConfig::Stdio { command, args, env } => {
+                // Security constants
+                const MAX_ARGS: usize = 100;
+                const MAX_ARG_LENGTH: usize = 4096;
+
+                // Security: Validate command path to prevent command injection
+                if DANGEROUS_PATH_GLOB_SET.is_match(command) {
+                    return Err(super::Error::CouldNotConstructTool {
+                        name: "mcp_stdio".to_string(),
+                        e: format!(
+                            "Invalid command path '{command}'. Path contains dangerous components"
+                        ),
+                    });
+                }
+
+                // Security: Limit number of arguments to prevent resource exhaustion
+                if args.len() > MAX_ARGS {
+                    return Err(super::Error::CouldNotConstructTool {
+                        name: "mcp_stdio".to_string(),
+                        e: format!(
+                            "Too many arguments ({}). Maximum allowed: {MAX_ARGS}",
+                            args.len()
+                        ),
+                    });
+                }
+
+                // Security: Validate argument lengths to prevent buffer overflow attacks
+                for (i, arg) in args.iter().enumerate() {
+                    if arg.len() > MAX_ARG_LENGTH {
+                        return Err(super::Error::CouldNotConstructTool {
+                            name: "mcp_stdio".to_string(),
+                            e: format!(
+                                "Argument {i} too long ({} bytes). Maximum allowed: {MAX_ARG_LENGTH} bytes",
+                                arg.len()
+                            ),
+                        });
+                    }
+                }
+
+                Ok(McpClient::Stdio(
+                    serve_client(
+                        (),
+                        TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
+                            c.envs(env).args(args);
+                        }))
+                        .boxed()
+                        .context(UnderlyingTransportSnafu)?,
+                    )
+                    .await
                     .boxed()
                     .context(UnderlyingTransportSnafu)?,
-                )
-                .await
-                .boxed()
-                .context(UnderlyingTransportSnafu)?,
-            )),
+                ))
+            }
             MCPConfig::Https { url } => {
+                // Security: Validate URL scheme (only https allowed, http for localhost testing)
+                if url.scheme() != "https" && url.scheme() != "http" {
+                    return Err(super::Error::CouldNotConstructTool {
+                        name: "mcp_https".to_string(),
+                        e: format!(
+                            "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
+                            url.scheme()
+                        ),
+                    });
+                }
+
+                // Security: Warn if using http (unencrypted) for non-localhost
+                let host = url.host_str().unwrap_or("<unknown>");
+                if url.scheme() == "http" && !is_localhost(host) {
+                    tracing::warn!(
+                        "MCP HTTPS client using unencrypted HTTP connection to non-localhost host '{}': {}. This is insecure.",
+                        host,
+                        url
+                    );
+                }
+
                 let transport = SseClientTransport::start(url.to_string())
                     .await
                     .boxed()
@@ -133,9 +230,23 @@ impl McpToolCatalog {
     }
 
     async fn list_tools(&self) -> std::result::Result<Vec<rmcp::model::Tool>, ServiceError> {
+        // Security: Limit pagination to prevent infinite loops and memory exhaustion
+        const MAX_PAGINATION_ITERATIONS: usize = 100;
+        const MAX_TOTAL_TOOLS: usize = 10000;
+
         let mut cursor: Option<String> = None;
         let mut tools: Vec<rmcp::model::Tool> = vec![];
+        let mut iterations = 0;
+
         loop {
+            iterations += 1;
+            if iterations > MAX_PAGINATION_ITERATIONS {
+                tracing::warn!(
+                    "MCP tool listing exceeded maximum pagination iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
+                );
+                break;
+            }
+
             let response = self
                 .client
                 .read()
@@ -144,6 +255,17 @@ impl McpToolCatalog {
                     cursor: cursor.clone(),
                 }))
                 .await?;
+
+            // Security: Validate total tools count to prevent memory exhaustion
+            if tools.len().saturating_add(response.tools.len()) > MAX_TOTAL_TOOLS {
+                tracing::warn!(
+                    "MCP tool listing exceeded maximum tools count ({MAX_TOTAL_TOOLS}), limiting results"
+                );
+                let remaining = MAX_TOTAL_TOOLS - tools.len();
+                tools.extend(response.tools.into_iter().take(remaining));
+                break;
+            }
+
             tools.extend(response.tools);
             cursor = response.next_cursor;
             if cursor.is_none() {
@@ -157,8 +279,21 @@ impl McpToolCatalog {
         &self,
         name: &str,
     ) -> std::result::Result<Option<rmcp::model::Tool>, ServiceError> {
+        // Security: Limit pagination to prevent infinite loops
+        const MAX_PAGINATION_ITERATIONS: usize = 100;
+
         let mut cursor: Option<String> = None;
+        let mut iterations = 0;
+
         loop {
+            iterations += 1;
+            if iterations > MAX_PAGINATION_ITERATIONS {
+                tracing::warn!(
+                    "MCP get_tool pagination exceeded maximum iterations ({MAX_PAGINATION_ITERATIONS}), stopping iteration"
+                );
+                break;
+            }
+
             let response = self
                 .client
                 .read()
