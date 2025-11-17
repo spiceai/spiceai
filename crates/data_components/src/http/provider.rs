@@ -1998,11 +1998,21 @@ mod tests {
         let content = content_col.value(0);
         assert!(content.contains("userId"), "Should contain userId field");
         assert!(
-            content.contains("\"id\"") && content.contains("1"),
+            content.contains("\"id\"") && content.contains('1'),
             "Should contain id field with value 1"
         );
         assert!(content.contains("title"), "Should contain title field");
         assert!(content.contains("body"), "Should contain body field");
+
+        // Validate actual field values from the API
+        assert!(
+            content.contains("sunt aut facere repellat provident"),
+            "Should contain expected title text"
+        );
+        assert!(
+            content.contains("quia et suscipit"),
+            "Should contain expected body text"
+        );
     }
 
     #[tokio::test]
@@ -2031,10 +2041,11 @@ mod tests {
         let results = df.collect().await.expect("collect should succeed");
         assert!(!results.is_empty(), "Should have results");
 
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
 
         // Verify content contains expected post IDs
+        let mut found_posts = [false, false, false]; // Track posts 1, 2, 3
         for batch in &results {
             let content_col = batch
                 .column(1)
@@ -2047,8 +2058,21 @@ mod tests {
                 assert!(content.contains("userId"), "Should contain userId field");
                 assert!(content.contains("id"), "Should contain id field");
                 assert!(content.contains("title"), "Should contain title field");
+
+                // Check which post this is by title
+                if content.contains("sunt aut facere repellat provident") {
+                    found_posts[0] = true;
+                } else if content.contains("qui est esse") {
+                    found_posts[1] = true;
+                } else if content.contains("ea molestias quasi exercitationem") {
+                    found_posts[2] = true;
+                }
             }
         }
+
+        assert!(found_posts[0], "Should have found post 1");
+        assert!(found_posts[1], "Should have found post 2");
+        assert!(found_posts[2], "Should have found post 3");
     }
     #[tokio::test]
     async fn test_integration_jsonplaceholder_all_posts() {
@@ -2073,7 +2097,7 @@ mod tests {
         assert!(!results.is_empty(), "Should have results");
 
         // JSONPlaceholder /posts returns exactly 100 posts as a JSON array
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(
             total_rows, 100,
             "Should have exactly 100 posts from /posts endpoint"
@@ -2092,6 +2116,35 @@ mod tests {
         assert!(first_post.contains("id"), "Should contain id field");
         assert!(first_post.contains("title"), "Should contain title field");
         assert!(first_post.contains("body"), "Should contain body field");
+
+        // Validate first post has expected values
+        assert!(
+            first_post.contains("sunt aut facere repellat provident"),
+            "First post should have expected title"
+        );
+
+        // Verify we can find a post with id 100 (last post)
+        let mut found_last_post = false;
+        for batch in &results {
+            let content_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                // Last post has id 100
+                if content.contains("\"id\"")
+                    && content.contains("100")
+                    && !content.contains("1000")
+                {
+                    found_last_post = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_last_post, "Should have found post with id 100");
     }
     #[tokio::test]
     async fn test_integration_tvmaze_single_show() {
@@ -2128,7 +2181,7 @@ mod tests {
         let content = content_col.value(0);
         assert!(content.starts_with('{'), "Should be JSON object");
         assert!(
-            content.contains("\"id\"") && content.contains("1"),
+            content.contains("\"id\"") && content.contains('1'),
             "Should contain id field with value 1"
         );
         assert!(
@@ -2138,6 +2191,18 @@ mod tests {
         assert!(content.contains("url"), "Should contain url field");
         assert!(content.contains("genres"), "Should contain genres field");
         assert!(content.contains("summary"), "Should contain summary field");
+
+        // Validate specific field values
+        assert!(content.contains("Scripted"), "Should have type 'Scripted'");
+        assert!(content.contains("Drama"), "Should have Drama genre");
+        assert!(
+            content.contains("Science-Fiction"),
+            "Should have Science-Fiction genre"
+        );
+        assert!(
+            content.contains("sealed off from the rest of the world"),
+            "Should contain expected summary text"
+        );
     }
 
     #[tokio::test]
@@ -2166,11 +2231,15 @@ mod tests {
         let results = df.collect().await.expect("collect should succeed");
         assert!(!results.is_empty(), "Should have results");
 
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 shows");
 
         // Collect all show names to verify we got the right shows
         let mut show_names = Vec::new();
+        let mut found_under_dome = false;
+        let mut found_person_interest = false;
+        let mut found_game_thrones = false;
+
         for batch in &results {
             let content_col = batch
                 .column(1)
@@ -2182,27 +2251,36 @@ mod tests {
                 let content = content_col.value(i);
                 if content.contains("Under the Dome") {
                     show_names.push("Under the Dome");
+                    // Validate Under the Dome specific values
+                    assert!(content.contains("\"id\"") && content.contains('1'));
+                    assert!(content.contains("Drama"));
+                    assert!(content.contains("Science-Fiction"));
+                    found_under_dome = true;
                 } else if content.contains("Person of Interest") {
                     show_names.push("Person of Interest");
+                    // Validate Person of Interest specific values
+                    assert!(content.contains("\"id\"") && content.contains('2'));
+                    assert!(content.contains("Action"));
+                    assert!(content.contains("Crime"));
+                    found_person_interest = true;
                 } else if content.contains("Game of Thrones") {
                     show_names.push("Game of Thrones");
+                    // Validate Game of Thrones specific values
+                    assert!(content.contains("\"id\"") && content.contains("82"));
+                    assert!(content.contains("Fantasy"));
+                    assert!(content.contains("Adventure"));
+                    found_game_thrones = true;
                 }
             }
         }
 
         assert_eq!(show_names.len(), 3, "Should have found all 3 shows");
+        assert!(found_under_dome, "Should have found Under the Dome");
         assert!(
-            show_names.contains(&"Under the Dome"),
-            "Should have Under the Dome"
+            found_person_interest,
+            "Should have found Person of Interest"
         );
-        assert!(
-            show_names.contains(&"Person of Interest"),
-            "Should have Person of Interest"
-        );
-        assert!(
-            show_names.contains(&"Game of Thrones"),
-            "Should have Game of Thrones"
-        );
+        assert!(found_game_thrones, "Should have found Game of Thrones");
     }
     #[tokio::test]
     async fn test_integration_tvmaze_projection() {
@@ -2243,6 +2321,13 @@ mod tests {
             "Should be Under the Dome"
         );
         assert!(content.contains("genres"), "Should contain genres field");
+
+        // Validate specific values in the projection
+        assert!(content.contains("Drama"), "Should contain Drama genre");
+        assert!(
+            content.contains("Science-Fiction"),
+            "Should contain Science-Fiction genre"
+        );
     }
 
     #[tokio::test]
@@ -2257,6 +2342,47 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_table("shows", Arc::new(provider))
             .expect("register table");
+
+        // First validate that we get the actual content before testing aggregation
+        let df_content = ctx
+            .sql("SELECT content FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
+            .await
+            .expect("query should succeed");
+
+        let content_results = df_content.collect().await.expect("collect should succeed");
+        assert!(!content_results.is_empty(), "Should have content results");
+
+        let mut found_under_dome = false;
+        let mut found_person_interest = false;
+
+        for batch in &content_results {
+            let content_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                if content.contains("Under the Dome") {
+                    assert!(content.contains("Drama"));
+                    found_under_dome = true;
+                }
+                if content.contains("Person of Interest") {
+                    assert!(content.contains("Action"));
+                    found_person_interest = true;
+                }
+            }
+        }
+
+        assert!(
+            found_under_dome,
+            "Should have found Under the Dome with Drama genre"
+        );
+        assert!(
+            found_person_interest,
+            "Should have found Person of Interest with Action genre"
+        );
 
         // Test count aggregation
         let df = ctx
