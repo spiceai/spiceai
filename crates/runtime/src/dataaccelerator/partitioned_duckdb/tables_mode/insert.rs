@@ -247,16 +247,11 @@ impl BatchPartitioner {
 
         partitions
             .into_iter()
-            .map(|(partition_key, (scalar_value, batch))| {
-                // Use encode_key to handle NULL values consistently (NULL -> "none")
-                let encoded_key = encode_key(&scalar_value).map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "Failed to encode partition key for value {scalar_value}: {e}"
-                    ))
-                })?;
-                // hive-style format: partition_name=value
+            .map(|(partition_key, (_scalar_value, batch))| {
+                // partition_key is already encoded from partition_batch
+                // Format as hive-style: partition_name=encoded_value
                 Ok((
-                    format!("{}={}", self.partitioned_by.name, encoded_key),
+                    format!("{}={}", self.partitioned_by.name, partition_key),
                     batch,
                 ))
             })
