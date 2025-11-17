@@ -87,6 +87,17 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         with:

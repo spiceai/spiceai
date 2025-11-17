@@ -1,0 +1,180 @@
+name: Build Spicepod Validator
+description: 'Builds the spicepod-validator binary with caching based on commit SHA'
+
+inputs:
+  install_to_system_path:
+    description: 'Whether to install spicepod-validator to system path'
+    required: false
+    default: 'true'
+  force_rebuild:
+    description: 'Whether to force a rebuild (skip cache)'
+    required: false
+    default: 'false'
+  download_from_minio:
+    description: 'Whether to try downloading from MinIO before checking GitHub cache'
+    required: false
+    default: 'true'
+  minio_endpoint:
+    description: 'MinIO endpoint for sccache'
+    required: false
+    type: string
+  minio_access_key:
+    description: 'MinIO access key for sccache'
+    required: false
+    type: string
+  minio_secret_key:
+    description: 'MinIO secret key for sccache'
+    required: false
+    type: string
+
+outputs:
+  cache-hit:
+    description: 'Whether the spicepod-validator was found in cache'
+    value: ${{ steps.cache-validator.outputs.cache-hit }}
+  validator-path:
+    description: 'Path to the spicepod-validator binary'
+    value: ${{ steps.set-path.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect OS
+      id: detect-os
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux)
+            echo "os=linux" >> $GITHUB_OUTPUT
+            echo "ext=" >> $GITHUB_OUTPUT
+            ;;
+          macOS)
+            echo "os=darwin" >> $GITHUB_OUTPUT
+            echo "ext=" >> $GITHUB_OUTPUT
+            ;;
+          Windows)
+            echo "os=windows" >> $GITHUB_OUTPUT
+            echo "ext=.exe" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "Unsupported OS: $RUNNER_OS"
+            exit 1
+            ;;
+        esac
+
+    - name: Set validator commit SHA
+      id: commit-sha
+      shell: bash
+      run: |
+        echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+    - name: Download spicepod-validator from MinIO
+      if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
+      id: minio-download
+      shell: bash
+      run: |
+        if mc stat spice-minio/artifacts/spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}; then
+          echo "Found spicepod-validator in MinIO"
+          mkdir -p target/release
+          mc cp spice-minio/artifacts/spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }} target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
+          chmod +x target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
+          echo "found=true" >> $GITHUB_OUTPUT
+        else
+          echo "Spicepod-validator not found in MinIO"
+          echo "found=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Cache spicepod-validator binary
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
+      id: cache-validator
+      uses: actions/cache@v4
+      with:
+        path: |
+          target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
+        key: spicepod-validator-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
+        lookup-only: true
+
+    - name: Setup Rust
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
+      uses: spiceai/spiceai/.github/actions/setup-rust@trunk
+      with:
+        os: ${{ steps.detect-os.outputs.os }}
+
+    - name: Setup cc
+      if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'
+      uses: spiceai/spiceai/.github/actions/setup-cc@trunk
+
+    - name: Check if sccache can be set up
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
+      id: check-sccache
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.minio_endpoint }}" ]; then
+          echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
+          echo "RUSTC_WRAPPER=" >> $GITHUB_OUTPUT
+        else
+          echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up sccache
+      if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
+      uses: spiceai/spiceai/.github/actions/setup-sccache@trunk
+      with:
+        minio_endpoint: ${{ inputs.minio_endpoint }}
+        os: ${{ steps.detect-os.outputs.os }}
+
+    - name: Build spicepod-validator
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
+      shell: bash
+      run: |
+        cargo build -p spicepod-validator --release
+      env:
+        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    - name: Save to cache
+      if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
+        key: spicepod-validator-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
+
+    - name: Upload spicepod-validator to MinIO
+      if: inputs.download_from_minio == 'true' && steps.minio-download.outputs.found != 'true' && (inputs.force_rebuild == 'true' || steps.cache-validator.outputs.cache-hit != 'true')
+      shell: bash
+      run: |
+        mc cp target/release/spicepod-validator${{ steps.detect-os.outputs.ext }} spice-minio/artifacts/spicepod-validator/${{ steps.detect-os.outputs.os }}-x86_64/${{ steps.commit-sha.outputs.sha }}/spicepod-validator${{ steps.detect-os.outputs.ext }}
+
+    - name: Install spicepod-validator to system path (Linux/macOS)
+      if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os != 'windows'
+      shell: bash
+      run: |
+        sudo mkdir -p /usr/local/bin
+        sudo cp target/release/spicepod-validator${{ steps.detect-os.outputs.ext }} /usr/local/bin/spicepod-validator
+        sudo chmod +x /usr/local/bin/spicepod-validator
+
+    - name: Install spicepod-validator to system path (Windows)
+      if: inputs.install_to_system_path == 'true' && steps.detect-os.outputs.os == 'windows'
+      shell: bash
+      run: |
+        mkdir -p /c/usr/local/bin
+        copy target/release/spicepod-validator.exe /c/usr/local/bin/spicepod-validator.exe
+        chmod +x /c/usr/local/bin/spicepod-validator.exe
+
+    - name: Set output path
+      id: set-path
+      shell: bash
+      run: |
+        if [ "${{ inputs.install_to_system_path }}" = "true" ]; then
+          if [ "${{ steps.detect-os.outputs.os }}" = "windows" ]; then
+            echo "path=/c/usr/local/bin/spicepod-validator.exe" >> $GITHUB_OUTPUT
+          else
+            echo "path=/usr/local/bin/spicepod-validator" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "path=${{ github.workspace }}/target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
+        fi

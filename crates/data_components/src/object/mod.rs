@@ -45,7 +45,22 @@ impl ObjectStoreContext {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (prefix, filename_regex_opt) = parse_prefix_and_regex(url, extension)?;
         let filename_regex = filename_regex_opt
-            .map(|regex| Regex::new(&regex).boxed())
+            .map(|regex| {
+                // The Rust `regex` crate uses a finite automaton approach that guarantees
+                // linear time complexity and is immune to catastrophic backtracking (ReDoS).
+                // However, we still limit regex length to prevent resource exhaustion during
+                // compilation and to catch obviously malicious patterns.
+                const MAX_REGEX_LENGTH: usize = 100;
+                if regex.len() > MAX_REGEX_LENGTH {
+                    return Err(format!(
+                        "Regex pattern too long ({} chars). Maximum allowed: {MAX_REGEX_LENGTH}",
+                        regex.len()
+                    )
+                    .into());
+                }
+
+                Regex::new(&regex).boxed()
+            })
             .transpose()?;
 
         Ok(Self {
@@ -139,5 +154,58 @@ mod tests {
         assert_eq!(prefix, "/path/to/file");
         assert_eq!(regex, Some(r"^.*\txt$".to_string()));
         Ok(())
+    }
+
+    #[test]
+    fn test_regex_length_limit() {
+        use super::*;
+        use std::sync::Arc;
+
+        // Create a very long regex pattern
+        let long_pattern = "a".repeat(101);
+        let url = Url::parse("file:///tmp/").expect("valid url");
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let result = ObjectStoreContext::try_new(store, &url, Some(long_pattern));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("should be an error")
+                .to_string()
+                .contains("too long")
+        );
+    }
+
+    #[test]
+    fn test_rust_regex_handles_complex_patterns() {
+        use regex::Regex;
+
+        // The Rust `regex` crate uses a finite automaton that guarantees linear time
+        // and is immune to catastrophic backtracking (ReDoS). These patterns would be
+        // problematic in PCRE/JavaScript regex engines but are safe here.
+        let test_cases = vec![
+            (r"^.*(abc)+xyz$", "testabcabcxyz"), // Pattern with quantifier
+            (r"^.*(a|b)+c$", "aaabbbbc"),        // Alternation with quantifier
+            (r"^.*([a-z]+)@.*$", "user@example.com"), // Character class with quantifier
+            (r"^.*(test)+.*$", "mytesttestfile.txt"), // Multiple quantifiers
+        ];
+
+        for (pattern, test_str) in test_cases {
+            let result = Regex::new(pattern);
+            assert!(
+                result.is_ok(),
+                "Pattern '{}' should compile successfully: {:?}",
+                pattern,
+                result.err()
+            );
+
+            // Verify it actually matches the test string
+            let re = result.expect("regex should compile");
+            assert!(
+                re.is_match(test_str),
+                "Pattern '{pattern}' should match '{test_str}'"
+            );
+        }
     }
 }
