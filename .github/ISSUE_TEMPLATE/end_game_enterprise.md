@@ -58,6 +58,9 @@ assignees: ''
      - Use the [Test Operator Dispatch](https://github.com/spicehq/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `throughput`
        - All other values left empty.
+   - [ ] Verify [Customer Datasets Benchmarks](https://github.com/spicehq/spiceai/actions/workflows/testoperator_customers.yml) are green on the release branch.
+     - Trigger and verify `bench` workflow
+     - Trigger and verify `load` workflow 
 
 1. **Cookbook Recipes**
 
