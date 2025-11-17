@@ -484,7 +484,7 @@ mod tests {
                 let permit = permit.expect("should be Ok");
                 assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
-            () = tokio::time::sleep(Duration::from_nanos(100)) => {
+            () = tokio::time::sleep(Duration::from_millis(10)) => {
                 panic!("Expected to acquire a permit immediately, but timed out.");
             }
         }
