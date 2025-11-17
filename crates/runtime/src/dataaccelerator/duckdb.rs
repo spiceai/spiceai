@@ -1663,18 +1663,11 @@ mod tests {
         accelerator.init(&dataset1).await.expect("init dataset1");
         accelerator.init(&dataset2).await.expect("init dataset2");
 
-        // Store datasets in the runtime by adding them to the app
-        // We need to use unsafe cell to work around the runtime's private methods
-        let datasets = Arc::new(Mutex::new(vec![
-            Arc::new(dataset1),
-            Arc::new(dataset2.clone()),
-        ]));
-
         // Create external table for dataset2
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
-        let mut external_table = CreateExternalTable {
+        let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("dataset2"),
             location: String::new(),
@@ -1697,7 +1690,7 @@ mod tests {
 
         // Before: options should not have attach_databases
         assert!(
-            external_table.options.get("attach_databases").is_none(),
+            !external_table.options.contains_key("attach_databases"),
             "Should not have attach_databases before create_external_table"
         );
 
@@ -1949,6 +1942,7 @@ mod tests {
         eprintln!("✓ Test passed: Dataset correctly excludes itself from attachments");
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_mixed_partitioned_and_regular_duckdb_file_paths() {
         use tempfile::TempDir;
