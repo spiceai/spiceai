@@ -1,6 +1,0 @@
----
-source: crates/runtime-table-partition/tests/partition_table_provider.rs
-assertion_line: 1106
-expression: explain_plan
----
-PartitionMemTableExec: partition_value=20, filters=[age = Int32(20)]

@@ -2281,4 +2281,210 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_transform_and_evaluate_bucket() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Int32, false)]);
+        let partition_expr = bucket_expr(vec![lit(3i64), col("user_id")]);
+        let col_ref = Column::from_name("user_id");
+
+        // Test bucket(3, 221) should evaluate consistently
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int32(Some(221)),
+            &schema,
+        )?;
+        assert!(matches!(result, ScalarValue::Int32(_)));
+
+        // Verify the same value always produces the same result
+        let result2 = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int32(Some(221)),
+            &schema,
+        )?;
+        assert_eq!(result, result2, "bucket should be deterministic");
+
+        // Test different values produce potentially different buckets
+        let result_100 = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int32(Some(100)),
+            &schema,
+        )?;
+        let result_200 = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int32(Some(200)),
+            &schema,
+        )?;
+
+        // All results should be in range [0, 3)
+        if let ScalarValue::Int32(Some(val)) = result_100 {
+            assert!(
+                val >= 0 && val < 3,
+                "bucket result should be in [0, 3), got {val}"
+            );
+        }
+        if let ScalarValue::Int32(Some(val)) = result_200 {
+            assert!(
+                val >= 0 && val < 3,
+                "bucket result should be in [0, 3), got {val}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transform_and_evaluate_truncate() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("sales", DataType::Int64, false)]);
+        let func = Arc::new(ScalarUDF::new_from_impl(truncate::Truncate::new()));
+        let partition_expr = Expr::ScalarFunction(ScalarFunction {
+            func,
+            args: vec![lit(1000i64), col("sales")],
+        });
+        let col_ref = Column::from_name("sales");
+
+        // Test truncate(1000, 1500) = 1000
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int64(Some(1500)),
+            &schema,
+        )?;
+        assert_eq!(result, ScalarValue::Int64(Some(1000)));
+
+        // Test truncate(1000, 2750) = 2000
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int64(Some(2750)),
+            &schema,
+        )?;
+        assert_eq!(result, ScalarValue::Int64(Some(2000)));
+
+        // Test truncate(1000, 999) = 0
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Int64(Some(999)),
+            &schema,
+        )?;
+        assert_eq!(result, ScalarValue::Int64(Some(0)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transform_and_evaluate_date_trunc() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
+        let partition_expr = date_trunc(lit("day"), col("timestamp"));
+        let col_ref = Column::from_name("timestamp");
+
+        // Test date_trunc to day boundary
+        let input_time = timestamp_nanos("2025-01-15 14:30:45");
+        let expected_time = timestamp_nanos("2025-01-15 00:00:00");
+
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::TimestampNanosecond(Some(input_time), None),
+            &schema,
+        )?;
+        assert_eq!(
+            result,
+            ScalarValue::TimestampNanosecond(Some(expected_time), None)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transform_and_evaluate_modulo() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("value", DataType::Int32, false)]);
+        let partition_expr = col("value") % lit(10i32);
+        let col_ref = Column::from_name("value");
+
+        // Test various modulo operations
+        let test_cases = vec![
+            (23, 3),  // 23 % 10 = 3
+            (45, 5),  // 45 % 10 = 5
+            (100, 0), // 100 % 10 = 0
+            (7, 7),   // 7 % 10 = 7
+        ];
+
+        for (input, expected) in test_cases {
+            let result = transform_and_evaluate(
+                &partition_expr,
+                &col_ref,
+                &ScalarValue::Int32(Some(input)),
+                &schema,
+            )?;
+            assert_eq!(
+                result,
+                ScalarValue::Int32(Some(expected)),
+                "modulo({input}, 10) should equal {expected}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transform_and_evaluate_simple_column() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
+        let partition_expr = col("region");
+        let col_ref = Column::from_name("region");
+
+        // Simple column reference should just return the value
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::Utf8(Some("us-east-1".to_string())),
+            &schema,
+        )?;
+        assert_eq!(result, ScalarValue::Utf8(Some("us-east-1".to_string())));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transform_and_evaluate_date_part() -> Result<(), DataFusionError> {
+        let schema = Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
+
+        // Use the correct function for date extraction
+        use datafusion::functions::datetime::date_part;
+        let date_part_udf = date_part();
+        let partition_expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&date_part_udf),
+            vec![lit("year"), col("timestamp")],
+        ));
+        let col_ref = Column::from_name("timestamp");
+
+        // Test extracting year from timestamp
+        let input_time = timestamp_nanos("2024-06-15 14:30:45");
+
+        let result = transform_and_evaluate(
+            &partition_expr,
+            &col_ref,
+            &ScalarValue::TimestampNanosecond(Some(input_time), None),
+            &schema,
+        )?;
+
+        // date_part can return Int32 or Float64 depending on the extracted part
+        // For year, it returns Int32
+        assert_eq!(result, ScalarValue::Int32(Some(2024)));
+
+        Ok(())
+    }
 }
