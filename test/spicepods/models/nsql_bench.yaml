@@ -65,8 +65,8 @@ models:
       hf_token: ${ secrets:SPICE_HF_TOKEN }
       spice_tools: auto
       system_prompt: *system_prompt
-  - name: claude-4-5-sonnet
-    from: anthropic:claude-4-5-sonnet-20250514
+  - name: claude-sonnet-4-5
+    from: anthropic:claude-sonnet-4-5
     params:
       spice_tools: auto
       anthropic_api_key: ${ secrets:SPICE_ANTHROPIC_API_KEY }

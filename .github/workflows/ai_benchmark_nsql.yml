@@ -15,7 +15,7 @@ on:
           - 'o1'
           - 'o3-mini'
           - 'llama3-3B-Instruct'
-          - 'claude-4-5-sonnet'
+          - 'claude-sonnet-4-5'
           - 'grok3'
           - 'grok4'
         default: 'all'
@@ -91,7 +91,7 @@ jobs:
               { name: "o1" },
               { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
-              { name: "claude-4-5-sonnet" },
+              { name: "claude-sonnet-4-5" },
               { name: "grok3" },
               { name: "grok4" },
             ];
