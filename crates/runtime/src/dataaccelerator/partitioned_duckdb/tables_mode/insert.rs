@@ -245,12 +245,21 @@ impl BatchPartitioner {
     ) -> Result<HashMap<String, RecordBatch>, DataFusionError> {
         let partitions = partition_batch(batch, self.physical_expr.as_ref())?;
 
-        Ok(partitions
+        partitions
             .into_iter()
-            .map(|(partition, (_scalar_value, batch))| {
-                // hive-style format
-                (format!("{}={partition}", self.partitioned_by.name), batch)
+            .map(|(partition_key, (scalar_value, batch))| {
+                // Use encode_key to handle NULL values consistently (NULL -> "none")
+                let encoded_key = encode_key(&scalar_value).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to encode partition key for value {scalar_value}: {e}"
+                    ))
+                })?;
+                // hive-style format: partition_name=value
+                Ok((
+                    format!("{}={}", self.partitioned_by.name, encoded_key),
+                    batch,
+                ))
             })
-            .collect::<HashMap<_, _>>())
+            .collect::<Result<HashMap<_, _>, DataFusionError>>()
     }
 }
