@@ -226,12 +226,12 @@ impl TableProvider for PartitionTableProvider {
         //   - WHERE user_id = 100 SHOULD be a data filter (partition only determines bucket)
         let data_filters: Vec<_> = filters
             .iter()
-            .filter(|filter| {
+            .zip(filter_columns_cache.iter())
+            .filter(|(_filter, filter_cols)| {
                 // If the partition expression is just a simple column reference,
                 // and this filter is on that exact column, exclude it from data filters
                 if let Expr::Column(partition_col) = &self.partition_by.expression {
                     // Check if this filter references only the partition column
-                    let filter_cols = filter.column_refs();
                     if filter_cols.len() == 1 && filter_cols.iter().next() == Some(&partition_col) {
                         return false; // Exclude from data filters
                     }
@@ -239,7 +239,7 @@ impl TableProvider for PartitionTableProvider {
                 // For all other cases (transform expressions, multiple columns, etc.), keep as data filter
                 true
             })
-            .cloned()
+            .map(|(filter, _)| filter.clone())
             .collect();
 
         let partitions = self.partitions.read().await;
