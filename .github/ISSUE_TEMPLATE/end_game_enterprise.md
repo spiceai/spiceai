@@ -60,7 +60,7 @@ assignees: ''
        - All other values left empty.
    - [ ] Verify [Customer Datasets Benchmarks](https://github.com/spicehq/spiceai/actions/workflows/testoperator_customers.yml) are green on the release branch.
      - Trigger and verify `bench` workflow
-     - Trigger and verify `load` workflow 
+     - Trigger and verify `load` workflow
 
 1. **Cookbook Recipes**
 
