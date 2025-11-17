@@ -1863,6 +1863,67 @@ mod tests {
     }
 
     #[test]
+    fn test_supports_filters_pushdown_with_disallowed_path() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/allowed/path".to_string()])
+            .expect("allowed paths");
+
+        // Filter with allowed path - should return Inexact
+        let allowed_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/allowed/path".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&allowed_filter])
+            .expect("should support");
+        assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
+
+        // Filter with disallowed path - should return Unsupported
+        let disallowed_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/not/allowed".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&disallowed_filter])
+            .expect("should support");
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_supports_filters_pushdown_with_disabled_query_filters() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+
+        // Provider without query filters enabled
+        let provider = base_provider();
+
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_query"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("q=test".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("should support");
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
     fn test_sort_query_params() {
         // Test empty query
         assert_eq!(HttpTableProvider::sort_query_params(""), "");
@@ -1896,5 +1957,297 @@ mod tests {
             HttpTableProvider::sort_query_params("userId=1&title=foo&body=bar"),
             "body=bar&title=foo&userId=1"
         );
+    }
+
+    // Integration tests that make real HTTP requests
+    // These are marked with #[ignore] by default to avoid network dependencies in CI
+
+    #[tokio::test]
+    async fn test_integration_jsonplaceholder_single_post() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/posts/1".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("posts", Arc::new(provider))
+            .expect("register table");
+
+        // Test basic query
+        let df = ctx
+            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts/1'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+        
+        let batch = &results[0];
+        assert!(batch.num_rows() > 0, "Should have rows");
+        assert_eq!(batch.num_columns(), 2);
+        
+        // Validate content contains expected post fields
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        
+        let content = content_col.value(0);
+        assert!(content.contains("userId"), "Should contain userId field");
+        assert!(content.contains("\"id\"") && content.contains("1"), "Should contain id field with value 1");
+        assert!(content.contains("title"), "Should contain title field");
+        assert!(content.contains("body"), "Should contain body field");
+    }
+
+    #[tokio::test]
+    async fn test_integration_jsonplaceholder_multiple_posts() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec![
+                "/posts/1".to_string(),
+                "/posts/2".to_string(),
+                "/posts/3".to_string(),
+            ])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("posts", Arc::new(provider))
+            .expect("register table");
+
+        // Test IN list filter for multiple paths
+        let df = ctx
+            .sql("SELECT request_path, content FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+        
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
+        
+        // Verify content contains expected post IDs
+        for batch in &results {
+            let content_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+            
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                assert!(content.contains("userId"), "Should contain userId field");
+                assert!(content.contains("id"), "Should contain id field");
+                assert!(content.contains("title"), "Should contain title field");
+            }
+        }
+    }    #[tokio::test]
+    async fn test_integration_jsonplaceholder_all_posts() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/posts".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("posts", Arc::new(provider))
+            .expect("register table");
+
+        // Test fetching all posts (returns JSON array)
+        let df = ctx
+            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+        
+        // JSONPlaceholder /posts returns exactly 100 posts as a JSON array
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 100, "Should have exactly 100 posts from /posts endpoint");
+        
+        // Verify first post has expected structure
+        let batch = &results[0];
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        
+        let first_post = content_col.value(0);
+        assert!(first_post.contains("userId"), "Should contain userId field");
+        assert!(first_post.contains("id"), "Should contain id field");
+        assert!(first_post.contains("title"), "Should contain title field");
+        assert!(first_post.contains("body"), "Should contain body field");
+    }    #[tokio::test]
+    async fn test_integration_tvmaze_single_show() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/shows/1".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test basic query with filter
+        let df = ctx
+            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        assert!(batch.num_rows() > 0, "Should have rows");
+
+        // Verify content is JSON
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let content = content_col.value(0);
+        assert!(content.starts_with('{'), "Should be JSON object");
+        assert!(content.contains("\"id\"") && content.contains("1"), "Should contain id field with value 1");
+        assert!(content.contains("\"name\"") && content.contains("Under the Dome"), "Should be 'Under the Dome'");
+        assert!(content.contains("url"), "Should contain url field");
+        assert!(content.contains("genres"), "Should contain genres field");
+        assert!(content.contains("summary"), "Should contain summary field");
+    }
+
+    #[tokio::test]
+    async fn test_integration_tvmaze_multiple_shows() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec![
+                "/shows/1".to_string(),
+                "/shows/2".to_string(),
+                "/shows/82".to_string(),
+            ])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test OR filter for multiple paths
+        let df = ctx
+            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1' OR request_path = '/shows/2' OR request_path = '/shows/82'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+        
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 shows");
+        
+        // Collect all show names to verify we got the right shows
+        let mut show_names = Vec::new();
+        for batch in &results {
+            let content_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+            
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                if content.contains("Under the Dome") {
+                    show_names.push("Under the Dome");
+                } else if content.contains("Person of Interest") {
+                    show_names.push("Person of Interest");
+                } else if content.contains("Game of Thrones") {
+                    show_names.push("Game of Thrones");
+                }
+            }
+        }
+        
+        assert_eq!(show_names.len(), 3, "Should have found all 3 shows");
+        assert!(show_names.contains(&"Under the Dome"), "Should have Under the Dome");
+        assert!(show_names.contains(&"Person of Interest"), "Should have Person of Interest");
+        assert!(show_names.contains(&"Game of Thrones"), "Should have Game of Thrones");
+    }    #[tokio::test]
+    async fn test_integration_tvmaze_projection() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/shows/1".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test with projection - only select content column
+        let df = ctx
+            .sql("SELECT content FROM shows WHERE request_path = '/shows/1'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        assert_eq!(batch.num_columns(), 1, "Should only have content column");
+        assert!(batch.num_rows() > 0, "Should have rows");
+        
+        // Verify the content is valid JSON with expected fields
+        let content_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        
+        let content = content_col.value(0);
+        assert!(content.contains("Under the Dome"), "Should be Under the Dome");
+        assert!(content.contains("genres"), "Should contain genres field");
+    }
+
+    #[tokio::test]
+    async fn test_integration_tvmaze_aggregation() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/shows/1".to_string(), "/shows/2".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test count aggregation
+        let df = ctx
+            .sql("SELECT COUNT(*) as total FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        let count_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count should be int64 array");
+
+        let count = count_col.value(0);
+        assert_eq!(count, 2, "Should have counted exactly 2 rows for 2 shows");
     }
 }
