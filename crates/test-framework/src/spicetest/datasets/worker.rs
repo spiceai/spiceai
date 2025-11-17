@@ -537,7 +537,7 @@ impl SpiceTestQueryWorker {
         if validate {
             // Execute reference query if reference_schema is provided
             let reference_batches = if let Some(ref_schema) = &self.reference_schema {
-                let reference_query = query.rewrite_with_reference_schema(ref_schema);
+                let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
                 println!(
                     "Worker {} - Query '{}' - Executing reference query against {}.* tables",
                     self.id, query.name, ref_schema
