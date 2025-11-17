@@ -10,13 +10,11 @@ on:
         type: choice
         options:
           - 'all'
-          - 'gpt-5'
+          - 'gpt-5.1'
           - 'gpt-5-mini'
-          - 'o1'
           - 'o3-mini'
           - 'llama3-3B-Instruct'
           - 'claude-sonnet-4-5'
-          - 'grok3'
           - 'grok4'
         default: 'all'
   schedule:
@@ -86,13 +84,11 @@ jobs:
         with:
           script: |
             const matrix = [
-              { name: "gpt-5" },
+              { name: "gpt-5.1" },
               { name: "gpt-5-mini" },
-              { name: "o1" },
               { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
               { name: "claude-sonnet-4-5" },
-              { name: "grok3" },
               { name: "grok4" },
             ];
 
