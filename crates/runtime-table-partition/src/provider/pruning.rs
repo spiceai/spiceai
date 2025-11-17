@@ -1797,7 +1797,7 @@ mod tests {
         // Partition by date_part('month', order_date)
         let date_part_udf = date_part();
         let partition_by = Expr::ScalarFunction(ScalarFunction::new_udf(
-            date_part_udf.clone(),
+            Arc::clone(&date_part_udf),
             vec![lit("month"), col("order_date")],
         ));
 
@@ -1811,7 +1811,7 @@ mod tests {
         // Partition 3 should NOT be pruned
         assert!(
             !prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Float64(Some(3.0)),
                 &schema
@@ -1822,7 +1822,7 @@ mod tests {
         // Partition 1 should be pruned
         assert!(
             prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Float64(Some(1.0)),
                 &schema
@@ -1881,10 +1881,10 @@ mod tests {
         // Only the matching partition should NOT be pruned
         for partition_value in 0..5_i32 {
             let pruned = prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             let should_prune = partition_value != expected_bucket;
             assert_eq!(
@@ -1925,7 +1925,7 @@ mod tests {
         // Partition 2 should NOT be pruned
         assert!(
             !prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Int64(Some(2)),
                 &schema
@@ -1936,7 +1936,7 @@ mod tests {
         // Partition 0 should be pruned
         assert!(
             prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Int64(Some(0)),
                 &schema
@@ -2008,10 +2008,10 @@ mod tests {
         // Only partitions containing the UUIDs should NOT be pruned
         for partition_value in 0..5_i32 {
             let pruned = prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             let should_prune = !expected_buckets.contains(&partition_value);
             assert_eq!(
@@ -2060,10 +2060,10 @@ mod tests {
         // Only the matching partition should NOT be pruned
         for partition_value in 0..10_i32 {
             let pruned = prune_partition(
-                &[filter.clone()],
+                std::slice::from_ref(&filter),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             let should_prune = partition_value != expected_bucket;
             assert_eq!(
@@ -2099,10 +2099,10 @@ mod tests {
         let filter_17 = col("user_id").eq(lit(17_i32));
         for partition_value in 0..10_i32 {
             let pruned = prune_partition(
-                &[filter_17.clone()],
+                std::slice::from_ref(&filter_17),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             let expected_partition = 17 % 10;
             let should_prune = partition_value != expected_partition;
@@ -2121,10 +2121,10 @@ mod tests {
         let filter_42 = col("user_id").eq(lit(42_i32));
         for partition_value in 0..10_i32 {
             let pruned = prune_partition(
-                &[filter_42.clone()],
+                std::slice::from_ref(&filter_42),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             let expected_partition = 42 % 10;
             let should_prune = partition_value != expected_partition;
@@ -2140,13 +2140,17 @@ mod tests {
 
         // Test Case 3: IN list with multiple values
         // user_id IN (13, 23, 33) - all map to partition 3
-        let filter_in = in_list(col("user_id"), vec![lit(13_i32), lit(23_i32), lit(33_i32)], false);
+        let filter_in = in_list(
+            col("user_id"),
+            vec![lit(13_i32), lit(23_i32), lit(33_i32)],
+            false,
+        );
         for partition_value in 0..10_i32 {
             let pruned = prune_partition(
-                &[filter_in.clone()],
+                std::slice::from_ref(&filter_in),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             // All values (13, 23, 33) map to partition 3
             let should_prune = partition_value != 3;
@@ -2161,13 +2165,17 @@ mod tests {
 
         // Test Case 4: IN list with values mapping to different partitions
         // user_id IN (11, 22, 33) -> partitions 1, 2, 3
-        let filter_in_multi = in_list(col("user_id"), vec![lit(11_i32), lit(22_i32), lit(33_i32)], false);
+        let filter_in_multi = in_list(
+            col("user_id"),
+            vec![lit(11_i32), lit(22_i32), lit(33_i32)],
+            false,
+        );
         for partition_value in 0..10_i32 {
             let pruned = prune_partition(
-                &[filter_in_multi.clone()],
+                std::slice::from_ref(&filter_in_multi),
                 &partition_by,
                 &ScalarValue::Int32(Some(partition_value)),
-                &schema
+                &schema,
             )?;
             // 11 % 10 = 1, 22 % 10 = 2, 33 % 10 = 3
             let should_prune = ![1, 2, 3].contains(&partition_value);
@@ -2192,10 +2200,10 @@ mod tests {
         // for the same values, proving they use different algorithms
 
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
-        
+
         // Modulo partitioning: id % 10
         let partition_by_modulo = col("id") % lit(10);
-        
+
         // Bucket partitioning: bucket(10, id)
         let partition_by_bucket = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
@@ -2205,24 +2213,23 @@ mod tests {
         // For value 42:
         // - Modulo: 42 % 10 = 2 (deterministic arithmetic)
         // - Bucket: bucket(10, 42) = hash(42) % 10 (could be any value 0-9)
-        
+
         let filter = col("id").eq(lit(42_i32));
-        
+
         // Modulo should map to partition 2
         let modulo_partition = 42 % 10;
         assert_eq!(modulo_partition, 2, "42 % 10 should equal 2");
-        
-        assert_eq!(
-            prune_partition(
-                &[filter.clone()],
+
+        assert!(
+            !prune_partition(
+                std::slice::from_ref(&filter),
                 &partition_by_modulo,
                 &ScalarValue::Int32(Some(2)),
                 &schema
             )?,
-            false,
             "Modulo partition 2 should not be pruned for value 42"
         );
-        
+
         // Bucket maps to whatever the hash function returns
         let f = ScalarUDF::new_from_impl(bucket::Bucket::new());
         let ScalarValue::Int32(Some(bucket_partition)) = call(
@@ -2232,46 +2239,46 @@ mod tests {
         else {
             panic!("expected Int32");
         };
-        
-        assert_eq!(
-            prune_partition(
-                &[filter.clone()],
+
+        assert!(
+            !prune_partition(
+                std::slice::from_ref(&filter),
                 &partition_by_bucket,
                 &ScalarValue::Int32(Some(bucket_partition)),
                 &schema
             )?,
-            false,
-            "Bucket partition {} should not be pruned for value 42",
-            bucket_partition
+            "Bucket partition {bucket_partition} should not be pruned for value 42"
         );
-        
+
         // Verify that modulo and bucket produce different results for at least some values
         // (they might coincidentally match for value 42, but shouldn't match for all values)
         let test_values = [0, 1, 7, 13, 42, 99, 100, 123];
         let mut differences_found = false;
-        
+
         for &value in &test_values {
             let modulo_result = value % 10;
             let ScalarValue::Int32(Some(bucket_result)) = call(
                 &f,
-                vec![ScalarValue::Int64(Some(10)), ScalarValue::Int32(Some(value))],
+                vec![
+                    ScalarValue::Int64(Some(10)),
+                    ScalarValue::Int32(Some(value)),
+                ],
             )?
             else {
                 panic!("expected Int32");
             };
-            
+
             if modulo_result != bucket_result {
                 differences_found = true;
                 break;
             }
         }
-        
+
         assert!(
             differences_found,
             "Modulo and bucket should produce different partition assignments for at least some values"
         );
-        
+
         Ok(())
     }
 }
-
