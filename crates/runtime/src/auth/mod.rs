@@ -24,6 +24,9 @@ use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+mod anonymous;
+pub mod no_auth;
+
 #[derive(Clone)]
 pub struct EndpointAuth {
     pub http_auth: Option<Arc<dyn HttpAuth + Send + Sync>>,

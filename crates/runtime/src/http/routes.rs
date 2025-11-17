@@ -68,6 +68,7 @@ use axum::{
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
 #[allow(clippy::needless_for_each)]
@@ -186,6 +187,18 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
+// Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
+// Applied at three levels:
+// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings, evals)
+//    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
+// 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
+//    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
+// 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
+//    Applied to unauthenticated routes to prevent DoS via health check endpoints
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
+const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
+const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
@@ -283,6 +296,13 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let _cancellation_token =
             sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+
+        // Apply MCP-specific request body limit before merging
+        tracing::info!(
+            "MCP request body size limit set to {} bytes",
+            MCP_REQUEST_BODY_LIMIT
+        );
+        let mcp_router = mcp_router.route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -290,6 +310,15 @@ pub(crate) fn routes(
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
+
+    // Apply request body size limit to prevent DoS attacks via unbounded request payloads
+    // This must be applied as a route layer before auth
+    tracing::info!(
+        "Request body size limit set to {} bytes",
+        DEFAULT_REQUEST_BODY_LIMIT
+    );
+    authenticated_router =
+        authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
 
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
@@ -300,7 +329,8 @@ pub(crate) fn routes(
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
-        .layer(Extension(Arc::clone(&rt.status)));
+        .layer(Extension(Arc::clone(&rt.status)))
+        .route_layer(RequestBodyLimitLayer::new(HEALTH_REQUEST_BODY_LIMIT));
 
     unauthenticated_router
         .merge(authenticated_router)

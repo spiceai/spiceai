@@ -7,13 +7,13 @@
     "catalogs": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Catalog"
+        "$ref": "#/$defs/ComponentOrReference"
       }
     },
     "datasets": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Dataset"
+        "$ref": "#/$defs/ComponentOrReference2"
       }
     },
     "dependencies": {
@@ -25,13 +25,13 @@
     "embeddings": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Embeddings"
+        "$ref": "#/$defs/ComponentOrReference5"
       }
     },
     "evals": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Eval"
+        "$ref": "#/$defs/ComponentOrReference6"
       }
     },
     "extensions": {
@@ -63,7 +63,7 @@
     "models": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Model"
+        "$ref": "#/$defs/ComponentOrReference4"
       }
     },
     "name": {
@@ -75,7 +75,7 @@
       "$ref": "#/$defs/Runtime"
     },
     "secrets": {
-      "description": "Optional spicepod secrets configuration\n Default value is:\n ```yaml\n secrets:\n   - from: env\n     name: env\n ```",
+      "description": "Optional spicepod secrets configuration\nDefault value is:\n```yaml\nsecrets:\n  - from: env\n    name: env\n```",
       "type": "array",
       "items": {
         "$ref": "#/$defs/Secret"
@@ -95,7 +95,7 @@
     "tools": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Tool"
+        "$ref": "#/$defs/ComponentOrReference7"
       }
     },
     "version": {
@@ -105,13 +105,13 @@
     "views": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_View"
+        "$ref": "#/$defs/ComponentOrReference3"
       }
     },
     "workers": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/ComponentOrReference_for_Worker"
+        "$ref": "#/$defs/ComponentOrReference8"
       }
     }
   },
@@ -286,7 +286,7 @@
           ]
         },
         "snapshots": {
-          "description": "Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.\n\n Options: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n `disabled` (default) will turn off snapshots for this dataset.\n `enabled` will enable both creating and bootstrapping from snapshots.\n `bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n `create_only` will only create snapshots, it won't attempt to bootstrap from one.",
+          "description": "Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
           "$ref": "#/$defs/SnapshotBehavior"
         }
       },
@@ -464,12 +464,6 @@
     "Catalog": {
       "type": "object",
       "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "access": {
           "$ref": "#/$defs/AccessMode"
         },
@@ -488,6 +482,12 @@
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "from": {
           "type": "string"
@@ -586,7 +586,7 @@
       ]
     },
     "ColumnEmbeddingConfig": {
-      "description": "Configuration for if and how a dataset's column should be embedded.\n\n Prefer to use [`super::dataset::column::ColumnLevelEmbeddingConfig`] going\n forward. Support for [`ColumnEmbeddingConfig`] will be removed in future.",
+      "description": "Configuration for if and how a dataset's column should be embedded.\n\nPrefer to use [`super::dataset::column::ColumnLevelEmbeddingConfig`] going\nforward. Support for [`ColumnEmbeddingConfig`] will be removed in future.",
       "type": "object",
       "properties": {
         "chunking": {
@@ -629,7 +629,7 @@
       ]
     },
     "ColumnLevelEmbeddingConfig": {
-      "description": "Configuration for if and how a dataset's column should be embedded.\n Different to [`crate::component::embeddings::ColumnEmbeddingConfig`],\n as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],\n not [`super::Dataset`].\n\n [`crate::component::embeddings::ColumnEmbeddingConfig`] will be\n deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].",
+      "description": "Configuration for if and how a dataset's column should be embedded.\nDifferent to [`crate::component::embeddings::ColumnEmbeddingConfig`],\nas [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],\nnot [`super::Dataset`].\n\n[`crate::component::embeddings::ColumnEmbeddingConfig`] will be\ndeprecated long term in favour of [`ColumnLevelEmbeddingConfig`].",
       "type": "object",
       "properties": {
         "chunking": {
@@ -665,7 +665,7 @@
         }
       }
     },
-    "ComponentOrReference_for_Catalog": {
+    "ComponentOrReference": {
       "anyOf": [
         {
           "$ref": "#/$defs/Catalog"
@@ -675,7 +675,7 @@
         }
       ]
     },
-    "ComponentOrReference_for_Dataset": {
+    "ComponentOrReference2": {
       "anyOf": [
         {
           "$ref": "#/$defs/Dataset"
@@ -685,47 +685,7 @@
         }
       ]
     },
-    "ComponentOrReference_for_Embeddings": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Embeddings"
-        },
-        {
-          "$ref": "#/$defs/ComponentReference"
-        }
-      ]
-    },
-    "ComponentOrReference_for_Eval": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Eval"
-        },
-        {
-          "$ref": "#/$defs/ComponentReference"
-        }
-      ]
-    },
-    "ComponentOrReference_for_Model": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Model"
-        },
-        {
-          "$ref": "#/$defs/ComponentReference"
-        }
-      ]
-    },
-    "ComponentOrReference_for_Tool": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Tool"
-        },
-        {
-          "$ref": "#/$defs/ComponentReference"
-        }
-      ]
-    },
-    "ComponentOrReference_for_View": {
+    "ComponentOrReference3": {
       "anyOf": [
         {
           "$ref": "#/$defs/View"
@@ -735,7 +695,47 @@
         }
       ]
     },
-    "ComponentOrReference_for_Worker": {
+    "ComponentOrReference4": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Model"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "ComponentOrReference5": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Embeddings"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "ComponentOrReference6": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Eval"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "ComponentOrReference7": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Tool"
+        },
+        {
+          "$ref": "#/$defs/ComponentReference"
+        }
+      ]
+    },
+    "ComponentOrReference8": {
       "anyOf": [
         {
           "$ref": "#/$defs/Worker"
@@ -782,14 +782,9 @@
       "additionalProperties": false
     },
     "Dataset": {
+      "description": "Helper struct for deserializing Dataset with custom logic for handling `InvalidTypeAction` migration",
       "type": "object",
       "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "acceleration": {
           "anyOf": [
             {
@@ -804,7 +799,6 @@
           "$ref": "#/$defs/AccessMode"
         },
         "check_availability": {
-          "description": "Configures whether the dataset availability monitor is enabled for this dataset.\n When enabled, the runtime will periodically check dataset availability\n and report metrics. Dataset availability is only checked if the dataset is not accelerated.",
           "$ref": "#/$defs/CheckAvailability"
         },
         "columns": {
@@ -818,6 +812,12 @@
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "embeddings": {
           "type": "array",
@@ -833,6 +833,17 @@
             "boolean",
             "null"
           ]
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
         },
         "metadata": {
           "type": "object",
@@ -1008,12 +1019,6 @@
     "Eval": {
       "type": "object",
       "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "dataset": {
           "type": "string"
         },
@@ -1022,6 +1027,12 @@
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "metrics": {
           "anyOf": [
@@ -1137,6 +1148,15 @@
         "unique"
       ]
     },
+    "InvalidTypeAction": {
+      "description": "This is deprecated, use `unsupported_type_action` instead.",
+      "type": "string",
+      "enum": [
+        "error",
+        "warn",
+        "ignore"
+      ]
+    },
     "LoadBalanceParams": {
       "type": "object",
       "properties": {
@@ -1209,12 +1229,6 @@
     "Model": {
       "type": "object",
       "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "datasets": {
           "type": "array",
           "items": {
@@ -1226,6 +1240,12 @@
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "files": {
           "type": "array",
@@ -1267,17 +1287,6 @@
     "ModelFile": {
       "type": "object",
       "properties": {
-        "type": {
-          "description": "Should use [`Self::file_type`] to access.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ModelFileType"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "name": {
           "type": [
             "string",
@@ -1295,6 +1304,17 @@
         },
         "path": {
           "type": "string"
+        },
+        "type": {
+          "description": "Should use [`Self::file_type`] to access.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelFileType"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1371,7 +1391,7 @@
       "type": "object",
       "properties": {
         "memory_limit": {
-          "description": "Specifies the runtime memory limit. When configured, will spill to disk\n for supported queries larger than memory.",
+          "description": "Specifies the runtime memory limit. When configured, will spill to disk\nfor supported queries larger than memory.",
           "type": [
             "string",
             "null"
@@ -1389,7 +1409,7 @@
           ]
         },
         "temp_directory": {
-          "description": "Configures where the runtime will store temporary files needed for operations like\n spilling to disk for queries & accelerations that are larger than memory.",
+          "description": "Configures where the runtime will store temporary files needed for operations like\nspilling to disk for queries & accelerations that are larger than memory.",
           "type": [
             "string",
             "null"
@@ -1475,6 +1495,13 @@
             "string",
             "null"
           ]
+        },
+        "max_stale_while_revalidate": {
+          "description": "Maximum stale-while-revalidate duration to add to the cache TTL.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -1529,6 +1556,7 @@
       ]
     },
     "Runtime": {
+      "description": "Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation",
       "type": "object",
       "properties": {
         "auth": {
@@ -1565,6 +1593,14 @@
             }
           ]
         },
+        "memory_limit": {
+          "description": "Specifies the runtime memory limit. When configured, will spill to disk\nfor supported queries larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "deprecated": true
+        },
         "metrics": {
           "anyOf": [
             {
@@ -1576,7 +1612,7 @@
           ]
         },
         "output_level": {
-          "description": "Configures log level for the runtime. Can be overriden if flags or environment variables\n are set.",
+          "description": "Configures log level for the runtime. Can be overriden if flags or environment variables\nare set.",
           "anyOf": [
             {
               "$ref": "#/$defs/OutputLevel"
@@ -1613,7 +1649,7 @@
           ]
         },
         "shutdown_timeout": {
-          "description": "Configures how long the runtime waits for connections to be gracefully drained\n and components to shut down cleanly during runtime termination",
+          "description": "Configures how long the runtime waits for connections to be gracefully drained\nand components to shut down cleanly during runtime termination",
           "type": [
             "string",
             "null"
@@ -1624,6 +1660,14 @@
         },
         "telemetry": {
           "$ref": "#/$defs/TelemetryConfig"
+        },
+        "temp_directory": {
+          "description": "Configures where the runtime will store temporary files needed for operations like\nspilling to disk for queries & accelerations that are larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "deprecated": true
         },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
@@ -1683,7 +1727,7 @@
           ]
         },
         "stale_while_revalidate_ttl": {
-          "description": "Maximum age for serving stale cached results while revalidating in the background.\n When set, cached results past their TTL (but within this additional window) will be\n served immediately while a background refresh is triggered.\n Format: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
+          "description": "Maximum age for serving stale cached results while revalidating in the background.\nWhen set, cached results past their TTL (but within this additional window) will be\nserved immediately while a background refresh is triggered.\nFormat: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
           "type": [
             "string",
             "null"
@@ -1693,7 +1737,7 @@
       "additionalProperties": false
     },
     "Secret": {
-      "description": "The secrets configuration for a Spicepod.\n\n Example:\n ```yaml\n secrets:\n   - from: env\n     name: env\n   - from: kubernetes:my_secret_name\n     name: k8s\n ```",
+      "description": "The secrets configuration for a Spicepod.\n\nExample:\n```yaml\nsecrets:\n  - from: env\n    name: env\n  - from: kubernetes:my_secret_name\n    name: k8s\n```",
       "type": "object",
       "properties": {
         "description": {
@@ -1750,11 +1794,11 @@
       ]
     },
     "Snapshots": {
-      "description": "Datasets accelerated using a file-mode acceleration\n engine (i.e. `Sqlite` or `DuckDB`) can bootstrap from a DB\n file on object storage (i.e. S3) if the acceleration file\n does not exist on startup using this configuration.\n\n Each dataset needs to opt-in for snapshots in addition to this config.",
+      "description": "Datasets accelerated using a file-mode acceleration\nengine (i.e. `Sqlite` or `DuckDB`) can bootstrap from a DB\nfile on object storage (i.e. S3) if the acceleration file\ndoes not exist on startup using this configuration.\n\nEach dataset needs to opt-in for snapshots in addition to this config.",
       "type": "object",
       "properties": {
         "bootstrap_on_failure_behavior": {
-          "description": "The behavior when loading a snapshot fails: 'warn', 'retry' or 'fallback'\n\n 'warn' will continue with an empty acceleration after logging a warning.\n `retry` will retry loading the newest snapshot indefinitely until the snapshot is loaded correctly.\n 'fallback' will try older snapshot files if loading newer ones fail.",
+          "description": "The behavior when loading a snapshot fails: 'warn', 'retry' or 'fallback'\n\n'warn' will continue with an empty acceleration after logging a warning.\n`retry` will retry loading the newest snapshot indefinitely until the snapshot is loaded correctly.\n'fallback' will try older snapshot files if loading newer ones fail.",
           "$ref": "#/$defs/BootstrapOnFailureBehavior"
         },
         "enabled": {
@@ -1763,14 +1807,14 @@
           "default": true
         },
         "location": {
-          "description": "The object store location pointing to a folder\n containing the dataset snapshots.\n i.e. `s3://my-bucket/spice/snapshots/`",
+          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`",
           "type": [
             "string",
             "null"
           ]
         },
         "params": {
-          "description": "Auth params for accessing the object store location.\n For S3, this is the same as the S3 dataset connector params\n with the notable exception that `s3_auth` is set to `iam_role` by default.",
+          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -1847,16 +1891,16 @@
     "TelemetryConfig": {
       "type": "object",
       "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
         "properties": {
           "type": "object",
           "additionalProperties": {
             "type": "string"
           },
           "default": {}
-        },
-        "enabled": {
-          "type": "boolean",
-          "default": true
         },
         "user_agent_collection": {
           "$ref": "#/$defs/UserAgentCollection",
@@ -1920,17 +1964,17 @@
     "Tool": {
       "type": "object",
       "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "dependsOn": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "env": {
           "type": "object",
@@ -2036,12 +2080,6 @@
     "View": {
       "type": "object",
       "properties": {
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "acceleration": {
           "anyOf": [
             {
@@ -2063,6 +2101,12 @@
           "items": {
             "type": "string"
           }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "metadata": {
           "type": "object",
@@ -2107,13 +2151,13 @@
     "Worker": {
       "type": "object",
       "properties": {
-        "description": {
+        "cron": {
           "type": [
             "string",
             "null"
           ]
         },
-        "cron": {
+        "description": {
           "type": [
             "string",
             "null"
