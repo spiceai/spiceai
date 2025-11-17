@@ -177,7 +177,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -271,7 +271,21 @@ impl AcceleratorEngineRegistry {
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
                 if !constraints.is_empty() {
-                    external_table_builder = external_table_builder.constraints(constraints);
+                    external_table_builder =
+                        external_table_builder.constraints(constraints.clone());
+                    // Update on_conflict to match the new constraints' primary key
+                    // if user hasn't explicitly configured on_conflict
+                    if acceleration_settings.on_conflict.is_empty() {
+                        let primary_keys: Vec<String> =
+                            get_primary_keys_from_constraints(&constraints, &schema);
+                        if !primary_keys.is_empty() {
+                            external_table_builder =
+                                external_table_builder.on_conflict(OnConflict::Upsert(
+                                    ColumnReference::new(primary_keys),
+                                    UpsertOptions::default(),
+                                ));
+                        }
+                    }
                 }
             }
             Ok(None) => {}
