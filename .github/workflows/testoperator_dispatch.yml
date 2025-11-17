@@ -79,28 +79,28 @@ jobs:
 
       - name: Validate spicepods - TPCH - SF1
         run: |
-          for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
+          for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
             echo "Validating $file"
             ./target/release/spicepod-validator "$file"
           done
 
       - name: Validate spicepods - TPCDS
         run: |
-          for file in ./tools/testoperator/dispatch/tpcds/sf1/**/*.yaml; do
+          for file in ./test/spicepods/tpcds/**/*.yaml; do
             echo "Validating $file"
             ./target/release/spicepod-validator "$file"
           done
 
       - name: Validate spicepods - ClickBench
         run: |
-          for file in ./tools/testoperator/dispatch/clickbench/sf1/**/*.yaml; do
+          for file in ./test/spicepods/clickbench/**/*.yaml; do
             echo "Validating $file"
             ./target/release/spicepod-validator "$file"
           done
 
       - name: Validate spicepods - TPCH - SF100
         run: |
-          for file in ./tools/testoperator/dispatch/tpch/sf100/**/*.yaml; do
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
             echo "Validating $file"
             ./target/release/spicepod-validator "$file"
           done
@@ -180,28 +180,28 @@ jobs:
 
       - name: Validate spicepods - TPCH - SF1
         run: |
-          for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
+          for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
             echo "Validating $file"
             spicepod-validator "$file"
           done
 
       - name: Validate spicepods - TPCDS
         run: |
-          for file in ./tools/testoperator/dispatch/tpcds/sf1/**/*.yaml; do
+          for file in ./test/spicepods/tpcds/**/*.yaml; do
             echo "Validating $file"
             spicepod-validator "$file"
           done
 
       - name: Validate spicepods - ClickBench
         run: |
-          for file in ./tools/testoperator/dispatch/clickbench/sf1/**/*.yaml; do
+          for file in ./test/spicepods/clickbench/**/*.yaml; do
             echo "Validating $file"
             spicepod-validator "$file"
           done
 
       - name: Validate spicepods - TPCH - SF100
         run: |
-          for file in ./tools/testoperator/dispatch/tpch/sf100/**/*.yaml; do
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
             echo "Validating $file"
             spicepod-validator "$file"
           done
