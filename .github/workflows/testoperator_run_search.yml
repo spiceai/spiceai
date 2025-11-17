@@ -80,7 +80,7 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
-          testoperator run vector-search \
+          testoperator run search \
             --ready-wait 1800 \
             --concurrency 10 \
             --benchmark-dataset quora_retrieval \
