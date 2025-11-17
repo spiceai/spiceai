@@ -1166,13 +1166,17 @@ impl HttpTableProvider {
     fn can_pushdown_filter(&self, filter: &Expr) -> bool {
         match filter {
             // Simple equality on request_path, request_query, or request_body
-            Expr::BinaryExpr(BinaryExpr { left, op, right: _ }) if *op == Operator::Eq => {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
                 if let Expr::Column(col) = left.as_ref() {
-                    match col.name.as_str() {
-                        "request_path" => self.allowed_paths.is_some(),
-                        "request_query" => self.allow_query_filters,
-                        "request_body" => self.allow_body_filters,
-                        _ => false,
+                    if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = right.as_ref() {
+                        match col.name.as_str() {
+                            "request_path" => self.validate_path_filter(value),
+                            "request_query" => self.validate_query_filter(value),
+                            "request_body" => self.validate_body_filter(value),
+                            _ => false,
+                        }
+                    } else {
+                        false
                     }
                 } else {
                     false
@@ -1181,12 +1185,19 @@ impl HttpTableProvider {
             // IN list on request_path, request_query, or request_body
             Expr::InList(in_list) => {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
-                    match col.name.as_str() {
-                        "request_path" => self.allowed_paths.is_some(),
-                        "request_query" => self.allow_query_filters,
-                        "request_body" => self.allow_body_filters,
-                        _ => false,
-                    }
+                    // All values in the IN list must be valid
+                    in_list.list.iter().all(|expr| {
+                        if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = expr {
+                            match col.name.as_str() {
+                                "request_path" => self.validate_path_filter(value),
+                                "request_query" => self.validate_query_filter(value),
+                                "request_body" => self.validate_body_filter(value),
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        }
+                    })
                 } else {
                     false
                 }
@@ -1199,6 +1210,33 @@ impl HttpTableProvider {
             }
             _ => false,
         }
+    }
+
+    fn validate_path_filter(&self, value: &str) -> bool {
+        if let Err(e) = self.ensure_allowed_path(value) {
+            tracing::warn!("Filter pushdown rejected for request_path '{value}': {}", e);
+            return false;
+        }
+        true
+    }
+
+    fn validate_query_filter(&self, value: &str) -> bool {
+        if let Err(e) = self.ensure_allowed_query(value) {
+            tracing::warn!(
+                "Filter pushdown rejected for request_query '{value}': {}",
+                e
+            );
+            return false;
+        }
+        true
+    }
+
+    fn validate_body_filter(&self, value: &str) -> bool {
+        if let Err(e) = self.ensure_allowed_body(value) {
+            tracing::warn!("Filter pushdown rejected for request_body '{value}': {}", e);
+            return false;
+        }
+        true
     }
 
     fn ensure_allowed_path(&self, raw: &str) -> Result<String> {
@@ -1235,7 +1273,14 @@ impl HttpTableProvider {
 
         if !allowed.contains(raw) {
             return Err(Error::FilterRejected {
-                message: format!("request_path '{raw}' is not included in allowed_request_paths"),
+                message: format!(
+                    "request_path '{raw}' is not included in allowed_request_paths. Allowed paths: {}",
+                    allowed
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             });
         }
 
