@@ -372,6 +372,7 @@ impl DataAccelerator for DuckDBAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
+    #[allow(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         mut cmd: CreateExternalTable,
@@ -432,30 +433,27 @@ impl DataAccelerator for DuckDBAccelerator {
                     .into_iter()
                     .map(|ds| ds as Arc<dyn AccelerationSource>)
                 {
-                    if let Some(accel) = ds.acceleration() {
-                        if accel.mode == Mode::File
-                            && ds.name() != source.name()
-                            && matches!(
+                    if let Some(accel) = ds.acceleration()
+                        && accel.mode == Mode::File
+                        && ds.name() != source.name()
+                        && matches!(
+                            accel.engine,
+                            Engine::DuckDB
+                                | Engine::TableModePartitionedDuckDB
+                                | Engine::PartitionedDuckDB
+                        )
+                    {
+                        // Get the correct accelerator for this source's engine type
+                        if let Some(other_accelerator) =
+                            crate::dataaccelerator::get_registered_accelerator(
+                                ds.as_ref(),
                                 accel.engine,
-                                Engine::DuckDB
-                                    | Engine::TableModePartitionedDuckDB
-                                    | Engine::PartitionedDuckDB
                             )
+                            .await
+                            && let Ok(other_path) = other_accelerator.file_path(ds.as_ref())
+                            && other_path != self_path
                         {
-                            // Get the correct accelerator for this source's engine type
-                            if let Some(other_accelerator) =
-                                crate::dataaccelerator::get_registered_accelerator(
-                                    ds.as_ref(),
-                                    accel.engine,
-                                )
-                                .await
-                            {
-                                if let Ok(other_path) = other_accelerator.file_path(ds.as_ref()) {
-                                    if other_path != self_path {
-                                        attach_databases.insert(other_path);
-                                    }
-                                }
-                            }
+                            attach_databases.insert(other_path);
                         }
                     }
                 }
@@ -464,30 +462,27 @@ impl DataAccelerator for DuckDBAccelerator {
                     .into_iter()
                     .map(|view| view as Arc<dyn AccelerationSource>)
                 {
-                    if let Some(accel) = view.acceleration() {
-                        if accel.mode == Mode::File
-                            && view.name() != source.name()
-                            && matches!(
+                    if let Some(accel) = view.acceleration()
+                        && accel.mode == Mode::File
+                        && view.name() != source.name()
+                        && matches!(
+                            accel.engine,
+                            Engine::DuckDB
+                                | Engine::TableModePartitionedDuckDB
+                                | Engine::PartitionedDuckDB
+                        )
+                    {
+                        // Get the correct accelerator for this source's engine type
+                        if let Some(other_accelerator) =
+                            crate::dataaccelerator::get_registered_accelerator(
+                                view.as_ref(),
                                 accel.engine,
-                                Engine::DuckDB
-                                    | Engine::TableModePartitionedDuckDB
-                                    | Engine::PartitionedDuckDB
                             )
+                            .await
+                            && let Ok(other_path) = other_accelerator.file_path(view.as_ref())
+                            && other_path != self_path
                         {
-                            // Get the correct accelerator for this source's engine type
-                            if let Some(other_accelerator) =
-                                crate::dataaccelerator::get_registered_accelerator(
-                                    view.as_ref(),
-                                    accel.engine,
-                                )
-                                .await
-                            {
-                                if let Ok(other_path) = other_accelerator.file_path(view.as_ref()) {
-                                    if other_path != self_path {
-                                        attach_databases.insert(other_path);
-                                    }
-                                }
-                            }
+                            attach_databases.insert(other_path);
                         }
                     }
                 }
