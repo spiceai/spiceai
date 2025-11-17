@@ -1,8 +1,9 @@
 use crate::common::plan_node_key::PlanNodeKey;
 use crate::common::search_visitor::SearchVisitor;
 use crate::concrete;
-use datafusion::common::Result;
+use crate::physical_plan::duckdb::{ConcreteDuckSqlExec, PARSER_DIALECT};
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::sqlparser::ast::{CteAsMaterialized, ObjectName, Query};
@@ -10,25 +11,19 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, With, visit_expressions,
-    visit_expressions_mut, visit_relations,
+    visit_expressions, visit_expressions_mut, visit_relations, BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select,
+    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value,
+    ValueWithSpan, With,
 };
-use datafusion::sql::sqlparser::dialect::DuckDbDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Span;
-use datafusion_table_providers::duckdb::sql_table::DuckSqlExec;
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::indexes::IndexType;
-use duckdb::DuckdbConnectionManager;
-use r2d2::PooledConnection;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-static DIALECT: DuckDbDialect = DuckDbDialect {};
 const CTE_NAME: &str = "_intermediate_materialize";
 
 pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
@@ -311,7 +306,7 @@ impl Debug for DuckDBIntermediateIndexMaterializationOptimizer {
     }
 }
 
-type ConcreteDuckSqlExec = DuckSqlExec<PooledConnection<DuckdbConnectionManager>, DuckDBParameter>;
+
 
 impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
     fn optimize(
@@ -337,7 +332,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             DataFusionError::Execution(format!("Unable to generate DuckDB SQL: {e}"))
         })?;
 
-        let Some(statement) = Parser::parse_sql(&DIALECT, sql.as_str())?.first().cloned() else {
+        let Some(statement) = Parser::parse_sql(&PARSER_DIALECT, sql.as_str())?.first().cloned() else {
             return Ok(plan);
         };
 
@@ -381,7 +376,7 @@ mod tests {
     use datafusion_table_providers::util::indexes::IndexType;
 
     fn parse_statement(sql: &str) -> Statement {
-        Parser::parse_sql(&DIALECT, sql)
+        Parser::parse_sql(&PARSER_DIALECT, sql)
             .expect("Failed to parse SQL")
             .into_iter()
             .next()
