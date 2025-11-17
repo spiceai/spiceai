@@ -45,6 +45,10 @@ pub struct DatasetTestArgs {
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) validate: bool,
 
+    /// Reference schema containing known good tables for validation (e.g., "arrow" to validate against arrow.customer instead of customer)
+    #[arg(long)]
+    pub(crate) reference_schema: Option<String>,
+
     /// Whether to disable results caching, by supplying the cache control header through flight
     #[arg(long)]
     pub(crate) disable_caching: bool,

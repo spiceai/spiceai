@@ -39,6 +39,7 @@ use datafusion_table_providers::{
 };
 use futures::StreamExt;
 use runtime_table_partition::{
+    creator::filename::encode_key,
     expression::PartitionedBy,
     insert::{InsertStrategy, PartitionContext, partition_batch},
 };
@@ -128,9 +129,27 @@ impl DuckDBPartitionedInsertStrategy {
                                     Ok(partitions) => {
                                         let partitions_map = partitions
                                             .into_iter()
-                                            .map(|p| (p.partition_value.to_string(), p))
-                                            .collect::<HashMap<_, _>>();
-                                        *partitions_lock.write().await = partitions_map;
+                                            .map(|p| {
+                                                let key = encode_key(&p.partition_value).map_err(
+                                                    |e| {
+                                                        DataFusionError::Execution(format!(
+                                                            "Failed to encode partition key: {e}"
+                                                        ))
+                                                    },
+                                                )?;
+                                                Ok((key, p))
+                                            })
+                                            .collect::<Result<HashMap<_, _>, DataFusionError>>();
+                                        match partitions_map {
+                                            Ok(map) => {
+                                                *partitions_lock.write().await = map;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to encode partition keys after insert: {e}"
+                                                );
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -226,12 +245,16 @@ impl BatchPartitioner {
     ) -> Result<HashMap<String, RecordBatch>, DataFusionError> {
         let partitions = partition_batch(batch, self.physical_expr.as_ref())?;
 
-        Ok(partitions
+        partitions
             .into_iter()
-            .map(|(partition, (_scalar_value, batch))| {
-                // hive-style format
-                (format!("{}={partition}", self.partitioned_by.name), batch)
+            .map(|(partition_key, (_scalar_value, batch))| {
+                // partition_key is already encoded from partition_batch
+                // Format as hive-style: partition_name=encoded_value
+                Ok((
+                    format!("{}={}", self.partitioned_by.name, partition_key),
+                    batch,
+                ))
             })
-            .collect::<HashMap<_, _>>())
+            .collect::<Result<HashMap<_, _>, DataFusionError>>()
     }
 }

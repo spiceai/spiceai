@@ -313,16 +313,12 @@ pub(crate) fn routes(
 
     // Apply request body size limit to prevent DoS attacks via unbounded request payloads
     // This must be applied as a route layer before auth
-    tracing::info!(
-        "Request body size limit set to {} bytes",
-        DEFAULT_REQUEST_BODY_LIMIT
-    );
     authenticated_router =
         authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
 
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
-        tracing::info!("Enabled authentication on HTTP routes");
+        tracing::info!("Enabled API key authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
