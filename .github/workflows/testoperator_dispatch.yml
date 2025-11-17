@@ -185,16 +185,16 @@ jobs:
             spicepod-validator "$file"
           done
 
-      - name: Validate spicepods - TPCDS
+      - name: Validate spicepods - TPCDS - SF1
         run: |
-          for file in ./test/spicepods/tpcds/**/*.yaml; do
+          for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
             echo "Validating $file"
             spicepod-validator "$file"
           done
 
-      - name: Validate spicepods - ClickBench
+      - name: Validate spicepods - ClickBench - SF1
         run: |
-          for file in ./test/spicepods/clickbench/**/*.yaml; do
+          for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
             echo "Validating $file"
             spicepod-validator "$file"
           done
