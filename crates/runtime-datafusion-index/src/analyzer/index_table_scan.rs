@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::Schema,
     common::{
-        DFSchemaRef,
+        DFSchemaRef, SchemaExt,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     datasource::DefaultTableSource,
@@ -407,10 +407,10 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if !schemas_compatible(
-                                    b.schema().as_ref(),
-                                    expected_schema.as_ref(),
-                                ) {
+                                if b.schema()
+                                    .as_ref()
+                                    .equivalent_names_and_types(expected_schema.as_ref())
+                                {
                                     let exp = schema_signature(expected_schema.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
@@ -447,27 +447,6 @@ impl ExecutionPlan for IndexerExec {
             .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
-}
-
-/// Compares two schemas for compatibility, ignoring nullability differences.
-/// This is used for index validation where nullability differences are acceptable.
-fn schemas_compatible(a: &Schema, b: &Schema) -> bool {
-    if a.fields().len() != b.fields().len() {
-        return false;
-    }
-
-    for (field_a, field_b) in a.fields().iter().zip(b.fields().iter()) {
-        if field_a.name() != field_b.name() {
-            return false;
-        }
-
-        // Data types must match (nullability is ignored)
-        if field_a.data_type() != field_b.data_type() {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Helper for better diagnostics when schema is mismatched.
