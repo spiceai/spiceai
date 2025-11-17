@@ -1,17 +1,17 @@
 tests:
   bench:
-    spicepod_path: accelerated/file[parquet]-cayenne[file]-partitioned.yaml
+    spicepod_path: accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     validate_results: true
     duration: 28800
   throughput:
-    spicepod_path: accelerated/file[parquet]-cayenne[file]-partitioned.yaml
+    spicepod_path: accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
   load:
-    spicepod_path: accelerated/file[parquet]-cayenne[file]-partitioned.yaml
+    spicepod_path: accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
