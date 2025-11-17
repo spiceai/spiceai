@@ -64,3 +64,36 @@ datasets:
     name: supplier
     params: *s3_params
     acceleration: *acceleration
+
+  # Known good reference datasets for validation
+  - from: s3://benchmarks/tpch_sf1/customer.parquet
+    name: arrow.customer
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/lineitem.parquet
+    name: arrow.lineitem
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/nation.parquet
+    name: arrow.nation
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/orders.parquet
+    name: arrow.orders
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/part.parquet
+    name: arrow.part
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/partsupp.parquet
+    name: arrow.partsupp
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/region.parquet
+    name: arrow.region
+    params: *s3_params
+
+  - from: s3://benchmarks/tpch_sf1/supplier.parquet
+    name: arrow.supplier
+    params: *s3_params
