@@ -850,28 +850,31 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
     ) -> DataFusionResult<RecordBatch> {
-        let (path, _query, _body) = &self.partitions[partition];
+        let (path, query, body) = &self.partitions[partition];
 
         // Use the filter path or empty string (base URL only)
         let path_val = path.as_deref().unwrap_or("");
+        let query_val = query.as_deref();
+        let body_val = body.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}",
+            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
             partition,
-            path_val
+            path_val,
+            query_val,
+            body_val
         );
 
-        // Fetch content with only the path, no query or body
+        // Fetch content with path, query, and body
         let content = provider
-            .get_content(path_val, None, None)
+            .get_content(path_val, query_val, body_val)
             .await
             .map_err(DataFusionError::from)?;
 
-        // Set path from partition, but leave query and body empty
-        // DataFusion's FilterExec will filter based on these columns if needed
+        // Store the actual values from the partition for the primary key
         let path_for_batch = path.as_deref().unwrap_or("");
-        let query_for_batch = "";
-        let body_for_batch = "";
+        let query_for_batch = query.as_deref().unwrap_or("");
+        let body_for_batch = body.as_deref().unwrap_or("");
 
         tracing::debug!(
             "Creating batch with request_path={:?}, content_len={}",
@@ -1260,7 +1263,19 @@ impl HttpTableProvider {
             });
         }
 
-        Ok(raw.strip_prefix('?').unwrap_or(raw).to_string())
+        let query = raw.strip_prefix('?').unwrap_or(raw);
+        Ok(Self::sort_query_params(query))
+    }
+
+    /// Sort query parameters alphabetically by key for consistent primary key handling
+    fn sort_query_params(query: &str) -> String {
+        if query.is_empty() {
+            return String::new();
+        }
+
+        let mut params: Vec<&str> = query.split('&').collect();
+        params.sort_unstable();
+        params.join("&")
     }
 
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {
@@ -1780,6 +1795,42 @@ mod tests {
         assert_eq!(
             projected_field_names,
             &["request_path", "request_query", "request_body", "content"]
+        );
+    }
+
+    #[test]
+    fn test_sort_query_params() {
+        // Test empty query
+        assert_eq!(HttpTableProvider::sort_query_params(""), "");
+
+        // Test single parameter
+        assert_eq!(
+            HttpTableProvider::sort_query_params("key=value"),
+            "key=value"
+        );
+
+        // Test already sorted parameters
+        assert_eq!(
+            HttpTableProvider::sort_query_params("a=1&b=2&c=3"),
+            "a=1&b=2&c=3"
+        );
+
+        // Test unsorted parameters - should be sorted alphabetically
+        assert_eq!(
+            HttpTableProvider::sort_query_params("c=3&a=1&b=2"),
+            "a=1&b=2&c=3"
+        );
+
+        // Test with URL encoding
+        assert_eq!(
+            HttpTableProvider::sort_query_params("z=last&a=first&m=middle"),
+            "a=first&m=middle&z=last"
+        );
+
+        // Test complex query string
+        assert_eq!(
+            HttpTableProvider::sort_query_params("userId=1&title=foo&body=bar"),
+            "body=bar&title=foo&userId=1"
         );
     }
 }
