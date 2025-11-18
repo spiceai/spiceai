@@ -38,6 +38,7 @@ pub mod metrics;
 mod simple_cache;
 mod utils;
 
+pub mod encoding;
 pub mod key;
 pub mod result;
 
@@ -308,6 +309,9 @@ pub struct QueryResultsCacheProvider {
     stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
+    encoder: Arc<dyn encoding::Encoder>,
+    encoding: spicepod::component::caching::Encoding,
+    hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -368,12 +372,17 @@ impl QueryResultsCacheProvider {
             config.engine,
         ));
 
+        let encoder = encoding::get_encoder(config.encoding);
+
         let cache_provider = QueryResultsCacheProvider {
             cache,
             cache_max_size,
             ttl,
             stale_while_revalidate_ttl,
             ignore_schemas,
+            encoder,
+            encoding: config.encoding,
+            hashing_algorithm: config.hashing_algorithm,
         };
 
         Ok(cache_provider)
@@ -475,6 +484,19 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
+    pub fn encoder(&self) -> Arc<dyn encoding::Encoder> {
+        Arc::clone(&self.encoder)
+    }
+
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        match self.encoding {
+            spicepod::component::caching::Encoding::None => "none",
+            spicepod::component::caching::Encoding::Zstd => "zstd",
+        }
+    }
+
+    #[must_use]
     pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
         let mut plan_stack = vec![plan];
 
@@ -512,9 +534,11 @@ impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item ttl: {:?}",
+            "max size: {:.2}, item ttl: {:?}, hashing algorithm: {:?}, encoding: {}",
             Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
-            self.ttl
+            self.ttl,
+            self.hashing_algorithm,
+            self.encoding_name(),
         )
     }
 }
@@ -608,6 +632,33 @@ mod tests {
                 .expect("valid cache provider");
 
         assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[test]
+    fn test_display_includes_encoding() {
+        let config_none = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::None,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_none = QueryResultsCacheProvider::try_new(&config_none, Box::new([]))
+            .expect("valid cache provider");
+        let display_none = format!("{cache_none}");
+        assert!(
+            display_none.contains("encoding: none"),
+            "Display should include encoding: none, got: {display_none}"
+        );
+
+        let config_zstd = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::Zstd,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_zstd = QueryResultsCacheProvider::try_new(&config_zstd, Box::new([]))
+            .expect("valid cache provider");
+        let display_zstd = format!("{cache_zstd}");
+        assert!(
+            display_zstd.contains("encoding: zstd"),
+            "Display should include encoding: zstd, got: {display_zstd}"
+        );
     }
 
     #[tokio::test]

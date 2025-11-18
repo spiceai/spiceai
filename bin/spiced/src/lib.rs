@@ -309,6 +309,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     let rt = Arc::new(rt);
 
+    if prometheus_registry.is_some() {
+        rt.init_cache_metrics();
+    }
+
+    // Start background task to log cache size every 5s
+    rt.start_cache_size_logger().await;
+
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
