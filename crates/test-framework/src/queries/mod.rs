@@ -729,7 +729,9 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Spicecloud) => remove_tpcds_query!(
             queries, 8,  // https://github.com/spiceai/spiceai/issues/4668
             38, // https://github.com/spiceai/spiceai/issues/4667
-            87  // https://github.com/spiceai/spiceai/issues/4667
+            87, // https://github.com/spiceai/spiceai/issues/4667
+            32, 92, // https://github.com/spiceai/spiceai/issues/8150
+            29, 37, 41, 44, 54, 58 // empty results
         ),
         Some(QueryOverrides::SQLite) => remove_tpcds_query!(
             queries, 17, 29, 35, 74, // SQLite does not support `stddev`
