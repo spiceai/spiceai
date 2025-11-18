@@ -35,6 +35,7 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
@@ -214,7 +215,7 @@ pub struct HttpTableProvider {
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
     custom_headers: HeaderMap,
-    allowed_paths: Option<HashSet<String>>,
+    allowed_paths: Option<(GlobSet, Vec<String>)>,
     allow_query_filters: bool,
     max_query_length: usize,
     allow_body_filters: bool,
@@ -267,7 +268,9 @@ impl HttpTableProvider {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut normalized = HashSet::new();
+        let mut patterns = Vec::new();
+        let mut builder = GlobSetBuilder::new();
+
         for path in paths {
             let value = path.into().trim().to_string();
             ensure!(
@@ -292,13 +295,21 @@ impl HttpTableProvider {
                     )
                 }
             );
-            normalized.insert(value);
+
+            let glob = Glob::new(&value).map_err(|e| Error::Configuration {
+                message: format!("Invalid glob pattern in allowed_request_paths '{value}': {e}"),
+            })?;
+            builder.add(glob);
+            patterns.push(value);
         }
 
-        self.allowed_paths = if normalized.is_empty() {
+        self.allowed_paths = if patterns.is_empty() {
             None
         } else {
-            Some(normalized)
+            let globset = builder.build().map_err(|e| Error::Configuration {
+                message: format!("Failed to build glob matcher for allowed_request_paths: {e}"),
+            })?;
+            Some((globset, patterns))
         };
         Ok(self)
     }
@@ -773,7 +784,7 @@ impl TableProvider for HttpTableProvider {
             .iter()
             .map(|f| {
                 // Check if this specific filter can be pushed down
-                if self.can_pushdown_filter(f) {
+                if Self::can_pushdown_filter(f) {
                     TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -787,9 +798,13 @@ impl TableProvider for HttpTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::debug!("HTTP scan called with {} filters", filters.len());
+        tracing::debug!(
+            "HTTP scan called with {} filters, limit={:?}",
+            filters.len(),
+            limit
+        );
         for (i, filter) in filters.iter().enumerate() {
             tracing::trace!("  Filter {}: {:?}", i, filter);
         }
@@ -812,6 +827,7 @@ impl TableProvider for HttpTableProvider {
             Self::get_projected_schema(&self.schema, projection)?,
             Arc::new(self.clone()),
             partitions,
+            limit,
         )))
     }
 }
@@ -821,6 +837,7 @@ pub struct HttpExec {
     projected_schema: SchemaRef,
     provider: Arc<HttpTableProvider>,
     partitions: Vec<PartitionSpec>,
+    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -830,6 +847,7 @@ impl HttpExec {
         projected_schema: SchemaRef,
         provider: Arc<HttpTableProvider>,
         partitions: Vec<PartitionSpec>,
+        limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
@@ -841,6 +859,7 @@ impl HttpExec {
             projected_schema,
             provider,
             partitions,
+            limit,
             properties,
         }
     }
@@ -883,7 +902,7 @@ impl HttpExec {
         );
 
         // Parse content to determine how many rows we'll create
-        let content_rows = Self::parse_content(&content);
+        let content_rows = Self::parse_content(&content, self.limit);
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
@@ -926,7 +945,9 @@ impl HttpExec {
     /// - For JSON objects: single row
     /// - For newline-delimited JSON: each line becomes a row
     /// - For other content: single row
-    fn parse_content(content: &str) -> Vec<String> {
+    ///
+    /// If limit is provided, only returns up to that many rows
+    fn parse_content(content: &str, limit: Option<usize>) -> Vec<String> {
         let trimmed = content.trim();
 
         // Try to parse as JSON
@@ -934,7 +955,17 @@ impl HttpExec {
             match json_value {
                 serde_json::Value::Array(arr) => {
                     // JSON array: each element is a row
-                    return arr.into_iter().map(|item| item.to_string()).collect();
+                    let mut rows: Vec<String> = arr
+                        .into_iter()
+                        .take(limit.unwrap_or(usize::MAX))
+                        .map(|item| item.to_string())
+                        .collect();
+                    if let Some(lim) = limit
+                        && rows.len() > lim
+                    {
+                        rows.truncate(lim);
+                    }
+                    return rows;
                 }
                 _ => {
                     // Single JSON object or primitive value: one row
@@ -952,6 +983,7 @@ impl HttpExec {
             return trimmed
                 .lines()
                 .filter(|line| !line.trim().is_empty())
+                .take(limit.unwrap_or(usize::MAX))
                 .map(std::string::ToString::to_string)
                 .collect();
         }
@@ -1052,6 +1084,14 @@ impl ExecutionPlan for HttpExec {
 impl HttpTableProvider {
     /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
+        tracing::debug!(
+            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}",
+            filters.len(),
+            self.allowed_paths,
+            self.allow_query_filters,
+            self.allow_body_filters
+        );
+
         let mut accumulator = PartitionAccumulator::new();
 
         for filter in filters {
@@ -1059,7 +1099,21 @@ impl HttpTableProvider {
                 .map_err(DataFusionError::from)?;
         }
 
+        tracing::debug!(
+            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}",
+            accumulator.has_path_filter,
+            accumulator.has_query_filter,
+            accumulator.has_body_filter
+        );
+
         let (paths, queries, bodies) = accumulator.finalize();
+
+        tracing::debug!(
+            "After finalize: paths={:?}, queries={:?}, bodies={:?}",
+            paths,
+            queries,
+            bodies
+        );
 
         let mut partitions = vec![];
         for p in &paths {
@@ -1143,38 +1197,47 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
+        tracing::debug!(
+            "apply_literal_filter: column={}, value={}",
+            column_name,
+            value
+        );
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
+                tracing::debug!("Path filter validated and normalized: {}", normalized);
                 accumulator.record_path(normalized);
             }
             "request_query" => {
                 let normalized = self.ensure_allowed_query(value)?;
+                tracing::debug!("Query filter validated and normalized: {}", normalized);
                 accumulator.record_query(normalized);
             }
             "request_body" => {
                 let normalized = self.ensure_allowed_body(value)?;
+                tracing::debug!("Body filter validated and normalized: {}", normalized);
                 accumulator.record_body(normalized);
             }
-            _ => {}
+            _ => {
+                tracing::debug!("Ignoring filter on column: {}", column_name);
+            }
         }
         Ok(())
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
-    /// Note: This is only used for `supports_filters_pushdown`, actual validation happens in `extract_filter_values`
-    fn can_pushdown_filter(&self, filter: &Expr) -> bool {
+    /// Note: This returns true if the filter is on `request_path`, `request_query`, or `request_body` columns.
+    /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
+    fn can_pushdown_filter(filter: &Expr) -> bool {
         match filter {
             // Simple equality on request_path, request_query, or request_body
             Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
                 if let Expr::Column(col) = left.as_ref() {
-                    if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = right.as_ref() {
-                        match col.name.as_str() {
-                            "request_path" => self.ensure_allowed_path(value).is_ok(),
-                            "request_query" => self.ensure_allowed_query(value).is_ok(),
-                            "request_body" => self.ensure_allowed_body(value).is_ok(),
-                            _ => false,
-                        }
+                    if let Expr::Literal(ScalarValue::Utf8(Some(_value)), _) = right.as_ref() {
+                        matches!(
+                            col.name.as_str(),
+                            "request_path" | "request_query" | "request_body"
+                        )
                     } else {
                         false
                     }
@@ -1185,19 +1248,10 @@ impl HttpTableProvider {
             // IN list on request_path, request_query, or request_body
             Expr::InList(in_list) => {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
-                    // All values in the IN list must be valid
-                    in_list.list.iter().all(|expr| {
-                        if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = expr {
-                            match col.name.as_str() {
-                                "request_path" => self.ensure_allowed_path(value).is_ok(),
-                                "request_query" => self.ensure_allowed_query(value).is_ok(),
-                                "request_body" => self.ensure_allowed_body(value).is_ok(),
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        }
-                    })
+                    matches!(
+                        col.name.as_str(),
+                        "request_path" | "request_query" | "request_body"
+                    )
                 } else {
                     false
                 }
@@ -1206,13 +1260,19 @@ impl HttpTableProvider {
             Expr::BinaryExpr(BinaryExpr { left, op, right })
                 if *op == Operator::Or || *op == Operator::And =>
             {
-                self.can_pushdown_filter(left) && self.can_pushdown_filter(right)
+                Self::can_pushdown_filter(left) && Self::can_pushdown_filter(right)
             }
             _ => false,
         }
     }
 
     fn ensure_allowed_path(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_path called with raw={}, allowed_paths={:?}",
+            raw,
+            self.allowed_paths
+        );
+
         if raw.is_empty() {
             return Err(Error::FilterRejected {
                 message: "The 'request_path' filter cannot be empty. Provide a valid path starting with '/', such as '/api/endpoint'.".to_string(),
@@ -1241,19 +1301,20 @@ impl HttpTableProvider {
             });
         }
 
-        let Some(allowed) = &self.allowed_paths else {
+        let Some((globset, patterns)) = &self.allowed_paths else {
+            tracing::warn!("Path filter attempted but allowed_paths is None");
             return Err(Error::FilterRejected {
                 message:
-                    "Cannot filter by 'request_path' because path filtering is disabled for this dataset. To enable, add the 'allowed_request_paths' parameter with a comma-separated list of allowed paths in your dataset configuration."
+                    "Cannot filter by 'request_path' because path filtering is disabled for this dataset. To enable, add the 'allowed_request_paths' parameter with a comma-separated list of allowed path patterns in your dataset configuration."
                         .to_string(),
             });
         };
 
-        if !allowed.contains(raw) {
+        if !globset.is_match(raw) {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "The 'request_path' value '{raw}' is not in the allowed paths list. Allowed paths are: [{}]. Update the 'allowed_request_paths' parameter in your dataset configuration to include this path.",
-                    allowed
+                    "The 'request_path' value '{raw}' does not match any allowed path patterns. Allowed patterns are: [{}]. Update the 'allowed_request_paths' parameter in your dataset configuration to include a matching pattern.",
+                    patterns
                         .iter()
                         .map(|p| format!("'{p}'"))
                         .collect::<Vec<_>>()
@@ -1266,7 +1327,14 @@ impl HttpTableProvider {
     }
 
     fn ensure_allowed_query(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_query called with raw={}, allow_query_filters={}",
+            raw,
+            self.allow_query_filters
+        );
+
         if !self.allow_query_filters {
+            tracing::warn!("Query filter attempted but allow_query_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
@@ -1303,7 +1371,14 @@ impl HttpTableProvider {
     }
 
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_body called with raw={}, allow_body_filters={}",
+            raw,
+            self.allow_body_filters
+        );
+
         if !self.allow_body_filters {
+            tracing::warn!("Body filter attempted but allow_body_filters is false");
             return Err(Error::FilterRejected {
                 message:
                     "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
