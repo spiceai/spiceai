@@ -331,7 +331,7 @@ impl Https {
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
-        tracing::debug!(
+        tracing::trace!(
             "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}",
             dataset.name,
             allow_query_filters,
@@ -339,7 +339,7 @@ impl Https {
         );
 
         if allow_query_filters {
-            tracing::debug!(
+            tracing::trace!(
                 "Enabling query filters with max_length={}",
                 max_query_length
             );
@@ -347,7 +347,7 @@ impl Https {
         }
 
         if allow_body_filters {
-            tracing::debug!("Enabling body filters with max_bytes={}", max_body_bytes);
+            tracing::trace!("Enabling body filters with max_bytes={}", max_body_bytes);
             provider = provider.enable_body_filters(max_body_bytes);
         }
 

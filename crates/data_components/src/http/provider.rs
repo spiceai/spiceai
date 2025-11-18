@@ -800,7 +800,7 @@ impl TableProvider for HttpTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::debug!(
+        tracing::trace!(
             "HTTP scan called with {} filters, limit={:?}",
             filters.len(),
             limit
@@ -812,9 +812,9 @@ impl TableProvider for HttpTableProvider {
         // Extract all (path, query, body) combinations that are allowed for this provider
         let partitions = self.extract_partitions(filters)?;
 
-        tracing::debug!("Extracted {} partitions from filters", partitions.len());
+        tracing::trace!("Extracted {} partitions from filters", partitions.len());
         for (i, partition) in partitions.iter().enumerate() {
-            tracing::debug!(
+            tracing::trace!(
                 "  Partition {}: path={:?}, query={:?}, body={:?}",
                 i,
                 partition.0,
@@ -1054,7 +1054,7 @@ impl ExecutionPlan for HttpExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        tracing::debug!(
+        tracing::trace!(
             "HttpExec::execute called for partition {}, total partitions: {}",
             partition,
             self.partitions.len()
@@ -1066,9 +1066,9 @@ impl ExecutionPlan for HttpExec {
 
         // Use futures::stream::once to create a stream from a single async operation
         let stream = futures::stream::once(async move {
-            tracing::debug!("Fetching partition {}", partition);
+            tracing::trace!("Fetching partition {}", partition);
             let batch = exec.fetch_and_create_batch(&provider, partition).await?;
-            tracing::debug!(
+            tracing::trace!(
                 "Yielding batch for partition {}: {} rows",
                 partition,
                 batch.num_rows()
@@ -1084,7 +1084,7 @@ impl ExecutionPlan for HttpExec {
 impl HttpTableProvider {
     /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
-        tracing::debug!(
+        tracing::trace!(
             "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}",
             filters.len(),
             self.allowed_paths,
@@ -1099,7 +1099,7 @@ impl HttpTableProvider {
                 .map_err(DataFusionError::from)?;
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}",
             accumulator.has_path_filter,
             accumulator.has_query_filter,
@@ -1108,7 +1108,7 @@ impl HttpTableProvider {
 
         let (paths, queries, bodies) = accumulator.finalize();
 
-        tracing::debug!(
+        tracing::trace!(
             "After finalize: paths={:?}, queries={:?}, bodies={:?}",
             paths,
             queries,
@@ -1197,7 +1197,7 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
-        tracing::debug!(
+        tracing::trace!(
             "apply_literal_filter: column={}, value={}",
             column_name,
             value
@@ -1205,17 +1205,17 @@ impl HttpTableProvider {
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
-                tracing::debug!("Path filter validated and normalized: {}", normalized);
+                tracing::trace!("Path filter validated and normalized: {}", normalized);
                 accumulator.record_path(normalized);
             }
             "request_query" => {
                 let normalized = self.ensure_allowed_query(value)?;
-                tracing::debug!("Query filter validated and normalized: {}", normalized);
+                tracing::trace!("Query filter validated and normalized: {}", normalized);
                 accumulator.record_query(normalized);
             }
             "request_body" => {
                 let normalized = self.ensure_allowed_body(value)?;
-                tracing::debug!("Body filter validated and normalized: {}", normalized);
+                tracing::trace!("Body filter validated and normalized: {}", normalized);
                 accumulator.record_body(normalized);
             }
             _ => {
@@ -1688,7 +1688,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("allow_request_query_filters"));
+                assert!(message.contains("request_query_filters"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1711,7 +1711,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("allow_request_body_filters"));
+                assert!(message.contains("request_body_filters"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1734,7 +1734,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("max length"));
+                assert!(message.contains("too long"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1757,7 +1757,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("max size"));
+                assert!(message.contains("too large"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1919,15 +1919,16 @@ mod tests {
     }
 
     #[test]
-    fn test_supports_filters_pushdown_with_disallowed_path() {
+    fn test_supports_filters_pushdown_returns_inexact() {
         use datafusion::logical_expr::TableProviderFilterPushDown;
 
         let provider = base_provider()
             .with_allowed_paths(vec!["/allowed/path".to_string()])
             .expect("allowed paths");
 
-        // Filter with allowed path - should return Inexact
-        let allowed_filter = Expr::BinaryExpr(BinaryExpr {
+        // All request_path/query/body filters return Inexact
+        // Actual validation happens during scan/extract_partitions
+        let filter = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("request_path"))),
             op: Operator::Eq,
             right: Box::new(Expr::Literal(
@@ -1937,11 +1938,11 @@ mod tests {
         });
 
         let result = provider
-            .supports_filters_pushdown(&[&allowed_filter])
+            .supports_filters_pushdown(&[&filter])
             .expect("should support");
         assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
 
-        // Filter with disallowed path - should return Unsupported
+        // Even disallowed paths return Inexact (rejection happens in extract_partitions)
         let disallowed_filter = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::from_name("request_path"))),
             op: Operator::Eq,
@@ -1954,11 +1955,11 @@ mod tests {
         let result = provider
             .supports_filters_pushdown(&[&disallowed_filter])
             .expect("should support");
-        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+        assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
     }
 
     #[test]
-    fn test_supports_filters_pushdown_with_disabled_query_filters() {
+    fn test_supports_filters_pushdown_always_inexact() {
         use datafusion::logical_expr::TableProviderFilterPushDown;
 
         // Provider without query filters enabled
@@ -1973,10 +1974,12 @@ mod tests {
             )),
         });
 
+        // Returns Inexact even though query filters are disabled
+        // Rejection happens during extract_partitions
         let result = provider
             .supports_filters_pushdown(&[&filter])
             .expect("should support");
-        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+        assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
     }
 
     #[test]
@@ -2017,6 +2020,294 @@ mod tests {
 
     // Integration tests that make real HTTP requests
     // These are marked with #[ignore] by default to avoid network dependencies in CI
+
+    // Tests for globset pattern matching
+    #[test]
+    fn test_glob_pattern_wildcard() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string()])
+            .expect("allowed paths");
+
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+    }
+
+    #[test]
+    fn test_glob_pattern_double_wildcard() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/**".to_string()])
+            .expect("allowed paths");
+
+        // Should match nested paths
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/v1/users/123".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0],
+            (Some("/api/v1/users/123".to_string()), None, None)
+        );
+    }
+
+    #[test]
+    fn test_glob_pattern_character_class() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/v[0-9]/*".to_string()])
+            .expect("allowed paths");
+
+        // Should match v1, v2, etc.
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/v1/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0],
+            (Some("/api/v1/users".to_string()), None, None)
+        );
+    }
+
+    #[test]
+    fn test_glob_pattern_rejection() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string()])
+            .expect("allowed paths");
+
+        // Should reject paths that don't match the pattern
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/admin/users".to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("does not match any allowed path patterns"));
+                assert!(message.contains("/admin/users"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_glob_pattern_multiple_patterns() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string(), "/search/**".to_string()])
+            .expect("allowed paths");
+
+        // Test first pattern matches
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/posts".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+
+        // Test second pattern matches
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/search/deep/nested/path".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_exact_match() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/users".to_string()])
+            .expect("allowed paths");
+
+        // Exact string (no glob chars) should still work
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_question_mark() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/user?".to_string()])
+            .expect("allowed paths");
+
+        // ? matches single character
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_invalid_pattern() {
+        // Invalid glob pattern should fail gracefully
+        let result = base_provider().with_allowed_paths(vec!["/[invalid".to_string()]);
+
+        assert!(result.is_err());
+        let err = result.expect_err("should fail");
+        match &err {
+            Error::Configuration { message } => {
+                // globset error message contains pattern syntax errors
+                assert!(
+                    message.contains("Invalid glob pattern")
+                        || message.contains("unclosed")
+                        || message.contains("regex")
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_glob_pattern_with_in_list() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string(), "/v[0-9]/search".to_string()])
+            .expect("allowed paths");
+
+        // Test IN list with multiple values matching different patterns
+        let filters = vec![Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::from_name("request_path"))),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some("/api/users".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("/v1/search".to_string())), None),
+            ],
+            false,
+        ))];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 2);
+        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None)));
+    }
+
+    #[test]
+    fn test_glob_pattern_wildcard_matches_single_level() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string()])
+            .expect("allowed paths");
+
+        // Single * matches one path segment (no slash in the matched part)
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("should match");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+    }
+
+    #[test]
+    fn test_glob_pattern_mixed_exact_and_patterns() {
+        let provider = base_provider()
+            .with_allowed_paths(vec![
+                "/exact/path".to_string(),
+                "/api/*".to_string(),
+                "/search/**".to_string(),
+            ])
+            .expect("allowed paths");
+
+        // Test exact match
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/exact/path".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_ok());
+
+        // Test * pattern
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/posts".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_ok());
+
+        // Test ** pattern
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/search/a/b/c".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_ok());
+
+        // Test non-matching path
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/other/path".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_err());
+    }
 
     #[tokio::test]
     async fn test_integration_jsonplaceholder_single_post() {
