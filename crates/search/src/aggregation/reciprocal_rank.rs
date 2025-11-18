@@ -116,7 +116,10 @@ impl CandidateAggregation for ReciprocalRankFusion {
             i += 1;
         }
 
-        let primary_key_str: Vec<String> = primary_key.iter().map(datafusion::prelude::Column::flat_name).collect();
+        let primary_key_str: Vec<String> = primary_key
+            .iter()
+            .map(datafusion::prelude::Column::flat_name)
+            .collect();
 
         // Now that we've filtered empty generation data, again check for <=1 inputs.
         if table_names.len() <= 1 {
@@ -157,7 +160,10 @@ impl CandidateAggregation for ReciprocalRankFusion {
         Ok(AggregationResult {
             data,
             primary_key: primary_key_str,
-            data_columns: additional_columns.iter().map(datafusion::prelude::Column::flat_name).collect(),
+            data_columns: additional_columns
+                .iter()
+                .map(datafusion::prelude::Column::flat_name)
+                .collect(),
             matches,
         })
     }
