@@ -15,6 +15,7 @@ async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 byte-unit.workspace = true
+bytes.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
@@ -25,6 +26,7 @@ spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
 twox-hash = { workspace = true, optional = true }
+zstd = "0.13"
 
 [dev-dependencies]
 rstest = "0.25.0"

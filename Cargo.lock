@@ -2706,6 +2706,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "byte-unit",
+ "bytes",
  "datafusion",
  "fundu",
  "futures",
@@ -2717,6 +2718,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]

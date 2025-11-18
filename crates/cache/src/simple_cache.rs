@@ -179,12 +179,15 @@ mod tests {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult::new(
-            Arc::new(vec![record_batch.clone()]),
-            Arc::new(record_batch.schema().as_ref().to_owned()),
+        let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
+
+        CachedQueryResult::from_batches(
+            &[record_batch],
             Arc::new(input_tables),
             std::time::Instant::now(),
+            encoder,
         )
+        .expect("Failed to create cached result")
     }
 
     #[rstest]
@@ -207,9 +210,10 @@ mod tests {
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         assert!(retrieved.is_some());
+        let retrieved = retrieved.expect("Failed to get from cache");
         assert_eq!(
-            retrieved.expect("Failed to get from cache").records.len(),
-            result.records.len()
+            retrieved.records().expect("Failed to decode").len(),
+            result.records().expect("Failed to decode").len()
         );
     }
 
