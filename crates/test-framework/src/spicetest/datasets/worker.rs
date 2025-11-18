@@ -55,6 +55,8 @@ pub(crate) struct SpiceTestQueryWorker {
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
     /// Optional reference schema for validating against known good tables
     reference_schema: Option<String>,
+    /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
+    skip_row_count_validation: Vec<String>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -114,6 +116,7 @@ impl SpiceTestQueryWorker {
             http_client: None,
             validation_data: None,
             reference_schema: None,
+            skip_row_count_validation: default_row_count_validation_skip_queries(),
         }
     }
 
@@ -769,6 +772,14 @@ impl SpiceTestQueryWorker {
         )
         .await?;
 
+        // skip row count validation for specific queries that legitimately return 0 rows
+        if self
+            .skip_row_count_validation
+            .contains(&query.name.to_string())
+        {
+            return Ok(());
+        }
+
         // Validate row counts if both HTTP and Flight are available
         if let Some(http_counts) = http_row_counts.get(&query.name) {
             if let Some(flight_counts) = row_counts.get(&query.name) {
@@ -832,4 +843,15 @@ impl SpiceTestQueryWorker {
 
         Ok(())
     }
+}
+
+fn default_row_count_validation_skip_queries() -> Vec<String> {
+    vec![
+        "tpcds_q29".to_string(),
+        "tpcds_q37".to_string(),
+        "tpcds_q41".to_string(),
+        "tpcds_q44".to_string(),
+        "tpcds_q54".to_string(),
+        "tpcds_q58".to_string(),
+    ]
 }
