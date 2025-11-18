@@ -583,37 +583,6 @@ impl Runtime {
         }
     }
 
-    /// Starts a background task to log SQL results cache size every 5 seconds.
-    pub async fn start_cache_size_logger(self: &Arc<Self>) {
-        let df = Arc::clone(&self.datafusion());
-        let cancellation_token = CancellationToken::new();
-
-        let task_fn = async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                interval.tick().await;
-
-                if let Some(cache_provider) = df.results_cache_provider() {
-                    let size_bytes = cache_provider.size().await;
-                    let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
-                    let item_count = cache_provider.item_count().await;
-                    tracing::info!(
-                        "SQL results cache: {:.2} MB ({} items)",
-                        size_mb,
-                        item_count
-                    );
-                }
-            }
-        };
-
-        self.start_runtime_task("cache_size_logger", Some(cancellation_token), task_fn)
-            .await
-            .await
-            .ok();
-    }
-
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
