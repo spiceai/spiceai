@@ -476,7 +476,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_ttl_blake3() {
-        let hasher = get_hash_builder(HashingAlgorithm::Blake3).expect("Failed to get hash builder");
+        let hasher =
+            get_hash_builder(HashingAlgorithm::Blake3).expect("Failed to get hash builder");
 
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);

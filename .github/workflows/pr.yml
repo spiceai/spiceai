@@ -206,7 +206,7 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
