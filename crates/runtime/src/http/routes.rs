@@ -298,7 +298,7 @@ pub(crate) fn routes(
             sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
 
         // Apply MCP-specific request body limit before merging
-        tracing::info!(
+        tracing::debug!(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );

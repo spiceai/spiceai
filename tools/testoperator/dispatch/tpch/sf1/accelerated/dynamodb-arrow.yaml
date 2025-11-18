@@ -4,17 +4,17 @@ tests:
     query_set: tpch
     runner_type: spiceai-dev-runners
     ready_wait: 600
-    query_overrides: dynamo-db-accelerated
+    query_overrides: dynamodb-accelerated
   throughput:
     spicepod_path: accelerated/dynamodb-arrow.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     ready_wait: 600
-    query_overrides: dynamo-db-accelerated
+    query_overrides: dynamodb-accelerated
   load:
     spicepod_path: accelerated/dynamodb-arrow.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
     ready_wait: 600
-    query_overrides: dynamo-db-accelerated
+    query_overrides: dynamodb-accelerated
