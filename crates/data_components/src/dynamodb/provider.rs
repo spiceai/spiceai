@@ -272,6 +272,7 @@ impl TableProvider for DynamoDBTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        println!("supports_filters_pushdown: {:?}", filters);
         Ok(self.table_schema.supports_filters_pushdown(filters))
     }
 }
