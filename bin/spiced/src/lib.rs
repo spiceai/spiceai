@@ -297,8 +297,9 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+    if let Some(ref metrics_registry) = prometheus_registry {
+        init_metrics(&rt.datafusion(), metrics_registry.clone())
+            .context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -312,9 +313,6 @@ pub async fn run(args: Args) -> Result<()> {
     if prometheus_registry.is_some() {
         rt.init_cache_metrics();
     }
-
-    // Start background task to log cache size every 5s
-    rt.start_cache_size_logger().await;
 
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
