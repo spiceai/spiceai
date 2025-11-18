@@ -335,28 +335,53 @@ impl MetadataCatalog for CayenneCatalog {
                 })?;
 
             // Insert table metadata with initial snapshot
-            self.execute_helper(ExecuteParams {
-                sql: r"
+            // Handle race condition where another thread creates the table concurrently
+            let insert_result = self
+                .execute_helper(ExecuteParams {
+                    sql: r"
                     INSERT INTO cayenne_table (
                         table_id, table_uuid,
                         table_name, path, path_is_relative, schema_json, primary_key_json,
                         current_snapshot_id, partition_column, vortex_config_json
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ",
-                params: vec![
-                    MetastoreValue::Integer(table_id),
-                    MetastoreValue::Text(table_uuid),
-                    MetastoreValue::Text(table_name.clone()),
-                    MetastoreValue::Text(base_path.clone()),
-                    MetastoreValue::Bool(false), // path_is_relative
-                    MetastoreValue::Text(schema_json),
-                    primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    MetastoreValue::Text(initial_snapshot_id.clone()),
-                    partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
-                    MetastoreValue::Text(vortex_config_json),
-                ],
-            })
-            .await?;
+                    params: vec![
+                        MetastoreValue::Integer(table_id),
+                        MetastoreValue::Text(table_uuid),
+                        MetastoreValue::Text(table_name.clone()),
+                        MetastoreValue::Text(base_path.clone()),
+                        MetastoreValue::Bool(false), // path_is_relative
+                        MetastoreValue::Text(schema_json),
+                        primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        MetastoreValue::Text(initial_snapshot_id.clone()),
+                        partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                        MetastoreValue::Text(vortex_config_json),
+                    ],
+                })
+                .await;
+
+            // Check if insert failed due to constraint violation (race condition)
+            if let Err(CatalogError::Sqlite {
+                source: rusqlite::Error::SqliteFailure(err, _),
+            }) = &insert_result
+            {
+                if err.code == rusqlite::ErrorCode::ConstraintViolation {
+                    // Race condition - another thread created the table with same table_id
+                    // Fetch the existing table_id by table_name
+                    return self
+                        .query_row_helper(
+                            QueryRowParams {
+                                sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
+                                params: vec![MetastoreValue::Text(table_name.clone())],
+                            },
+                            |row| row.get_i64(0),
+                        )
+                        .await;
+                }
+            }
+
+            // Propagate any other errors
+            insert_result?;
 
             // Update next_catalog_id in metadata
             self.execute_helper(ExecuteParams {
@@ -540,41 +565,68 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64> {
-        // Get next delete_file_id
-        let next_delete_file_id: i64 = self
-            .query_row_helper(
-                QueryRowParams {
-                    sql: "SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM cayenne_delete_file",
-                    params: vec![],
-                },
-                |row| row.get_i64(0),
-            )
-            .await?;
+        // Retry loop to handle concurrent inserts - max 10 attempts
+        for attempt in 0..10 {
+            // Get next delete_file_id
+            let next_delete_file_id: i64 = self
+                .query_row_helper(
+                    QueryRowParams {
+                        sql: "SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM cayenne_delete_file",
+                        params: vec![],
+                    },
+                    |row| row.get_i64(0),
+                )
+                .await?;
 
-        let delete_file_id = next_delete_file_id;
+            let delete_file_id = next_delete_file_id;
 
-        // Insert delete file record
-        self.execute_helper(ExecuteParams {
-            sql: r"
+            // Insert delete file record
+            // Handle race condition where another thread creates a delete file concurrently
+            let insert_result = self
+                .execute_helper(ExecuteParams {
+                    sql: r"
                 INSERT INTO cayenne_delete_file (
                     delete_file_id, table_id, data_file_id, path, path_is_relative,
                     format, delete_count, file_size_bytes
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ",
-            params: vec![
-                MetastoreValue::Integer(delete_file_id),
-                MetastoreValue::Integer(delete_file.table_id),
-                MetastoreValue::Integer(delete_file.data_file_id),
-                MetastoreValue::Text(delete_file.path),
-                MetastoreValue::Bool(delete_file.path_is_relative),
-                MetastoreValue::Text(delete_file.format),
-                MetastoreValue::Integer(delete_file.delete_count),
-                MetastoreValue::Integer(delete_file.file_size_bytes),
-            ],
-        })
-        .await?;
+                    params: vec![
+                        MetastoreValue::Integer(delete_file_id),
+                        MetastoreValue::Integer(delete_file.table_id),
+                        MetastoreValue::Integer(delete_file.data_file_id),
+                        MetastoreValue::Text(delete_file.path.clone()),
+                        MetastoreValue::Bool(delete_file.path_is_relative),
+                        MetastoreValue::Text(delete_file.format.clone()),
+                        MetastoreValue::Integer(delete_file.delete_count),
+                        MetastoreValue::Integer(delete_file.file_size_bytes),
+                    ],
+                })
+                .await;
 
-        Ok(delete_file_id)
+            // Check if insert succeeded or failed due to constraint violation
+            match insert_result {
+                Ok(()) => return Ok(delete_file_id),
+                Err(CatalogError::Sqlite {
+                    source: rusqlite::Error::SqliteFailure(err, _),
+                }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    // Race condition - another thread used the same delete_file_id
+                    // Retry on next iteration (unless this was the last attempt)
+                    if attempt == 9 {
+                        // Last attempt failed, return the error
+                        return Err(CatalogError::Sqlite {
+                            source: rusqlite::Error::SqliteFailure(err, None),
+                        });
+                    }
+                    // Small delay before retry to reduce contention
+                    tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+                    // Otherwise, loop continues to next iteration
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // This should never be reached due to the loop logic
+        unreachable!("Retry loop should either return or error");
     }
 
     async fn get_delete_files(&self, _data_file_id: i64) -> CatalogResult<Vec<DeleteFile>> {
@@ -647,24 +699,52 @@ impl MetadataCatalog for CayenneCatalog {
         let partition_id = next_partition_id;
 
         // Insert partition metadata
-        self.execute_helper(ExecuteParams {
-            sql: r"
+        // Handle race condition where another thread creates the partition concurrently
+        let insert_result = self
+            .execute_helper(ExecuteParams {
+                sql: r"
                 INSERT INTO cayenne_partition (
                     partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ",
-            params: vec![
-                MetastoreValue::Integer(partition_id),
-                MetastoreValue::Integer(partition.table_id),
-                MetastoreValue::Text(partition.partition_column),
-                MetastoreValue::Text(partition.partition_value),
-                MetastoreValue::Text(partition.path),
-                MetastoreValue::Bool(partition.path_is_relative),
-                MetastoreValue::Integer(partition.record_count),
-                MetastoreValue::Integer(partition.file_size_bytes),
-            ],
-        })
-        .await?;
+                params: vec![
+                    MetastoreValue::Integer(partition_id),
+                    MetastoreValue::Integer(partition.table_id),
+                    MetastoreValue::Text(partition.partition_column.clone()),
+                    MetastoreValue::Text(partition.partition_value.clone()),
+                    MetastoreValue::Text(partition.path.clone()),
+                    MetastoreValue::Bool(partition.path_is_relative),
+                    MetastoreValue::Integer(partition.record_count),
+                    MetastoreValue::Integer(partition.file_size_bytes),
+                ],
+            })
+            .await;
+
+        // Check if insert failed due to constraint violation (race condition)
+        if let Err(CatalogError::Sqlite {
+            source: rusqlite::Error::SqliteFailure(err, _),
+        }) = &insert_result
+        {
+            if err.code == rusqlite::ErrorCode::ConstraintViolation {
+                // Race condition - another thread created the partition
+                // Fetch the existing partition_id by table_id and partition_value
+                return self
+                    .query_row_helper(
+                        QueryRowParams {
+                            sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_value = ?2",
+                            params: vec![
+                                MetastoreValue::Integer(partition.table_id),
+                                MetastoreValue::Text(partition.partition_value),
+                            ],
+                        },
+                        |row| row.get_i64(0),
+                    )
+                    .await;
+            }
+        }
+
+        // Propagate any other errors
+        insert_result?;
 
         // Update next_partition_id in metadata
         self.execute_helper(ExecuteParams {
@@ -818,10 +898,248 @@ impl MetadataCatalog for CayenneCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_catalog_creation() {
         let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
         // Tests will be added once implementation is complete
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_table_creation() {
+        // Create a unique test database to avoid conflicts with other tests
+        let test_db = format!("sqlite://./.test_concurrent_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        // Initialize the catalog
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        // Create test schema
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        let table_name = "test_concurrent_table";
+        let base_path = "/tmp/cayenne_test";
+
+        // Spawn multiple tasks that all try to create the same table concurrently
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let catalog_clone = Arc::clone(&catalog);
+            let schema_clone = Arc::clone(&schema);
+            let table_name = table_name.to_string();
+            let base_path = base_path.to_string();
+
+            let handle = tokio::spawn(async move {
+                let options = CreateTableOptions {
+                    table_name: table_name.clone(),
+                    schema: schema_clone,
+                    primary_key: vec![],
+                    base_path,
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig::default(),
+                };
+
+                catalog_clone.create_table(options).await
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        // All tasks should succeed (either creating or finding the table)
+        let mut table_ids = vec![];
+        for result in results {
+            let table_id = result.expect("Task panicked").expect("create_table failed");
+            table_ids.push(table_id);
+        }
+
+        // All tasks should have gotten the same table_id
+        assert!(
+            table_ids.windows(2).all(|w| w[0] == w[1]),
+            "All concurrent create_table calls should return the same table_id"
+        );
+
+        // Verify the table exists and can be queried
+        let table_metadata = catalog
+            .get_table(table_name)
+            .await
+            .expect("Failed to get table metadata");
+
+        assert_eq!(table_metadata.table_name, table_name);
+        assert_eq!(table_metadata.table_id, table_ids[0]);
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_partition_creation() {
+        // Create a unique test database to avoid conflicts with other tests
+        let test_db = format!(
+            "sqlite://./.test_concurrent_partition_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        // Initialize the catalog
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        // Create a test table first
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("date", arrow_schema::DataType::Utf8, true),
+        ]));
+
+        let table_options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec![],
+            base_path: "/tmp/cayenne_test_partition".to_string(),
+            partition_column: Some("date".to_string()),
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        // Spawn multiple tasks that all try to create the same partition concurrently
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let catalog_clone = Arc::clone(&catalog);
+
+            let handle = tokio::spawn(async move {
+                let partition = PartitionMetadata {
+                    partition_id: 0, // Will be assigned by catalog
+                    table_id,
+                    partition_column: "date".to_string(),
+                    partition_value: "2024-01-01".to_string(),
+                    path: "/tmp/cayenne_test_partition/partition_20240101".to_string(),
+                    path_is_relative: false,
+                    record_count: 100,
+                    file_size_bytes: 1024,
+                };
+
+                catalog_clone.add_partition(partition).await
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        // All tasks should succeed (either creating or finding the partition)
+        let mut partition_ids = vec![];
+        for result in results {
+            let partition_id = result
+                .expect("Task panicked")
+                .expect("add_partition failed");
+            partition_ids.push(partition_id);
+        }
+
+        // All tasks should have gotten the same partition_id
+        assert!(
+            partition_ids.windows(2).all(|w| w[0] == w[1]),
+            "All concurrent add_partition calls should return the same partition_id"
+        );
+
+        // Verify the partition exists and can be queried
+        let partitions = catalog
+            .get_partitions(table_id)
+            .await
+            .expect("Failed to get partitions");
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].partition_id, partition_ids[0]);
+        assert_eq!(partitions[0].partition_value, "2024-01-01");
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_delete_file_creation() {
+        // Create a unique test database to avoid conflicts with other tests
+        let test_db = format!(
+            "sqlite://./.test_concurrent_delete_file_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+
+        // Initialize the catalog
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let table_id = 1;
+        let data_file_id = 1;
+
+        // Spawn multiple tasks that all try to create delete files concurrently
+        let mut handles = vec![];
+        for i in 0..10 {
+            let catalog_clone = Arc::clone(&catalog);
+
+            let handle = tokio::spawn(async move {
+                let delete_file = DeleteFile {
+                    delete_file_id: 0, // Will be assigned by catalog
+                    table_id,
+                    data_file_id,
+                    path: format!("/tmp/delete_file_{i}.parquet"),
+                    path_is_relative: false,
+                    format: "parquet".to_string(),
+                    delete_count: 10,
+                    file_size_bytes: 512,
+                };
+
+                catalog_clone.add_delete_file(delete_file).await
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        let results: Vec<_> = futures::future::join_all(handles).await;
+
+        // All tasks should succeed with unique delete_file_ids
+        let mut delete_file_ids = vec![];
+        for result in results {
+            let delete_file_id = result
+                .expect("Task panicked")
+                .expect("add_delete_file failed");
+            delete_file_ids.push(delete_file_id);
+        }
+
+        // All delete_file_ids should be unique (unlike tables/partitions which are idempotent)
+        let unique_ids: std::collections::HashSet<_> = delete_file_ids.iter().collect();
+        assert_eq!(
+            unique_ids.len(),
+            delete_file_ids.len(),
+            "All concurrent add_delete_file calls should return unique delete_file_ids"
+        );
+
+        // Verify all delete files were created
+        let delete_files = catalog
+            .get_table_delete_files(table_id)
+            .await
+            .expect("Failed to get delete files");
+
+        assert_eq!(delete_files.len(), 10);
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 }
