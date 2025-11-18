@@ -15,49 +15,47 @@ use std::sync::{Arc, LazyLock};
 
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
-static SUPPORTED_AGG_FUNCTIONS_LIST: [&str; 30] = [
-    // Basic aggregates
-    "avg",
-    "count",
-    "max",
-    "min",
-    "sum",
-    // Bitwise aggregates
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    // Boolean aggregates
-    "bool_and",
-    "bool_or",
-    // String aggregates
-    "string_agg",
-    // Statistical aggregates
-    "corr",
-    "covar_pop",
-    "covar_samp",
-    "median",
-    "stddev_pop",
-    "stddev_samp",
-    "var_pop",
-    "var_samp",
-    // Regression aggregates
-    "regr_avgx",
-    "regr_avgy",
-    "regr_count",
-    "regr_intercept",
-    "regr_r2",
-    "regr_slope",
-    "regr_sxx",
-    "regr_sxy",
-    "regr_syy",
-    // Percentile/quantile aggregates
-    "quantile_cont",
-    // Approximate aggregates
-    "approx_percentile_cont",
-];
-
 static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> =
-    LazyLock::new(|| HashSet::from(SUPPORTED_AGG_FUNCTIONS_LIST));
+    LazyLock::new(|| HashSet::from([
+        // Basic aggregates
+        "avg",
+        "count",
+        "max",
+        "min",
+        "sum",
+        // Bitwise aggregates
+        "bit_and",
+        "bit_or",
+        "bit_xor",
+        // Boolean aggregates
+        "bool_and",
+        "bool_or",
+        // String aggregates
+        "string_agg",
+        // Statistical aggregates
+        "corr",
+        "covar_pop",
+        "covar_samp",
+        "median",
+        "stddev_pop",
+        "stddev_samp",
+        "var_pop",
+        "var_samp",
+        // Regression aggregates
+        "regr_avgx",
+        "regr_avgy",
+        "regr_count",
+        "regr_intercept",
+        "regr_r2",
+        "regr_slope",
+        "regr_sxx",
+        "regr_sxy",
+        "regr_syy",
+        // Percentile/quantile aggregates
+        "quantile_cont",
+        // Approximate aggregates
+        "approx_percentile_cont",
+    ]));
 
 /// This looks for opportunities in the expressed logical plan to push down aggregates
 /// directly into the SQL execution for DuckDB accelerated table providers (as indicated by `spice.accelerator`).
@@ -209,7 +207,10 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
             return Ok(maybe_marked_agg);
         }
 
-        // Try to push as much of the physical plan under the pushdown marker as possible
+        // Try to push as much of the physical plan under the pushdown marker as possible. We
+        // do this in two steps since the previous only operates on aggregate nodes (it is not
+        // possible to walk up at the point in time of rewriting), and trying to account for all
+        // invariants in one steps is difficult to follow
         let rewritten_plan = maybe_marked_agg.data;
         rewritten_plan.transform_down(|p| {
             if let Some(percolated) = Self::try_percolate_marker_node(&p)? {

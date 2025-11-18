@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod cache_invalidation;
+#[cfg(feature = "duckdb")]
 pub mod duckdb;
 
 pub use cache_invalidation::CacheInvalidationExtensionPlanner;
