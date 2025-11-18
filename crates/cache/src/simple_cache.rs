@@ -150,27 +150,36 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
         self.key_shards[shard].write().insert(*key);
     }
 
-    fn invalidate_all(&self) {
-        for shard_idx in 0..NUM_SHARDS {
-            let keys_to_remove: Vec<u64> = {
-                let shard = self.key_shards[shard_idx].read();
-                shard.iter().copied().collect()
-            };
-
-            for key in keys_to_remove {
-                self.cache.remove(key);
+    async fn invalidate_all(&self) {
+        // Pingora doesn't have a clear method, so we iterate and remove each key
+        let keys: Vec<u64> = {
+            let mut all_keys = Vec::new();
+            for shard in &self.key_shards {
+                all_keys.extend(shard.read().iter().copied());
             }
+            all_keys
+        };
 
-            self.key_shards[shard_idx].write().clear();
+        for key in keys {
+            self.cache.remove(key);
+        }
+
+        // Clear all key tracking shards
+        for shard in &self.key_shards {
+            shard.write().clear();
         }
     }
 
-    fn size_bytes(&self) -> u64 {
+    async fn size_bytes(&self) -> u64 {
         0 // Simple cache doesn't track weighted size
     }
 
-    fn item_count(&self) -> u64 {
-        self.cache.len() as u64
+    async fn item_count(&self) -> u64 {
+        // Sum keys across all shards
+        self.key_shards
+            .iter()
+            .map(|shard| shard.read().len() as u64)
+            .sum()
     }
 
     fn max_size(&self) -> usize {
@@ -323,7 +332,7 @@ mod tests {
         assert!(retrieved.is_some());
 
         // Invalidate the cache for the table
-        cache.invalidate_all();
+        cache.invalidate_all().await;
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;

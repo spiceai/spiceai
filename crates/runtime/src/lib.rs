@@ -596,9 +596,9 @@ impl Runtime {
                 interval.tick().await;
 
                 if let Some(cache_provider) = df.results_cache_provider() {
-                    let size_bytes = cache_provider.size();
+                    let size_bytes = cache_provider.size().await;
                     let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
-                    let item_count = cache_provider.item_count();
+                    let item_count = cache_provider.item_count().await;
                     tracing::info!(
                         "SQL results cache: {:.2} MB ({} items)",
                         size_mb,

@@ -142,8 +142,6 @@ impl<
             }
         };
 
-        V::init();
-
         LruCache {
             backend,
             hasher,
@@ -215,19 +213,11 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count());
-            V::record_size(self.size_bytes());
+        if now_seconds.saturating_sub(last_emitted) >= 5 {
+            self.metrics_last_reported_time
+                .store(now_seconds, Ordering::Relaxed);
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
             V::record_max_size(self.max_size() as u64);
 
             let hits = self.hits.load(Ordering::Relaxed);
@@ -236,91 +226,34 @@ impl<
         }
     }
 
-    fn invalidate_all(&self) {
-        // Block on async clear since this is a sync method that should complete before returning
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            // We're in a runtime, use block_in_place to avoid blocking the runtime
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    match &self.backend {
-                        CacheBackendType::Moka(backend) => backend.clear().await,
-                        CacheBackendType::Pingora(backend) => backend.clear().await,
-                    }
-                });
-            });
-        } else {
-            // Not in a runtime, create a new one
-            match tokio::runtime::Runtime::new() {
-                Ok(rt) => {
-                    rt.block_on(async {
-                        match &self.backend {
-                            CacheBackendType::Moka(backend) => backend.clear().await,
-                            CacheBackendType::Pingora(backend) => backend.clear().await,
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to create tokio runtime for cache invalidation: {}",
-                        e
-                    );
-                }
-            }
+    async fn invalidate_all(&self) {
+        match &self.backend {
+            CacheBackendType::Moka(backend) => backend.clear().await,
+            CacheBackendType::Pingora(backend) => backend.clear().await,
         }
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count());
-            V::record_size(self.size_bytes());
+        if now_seconds.saturating_sub(last_emitted) >= 5 {
+            self.metrics_last_reported_time
+                .store(now_seconds, Ordering::Relaxed);
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
         }
     }
 
-    fn size_bytes(&self) -> u64 {
-        // Both backends expose sync methods for size
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    match &self.backend {
-                        CacheBackendType::Moka(backend) => {
-                            // Moka doesn't expose weighted_size in async, use len as proxy
-                            backend.len().await as u64
-                        }
-                        CacheBackendType::Pingora(backend) => backend.len().await as u64,
-                    }
-                })
-            })
-        } else {
-            0 // Can't determine size without runtime
+    async fn size_bytes(&self) -> u64 {
+        match &self.backend {
+            CacheBackendType::Moka(backend) => backend.len().await as u64,
+            CacheBackendType::Pingora(backend) => backend.len().await as u64,
         }
     }
 
-    fn item_count(&self) -> u64 {
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    match &self.backend {
-                        CacheBackendType::Moka(backend) => backend.len().await as u64,
-                        CacheBackendType::Pingora(backend) => backend.len().await as u64,
-                    }
-                })
-            })
-        } else {
-            0 // Can't determine count without runtime
+    async fn item_count(&self) -> u64 {
+        match &self.backend {
+            CacheBackendType::Moka(backend) => backend.len().await as u64,
+            CacheBackendType::Pingora(backend) => backend.len().await as u64,
         }
     }
 
