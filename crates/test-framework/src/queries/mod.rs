@@ -535,7 +535,7 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         ),
         Some(QueryOverrides::MySQL) => remove_tpch_query!(queries, simple_q7),
         Some(QueryOverrides::DynamoDB) => remove_tpch_query!(
-            queries, 6  // Unsupported Decimals
+            queries, 6 // Unsupported Decimals
         ),
         Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
             "snowflake",
