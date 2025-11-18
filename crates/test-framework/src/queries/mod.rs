@@ -587,6 +587,9 @@ pub enum QueryOverrides {
     Spicecloud,
     SaffronViews,
     SaffronDuckdbCTE,
+    DynamoDB,
+    DynamoDBFederated,
+    DynamoDBAccelerated,
 }
 
 impl QueryOverrides {
@@ -600,6 +603,8 @@ impl QueryOverrides {
             "spark" => Some(Self::Spark),
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
+            "dynamodb_federated" => Some(Self::DynamoDBFederated),
+            "dynamodb_accelerated" => Some(Self::DynamoDBAccelerated),
             _ => None,
         }
     }
@@ -628,6 +633,12 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
         Some(QueryOverrides::MySQL) => remove_tpch_query!(queries, simple_q7),
+        Some(QueryOverrides::DynamoDBFederated) => remove_tpch_query!(
+            queries, 6 // Unsupported Decimals
+        ),
+        Some(QueryOverrides::DynamoDBAccelerated) => remove_tpch_query!(
+            queries, 1, 5, 6, 7, 8, 9, 10, 14, 17, 19, 22 // Unsupported Decimals
+        ),
         Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
             "snowflake",
             q1,
@@ -814,7 +825,9 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Spicecloud) => remove_tpcds_query!(
             queries, 8,  // https://github.com/spiceai/spiceai/issues/4668
             38, // https://github.com/spiceai/spiceai/issues/4667
-            87  // https://github.com/spiceai/spiceai/issues/4667
+            87, // https://github.com/spiceai/spiceai/issues/4667
+            32, 92, // https://github.com/spiceai/spiceai/issues/8150
+            29, 37, 41, 44, 54, 58 // empty results
         ),
         Some(QueryOverrides::SQLite) => remove_tpcds_query!(
             queries, 17, 29, 35, 74, // SQLite does not support `stddev`

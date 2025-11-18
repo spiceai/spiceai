@@ -69,13 +69,6 @@ struct HttpProviderParams {
 }
 
 impl Https {
-    fn parse_bool_flag(value: &str) -> bool {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }
-
     fn resolve_http_provider_params(&self, dataset: &Dataset) -> HttpProviderParams {
         let file_format = self
             .params
@@ -133,10 +126,10 @@ impl Https {
 
         let allow_query_filters = self
             .params
-            .get("allow_request_query_filters")
+            .get("request_query_filters")
             .expose()
             .ok()
-            .is_some_and(Self::parse_bool_flag);
+            .is_some_and(util::parse_enabled);
 
         let max_query_length = self
             .params
@@ -148,10 +141,10 @@ impl Https {
 
         let allow_body_filters = self
             .params
-            .get("allow_request_body_filters")
+            .get("request_body_filters")
             .expose()
             .ok()
-            .is_some_and(Self::parse_bool_flag);
+            .is_some_and(util::parse_enabled);
 
         let max_body_bytes = self
             .params
@@ -338,11 +331,23 @@ impl Https {
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
+        tracing::trace!(
+            "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}",
+            dataset.name,
+            allow_query_filters,
+            allow_body_filters
+        );
+
         if allow_query_filters {
+            tracing::trace!(
+                "Enabling query filters with max_length={}",
+                max_query_length
+            );
             provider = provider.enable_query_filters(max_query_length);
         }
 
         if allow_body_filters {
+            tracing::trace!("Enabling body filters with max_bytes={}", max_body_bytes);
             provider = provider.enable_body_filters(max_body_bytes);
         }
 
@@ -449,12 +454,14 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Randomization factor for retry delays (0.0 to 1.0). Default: 0.3 (30% randomization). Set to 0 for no jitter."),
         ParameterSpec::runtime("allowed_request_paths")
             .description("Comma-separated list of request_path values that users are allowed to query. Required to enable request_path filters."),
-        ParameterSpec::runtime("allow_request_query_filters")
-            .description("Set to true (1/true/yes/on) to allow request_query filters to be pushed down to HTTP requests."),
+        ParameterSpec::runtime("request_query_filters")
+            .description("Set to 'enabled' or 'disabled' to control whether request_query filters can be pushed down to HTTP requests.")
+            .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_query_length")
             .description("Maximum length (in characters) for request_query filter values. Default: 1024."),
-        ParameterSpec::runtime("allow_request_body_filters")
-            .description("Set to true (1/true/yes/on) to allow request_body filters to be pushed down as HTTP request bodies."),
+        ParameterSpec::runtime("request_body_filters")
+            .description("Set to 'enabled' or 'disabled' to control whether request_body filters can be pushed down as HTTP request bodies.")
+            .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
     ]);

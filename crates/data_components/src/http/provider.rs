@@ -35,6 +35,7 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
     Client,
@@ -214,7 +215,7 @@ pub struct HttpTableProvider {
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
     custom_headers: HeaderMap,
-    allowed_paths: Option<HashSet<String>>,
+    allowed_paths: Option<(GlobSet, Vec<String>)>,
     allow_query_filters: bool,
     max_query_length: usize,
     allow_body_filters: bool,
@@ -267,7 +268,9 @@ impl HttpTableProvider {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut normalized = HashSet::new();
+        let mut patterns = Vec::new();
+        let mut builder = GlobSetBuilder::new();
+
         for path in paths {
             let value = path.into().trim().to_string();
             ensure!(
@@ -292,13 +295,21 @@ impl HttpTableProvider {
                     )
                 }
             );
-            normalized.insert(value);
+
+            let glob = Glob::new(&value).map_err(|e| Error::Configuration {
+                message: format!("Invalid glob pattern in allowed_request_paths '{value}': {e}"),
+            })?;
+            builder.add(glob);
+            patterns.push(value);
         }
 
-        self.allowed_paths = if normalized.is_empty() {
+        self.allowed_paths = if patterns.is_empty() {
             None
         } else {
-            Some(normalized)
+            let globset = builder.build().map_err(|e| Error::Configuration {
+                message: format!("Failed to build glob matcher for allowed_request_paths: {e}"),
+            })?;
+            Some((globset, patterns))
         };
         Ok(self)
     }
@@ -773,7 +784,7 @@ impl TableProvider for HttpTableProvider {
             .iter()
             .map(|f| {
                 // Check if this specific filter can be pushed down
-                if self.can_pushdown_filter(f) {
+                if Self::can_pushdown_filter(f) {
                     TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -787,9 +798,13 @@ impl TableProvider for HttpTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::debug!("HTTP scan called with {} filters", filters.len());
+        tracing::trace!(
+            "HTTP scan called with {} filters, limit={:?}",
+            filters.len(),
+            limit
+        );
         for (i, filter) in filters.iter().enumerate() {
             tracing::trace!("  Filter {}: {:?}", i, filter);
         }
@@ -797,9 +812,9 @@ impl TableProvider for HttpTableProvider {
         // Extract all (path, query, body) combinations that are allowed for this provider
         let partitions = self.extract_partitions(filters)?;
 
-        tracing::debug!("Extracted {} partitions from filters", partitions.len());
+        tracing::trace!("Extracted {} partitions from filters", partitions.len());
         for (i, partition) in partitions.iter().enumerate() {
-            tracing::debug!(
+            tracing::trace!(
                 "  Partition {}: path={:?}, query={:?}, body={:?}",
                 i,
                 partition.0,
@@ -812,6 +827,7 @@ impl TableProvider for HttpTableProvider {
             Self::get_projected_schema(&self.schema, projection)?,
             Arc::new(self.clone()),
             partitions,
+            limit,
         )))
     }
 }
@@ -821,6 +837,7 @@ pub struct HttpExec {
     projected_schema: SchemaRef,
     provider: Arc<HttpTableProvider>,
     partitions: Vec<PartitionSpec>,
+    limit: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -830,6 +847,7 @@ impl HttpExec {
         projected_schema: SchemaRef,
         provider: Arc<HttpTableProvider>,
         partitions: Vec<PartitionSpec>,
+        limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
@@ -841,6 +859,7 @@ impl HttpExec {
             projected_schema,
             provider,
             partitions,
+            limit,
             properties,
         }
     }
@@ -850,28 +869,31 @@ impl HttpExec {
         provider: &HttpTableProvider,
         partition: usize,
     ) -> DataFusionResult<RecordBatch> {
-        let (path, _query, _body) = &self.partitions[partition];
+        let (path, query, body) = &self.partitions[partition];
 
         // Use the filter path or empty string (base URL only)
         let path_val = path.as_deref().unwrap_or("");
+        let query_val = query.as_deref();
+        let body_val = body.as_deref();
 
         tracing::debug!(
-            "HttpExec fetching partition {}: request_path={:?}",
+            "HttpExec fetching partition {}: request_path={:?}, request_query={:?}, request_body={:?}",
             partition,
-            path_val
+            path_val,
+            query_val,
+            body_val
         );
 
-        // Fetch content with only the path, no query or body
+        // Fetch content with path, query, and body
         let content = provider
-            .get_content(path_val, None, None)
+            .get_content(path_val, query_val, body_val)
             .await
             .map_err(DataFusionError::from)?;
 
-        // Set path from partition, but leave query and body empty
-        // DataFusion's FilterExec will filter based on these columns if needed
+        // Store the actual values from the partition for the primary key
         let path_for_batch = path.as_deref().unwrap_or("");
-        let query_for_batch = "";
-        let body_for_batch = "";
+        let query_for_batch = query.as_deref().unwrap_or("");
+        let body_for_batch = body.as_deref().unwrap_or("");
 
         tracing::debug!(
             "Creating batch with request_path={:?}, content_len={}",
@@ -880,7 +902,7 @@ impl HttpExec {
         );
 
         // Parse content to determine how many rows we'll create
-        let content_rows = Self::parse_content(&content);
+        let content_rows = Self::parse_content(&content, self.limit);
         let num_rows = content_rows.len();
 
         if num_rows == 0 {
@@ -923,7 +945,9 @@ impl HttpExec {
     /// - For JSON objects: single row
     /// - For newline-delimited JSON: each line becomes a row
     /// - For other content: single row
-    fn parse_content(content: &str) -> Vec<String> {
+    ///
+    /// If limit is provided, only returns up to that many rows
+    fn parse_content(content: &str, limit: Option<usize>) -> Vec<String> {
         let trimmed = content.trim();
 
         // Try to parse as JSON
@@ -931,7 +955,17 @@ impl HttpExec {
             match json_value {
                 serde_json::Value::Array(arr) => {
                     // JSON array: each element is a row
-                    return arr.into_iter().map(|item| item.to_string()).collect();
+                    let mut rows: Vec<String> = arr
+                        .into_iter()
+                        .take(limit.unwrap_or(usize::MAX))
+                        .map(|item| item.to_string())
+                        .collect();
+                    if let Some(lim) = limit
+                        && rows.len() > lim
+                    {
+                        rows.truncate(lim);
+                    }
+                    return rows;
                 }
                 _ => {
                     // Single JSON object or primitive value: one row
@@ -949,6 +983,7 @@ impl HttpExec {
             return trimmed
                 .lines()
                 .filter(|line| !line.trim().is_empty())
+                .take(limit.unwrap_or(usize::MAX))
                 .map(std::string::ToString::to_string)
                 .collect();
         }
@@ -1019,7 +1054,7 @@ impl ExecutionPlan for HttpExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        tracing::debug!(
+        tracing::trace!(
             "HttpExec::execute called for partition {}, total partitions: {}",
             partition,
             self.partitions.len()
@@ -1031,9 +1066,9 @@ impl ExecutionPlan for HttpExec {
 
         // Use futures::stream::once to create a stream from a single async operation
         let stream = futures::stream::once(async move {
-            tracing::debug!("Fetching partition {}", partition);
+            tracing::trace!("Fetching partition {}", partition);
             let batch = exec.fetch_and_create_batch(&provider, partition).await?;
-            tracing::debug!(
+            tracing::trace!(
                 "Yielding batch for partition {}: {} rows",
                 partition,
                 batch.num_rows()
@@ -1049,6 +1084,14 @@ impl ExecutionPlan for HttpExec {
 impl HttpTableProvider {
     /// Extract paths from filters for creating partitions. Query and body filters are validated but not used for partitioning.
     fn extract_partitions(&self, filters: &[Expr]) -> DataFusionResult<Vec<PartitionSpec>> {
+        tracing::trace!(
+            "extract_partitions called with {} filters, allowed_paths={:?}, allow_query_filters={}, allow_body_filters={}",
+            filters.len(),
+            self.allowed_paths,
+            self.allow_query_filters,
+            self.allow_body_filters
+        );
+
         let mut accumulator = PartitionAccumulator::new();
 
         for filter in filters {
@@ -1056,21 +1099,34 @@ impl HttpTableProvider {
                 .map_err(DataFusionError::from)?;
         }
 
-        let (paths, _queries, _bodies) = accumulator.finalize();
+        tracing::trace!(
+            "After processing filters: has_path_filter={}, has_query_filter={}, has_body_filter={}",
+            accumulator.has_path_filter,
+            accumulator.has_query_filter,
+            accumulator.has_body_filter
+        );
 
-        // Create partitions only from paths, not from query/body combinations
-        // Query and body filters will be applied by DataFusion's FilterExec
-        // Paths are already deduplicated and sorted by the accumulator
-        let partitions = paths
-            .into_iter()
-            .map(|path| {
-                (
-                    if path.is_empty() { None } else { Some(path) },
-                    None, // No query in partition spec
-                    None, // No body in partition spec
-                )
-            })
-            .collect();
+        let (paths, queries, bodies) = accumulator.finalize();
+
+        tracing::trace!(
+            "After finalize: paths={:?}, queries={:?}, bodies={:?}",
+            paths,
+            queries,
+            bodies
+        );
+
+        let mut partitions = vec![];
+        for p in &paths {
+            for q in &queries {
+                for b in &bodies {
+                    partitions.push((
+                        if p.is_empty() { None } else { Some(p.clone()) },
+                        q.clone(),
+                        b.clone(),
+                    ));
+                }
+            }
+        }
 
         Ok(partitions)
     }
@@ -1141,35 +1197,49 @@ impl HttpTableProvider {
         value: &str,
         accumulator: &mut PartitionAccumulator,
     ) -> Result<()> {
+        tracing::trace!(
+            "apply_literal_filter: column={}, value={}",
+            column_name,
+            value
+        );
         match column_name {
             "request_path" => {
                 let normalized = self.ensure_allowed_path(value)?;
+                tracing::trace!("Path filter validated and normalized: {}", normalized);
                 accumulator.record_path(normalized);
             }
             "request_query" => {
                 let normalized = self.ensure_allowed_query(value)?;
+                tracing::trace!("Query filter validated and normalized: {}", normalized);
                 accumulator.record_query(normalized);
             }
             "request_body" => {
                 let normalized = self.ensure_allowed_body(value)?;
+                tracing::trace!("Body filter validated and normalized: {}", normalized);
                 accumulator.record_body(normalized);
             }
-            _ => {}
+            _ => {
+                tracing::debug!("Ignoring filter on column: {}", column_name);
+            }
         }
         Ok(())
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
-    fn can_pushdown_filter(&self, filter: &Expr) -> bool {
+    /// Note: This returns true if the filter is on `request_path`, `request_query`, or `request_body` columns.
+    /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
+    fn can_pushdown_filter(filter: &Expr) -> bool {
         match filter {
             // Simple equality on request_path, request_query, or request_body
-            Expr::BinaryExpr(BinaryExpr { left, op, right: _ }) if *op == Operator::Eq => {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
                 if let Expr::Column(col) = left.as_ref() {
-                    match col.name.as_str() {
-                        "request_path" => self.allowed_paths.is_some(),
-                        "request_query" => self.allow_query_filters,
-                        "request_body" => self.allow_body_filters,
-                        _ => false,
+                    if let Expr::Literal(ScalarValue::Utf8(Some(_value)), _) = right.as_ref() {
+                        matches!(
+                            col.name.as_str(),
+                            "request_path" | "request_query" | "request_body"
+                        )
+                    } else {
+                        false
                     }
                 } else {
                     false
@@ -1178,12 +1248,10 @@ impl HttpTableProvider {
             // IN list on request_path, request_query, or request_body
             Expr::InList(in_list) => {
                 if let Expr::Column(col) = in_list.expr.as_ref() {
-                    match col.name.as_str() {
-                        "request_path" => self.allowed_paths.is_some(),
-                        "request_query" => self.allow_query_filters,
-                        "request_body" => self.allow_body_filters,
-                        _ => false,
-                    }
+                    matches!(
+                        col.name.as_str(),
+                        "request_path" | "request_query" | "request_body"
+                    )
                 } else {
                     false
                 }
@@ -1192,47 +1260,66 @@ impl HttpTableProvider {
             Expr::BinaryExpr(BinaryExpr { left, op, right })
                 if *op == Operator::Or || *op == Operator::And =>
             {
-                self.can_pushdown_filter(left) && self.can_pushdown_filter(right)
+                Self::can_pushdown_filter(left) && Self::can_pushdown_filter(right)
             }
             _ => false,
         }
     }
 
     fn ensure_allowed_path(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_path called with raw={}, allowed_paths={:?}",
+            raw,
+            self.allowed_paths
+        );
+
         if raw.is_empty() {
             return Err(Error::FilterRejected {
-                message: "request_path filter cannot be empty".to_string(),
+                message: "The 'request_path' filter cannot be empty. Provide a valid path starting with '/', such as '/api/endpoint'.".to_string(),
             });
         }
         if raw.len() > MAX_REQUEST_PATH_LENGTH {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_path exceeds the maximum supported length of {MAX_REQUEST_PATH_LENGTH} characters"
+                    "The 'request_path' value '{raw}' is too long ({} characters). Maximum allowed length is {MAX_REQUEST_PATH_LENGTH} characters.",
+                    raw.len()
                 ),
             });
         }
         if !raw.starts_with('/') {
             return Err(Error::FilterRejected {
-                message: "request_path filters must start with '/'".to_string(),
+                message: format!(
+                    "The 'request_path' value '{raw}' must start with '/'. For example: '/api/endpoint' instead of '{raw}'."
+                ),
             });
         }
         if raw.contains("..") {
             return Err(Error::FilterRejected {
-                message: "request_path cannot contain '..' segments".to_string(),
+                message: format!(
+                    "The 'request_path' value '{raw}' contains '..' segments, which are not allowed for security reasons."
+                ),
             });
         }
 
-        let Some(allowed) = &self.allowed_paths else {
+        let Some((globset, patterns)) = &self.allowed_paths else {
+            tracing::warn!("Path filter attempted but allowed_paths is None");
             return Err(Error::FilterRejected {
                 message:
-                    "request_path filters are disabled for this dataset. Configure allowed_request_paths to enable them."
+                    "Cannot filter by 'request_path' because path filtering is disabled for this dataset. To enable, add the 'allowed_request_paths' parameter with a comma-separated list of allowed path patterns in your dataset configuration."
                         .to_string(),
             });
         };
 
-        if !allowed.contains(raw) {
+        if !globset.is_match(raw) {
             return Err(Error::FilterRejected {
-                message: format!("request_path '{raw}' is not included in allowed_request_paths"),
+                message: format!(
+                    "The 'request_path' value '{raw}' does not match any allowed path patterns. Allowed patterns are: [{}]. Update the 'allowed_request_paths' parameter in your dataset configuration to include a matching pattern.",
+                    patterns
+                        .iter()
+                        .map(|p| format!("'{p}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             });
         }
 
@@ -1240,40 +1327,68 @@ impl HttpTableProvider {
     }
 
     fn ensure_allowed_query(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_query called with raw={}, allow_query_filters={}",
+            raw,
+            self.allow_query_filters
+        );
+
         if !self.allow_query_filters {
+            tracing::warn!("Query filter attempted but allow_query_filters is false");
             return Err(Error::FilterRejected {
                 message:
-                    "request_query filters are disabled for this dataset. Enable allow_request_query_filters to use them.".to_string(),
+                    "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
         if raw.len() > self.max_query_length {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_query exceeds the configured max length of {} characters",
+                    "The 'request_query' value is too long ({} characters). Maximum allowed length is {} characters. You can increase this limit using the 'max_request_query_length' parameter.",
+                    raw.len(),
                     self.max_query_length
                 ),
             });
         }
         if raw.chars().any(char::is_control) {
             return Err(Error::FilterRejected {
-                message: "request_query cannot contain control characters".to_string(),
+                message: "The 'request_query' value contains control characters, which are not allowed for security reasons.".to_string(),
             });
         }
 
-        Ok(raw.strip_prefix('?').unwrap_or(raw).to_string())
+        let query = raw.strip_prefix('?').unwrap_or(raw);
+        Ok(Self::sort_query_params(query))
+    }
+
+    /// Sort query parameters alphabetically by key for consistent primary key handling
+    fn sort_query_params(query: &str) -> String {
+        if query.is_empty() {
+            return String::new();
+        }
+
+        let mut params: Vec<&str> = query.split('&').collect();
+        params.sort_unstable();
+        params.join("&")
     }
 
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {
+        tracing::debug!(
+            "ensure_allowed_body called with raw={}, allow_body_filters={}",
+            raw,
+            self.allow_body_filters
+        );
+
         if !self.allow_body_filters {
+            tracing::warn!("Body filter attempted but allow_body_filters is false");
             return Err(Error::FilterRejected {
                 message:
-                    "request_body filters are disabled for this dataset. Enable allow_request_body_filters to use them.".to_string(),
+                    "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
         if raw.len() > self.max_body_bytes {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_body exceeds the configured max size of {} bytes",
+                    "The 'request_body' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_body_bytes' parameter.",
+                    raw.len(),
                     self.max_body_bytes
                 ),
             });
@@ -1334,7 +1449,11 @@ mod tests {
         assert_eq!(partitions.len(), 1);
         assert_eq!(
             partitions[0],
-            (Some("/singlesearch/shows".to_string()), None, None)
+            (
+                Some("/singlesearch/shows".to_string()),
+                Some("q=South%20Park".to_string()),
+                None
+            )
         );
     }
 
@@ -1443,8 +1562,9 @@ mod tests {
 
         // Query filters don't create partitions, only path filters do
         // This will create a single partition with no path
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (None, None, None));
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0], (None, Some("limit=10".to_string()), None));
+        assert_eq!(partitions[1], (None, Some("limit=20".to_string()), None));
     }
 
     #[test]
@@ -1509,8 +1629,23 @@ mod tests {
         let partitions = provider.extract_partitions(&filters).expect("partitions");
 
         // Only path creates partition; query filters are validated but don't create separate partitions
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(
+            partitions[0],
+            (
+                Some("/api/users".to_string()),
+                Some("limit=10".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            partitions[1],
+            (
+                Some("/api/users".to_string()),
+                Some("limit=20".to_string()),
+                None
+            )
+        );
     }
 
     #[test]
@@ -1553,7 +1688,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("allow_request_query_filters"));
+                assert!(message.contains("request_query_filters"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1576,7 +1711,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("allow_request_body_filters"));
+                assert!(message.contains("request_body_filters"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1599,7 +1734,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("max length"));
+                assert!(message.contains("too long"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1622,7 +1757,7 @@ mod tests {
             .expect_err("expected rejection");
         match err {
             DataFusionError::Plan(message) => {
-                assert!(message.contains("max size"));
+                assert!(message.contains("too large"));
             }
             other => panic!("Unexpected error: {other:?}"),
         }
@@ -1781,5 +1916,838 @@ mod tests {
             projected_field_names,
             &["request_path", "request_query", "request_body", "content"]
         );
+    }
+
+    #[test]
+    fn test_supports_filters_pushdown_returns_inexact() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/allowed/path".to_string()])
+            .expect("allowed paths");
+
+        // All request_path/query/body filters return Inexact
+        // Actual validation happens during scan/extract_partitions
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/allowed/path".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("should support");
+        assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
+
+        // Even disallowed paths return Inexact (rejection happens in extract_partitions)
+        let disallowed_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/not/allowed".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&disallowed_filter])
+            .expect("should support");
+        assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
+    }
+
+    #[test]
+    fn test_supports_filters_pushdown_always_inexact() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+
+        // Provider without query filters enabled
+        let provider = base_provider();
+
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_query"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("q=test".to_string())),
+                None,
+            )),
+        });
+
+        // Returns Inexact even though query filters are disabled
+        // Rejection happens during extract_partitions
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("should support");
+        assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
+    }
+
+    #[test]
+    fn test_sort_query_params() {
+        // Test empty query
+        assert_eq!(HttpTableProvider::sort_query_params(""), "");
+
+        // Test single parameter
+        assert_eq!(
+            HttpTableProvider::sort_query_params("key=value"),
+            "key=value"
+        );
+
+        // Test already sorted parameters
+        assert_eq!(
+            HttpTableProvider::sort_query_params("a=1&b=2&c=3"),
+            "a=1&b=2&c=3"
+        );
+
+        // Test unsorted parameters - should be sorted alphabetically
+        assert_eq!(
+            HttpTableProvider::sort_query_params("c=3&a=1&b=2"),
+            "a=1&b=2&c=3"
+        );
+
+        // Test with URL encoding
+        assert_eq!(
+            HttpTableProvider::sort_query_params("z=last&a=first&m=middle"),
+            "a=first&m=middle&z=last"
+        );
+
+        // Test complex query string
+        assert_eq!(
+            HttpTableProvider::sort_query_params("userId=1&title=foo&body=bar"),
+            "body=bar&title=foo&userId=1"
+        );
+    }
+
+    // Integration tests that make real HTTP requests
+    // These are marked with #[ignore] by default to avoid network dependencies in CI
+
+    // Tests for globset pattern matching
+    #[test]
+    fn test_glob_pattern_wildcard() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string()])
+            .expect("allowed paths");
+
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+    }
+
+    #[test]
+    fn test_glob_pattern_double_wildcard() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/**".to_string()])
+            .expect("allowed paths");
+
+        // Should match nested paths
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/v1/users/123".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0],
+            (Some("/api/v1/users/123".to_string()), None, None)
+        );
+    }
+
+    #[test]
+    fn test_glob_pattern_character_class() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/v[0-9]/*".to_string()])
+            .expect("allowed paths");
+
+        // Should match v1, v2, etc.
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/v1/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0],
+            (Some("/api/v1/users".to_string()), None, None)
+        );
+    }
+
+    #[test]
+    fn test_glob_pattern_rejection() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string()])
+            .expect("allowed paths");
+
+        // Should reject paths that don't match the pattern
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/admin/users".to_string())),
+                None,
+            )),
+        })];
+
+        let err = provider
+            .extract_partitions(&filters)
+            .expect_err("expected rejection");
+        match err {
+            DataFusionError::Plan(message) => {
+                assert!(message.contains("does not match any allowed path patterns"));
+                assert!(message.contains("/admin/users"));
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_glob_pattern_multiple_patterns() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string(), "/search/**".to_string()])
+            .expect("allowed paths");
+
+        // Test first pattern matches
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/posts".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+
+        // Test second pattern matches
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/search/deep/nested/path".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_exact_match() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/users".to_string()])
+            .expect("allowed paths");
+
+        // Exact string (no glob chars) should still work
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_question_mark() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/user?".to_string()])
+            .expect("allowed paths");
+
+        // ? matches single character
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_pattern_invalid_pattern() {
+        // Invalid glob pattern should fail gracefully
+        let result = base_provider().with_allowed_paths(vec!["/[invalid".to_string()]);
+
+        assert!(result.is_err());
+        let err = result.expect_err("should fail");
+        match &err {
+            Error::Configuration { message } => {
+                // globset error message contains pattern syntax errors
+                assert!(
+                    message.contains("Invalid glob pattern")
+                        || message.contains("unclosed")
+                        || message.contains("regex")
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_glob_pattern_with_in_list() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string(), "/v[0-9]/search".to_string()])
+            .expect("allowed paths");
+
+        // Test IN list with multiple values matching different patterns
+        let filters = vec![Expr::InList(InList::new(
+            Box::new(Expr::Column(Column::from_name("request_path"))),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some("/api/users".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("/v1/search".to_string())), None),
+            ],
+            false,
+        ))];
+
+        let partitions = provider.extract_partitions(&filters).expect("partitions");
+        assert_eq!(partitions.len(), 2);
+        assert!(partitions.contains(&(Some("/api/users".to_string()), None, None)));
+        assert!(partitions.contains(&(Some("/v1/search".to_string()), None, None)));
+    }
+
+    #[test]
+    fn test_glob_pattern_wildcard_matches_single_level() {
+        let provider = base_provider()
+            .with_allowed_paths(vec!["/api/*".to_string()])
+            .expect("allowed paths");
+
+        // Single * matches one path segment (no slash in the matched part)
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/users".to_string())),
+                None,
+            )),
+        })];
+
+        let partitions = provider.extract_partitions(&filters).expect("should match");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], (Some("/api/users".to_string()), None, None));
+    }
+
+    #[test]
+    fn test_glob_pattern_mixed_exact_and_patterns() {
+        let provider = base_provider()
+            .with_allowed_paths(vec![
+                "/exact/path".to_string(),
+                "/api/*".to_string(),
+                "/search/**".to_string(),
+            ])
+            .expect("allowed paths");
+
+        // Test exact match
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/exact/path".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_ok());
+
+        // Test * pattern
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/api/posts".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_ok());
+
+        // Test ** pattern
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/search/a/b/c".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_ok());
+
+        // Test non-matching path
+        let filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::from_name("request_path"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("/other/path".to_string())),
+                None,
+            )),
+        })];
+        assert!(provider.extract_partitions(&filters).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_integration_jsonplaceholder_single_post() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/posts/1".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("posts", Arc::new(provider))
+            .expect("register table");
+
+        // Test basic query
+        let df = ctx
+            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts/1'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        assert!(batch.num_rows() > 0, "Should have rows");
+        assert_eq!(batch.num_columns(), 2);
+
+        // Validate content contains expected post fields
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let content = content_col.value(0);
+        assert!(content.contains("userId"), "Should contain userId field");
+        assert!(
+            content.contains("\"id\"") && content.contains('1'),
+            "Should contain id field with value 1"
+        );
+        assert!(content.contains("title"), "Should contain title field");
+        assert!(content.contains("body"), "Should contain body field");
+
+        // Validate actual field values from the API
+        assert!(
+            content.contains("sunt aut facere repellat provident"),
+            "Should contain expected title text"
+        );
+        assert!(
+            content.contains("quia et suscipit"),
+            "Should contain expected body text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_jsonplaceholder_multiple_posts() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec![
+                "/posts/1".to_string(),
+                "/posts/2".to_string(),
+                "/posts/3".to_string(),
+            ])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("posts", Arc::new(provider))
+            .expect("register table");
+
+        // Test IN list filter for multiple paths
+        let df = ctx
+            .sql("SELECT request_path, content FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
+
+        // Verify content contains expected post IDs
+        let mut found_posts = [false, false, false]; // Track posts 1, 2, 3
+        for batch in &results {
+            let content_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                assert!(content.contains("userId"), "Should contain userId field");
+                assert!(content.contains("id"), "Should contain id field");
+                assert!(content.contains("title"), "Should contain title field");
+
+                // Check which post this is by title
+                if content.contains("sunt aut facere repellat provident") {
+                    found_posts[0] = true;
+                } else if content.contains("qui est esse") {
+                    found_posts[1] = true;
+                } else if content.contains("ea molestias quasi exercitationem") {
+                    found_posts[2] = true;
+                }
+            }
+        }
+
+        assert!(found_posts[0], "Should have found post 1");
+        assert!(found_posts[1], "Should have found post 2");
+        assert!(found_posts[2], "Should have found post 3");
+    }
+    #[tokio::test]
+    async fn test_integration_jsonplaceholder_all_posts() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/posts".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("posts", Arc::new(provider))
+            .expect("register table");
+
+        // Test fetching all posts (returns JSON array)
+        let df = ctx
+            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        // JSONPlaceholder /posts returns exactly 100 posts as a JSON array
+        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 100,
+            "Should have exactly 100 posts from /posts endpoint"
+        );
+
+        // Verify first post has expected structure
+        let batch = &results[0];
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let first_post = content_col.value(0);
+        assert!(first_post.contains("userId"), "Should contain userId field");
+        assert!(first_post.contains("id"), "Should contain id field");
+        assert!(first_post.contains("title"), "Should contain title field");
+        assert!(first_post.contains("body"), "Should contain body field");
+
+        // Validate first post has expected values
+        assert!(
+            first_post.contains("sunt aut facere repellat provident"),
+            "First post should have expected title"
+        );
+
+        // Verify we can find a post with id 100 (last post)
+        let mut found_last_post = false;
+        for batch in &results {
+            let content_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                // Last post has id 100
+                if content.contains("\"id\"")
+                    && content.contains("100")
+                    && !content.contains("1000")
+                {
+                    found_last_post = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_last_post, "Should have found post with id 100");
+    }
+    #[tokio::test]
+    async fn test_integration_tvmaze_single_show() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/shows/1".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test basic query with filter
+        let df = ctx
+            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        assert!(batch.num_rows() > 0, "Should have rows");
+
+        // Verify content is JSON
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let content = content_col.value(0);
+        assert!(content.starts_with('{'), "Should be JSON object");
+        assert!(
+            content.contains("\"id\"") && content.contains('1'),
+            "Should contain id field with value 1"
+        );
+        assert!(
+            content.contains("\"name\"") && content.contains("Under the Dome"),
+            "Should be 'Under the Dome'"
+        );
+        assert!(content.contains("url"), "Should contain url field");
+        assert!(content.contains("genres"), "Should contain genres field");
+        assert!(content.contains("summary"), "Should contain summary field");
+
+        // Validate specific field values
+        assert!(content.contains("Scripted"), "Should have type 'Scripted'");
+        assert!(content.contains("Drama"), "Should have Drama genre");
+        assert!(
+            content.contains("Science-Fiction"),
+            "Should have Science-Fiction genre"
+        );
+        assert!(
+            content.contains("sealed off from the rest of the world"),
+            "Should contain expected summary text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_tvmaze_multiple_shows() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec![
+                "/shows/1".to_string(),
+                "/shows/2".to_string(),
+                "/shows/82".to_string(),
+            ])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test OR filter for multiple paths
+        let df = ctx
+            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1' OR request_path = '/shows/2' OR request_path = '/shows/82'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 shows");
+
+        // Collect all show names to verify we got the right shows
+        let mut show_names = Vec::new();
+        let mut found_under_dome = false;
+        let mut found_person_interest = false;
+        let mut found_game_thrones = false;
+
+        for batch in &results {
+            let content_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                if content.contains("Under the Dome") {
+                    show_names.push("Under the Dome");
+                    // Validate Under the Dome specific values
+                    assert!(content.contains("\"id\"") && content.contains('1'));
+                    assert!(content.contains("Drama"));
+                    assert!(content.contains("Science-Fiction"));
+                    found_under_dome = true;
+                } else if content.contains("Person of Interest") {
+                    show_names.push("Person of Interest");
+                    // Validate Person of Interest specific values
+                    assert!(content.contains("\"id\"") && content.contains('2'));
+                    assert!(content.contains("Action"));
+                    assert!(content.contains("Crime"));
+                    found_person_interest = true;
+                } else if content.contains("Game of Thrones") {
+                    show_names.push("Game of Thrones");
+                    // Validate Game of Thrones specific values
+                    assert!(content.contains("\"id\"") && content.contains("82"));
+                    assert!(content.contains("Fantasy"));
+                    assert!(content.contains("Adventure"));
+                    found_game_thrones = true;
+                }
+            }
+        }
+
+        assert_eq!(show_names.len(), 3, "Should have found all 3 shows");
+        assert!(found_under_dome, "Should have found Under the Dome");
+        assert!(
+            found_person_interest,
+            "Should have found Person of Interest"
+        );
+        assert!(found_game_thrones, "Should have found Game of Thrones");
+    }
+    #[tokio::test]
+    async fn test_integration_tvmaze_projection() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/shows/1".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // Test with projection - only select content column
+        let df = ctx
+            .sql("SELECT content FROM shows WHERE request_path = '/shows/1'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        assert_eq!(batch.num_columns(), 1, "Should only have content column");
+        assert!(batch.num_rows() > 0, "Should have rows");
+
+        // Verify the content is valid JSON with expected fields
+        let content_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let content = content_col.value(0);
+        assert!(
+            content.contains("Under the Dome"),
+            "Should be Under the Dome"
+        );
+        assert!(content.contains("genres"), "Should contain genres field");
+
+        // Validate specific values in the projection
+        assert!(content.contains("Drama"), "Should contain Drama genre");
+        assert!(
+            content.contains("Science-Fiction"),
+            "Should contain Science-Fiction genre"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_tvmaze_aggregation() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/shows/1".to_string(), "/shows/2".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("shows", Arc::new(provider))
+            .expect("register table");
+
+        // First validate that we get the actual content before testing aggregation
+        let df_content = ctx
+            .sql("SELECT content FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
+            .await
+            .expect("query should succeed");
+
+        let content_results = df_content.collect().await.expect("collect should succeed");
+        assert!(!content_results.is_empty(), "Should have content results");
+
+        let mut found_under_dome = false;
+        let mut found_person_interest = false;
+
+        for batch in &content_results {
+            let content_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("content should be string array");
+
+            for i in 0..batch.num_rows() {
+                let content = content_col.value(i);
+                if content.contains("Under the Dome") {
+                    assert!(content.contains("Drama"));
+                    found_under_dome = true;
+                }
+                if content.contains("Person of Interest") {
+                    assert!(content.contains("Action"));
+                    found_person_interest = true;
+                }
+            }
+        }
+
+        assert!(
+            found_under_dome,
+            "Should have found Under the Dome with Drama genre"
+        );
+        assert!(
+            found_person_interest,
+            "Should have found Person of Interest with Action genre"
+        );
+
+        // Test count aggregation
+        let df = ctx
+            .sql("SELECT COUNT(*) as total FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results");
+
+        let batch = &results[0];
+        let count_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count should be int64 array");
+
+        let count = count_col.value(0);
+        assert_eq!(count, 2, "Should have counted exactly 2 rows for 2 shows");
     }
 }
