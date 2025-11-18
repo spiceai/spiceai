@@ -1,0 +1,16 @@
+# Vector store configurations.
+# Each key represents a vector store confuration for use in `.views[].vectors` or `.datasets[].vectors`.
+# Some `.params` will be overriden per test case (e.g. index/bucket for s3_vectors), per `engine` type.
+
+no_vector_engine:
+  enabled: false
+
+s3_vectors_basic:
+  enabled: true
+  engine: s3_vectors
+  params:
+    s3_vectors_aws_region: us-east-2
+    # We expect `s3_vectors_index` to be overridden per test case.
+    s3_vectors_bucket: spice-ci-tests-s3-vectors
+    s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
+    s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}

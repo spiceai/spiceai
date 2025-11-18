@@ -180,13 +180,17 @@ pub struct SearchSpicepodConfiguration {
 }
 
 static TABLE_ACCELERATION_OPTIONS: LazyLock<HashMap<String, Acceleration>> = LazyLock::new(|| {
-    let yaml_content = include_str!("acceleration.yaml");
-    serde_yaml::from_str(yaml_content).expect("Failed to parse 'acceleration.yaml' configurations")
+    serde_yaml::from_str(include_str!("acceleration.yaml"))
+        .expect("Failed to parse 'acceleration.yaml' configurations")
+});
+
+static TABLE_VECTOR_STORE_OPTIONS: LazyLock<HashMap<String, VectorStore>> = LazyLock::new(|| {
+    serde_yaml::from_str(include_str!("vector_store.yaml"))
+        .expect("Failed to parse 'acceleration.yaml' configurations")
 });
 
 static MEGA_SCIENCE_COLUMN_CONFIGS: LazyLock<HashMap<String, Vec<Column>>> = LazyLock::new(|| {
-    let yaml_content = include_str!("mega_science.yaml");
-    serde_yaml::from_str(yaml_content)
+    serde_yaml::from_str(include_str!("mega_science.yaml"))
         .expect("Failed to parse 'mega_science.yaml' column configurations")
 });
 
@@ -207,46 +211,28 @@ impl SearchSpicepodConfiguration {
             ));
         };
 
-        let vector = match vector {
-            "s3_vectors" => Some(VectorStore {
-                enabled: true,
-                engine: Some("s3_vectors".to_string()),
-                params: Some(Params::from_string_map(
-                    vec![
-                        ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
-                        (
-                            "s3_vectors_bucket".to_string(),
-                            "spice-ci-tests-s3-vectors".to_string(),
+        let Some(mut vector_store) = TABLE_VECTOR_STORE_OPTIONS.get(vector).cloned() else {
+            return Err(anyhow::anyhow!(
+                "Invalid acceleration option '{column_configuration}' in search spicepod slug."
+            ));
+        };
+
+        // Update vector store params with dynamic values as needed.
+        match vector_store.engine.as_deref() {
+            "s3_vectors" => {
+                if let Some(params) = vector_store.params.as_mut() {
+                    params.data.insert(
+                        "s3_vectors_index".to_string(),
+                        format!(
+                            "{engine}-{}-{}-{}",
+                            table_component.replace("_", "-"),
+                            column_configuration.replace("_", "-"),
+                            rand::random::<u8>() % 11
                         ),
-                        (
-                            "s3_vectors_index".to_string(),
-                            format!(
-                                "{engine}-{}-{}-{}",
-                                table_component.replace("_", "-"),
-                                column_configuration.replace("_", "-"),
-                                rand::random::<u8>() % 11
-                            ),
-                        ),
-                        (
-                            "s3_vectors_aws_access_key_id".to_string(),
-                            "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                        ),
-                        (
-                            "s3_vectors_aws_secret_access_key".to_string(),
-                            "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )),
-                partition_by: vec![],
-            }),
-            "no_vector_engine" => None,
-            x => {
-                return Err(anyhow::anyhow!(
-                    "Invalid vector field '{x}' in search spicepod slug."
-                ));
+                    );
+                }
             }
+            _ => {}
         };
 
         let Some(columns) = column_configs.get(column_configuration).cloned() else {
@@ -257,7 +243,7 @@ impl SearchSpicepodConfiguration {
 
         Ok(SearchSpicepodConfiguration {
             acceleration: Some(acceleration),
-            vector,
+            vector: Some(vector),
             table_component: table_component
                 .parse()
                 .map_err(|e: String| anyhow::anyhow!(e))?,
