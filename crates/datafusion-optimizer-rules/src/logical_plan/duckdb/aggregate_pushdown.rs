@@ -88,8 +88,8 @@ impl DuckDBAggregateLogicalPushdown {
         ))
     }
 
-    // If this aggregate's root scan is from a DuckDB accelerated source, with supported expressions,
-    // wrap it in a marker node for pushdown rewriting during physical planning
+    /// If this aggregate's root scan is from a DuckDB accelerated source, with supported expressions,
+    /// wrap it in a marker node for pushdown rewriting during physical planning
     fn try_mark_pushdown(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         // Find an aggregate node
         let LogicalPlan::Aggregate(agg) = plan else {
@@ -129,6 +129,41 @@ impl DuckDBAggregateLogicalPushdown {
             Ok(None)
         }
     }
+
+    /// Try to find a unary path to a marker node from the current node, then swap it
+    fn try_percolate_marker_node(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+        let with_erased_marker = plan.clone().transform_down(|p| {
+            if p.inputs().len() > 1 {
+                return Ok(Transformed::new(p, false, TreeNodeRecursion::Stop));
+            }
+
+            let LogicalPlan::Extension(ref ext) = p else {
+                return Ok(Transformed::no(p));
+            };
+
+            let Some(marker) = ext
+                .node
+                .as_any()
+                .downcast_ref::<DuckDBAggregatePushdownNode>()
+            else {
+                return Ok(Transformed::no(p));
+            };
+
+            Ok(Transformed::new(
+                marker.input_plan.clone(),
+                true,
+                TreeNodeRecursion::Jump,
+            ))
+        })?;
+
+        if with_erased_marker.transformed {
+            Ok(Some(LogicalPlan::Extension(Extension {
+                node: DuckDBAggregatePushdownNode::new(with_erased_marker.data),
+            })))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl OptimizerRule for DuckDBAggregateLogicalPushdown {
@@ -146,8 +181,10 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
-        plan.transform_down(|p| {
+        // Mark all eligible nodes for DuckDB agg pushdown
+        let maybe_marked_agg = plan.transform_down(|p| {
             match &p {
+                // Skip already marked subtrees
                 LogicalPlan::Extension(ext)
                     if concrete!(ext.node, DuckDBAggregatePushdownNode).is_some() =>
                 {
@@ -162,6 +199,21 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
                     true,
                     TreeNodeRecursion::Jump,
                 ))
+            } else {
+                Ok(Transformed::no(p))
+            }
+        })?;
+
+        // If we didn't rewrite, bail out early
+        if !maybe_marked_agg.transformed {
+            return Ok(maybe_marked_agg);
+        }
+
+        // Try to push as much of the physical plan under the pushdown marker as possible
+        let rewritten_plan = maybe_marked_agg.data;
+        rewritten_plan.transform_down(|p| {
+            if let Some(percolated) = Self::try_percolate_marker_node(&p)? {
+                Ok(Transformed::new(percolated, true, TreeNodeRecursion::Jump))
             } else {
                 Ok(Transformed::no(p))
             }
@@ -207,11 +259,7 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
         write!(f, "DuckDBAggregatePushdownNode")
     }
 
-    fn with_exprs_and_inputs(
-        &self,
-        _exprs: Vec<datafusion_expr::Expr>,
-        inputs: Vec<LogicalPlan>,
-    ) -> Result<Self> {
+    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "DuckDBAggregatePushdownNode is unary");
         Ok(DuckDBAggregatePushdownNode {
             input_plan: inputs[0].clone(),

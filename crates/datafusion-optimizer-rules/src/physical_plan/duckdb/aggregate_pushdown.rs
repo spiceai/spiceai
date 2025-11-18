@@ -16,6 +16,8 @@ use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+/// The physical planning counterpart to `DuckDBAggregateLogicalPushdown`, which looks for physical
+/// plan marker nodes to rewrite with a `DuckSqlExec` that satisfies the whole plan subtree
 #[derive(Debug)]
 pub struct DuckDBAggregatePushdownMarkerExec {
     logical_plan: LogicalPlan,
@@ -130,12 +132,4 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
     fn schema_check(&self) -> bool {
         false
     }
-}
-
-mod tests {
-    use crate::physical_plan::duckdb::PARSER_DIALECT;
-    use datafusion::logical_expr::sqlparser::parser::Parser;
-
-    #[test]
-    fn test_rewrite_agg() {}
 }
