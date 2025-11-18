@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     panic,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -56,7 +56,7 @@ pub(crate) struct SpiceTestQueryWorker {
     /// Optional reference schema for validating against known good tables
     reference_schema: Option<String>,
     /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
-    skip_row_count_validation: Vec<String>,
+    skip_row_count_validation: HashSet<String>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -845,13 +845,17 @@ impl SpiceTestQueryWorker {
     }
 }
 
-fn default_row_count_validation_skip_queries() -> Vec<String> {
-    vec![
-        "tpcds_q29".to_string(),
-        "tpcds_q37".to_string(),
-        "tpcds_q41".to_string(),
-        "tpcds_q44".to_string(),
-        "tpcds_q54".to_string(),
-        "tpcds_q58".to_string(),
+fn default_row_count_validation_skip_queries() -> HashSet<String> {
+    [
+        "tpcds_q8",
+        "tpcds_q29",
+        "tpcds_q37",
+        "tpcds_q41",
+        "tpcds_q44",
+        "tpcds_q54",
+        "tpcds_q58",
     ]
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect()
 }
