@@ -2,8 +2,8 @@ use crate::common::plan_node_key::PlanNodeKey;
 use crate::common::search_visitor::SearchVisitor;
 use crate::concrete;
 use crate::physical_plan::duckdb::{ConcreteDuckSqlExec, PARSER_DIALECT};
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::sqlparser::ast::{CteAsMaterialized, ObjectName, Query};
@@ -11,9 +11,9 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
-    visit_expressions, visit_expressions_mut, visit_relations, BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value,
-    ValueWithSpan, With,
+    BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, With, visit_expressions,
+    visit_expressions_mut, visit_relations,
 };
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Span;
@@ -306,8 +306,6 @@ impl Debug for DuckDBIntermediateIndexMaterializationOptimizer {
     }
 }
 
-
-
 impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
     fn optimize(
         &self,
@@ -332,7 +330,10 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             DataFusionError::Execution(format!("Unable to generate DuckDB SQL: {e}"))
         })?;
 
-        let Some(statement) = Parser::parse_sql(&PARSER_DIALECT, sql.as_str())?.first().cloned() else {
+        let Some(statement) = Parser::parse_sql(&PARSER_DIALECT, sql.as_str())?
+            .first()
+            .cloned()
+        else {
             return Ok(plan);
         };
 
@@ -349,7 +350,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             if node_key == old_exec_key {
                 let new_exec = duck_exec
                     .clone()
-                    .with_optimized_sql(format!("{new_statement}"));
+                    .with_optimized_sql(new_statement.to_string(), None);
 
                 Ok(Transformed::yes(Arc::new(new_exec)))
             } else {

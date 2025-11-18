@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{AccelerationSource, DataAccelerator};
 use crate::{
     App, Runtime,
     component::{
@@ -54,6 +55,7 @@ use itertools::Itertools;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{
     any::Any,
     cmp::max,
@@ -62,8 +64,6 @@ use std::{
     path::PathBuf,
     sync::{Arc, Once},
 };
-use std::collections::HashMap;
-use super::{AccelerationSource, DataAccelerator};
 
 pub(crate) mod settings;
 
@@ -532,7 +532,7 @@ pub(crate) async fn create_table_provider(
         cloned_writer,
         duckdb_writer,
         read_provider,
-        schema_metadata
+        schema_metadata,
     ));
 
     Ok(table_provider)

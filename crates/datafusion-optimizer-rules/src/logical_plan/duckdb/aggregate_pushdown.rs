@@ -1,9 +1,10 @@
 use crate::concrete;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, DataFusionError};
-use datafusion::datasource::{source_as_provider, TableProvider};
+use datafusion::datasource::{TableProvider, source_as_provider};
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::{Expr, Extension, LogicalPlan, TableScan, UserDefinedLogicalNodeCore};
 use datafusion_federation::FederatedTableProviderAdaptor;
@@ -11,7 +12,6 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
-use datafusion::physical_plan::ExecutionPlan;
 
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
@@ -22,19 +22,15 @@ static SUPPORTED_AGG_FUNCTIONS_LIST: [&str; 30] = [
     "max",
     "min",
     "sum",
-
     // Bitwise aggregates
     "bit_and",
     "bit_or",
     "bit_xor",
-
     // Boolean aggregates
     "bool_and",
     "bool_or",
-
     // String aggregates
     "string_agg",
-
     // Statistical aggregates
     "corr",
     "covar_pop",
@@ -44,7 +40,6 @@ static SUPPORTED_AGG_FUNCTIONS_LIST: [&str; 30] = [
     "stddev_samp",
     "var_pop",
     "var_samp",
-
     // Regression aggregates
     "regr_avgx",
     "regr_avgy",
@@ -55,17 +50,14 @@ static SUPPORTED_AGG_FUNCTIONS_LIST: [&str; 30] = [
     "regr_sxx",
     "regr_sxy",
     "regr_syy",
-
     // Percentile/quantile aggregates
     "quantile_cont",
-
     // Approximate aggregates
     "approx_percentile_cont",
 ];
 
-static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
-    HashSet::from(SUPPORTED_AGG_FUNCTIONS_LIST)
-});
+static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> =
+    LazyLock::new(|| HashSet::from(SUPPORTED_AGG_FUNCTIONS_LIST));
 
 /// This looks for opportunities in the expressed logical plan to push down aggregates
 /// directly into the SQL execution for DuckDB accelerated table providers (as indicated by `spice.accelerator`).
@@ -86,7 +78,14 @@ impl DuckDBAggregateLogicalPushdown {
             return Ok(false);
         };
 
-        Ok(matches!(fed_adapter.schema().metadata.get("spice.accelerator").map(|s| s.as_str()), Some("duckdb")))
+        Ok(matches!(
+            fed_adapter
+                .schema()
+                .metadata
+                .get("spice.accelerator")
+                .map(|s| s.as_str()),
+            Some("duckdb")
+        ))
     }
 
     // If this aggregate's root scan is from a DuckDB accelerated source, with supported expressions,
@@ -100,13 +99,12 @@ impl DuckDBAggregateLogicalPushdown {
         // Validate its agg expressions to make sure they are supported
         for expr in &agg.aggr_expr {
             match expr {
-                Expr::AggregateFunction(AggregateFunction {
-                    func,
-                    ..
-                }) if SUPPORTED_AGG_FUNCTIONS.contains(func.name()) => {
-                    continue
-                },
-                _ => return Ok(None)
+                Expr::AggregateFunction(AggregateFunction { func, .. })
+                    if SUPPORTED_AGG_FUNCTIONS.contains(func.name()) =>
+                {
+                    continue;
+                }
+                _ => return Ok(None),
             }
         }
 
@@ -114,20 +112,18 @@ impl DuckDBAggregateLogicalPushdown {
         // DuckDB provider
         let mut found = false;
 
-        let _ = plan.apply(|p| {
-            match p {
-                LogicalPlan::TableScan(table_scan) if Self::is_duckdb_provider(&table_scan)? => {
-                    found = true;
-                    Ok(TreeNodeRecursion::Stop)
-                }
-                other if other.inputs().len() > 1 => Ok(TreeNodeRecursion::Stop),
-                _ => Ok(TreeNodeRecursion::Continue),
+        let _ = plan.apply(|p| match p {
+            LogicalPlan::TableScan(table_scan) if Self::is_duckdb_provider(&table_scan)? => {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
             }
+            other if other.inputs().len() > 1 => Ok(TreeNodeRecursion::Stop),
+            _ => Ok(TreeNodeRecursion::Continue),
         })?;
 
         if found {
             Ok(Some(LogicalPlan::Extension(Extension {
-                node: DuckDBAggregatePushdownNode::new(plan.clone())
+                node: DuckDBAggregatePushdownNode::new(plan.clone()),
             })))
         } else {
             Ok(None)
@@ -145,17 +141,27 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
         None
     }
 
-    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
         plan.transform_down(|p| {
             match &p {
-                LogicalPlan::Extension(ext) if concrete!(ext.node, DuckDBAggregatePushdownNode).is_some() => {
-                    return Ok(Transformed::new(p, false, TreeNodeRecursion::Jump))
+                LogicalPlan::Extension(ext)
+                    if concrete!(ext.node, DuckDBAggregatePushdownNode).is_some() =>
+                {
+                    return Ok(Transformed::new(p, false, TreeNodeRecursion::Jump));
                 }
-                _ => {/* no-op */}
+                _ => { /* no-op */ }
             };
 
             if let Some(marked_for_pushdown) = Self::try_mark_pushdown(&p)? {
-                Ok(Transformed::new(marked_for_pushdown, true, TreeNodeRecursion::Jump))
+                Ok(Transformed::new(
+                    marked_for_pushdown,
+                    true,
+                    TreeNodeRecursion::Jump,
+                ))
             } else {
                 Ok(Transformed::no(p))
             }
@@ -201,8 +207,14 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
         write!(f, "DuckDBAggregatePushdownNode")
     }
 
-    fn with_exprs_and_inputs(&self, _exprs: Vec<datafusion_expr::Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<datafusion_expr::Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "DuckDBAggregatePushdownNode is unary");
-        Ok(DuckDBAggregatePushdownNode { input_plan: inputs[0].clone() })
+        Ok(DuckDBAggregatePushdownNode {
+            input_plan: inputs[0].clone(),
+        })
     }
 }
