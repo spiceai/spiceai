@@ -106,9 +106,9 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
-    fn invalidate_all(&self);
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
+    async fn invalidate_all(&self);
+    async fn size_bytes(&self) -> u64;
+    async fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
 }
@@ -427,13 +427,13 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn size(&self) -> u64 {
-        self.cache.size_bytes()
+    pub async fn size(&self) -> u64 {
+        self.cache.size_bytes().await
     }
 
     #[must_use]
-    pub fn item_count(&self) -> u64 {
-        self.cache.item_count()
+    pub async fn item_count(&self) -> u64 {
+        self.cache.item_count().await
     }
 
     /// Returns the base TTL for cache entries (used for staleness checks).

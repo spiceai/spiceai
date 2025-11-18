@@ -140,8 +140,6 @@ impl<
             .support_invalidation_closures()
             .build_with_hasher(hasher.clone());
 
-        V::init();
-
         LruCache {
             cache,
             hasher,
@@ -200,6 +198,8 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
         if now_seconds.saturating_sub(last_emitted) >= 5
             && self
                 .metrics_last_reported_time
@@ -211,18 +211,20 @@ impl<
                 )
                 .is_ok()
         {
-            V::record_item_count(self.item_count());
-            V::record_size(self.size_bytes());
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
             V::record_max_size(self.max_size() as u64);
         }
     }
 
-    fn invalidate_all(&self) {
+    async fn invalidate_all(&self) {
         self.cache.invalidate_all();
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
         if now_seconds.saturating_sub(last_emitted) >= 5
             && self
                 .metrics_last_reported_time
@@ -234,16 +236,18 @@ impl<
                 )
                 .is_ok()
         {
-            V::record_item_count(self.item_count());
-            V::record_size(self.size_bytes());
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
         }
     }
 
-    fn size_bytes(&self) -> u64 {
+    async fn size_bytes(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
         self.cache.weighted_size()
     }
 
-    fn item_count(&self) -> u64 {
+    async fn item_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
         self.cache.entry_count()
     }
 
