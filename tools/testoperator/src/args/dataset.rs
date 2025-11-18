@@ -107,10 +107,8 @@ pub enum QueryOverridesArg {
     DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
-    #[serde(rename = "dynamodb-federated")]
-    DynamoDBFederated,
-    #[serde(rename = "dynamodb-accelerated")]
-    DynamoDBAccelerated,
+    #[serde(rename = "dynamodb")]
+    DynamoDB,
 }
 
 impl From<QuerySetArg> for QuerySet {
