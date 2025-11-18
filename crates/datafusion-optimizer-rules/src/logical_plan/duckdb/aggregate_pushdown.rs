@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
+use datafusion::physical_plan::ExecutionPlan;
 
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
@@ -66,10 +67,15 @@ static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
     HashSet::from(SUPPORTED_AGG_FUNCTIONS_LIST)
 });
 
+/// This looks for opportunities in the expressed logical plan to push down aggregates
+/// directly into the SQL execution for DuckDB accelerated table providers (as indicated by `spice.accelerator`).
+///
+/// Schema metadata was chosen to "tag" scans in order to avoid a dependency on the runtime crate and
+/// concrete adapter types.
 #[derive(Debug)]
-pub struct DuckDBAggregatePushdownOptimizerRule {}
+pub struct DuckDBAggregateLogicalPushdown {}
 
-impl DuckDBAggregatePushdownOptimizerRule {
+impl DuckDBAggregateLogicalPushdown {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {})
     }
@@ -92,7 +98,7 @@ impl DuckDBAggregatePushdownOptimizerRule {
         };
 
         // Validate its agg expressions to make sure they are supported
-        for expr in agg.aggr_expr {
+        for expr in &agg.aggr_expr {
             match expr {
                 Expr::AggregateFunction(AggregateFunction {
                     func,
@@ -129,7 +135,7 @@ impl DuckDBAggregatePushdownOptimizerRule {
     }
 }
 
-impl OptimizerRule for DuckDBAggregatePushdownOptimizerRule {
+impl OptimizerRule for DuckDBAggregateLogicalPushdown {
     fn name(&self) -> &str {
         "DuckDBAggregatePushdownOptimizerRule"
     }
@@ -159,18 +165,18 @@ impl OptimizerRule for DuckDBAggregatePushdownOptimizerRule {
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct DuckDBAggregatePushdownNode {
-    input: LogicalPlan,
+    pub input_plan: LogicalPlan,
 }
 
 impl PartialOrd for DuckDBAggregatePushdownNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.input.partial_cmp(&other.input)
+        self.input_plan.partial_cmp(&other.input_plan)
     }
 }
 
 impl DuckDBAggregatePushdownNode {
     pub fn new(input: LogicalPlan) -> Arc<Self> {
-        Arc::new(Self { input })
+        Arc::new(Self { input_plan: input })
     }
 }
 
@@ -180,23 +186,23 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input]
+        vec![&self.input_plan]
     }
 
     fn schema(&self) -> &DFSchemaRef {
-        self.input.schema()
+        self.input_plan.schema()
     }
 
-    fn expressions(&self) -> Vec<Expr> {
-        self.input.expressions()
+    fn expressions(&self) -> Vec<datafusion_expr::Expr> {
+        self.input_plan.expressions()
     }
 
     fn fmt_for_explain(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "DuckDBAggregatePushdownNode")
     }
 
-    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+    fn with_exprs_and_inputs(&self, _exprs: Vec<datafusion_expr::Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "DuckDBAggregatePushdownNode is unary");
-        Ok(DuckDBAggregatePushdownNode { input: inputs[0].clone() })
+        Ok(DuckDBAggregatePushdownNode { input_plan: inputs[0].clone() })
     }
 }

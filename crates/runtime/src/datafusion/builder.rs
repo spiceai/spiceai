@@ -68,7 +68,9 @@ use tokio::{
     runtime::Handle,
     sync::{RwLock as TokioRwLock, Semaphore},
 };
-use datafusion_optimizer_rules::logical_plan::duckdb_aggregate_pushdown::DuckDBAggregatePushdownOptimizerRule;
+use datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown;
+use datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner;
+use datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter;
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
@@ -248,7 +250,8 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
-            .with_optimizer_rule(DuckDBAggregatePushdownOptimizerRule::new())
+            .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
+            .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         #[cfg(feature = "duckdb")]
@@ -467,6 +470,7 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        DuckDBLogicalExtensionPlanner::new()
     ]
 }
 
