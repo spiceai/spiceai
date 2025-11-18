@@ -24,9 +24,11 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
+tokio.workspace = true
 tracing.workspace = true
 tract-core.workspace = true
 tract-onnx = "0.22.0"
+util = { path = "../util" }
 
 [features]
 dev = []

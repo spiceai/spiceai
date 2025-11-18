@@ -313,6 +313,7 @@ impl RefreshTask {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
         self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
@@ -340,6 +341,44 @@ impl RefreshTask {
             None
         };
 
+        // For table providers with refresh skip support, check if the refresh can be skipped to
+        // avoid unnecessary data fetching when the underlying data is unchanged.
+        if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
+            let table_provider = self.federated.table_provider().await;
+
+            match data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                table_provider.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(true)) => {
+                    tracing::debug!(
+                        "Skipping refresh for {} - data unchanged",
+                        self.dataset_name
+                    );
+
+                    for label_set in &dataset_metrics_label_sets {
+                        metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                    }
+
+                    self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Ready)
+                        .await;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Data may have changed or provider does not support skipping; continue with refresh.
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
+                        self.dataset_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
@@ -368,6 +407,11 @@ impl RefreshTask {
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
+                // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+                // This is expected and should not be logged as an error.
+                if self.runtime_status.is_shutdown() {
+                    return Ok(());
+                }
                 self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
                     .await;
                 return Err(e);
@@ -396,27 +440,27 @@ impl RefreshTask {
                 (streaming_data_update, None)
             };
 
-        self.write_streaming_data_update(
-            Some(start_time),
-            streaming_data_update,
-            refresh.sql.as_deref(),
-        )
-        .await
-        .inspect_err(|e| {
+        if let Err(e) = self
+            .write_streaming_data_update(
+                Some(start_time),
+                streaming_data_update,
+                refresh.sql.as_deref(),
+            )
+            .await
+        {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
-            if !self.runtime_status.is_shutdown() {
-                tracing::warn!(
-                    "Failed to load data for {} {}: {}",
-                    self.component_type(),
-                    include_source_to_table_name(
-                        &self.dataset_name,
-                        self.federated_source.as_deref()
-                    ),
-                    inner_err_from_retry_ref(e)
-                );
+            if self.runtime_status.is_shutdown() {
+                return Ok(());
             }
-        })?;
+            tracing::warn!(
+                "Failed to load data for {} {}: {}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+                inner_err_from_retry_ref(&e)
+            );
+            return Err(e);
+        }
 
         // Only record metrics if a refresh was successful
         self.handle_metrics(
@@ -439,15 +483,17 @@ impl RefreshTask {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
                 Ok(None) => None,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
-                        self.component_type(),
-                        include_source_to_table_name(
-                            &self.dataset_name,
-                            self.federated_source.as_deref()
-                        ),
-                        e
-                    );
+                    if !self.runtime_status.is_shutdown() {
+                        tracing::warn!(
+                            "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
+                            self.component_type(),
+                            include_source_to_table_name(
+                                &self.dataset_name,
+                                self.federated_source.as_deref()
+                            ),
+                            e
+                        );
+                    }
                     None
                 }
             }
@@ -670,7 +716,9 @@ impl RefreshTask {
                 Err(e) => Err(e),
             },
             Err(e) => {
-                tracing::error!("No latest timestamp is found: {e}");
+                if !self.runtime_status.is_shutdown() {
+                    tracing::error!("No latest timestamp is found: {e}");
+                }
                 Err(e)
             }
         }

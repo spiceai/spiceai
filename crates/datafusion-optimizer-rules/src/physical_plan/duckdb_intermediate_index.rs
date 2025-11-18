@@ -328,6 +328,10 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             return Ok(plan);
         };
 
+        if duck_exec.indexes().is_empty() {
+            return Ok(plan);
+        }
+
         // Get its SQL + statement
         let sql = duck_exec.base_sql().map_err(|e| {
             DataFusionError::Execution(format!("Unable to generate DuckDB SQL: {e}"))

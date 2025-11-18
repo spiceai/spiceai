@@ -13,12 +13,10 @@ description: "Query: tpch_q13"
 |               |           Aggregate: groupBy=[[customer.C_CUSTKEY]], aggr=[[count(orders.O_ORDERKEY)]]                                                      |
 |               |             Projection: customer.C_CUSTKEY, orders.O_ORDERKEY                                                                               |
 |               |               Left Join: customer.C_CUSTKEY = orders.O_CUSTKEY                                                                              |
-|               |                 BytesProcessedNode                                                                                                          |
-|               |                   TableScan: customer projection=[C_CUSTKEY]                                                                                |
+|               |                 TableScan: customer projection=[C_CUSTKEY]                                                                                  |
 |               |                 Projection: orders.O_ORDERKEY, orders.O_CUSTKEY                                                                             |
-|               |                   BytesProcessedNode                                                                                                        |
-|               |                     Filter: orders.O_COMMENT NOT LIKE Utf8("%special%requests%")                                                            |
-|               |                       TableScan: orders projection=[O_ORDERKEY, O_CUSTKEY, O_COMMENT]                                                       |
+|               |                   Filter: orders.O_COMMENT NOT LIKE Utf8("%special%requests%")                                                              |
+|               |                     TableScan: orders projection=[O_ORDERKEY, O_CUSTKEY, O_COMMENT]                                                         |
 | physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                  |
 |               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                            |
 |               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                              |
@@ -33,17 +31,16 @@ description: "Query: tpch_q13"
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([C_CUSTKEY@0], 32), input_partitions=32                                          |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                             |
-|               |                             BytesProcessedExec                                                                                              |
-|               |                               CooperativeExec                                                                                               |
+|               |                             CooperativeExec                                                                                                 |
+|               |                               BytesProcessedExec                                                                                            |
 |               |                                 OracleExec sql=SELECT "C_CUSTKEY" FROM "TPCH_SF1"."CUSTOMER"                                                |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([O_CUSTKEY@1], 32), input_partitions=32                                          |
-|               |                           ProjectionExec: expr=[O_ORDERKEY@0 as O_ORDERKEY, O_CUSTKEY@1 as O_CUSTKEY]                                       |
-|               |                             BytesProcessedExec                                                                                              |
-|               |                               CoalesceBatchesExec: target_batch_size=8192                                                                   |
-|               |                                 FilterExec: O_COMMENT@2 NOT LIKE %special%requests%                                                         |
-|               |                                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                     |
-|               |                                     CooperativeExec                                                                                         |
-|               |                                       OracleExec sql=SELECT "O_ORDERKEY", "O_CUSTKEY", "O_COMMENT" FROM "TPCH_SF1"."ORDERS"                 |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                       |
+|               |                             FilterExec: O_COMMENT@2 NOT LIKE %special%requests%, projection=[O_ORDERKEY@0, O_CUSTKEY@1]                     |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                         |
+|               |                                 CooperativeExec                                                                                             |
+|               |                                   BytesProcessedExec                                                                                        |
+|               |                                     OracleExec sql=SELECT "O_ORDERKEY", "O_CUSTKEY", "O_COMMENT" FROM "TPCH_SF1"."ORDERS"                   |
 |               |                                                                                                                                             |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------+

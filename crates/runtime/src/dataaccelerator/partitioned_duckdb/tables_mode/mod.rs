@@ -345,7 +345,8 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
             .with_dialect(new_duckdb_dialect())
-            .with_schema(Arc::clone(&self.schema));
+            .with_schema(Arc::clone(&self.schema))
+            .with_indexes(self.table_definition.indexes().to_vec());
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {
@@ -356,15 +357,26 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 continue;
             };
 
-            let Some((_, value_str)) = partition_expr.split_once('=') else {
+            // Extract the partition value by removing the partition name prefix
+            // The partition_expr is in format "{partition_by.name}={value}"
+            // For example: "bucket(3, passenger_count)=2"
+            // We need to extract the value after the last '=' that follows the partition name
+            let partition_prefix = format!("{}=", self.partition_by.name);
+            let Some(value_str) = partition_expr.strip_prefix(&partition_prefix) else {
                 tracing::warn!(
-                    "Excluded partitioned table '{table}' as it does not match expected partitioning pattern"
+                    "Excluded partitioned table '{table}' as partition expression '{partition_expr}' does not match expected prefix '{partition_prefix}'"
                 );
                 continue;
             };
 
             let partition_value = parse_partition_value(&schema, &self.partition_by, value_str)
-                .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to parse partition value from table '{table}': partition_expr='{partition_expr}', value_str='{value_str}', partition_by.name='{}', error: {e}",
+                        self.partition_by.name
+                    );
+                    creator::Error::InferringPartitions { source: e.into() }
+                })?;
 
             let table_provider = duckdb_table_factory
                 .table_provider(table.into())

@@ -33,7 +33,7 @@ use test_framework::{
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    let query_set = QuerySet::from(args.query_set.clone());
+    let query_set = args.load_query_set()?;
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
 
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
@@ -45,7 +45,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let append_test = SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_query_set(query_set, query_overrides)
+            .with_query_set(query_set.clone(), query_overrides)
             .with_parallel_count(1)
             .with_end_duration(Duration::from_secs(60 * 60))
             .with_tempdir_path(start_request.get_tempdir_path()),
@@ -74,7 +74,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let table_count_result = check_table_counts(
         &spiced_instance,
-        query_set,
+        &query_set,
         args.scale_factor.unwrap_or(1.0),
     )
     .await;
@@ -121,7 +121,7 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
 
 async fn check_table_counts(
     spiced: &SpicedInstance,
-    query_set: QuerySet,
+    query_set: &QuerySet,
     scale_factor: f64,
 ) -> anyhow::Result<()> {
     let spice_client = spiced.spice_client(None, false).await?;

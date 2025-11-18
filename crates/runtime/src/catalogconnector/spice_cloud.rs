@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
-use crate::catalogconnector::iceberg::{Error as IcebergError, UnableToBuildCatalogSnafu};
+use crate::catalogconnector::iceberg::{
+    Error as IcebergError, UnableToBuildCatalogClientSnafu, UnableToBuildCatalogSnafu,
+};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
     App, Runtime,
@@ -124,8 +126,14 @@ impl SpiceCloudPlatformCatalog {
             props.insert("token".to_string(), api_key.to_string());
         }
 
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()
+            .context(UnableToBuildCatalogClientSnafu)?;
+
         props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint.to_string());
         let iceberg_rest_catalog = RestCatalogBuilder::default()
+            .with_client(client)
             .load("rest", props)
             .await
             .context(UnableToBuildCatalogSnafu)?;

@@ -14,7 +14,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | Delta Lake                       | ✅           | @Sevenannn      |
 | Dremio                           | ✅           | @Sevenannn      |
 | DuckDB                           | ✅           | @peasee         |
-| DynamoDB                         | ➖           |                 |
+| DynamoDB                         | ✅           | @krinart        |
 | File                             | ✅           | @peasee         |
 | FlightSQL                        | ➖           |                 |
 | FTP/SFTP                         | ➖           |                 |
@@ -69,6 +69,7 @@ This table defines the required features and/or tests for each connector:
 | S3                               | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Azure BlobFS                     | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Spark                            | ✅ (1)                | ➖             | ☑️                | ➖                       | ➖                  | ➖                         |
+| DynamoDB                         | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ☑️                         |
 
 [tpch]: #tpc-h
 [fed]: #federation

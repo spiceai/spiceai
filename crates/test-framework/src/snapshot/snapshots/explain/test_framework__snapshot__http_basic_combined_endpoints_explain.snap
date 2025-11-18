@@ -1,0 +1,20 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: combined_endpoints"
+snapshot_kind: text
+---
++---------------+-----------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                            |
++---------------+-----------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Union                                                                                                           |
+|               |   TableScan: httpbin_status_200 projection=[request_path, content]                                              |
+|               |   TableScan: httpbin_status_201 projection=[request_path, content]                                              |
+| physical_plan | UnionExec                                                                                                       |
+|               |   CooperativeExec                                                                                               |
+|               |     BytesProcessedExec                                                                                          |
+|               |       HttpExec: base_url=https://httpbin.org/status/200, format=auto, partitions=[(path="", query="", body="")] |
+|               |   CooperativeExec                                                                                               |
+|               |     BytesProcessedExec                                                                                          |
+|               |       HttpExec: base_url=https://httpbin.org/status/201, format=auto, partitions=[(path="", query="", body="")] |
+|               |                                                                                                                 |
++---------------+-----------------------------------------------------------------------------------------------------------------+

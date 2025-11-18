@@ -30,7 +30,6 @@ use test_framework::{
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicepod::acceleration::Mode,
     spicetest::{
@@ -70,10 +69,6 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
-    let query_set = QuerySet::from(args.query_set.clone());
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
-
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
@@ -98,23 +93,24 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
-    let benchmark_test = SpiceTest::new(
-        app.name.clone(),
+    let (query_set, test_builder) = super::build_test_with_validation(
+        args,
         NotStarted::new()
-            .with_query_set(queries.clone())
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
             .with_validate(args.validate)
             .with_disable_caching(args.disable_caching)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_http_client(args.http_clients),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_explain_plan_snapshot()
-    .with_results_snapshot(snapshot_predicate)
-    .with_progress_bars(!args.common.disable_progress_bars)
-    .start()
-    .await?;
+    )?;
+
+    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_explain_plan_snapshot()
+        .with_results_snapshot(snapshot_predicate)
+        .with_progress_bars(!args.common.disable_progress_bars)
+        .start()
+        .await?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 

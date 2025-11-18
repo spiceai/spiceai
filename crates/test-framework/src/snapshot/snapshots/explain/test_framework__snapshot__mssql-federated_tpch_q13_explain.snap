@@ -13,12 +13,10 @@ description: "Query: tpch_q13"
 |               |           Aggregate: groupBy=[[customer.c_custkey]], aggr=[[count(orders.o_orderkey)]]                                                      |
 |               |             Projection: customer.c_custkey, orders.o_orderkey                                                                               |
 |               |               Left Join: customer.c_custkey = orders.o_custkey                                                                              |
-|               |                 BytesProcessedNode                                                                                                          |
-|               |                   TableScan: customer projection=[c_custkey]                                                                                |
+|               |                 TableScan: customer projection=[c_custkey]                                                                                  |
 |               |                 Projection: orders.o_orderkey, orders.o_custkey                                                                             |
-|               |                   BytesProcessedNode                                                                                                        |
-|               |                     Filter: orders.o_comment NOT LIKE Utf8("%special%requests%")                                                            |
-|               |                       TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                       |
+|               |                   Filter: orders.o_comment NOT LIKE Utf8("%special%requests%")                                                              |
+|               |                     TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                         |
 | physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                  |
 |               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                            |
 |               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                              |
@@ -33,17 +31,16 @@ description: "Query: tpch_q13"
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 32), input_partitions=32                                          |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                             |
-|               |                             BytesProcessedExec                                                                                              |
-|               |                               CooperativeExec                                                                                               |
+|               |                             CooperativeExec                                                                                                 |
+|               |                               BytesProcessedExec                                                                                            |
 |               |                                 SqlServerExec sql=SELECT c_custkey FROM customer                                                            |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 32), input_partitions=32                                          |
-|               |                           ProjectionExec: expr=[o_orderkey@0 as o_orderkey, o_custkey@1 as o_custkey]                                       |
-|               |                             BytesProcessedExec                                                                                              |
-|               |                               CoalesceBatchesExec: target_batch_size=8192                                                                   |
-|               |                                 FilterExec: o_comment@2 NOT LIKE %special%requests%                                                         |
-|               |                                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                     |
-|               |                                     CooperativeExec                                                                                         |
-|               |                                       SqlServerExec sql=SELECT o_orderkey, o_custkey, o_comment FROM orders                                 |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                       |
+|               |                             FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]                     |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                         |
+|               |                                 CooperativeExec                                                                                             |
+|               |                                   BytesProcessedExec                                                                                        |
+|               |                                     SqlServerExec sql=SELECT o_orderkey, o_custkey, o_comment FROM orders                                   |
 |               |                                                                                                                                             |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------+

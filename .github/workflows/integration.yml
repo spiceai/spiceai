@@ -202,7 +202,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     strategy:
       fail-fast: false
       matrix:
@@ -227,13 +227,7 @@ jobs:
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
-          mkdir linux
-          unzip basic.zip -d linux -x "META-INF/*"
-          IC_DIR=$PWD/$(ls -d linux/instantclient*)
-          ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 $IC_DIR/libaio.so.1
-          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
+        uses: ./.github/actions/setup-oracle-odpi
 
       # Download the test archive artifact
       - name: Download test archive

@@ -17,9 +17,9 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::{TestType, queries::QuerySet};
+use test_framework::TestType;
 
-use super::dataset::QueryOverridesArg;
+use super::dataset::{QueryOverridesArg, QuerySetArg};
 
 use super::HttpTestArgs;
 
@@ -44,9 +44,6 @@ pub struct DispatchArgs {
 
     #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
-
-    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
-    pub(crate) validate: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -94,7 +91,7 @@ pub struct DispatchTests {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
-    pub query_set: QuerySet,
+    pub query_set: QuerySetArg,
     pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
@@ -134,12 +131,6 @@ impl BenchArgs {
     #[must_use]
     pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
         self.update_snapshots = Some(update_snapshots);
-        self
-    }
-
-    #[must_use]
-    pub fn with_validate(mut self, validate: bool) -> Self {
-        self.validate_results = Some(validate);
         self
     }
 }

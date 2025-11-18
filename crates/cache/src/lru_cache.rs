@@ -100,7 +100,9 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
 
     let ttl = match &cache_config.item_ttl {
         Some(item_ttl) => {
-            fundu::parse_duration(item_ttl).context(super::FailedToParseItemTtlSnafu)?
+            fundu::parse_duration(item_ttl).context(super::FailedToParseDurationSnafu {
+                field: "item_ttl".to_string(),
+            })?
         }
         None => std::time::Duration::from_secs(1),
     };

@@ -34,6 +34,7 @@ tonic = { workspace = true, features = [
   "tls-ring",
   "tls-native-roots",
 ] }
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

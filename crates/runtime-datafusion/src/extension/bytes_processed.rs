@@ -176,7 +176,7 @@ impl BytesProcessedExec {
     }
 
     #[must_use]
-    fn fallback_to_new_context(mut self) -> Self {
+    pub fn fallback_to_new_context(mut self) -> Self {
         self.fallback_to_new_context = true;
         self
     }

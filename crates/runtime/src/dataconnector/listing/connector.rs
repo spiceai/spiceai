@@ -35,6 +35,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
@@ -59,6 +60,10 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 
 #[async_trait]
 pub trait ListingTableConnector: DataConnector {
+    fn object_versioning_type(&self) -> Option<ObjectVersionType> {
+        None
+    }
+
     fn as_any(&self) -> &dyn Any;
 
     /// Retrieves the object store URL for a given dataset.
@@ -580,6 +585,7 @@ pub trait ListingTableConnector: DataConnector {
         let session_state = ctx.state();
         let mut options = ListingOptions::new(file_format)
             .with_file_extension(extension)
+            .with_object_versioning_type(self.object_versioning_type())
             .with_session_config_options(session_state.config());
 
         let resolved_schema = options
@@ -627,7 +633,7 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
-        let config = ListingTableConfig::new(table_path)
+        let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
             .with_schema(expanded_schema);
 
@@ -641,7 +647,31 @@ pub trait ListingTableConnector: DataConnector {
                     code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
                 })?;
 
-        Ok(Arc::new(table))
+        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
+        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
+        let table_arc = Arc::new(table);
+        let is_s3_connector = ListingTableConnector::as_any(self)
+            .downcast_ref::<crate::dataconnector::s3::S3>()
+            .is_some();
+        if is_s3_connector
+            && refresh_skip_enabled(dataset)
+            && !table_path.is_collection()
+            && dataset.acceleration.is_some()
+            && let Some(cached_table) =
+                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+                    Arc::clone(&table_arc),
+                    Arc::clone(&object_store),
+                    dataset.name.to_string(),
+                )
+        {
+            tracing::debug!(
+                "Enabled S3 single-file ETag/Version caching for {}",
+                dataset.name
+            );
+            return Ok(Arc::new(cached_table));
+        }
+
+        Ok(table_arc)
     }
 }
 
@@ -695,6 +725,21 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
+    }
+}
+
+fn refresh_skip_enabled(dataset: &Dataset) -> bool {
+    match dataset.params.get("refresh_skip").map(String::as_str) {
+        None | Some("enabled") => true,
+        Some("disabled") => false,
+        Some(other) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                value = other,
+                "Invalid refresh_skip value; expected 'enabled' or 'disabled'. Defaulting to 'enabled'."
+            );
+            true
+        }
     }
 }
 

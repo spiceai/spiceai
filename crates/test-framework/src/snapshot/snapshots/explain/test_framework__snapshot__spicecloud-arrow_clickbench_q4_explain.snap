@@ -6,13 +6,12 @@ description: "Query: clickbench_q4"
 | plan_type     | plan                                                                                                                                                      |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Aggregate: groupBy=[[]], aggr=[[avg(CAST(hits.UserID AS Float64))]]                                                                                       |
-|               |   BytesProcessedNode                                                                                                                                      |
-|               |     TableScan: hits projection=[UserID]                                                                                                                   |
+|               |   TableScan: hits projection=[UserID]                                                                                                                     |
 | physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                                                                                                |
 |               |   CoalescePartitionsExec                                                                                                                                  |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]                                                                                          |
-|               |       BytesProcessedExec                                                                                                                                  |
-|               |         SchemaCastScanExec                                                                                                                                |
+|               |       SchemaCastScanExec                                                                                                                                  |
+|               |         BytesProcessedExec                                                                                                                                |
 |               |           DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                           |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+

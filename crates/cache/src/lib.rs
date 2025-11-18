@@ -53,8 +53,8 @@ pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
-    #[snafu(display("Failed to parse item_ttl value: {source}"))]
-    FailedToParseItemTtl { source: ParseError },
+    #[snafu(display("Failed to parse {field} value: {source}"))]
+    FailedToParseDuration { source: ParseError, field: String },
 
     #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
     FailedToInvalidateCache {
@@ -302,6 +302,7 @@ pub struct QueryResultsCacheProvider {
     cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
+    stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
 }
@@ -311,6 +312,10 @@ impl std::fmt::Debug for QueryResultsCacheProvider {
         f.debug_struct("QueryResultsCacheProvider")
             .field("cache_max_size", &self.cache_max_size)
             .field("ttl", &self.ttl)
+            .field(
+                "stale_while_revalidate_ttl",
+                &self.stale_while_revalidate_ttl,
+            )
             .field("ignore_schemas", &self.ignore_schemas)
             .finish_non_exhaustive()
     }
@@ -332,17 +337,34 @@ impl QueryResultsCacheProvider {
         };
 
         let ttl = match &config.item_ttl {
-            Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
+            Some(item_ttl) => {
+                fundu::parse_duration(item_ttl).context(FailedToParseDurationSnafu {
+                    field: "item_ttl".to_string(),
+                })?
+            }
             None => std::time::Duration::from_secs(1),
         };
 
+        let stale_while_revalidate_ttl = match &config.stale_while_revalidate_ttl {
+            Some(stale_ttl_str) => Some(fundu::parse_duration(stale_ttl_str).context(
+                FailedToParseDurationSnafu {
+                    field: "stale_while_revalidate_ttl".to_string(),
+                },
+            )?),
+            None => None,
+        };
+
         let hash_builder = get_hash_builder(config.hashing_algorithm)?;
-        let cache = Arc::new(LruCache::new(cache_max_size, ttl, hash_builder));
+        // Cache TTL should be the base TTL plus the stale-while-revalidate window
+        // so entries aren't evicted before they can be served as stale
+        let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
+        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
 
         let cache_provider = QueryResultsCacheProvider {
             cache,
             cache_max_size,
             ttl,
+            stale_while_revalidate_ttl,
             ignore_schemas,
         };
 
@@ -414,9 +436,34 @@ impl QueryResultsCacheProvider {
         self.cache.item_count()
     }
 
+    /// Returns the base TTL for cache entries (used for staleness checks).
     #[must_use]
     pub fn ttl(&self) -> std::time::Duration {
         self.ttl
+    }
+
+    /// Returns the maximum stale-while-revalidate duration.
+    #[must_use]
+    pub fn max_stale_while_revalidate(&self) -> std::time::Duration {
+        self.stale_while_revalidate_ttl.unwrap_or_default()
+    }
+
+    /// Returns the actual cache TTL (base TTL + stale-while-revalidate period).
+    /// This is the duration after which entries are evicted from the cache.
+    #[must_use]
+    pub fn cache_ttl(&self) -> std::time::Duration {
+        self.ttl + self.stale_while_revalidate_ttl.unwrap_or_default()
+    }
+
+    /// Runs pending cache maintenance tasks (e.g., eviction of expired entries).
+    /// This is useful in tests to ensure eviction happens immediately.
+    pub async fn run_pending_tasks(&self) {
+        self.cache.checkpoint().await;
+    }
+
+    #[must_use]
+    pub fn stale_while_revalidate_ttl(&self) -> Option<std::time::Duration> {
+        self.stale_while_revalidate_ttl
     }
 
     #[must_use]

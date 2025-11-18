@@ -2,29 +2,28 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: clickbench_q21"
 ---
-+---------------+----------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                 |
-+---------------+----------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: count(Int64(1)) AS count(*)                                                                              |
-|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                  |
-|               |     Projection:                                                                                                      |
-|               |       BytesProcessedNode                                                                                             |
-|               |         Filter: CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%")                                               |
-|               |           TableScan: hits projection=[URL], partial_filters=[CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%")] |
-| physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as count(*)]                                                                 |
-|               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                          |
-|               |     CoalescePartitionsExec                                                                                           |
-|               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                    |
-|               |         ProjectionExec: expr=[]                                                                                      |
-|               |           BytesProcessedExec                                                                                         |
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                              |
-|               |               FilterExec: CAST(URL@0 AS LargeUtf8) LIKE %google%                                                     |
-|               |                 SchemaCastScanExec                                                                                   |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                              |
-|               |                     FallbackOnZeroResultsScanExec                                                                    |
-|               |                       CoalescePartitionsExec                                                                         |
-|               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                        |
-|               |                           CooperativeExec                                                                            |
-|               |                             DuckSqlExec sql= SELECT "URL" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%'        |
-|               |                                                                                                                      |
-+---------------+----------------------------------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                               |
++---------------+--------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: count(Int64(1)) AS count(*)                                                                            |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                |
+|               |     Projection:                                                                                                    |
+|               |       Filter: CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%")                                               |
+|               |         TableScan: hits projection=[URL], partial_filters=[CAST(hits.URL AS LargeUtf8) LIKE LargeUtf8("%google%")] |
+| physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as count(*)]                                                               |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                        |
+|               |     CoalescePartitionsExec                                                                                         |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                  |
+|               |         ProjectionExec: expr=[]                                                                                    |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                              |
+|               |             FilterExec: CAST(URL@0 AS LargeUtf8) LIKE %google%                                                     |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                |
+|               |                 SchemaCastScanExec                                                                                 |
+|               |                   FallbackOnZeroResultsScanExec                                                                    |
+|               |                     CoalescePartitionsExec                                                                         |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                        |
+|               |                         CooperativeExec                                                                            |
+|               |                           BytesProcessedExec                                                                       |
+|               |                             DuckSqlExec sql= SELECT "URL" FROM hits WHERE CAST("URL" AS TEXT) LIKE '%google%'      |
+|               |                                                                                                                    |
++---------------+--------------------------------------------------------------------------------------------------------------------+

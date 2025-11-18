@@ -17,6 +17,7 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use test_framework::anyhow;
 use test_framework::queries::{QueryOverrides, QuerySet};
 
 use super::CommonArgs;
@@ -34,11 +35,19 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) query_set: QuerySetArg,
 
+    /// Path to a scenario query set file (YAML format, required when using --query-set scenario)
+    #[arg(long, required_if_eq("query_set", "scenario"))]
+    pub(crate) scenario_query_file: Option<PathBuf>,
+
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
 
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) validate: bool,
+
+    /// Reference schema containing known good tables for validation (e.g., "arrow" to validate against arrow.customer instead of customer)
+    #[arg(long)]
+    pub(crate) reference_schema: Option<String>,
 
     /// Whether to disable results caching, by supplying the cache control header through flight
     #[arg(long)]
@@ -49,13 +58,17 @@ pub struct DatasetTestArgs {
     pub(crate) http_clients: bool,
 }
 
-#[derive(Clone, ValueEnum, Debug)]
+#[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QuerySetArg {
     Tpch,
     Tpcds,
     Clickbench,
     #[value(name = "tpch[parameterized]")]
+    #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
+    /// Scenario query set loaded from a file (use --scenario-query-file)
+    Scenario,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
@@ -94,6 +107,10 @@ pub enum QueryOverridesArg {
     DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
+    #[serde(rename = "dynamodb-federated")]
+    DynamoDBFederated,
+    #[serde(rename = "dynamodb-accelerated")]
+    DynamoDBAccelerated,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -103,6 +120,36 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
+            QuerySetArg::Scenario => {
+                // This should never be reached - callers must use DatasetTestArgs::load_query_set()
+                // for Scenario query sets as they require loading from a file.
+                unreachable!(
+                    "Scenario query set requires loading from file - use DatasetTestArgs::load_query_set() instead"
+                )
+            }
+        }
+    }
+}
+
+impl DatasetTestArgs {
+    /// Load the query set, handling scenario query sets from files
+    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
+        match self.query_set {
+            QuerySetArg::Scenario => {
+                let Some(file_path) = self.scenario_query_file.as_ref() else {
+                    anyhow::bail!("scenario_query_file is required when query_set is Scenario");
+                };
+
+                let scenario_set =
+                    test_framework::queries::scenario::ScenarioQuerySet::from_file(file_path)?;
+                let queries = scenario_set.clone().into_queries();
+
+                Ok(QuerySet::Scenario {
+                    queries,
+                    scenario_set,
+                })
+            }
+            _ => Ok(QuerySet::from(self.query_set.clone())),
         }
     }
 }
@@ -128,6 +175,8 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
+            QueryOverridesArg::DynamoDBFederated => QueryOverrides::DynamoDBFederated,
+            QueryOverridesArg::DynamoDBAccelerated => QueryOverrides::DynamoDBAccelerated,
         }
     }
 }

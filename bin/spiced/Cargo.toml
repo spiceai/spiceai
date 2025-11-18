@@ -80,6 +80,7 @@ default = [
     "mongodb",
     "iceberg-write",
     "turso",
+    "cluster",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]

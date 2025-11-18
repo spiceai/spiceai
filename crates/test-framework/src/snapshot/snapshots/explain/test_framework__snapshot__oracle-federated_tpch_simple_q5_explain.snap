@@ -11,11 +11,9 @@ description: "Query: tpch_simple_q5"
 |               |       Projection: O.O_TOTALPRICE, L.L_LINESTATUS                                                                                                |
 |               |         Inner Join: O.O_ORDERKEY = L.L_ORDERKEY                                                                                                 |
 |               |           SubqueryAlias: O                                                                                                                      |
-|               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: orders projection=[O_ORDERKEY, O_TOTALPRICE]                                                                           |
+|               |             TableScan: orders projection=[O_ORDERKEY, O_TOTALPRICE]                                                                             |
 |               |           SubqueryAlias: L                                                                                                                      |
-|               |             BytesProcessedNode                                                                                                                  |
-|               |               TableScan: lineitem projection=[L_ORDERKEY, L_LINESTATUS]                                                                         |
+|               |             TableScan: lineitem projection=[L_ORDERKEY, L_LINESTATUS]                                                                           |
 | physical_plan | SortPreservingMergeExec: [TOTAL_PRICE@0 DESC]                                                                                                   |
 |               |   SortExec: expr=[TOTAL_PRICE@0 DESC], preserve_partitioning=[true]                                                                             |
 |               |     ProjectionExec: expr=[sum(O.O_TOTALPRICE)@1 as TOTAL_PRICE, L_LINESTATUS@0 as L_LINESTATUS]                                                 |
@@ -28,14 +26,14 @@ description: "Query: tpch_simple_q5"
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([O_ORDERKEY@0], 32), input_partitions=32                                                 |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
-|               |                         BytesProcessedExec                                                                                                      |
-|               |                           CooperativeExec                                                                                                       |
+|               |                         CooperativeExec                                                                                                         |
+|               |                           BytesProcessedExec                                                                                                    |
 |               |                             OracleExec sql=SELECT "O_ORDERKEY", "O_TOTALPRICE" FROM "TPCH_SF1"."ORDERS"                                         |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                   |
 |               |                     RepartitionExec: partitioning=Hash([L_ORDERKEY@0], 32), input_partitions=32                                                 |
 |               |                       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                     |
-|               |                         BytesProcessedExec                                                                                                      |
-|               |                           CooperativeExec                                                                                                       |
+|               |                         CooperativeExec                                                                                                         |
+|               |                           BytesProcessedExec                                                                                                    |
 |               |                             OracleExec sql=SELECT "L_ORDERKEY", "L_LINESTATUS" FROM "TPCH_SF1"."LINEITEM"                                       |
 |               |                                                                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+

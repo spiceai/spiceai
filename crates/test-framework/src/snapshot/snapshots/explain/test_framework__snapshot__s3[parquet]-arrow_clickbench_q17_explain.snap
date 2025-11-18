@@ -8,8 +8,7 @@ description: "Query: clickbench_q17"
 | logical_plan  | Sort: count(*) DESC NULLS FIRST, fetch=10                                                                                                         |
 |               |   Projection: hits.UserID, hits.SearchPhrase, count(Int64(1)) AS count(*)                                                                         |
 |               |     Aggregate: groupBy=[[hits.UserID, hits.SearchPhrase]], aggr=[[count(Int64(1))]]                                                               |
-|               |       BytesProcessedNode                                                                                                                          |
-|               |         TableScan: hits projection=[UserID, SearchPhrase]                                                                                         |
+|               |       TableScan: hits projection=[UserID, SearchPhrase]                                                                                           |
 | physical_plan | SortPreservingMergeExec: [count(*)@2 DESC], fetch=10                                                                                              |
 |               |   SortExec: TopK(fetch=10), expr=[count(*)@2 DESC], preserve_partitioning=[true]                                                                  |
 |               |     ProjectionExec: expr=[UserID@0 as UserID, SearchPhrase@1 as SearchPhrase, count(Int64(1))@2 as count(*)]                                      |
@@ -17,8 +16,8 @@ description: "Query: clickbench_q17"
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                               |
 |               |           RepartitionExec: partitioning=Hash([UserID@0, SearchPhrase@1], 16), input_partitions=16                                                 |
 |               |             AggregateExec: mode=Partial, gby=[UserID@0 as UserID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))]                         |
-|               |               BytesProcessedExec                                                                                                                  |
-|               |                 SchemaCastScanExec                                                                                                                |
+|               |               SchemaCastScanExec                                                                                                                  |
+|               |                 BytesProcessedExec                                                                                                                |
 |               |                   DataSourceExec: partitions=16, partition_sizes=[382, 382, 382, 382, 382, 382, 382, 382, 381, 381, 381, 381, 381, 381, 381, 386] |
 |               |                                                                                                                                                   |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -24,7 +24,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -36,10 +35,12 @@ import (
 )
 
 var upgradeCmd = &cobra.Command{
-	Use:   "upgrade",
-	Short: "Upgrades the Spice CLI to the latest release",
+	Use:   "upgrade [version]",
+	Short: "Upgrades the Spice CLI and runtime to the latest or specified version",
+	Args:  cobra.MaximumNArgs(1),
 	Example: `
 spice upgrade
+spice upgrade v1.8.3
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		force, err := cmd.Flags().GetBool("force")
@@ -54,9 +55,47 @@ spice upgrade
 			os.Exit(1)
 		}
 
+		// Parse optional version argument
+		var targetVersion string
+		if len(args) > 0 {
+			targetVersion = args[0]
+			if !strings.HasPrefix(targetVersion, "v") {
+				slog.Error(fmt.Sprintf("Invalid version format: %s. Expected format: v1.8.3", targetVersion))
+				os.Exit(1)
+			}
+		}
+
+		// Special handling for version-specific upgrades: install both runtime and CLI without restart
+		if targetVersion != "" {
+			slog.Info(fmt.Sprintf("Upgrading to Spice version %s...", targetVersion))
+			
+			// Determine flavor from current installation
+			flavor := constants.FlavorCore
+			models, accelerated := rtcontext.ModelsFlavorInstalled()
+			if models {
+				flavor = constants.FlavorAI
+			}
+			
+			// Install runtime first (sets version lock)
+			err = rtcontext.InstallSpecificRuntime(targetVersion, flavor, accelerated)
+			if err != nil {
+				slog.Error("installing runtime", "error", err)
+				os.Exit(1)
+			}
+			slog.Info(fmt.Sprintf("Runtime upgraded to %s successfully.", targetVersion))
+			
+			// Then upgrade CLI - note: returns false on success (ready to restart)
+			// But we won't restart - we'll just exit with success
+			upgradeCli(false, targetVersion, true, rtcontext)
+			
+			slog.Info(fmt.Sprintf("Spice upgraded to %s successfully.", targetVersion))
+			return
+		}
+
+		// For latest version upgrade, use the restart pattern
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
-			if !upgradeCli(force, rtcontext) {
+			if !upgradeCli(force, "", false, rtcontext) {
 				// Exit if CLI upgrade fail / completes
 				return
 			}
@@ -68,12 +107,21 @@ spice upgrade
 		}
 
 		slog.Info("Checking for the latest Spice Runtime release...")
+
 		currentVersion, err := rtcontext.Version()
 		if err != nil {
 			slog.Info("Spice runtime is not installed and won't be upgraded. Run `spice install` to install the runtime.")
 			return
 		}
 
+		// For runtime upgrades, default to the flavor that was installed previously.
+		flavor := constants.FlavorCore
+		models, accelerated := rtcontext.ModelsFlavorInstalled()
+		if models {
+			flavor = constants.FlavorAI
+		}
+
+		// Upgrade to latest
 		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
 		if err != nil {
 			slog.Error("checking for runtime upgrade", "error", err)
@@ -83,13 +131,6 @@ spice upgrade
 		if runtimeUpgradeRequired == "" {
 			slog.Info(fmt.Sprintf("Using version %s. Runtime upgrade not required.", currentVersion))
 			return
-		}
-
-		// For runtime upgrades, default to the flavor that was installed previously.
-		flavor := constants.FlavorCore
-		models, accelerated := rtcontext.ModelsFlavorInstalled()
-		if models {
-			flavor = constants.FlavorAI
 		}
 
 		release, err := github.GetRuntimeRelease(version.Version())
@@ -104,26 +145,14 @@ spice upgrade
 			os.Exit(1)
 		}
 
+		// Clear version lock when upgrading to latest (no version specified)
+		err = rtcontext.ClearVersionLock()
+		if err != nil {
+			slog.Warn("failed to clear version lock", "error", err)
+		}
+
 		slog.Info(fmt.Sprintf("Spice runtime upgraded to %s successfully.", release.TagName))
 	},
-}
-
-type cleanupInfo struct {
-	tmpDir     string
-	markerPath string
-	oldBinary  string
-}
-
-func createCleanupInfo() *cleanupInfo {
-	if !util.IsWindows() {
-		return nil
-	}
-	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("spice-%d", time.Now().UnixNano()))
-	return &cleanupInfo{
-		tmpDir:     tmpDir,
-		markerPath: filepath.Join(tmpDir, constants.SpiceCliCleanupMarkerFile),
-		oldBinary:  filepath.Join(tmpDir, constants.SpiceCliFilename),
-	}
 }
 
 func cleanupOldBinaries() {
@@ -151,12 +180,24 @@ func cleanupOldBinaries() {
 // Upgrade CLI
 // Returns true if the CLI no upgrade was required
 // Returns false if the upgrade failed or the CLI upgrade completes
-func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
-	slog.Info("Checking for latest Spice CLI release...")
-	release, err := github.GetLatestCliRelease()
-	if err != nil {
-		slog.Error("checking for latest release", "error", err)
-		return false
+func upgradeCli(force bool, targetVersion string, skipRestart bool, rtcontext *context.RuntimeContext) bool {
+	var release *github.RepoRelease
+	var err error
+
+	if targetVersion != "" {
+		slog.Info(fmt.Sprintf("Checking for Spice CLI release %s...", targetVersion))
+		release, err = github.GetRuntimeRelease(targetVersion)
+		if err != nil {
+			slog.Error("checking for release", "error", err)
+			return false
+		}
+	} else {
+		slog.Info("Checking for latest Spice CLI release...")
+		release, err = github.GetLatestCliRelease()
+		if err != nil {
+			slog.Error("checking for latest release", "error", err)
+			return false
+		}
 	}
 
 	cliVersion := version.Version()
@@ -255,6 +296,11 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 
 	slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
 
+	// Skip restart if requested (for version-specific upgrades)
+	if skipRestart {
+		return true
+	}
+
 	execArgs := []string{releaseFilePath}
 	execArgs = append(execArgs, os.Args[1:]...)
 	if err := restartWithNewCli(releaseFilePath, execArgs); err != nil {
@@ -264,18 +310,6 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	// For unix, this is unreachable
 	// For windows, the CLI will be restarted with the new binary, return false to terminate old CLI
 	return false
-}
-
-func restartWithNewCli(cliPath string, args []string) error {
-	// windows: Prompt the user to restart the CLI
-	if runtime.GOOS == "windows" {
-		slog.Info("Please rerun the `spice upgrade` command to finish the runtime upgrade.")
-		return nil
-	}
-
-	// unix: Replace the current process with the new cli
-	execEnv := append(os.Environ(), fmt.Sprintf("%s=true", constants.SpiceUpgradeReloadEnv))
-	return syscall.Exec(cliPath, args, execEnv)
 }
 
 func init() {

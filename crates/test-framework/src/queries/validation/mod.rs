@@ -488,6 +488,102 @@ pub fn validate_tpch_query(
     validate_batches_as_strings(&expected_batches, &actual_batches)
 }
 
+/// Validate a query against expected results from a custom query set
+/// This is a generic validation function that can be used for custom queries
+pub fn validate_with_expected_batches(
+    query_name: &str,
+    actual_batches: &[RecordBatch],
+    expected_batches: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    if expected_batches.is_empty() && actual_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+
+    if expected_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    if actual_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+
+    let Some(expected_schema) = expected_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+
+    let Some(actual_schema) = actual_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+
+    if !equivalent_schemas(&expected_schema, &actual_schema) {
+        println!("Query '{query_name}' schema mismatch:");
+        println!("  expected_schema: {expected_schema:?}");
+        println!("  actual_schema: {actual_schema:?}");
+
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+
+    // combine all expected batches and all actual batches into a single RecordBatch
+    let expected_batches = arrow::compute::concat_batches(&expected_schema, expected_batches)?;
+    let actual_batches = arrow::compute::concat_batches(&actual_schema, actual_batches)?;
+
+    // check the row counts are equal
+    if expected_batches.num_rows() != actual_batches.num_rows() {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  expected: {}", expected_batches.num_rows());
+        println!("  actual: {}", actual_batches.num_rows());
+
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_batches.num_rows(),
+                actual: actual_batches.num_rows(),
+            },
+        ));
+    }
+
+    validate_batches_as_strings(&expected_batches, &actual_batches)
+}
+
+/// Validate that actual batches have the expected row count
+pub fn validate_row_count(
+    query_name: &str,
+    actual_batches: &[RecordBatch],
+    expected_row_count: usize,
+) -> Result<QueryValidationResult> {
+    let actual_row_count: usize = actual_batches.iter().map(RecordBatch::num_rows).sum();
+
+    if actual_row_count == expected_row_count {
+        Ok(QueryValidationResult::Pass)
+    } else {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  expected: {expected_row_count}");
+        println!("  actual: {actual_row_count}");
+
+        Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_row_count,
+                actual: actual_row_count,
+            },
+        ))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_lines)]
 mod test {
