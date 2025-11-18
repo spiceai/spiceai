@@ -86,7 +86,7 @@ impl ServerHandler for RuntimeServer {
             // Security: Validate tool name contains only safe characters
             if !tool_name
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
             {
                 return Err(McpError::invalid_params(
                     "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, and dot allowed".to_string(),
