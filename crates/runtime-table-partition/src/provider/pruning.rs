@@ -211,9 +211,13 @@ pub(crate) fn prune_partition(
             matches!(
                 f,
                 Expr::BinaryExpr(BinaryExpr {
-                    op: Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
+                    op: Operator::Gt
+                        | Operator::GtEq
+                        | Operator::Lt
+                        | Operator::LtEq
+                        | Operator::NotEq,
                     ..
-                })
+                }) | Expr::InList(InList { negated: true, .. })
             )
         });
 
@@ -485,11 +489,19 @@ fn evaluate_bucket_inequality(
                         Operator::LtEq => {
                             upper_bound = Some((lit.clone(), true));
                         }
+                        Operator::NotEq => {
+                            // For bucket partitions with != don't prune any partitions
+                            return Ok(false);
+                        }
                         _ => {}
                     }
                 }
                 _ => {}
             }
+        } else if let Expr::InList(InList { negated: true, .. }) = filter {
+            // Handle negated IN list (NOT IN)
+            // For bucket partitioning with NOT IN, don't prune any partitions
+            return Ok(false);
         }
     }
 
@@ -2485,6 +2497,62 @@ mod tests {
         // date_part can return Int32 or Float64 depending on the extracted part
         // For year, it returns Int32
         assert_eq!(result, ScalarValue::Int32(Some(2024)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_partition_bucket_no_pruning() -> Result<(), DataFusionError> {
+        // Test that bucket partitions with != and NOT IN filters
+        // For bucket partitioning, these operators should generally not prune any partitions
+        // because buckets can contain multiple values
+        let schema = Schema::new(vec![Field::new("user_id", DataType::Int32, false)]);
+        let partition_by = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(10_i64), col("user_id")],
+        });
+
+        // Test Case 1: user_id != 42
+        // For bucket partitioning with !=, no partitions should be pruned because:
+        // - Each bucket can contain multiple values
+        // - Even if a bucket contains 42, it likely contains other values that are != 42
+        let filters_not_equal = &[col("user_id").not_eq(lit(42_i32))];
+
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &filters_not_equal[..],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema,
+            )?;
+            assert!(
+                !pruned,
+                "Partition {partition_value} should not be pruned for user_id != 42 (bucket partitioning)",
+            );
+        }
+
+        // Test Case 2: user_id NOT IN (10, 20, 30)
+        // For bucket partitioning with NOT IN, no partitions should be pruned because:
+        // - Each bucket can contain multiple values
+        // - Even if a bucket contains one of the excluded values, it likely contains other values not in the list
+        let filters_not_in = &[in_list(
+            col("user_id"),
+            vec![lit(10_i32), lit(20_i32), lit(30_i32)],
+            true, // NOT IN
+        )];
+
+        for partition_value in 0..10_i32 {
+            let pruned = prune_partition(
+                &filters_not_in[..],
+                &partition_by,
+                &ScalarValue::Int32(Some(partition_value)),
+                &schema,
+            )?;
+            assert!(
+                !pruned,
+                "Partition {partition_value} should not be pruned for user_id NOT IN (10, 20, 30) (bucket partitioning)",
+            );
+        }
 
         Ok(())
     }
