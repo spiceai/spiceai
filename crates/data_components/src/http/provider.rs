@@ -1228,12 +1228,16 @@ impl HttpTableProvider {
         }
         if !raw.starts_with('/') {
             return Err(Error::FilterRejected {
-                message: format!("The 'request_path' value '{raw}' must start with '/'. For example: '/api/endpoint' instead of '{raw}'."),
+                message: format!(
+                    "The 'request_path' value '{raw}' must start with '/'. For example: '/api/endpoint' instead of '{raw}'."
+                ),
             });
         }
         if raw.contains("..") {
             return Err(Error::FilterRejected {
-                message: format!("The 'request_path' value '{raw}' contains '..' segments, which are not allowed for security reasons."),
+                message: format!(
+                    "The 'request_path' value '{raw}' contains '..' segments, which are not allowed for security reasons."
+                ),
             });
         }
 
