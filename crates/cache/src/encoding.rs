@@ -57,13 +57,16 @@ pub trait Encoder: Send + Sync {
 
     /// Returns a reference to self as `Any` for downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Returns true if the encoder uses compression.
+    fn compressed(&self) -> bool;
 }
 
-/// No-op encoder that just serializes to Arrow IPC format without compression.
+/// Uncompressed encoder that serializes to Arrow IPC format without compression.
 #[derive(Debug, Clone, Copy)]
-pub struct NoOpEncoder;
+pub struct UncompressedEncoder;
 
-impl Encoder for NoOpEncoder {
+impl Encoder for UncompressedEncoder {
     fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
         if batches.is_empty() {
             return Ok(Vec::new());
@@ -100,6 +103,10 @@ impl Encoder for NoOpEncoder {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn compressed(&self) -> bool {
+        false
     }
 }
 
@@ -169,13 +176,17 @@ impl Encoder for ZstdEncoder {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn compressed(&self) -> bool {
+        true
+    }
 }
 
 /// Create an encoder based on the encoding configuration.
 #[must_use]
 pub fn get_encoder(encoding: Encoding) -> Arc<dyn Encoder> {
     match encoding {
-        Encoding::None => Arc::new(NoOpEncoder),
+        Encoding::None => Arc::new(UncompressedEncoder),
         Encoding::Zstd => Arc::new(ZstdEncoder::default()),
     }
 }
@@ -203,8 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn test_noop_encoder_roundtrip() {
-        let encoder = NoOpEncoder;
+    fn test_uncompressed_encoder_roundtrip() {
+        let encoder = UncompressedEncoder;
         let original = vec![create_test_batch()];
 
         let encoded_data = encoder.encode(&original).expect("encode should succeed");
@@ -219,8 +230,8 @@ mod tests {
     }
 
     #[test]
-    fn test_noop_encoder_empty() {
-        let encoder = NoOpEncoder;
+    fn test_uncompressed_encoder_empty() {
+        let encoder = UncompressedEncoder;
         let empty: Vec<RecordBatch> = vec![];
 
         let encoded_data = encoder.encode(&empty).expect("encode should succeed");
@@ -275,10 +286,10 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("valid record batch");
 
-        let noop_encoder = NoOpEncoder;
+        let uncompressed_encoder = UncompressedEncoder;
         let zstd_encoder = ZstdEncoder::default();
 
-        let noop_size = noop_encoder
+        let uncompressed_size = uncompressed_encoder
             .encode(std::slice::from_ref(&batch))
             .expect("encode should succeed")
             .len();
@@ -289,8 +300,8 @@ mod tests {
 
         // Zstd should compress this significantly
         assert!(
-            zstd_size < noop_size,
-            "Zstd size ({zstd_size}) should be less than uncompressed size ({noop_size})"
+            zstd_size < uncompressed_size,
+            "Zstd size ({zstd_size}) should be less than uncompressed size ({uncompressed_size})"
         );
     }
 }

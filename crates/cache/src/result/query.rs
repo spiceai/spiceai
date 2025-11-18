@@ -78,7 +78,7 @@ impl CachedQueryResult {
             schema,
             input_tables,
             cached_at,
-            encoder: Arc::new(crate::encoding::NoOpEncoder),
+            encoder: Arc::new(crate::encoding::UncompressedEncoder),
         }
     }
 
@@ -101,7 +101,7 @@ impl CachedQueryResult {
     }
 
     /// Create a cached query result from record batches.
-    /// If using `NoOpEncoder`, stores raw batches. Otherwise encodes them.
+    /// If using `UncompressedEncoder`, stores raw batches. Otherwise encodes them.
     ///
     /// # Errors
     ///
@@ -118,14 +118,8 @@ impl CachedQueryResult {
             records[0].schema()
         };
 
-        // Check if this is NoOpEncoder - if so, store raw batches
-        let is_noop = encoder
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::encoding::NoOpEncoder>()
-            .is_some();
-
-        let data = if is_noop {
+        // If this encoder is uncompressed, store raw batches
+        let data = if !encoder.compressed() {
             CachedData::Raw(Arc::new(records.to_vec()))
         } else {
             let encoded_data = encoder.encode(records)?;
