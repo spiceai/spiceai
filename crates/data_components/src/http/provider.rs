@@ -1162,6 +1162,7 @@ impl HttpTableProvider {
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
+    /// Note: This is only used for supports_filters_pushdown, actual validation happens in extract_filter_values
     fn can_pushdown_filter(&self, filter: &Expr) -> bool {
         match filter {
             // Simple equality on request_path, request_query, or request_body
@@ -1169,9 +1170,9 @@ impl HttpTableProvider {
                 if let Expr::Column(col) = left.as_ref() {
                     if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = right.as_ref() {
                         match col.name.as_str() {
-                            "request_path" => self.validate_path_filter(value),
-                            "request_query" => self.validate_query_filter(value),
-                            "request_body" => self.validate_body_filter(value),
+                            "request_path" => self.ensure_allowed_path(value).is_ok(),
+                            "request_query" => self.ensure_allowed_query(value).is_ok(),
+                            "request_body" => self.ensure_allowed_body(value).is_ok(),
                             _ => false,
                         }
                     } else {
@@ -1188,9 +1189,9 @@ impl HttpTableProvider {
                     in_list.list.iter().all(|expr| {
                         if let Expr::Literal(ScalarValue::Utf8(Some(value)), _) = expr {
                             match col.name.as_str() {
-                                "request_path" => self.validate_path_filter(value),
-                                "request_query" => self.validate_query_filter(value),
-                                "request_body" => self.validate_body_filter(value),
+                                "request_path" => self.ensure_allowed_path(value).is_ok(),
+                                "request_query" => self.ensure_allowed_query(value).is_ok(),
+                                "request_body" => self.ensure_allowed_body(value).is_ok(),
                                 _ => false,
                             }
                         } else {
@@ -1211,61 +1212,35 @@ impl HttpTableProvider {
         }
     }
 
-    fn validate_path_filter(&self, value: &str) -> bool {
-        if let Err(e) = self.ensure_allowed_path(value) {
-            tracing::warn!("Filter pushdown rejected for request_path '{value}': {}", e);
-            return false;
-        }
-        true
-    }
-
-    fn validate_query_filter(&self, value: &str) -> bool {
-        if let Err(e) = self.ensure_allowed_query(value) {
-            tracing::warn!(
-                "Filter pushdown rejected for request_query '{value}': {}",
-                e
-            );
-            return false;
-        }
-        true
-    }
-
-    fn validate_body_filter(&self, value: &str) -> bool {
-        if let Err(e) = self.ensure_allowed_body(value) {
-            tracing::warn!("Filter pushdown rejected for request_body '{value}': {}", e);
-            return false;
-        }
-        true
-    }
-
     fn ensure_allowed_path(&self, raw: &str) -> Result<String> {
         if raw.is_empty() {
             return Err(Error::FilterRejected {
-                message: "request_path filter cannot be empty".to_string(),
+                message: "The 'request_path' filter cannot be empty. Provide a valid path starting with '/', such as '/api/endpoint'.".to_string(),
             });
         }
         if raw.len() > MAX_REQUEST_PATH_LENGTH {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_path exceeds the maximum supported length of {MAX_REQUEST_PATH_LENGTH} characters"
+                    "The 'request_path' value '{raw}' is too long ({} characters). Maximum allowed length is {MAX_REQUEST_PATH_LENGTH} characters.",
+                    raw.len()
                 ),
             });
         }
         if !raw.starts_with('/') {
             return Err(Error::FilterRejected {
-                message: "request_path filters must start with '/'".to_string(),
+                message: format!("The 'request_path' value '{raw}' must start with '/'. For example: '/api/endpoint' instead of '{raw}'."),
             });
         }
         if raw.contains("..") {
             return Err(Error::FilterRejected {
-                message: "request_path cannot contain '..' segments".to_string(),
+                message: format!("The 'request_path' value '{raw}' contains '..' segments, which are not allowed for security reasons."),
             });
         }
 
         let Some(allowed) = &self.allowed_paths else {
             return Err(Error::FilterRejected {
                 message:
-                    "request_path filters are disabled for this dataset. Configure allowed_request_paths to enable them."
+                    "Cannot filter by 'request_path' because path filtering is disabled for this dataset. To enable, add the 'allowed_request_paths' parameter with a comma-separated list of allowed paths in your dataset configuration."
                         .to_string(),
             });
         };
@@ -1273,10 +1248,10 @@ impl HttpTableProvider {
         if !allowed.contains(raw) {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_path '{raw}' is not included in allowed_request_paths. Allowed paths: {}",
+                    "The 'request_path' value '{raw}' is not in the allowed paths list. Allowed paths are: [{}]. Update the 'allowed_request_paths' parameter in your dataset configuration to include this path.",
                     allowed
                         .iter()
-                        .map(std::string::String::as_str)
+                        .map(|p| format!("'{p}'"))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -1290,20 +1265,21 @@ impl HttpTableProvider {
         if !self.allow_query_filters {
             return Err(Error::FilterRejected {
                 message:
-                    "request_query filters are disabled for this dataset. Enable allow_request_query_filters to use them.".to_string(),
+                    "Cannot filter by 'request_query' because query filtering is disabled for this dataset. To enable, set the 'request_query_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
         if raw.len() > self.max_query_length {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_query exceeds the configured max length of {} characters",
+                    "The 'request_query' value is too long ({} characters). Maximum allowed length is {} characters. You can increase this limit using the 'max_request_query_length' parameter.",
+                    raw.len(),
                     self.max_query_length
                 ),
             });
         }
         if raw.chars().any(char::is_control) {
             return Err(Error::FilterRejected {
-                message: "request_query cannot contain control characters".to_string(),
+                message: "The 'request_query' value contains control characters, which are not allowed for security reasons.".to_string(),
             });
         }
 
@@ -1326,13 +1302,14 @@ impl HttpTableProvider {
         if !self.allow_body_filters {
             return Err(Error::FilterRejected {
                 message:
-                    "request_body filters are disabled for this dataset. Enable allow_request_body_filters to use them.".to_string(),
+                    "Cannot filter by 'request_body' because body filtering is disabled for this dataset. To enable, set the 'request_body_filters' parameter to 'enabled' in your dataset configuration.".to_string(),
             });
         }
         if raw.len() > self.max_body_bytes {
             return Err(Error::FilterRejected {
                 message: format!(
-                    "request_body exceeds the configured max size of {} bytes",
+                    "The 'request_body' value is too large ({} bytes). Maximum allowed size is {} bytes. You can increase this limit using the 'max_request_body_bytes' parameter.",
+                    raw.len(),
                     self.max_body_bytes
                 ),
             });
