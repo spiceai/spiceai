@@ -508,7 +508,7 @@ impl QueryOverrides {
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
             "dynamodb_federated" => Some(Self::DynamoDBFederated),
-            "dynamodb_accelerated" => Some(Self::DynamoDBFederated),
+            "dynamodb_accelerated" => Some(Self::DynamoDBAccelerated),
             _ => None,
         }
     }
