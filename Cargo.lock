@@ -13252,6 +13252,7 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
+ "criterion 0.7.0",
  "datafusion",
  "futures",
  "insta",
