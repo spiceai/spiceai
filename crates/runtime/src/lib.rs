@@ -687,10 +687,13 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let auth = endpoint_auth
-            .http_auth
-            .clone()
-            .unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth));
+        let (auth, has_auth) = match endpoint_auth.http_auth.clone() {
+            Some(auth) => (auth, true),
+            None => (
+                Arc::new(auth::no_auth::NoAuth) as Arc<dyn runtime_auth::HttpAuth + Send + Sync>,
+                false,
+            ),
+        };
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -704,6 +707,7 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
+                    has_auth,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
