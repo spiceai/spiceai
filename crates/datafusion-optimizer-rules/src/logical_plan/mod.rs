@@ -15,4 +15,6 @@ limitations under the License.
 */
 
 pub mod cache_invalidation;
+pub mod duckdb_aggregate_pushdown;
+
 pub use cache_invalidation::CacheInvalidationExtensionPlanner;

@@ -4705,6 +4705,7 @@ dependencies = [
  "cache",
  "datafusion",
  "datafusion-expr",
+ "datafusion-federation",
  "datafusion-table-providers",
  "duckdb",
  "futures",

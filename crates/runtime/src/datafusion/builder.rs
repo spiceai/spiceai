@@ -68,6 +68,7 @@ use tokio::{
     runtime::Handle,
     sync::{RwLock as TokioRwLock, Semaphore},
 };
+use datafusion_optimizer_rules::logical_plan::duckdb_aggregate_pushdown::DuckDBAggregatePushdownOptimizerRule;
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
@@ -247,6 +248,7 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
+            .with_optimizer_rule(DuckDBAggregatePushdownOptimizerRule::new())
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         #[cfg(feature = "duckdb")]

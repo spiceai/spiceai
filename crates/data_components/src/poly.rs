@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{any::Any, borrow::Cow, sync::Arc};
-
+use std::collections::HashMap;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -39,6 +39,7 @@ pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn DeletionTableProvider>,
     fed: Arc<dyn TableProvider>,
+    schema_metadata: HashMap<String, String>
 }
 
 impl PolyTableProvider {
@@ -47,7 +48,16 @@ impl PolyTableProvider {
         delete: Arc<dyn DeletionTableProvider>,
         fed: Arc<dyn TableProvider>,
     ) -> Self {
-        PolyTableProvider { write, delete, fed }
+        PolyTableProvider { write, delete, fed, schema_metadata: HashMap::new() }
+    }
+
+    pub fn new_with_schema_metadata(
+        write: Arc<dyn TableProvider>,
+        delete: Arc<dyn DeletionTableProvider>,
+        fed: Arc<dyn TableProvider>,
+        schema_metadata: HashMap<String, String>
+    ) -> Self {
+        PolyTableProvider { write, delete, fed, schema_metadata }
     }
 
     fn get_federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
@@ -111,7 +121,8 @@ impl TableProvider for PolyTableProvider {
         self
     }
     fn schema(&self) -> SchemaRef {
-        self.write.schema()
+        let schema = self.write.schema().as_ref().clone();
+        Arc::new(schema.with_metadata(self.schema_metadata.clone()))
     }
     fn constraints(&self) -> Option<&Constraints> {
         self.write.constraints()

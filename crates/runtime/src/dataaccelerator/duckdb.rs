@@ -62,7 +62,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Once},
 };
-
+use std::collections::HashMap;
 use super::{AccelerationSource, DataAccelerator};
 
 pub(crate) mod settings;
@@ -525,10 +525,14 @@ pub(crate) async fn create_table_provider(
     };
     let cloned_writer = Arc::clone(&duckdb_writer);
 
-    let table_provider = Arc::new(PolyTableProvider::new(
+    let mut schema_metadata = HashMap::new();
+    schema_metadata.insert("spice.accelerator".to_string(), "duckdb".to_string());
+
+    let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         cloned_writer,
         duckdb_writer,
         read_provider,
+        schema_metadata
     ));
 
     Ok(table_provider)
