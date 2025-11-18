@@ -147,8 +147,6 @@ impl<
             })
             .build_with_hasher(hasher.clone());
 
-        V::init();
-
         LruCache {
             cache,
             hasher,
@@ -212,19 +210,11 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count());
-            V::record_size(self.size_bytes());
+        if now_seconds.saturating_sub(last_emitted) >= 5 {
+            self.metrics_last_reported_time
+                .store(now_seconds, Ordering::Relaxed);
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
             V::record_max_size(self.max_size() as u64);
 
             let hits = self.hits.load(Ordering::Relaxed);
@@ -233,33 +223,27 @@ impl<
         }
     }
 
-    fn invalidate_all(&self) {
+    async fn invalidate_all(&self) {
         self.cache.invalidate_all();
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count());
-            V::record_size(self.size_bytes());
+        if now_seconds.saturating_sub(last_emitted) >= 5 {
+            self.metrics_last_reported_time
+                .store(now_seconds, Ordering::Relaxed);
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
         }
     }
 
-    fn size_bytes(&self) -> u64 {
+    async fn size_bytes(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
         self.cache.weighted_size()
     }
 
-    fn item_count(&self) -> u64 {
+    async fn item_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
         self.cache.entry_count()
     }
 
