@@ -1162,7 +1162,7 @@ impl HttpTableProvider {
     }
 
     /// Check if a filter expression can be pushed down to HTTP requests
-    /// Note: This is only used for supports_filters_pushdown, actual validation happens in extract_filter_values
+    /// Note: This is only used for `supports_filters_pushdown`, actual validation happens in `extract_filter_values`
     fn can_pushdown_filter(&self, filter: &Expr) -> bool {
         match filter {
             // Simple equality on request_path, request_query, or request_body
