@@ -373,3 +373,4 @@ parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8
 turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296163b3241d6963a2e87d" }
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
+
