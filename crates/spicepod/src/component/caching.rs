@@ -35,6 +35,8 @@ pub enum HashingAlgorithm {
     #[default]
     Siphash,
     Ahash,
+    #[serde(rename = "blake3")]
+    Blake3,
     #[serde(rename = "xxh3")]
     XXH3,
     #[serde(rename = "xxh32")]

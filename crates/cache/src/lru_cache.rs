@@ -287,7 +287,6 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
-    #[cfg(feature = "xxhash")]
     use spicepod::component::caching::HashingAlgorithm;
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
@@ -475,7 +474,30 @@ mod tests {
         assert!(retrieved.is_none());
     }
 
-    #[cfg(feature = "xxhash")]
+    #[tokio::test]
+    async fn test_cache_ttl_blake3() {
+        let hasher = get_hash_builder(HashingAlgorithm::Blake3).expect("Failed to get hash builder");
+
+        let cache: LruCache<CachedQueryResult, _> =
+            LruCache::new(10, Duration::from_millis(100), hasher);
+        let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache.put_raw_key(&key().as_u64(), result).await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_some());
+
+        // Wait for the TTL to expire
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&key().as_u64()).await;
+        assert!(retrieved.is_none());
+    }
+
     #[rstest]
     #[case::xxh3(HashingAlgorithm::XXH3)]
     #[case::xxh32(HashingAlgorithm::XXH32)]
