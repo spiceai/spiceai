@@ -46,8 +46,8 @@ on:
           - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
-          - 'dynamo-db-federated'
-          - 'dynamo-db-accelerated'
+          - 'dynamodb-federated'
+          - 'dynamodb-accelerated'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
