@@ -306,7 +306,7 @@ pub struct QueryResultsCacheProvider {
     stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
-    encoder: Arc<dyn encoding::Encoder>,
+    encoder: Option<Arc<dyn encoding::Encoder>>,
     encoding: spicepod::component::caching::Encoding,
     hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
 }
@@ -476,8 +476,8 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn encoder(&self) -> Arc<dyn encoding::Encoder> {
-        Arc::clone(&self.encoder)
+    pub fn encoder(&self) -> Option<Arc<dyn encoding::Encoder>> {
+        self.encoder.as_ref().map(Arc::clone)
     }
 
     #[must_use]

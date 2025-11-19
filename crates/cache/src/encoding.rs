@@ -35,6 +35,9 @@ pub enum Error {
 
     #[snafu(display("Failed to decompress data with zstd: {source}"))]
     FailedToDecompress { source: std::io::Error },
+
+    #[snafu(display("No encoder specified for decoding cached data"))]
+    NoEncoderSpecified,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -60,54 +63,6 @@ pub trait Encoder: Send + Sync {
 
     /// Returns true if the encoder uses compression.
     fn compressed(&self) -> bool;
-}
-
-/// Uncompressed encoder that serializes to Arrow IPC format without compression.
-#[derive(Debug, Clone, Copy)]
-pub struct UncompressedEncoder;
-
-impl Encoder for UncompressedEncoder {
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
-        if batches.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let schema = batches[0].schema();
-        let mut buffer = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::try_new(&mut buffer, &schema).context(FailedToSerializeSnafu)?;
-
-            for batch in batches {
-                writer.write(batch).context(FailedToSerializeSnafu)?;
-            }
-
-            writer.finish().context(FailedToSerializeSnafu)?;
-        }
-
-        Ok(buffer)
-    }
-
-    fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let cursor = Cursor::new(data);
-        let reader = StreamReader::try_new(cursor, None).context(FailedToDeserializeSnafu)?;
-
-        reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context(FailedToDeserializeSnafu)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn compressed(&self) -> bool {
-        false
-    }
 }
 
 /// Zstd encoder that compresses `RecordBatch` data.
@@ -184,10 +139,10 @@ impl Encoder for ZstdEncoder {
 
 /// Create an encoder based on the encoding configuration.
 #[must_use]
-pub fn get_encoder(encoding: Encoding) -> Arc<dyn Encoder> {
+pub fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
     match encoding {
-        Encoding::None => Arc::new(UncompressedEncoder),
-        Encoding::Zstd => Arc::new(ZstdEncoder::default()),
+        Encoding::None => None,
+        Encoding::Zstd => Some(Arc::new(ZstdEncoder::default())),
     }
 }
 
@@ -211,36 +166,6 @@ mod tests {
             ],
         )
         .expect("valid record batch")
-    }
-
-    #[test]
-    fn test_uncompressed_encoder_roundtrip() {
-        let encoder = UncompressedEncoder;
-        let original = vec![create_test_batch()];
-
-        let encoded_data = encoder.encode(&original).expect("encode should succeed");
-        assert!(!encoded_data.is_empty());
-
-        let decoded = encoder
-            .decode(&encoded_data)
-            .expect("decode should succeed");
-        assert_eq!(decoded.len(), original.len());
-        assert_eq!(decoded[0].num_rows(), original[0].num_rows());
-        assert_eq!(decoded[0].num_columns(), original[0].num_columns());
-    }
-
-    #[test]
-    fn test_uncompressed_encoder_empty() {
-        let encoder = UncompressedEncoder;
-        let empty: Vec<RecordBatch> = vec![];
-
-        let encoded_data = encoder.encode(&empty).expect("encode should succeed");
-        assert!(encoded_data.is_empty());
-
-        let decoded = encoder
-            .decode(&encoded_data)
-            .expect("decode should succeed");
-        assert!(decoded.is_empty());
     }
 
     #[test]
@@ -286,13 +211,9 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("valid record batch");
 
-        let uncompressed_encoder = UncompressedEncoder;
         let zstd_encoder = ZstdEncoder::default();
 
-        let uncompressed_size = uncompressed_encoder
-            .encode(std::slice::from_ref(&batch))
-            .expect("encode should succeed")
-            .len();
+        let uncompressed_size = batch.get_array_memory_size();
         let zstd_size = zstd_encoder
             .encode(std::slice::from_ref(&batch))
             .expect("encode should succeed")

@@ -56,7 +56,7 @@ pub struct CachedQueryResult {
     /// Timestamp when the result was cached.
     cached_at: Instant,
     /// Encoder used to decode the data
-    encoder: Arc<dyn Encoder>,
+    encoder: Option<Arc<dyn Encoder>>,
 }
 
 impl CachedQueryResult {
@@ -78,7 +78,7 @@ impl CachedQueryResult {
             schema,
             input_tables,
             cached_at,
-            encoder: Arc::new(crate::encoding::UncompressedEncoder),
+            encoder: None,
         }
     }
 
@@ -89,7 +89,7 @@ impl CachedQueryResult {
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
-        encoder: Arc<dyn Encoder>,
+        encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
         Self {
             data: CachedData::Encoded(encoded_data),
@@ -101,7 +101,7 @@ impl CachedQueryResult {
     }
 
     /// Create a cached query result from record batches.
-    /// If using `UncompressedEncoder`, stores raw batches. Otherwise encodes them.
+    /// Only store encoded data if an encoder is provided.
     ///
     /// # Errors
     ///
@@ -110,7 +110,7 @@ impl CachedQueryResult {
         records: &[RecordBatch],
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
-        encoder: Arc<dyn Encoder>,
+        encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
         let schema = if records.is_empty() {
             Arc::new(Schema::empty())
@@ -118,12 +118,12 @@ impl CachedQueryResult {
             records[0].schema()
         };
 
-        // If this encoder is uncompressed, store raw batches
-        let data = if !encoder.compressed() {
-            CachedData::Raw(Arc::new(records.to_vec()))
-        } else {
+        // only store encoded data if an encoder is provided
+        let data = if let Some(encoder) = encoder.as_ref() {
             let encoded_data = encoder.encode(records)?;
             CachedData::Encoded(Bytes::from(encoded_data))
+        } else {
+            CachedData::Raw(Arc::new(records.to_vec()))
         };
 
         Ok(Self {
@@ -143,7 +143,13 @@ impl CachedQueryResult {
     pub fn records(&self) -> Result<Vec<RecordBatch>, crate::encoding::Error> {
         match &self.data {
             CachedData::Raw(batches) => Ok((**batches).clone()),
-            CachedData::Encoded(bytes) => self.encoder.decode(bytes),
+            CachedData::Encoded(bytes) => {
+                if let Some(encoder) = &self.encoder {
+                    encoder.decode(bytes)
+                } else {
+                    Err(crate::encoding::Error::NoEncoderSpecified)
+                }
+            }
         }
     }
 
