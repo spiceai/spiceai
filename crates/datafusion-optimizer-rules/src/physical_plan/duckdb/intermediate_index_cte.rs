@@ -40,12 +40,9 @@ impl SelectionWithIdents {
         let mut references = HashSet::new();
 
         let _ = visit_expressions(expr, |e| {
-            match e {
-                ident @ Expr::Identifier(_) | ident @ Expr::CompoundIdentifier(_) => {
-                    references.insert(ident.clone());
-                }
-                _ => { /* no-op */ }
-            }
+            if let ident @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) = e {
+                references.insert(ident.clone());
+            } else { /* no-op */ }
 
             ControlFlow::<()>::Continue(())
         });
@@ -118,6 +115,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
     /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
     /// materialized CTE with filters _only_ on index columns
+    #[allow(clippy::too_many_lines)]
     fn build_cte(
         select: &Select,
         indexes: &[(ColumnReference, IndexType)],
@@ -213,12 +211,9 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
             for item in &cte_select.projection {
                 let _ = visit_expressions(item, |e| {
-                    match e {
-                        ident @ Expr::Identifier(_) | ident @ Expr::CompoundIdentifier(_) => {
-                            projected_columns.insert(ident.clone());
-                        }
-                        _ => { /* no-op */ }
-                    }
+                    if let ident @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) = e {
+                        projected_columns.insert(ident.clone());
+                    } else { /* no-op */ }
 
                     ControlFlow::<()>::Continue(())
                 });
