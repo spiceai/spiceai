@@ -796,7 +796,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::unwrap_used)]
     fn test_valid_expressions() {
         let valid_expressions = vec![
             r#"{"year": {"$gte": 2020}}"#,
@@ -818,7 +817,12 @@ mod tests {
             r#"{"$or": [{"genre": {"$eq": "drama"}}, {"year": {"$gte": 2020}}]}"#,
         ];
         for expr in valid_expressions {
-            assert!(MetadataFilter::from_json(expr).unwrap().validate().is_ok());
+            assert!(
+                MetadataFilter::from_json(expr)
+                    .expect("should parse metadata filter from JSON")
+                    .validate()
+                    .is_ok()
+            );
         }
     }
 

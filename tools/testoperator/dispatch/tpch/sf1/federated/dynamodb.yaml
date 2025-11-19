@@ -3,16 +3,16 @@ tests:
     spicepod_path: federated/dynamodb.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
-    query_overrides: dynamodb-federated
+    query_overrides: dynamodb
     validate_results: true
   throughput:
     spicepod_path: federated/dynamodb.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
-    query_overrides: dynamodb-federated
+    query_overrides: dynamodb
   load:
     spicepod_path: federated/dynamodb.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
-    query_overrides: dynamodb-federated
+    query_overrides: dynamodb

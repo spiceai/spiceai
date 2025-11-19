@@ -110,13 +110,16 @@ impl Encoder for ZstdEncoder {
             writer.finish().context(FailedToSerializeSnafu)?;
         }
 
-        let mut encoder =
-            AsyncZstdEncoder::with_quality(ipc_buffer, Level::Precise(self.compression_level));
         let mut compressed_data = Vec::new();
+        let mut encoder = AsyncZstdEncoder::with_quality(
+            &mut compressed_data,
+            Level::Precise(self.compression_level),
+        );
         encoder
-            .write_all(&mut compressed_data)
+            .write_all(&ipc_buffer)
             .await
             .context(FailedToCompressSnafu)?;
+        encoder.shutdown().await.context(FailedToCompressSnafu)?;
         Ok(compressed_data)
     }
 
