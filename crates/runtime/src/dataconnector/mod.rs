@@ -600,13 +600,11 @@ pub async fn get_data(
         df = df.filter(filter).map_err(find_datafusion_root)?;
     }
 
-    if tracing::enabled!(Level::DEBUG) {
-        if let Ok(explained) = df.clone().explain(false, false) {
-            if let Ok(explained) = explained.to_string().await {
+    if tracing::enabled!(Level::DEBUG)
+        && let Ok(explained) = df.clone().explain(false, false)
+            && let Ok(explained) = explained.to_string().await {
                 tracing::debug!("Data refresh plan for {}: \n{}", table_name, explained);
             }
-        }
-    }
 
     let sql = Unparser::default()
         .plan_to_sql(df.logical_plan())
