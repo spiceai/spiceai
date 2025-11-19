@@ -23,6 +23,39 @@ use test_framework::queries::{QueryOverrides, QuerySet};
 use super::CommonArgs;
 
 #[derive(Parser, Debug, Clone)]
+pub struct QueryArgs {
+    /// The expected scale factor for the test, used in metrics calculation
+    #[arg(long)]
+    pub(crate) scale_factor: Option<f64>,
+
+    /// The query set to use for the test
+    #[arg(long)]
+    pub(crate) query_set: QuerySetArg,
+
+    /// Path to a scenario query set file (YAML format, required when using --query-set scenario)
+    #[arg(long, required_if_eq("query_set", "scenario"))]
+    pub(crate) scenario_query_file: Option<PathBuf>,
+
+    #[arg(long)]
+    pub(crate) query_overrides: Option<QueryOverridesArg>,
+
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) validate: bool,
+
+    /// Reference schema containing known good tables for validation (e.g., "arrow" to validate against arrow.customer instead of customer)
+    #[arg(long)]
+    pub(crate) reference_schema: Option<String>,
+
+    /// Whether to disable results caching, by supplying the cache control header through flight
+    #[arg(long)]
+    pub(crate) disable_caching: bool,
+
+    /// Whether to add HTTP clients for the test
+    #[arg(long)]
+    pub(crate) http_clients: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
 pub struct DatasetTestArgs {
     #[command(flatten)]
     pub(crate) common: CommonArgs,
@@ -132,6 +165,28 @@ impl From<QuerySetArg> for QuerySet {
 
 impl DatasetTestArgs {
     /// Load the query set, handling scenario query sets from files
+    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
+        match self.query_set {
+            QuerySetArg::Scenario => {
+                let Some(file_path) = self.scenario_query_file.as_ref() else {
+                    anyhow::bail!("scenario_query_file is required when query_set is Scenario");
+                };
+
+                let scenario_set =
+                    test_framework::queries::scenario::ScenarioQuerySet::from_file(file_path)?;
+                let queries = scenario_set.clone().into_queries();
+
+                Ok(QuerySet::Scenario {
+                    queries,
+                    scenario_set,
+                })
+            }
+            _ => Ok(QuerySet::from(self.query_set.clone())),
+        }
+    }
+}
+
+impl QueryArgs {
     pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
         match self.query_set {
             QuerySetArg::Scenario => {

@@ -35,6 +35,7 @@ pub(crate) mod dispatch;
 pub(crate) mod evals;
 pub(crate) mod http;
 pub(crate) mod load;
+pub(crate) mod query;
 pub(crate) mod search;
 pub(crate) mod throughput;
 mod util;

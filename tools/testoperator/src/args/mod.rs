@@ -22,7 +22,7 @@ mod http;
 pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs};
 
 pub mod dispatch;
 use dispatch::DispatchArgs;
@@ -47,16 +47,26 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum TestCommands {
+    // Run a throughput test
     Throughput(DatasetTestArgs),
+    // Run an extended load test
     Load(LoadTestArgs),
+    // Run a single-run benchmark
     Bench(DatasetTestArgs),
+    // Run a data consistency test
     DataConsistency(DataConsistencyArgs),
+    // Run an HTTP consistency test
     HttpConsistency(HttpConsistencyTestArgs),
+    // Run an HTTP overhead test
     HttpOverhead(HttpOverheadTestArgs),
+    // Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(DatasetTestArgs),
+    // Run a vector search test
     Search(SearchTestArgs),
+    // Execute benchmark queries against a pre-existing spiced instance
+    Query(QueryArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

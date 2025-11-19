@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
@@ -49,9 +49,9 @@ impl Display for SpicedVersion {
 }
 
 pub struct SpicedInstance {
-    child: Child,
-    tempdir: TempDir,
-    version: SpicedVersion,
+    child: Option<Child>,
+    tempdir: Option<TempDir>,
+    version: Option<SpicedVersion>,
 }
 
 pub struct StartRequest {
@@ -121,6 +121,14 @@ impl StartRequest {
 }
 
 impl SpicedInstance {
+    pub fn empty() -> Self {
+        Self {
+            child: None,
+            tempdir: None,
+            version: None,
+        }
+    }
+
     /// Start a spiced instance
     ///
     /// # Errors
@@ -176,20 +184,29 @@ impl SpicedInstance {
         let child = cmd.spawn()?;
 
         Ok(Self {
-            child,
-            tempdir,
-            version: SpicedVersion::new(version),
+            child: Some(child),
+            tempdir: Some(tempdir),
+            version: Some(SpicedVersion::new(version)),
         })
     }
 
     #[must_use]
     pub fn version(&self) -> &str {
-        self.version.0.as_str()
+        let Some(version) = self.version.as_ref() else {
+            return "unknown";
+        };
+
+        version.0.as_str()
     }
 
     #[must_use]
-    pub fn get_tempdir_path(&self) -> PathBuf {
-        self.tempdir.path().to_path_buf()
+    pub fn get_tempdir_path(&self) -> Result<PathBuf> {
+        Ok(self
+            .tempdir
+            .as_ref()
+            .context(anyhow::anyhow!("tempdir must be set to retrieve path"))?
+            .path()
+            .to_path_buf())
     }
 
     /// Get a spice client for the spiced instance
@@ -279,24 +296,28 @@ impl SpicedInstance {
     ///
     /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+
         #[cfg(not(target_os = "windows"))]
         {
             // Send a SIGTERM to the spiced instance and wait for it to exit
-            let Ok(pid_i32) = self.child.id().try_into() else {
+            let Ok(pid_i32) = child.id().try_into() else {
                 anyhow::bail!("Failed to convert pid to i32");
             };
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid_i32),
                 nix::sys::signal::Signal::SIGTERM,
             )?;
-            self.child.wait()?;
+            child.wait()?;
         }
 
         #[cfg(target_os = "windows")]
         {
             // On Windows, we can use the built-in process termination
-            self.child.kill()?;
-            self.child.wait()?;
+            child.kill()?;
+            child.wait()?;
         }
 
         Ok(())
@@ -305,14 +326,25 @@ impl SpicedInstance {
     /// Returns an instance of a `Process` for the spiced instance
     /// This allows tracking the spiced process, without owning the spiced instance
     #[must_use]
-    pub fn process(&self) -> Process {
-        Process::new(Pid::from_u32(self.child.id()))
+    pub fn process(&self) -> Result<Process> {
+        Ok(Process::new(Pid::from_u32(
+            self.child
+                .as_ref()
+                .context(anyhow::anyhow!(
+                    "child process must be set to retrieve process"
+                ))?
+                .id(),
+        )))
     }
 }
 
 impl Drop for SpicedInstance {
     fn drop(&mut self) {
-        match self.child.kill() {
+        let Some(child) = &mut self.child else {
+            return;
+        };
+
+        match child.kill() {
             Ok(()) => (),
             Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
         }
