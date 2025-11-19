@@ -28,10 +28,6 @@ use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
 async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -45,8 +41,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
         .scope(async {
             let mut db_catalog =
                 Catalog::new(format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"), "ice_glue".to_string());
-            // `params.include` not supported: https://github.com/spiceai/spiceai/issues/5314
-            // db_catalog.include = vec!["testdb_001.*".to_string(), "testdb_002.*".to_string()];
+            db_catalog.include = vec!["testdb_001.*".to_string(), "testdb_002.*".to_string()];
             db_catalog.params = Some(get_params());
 
             let app = AppBuilder::new("glue_iceberg_integration_test_catalog")
@@ -63,8 +58,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                // `params.include` not supported and full catalog is loaded: https://github.com/spiceai/spiceai/issues/5314
-                () = tokio::time::sleep(std::time::Duration::from_secs(1200)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
