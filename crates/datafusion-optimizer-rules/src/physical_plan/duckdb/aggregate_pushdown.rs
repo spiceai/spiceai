@@ -52,7 +52,11 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        assert_eq!(children.len(), 1, "DuckDBAggregatePushdownMarkerExec is unary");
+        assert_eq!(
+            children.len(),
+            1,
+            "DuckDBAggregatePushdownMarkerExec is unary"
+        );
         Ok(Self::new(
             self.logical_plan.clone(),
             Arc::clone(&children[0]),

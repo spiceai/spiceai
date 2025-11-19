@@ -42,7 +42,8 @@ impl SelectionWithIdents {
         let _ = visit_expressions(expr, |e| {
             if let ident @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) = e {
                 references.insert(ident.clone());
-            } else { /* no-op */ }
+            } else { /* no-op */
+            }
 
             ControlFlow::<()>::Continue(())
         });
@@ -213,7 +214,8 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
                 let _ = visit_expressions(item, |e| {
                     if let ident @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) = e {
                         projected_columns.insert(ident.clone());
-                    } else { /* no-op */ }
+                    } else { /* no-op */
+                    }
 
                     ControlFlow::<()>::Continue(())
                 });
