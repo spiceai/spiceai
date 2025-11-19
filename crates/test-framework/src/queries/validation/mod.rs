@@ -125,14 +125,14 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
     }
 });
 
-fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
+fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
     if expected_type == actual_type {
         return true;
     }
 
     // Check for logical equivalence, with a lenient set of rules
     // E.g. a number could be returned as a string, number, or float.
-    match (&expected_type, &actual_type) {
+    match (expected_type, actual_type) {
         // Handle timestamp timezone differences
         (DataType::Timestamp(unit1, tz1), DataType::Timestamp(unit2, tz2)) => {
             // Same time unit is required
@@ -147,7 +147,7 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
         }
         // Existing numeric and string type equivalences
         _ => matches!(
-            (&expected_type, &actual_type),
+            (expected_type, actual_type),
             (DataType::Float32, DataType::Float64)
                 | (
                     DataType::Float64 | DataType::Int64,
@@ -180,7 +180,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .fields()
         .iter()
         .zip(actual_schema.fields().iter())
-        .all(|(f1, f2)| datatype_equivalent(f1.data_type().clone(), f2.data_type().clone()))
+        .all(|(f1, f2)| datatype_equivalent(f1.data_type(), f2.data_type()))
 }
 
 macro_rules! downcast_and_stringify {
@@ -286,9 +286,10 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                 .downcast_ref::<Date64Array>()
                 .ok_or_else(|| anyhow!("Failed to downcast Date64 array"))?
                 .value(index);
+            let days = millis / 86_400_000; // Convert milliseconds to days
             let date = NaiveDate::from_ymd_opt(1970, 1, 1)
                 .ok_or_else(|| anyhow!("Invalid base date"))?
-                .checked_add_signed(chrono::Duration::milliseconds(millis))
+                .checked_add_signed(chrono::Duration::days(days))
                 .ok_or_else(|| anyhow!("Date out of range"))?;
             Ok(Some(date.format("%Y-%m-%d").to_string()))
         }
