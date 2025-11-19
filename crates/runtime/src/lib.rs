@@ -563,6 +563,26 @@ impl Runtime {
         self.datasets_health_monitor.clone()
     }
 
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
