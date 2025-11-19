@@ -17,10 +17,15 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use async_compression::Level;
+use async_compression::tokio::bufread::ZstdDecoder;
+use async_compression::tokio::write::ZstdEncoder as AsyncZstdEncoder;
+use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::Encoding;
 use std::io::Cursor;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,20 +48,21 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Trait for encoding and decoding `RecordBatch` data.
+#[async_trait]
 pub trait Encoder: Send + Sync {
     /// Encode a vector of `RecordBatch`es into compressed bytes.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization or compression fails.
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>>;
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>>;
 
     /// Decode compressed bytes back into a vector of `RecordBatch`es.
     ///
     /// # Errors
     ///
     /// Returns an error if decompression or deserialization fails.
-    fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>>;
+    async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>>;
 
     /// Returns a reference to self as `Any` for downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
@@ -83,8 +89,9 @@ impl Default for ZstdEncoder {
     }
 }
 
+#[async_trait]
 impl Encoder for ZstdEncoder {
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
         if batches.is_empty() {
             return Ok(Vec::new());
         }
@@ -103,18 +110,27 @@ impl Encoder for ZstdEncoder {
             writer.finish().context(FailedToSerializeSnafu)?;
         }
 
-        // Then compress with zstd
-        zstd::encode_all(ipc_buffer.as_slice(), self.compression_level)
-            .context(FailedToCompressSnafu)
+        let mut encoder =
+            AsyncZstdEncoder::with_quality(ipc_buffer, Level::Precise(self.compression_level));
+        let mut compressed_data = Vec::new();
+        encoder
+            .write_all(&mut compressed_data)
+            .await
+            .context(FailedToCompressSnafu)?;
+        Ok(compressed_data)
     }
 
-    fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
+    async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
 
-        // First, decompress with zstd
-        let decompressed = zstd::decode_all(data).context(FailedToDecompressSnafu)?;
+        let mut decompressed = Vec::new();
+        let mut decoder = ZstdDecoder::new(data);
+        decoder
+            .read_to_end(&mut decompressed)
+            .await
+            .context(FailedToDecompressSnafu)?;
 
         // Then deserialize from Arrow IPC format
         let cursor = Cursor::new(decompressed);
@@ -161,38 +177,43 @@ mod tests {
         .expect("valid record batch")
     }
 
-    #[test]
-    fn test_zstd_encoder_roundtrip() {
+    #[tokio::test]
+    async fn test_zstd_encoder_roundtrip() {
         let encoder = ZstdEncoder::default();
         let original = vec![create_test_batch()];
 
-        let encoded_data = encoder.encode(&original).expect("encode should succeed");
+        let encoded_data = encoder
+            .encode(&original)
+            .await
+            .expect("encode should succeed");
         assert!(!encoded_data.is_empty());
 
         let decoded = encoder
             .decode(&encoded_data)
+            .await
             .expect("decode should succeed");
         assert_eq!(decoded.len(), original.len());
         assert_eq!(decoded[0].num_rows(), original[0].num_rows());
         assert_eq!(decoded[0].num_columns(), original[0].num_columns());
     }
 
-    #[test]
-    fn test_zstd_encoder_empty() {
+    #[tokio::test]
+    async fn test_zstd_encoder_empty() {
         let encoder = ZstdEncoder::default();
         let empty: Vec<RecordBatch> = vec![];
 
-        let encoded_data = encoder.encode(&empty).expect("encode should succeed");
+        let encoded_data = encoder.encode(&empty).await.expect("encode should succeed");
         assert!(encoded_data.is_empty());
 
         let decoded = encoder
             .decode(&encoded_data)
+            .await
             .expect("decode should succeed");
         assert!(decoded.is_empty());
     }
 
-    #[test]
-    fn test_zstd_compression_reduces_size() {
+    #[tokio::test]
+    async fn test_zstd_compression_reduces_size() {
         // Create a batch with repetitive data that should compress well
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -209,6 +230,7 @@ mod tests {
         let uncompressed_size = batch.get_array_memory_size();
         let zstd_size = zstd_encoder
             .encode(std::slice::from_ref(&batch))
+            .await
             .expect("encode should succeed")
             .len();
 

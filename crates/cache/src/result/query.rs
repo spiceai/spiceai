@@ -120,14 +120,7 @@ impl CachedQueryResult {
 
         // Only store encoded data if an encoder is provided
         let data = if let Some(encoder) = encoder.as_ref() {
-            let records_vec = records.to_vec();
-            let encoder_clone = Arc::clone(encoder);
-            let encoded_data =
-                tokio::task::spawn_blocking(move || encoder_clone.encode(&records_vec))
-                    .await
-                    .map_err(|e| crate::encoding::Error::FailedToSerialize {
-                        source: arrow::error::ArrowError::ExternalError(Box::new(e)),
-                    })??;
+            let encoded_data = encoder.encode(records).await?;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
             CachedData::Raw(Arc::new(records.to_vec()))
@@ -147,12 +140,12 @@ impl CachedQueryResult {
     /// # Errors
     ///
     /// Returns an error if decoding fails.
-    pub fn records(&self) -> Result<Vec<RecordBatch>, crate::encoding::Error> {
+    pub async fn records(&self) -> Result<Vec<RecordBatch>, crate::encoding::Error> {
         match &self.data {
             CachedData::Raw(batches) => Ok((**batches).clone()),
             CachedData::Encoded(bytes) => {
                 if let Some(encoder) = &self.encoder {
-                    encoder.decode(bytes)
+                    encoder.decode(bytes).await
                 } else {
                     Err(crate::encoding::Error::NoEncoderSpecified)
                 }

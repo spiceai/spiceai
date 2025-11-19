@@ -337,7 +337,7 @@ impl Query {
                 .results_cache_hit(true)
         });
 
-        let records = match cached_result.records() {
+        let records = match cached_result.records().await {
             Ok(records) => Arc::new(records),
             Err(e) => {
                 tracing::error!("Failed to decode cached query result: {e}");

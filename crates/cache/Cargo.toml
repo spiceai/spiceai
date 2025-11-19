@@ -11,6 +11,11 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+# required until DF update to resolve dependency conflicts. See: https://github.com/apache/datafusion/issues/15342
+async-compression = { version = "=0.4.19", features = [
+    "tokio",
+    "zstd",
+], default-features = false }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
@@ -26,7 +31,6 @@ spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
 twox-hash = { workspace = true, optional = true }
-zstd = "0.13"
 
 [dev-dependencies]
 rstest = "0.25.0"

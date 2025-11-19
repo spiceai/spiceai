@@ -215,8 +215,8 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved = retrieved.expect("Failed to get from cache");
         assert_eq!(
-            retrieved.records().expect("Failed to decode").len(),
-            result.records().expect("Failed to decode").len()
+            retrieved.records().await.expect("Failed to decode").len(),
+            result.records().await.expect("Failed to decode").len()
         );
     }
 
