@@ -133,8 +133,6 @@ async fn execute_query_and_check_cache_status(
 async fn results_cache_stale_while_revalidate_memory_protection_metrics()
 -> Result<(), anyhow::Error> {
     const CACHE_MAX_SIZE_BYTES: u64 = 1024 * 1024; // 1 MiB
-    const CACHE_MAX_SIZE_BYTES_U32: u32 = 1024 * 1024;
-    const CACHE_MAX_SIZE_BYTES_F64: f64 = 1_048_576.0;
     const IN_PROGRESS_METRIC: &str = "results_cache_stale_while_revalidate_in_progress_size_bytes";
     const ABORTED_METRIC: &str = "results_cache_stale_while_revalidate_aborted_requests_total";
 
@@ -178,7 +176,11 @@ async fn results_cache_stale_while_revalidate_memory_protection_metrics()
             rt.init_cache_metrics();
 
             let df = rt.datafusion();
-            let rows_per_batch = (CACHE_MAX_SIZE_BYTES_U32 * 3 / 4) / 8;
+            let cache_limit_u32 =
+                u32::try_from(CACHE_MAX_SIZE_BYTES).expect("cache max size fits u32");
+            let cache_limit_bytes_f64 = f64::from(cache_limit_u32);
+            // Create tables sized at ~75% of cache limit (Int64 = 8 bytes each)
+            let rows_per_batch = (cache_limit_u32 * 3 / 4) / 8;
             let first_table_batch_bytes =
                 register_large_table(&df, "cache_guard_large_a", rows_per_batch)
                     .context("register table A")?;
@@ -226,7 +228,7 @@ async fn results_cache_stale_while_revalidate_memory_protection_metrics()
             .context("expected in-progress metric to report usage")?;
 
             assert!(
-                gauge_value <= CACHE_MAX_SIZE_BYTES_F64,
+                gauge_value <= cache_limit_bytes_f64,
                 "gauge value {gauge_value} exceeded limit {CACHE_MAX_SIZE_BYTES}"
             );
 
@@ -294,13 +296,15 @@ where
     F: Fn(f64) -> bool,
 {
     let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+    let mut now = std::time::Instant::now();
+    while now < deadline {
         if let Some(value) = read_metric_value(registry, metric_name, metric_type)
             && predicate(value)
         {
             return Some(value);
         }
         sleep(Duration::from_millis(20)).await;
+        now = std::time::Instant::now();
     }
     None
 }

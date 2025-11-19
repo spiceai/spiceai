@@ -584,7 +584,8 @@ fn attach_query_tracker_to_stream(
                         captured_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
                     }
 
-                    num_output_bytes += batch.get_array_memory_size() as u64;
+                    num_output_bytes += u64::try_from(batch.get_array_memory_size())
+                        .unwrap_or(u64::MAX);
 
                     num_records += batch.num_rows() as u64;
                     yield batch_result

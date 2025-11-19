@@ -546,7 +546,8 @@ impl Query {
         loop {
             match stream.try_next().await {
                 Ok(Some(batch)) => {
-                    let batch_size = batch.get_array_memory_size() as u64;
+                    let batch_size =
+                        u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
                     if !guard.try_reserve(batch_size) {
                         record_stale_while_revalidate_abort();
                         tracing::debug!(
