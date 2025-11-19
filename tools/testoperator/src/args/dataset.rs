@@ -108,6 +108,7 @@ pub enum QueryOverridesArg {
     #[serde(rename = "spicecloud")]
     Spicecloud,
     #[serde(rename = "dynamodb")]
+    #[value(name = "dynamodb")]
     DynamoDB,
 }
 
