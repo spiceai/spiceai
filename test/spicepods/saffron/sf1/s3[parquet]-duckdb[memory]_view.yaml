@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]_view
+name: s3[parquet]-duckdb[memory]_view
 
 runtime:
   caching:
@@ -30,7 +30,6 @@ datasets:
       refresh_mode: append
       params:
         duckdb_preserve_insertion_order: false
-        duckdb_memory_limit: 2GiB
 
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
@@ -41,7 +40,6 @@ datasets:
       mode: file
       params:
         duckdb_preserve_insertion_order: false
-        duckdb_memory_limit: 2GiB
 
   - from: s3://benchmarks/saffron/sender_info_sf1
     name: sender_info_by_arrival
@@ -52,7 +50,6 @@ datasets:
       mode: file
       params:
         duckdb_preserve_insertion_order: false
-        duckdb_memory_limit: 2GiB
 
 views:
   - name: sender_info
@@ -74,12 +71,10 @@ views:
     acceleration:
       enabled: true
       engine: duckdb
-      mode: file
+      mode: memory
       refresh_on_startup: auto
       params:
-        duckdb_file: sender_info.duckdb
         duckdb_preserve_insertion_order: true
-        duckdb_memory_limit: 4GiB
 
   - name: number_info_with_cap
     sql: |
@@ -107,9 +102,8 @@ views:
     acceleration:
       enabled: true
       engine: duckdb
-      mode: file
+      mode: memory
       refresh_on_startup: auto
       params:
         duckdb_preserve_insertion_order: true
-        duckdb_file: number_info_with_cap.duckdb
-        duckdb_memory_limit: 8GiB
+
