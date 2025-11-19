@@ -1120,6 +1120,32 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
+        // Parse SWR TTL from params if refresh_mode is swr
+        let swr_ttl = if refresh_mode == RefreshMode::Swr {
+            acceleration_settings
+                .params
+                .get("swr_ttl")
+                .and_then(|ttl_str| {
+                    fundu::parse_duration(ttl_str)
+                        .map_err(|e| {
+                            tracing::warn!("Failed to parse swr_ttl param '{}': {}", ttl_str, e);
+                            e
+                        })
+                        .ok()
+                })
+                .or_else(|| {
+                    // Default TTL of 5 minutes if not specified
+                    tracing::debug!(
+                        "SWR mode enabled without swr_ttl param, using default TTL of 5 minutes"
+                    );
+                    Some(std::time::Duration::from_secs(300))
+                })
+        } else {
+            None
+        };
+
+        accelerated_table_builder.swr_ttl(swr_ttl);
+
         if acceleration_settings.snapshots.create_enabled()
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
         {

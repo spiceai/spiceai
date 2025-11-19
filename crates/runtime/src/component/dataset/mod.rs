@@ -105,6 +105,9 @@ pub enum Error {
         "Chunking is not supported for vector engines. Disable chunking for the column '{column}', or disable the vector engine, and try again."
     ))]
     ChunkingNotSupportedForVectorEngine { column: String },
+
+    #[snafu(display("{message}"))]
+    InvalidConfiguration { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

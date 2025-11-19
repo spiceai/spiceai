@@ -417,6 +417,7 @@ pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
+    Swr,
 }
 
 pub struct Refresher {
@@ -620,6 +621,11 @@ impl Refresher {
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
                 return Some(self.start_changes_stream(stream));
+            }
+            (AccelerationRefreshMode::Swr, _) => {
+                // SWR mode doesn't do periodic refreshes, only on-demand
+                self.initial_load_completed.store(true, Ordering::Relaxed);
+                return None;
             }
         };
 
