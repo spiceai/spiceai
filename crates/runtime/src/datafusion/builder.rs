@@ -254,13 +254,12 @@ impl DataFusionBuilder {
 
         #[cfg(feature = "duckdb")]
         {
-            state =
-                state
-                    .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                    .with_physical_optimizer_rule(
-                        DuckDBIntermediateIndexMaterializationOptimizer::new(),
-                    )
-                    .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new());
+            state = state
+                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
+                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
+                .with_physical_optimizer_rule(
+                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
+                );
         }
 
         state = state

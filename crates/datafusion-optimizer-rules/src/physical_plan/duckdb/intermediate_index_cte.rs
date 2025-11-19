@@ -31,7 +31,7 @@ pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
 #[derive(Debug, Clone, PartialEq)]
 struct SelectionWithIdents {
     expr: Expr,
-    references: HashSet<String>,
+    references: HashSet<Expr>,
 }
 
 impl SelectionWithIdents {
@@ -39,8 +39,11 @@ impl SelectionWithIdents {
         let mut references = HashSet::new();
 
         let _ = visit_expressions(expr, |e| {
-            if let Expr::Identifier(id) = e {
-                references.insert(id.value.clone());
+            match e {
+                ident @ Expr::Identifier(_) | ident @ Expr::CompoundIdentifier(_) => {
+                    references.insert(ident.clone());
+                }
+                _ => { /* no-op */ }
             }
 
             ControlFlow::<()>::Continue(())
@@ -50,6 +53,14 @@ impl SelectionWithIdents {
             expr: expr.clone(),
             references,
         }
+    }
+}
+
+fn simple_column_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(idents) => idents.last().map(|i| i.value.clone()),
+        _ => None,
     }
 }
 
@@ -105,9 +116,14 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .flat_map(|swi| swi.references.clone())
             .collect::<HashSet<_>>();
 
+        let simple_filter_idents = all_filter_idents
+            .iter()
+            .filter_map(simple_column_ident)
+            .collect::<HashSet<_>>();
+
         // Find the first index we can bind (we can only bind one)
         let bindable_index = indexes.iter().find_map(|(cr, _)| {
-            if cr.columns.iter().all(|c| all_filter_idents.contains(c)) {
+            if cr.columns.iter().all(|c| simple_filter_idents.contains(c)) {
                 Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
             } else {
                 None
@@ -115,14 +131,19 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         })?;
 
         // This query is already optimal
-        if bindable_index == all_filter_idents {
+        if bindable_index == simple_filter_idents {
             return None;
         }
 
         // Match filters to the index idents. An index may be satisfied by more than one filter.
         let cte_filters = filters
             .into_iter()
-            .filter(|f| f.references.iter().all(|cr| bindable_index.contains(cr)))
+            .filter(|f| {
+                f.references.iter().all(|cr| match simple_column_ident(cr) {
+                    Some(simple_ident) => bindable_index.contains(&simple_ident),
+                    None => false,
+                })
+            })
             .collect::<Vec<_>>();
 
         // It may be possible for an expr to reference many columns, so a binding can be satisfied
@@ -133,8 +154,13 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .cloned()
             .collect::<HashSet<_>>();
 
+        let simple_cte_columns = cte_columns
+            .iter()
+            .filter_map(simple_column_ident)
+            .collect::<HashSet<_>>();
+
         // TODO: it may be possible to rewrite variants where this is true
-        if cte_columns != bindable_index {
+        if simple_cte_columns != bindable_index {
             return None;
         }
 
@@ -168,11 +194,16 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
         if !has_wildcard && !remaining_filter_columns.is_empty() {
             let mut projected_columns = HashSet::new();
+
             for item in &cte_select.projection {
                 let _ = visit_expressions(item, |e| {
-                    if let Expr::Identifier(id) = e {
-                        projected_columns.insert(id.value.clone());
+                    match e {
+                        ident @ Expr::Identifier(_) | ident @ Expr::CompoundIdentifier(_) => {
+                            projected_columns.insert(ident.clone());
+                        }
+                        _ => { /* no-op */ }
                     }
+
                     ControlFlow::<()>::Continue(())
                 });
             }
@@ -184,9 +215,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             missing_columns.sort();
 
             for col in missing_columns {
-                cte_select
-                    .projection
-                    .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(&col))));
+                cte_select.projection.push(SelectItem::UnnamedExpr(col));
             }
         }
 
@@ -326,7 +355,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
         }
 
         // Get its SQL + statement
-        let sql = duck_exec.base_sql().map_err(|e| {
+        let sql = duck_exec.sql().map_err(|e| {
             DataFusionError::Execution(format!("Unable to generate DuckDB SQL: {e}"))
         })?;
 
@@ -491,6 +520,62 @@ mod tests {
                 vec![make_index(&["a", "b"])],
                 Some(
                     "WITH _intermediate_materialize AS MATERIALIZED (SELECT a, b, c FROM foo WHERE a = 1 AND b = 2) SELECT a, b FROM _intermediate_materialize WHERE true AND true AND (c IN (1, 0))",
+                ),
+            ),
+            // function call in projection
+            (
+                "SELECT upper(a), lower(b) FROM foo WHERE a = 1 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT upper(a), lower(b), c FROM foo WHERE a = 1 AND b = 2) SELECT upper(a), lower(b) FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // compound column identifiers in filters
+            (
+                "SELECT * FROM foo WHERE foo.a = 1 AND foo.b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // compound identifiers in projection with indexed filters
+            (
+                "SELECT foo.d FROM foo WHERE a = 1 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, c FROM foo WHERE a = 1 AND b = 2) SELECT foo.d FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // function call in WHERE clause on indexed column
+            (
+                "SELECT * FROM foo WHERE upper(a) = 'X' AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE upper(a) = 'X' AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // mix of compound and simple identifiers in filters
+            (
+                "SELECT * FROM foo WHERE foo.a = 1 AND b = 2 AND foo.c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE foo.a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND foo.c = 3",
+                ),
+            ),
+            // function calls in projection with no matching column in WHERE
+            (
+                "SELECT concat(a, b) AS ab FROM foo WHERE a = 1 AND b = 2 AND c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT concat(a, b) AS ab, c FROM foo WHERE a = 1 AND b = 2) SELECT concat(a, b) AS ab FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // compound identifiers in both projection and filters
+            (
+                "SELECT foo.d, foo.e FROM foo WHERE foo.a = 1 AND foo.b = 2 AND foo.c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, foo.e, foo.c FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT foo.d, foo.e FROM _intermediate_materialize WHERE true AND true AND foo.c = 3",
                 ),
             ),
         ];
