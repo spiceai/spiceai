@@ -20,6 +20,7 @@ use super::{
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
     key::{CacheKey, RawCacheKey},
+    metrics::sql_results,
     result::CacheStatus,
     result::query::CachedStream,
     to_cached_record_batch_stream,
@@ -36,6 +37,7 @@ use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestConte
 use scopeguard;
 use snafu::ResultExt;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
 use tracing::Span;
 
@@ -60,6 +62,62 @@ impl RequestCacheManager {
 
     pub(super) fn should_cache_results(&self) -> bool {
         !matches!(self.cache_status, CacheStatus::CacheDisabled)
+    }
+}
+
+static BACKGROUND_CACHE_MEMORY_USAGE: AtomicU64 = AtomicU64::new(0);
+
+fn record_in_progress_cache_memory(bytes: u64) {
+    sql_results::IN_PROGRESS_SIZE_BYTES.record(bytes, &[]);
+}
+
+struct BackgroundCacheMemoryGuard {
+    limit: u64,
+    reserved: u64,
+}
+
+impl BackgroundCacheMemoryGuard {
+    fn new(limit: u64) -> Self {
+        Self { limit, reserved: 0 }
+    }
+
+    fn try_reserve(&mut self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+
+        let update_result = BACKGROUND_CACHE_MEMORY_USAGE.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|new_total| *new_total <= self.limit)
+            },
+        );
+
+        match update_result {
+            Ok(previous) => {
+                self.reserved = self.reserved.saturating_add(bytes);
+                record_in_progress_cache_memory(previous + bytes);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl Drop for BackgroundCacheMemoryGuard {
+    fn drop(&mut self) {
+        if self.reserved == 0 {
+            return;
+        }
+
+        let previous_total =
+            BACKGROUND_CACHE_MEMORY_USAGE.fetch_sub(self.reserved, Ordering::SeqCst);
+        let new_total = previous_total.saturating_sub(self.reserved);
+        record_in_progress_cache_memory(new_total);
+        self.reserved = 0;
     }
 }
 
@@ -461,46 +519,85 @@ impl Query {
         df: &Arc<DataFusion>,
         cache_key: &RawCacheKey,
         cache_key_u64: u64,
-        batches: Vec<arrow::record_batch::RecordBatch>,
-        _schema: arrow::datatypes::SchemaRef,
+        mut stream: SendableRecordBatchStream,
         input_tables: Arc<HashSet<TableReference>>,
     ) {
-        if let Some(cache_provider) = df.results_cache_provider() {
-            let cached_at = std::time::Instant::now();
-            let encoder = cache_provider.encoder();
+        let Some(cache_provider) = df.results_cache_provider() else {
+            tracing::debug!("Background revalidation completed but cache provider unavailable");
+            return;
+        };
 
-            match cache::result::query::CachedQueryResult::from_batches(
-                &batches,
-                input_tables,
-                cached_at,
-                encoder,
-            )
-            .await
-            {
-                Ok(cached_result) => {
-                    if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
+        let max_cache_size = cache_provider.max_size();
+        if max_cache_size == 0 {
+            tracing::debug!(
+                cache_key = cache_key_u64,
+                "Background revalidation cache max size is zero, skipping cache update"
+            );
+            return;
+        }
+
+        let mut guard = BackgroundCacheMemoryGuard::new(max_cache_size);
+        let mut records: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+
+        loop {
+            match stream.try_next().await {
+                Ok(Some(batch)) => {
+                    let batch_size = batch.get_array_memory_size() as u64;
+                    if !guard.try_reserve(batch_size) {
                         tracing::debug!(
                             cache_key = cache_key_u64,
-                            "Background revalidation failed to cache results: {}",
-                            e
+                            batch_size,
+                            "Background revalidation exceeded in-progress cache memory limit, dropping revalidation"
                         );
-                    } else {
-                        tracing::debug!(
-                            cache_key = cache_key_u64,
-                            "Background revalidation completed successfully and cached"
-                        );
+                        return;
                     }
+
+                    records.push(batch);
                 }
+                Ok(None) => break,
                 Err(e) => {
                     tracing::debug!(
                         cache_key = cache_key_u64,
-                        "Background revalidation failed to encode results: {}",
+                        "Background revalidation failed during collection: {}",
                         e
+                    );
+                    return;
+                }
+            }
+        }
+
+        let cached_at = std::time::Instant::now();
+        let encoder = cache_provider.encoder();
+
+        match cache::result::query::CachedQueryResult::from_batches(
+            &records,
+            input_tables,
+            cached_at,
+            encoder,
+        )
+        .await
+        {
+            Ok(cached_result) => {
+                if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
+                    tracing::debug!(
+                        cache_key = cache_key_u64,
+                        "Background revalidation failed to cache results: {}",
+                        e
+                    );
+                } else {
+                    tracing::debug!(
+                        cache_key = cache_key_u64,
+                        "Background revalidation completed successfully and cached"
                     );
                 }
             }
-        } else {
-            tracing::debug!("Background revalidation completed but cache provider unavailable");
+            Err(e) => {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation failed to encode results: {}",
+                    e
+                );
+            }
         }
     }
 
@@ -562,36 +659,18 @@ impl Query {
 
             match result {
                 Ok(query_result) => {
-                    let schema = query_result.data.schema();
                     tracing::debug!(
                         cache_key = cache_key_u64,
-                        "Background query execution succeeded, collecting batches"
+                        "Background query execution succeeded, streaming batches for caching"
                     );
-                    match query_result.data.try_collect::<Vec<_>>().await {
-                        Ok(batches) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                num_batches = batches.len(),
-                                "Collected batches, now caching"
-                            );
-                            Self::cache_revalidation_result(
-                                &df,
-                                &cache_key,
-                                cache_key_u64,
-                                batches,
-                                schema,
-                                input_tables,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                cache_key = cache_key_u64,
-                                "Background revalidation failed during collection: {}",
-                                e
-                            );
-                        }
-                    }
+                    Self::cache_revalidation_result(
+                        &df,
+                        &cache_key,
+                        cache_key_u64,
+                        query_result.data,
+                        input_tables,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::debug!(

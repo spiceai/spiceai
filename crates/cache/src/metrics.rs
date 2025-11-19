@@ -49,6 +49,16 @@ macro_rules! generate_cache_metrics {
                     .build()
             });
 
+            pub static IN_PROGRESS_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_gauge(concat!($prefix, "_cache_in_progress_size_bytes"))
+                    .with_description(
+                        "Memory currently used by in-progress cache population in bytes.",
+                    )
+                    .with_unit("By")
+                    .build()
+            });
+
             pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
                 METER
                     .u64_counter(concat!($prefix, "_cache_requests"))
