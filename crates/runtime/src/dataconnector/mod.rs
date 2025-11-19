@@ -602,7 +602,7 @@ pub async fn get_data(
 
     if tracing::enabled!(Level::DEBUG)
         && let Ok(explained) = df.clone().explain(false, false)
-        && let Ok(explained) = explained.to_string().await 
+        && let Ok(explained) = explained.to_string().await
     {
         tracing::debug!("Data refresh plan for {}:\n{}", table_name, explained);
     }
