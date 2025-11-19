@@ -205,7 +205,7 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
             return Ok(maybe_marked_agg);
         }
 
-        // Try to push as much of the physical plan under the pushdown marker as possible. We
+        // Try to push as much of the logical plan under the pushdown marker as possible. We
         // do this in two steps since the previous only operates on aggregate nodes (it is not
         // possible to walk up at the point in time of rewriting), and trying to account for all
         // invariants in one steps is difficult to follow
