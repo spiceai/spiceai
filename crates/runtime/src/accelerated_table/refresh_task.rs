@@ -705,16 +705,25 @@ impl RefreshTask {
             .await
             .map_err(RetryError::permanent)
         {
-            Ok(timestamp) => match self
-                .get_full_or_incremental_append_update(refresh, timestamp)
-                .await
-            {
-                Ok(data) => match self.except_existing_records_from(refresh, data).await {
-                    Ok(data) => Ok(data),
+            Ok(timestamp) => {
+                tracing::debug!(
+                    "Found max timestamp for {} {}: {:?}",
+                    self.component_type(),
+                    self.dataset_name,
+                    timestamp
+                );
+
+                match self
+                    .get_full_or_incremental_append_update(refresh, timestamp)
+                    .await
+                {
+                    Ok(data) => match self.except_existing_records_from(refresh, data).await {
+                        Ok(data) => Ok(data),
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            },
+                }
+            }
             Err(e) => {
                 if !self.runtime_status.is_shutdown() {
                     tracing::error!("No latest timestamp is found: {e}");
