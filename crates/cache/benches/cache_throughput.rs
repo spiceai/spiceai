@@ -2,13 +2,15 @@
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::unit_arg)]
 
-use cache::{AsTableRefs, CacheMetrics, CacheProvider, LruCache, SimpleCache, Sizeable, get_hash_builder};
+use cache::{
+    AsTableRefs, CacheMetrics, CacheProvider, LruCache, SimpleCache, Sizeable, get_hash_builder,
+};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
 use rand::distributions::Alphanumeric;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use spicepod::component::caching::{CacheEngine, HashingAlgorithm, Encoding};
+use spicepod::component::caching::{CacheEngine, Encoding, HashingAlgorithm};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,10 +68,7 @@ fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
 
 // Get all encoding variants to benchmark
 fn all_encodings() -> Vec<(&'static str, Encoding)> {
-    vec![
-        ("no_encoding", Encoding::None),
-        ("zstd", Encoding::Zstd),
-    ]
+    vec![("no_encoding", Encoding::None), ("zstd", Encoding::Zstd)]
 }
 
 fn default_hasher() -> impl std::hash::BuildHasher + Clone + Send + Sync + 'static {
@@ -279,20 +278,22 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                         (thread_count * OPERATIONS_PER_THREAD) as u64,
                     ));
 
-                    let bench_name = format!("{backend}_{hash_name}_{encoding_name}_{thread_count}threads");
-                    
+                    let bench_name =
+                        format!("{backend}_{hash_name}_{encoding_name}_{thread_count}threads");
+
                     group.bench_with_input(
                         BenchmarkId::from_parameter(&bench_name),
                         &thread_count,
                         |b, &threads| {
                             b.iter_batched(
                                 || {
-                                    let cache: Arc<LruCache<BenchValue, _>> = Arc::new(LruCache::new(
-                                        CACHE_WEIGHT,
-                                        Duration::from_secs(60),
-                                        hash_builder.clone(),
-                                        engine,
-                                    ));
+                                    let cache: Arc<LruCache<BenchValue, _>> =
+                                        Arc::new(LruCache::new(
+                                            CACHE_WEIGHT,
+                                            Duration::from_secs(60),
+                                            hash_builder.clone(),
+                                            engine,
+                                        ));
                                     let mut rng = StdRng::seed_from_u64(42);
                                     rt.block_on(async {
                                         for i in 0..5000 {
@@ -310,7 +311,8 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                             std::thread::spawn(move || {
                                                 let rt = tokio::runtime::Runtime::new()
                                                     .expect("Failed to create runtime");
-                                                let mut rng = StdRng::seed_from_u64(thread_id as u64);
+                                                let mut rng =
+                                                    StdRng::seed_from_u64(thread_id as u64);
                                                 rt.block_on(async {
                                                     for _ in 0..OPERATIONS_PER_THREAD {
                                                         let key = rng.gen_range(0..KEY_SPACE);
@@ -355,8 +357,9 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                         (thread_count * OPERATIONS_PER_THREAD) as u64,
                     ));
 
-                    let bench_name = format!("{backend}_{hash_name}_{encoding_name}_{thread_count}threads");
-                    
+                    let bench_name =
+                        format!("{backend}_{hash_name}_{encoding_name}_{thread_count}threads");
+
                     group.bench_with_input(
                         BenchmarkId::from_parameter(&bench_name),
                         &thread_count,
@@ -377,12 +380,16 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                                             std::thread::spawn(move || {
                                                 let rt = tokio::runtime::Runtime::new()
                                                     .expect("Failed to create runtime");
-                                                let mut rng = StdRng::seed_from_u64(thread_id as u64);
+                                                let mut rng =
+                                                    StdRng::seed_from_u64(thread_id as u64);
                                                 rt.block_on(async {
                                                     for _ in 0..OPERATIONS_PER_THREAD {
                                                         let key = rng.gen_range(0..KEY_SPACE);
-                                                        let value = BenchValue(random_value(&mut rng));
-                                                        black_box(cache.put_raw_key(&key, value).await);
+                                                        let value =
+                                                            BenchValue(random_value(&mut rng));
+                                                        black_box(
+                                                            cache.put_raw_key(&key, value).await,
+                                                        );
                                                     }
                                                 });
                                             })
@@ -424,20 +431,22 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                         (thread_count * OPERATIONS_PER_THREAD) as u64,
                     ));
 
-                    let bench_name = format!("{backend}_{hash_name}_{encoding_name}_{thread_count}threads");
-                    
+                    let bench_name =
+                        format!("{backend}_{hash_name}_{encoding_name}_{thread_count}threads");
+
                     group.bench_with_input(
                         BenchmarkId::from_parameter(&bench_name),
                         &thread_count,
                         |b, &threads| {
                             b.iter_batched(
                                 || {
-                                    let cache: Arc<LruCache<BenchValue, _>> = Arc::new(LruCache::new(
-                                        CACHE_WEIGHT,
-                                        Duration::from_secs(60),
-                                        hash_builder.clone(),
-                                        engine,
-                                    ));
+                                    let cache: Arc<LruCache<BenchValue, _>> =
+                                        Arc::new(LruCache::new(
+                                            CACHE_WEIGHT,
+                                            Duration::from_secs(60),
+                                            hash_builder.clone(),
+                                            engine,
+                                        ));
                                     let mut rng = StdRng::seed_from_u64(42);
                                     rt.block_on(async {
                                         for i in 0..5000 {
@@ -455,15 +464,23 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                             std::thread::spawn(move || {
                                                 let rt = tokio::runtime::Runtime::new()
                                                     .expect("Failed to create runtime");
-                                                let mut rng = StdRng::seed_from_u64(thread_id as u64);
+                                                let mut rng =
+                                                    StdRng::seed_from_u64(thread_id as u64);
                                                 rt.block_on(async {
                                                     for _ in 0..OPERATIONS_PER_THREAD {
                                                         let key = rng.gen_range(0..KEY_SPACE);
                                                         if rng.gen_bool(0.8) {
-                                                            black_box(cache.get_raw_key(&key).await);
+                                                            black_box(
+                                                                cache.get_raw_key(&key).await,
+                                                            );
                                                         } else {
-                                                            let value = BenchValue(random_value(&mut rng));
-                                                            black_box(cache.put_raw_key(&key, value).await);
+                                                            let value =
+                                                                BenchValue(random_value(&mut rng));
+                                                            black_box(
+                                                                cache
+                                                                    .put_raw_key(&key, value)
+                                                                    .await,
+                                                            );
                                                         }
                                                     }
                                                 });
