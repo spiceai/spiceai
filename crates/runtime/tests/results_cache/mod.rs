@@ -37,7 +37,10 @@ use runtime::{
     datafusion::{DataFusion, query::QueryBuilder},
 };
 use spicepod::{
-    component::{caching::ResultsCache, dataset::Dataset},
+    component::{
+        caching::{ResultsCache, SQLResultsCacheConfig},
+        dataset::Dataset,
+    },
     param::Params,
 };
 
@@ -161,15 +164,16 @@ async fn results_cache_stale_while_revalidate_memory_protection_metrics()
 
             configure_test_datafusion();
 
-            let results_cache = ResultsCache {
+            let mut runtime_config = spicepod::component::runtime::Runtime::default();
+            runtime_config.caching.sql_results = Some(SQLResultsCacheConfig {
+                max_size: Some("1MiB".to_string()),
                 item_ttl: Some("0s".to_string()),
-                max_stale_while_revalidate: Some("5s".to_string()),
-                cache_max_size: Some("1MiB".to_string()),
-                ..Default::default()
-            };
+                stale_while_revalidate_ttl: Some("5s".to_string()),
+                ..SQLResultsCacheConfig::default()
+            });
 
             let app = AppBuilder::new("cache_guard_test")
-                .with_results_cache(results_cache)
+                .with_runtime(runtime_config)
                 .build();
 
             let rt = Runtime::builder().with_app(app).build().await;
@@ -200,6 +204,8 @@ async fn results_cache_stale_while_revalidate_memory_protection_metrics()
             run_query(&rt, "SELECT * FROM cache_guard_large_b")
                 .await
                 .context("warm cache B")?;
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
 
             let rt_for_a = Arc::clone(&rt);
             let rt_for_b = Arc::clone(&rt);
