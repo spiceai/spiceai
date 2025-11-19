@@ -47,11 +47,15 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
-use datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown;
-use datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner;
-use datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter;
+
 #[cfg(feature = "duckdb")]
-use datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer;
+use {
+    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
+    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
+    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
+    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
+};
+
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -250,15 +254,17 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
                 Box::new(track_bytes_processed),
             ))))
-            .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
-            .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         #[cfg(feature = "duckdb")]
         {
-            state = state.with_physical_optimizer_rule(
-                DuckDBIntermediateIndexMaterializationOptimizer::new(),
-            );
+            state =
+                state
+                    .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
+                    .with_physical_optimizer_rule(
+                        DuckDBIntermediateIndexMaterializationOptimizer::new(),
+                    )
+                    .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new());
         }
 
         let mut state = state.build();
