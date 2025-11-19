@@ -354,6 +354,7 @@ mod tests {
         let rewritten = optimizer.rewrite(plan, &ctx.state())?;
         assert!(rewritten.transformed, "This query must be rewritten");
 
+        // Make sure each union has a marker node
         let traversal = rewritten.data.apply(|p| {
             if let LogicalPlan::Union(union) = p {
                 for input in &union.inputs {
@@ -379,8 +380,8 @@ mod tests {
 
         let optimizer = DuckDBAggregateLogicalPushdown::new();
 
-        // This query cannot be rewritten, as the aggregate input is the joined data and joins
-        // do not push down
+        // This query cannot be rewritten: the aggregate node input is against joined data, which
+        // may not all be DuckDB, and we do not currently push down joins
         let plan = ctx
             .state()
             .create_logical_plan(
@@ -394,6 +395,222 @@ mod tests {
 
         let rewritten = optimizer.rewrite(plan, &ctx.state())?;
         assert!(!rewritten.transformed, "This query must NOT be rewritten");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_with_projection_alias() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // Test percolation: the alias should come from the pushed down DDL and not from a DF projection
+        let plan = ctx
+            .state()
+            .create_logical_plan("select group_a, count(*) as cnt from sut group by group_a")
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            rewritten.transformed,
+            "This query must be rewritten with percolation"
+        );
+
+        assert_marker!(&rewritten.data);
+
+        let LogicalPlan::Extension(ext) = rewritten.data else {
+            panic!("Expected extension node");
+        };
+
+        let marker =
+            concrete!(ext.node, DuckDBAggregatePushdownNode).expect("Must be a marker node");
+
+        let LogicalPlan::Projection(proj) = &marker.input_plan else {
+            panic!(
+                "Expected projection inside marker, got: {:?}",
+                marker.input_plan
+            );
+        };
+
+        assert!(
+            proj.schema.field_names().contains(&"cnt".to_string()),
+            "Projection should contain the 'cnt' alias"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_unsupported_aggregate() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // array_agg is not in SUPPORTED_AGG_FUNCTIONS, so this should not be rewritten
+        let plan = ctx
+            .state()
+            .create_logical_plan("select array_agg(id) from sut")
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            !rewritten.transformed,
+            "Query with unsupported aggregate must NOT be rewritten"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_with_where_clause() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // Filters should be pushed below the marker node
+        let plan = ctx
+            .state()
+            .create_logical_plan("select group_a, count(*) from sut where id > 10 group by group_a")
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            rewritten.transformed,
+            "Query with WHERE clause must be rewritten"
+        );
+        assert_marker!(&rewritten.data);
+
+        let LogicalPlan::Extension(ext) = rewritten.data else {
+            panic!("Expected extension node");
+        };
+
+        let marker =
+            concrete!(ext.node, DuckDBAggregatePushdownNode).expect("Must be a marker node");
+
+        let mut found_filter = false;
+        let _ = marker.input_plan.apply(|p| {
+            if matches!(p, LogicalPlan::Filter(_)) {
+                found_filter = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })?;
+
+        assert!(found_filter, "Filter node must be inside the marker");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_multiple_aggregates() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // Query with multiple aggregate functions
+        let plan = ctx
+            .state()
+            .create_logical_plan(
+                "select group_a, count(*), sum(id), avg(id), max(id), min(id) from sut group by group_a",
+            )
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            rewritten.transformed,
+            "Query with multiple aggregates must be rewritten"
+        );
+        assert_marker!(rewritten.data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_mixed_supported_unsupported_aggregates() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // Query mixing supported (count) and unsupported (array_agg) aggregates
+        // Should NOT be rewritten because array_agg is not supported
+        let plan = ctx
+            .state()
+            .create_logical_plan(
+                "select group_a, count(*), array_agg(id) from sut group by group_a",
+            )
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            !rewritten.transformed,
+            "Query with any unsupported aggregate must NOT be rewritten"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_complex_group_by() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // Query with multiple GROUP BY columns
+        let plan = ctx
+            .state()
+            .create_logical_plan(
+                "select group_a, group_b, count(*) from sut group by group_a, group_b",
+            )
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            rewritten.transformed,
+            "Query with complex GROUP BY must be rewritten"
+        );
+        assert_marker!(rewritten.data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_idempotency() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        let plan = ctx
+            .state()
+            .create_logical_plan("select group_a, count(*) from sut group by group_a")
+            .await?;
+
+        let rewritten_once = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            rewritten_once.transformed,
+            "First rewrite must transform the plan"
+        );
+
+        let rewritten_twice = optimizer.rewrite(rewritten_once.data, &ctx.state())?;
+        assert!(
+            !rewritten_twice.transformed,
+            "Second rewrite must not transform (already marked)"
+        );
 
         Ok(())
     }
