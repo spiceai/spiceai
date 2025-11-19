@@ -20,7 +20,7 @@ use super::{
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
     key::{CacheKey, RawCacheKey},
-    metrics::sql_results,
+    metrics::sql_results_stale_while_revalidate,
     result::CacheStatus,
     result::query::CachedStream,
     to_cached_record_batch_stream,
@@ -68,7 +68,11 @@ impl RequestCacheManager {
 static BACKGROUND_CACHE_MEMORY_USAGE: AtomicU64 = AtomicU64::new(0);
 
 fn record_in_progress_cache_memory(bytes: u64) {
-    sql_results::IN_PROGRESS_SIZE_BYTES.record(bytes, &[]);
+    sql_results_stale_while_revalidate::IN_PROGRESS_SIZE_BYTES.record(bytes, &[]);
+}
+
+fn record_stale_while_revalidate_abort() {
+    sql_results_stale_while_revalidate::ABORTED_REQUESTS_TOTAL.add(1, &[]);
 }
 
 struct BackgroundCacheMemoryGuard {
@@ -544,6 +548,7 @@ impl Query {
                 Ok(Some(batch)) => {
                     let batch_size = batch.get_array_memory_size() as u64;
                     if !guard.try_reserve(batch_size) {
+                        record_stale_while_revalidate_abort();
                         tracing::debug!(
                             cache_key = cache_key_u64,
                             batch_size,

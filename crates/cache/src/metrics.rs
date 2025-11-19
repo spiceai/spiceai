@@ -49,16 +49,6 @@ macro_rules! generate_cache_metrics {
                     .build()
             });
 
-            pub static IN_PROGRESS_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-                METER
-                    .u64_gauge(concat!($prefix, "_cache_in_progress_size_bytes"))
-                    .with_description(
-                        "Memory currently used by in-progress cache population in bytes.",
-                    )
-                    .with_unit("By")
-                    .build()
-            });
-
             pub static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
                 METER
                     .u64_counter(concat!($prefix, "_cache_requests"))
@@ -107,6 +97,32 @@ macro_rules! generate_cache_metrics {
 generate_cache_metrics!("results", sql_results); // TODO: update the prefix to `sql_results` in v2.0 - https://github.com/spiceai/spiceai/issues/6128
 generate_cache_metrics!("search_results", search_results);
 generate_cache_metrics!("embeddings", embeddings);
+
+pub mod sql_results_stale_while_revalidate {
+    use super::{Counter, Gauge, LazyLock, Meter, global};
+
+    static METER: LazyLock<Meter> =
+        LazyLock::new(|| global::meter("results_cache_stale_while_revalidate"));
+
+    pub static IN_PROGRESS_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+        METER
+            .u64_gauge("results_cache_stale_while_revalidate_in_progress_size_bytes")
+            .with_description(
+                "Memory currently used by stale-while-revalidate background cache population in bytes.",
+            )
+            .with_unit("By")
+            .build()
+    });
+
+    pub static ABORTED_REQUESTS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        METER
+            .u64_counter("results_cache_stale_while_revalidate_aborted_requests_total")
+            .with_description(
+                "Number of stale-while-revalidate background cache refreshes aborted due to memory limits.",
+            )
+            .build()
+    });
+}
 
 pub trait CacheMetrics: Send + Sync {
     fn init()
