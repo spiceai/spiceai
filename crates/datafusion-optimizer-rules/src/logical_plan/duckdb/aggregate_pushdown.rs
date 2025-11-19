@@ -15,8 +15,8 @@ use std::sync::{Arc, LazyLock};
 
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
-static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> =
-    LazyLock::new(|| HashSet::from([
+static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+    HashSet::from([
         // Basic aggregates
         "avg",
         "count",
@@ -55,13 +55,14 @@ static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> =
         "quantile_cont",
         // Approximate aggregates
         "approx_percentile_cont",
-    ]));
+    ])
+});
 
 /// This looks for opportunities in the expressed logical plan to push down aggregates
 /// directly into the SQL execution for DuckDB accelerated table providers (as indicated by `spice.accelerator`).
 ///
 /// Schema metadata was chosen to "tag" scans in order to avoid a dependency on the runtime crate and
-/// concrete adapter types.
+/// concrete adapter types. This also vastly simplifies testing.
 #[derive(Debug)]
 pub struct DuckDBAggregateLogicalPushdown {}
 
@@ -72,12 +73,9 @@ impl DuckDBAggregateLogicalPushdown {
 
     fn is_duckdb_provider(scan: &TableScan) -> Result<bool> {
         let provider = source_as_provider(&scan.source)?;
-        let Some(fed_adapter) = concrete!(provider, FederatedTableProviderAdaptor) else {
-            return Ok(false);
-        };
 
         Ok(matches!(
-            fed_adapter
+            provider
                 .schema()
                 .metadata
                 .get("spice.accelerator")
@@ -265,5 +263,138 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
         Ok(DuckDBAggregatePushdownNode {
             input_plan: inputs[0].clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::concrete;
+    use crate::logical_plan::duckdb::aggregate_pushdown::{
+        DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode,
+    };
+    use datafusion::catalog::MemTable;
+    use datafusion::common::Result;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::optimizer::OptimizerRule;
+    use datafusion::prelude::SessionContext;
+    use datafusion_expr::{LogicalPlan, col, lit};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    macro_rules! assert_marker {
+        ($node:expr) => {
+            let LogicalPlan::Extension(ext) = $node else {
+                panic!("The marker node must be the child of an extension")
+            };
+
+            assert!(
+                concrete!(ext.node, DuckDBAggregatePushdownNode).is_some(),
+                "Must cast to marker node type"
+            );
+        };
+    }
+
+    async fn make_fake_duck_table() -> Result<MemTable> {
+        let ctx = SessionContext::new();
+        let df = ctx
+            .sql("select unnest(range(50)) as id")
+            .await?
+            .with_column("group_a", col("id") % lit(5))?
+            .with_column("group_b", col("id") % lit(2))?;
+
+        let mut metadata = HashMap::new();
+        metadata.insert("spice.accelerator".to_string(), "duckdb".to_string());
+
+        let schema = df.schema().inner().as_ref().clone().with_metadata(metadata);
+        let batches = df.collect().await?;
+
+        MemTable::try_new(Arc::new(schema), vec![batches])
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_simple() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+        let plan = ctx
+            .state()
+            .create_logical_plan("select group_a, count(*) from sut group by group_a")
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(
+            rewritten.transformed,
+            "This query must be fully pushed down"
+        );
+        assert_marker!(rewritten.data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_union() -> Result<()> {
+        let ctx = SessionContext::new();
+        let fake_duck_table = make_fake_duck_table().await?;
+        ctx.register_table("sut", Arc::new(fake_duck_table))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+        let plan = ctx
+            .state()
+            .create_logical_plan(
+                "
+                select group_a, count(*) from sut group by group_a
+                union
+                select group_b, count(*) from sut group by group_b
+            ",
+            )
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(rewritten.transformed, "This query must be rewritten");
+
+        let traversal = rewritten.data.apply(|p| {
+            if let LogicalPlan::Union(union) = p {
+                for input in &union.inputs {
+                    assert_marker!(input.as_ref());
+                }
+
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })?;
+
+        assert!(matches!(traversal, TreeNodeRecursion::Stop));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mark_pushdown_ineligible_join() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_table("sut_a", Arc::new(make_fake_duck_table().await?))?;
+        ctx.register_table("sut_b", Arc::new(make_fake_duck_table().await?))?;
+
+        let optimizer = DuckDBAggregateLogicalPushdown::new();
+
+        // This query cannot be rewritten, as the aggregate input is the joined data and joins
+        // do not push down
+        let plan = ctx
+            .state()
+            .create_logical_plan(
+                "
+                select sut_b.group_a, count(*) from
+                sut_a join sut_b on sut_a.id = sut_b.id
+                group by sut_b.group_a
+            ",
+            )
+            .await?;
+
+        let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+        assert!(!rewritten.transformed, "This query must NOT be rewritten");
+
+        Ok(())
     }
 }
