@@ -476,6 +476,7 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]
 }
