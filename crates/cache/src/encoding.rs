@@ -60,9 +60,6 @@ pub trait Encoder: Send + Sync {
 
     /// Returns a reference to self as `Any` for downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
-
-    /// Returns true if the encoder uses compression.
-    fn compressed(&self) -> bool;
 }
 
 /// Zstd encoder that compresses `RecordBatch` data.
@@ -130,10 +127,6 @@ impl Encoder for ZstdEncoder {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn compressed(&self) -> bool {
-        true
     }
 }
 
