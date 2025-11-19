@@ -21,17 +21,16 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::array::{ArrayRef, RecordBatch, TimestampSecondArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::{SessionState, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream,
-    stream::RecordBatchStreamAdapter,
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
 };
 use datafusion::prelude::{DataFrame, SessionContext};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -102,9 +101,8 @@ pub fn add_refreshed_at_column(batch: RecordBatch) -> DataFusionResult<RecordBat
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
         .as_secs() as i64;
 
-    let refreshed_at_array: ArrayRef = Arc::new(TimestampSecondArray::from(
-        vec![now; batch.num_rows()],
-    ));
+    let refreshed_at_array: ArrayRef =
+        Arc::new(TimestampSecondArray::from(vec![now; batch.num_rows()]));
 
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(refreshed_at_array);
@@ -112,8 +110,6 @@ pub fn add_refreshed_at_column(batch: RecordBatch) -> DataFusionResult<RecordBat
     let new_schema = add_swr_metadata_column(batch.schema());
     RecordBatch::try_new(new_schema, columns).map_err(Into::into)
 }
-
-
 
 /// Helper functions for SWR refresh operations
 struct SwrRefreshHelper;
@@ -126,15 +122,18 @@ impl SwrRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
-        tracing::debug!("SWR: Fetching from source on cache miss for dataset {}", dataset_name);
-        
+        tracing::debug!(
+            "SWR: Fetching from source on cache miss for dataset {}",
+            dataset_name
+        );
+
         let ctx = SessionContext::new();
         let state = ctx.state();
-        
+
         // Query source with same filters/limit but all columns
         let plan = federated.scan(&state, None, filters, limit).await?;
         let task_ctx = Arc::new(TaskContext::default());
-        
+
         // Execute and collect
         let mut all_batches = Vec::new();
         for partition in 0..plan.output_partitioning().partition_count() {
@@ -148,9 +147,9 @@ impl SwrRefreshHelper {
                 }
             }
         }
-        
+
         // TODO: Store all_batches in accelerator for future queries
-        
+
         Ok(all_batches)
     }
 
@@ -164,11 +163,11 @@ impl SwrRefreshHelper {
         // Create a session to query the source
         let ctx = SessionContext::new();
         let state = ctx.state();
-        
+
         // Run the same filters/limit but fetch all columns (no projection)
         let plan = federated.scan(&state, None, filters, limit).await?;
         let task_ctx = Arc::new(TaskContext::default());
-        
+
         // Execute all partitions and collect data
         let mut all_batches = Vec::new();
         for partition in 0..plan.output_partitioning().partition_count() {
@@ -180,9 +179,12 @@ impl SwrRefreshHelper {
                 }
             }
         }
-        
+
         if all_batches.is_empty() {
-            tracing::debug!("SWR: No data fetched from source for dataset {}", dataset_name);
+            tracing::debug!(
+                "SWR: No data fetched from source for dataset {}",
+                dataset_name
+            );
             return Ok(0);
         }
 
@@ -194,13 +196,17 @@ impl SwrRefreshHelper {
         }
 
         let total_rows: usize = timestamped_batches.iter().map(|b| b.num_rows()).sum();
-        
-        tracing::debug!("SWR: Fetched {} rows from source for dataset {}", total_rows, dataset_name);
-        
+
+        tracing::debug!(
+            "SWR: Fetched {} rows from source for dataset {}",
+            total_rows,
+            dataset_name
+        );
+
         // TODO: Insert/replace the timestamped_batches into the accelerator
         // This requires the accelerator to support write operations
         // For now, we just fetch and add timestamps - the actual storage is deferred
-        
+
         Ok(total_rows)
     }
 }
@@ -261,13 +267,16 @@ impl SwrScanExec {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
-        tracing::debug!("SWR: Fetching fresh data from source for dataset {}", dataset_name);
-        
+        tracing::debug!(
+            "SWR: Fetching fresh data from source for dataset {}",
+            dataset_name
+        );
+
         // Simply run the same query the user requested, but on the source
         let plan = federated.scan(state, projection, filters, limit).await?;
         let ctx = SessionContext::new();
         let task_ctx = Arc::new(TaskContext::default());
-        
+
         // Execute all partitions
         let mut all_batches = Vec::new();
         for partition in 0..plan.output_partitioning().partition_count() {
@@ -276,7 +285,7 @@ impl SwrScanExec {
                 all_batches.push(batch?);
             }
         }
-        
+
         Ok(all_batches)
     }
 }
@@ -339,14 +348,14 @@ impl ExecutionPlan for SwrScanExec {
         // Execute the accelerator scan
         let mut accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
         let schema = accelerator_stream.schema();
-        
+
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
         let ttl = self.ttl;
         let io_runtime = self.io_runtime.clone();
-        
+
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
         let cache_miss_or_stale_stream = futures::stream::once(async move {
             // Check if accelerator has data
@@ -354,16 +363,16 @@ impl ExecutionPlan for SwrScanExec {
                 match first_batch {
                     Ok(batch) => {
                         tracing::trace!("SWR: Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
-                        
+
                         // Check if data is stale and trigger background refresh if needed
                         if let Some(ttl) = ttl {
                             if is_data_stale(&batch, ttl).unwrap_or(false) {
                                 tracing::debug!("SWR: Data is stale for dataset {}, triggering background refresh", dataset_name);
-                                
+
                                 let federated_clone = Arc::clone(&federated);
                                 let dataset_name_clone = dataset_name.clone();
                                 let filters_clone = filters.clone();
-                                
+
                                 io_runtime.spawn(async move {
                                     if let Err(e) = SwrRefreshHelper::refresh_from_source(
                                         federated_clone,
@@ -376,7 +385,7 @@ impl ExecutionPlan for SwrScanExec {
                                 });
                             }
                         }
-                        
+
                         // Return the accelerator data (piece back the stream with first batch)
                         let first_batch_stream = futures::stream::once(async move { Ok(batch) });
                         let adapter = RecordBatchStreamAdapter::new(
@@ -397,15 +406,15 @@ impl ExecutionPlan for SwrScanExec {
             } else {
                 // Cache miss - accelerator returned no data
                 tracing::info!("SWR: Cache miss for dataset {} - fetching from source", dataset_name);
-                
+
                 // Fetch from source synchronously
                 match SwrRefreshHelper::fetch_from_source_on_miss(federated, &dataset_name, &filters, limit).await {
                     Ok(batches) if !batches.is_empty() => {
-                        tracing::info!("SWR: Fetched {} batches ({} total rows) from source for dataset {}", 
+                        tracing::info!("SWR: Fetched {} batches ({} total rows) from source for dataset {}",
                             batches.len(),
                             batches.iter().map(|b| b.num_rows()).sum::<usize>(),
                             dataset_name);
-                        
+
                         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
                         let adapter = RecordBatchStreamAdapter::new(schema, batch_stream);
                         Box::pin(adapter) as SendableRecordBatchStream
@@ -430,9 +439,8 @@ impl ExecutionPlan for SwrScanExec {
                 }
             }
         }).flatten();
-        
+
         let adapter = RecordBatchStreamAdapter::new(schema, cache_miss_or_stale_stream);
         Ok(Box::pin(adapter))
     }
 }
-
