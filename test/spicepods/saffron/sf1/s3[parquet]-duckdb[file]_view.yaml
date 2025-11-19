@@ -30,7 +30,7 @@ datasets:
       refresh_mode: append
       params:
         duckdb_preserve_insertion_order: false
-        duckdb_memory_limit: 4GiB
+        duckdb_memory_limit: 12GiB
 
   - from: s3://benchmarks/saffron/number_caps_sf1
     name: number_caps
@@ -41,7 +41,7 @@ datasets:
       mode: file
       params:
         duckdb_preserve_insertion_order: false
-        duckdb_memory_limit: 4GiB
+        duckdb_memory_limit: 12GiB
 
   - from: s3://benchmarks/saffron/sender_info_sf1
     name: sender_info_by_arrival
@@ -52,7 +52,7 @@ datasets:
       mode: file
       params:
         duckdb_preserve_insertion_order: false
-        duckdb_memory_limit: 4GiB
+        duckdb_memory_limit: 12GiB
 
 views:
   - name: sender_info
