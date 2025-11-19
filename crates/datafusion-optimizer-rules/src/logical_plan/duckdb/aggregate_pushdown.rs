@@ -129,7 +129,7 @@ impl DuckDBAggregateLogicalPushdown {
     /// Try to find a unary path to a marker node from the current node, then swap it
     fn try_percolate_marker_node(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         let with_erased_marker = plan.clone().transform_down(|p| {
-            if p.inputs().len() > 1 {
+            if p.inputs().len() > 1 || matches!(p, LogicalPlan::Analyze(_)) {
                 return Ok(Transformed::new(p, false, TreeNodeRecursion::Stop));
             }
 
