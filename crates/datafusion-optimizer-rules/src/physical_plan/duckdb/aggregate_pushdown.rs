@@ -14,8 +14,8 @@ use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-/// The physical planning counterpart to `DuckDBAggregateLogicalPushdown`, which looks for physical
-/// plan marker nodes to rewrite with a `DuckSqlExec` that satisfies the whole plan subtree
+/// Physical planning counterpart to `DuckDBAggregateLogicalPushdown`.
+/// Looks for physical plan marker nodes and rewrites them with a `DuckSqlExec` that satisfies the whole plan subtree.
 #[derive(Debug)]
 pub struct DuckDBAggregatePushdownMarkerExec {
     logical_plan: LogicalPlan,
