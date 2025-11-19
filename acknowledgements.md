@@ -117,6 +117,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-schema 56.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
+- async-compression 0.4.19, Apache-2.0 OR MIT 
+  <br/>https://github.com/Nullus157/async-compression
+
 - async-graphql 7.0.17, Apache-2.0 OR MIT 
   <br/>https://github.com/async-graphql/async-graphql
 
@@ -705,7 +708,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - spiceai 3.1.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 1.9.0-rc.4, Apache-2.0 
+- spicepod-validator 1.9.0, Apache-2.0 
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
