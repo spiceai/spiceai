@@ -107,10 +107,9 @@ pub enum QueryOverridesArg {
     DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
-    #[serde(rename = "dynamodb-federated")]
-    DynamoDBFederated,
-    #[serde(rename = "dynamodb-accelerated")]
-    DynamoDBAccelerated,
+    #[serde(rename = "dynamodb")]
+    #[value(name = "dynamodb")]
+    DynamoDB,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -175,8 +174,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
-            QueryOverridesArg::DynamoDBFederated => QueryOverrides::DynamoDBFederated,
-            QueryOverridesArg::DynamoDBAccelerated => QueryOverrides::DynamoDBAccelerated,
+            QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
         }
     }
 }
