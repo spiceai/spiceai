@@ -22,7 +22,7 @@ mod http;
 pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
 
 pub mod dispatch;
 use dispatch::DispatchArgs;
@@ -35,37 +35,37 @@ pub use search::SearchTestArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {
-    // Run a test
+    /// Run a test
     #[command(subcommand)]
     Run(TestCommands),
-    // Export the spicepod environment that would run for a test
+    /// Export the spicepod environment that would run for a test
     #[command(subcommand)]
     Export(TestCommands),
-    // Dispatch a number of tests in GitHub Actions
+    /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
 }
 
 #[derive(Subcommand)]
 pub enum TestCommands {
-    // Run a throughput test
+    /// Run a throughput test
     Throughput(DatasetTestArgs),
-    // Run an extended load test
+    /// Run an extended load test
     Load(LoadTestArgs),
-    // Run a single-run benchmark
+    /// Run a single-run benchmark
     Bench(DatasetTestArgs),
-    // Run a data consistency test
+    /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    // Run an HTTP consistency test
+    /// Run an HTTP consistency test
     HttpConsistency(HttpConsistencyTestArgs),
-    // Run an HTTP overhead test
+    /// Run an HTTP overhead test
     HttpOverhead(HttpOverheadTestArgs),
-    // Run a models evaluations test
+    /// Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(DatasetTestArgs),
-    // Run a vector search test
+    /// Run a vector search test
     Search(SearchTestArgs),
-    // Execute benchmark queries against a pre-existing spiced instance
+    /// Execute benchmark queries against a pre-existing spiced instance
     Query(QueryArgs),
 }
 

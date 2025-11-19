@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use super::RowCounts;
-use crate::{args::QueryArgs, health::HealthMonitor};
+use crate::{
+    args::{QueryArgs, QuerySetLoader},
+    health::HealthMonitor,
+};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -56,6 +59,14 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
         .with_http_client(args.http_clients)
         .with_query_set(queries);
+
+    if args.validate {
+        if let Some(validation_data) =
+            query_set.get_validation_data(args.scenario_query_file.as_deref())?
+        {
+            test = test.with_validation_data(validation_data);
+        }
+    }
 
     if let Some(ref_schema) = &args.reference_schema {
         test = test.with_reference_schema(Some(ref_schema.clone()));

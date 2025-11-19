@@ -121,6 +121,7 @@ impl StartRequest {
 }
 
 impl SpicedInstance {
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             child: None,
@@ -199,7 +200,6 @@ impl SpicedInstance {
         version.0.as_str()
     }
 
-    #[must_use]
     pub fn get_tempdir_path(&self) -> Result<PathBuf> {
         Ok(self
             .tempdir
@@ -325,7 +325,6 @@ impl SpicedInstance {
 
     /// Returns an instance of a `Process` for the spiced instance
     /// This allows tracking the spiced process, without owning the spiced instance
-    #[must_use]
     pub fn process(&self) -> Result<Process> {
         Ok(Process::new(Pid::from_u32(
             self.child

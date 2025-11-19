@@ -163,12 +163,14 @@ impl From<QuerySetArg> for QuerySet {
     }
 }
 
-impl DatasetTestArgs {
-    /// Load the query set, handling scenario query sets from files
-    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
-        match self.query_set {
+pub trait QuerySetLoader {
+    fn query_set(&self) -> &QuerySetArg;
+    fn scenario_query_file(&self) -> Option<&PathBuf>;
+
+    fn load_query_set(&self) -> anyhow::Result<QuerySet> {
+        match self.query_set() {
             QuerySetArg::Scenario => {
-                let Some(file_path) = self.scenario_query_file.as_ref() else {
+                let Some(file_path) = self.scenario_query_file() else {
                     anyhow::bail!("scenario_query_file is required when query_set is Scenario");
                 };
 
@@ -181,30 +183,28 @@ impl DatasetTestArgs {
                     scenario_set,
                 })
             }
-            _ => Ok(QuerySet::from(self.query_set.clone())),
+            query_set => Ok(QuerySet::from(query_set.clone())),
         }
     }
 }
 
-impl QueryArgs {
-    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
-        match self.query_set {
-            QuerySetArg::Scenario => {
-                let Some(file_path) = self.scenario_query_file.as_ref() else {
-                    anyhow::bail!("scenario_query_file is required when query_set is Scenario");
-                };
+impl QuerySetLoader for DatasetTestArgs {
+    fn query_set(&self) -> &QuerySetArg {
+        &self.query_set
+    }
 
-                let scenario_set =
-                    test_framework::queries::scenario::ScenarioQuerySet::from_file(file_path)?;
-                let queries = scenario_set.clone().into_queries();
+    fn scenario_query_file(&self) -> Option<&PathBuf> {
+        self.scenario_query_file.as_ref()
+    }
+}
 
-                Ok(QuerySet::Scenario {
-                    queries,
-                    scenario_set,
-                })
-            }
-            _ => Ok(QuerySet::from(self.query_set.clone())),
-        }
+impl QuerySetLoader for QueryArgs {
+    fn query_set(&self) -> &QuerySetArg {
+        &self.query_set
+    }
+
+    fn scenario_query_file(&self) -> Option<&PathBuf> {
+        self.scenario_query_file.as_ref()
     }
 }
 
