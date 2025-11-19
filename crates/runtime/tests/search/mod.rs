@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use spicepod::{
     acceleration::Acceleration,
     component::embeddings::EmbeddingChunkConfig,
-    param::Params,
+    param::{ParamValue, Params},
     semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
     vector::VectorStore,
 };
@@ -219,16 +219,16 @@ impl SearchSpicepodConfiguration {
 
         // Update vector store params with dynamic values as needed.
         match vector_store.engine.as_deref() {
-            "s3_vectors" => {
+            Some("s3_vectors") => {
                 if let Some(params) = vector_store.params.as_mut() {
                     params.data.insert(
                         "s3_vectors_index".to_string(),
-                        format!(
+                        ParamValue::String(format!(
                             "{engine}-{}-{}-{}",
                             table_component.replace("_", "-"),
                             column_configuration.replace("_", "-"),
                             rand::random::<u8>() % 11
-                        ),
+                        )),
                     );
                 }
             }
@@ -243,7 +243,7 @@ impl SearchSpicepodConfiguration {
 
         Ok(SearchSpicepodConfiguration {
             acceleration: Some(acceleration),
-            vector: Some(vector),
+            vector: Some(vector_store),
             table_component: table_component
                 .parse()
                 .map_err(|e: String| anyhow::anyhow!(e))?,

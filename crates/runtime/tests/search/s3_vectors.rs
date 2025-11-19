@@ -16,7 +16,7 @@ limitations under the License.
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
-use s3_vectors::Client;
+use s3_vectors::{Client, DeleteIndexInput, S3Vectors};
 use serde_json::json;
 use snafu::ResultExt;
 use spicepod::{
@@ -919,10 +919,13 @@ async fn delete_index(
 
     let s3_vector_client = Client::new(&config);
     s3_vector_client
-        .delete_index()
-        .set_index_name(Some(index_name.to_string()))
-        .set_vector_bucket_name(Some(bucket_name.to_string()))
-        .send()
+        .delete_index(
+            DeleteIndexInput::builder()
+                .index_name(index_name.to_string())
+                .vector_bucket_name(bucket_name.to_string())
+                .build()
+                .boxed()?,
+        )
         .await
         .boxed()?;
 
