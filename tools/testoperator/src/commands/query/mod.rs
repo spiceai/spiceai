@@ -60,12 +60,11 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .with_http_client(args.http_clients)
         .with_query_set(queries);
 
-    if args.validate {
-        if let Some(validation_data) =
+    if args.validate
+        && let Some(validation_data) =
             query_set.get_validation_data(args.scenario_query_file.as_deref())?
-        {
-            test = test.with_validation_data(validation_data);
-        }
+    {
+        test = test.with_validation_data(validation_data);
     }
 
     if let Some(ref_schema) = &args.reference_schema {
