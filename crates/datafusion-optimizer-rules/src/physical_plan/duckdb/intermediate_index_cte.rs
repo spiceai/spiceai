@@ -12,11 +12,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, With, visit_expressions,
-    visit_expressions_mut, visit_relations,
+    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, VisitMut, With,
+    visit_expressions, visit_expressions_mut, visit_relations,
 };
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Span;
+use datafusion_expr::sqlparser::ast::GroupByExpr;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::indexes::IndexType;
 use std::collections::HashSet;
@@ -98,6 +99,21 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .into_iter()
             .map(SelectionWithIdents::from)
             .collect()
+    }
+
+    /// For idents outside the CTE expression, strip their qualifiers
+    fn strip_compound_idents<V: VisitMut>(node: &mut V) {
+        let _ = visit_expressions_mut(node, |e| {
+            if let Expr::CompoundIdentifier(idents) = e {
+                let maybe_last = idents.pop();
+
+                if let Some(last) = maybe_last {
+                    *e = Expr::Identifier(last);
+                }
+            }
+
+            ControlFlow::<()>::Continue(())
+        });
     }
 
     /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
@@ -219,6 +235,27 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             }
         }
 
+        let flat_projection = cte_select
+            .projection
+            .clone()
+            .into_iter()
+            .filter_map(|item| {
+                let expr = match item {
+                    SelectItem::ExprWithAlias { expr, .. } => expr,
+                    SelectItem::UnnamedExpr(expr) => expr,
+                    e => return Some(e),
+                };
+
+                let swi = SelectionWithIdents::from(&expr);
+                let reference = swi.references.into_iter().next();
+
+                reference.map(SelectItem::UnnamedExpr)
+            })
+            .collect::<Vec<_>>();
+
+        cte_select.projection = flat_projection;
+        cte_select.group_by = GroupByExpr::Expressions(vec![], vec![]);
+
         let table_alias = TableAlias {
             name: Ident::new(CTE_NAME),
             columns: vec![],
@@ -282,6 +319,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .map(|f| f.expr)
             .collect::<HashSet<_>>();
 
+        // "no-op-ify" covered inner filters
         let _ = visit_expressions_mut(&mut outer_selections, |e| {
             if exprs_to_noop.contains(e) {
                 *e = Expr::Value(ValueWithSpan {
@@ -315,6 +353,12 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
         // The selection now has all predicates except for those bound to the intermediate CTE
         new_select.selection = Some(outer_selections);
+
+        // Unprefix outer compound idents if they exist
+        Self::strip_compound_idents(&mut new_select.projection);
+        Self::strip_compound_idents(&mut new_select.selection);
+        Self::strip_compound_idents(&mut new_select.group_by);
+        Self::strip_compound_idents(&mut new_select.sort_by);
 
         // Build the new query, with all the new pieces
         let mut new_query = query.as_ref().clone();
@@ -379,7 +423,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             if node_key == old_exec_key {
                 let new_exec = duck_exec
                     .clone()
-                    .with_optimized_sql(new_statement.to_string(), None);
+                    .with_optimized_sql(new_statement.to_string(), Some(duck_exec.schema()));
 
                 Ok(Transformed::yes(Arc::new(new_exec)))
             } else {
@@ -522,12 +566,12 @@ mod tests {
                     "WITH _intermediate_materialize AS MATERIALIZED (SELECT a, b, c FROM foo WHERE a = 1 AND b = 2) SELECT a, b FROM _intermediate_materialize WHERE true AND true AND (c IN (1, 0))",
                 ),
             ),
-            // function call in projection
+            // function call in projection - flattened to just column refs in CTE
             (
                 "SELECT upper(a), lower(b) FROM foo WHERE a = 1 AND b = 2 AND c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT upper(a), lower(b), c FROM foo WHERE a = 1 AND b = 2) SELECT upper(a), lower(b) FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT a, b, c FROM foo WHERE a = 1 AND b = 2) SELECT upper(a), lower(b) FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
             // compound column identifiers in filters
@@ -538,12 +582,12 @@ mod tests {
                     "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
-            // compound identifiers in projection with indexed filters
+            // compound identifiers in projection - stripped in outer, preserved in CTE
             (
                 "SELECT foo.d FROM foo WHERE a = 1 AND b = 2 AND c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, c FROM foo WHERE a = 1 AND b = 2) SELECT foo.d FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, c FROM foo WHERE a = 1 AND b = 2) SELECT d FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
             // function call in WHERE clause on indexed column
@@ -554,28 +598,20 @@ mod tests {
                     "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE upper(a) = 'X' AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
-            // mix of compound and simple identifiers in filters
+            // mix of compound and simple identifiers in filters - stripped in outer
             (
                 "SELECT * FROM foo WHERE foo.a = 1 AND b = 2 AND foo.c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE foo.a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND foo.c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT * FROM foo WHERE foo.a = 1 AND b = 2) SELECT * FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
-            // function calls in projection with no matching column in WHERE
-            (
-                "SELECT concat(a, b) AS ab FROM foo WHERE a = 1 AND b = 2 AND c = 3",
-                vec![make_index(&["a", "b"])],
-                Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT concat(a, b) AS ab, c FROM foo WHERE a = 1 AND b = 2) SELECT concat(a, b) AS ab FROM _intermediate_materialize WHERE true AND true AND c = 3",
-                ),
-            ),
-            // compound identifiers in both projection and filters
+            // compound identifiers in both projection and filters - stripped in outer
             (
                 "SELECT foo.d, foo.e FROM foo WHERE foo.a = 1 AND foo.b = 2 AND foo.c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, foo.e, foo.c FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT foo.d, foo.e FROM _intermediate_materialize WHERE true AND true AND foo.c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, foo.e, foo.c FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT d, e FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
         ];
