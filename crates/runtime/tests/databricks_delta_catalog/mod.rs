@@ -60,7 +60,7 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
             runtime_ready_check(&rt).await;
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM db_uc.tpch.lineitem LIMIT 10",
+                "SELECT * FROM db_uc.tpch.lineitem ORDER BY l_orderkey, l_linenumber LIMIT 10",
                 "select_tpch",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
