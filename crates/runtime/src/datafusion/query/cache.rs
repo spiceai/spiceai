@@ -67,12 +67,29 @@ impl RequestCacheManager {
 
 static BACKGROUND_CACHE_MEMORY_USAGE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+fn background_memory_usage_for_test() -> u64 {
+    BACKGROUND_CACHE_MEMORY_USAGE.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static STALE_ABORTS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn stale_abort_count_for_test() -> u64 {
+    STALE_ABORTS_FOR_TEST.load(Ordering::SeqCst)
+}
+
 fn record_in_progress_cache_memory(bytes: u64) {
     sql_results_stale_while_revalidate::IN_PROGRESS_SIZE_BYTES.record(bytes, &[]);
 }
 
 fn record_stale_while_revalidate_abort() {
     sql_results_stale_while_revalidate::ABORTED_REQUESTS_TOTAL.add(1, &[]);
+    #[cfg(test)]
+    {
+        STALE_ABORTS_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 struct BackgroundCacheMemoryGuard {
@@ -716,7 +733,9 @@ mod tests {
     use cache::{
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
+    use opentelemetry::global;
     use spicepod::component::caching::SQLResultsCacheConfig;
+    use telemetry::noop::NoopMeterProvider;
     use tokio::runtime::Handle;
 
     use crate::{
@@ -737,6 +756,34 @@ mod tests {
                 .with_client_supplied_cache_key(user_cache_key)
                 .build(),
         )
+    }
+
+    #[test]
+    fn background_guard_updates_usage_metrics() {
+        global::set_meter_provider(NoopMeterProvider::new());
+        BACKGROUND_CACHE_MEMORY_USAGE.store(0, Ordering::SeqCst);
+        let mut guard = BackgroundCacheMemoryGuard::new(10);
+        assert!(guard.try_reserve(4));
+        assert_eq!(background_memory_usage_for_test(), 4);
+        assert!(guard.try_reserve(6));
+        assert_eq!(background_memory_usage_for_test(), 10);
+        drop(guard);
+        assert_eq!(background_memory_usage_for_test(), 0);
+    }
+
+    #[test]
+    fn background_guard_records_abort_when_limit_reached() {
+        global::set_meter_provider(NoopMeterProvider::new());
+        BACKGROUND_CACHE_MEMORY_USAGE.store(0, Ordering::SeqCst);
+        STALE_ABORTS_FOR_TEST.store(0, Ordering::SeqCst);
+        let mut guard = BackgroundCacheMemoryGuard::new(5);
+        assert!(guard.try_reserve(5));
+        assert_eq!(background_memory_usage_for_test(), 5);
+        assert!(!guard.try_reserve(1));
+        record_stale_while_revalidate_abort();
+        assert_eq!(stale_abort_count_for_test(), 1);
+        drop(guard);
+        assert_eq!(background_memory_usage_for_test(), 0);
     }
 
     async fn prepare_runtime(
