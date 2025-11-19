@@ -238,8 +238,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             .into_iter()
             .filter_map(|item| {
                 let expr = match item {
-                    SelectItem::ExprWithAlias { expr, .. } => expr,
-                    SelectItem::UnnamedExpr(expr) => expr,
+                    SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr,
                     e => return Some(e),
                 };
 
@@ -282,6 +281,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         Some((cte, cte_filters))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn rewrite_statement(
         statement: &Statement,
         indexes: &[(ColumnReference, IndexType)],
