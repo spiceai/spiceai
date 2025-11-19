@@ -37,7 +37,6 @@ pub fn to_cached_record_batch_stream(
     input_tables: Arc<HashSet<TableReference>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
-    let schema_copy = Arc::clone(&schema);
 
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
@@ -56,15 +55,24 @@ pub fn to_cached_record_batch_stream(
 
         if records_size < cache_max_size {
             let cached_at = std::time::Instant::now();
-            let cached_result = CachedQueryResult::new(
-                Arc::new(records),
-                schema_copy,
+            let encoder = cache_provider.encoder();
+
+            match CachedQueryResult::from_batches(
+                &records,
                 input_tables,
                 cached_at,
-            );
-
-            if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                tracing::error!("Failed to cache query results: {e}");
+                encoder,
+            )
+            .await
+            {
+                Ok(cached_result) => {
+                    if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                        tracing::error!("Failed to cache query results: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to encode query results for caching: {e}");
+                }
             }
         }
     };

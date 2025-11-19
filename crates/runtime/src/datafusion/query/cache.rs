@@ -337,7 +337,18 @@ impl Query {
                 .results_cache_hit(true)
         });
 
-        let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
+        let records = match cached_result.records().await {
+            Ok(records) => Arc::new(records),
+            Err(e) => {
+                tracing::error!("Failed to decode cached query result: {e}");
+                return Ok(CacheResponse::from(
+                    CacheResult::MissOrSkipped,
+                    cache_status,
+                ));
+            }
+        };
+
+        let record_batch_stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
 
         Ok(CacheResponse::from(
             CacheResult::Hit(QueryResult::new(
@@ -451,29 +462,42 @@ impl Query {
         cache_key: &RawCacheKey,
         cache_key_u64: u64,
         batches: Vec<arrow::record_batch::RecordBatch>,
-        schema: arrow::datatypes::SchemaRef,
+        _schema: arrow::datatypes::SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
     ) {
         if let Some(cache_provider) = df.results_cache_provider() {
             let cached_at = std::time::Instant::now();
-            let cached_result = cache::result::query::CachedQueryResult::new(
-                Arc::new(batches),
-                schema,
+            let encoder = cache_provider.encoder();
+
+            match cache::result::query::CachedQueryResult::from_batches(
+                &batches,
                 input_tables,
                 cached_at,
-            );
-
-            if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Background revalidation failed to cache results: {}",
-                    e
-                );
-            } else {
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Background revalidation completed successfully and cached"
-                );
+                encoder,
+            )
+            .await
+            {
+                Ok(cached_result) => {
+                    if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background revalidation failed to cache results: {}",
+                            e
+                        );
+                    } else {
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background revalidation completed successfully and cached"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        cache_key = cache_key_u64,
+                        "Background revalidation failed to encode results: {}",
+                        e
+                    );
+                }
             }
         } else {
             tracing::debug!("Background revalidation completed but cache provider unavailable");

@@ -381,6 +381,11 @@ impl DataFusion {
     }
 
     #[must_use]
+    pub fn caching(&self) -> Arc<Caching> {
+        Arc::clone(&self.caching)
+    }
+
+    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);

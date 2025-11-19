@@ -48,6 +48,8 @@ pub struct LruCache<
     metrics_last_reported_time: AtomicU64,
     ttl: Duration,
     initial_instant: Instant,
+    hits: AtomicU64,
+    total_requests: AtomicU64,
 }
 
 impl<
@@ -138,6 +140,11 @@ impl<
             .max_capacity(cache_max_size)
             .eviction_policy(moka::policy::EvictionPolicy::lru())
             .support_invalidation_closures()
+            .eviction_listener(|_key, _value, cause| {
+                if cause.was_evicted() {
+                    V::record_eviction();
+                }
+            })
             .build_with_hasher(hasher.clone());
 
         LruCache {
@@ -147,6 +154,8 @@ impl<
             metrics_last_reported_time: AtomicU64::new(0),
             ttl,
             initial_instant: Instant::now(),
+            hits: AtomicU64::new(0),
+            total_requests: AtomicU64::new(0),
         }
     }
 
@@ -183,12 +192,15 @@ impl<
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
         V::record_request();
-        match self.cache.get(key).await {
-            Some(v) => {
-                V::record_hit();
-                Some(v)
-            }
-            None => None,
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(v) = self.cache.get(key).await {
+            V::record_hit();
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(v)
+        } else {
+            V::record_miss();
+            None
         }
     }
 
@@ -214,6 +226,10 @@ impl<
             V::record_item_count(self.item_count().await);
             V::record_size(self.size_bytes().await);
             V::record_max_size(self.max_size() as u64);
+
+            let hits = self.hits.load(Ordering::Relaxed);
+            let total = self.total_requests.load(Ordering::Relaxed);
+            V::update_hit_ratio(hits, total);
         }
     }
 
@@ -304,19 +320,23 @@ mod tests {
             .expect("Failed to create record batch")
     }
 
-    fn create_test_cached_result() -> CachedQueryResult {
+    async fn create_test_cached_result() -> CachedQueryResult {
         let record_batch = create_test_record_batch();
         let mut input_tables = HashSet::new();
         input_tables.insert(TableReference::Bare {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult::new(
-            Arc::new(vec![record_batch.clone()]),
-            Arc::new(record_batch.schema().as_ref().to_owned()),
+        let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
+
+        CachedQueryResult::from_batches(
+            &[record_batch],
             Arc::new(input_tables),
             std::time::Instant::now(),
+            encoder,
         )
+        .await
+        .expect("Failed to create cached result")
     }
 
     fn create_test_cached_search_result() -> CachedSearchResult {
@@ -356,7 +376,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key.as_u64(), result.clone()).await;
@@ -366,9 +386,10 @@ mod tests {
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         assert!(retrieved.is_some());
+        let retrieved = retrieved.expect("Failed to get from cache");
         assert_eq!(
-            retrieved.expect("Failed to get from cache").records.len(),
-            result.records.len()
+            retrieved.records().await.expect("Failed to decode").len(),
+            result.records().await.expect("Failed to decode").len()
         );
     }
 
@@ -398,7 +419,7 @@ mod tests {
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         let get_key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
@@ -462,7 +483,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;
@@ -492,7 +513,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;

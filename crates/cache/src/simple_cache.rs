@@ -174,19 +174,23 @@ mod tests {
             .expect("Failed to create record batch")
     }
 
-    fn create_test_cached_result() -> CachedQueryResult {
+    async fn create_test_cached_result() -> CachedQueryResult {
         let record_batch = create_test_record_batch();
         let mut input_tables = HashSet::new();
         input_tables.insert(TableReference::Bare {
             table: Arc::from("test_table"),
         });
 
-        CachedQueryResult::new(
-            Arc::new(vec![record_batch.clone()]),
-            Arc::new(record_batch.schema().as_ref().to_owned()),
+        let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
+
+        CachedQueryResult::from_batches(
+            &[record_batch],
             Arc::new(input_tables),
             std::time::Instant::now(),
+            encoder,
         )
+        .await
+        .expect("Failed to create cached result")
     }
 
     #[rstest]
@@ -199,7 +203,7 @@ mod tests {
         let cache: SimpleCache<CachedQueryResult, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key.as_u64(), result.clone()).await;
@@ -209,9 +213,10 @@ mod tests {
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         assert!(retrieved.is_some());
+        let retrieved = retrieved.expect("Failed to get from cache");
         assert_eq!(
-            retrieved.expect("Failed to get from cache").records.len(),
-            result.records.len()
+            retrieved.records().await.expect("Failed to decode").len(),
+            result.records().await.expect("Failed to decode").len()
         );
     }
 
@@ -238,7 +243,7 @@ mod tests {
     ) {
         let cache: SimpleCache<CachedQueryResult, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         let get_key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
@@ -265,7 +270,7 @@ mod tests {
         let cache: SimpleCache<CachedQueryResult, _> =
             SimpleCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;

@@ -297,8 +297,9 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+    if let Some(ref metrics_registry) = prometheus_registry {
+        init_metrics(&rt.datafusion(), metrics_registry.clone())
+            .context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -308,6 +309,10 @@ pub async fn run(args: Args) -> Result<()> {
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let rt = Arc::new(rt);
+
+    if prometheus_registry.is_some() {
+        rt.init_cache_metrics();
+    }
 
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {

@@ -11,10 +11,16 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+# required until DF update to resolve dependency conflicts. See: https://github.com/apache/datafusion/issues/15342
+async-compression = { version = "=0.4.19", features = [
+    "tokio",
+    "zstd",
+], default-features = false }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 byte-unit.workspace = true
+bytes.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true

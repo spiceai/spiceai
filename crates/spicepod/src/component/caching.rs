@@ -33,7 +33,9 @@ pub enum CacheKeyType {
 #[serde(rename_all = "snake_case")]
 pub enum HashingAlgorithm {
     #[default]
+    #[serde(rename = "siphash")]
     Siphash,
+    #[serde(rename = "ahash")]
     Ahash,
     #[serde(rename = "xxh3")]
     XXH3,
@@ -43,6 +45,15 @@ pub enum HashingAlgorithm {
     XXH64,
     #[serde(rename = "xxh128")]
     XXH128,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    #[default]
+    None,
+    Zstd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,6 +125,9 @@ pub struct SQLResultsCacheConfig {
     /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_while_revalidate_ttl: Option<String>,
+    /// Encoding algorithm for compressing cached results.
+    #[serde(default)]
+    pub encoding: Encoding,
 }
 
 // serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
@@ -128,6 +142,7 @@ impl Default for SQLResultsCacheConfig {
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
             stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
         }
     }
 }
@@ -173,6 +188,7 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
             stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
         }
     }
 }
