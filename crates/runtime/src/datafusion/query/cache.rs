@@ -87,8 +87,8 @@ impl BackgroundCacheMemoryGuard {
         }
 
         let update_result = BACKGROUND_CACHE_MEMORY_USAGE.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::AcqRel,
+            Ordering::Acquire,
             |current| {
                 current
                     .checked_add(bytes)
@@ -114,7 +114,7 @@ impl Drop for BackgroundCacheMemoryGuard {
         }
 
         let previous_total =
-            BACKGROUND_CACHE_MEMORY_USAGE.fetch_sub(self.reserved, Ordering::SeqCst);
+            BACKGROUND_CACHE_MEMORY_USAGE.fetch_sub(self.reserved, Ordering::Release);
         let new_total = previous_total.saturating_sub(self.reserved);
         record_in_progress_cache_memory(new_total);
         self.reserved = 0;
