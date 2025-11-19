@@ -641,7 +641,7 @@ mod tests {
 
         // Verify it starts empty
         assert_eq!(
-            cache_provider.item_count(),
+            cache_provider.item_count().await,
             0,
             "Plan cache should be empty initially"
         );

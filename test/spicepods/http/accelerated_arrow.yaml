@@ -1,0 +1,20 @@
+version: v1beta1
+kind: Spicepod
+name: http_accelerated_arrow_test
+
+datasets:
+  - from: https://jsonplaceholder.typicode.com
+    name: create_post
+    params:
+      http_post_content_type: application/json
+      allowed_request_paths: /posts
+      allow_body_filters: true
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: full
+      refresh_sql: |
+        SELECT request_path, request_query, request_body, content
+        FROM create_post
+        WHERE request_path = '/posts'
+          AND request_body = '{"title": "foo", "body": "bar", "userId": 1}'

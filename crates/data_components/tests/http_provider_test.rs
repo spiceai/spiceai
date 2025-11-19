@@ -65,13 +65,29 @@ async fn test_http_provider_with_real_endpoint() {
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
-    // Query with specific path and no query string
-    let df = ctx
-        .sql(
-            "SELECT request_path, request_query, content FROM httpbin WHERE request_path = '/json'",
-        )
+    // Snapshot the explain plan
+    let query =
+        "SELECT request_path, request_query, content FROM httpbin WHERE request_path = '/json'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
         .await
-        .expect("Failed to create dataframe");
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+    insta::with_settings!({
+        description => "HTTP provider - real endpoint with path filter",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("http_provider_with_real_endpoint_explain", explain_plan);
+    });
+
+    // Query with specific path and no query string
+    let df = ctx.sql(query).await.expect("Failed to create dataframe");
 
     let results = df.collect().await.expect("Failed to execute query");
 
@@ -102,13 +118,28 @@ async fn test_http_provider_with_request_query_params() {
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
-    // Query with path and query parameters
-    let df = ctx
-        .sql(
-            "SELECT request_path, request_query, content FROM httpbin WHERE request_path = '/get' AND request_query = 'test=value'",
-        )
+    // Snapshot the explain plan
+    let query = "SELECT request_path, request_query, content FROM httpbin WHERE request_path = '/get' AND request_query = 'test=value'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
         .await
-        .expect("Failed to create dataframe");
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+    insta::with_settings!({
+        description => "HTTP provider - path and query parameter filters",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("http_provider_with_request_query_params_explain", explain_plan);
+    });
+
+    // Query with path and query parameters
+    let df = ctx.sql(query).await.expect("Failed to create dataframe");
 
     let results = df.collect().await.expect("Failed to execute query");
 
@@ -215,11 +246,29 @@ async fn test_tvmaze_single_object() {
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
-    // Query for a specific show (Breaking Bad, ID 169)
-    let df = ctx
-        .sql("SELECT request_path, request_query, content FROM tvmaze WHERE request_path = '/shows/169'")
+    // Snapshot the explain plan
+    let query =
+        "SELECT request_path, request_query, content FROM tvmaze WHERE request_path = '/shows/169'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
         .await
-        .expect("Failed to create dataframe");
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+    insta::with_settings!({
+        description => "HTTP provider - single JSON object",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("tvmaze_single_object_explain", explain_plan);
+    });
+
+    // Query for a specific show (Breaking Bad, ID 169)
+    let df = ctx.sql(query).await.expect("Failed to create dataframe");
 
     let results = df.collect().await.expect("Failed to execute query");
 
@@ -270,13 +319,28 @@ async fn test_tvmaze_multi_object() {
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
-    // Query for people search results
-    let df = ctx
-        .sql(
-            "SELECT request_path, request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=michael'",
-        )
+    // Snapshot the explain plan
+    let query = "SELECT request_path, request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=michael'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
         .await
-        .expect("Failed to create dataframe");
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+    insta::with_settings!({
+        description => "HTTP provider - multiple JSON objects (array)",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("tvmaze_multi_object_explain", explain_plan);
+    });
+
+    // Query for people search results
+    let df = ctx.sql(query).await.expect("Failed to create dataframe");
 
     let results = df.collect().await.expect("Failed to execute query");
 
@@ -352,16 +416,31 @@ async fn test_tvmaze_combined_or_filter() {
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
+    // Snapshot the explain plan
+    let query = "SELECT request_path, request_query, content FROM tvmaze 
+             WHERE request_path = '/shows/169' 
+                OR (request_path = '/search/people' AND request_query = 'q=michael')";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+    insta::with_settings!({
+        description => "HTTP provider - combined OR filter",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("tvmaze_combined_or_filter_explain", explain_plan);
+    });
+
     // Query combining single object and array endpoints
     // Note: We only filter on request_path for the single object, not on request_query
-    let df = ctx
-        .sql(
-            "SELECT request_path, request_query, content FROM tvmaze 
-             WHERE request_path = '/shows/169' 
-                OR (request_path = '/search/people' AND request_query = 'q=michael')",
-        )
-        .await
-        .expect("Failed to create dataframe");
+    let df = ctx.sql(query).await.expect("Failed to create dataframe");
 
     let results = df.collect().await.expect("Failed to execute query");
 
@@ -958,4 +1037,112 @@ async fn test_mixed_format_csv_json_or() {
     let results = df.collect().await.expect("Failed to execute query");
 
     assert!(!results.is_empty(), "Should have results");
+}
+
+/// Test explain plan with glob pattern wildcard
+#[tokio::test]
+async fn test_glob_pattern_wildcard_explain() {
+    let provider = build_provider(
+        "https://api.tvmaze.com",
+        "json",
+        &["/shows/*"],
+        false,
+        false,
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("tvmaze", Arc::new(provider))
+        .expect("Failed to register table");
+
+    let query = "SELECT content FROM tvmaze WHERE request_path = '/shows/169'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+
+    insta::with_settings!({
+        description => "HTTP provider - glob pattern with wildcard",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("http_glob_wildcard_explain", explain_plan);
+    });
+}
+
+/// Test explain plan with glob pattern double wildcard
+#[tokio::test]
+async fn test_glob_pattern_double_wildcard_explain() {
+    let provider = build_provider(
+        "https://api.example.com",
+        "json",
+        &["/api/**"],
+        false,
+        false,
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("api", Arc::new(provider))
+        .expect("Failed to register table");
+
+    let query = "SELECT content FROM api WHERE request_path = '/api/v1/users/123'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+
+    insta::with_settings!({
+        description => "HTTP provider - glob pattern with double wildcard",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("http_glob_double_wildcard_explain", explain_plan);
+    });
+}
+
+/// Test explain plan with glob pattern character class
+#[tokio::test]
+async fn test_glob_pattern_character_class_explain() {
+    let provider = build_provider(
+        "https://api.example.com",
+        "json",
+        &["/api/v[0-9]/*"],
+        false,
+        false,
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("api", Arc::new(provider))
+        .expect("Failed to register table");
+
+    let query = "SELECT content FROM api WHERE request_path = '/api/v1/users'";
+    let explain_df = ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .expect("Failed to create explain plan");
+    let explain_results = explain_df
+        .collect()
+        .await
+        .expect("Failed to execute explain");
+    let explain_plan = arrow::util::pretty::pretty_format_batches(&explain_results)
+        .expect("Failed to format explain plan");
+
+    insta::with_settings!({
+        description => "HTTP provider - glob pattern with character class",
+        omit_expression => true,
+        snapshot_path => "snapshots"
+    }, {
+        insta::assert_snapshot!("http_glob_character_class_explain", explain_plan);
+    });
 }
