@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct DuckDBLogicalExtensionPlanner {}
 
 impl DuckDBLogicalExtensionPlanner {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(DuckDBLogicalExtensionPlanner {})
     }

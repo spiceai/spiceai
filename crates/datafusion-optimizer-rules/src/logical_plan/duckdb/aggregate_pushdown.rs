@@ -2,12 +2,10 @@ use crate::concrete;
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, DataFusionError};
-use datafusion::datasource::{TableProvider, source_as_provider};
+use datafusion::datasource::source_as_provider;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::{Expr, Extension, LogicalPlan, TableScan, UserDefinedLogicalNodeCore};
-use datafusion_federation::FederatedTableProviderAdaptor;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
@@ -59,7 +57,7 @@ static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
 });
 
 /// This looks for opportunities in the expressed logical plan to push down aggregates
-/// directly into the SQL execution for DuckDB accelerated table providers (as indicated by `spice.accelerator`).
+/// directly into the SQL execution for `DuckDB` accelerated table providers (as indicated by `spice.accelerator`).
 ///
 /// Schema metadata was chosen to "tag" scans in order to avoid a dependency on the runtime crate and
 /// concrete adapter types. This also vastly simplifies testing.
@@ -67,6 +65,7 @@ static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
 pub struct DuckDBAggregateLogicalPushdown {}
 
 impl DuckDBAggregateLogicalPushdown {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {})
     }
@@ -79,13 +78,14 @@ impl DuckDBAggregateLogicalPushdown {
                 .schema()
                 .metadata
                 .get("spice.accelerator")
-                .map(|s| s.as_str()),
+                .map(std::string::String::as_str),
             Some("duckdb")
         ))
     }
 
-    /// If this aggregate's root scan is from a DuckDB accelerated source, with supported expressions,
+    /// If this aggregate's root scan is from a `DuckDB` accelerated source, with supported expressions,
     /// wrap it in a marker node for pushdown rewriting during physical planning
+    #[allow(clippy::needless_continue)]
     fn try_mark_pushdown(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         // Find an aggregate node
         let LogicalPlan::Aggregate(agg) = plan else {
@@ -109,7 +109,7 @@ impl DuckDBAggregateLogicalPushdown {
         let mut found = false;
 
         let _ = plan.apply(|p| match p {
-            LogicalPlan::TableScan(table_scan) if Self::is_duckdb_provider(&table_scan)? => {
+            LogicalPlan::TableScan(table_scan) if Self::is_duckdb_provider(table_scan)? => {
                 found = true;
                 Ok(TreeNodeRecursion::Stop)
             }
@@ -163,7 +163,7 @@ impl DuckDBAggregateLogicalPushdown {
 }
 
 impl OptimizerRule for DuckDBAggregateLogicalPushdown {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DuckDBAggregatePushdownOptimizerRule"
     }
 
@@ -187,7 +187,7 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
                     return Ok(Transformed::new(p, false, TreeNodeRecursion::Jump));
                 }
                 _ => { /* no-op */ }
-            };
+            }
 
             if let Some(marked_for_pushdown) = Self::try_mark_pushdown(&p)? {
                 Ok(Transformed::new(
@@ -232,13 +232,14 @@ impl PartialOrd for DuckDBAggregatePushdownNode {
 }
 
 impl DuckDBAggregatePushdownNode {
+    #[must_use]
     pub fn new(input: LogicalPlan) -> Arc<Self> {
         Arc::new(Self { input_plan: input })
     }
 }
 
 impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DuckDBAggregatePushdownNode"
     }
 

@@ -6,12 +6,10 @@ use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DuckDBDialect;
-use datafusion_expr::{Literal, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion_expr::LogicalPlan;
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -34,7 +32,7 @@ impl DuckDBAggregatePushdownMarkerExec {
 }
 
 impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DuckDBAggregatePushdownMarkerExec"
     }
 
@@ -71,7 +69,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
 }
 
 impl DisplayAs for DuckDBAggregatePushdownMarkerExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "DuckDBAggregatePushdownMarkerExec")
     }
 }
@@ -80,6 +78,7 @@ impl DisplayAs for DuckDBAggregatePushdownMarkerExec {
 pub struct DuckDBAggregatePushdownRewriter {}
 
 impl DuckDBAggregatePushdownRewriter {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(DuckDBAggregatePushdownRewriter {})
     }
@@ -125,7 +124,7 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
         maybe_new_plan.map(|t| t.data)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DuckDBAggregatePushdown"
     }
 
