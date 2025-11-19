@@ -14,6 +14,7 @@ datasets:
     acceleration: &acceleration
       enabled: true
       engine: duckdb
+      mode: memory
   - from: s3://benchmarks/tpch_sf100/lineitem.parquet
     name: lineitem
     params: *s3_params
