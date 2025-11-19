@@ -51,6 +51,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
+use tracing::Level;
 
 use std::future::Future;
 
@@ -599,15 +600,13 @@ pub async fn get_data(
         df = df.filter(filter).map_err(find_datafusion_root)?;
     }
 
-    match df.explain(false, false) {
-        Ok(explained) => match explained.to_string().await {
-            Ok(explained) => {
+    if tracing::enabled!(Level::DEBUG) {
+        if let Ok(explained) = df.clone().explain(false, false) {
+            if let Ok(explained) = explained.to_string().await {
                 tracing::debug!("get_data df.explain for {}: \n{}", table_name, explained);
             }
-            _ => {}
-        },
-        _ => {}
-    };
+        }
+    }
 
     let sql = Unparser::default()
         .plan_to_sql(df.logical_plan())
