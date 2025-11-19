@@ -2705,6 +2705,7 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
+ "blake3",
  "byte-unit",
  "bytes",
  "criterion 0.5.1",

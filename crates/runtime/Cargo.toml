@@ -297,7 +297,6 @@ turso = [
     "dep:rusqlite",
 ]
 vortex = ["dep:vortex-datafusion", "dep:vortex"]
-xxhash = ["cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }

@@ -343,7 +343,6 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
-    #[cfg(feature = "xxhash")]
     use spicepod::component::caching::HashingAlgorithm;
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
@@ -535,12 +534,12 @@ mod tests {
         assert!(retrieved.is_none());
     }
 
-    #[cfg(feature = "xxhash")]
     #[rstest]
     #[case::xxh3(HashingAlgorithm::XXH3)]
     #[case::xxh32(HashingAlgorithm::XXH32)]
     #[case::xxh64(HashingAlgorithm::XXH64)]
     #[case::xxh128(HashingAlgorithm::XXH128)]
+    #[case::blake3(HashingAlgorithm::Blake3)]
     #[tokio::test]
     async fn test_cache_ttl_xhash(#[case] hashing_algo: HashingAlgorithm) {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
