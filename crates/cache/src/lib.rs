@@ -482,9 +482,10 @@ impl QueryResultsCacheProvider {
 
     #[must_use]
     pub fn encoding_name(&self) -> &'static str {
+        use spicepod::component::caching::Encoding;
         match self.encoding {
-            spicepod::component::caching::Encoding::None => "none",
-            spicepod::component::caching::Encoding::Zstd => "zstd",
+            Encoding::None => "none",
+            Encoding::Zstd => "zstd",
         }
     }
 

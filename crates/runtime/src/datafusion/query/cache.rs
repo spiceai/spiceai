@@ -474,7 +474,9 @@ impl Query {
                 input_tables,
                 cached_at,
                 encoder,
-            ) {
+            )
+            .await
+            {
                 Ok(cached_result) => {
                     if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
                         tracing::debug!(

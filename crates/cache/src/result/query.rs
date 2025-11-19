@@ -41,7 +41,7 @@ use super::CacheStatus;
 pub enum CachedData {
     /// Raw `RecordBatches` stored directly (encoding: none)
     Raw(Arc<Vec<RecordBatch>>),
-    /// Encoded/compressed bytes (encoding: zstd or IPC)
+    /// IPC-serialized bytes, additionally compressed (e.g., with zstd)
     Encoded(Bytes),
 }
 
@@ -106,7 +106,7 @@ impl CachedQueryResult {
     /// # Errors
     ///
     /// Returns an error if encoding fails.
-    pub fn from_batches(
+    pub async fn from_batches(
         records: &[RecordBatch],
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
@@ -118,9 +118,16 @@ impl CachedQueryResult {
             records[0].schema()
         };
 
-        // only store encoded data if an encoder is provided
+        // Only store encoded data if an encoder is provided
         let data = if let Some(encoder) = encoder.as_ref() {
-            let encoded_data = encoder.encode(records)?;
+            let records_vec = records.to_vec();
+            let encoder_clone = Arc::clone(encoder);
+            let encoded_data =
+                tokio::task::spawn_blocking(move || encoder_clone.encode(&records_vec))
+                    .await
+                    .map_err(|e| crate::encoding::Error::FailedToSerialize {
+                        source: arrow::error::ArrowError::ExternalError(Box::new(e)),
+                    })??;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
             CachedData::Raw(Arc::new(records.to_vec()))
