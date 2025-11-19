@@ -40,6 +40,7 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
+    Swr,
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -48,6 +49,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
             spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
             spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
+            spicepod_acceleration::RefreshMode::Swr => RefreshMode::Swr,
         }
     }
 }
@@ -430,6 +432,37 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
+
+        // Validate SWR-specific params
+        if let Some(params_ref) = &params {
+            if let Some(swr_ttl) = params_ref.get("swr_ttl") {
+                // Validate that swr_ttl is only set when refresh_mode is swr
+                let is_swr_mode = acceleration
+                    .refresh_mode
+                    .as_ref()
+                    .is_some_and(|mode| matches!(mode, spicepod_acceleration::RefreshMode::Swr));
+
+                if !is_swr_mode {
+                    return Err(crate::Error::InvalidSpicepodDataset {
+                        source: super::Error::InvalidConfiguration {
+                            message:
+                                "Parameter 'swr_ttl' can only be set when refresh_mode is 'swr'"
+                                    .to_string(),
+                        },
+                    });
+                }
+
+                // Validate that the TTL can be parsed
+                fundu::parse_duration(swr_ttl).map_err(|e| {
+                    crate::Error::InvalidSpicepodDataset {
+                        source: super::Error::UnableToParseFieldAsDuration {
+                            source: e,
+                            field: "swr_ttl (in params)".into(),
+                        },
+                    }
+                })?;
+            }
+        }
 
         Ok(Acceleration {
             enabled: acceleration.enabled,
