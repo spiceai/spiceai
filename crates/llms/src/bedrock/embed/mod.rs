@@ -123,6 +123,10 @@ pub fn new_text_only_nova_multimodal(
     embedding_purpose: NovaEmbeddingPurpose,
     truncation_mode: NovaTruncationMode,
 ) -> BedrockEmbed<NovaEmbedRequest, NovaEmbedResponse> {
+    tracing::debug!(
+        "Initializing Nova multimodal embedder: dimensions={dimensions}, embedding_purpose={embedding_purpose:?}, truncation_mode={truncation_mode:?}, rate_limit={:?}",
+        client.rate_controller
+    );
     let config = Arc::new(NovaConfig {
         model_name: NOVA_MULTIMODAL_EMBED_V2.to_string(),
         dimensions,
@@ -146,10 +150,11 @@ where
         let mut estimated_tokens: u32 = texts
             .iter()
             .map(|t| u32::try_from(t.len()))
-            .collect::<Result<_, _>>()
-            .map_err(|e| EmbedError::FailedToExtractEmbeddings {
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| EmbedError::FailedToExtractEmbeddings {
                 message: format!("Too many embeddings ({}) in single request", texts.len()),
             })?
+            .into_iter()
             .sum();
         estimated_tokens = estimated_tokens.div_ceil(4); // Rough estimate: 4 characters per token + buffer
         let request_payloads = self.config.to_request_blobs(texts)?;
