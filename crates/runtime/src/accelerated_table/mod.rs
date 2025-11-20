@@ -24,10 +24,10 @@ use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
+use ::cache::Caching;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
@@ -535,9 +535,9 @@ impl Builder {
                     None,
                 )
             }
-            RefreshMode::Cache => {
+            RefreshMode::Caching => {
                 // Cache mode doesn't need initial refresh
-                (refresh::AccelerationRefreshMode::Cache, None)
+                (refresh::AccelerationRefreshMode::Caching, None)
             }
         };
 
@@ -748,7 +748,7 @@ impl TableProvider for AcceleratedTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Check if we're in cache mode
-        let is_cache_mode = self.refresh_params.read().await.mode == RefreshMode::Cache;
+        let is_cache_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
 
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
         if !self.refresher().initial_load_completed() && !is_cache_mode {

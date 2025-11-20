@@ -33,7 +33,7 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
-    Cache,
+    Caching,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

@@ -267,11 +267,12 @@ impl Refresh {
                 last_checkpoint.last_checkpoint_time().await.ok().flatten()
             }
             // Append and Changes modes are always refreshed since they stream changes from the source table.
+            #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
             RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
-            // Cache mode performs periodic refreshes but only refreshes stale data based on TTL
-            RefreshMode::Cache => {
+            // Caching mode performs periodic refreshes but only refreshes stale data based on TTL
+            RefreshMode::Caching => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
@@ -421,7 +422,7 @@ pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
-    Cache,
+    Caching,
 }
 
 pub struct Refresher {
@@ -618,6 +619,7 @@ impl Refresher {
         };
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
+            #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
             (
                 AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver),
@@ -626,7 +628,7 @@ impl Refresher {
             (AccelerationRefreshMode::Changes(stream), _) => {
                 return Ok(Some(self.start_changes_stream(stream)));
             }
-            (AccelerationRefreshMode::Cache, _) => return Ok(None),
+            (AccelerationRefreshMode::Caching, _) => return Ok(None),
         };
 
         let mut refresh_task_runner = RefreshTaskRunner::builder(

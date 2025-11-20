@@ -16,31 +16,31 @@ limitations under the License.
 
 use std::any::Any;
 use std::fmt;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
-use arrow::array::{ArrayRef, RecordBatch, TimestampSecondArray};
+use arrow::array::{Array, ArrayRef, RecordBatch, TimestampSecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
-use datafusion::execution::{SessionState, TaskContext};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
+    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+    stream::RecordBatchStreamAdapter,
 };
-use datafusion::prelude::{DataFrame, SessionContext};
-use futures::{Stream, StreamExt, TryStreamExt};
+use datafusion::prelude::SessionContext;
+use futures::StreamExt;
 use tokio::runtime::Handle;
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "__spice_cache_refreshed_at";
 
 /// Extension to add cache metadata column to schema
+#[must_use]
+#[allow(clippy::needless_pass_by_value)] // SchemaRef is Arc, so cheap to clone
 pub fn add_cache_metadata_column(schema: SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Field> = schema.fields().iter().cloned().collect();
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
     fields.push(Field::new(
         CACHE_REFRESHED_AT_COLUMN,
         DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
@@ -49,8 +49,9 @@ pub fn add_cache_metadata_column(schema: SchemaRef) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// Check if data in the acceleration is stale based on TTL
-pub fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<bool> {
+/// Check if cached data is stale based on TTL
+#[allow(clippy::cast_possible_wrap)] // SystemTime cast to i64 is safe for reasonable timestamps  
+fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<bool> {
     // Find the refreshed_at column
     let schema = batch.schema();
     let refreshed_at_idx = schema
@@ -68,8 +69,7 @@ pub fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<boo
         .downcast_ref::<TimestampSecondArray>()
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Execution(format!(
-                "Expected {} to be TimestampSecondArray",
-                CACHE_REFRESHED_AT_COLUMN
+                "Expected {CACHE_REFRESHED_AT_COLUMN} to be TimestampSecondArray"
             ))
         })?;
 
@@ -94,7 +94,9 @@ pub fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<boo
     Ok(false)
 }
 
-/// Add refreshed_at timestamp to a record batch
+/// Add `refreshed_at` timestamp to a record batch
+#[allow(clippy::needless_pass_by_value)] // RecordBatch is Arc-based, taking ownership is intentional
+#[allow(clippy::cast_possible_wrap)] // SystemTime cast to i64 is safe for reasonable timestamps
 pub fn add_refreshed_at_column(batch: RecordBatch) -> DataFusionResult<RecordBatch> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -136,7 +138,7 @@ impl CacheRefreshHelper {
 
         // Execute and collect
         let mut all_batches = Vec::new();
-        for partition in 0..plan.output_partitioning().partition_count() {
+        for partition in 0..plan.properties().output_partitioning().partition_count() {
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
@@ -170,7 +172,7 @@ impl CacheRefreshHelper {
 
         // Execute all partitions and collect data
         let mut all_batches = Vec::new();
-        for partition in 0..plan.output_partitioning().partition_count() {
+        for partition in 0..plan.properties().output_partitioning().partition_count() {
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
@@ -195,7 +197,10 @@ impl CacheRefreshHelper {
             timestamped_batches.push(timestamped);
         }
 
-        let total_rows: usize = timestamped_batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = timestamped_batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
 
         tracing::debug!(
             "Cache: Fetched {} rows from source for dataset {}",
@@ -205,7 +210,6 @@ impl CacheRefreshHelper {
 
         // TODO: Insert/replace the timestamped_batches into the accelerator
         // This requires the accelerator to support write operations
-        // For now, we just fetch and add timestamps - the actual storage is deferred
 
         Ok(total_rows)
     }
@@ -225,6 +229,7 @@ pub struct CacheAccelerationScanExec {
 }
 
 impl CacheAccelerationScanExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         ttl: Option<Duration>,
@@ -250,6 +255,7 @@ impl CacheAccelerationScanExec {
     }
 
     /// Check if we should trigger a background refresh
+    #[allow(dead_code)]
     fn should_refresh(&self, batch: &RecordBatch) -> bool {
         let Some(ttl) = self.ttl else {
             return false; // No TTL configured, never refresh
@@ -259,6 +265,7 @@ impl CacheAccelerationScanExec {
     }
 
     /// Run the user's query on the source (federated table) to fetch fresh data
+    #[allow(dead_code)]
     async fn fetch_from_source(
         federated: Arc<dyn TableProvider>,
         dataset_name: &str,
@@ -274,12 +281,12 @@ impl CacheAccelerationScanExec {
 
         // Simply run the same query the user requested, but on the source
         let plan = federated.scan(state, projection, filters, limit).await?;
-        let ctx = SessionContext::new();
+        let _ctx = SessionContext::new(); // TODO: Use for execution context when implementing background refresh
         let task_ctx = Arc::new(TaskContext::default());
 
         // Execute all partitions
         let mut all_batches = Vec::new();
-        for partition in 0..plan.output_partitioning().partition_count() {
+        for partition in 0..plan.properties().output_partitioning().partition_count() {
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
             while let Some(batch) = stream.next().await {
                 all_batches.push(batch?);
@@ -303,7 +310,7 @@ impl DisplayAs for CacheAccelerationScanExec {
 }
 
 impl ExecutionPlan for CacheAccelerationScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "CacheAccelerationScanExec"
     }
 
@@ -312,7 +319,7 @@ impl ExecutionPlan for CacheAccelerationScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.user_schema)
+        self.input.schema()
     }
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
@@ -348,6 +355,7 @@ impl ExecutionPlan for CacheAccelerationScanExec {
         // Execute the accelerator scan
         let mut accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
         let schema = accelerator_stream.schema();
+        let schema_clone = Arc::clone(&schema);
 
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
@@ -365,8 +373,8 @@ impl ExecutionPlan for CacheAccelerationScanExec {
                         tracing::trace!("Cache: Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
 
                         // Check if data is stale and trigger background refresh if needed
-                        if let Some(ttl) = ttl {
-                            if is_data_stale(&batch, ttl).unwrap_or(false) {
+                        if let Some(ttl) = ttl
+                            && is_data_stale(&batch, ttl).unwrap_or(false) {
                                 tracing::debug!("Cache: Data is stale for dataset {}, triggering background refresh", dataset_name);
 
                                 let federated_clone = Arc::clone(&federated);
@@ -384,12 +392,11 @@ impl ExecutionPlan for CacheAccelerationScanExec {
                                     }
                                 });
                             }
-                        }
 
                         // Return the accelerator data (piece back the stream with first batch)
                         let first_batch_stream = futures::stream::once(async move { Ok(batch) });
                         let adapter = RecordBatchStreamAdapter::new(
-                            schema,
+                            Arc::clone(&schema_clone),
                             first_batch_stream.chain(accelerator_stream),
                         );
                         Box::pin(adapter) as SendableRecordBatchStream
@@ -397,7 +404,7 @@ impl ExecutionPlan for CacheAccelerationScanExec {
                     Err(e) => {
                         // Error from accelerator - return the error
                         let error_stream = RecordBatchStreamAdapter::new(
-                            schema,
+                            Arc::clone(&schema_clone),
                             futures::stream::once(async move { Err(e) }),
                         );
                         Box::pin(error_stream) as SendableRecordBatchStream
@@ -412,18 +419,18 @@ impl ExecutionPlan for CacheAccelerationScanExec {
                     Ok(batches) if !batches.is_empty() => {
                         tracing::info!("Cache: Fetched {} batches ({} total rows) from source for dataset {}",
                             batches.len(),
-                            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                            batches.iter().map(arrow::array::RecordBatch::num_rows).sum::<usize>(),
                             dataset_name);
 
                         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                        let adapter = RecordBatchStreamAdapter::new(schema, batch_stream);
+                        let adapter = RecordBatchStreamAdapter::new(Arc::clone(&schema_clone), batch_stream);
                         Box::pin(adapter) as SendableRecordBatchStream
                     }
                     Ok(_) => {
                         // Source also returned no data
                         tracing::debug!("Cache: Cache miss - source also has no data for dataset {}", dataset_name);
                         let empty_stream = RecordBatchStreamAdapter::new(
-                            schema,
+                            Arc::clone(&schema_clone),
                             futures::stream::empty(),
                         );
                         Box::pin(empty_stream) as SendableRecordBatchStream
@@ -431,7 +438,7 @@ impl ExecutionPlan for CacheAccelerationScanExec {
                     Err(e) => {
                         tracing::error!("Cache: Cache miss fetch failed for dataset {}: {}", dataset_name, e);
                         let error_stream = RecordBatchStreamAdapter::new(
-                            schema,
+                            Arc::clone(&schema_clone),
                             futures::stream::once(async move { Err(e) }),
                         );
                         Box::pin(error_stream) as SendableRecordBatchStream
