@@ -68,8 +68,12 @@ generate_search_tests!([
 ]);
 "
     );
-    fs::write(&dest_path, generated).unwrap_or_else(|_| panic!("Failed to write search test case file: '{}'",
-            dest_path.display()));
+    fs::write(&dest_path, generated).unwrap_or_else(|_| {
+        panic!(
+            "Failed to write search test case file: '{}'",
+            dest_path.display()
+        )
+    });
 
     // Tell Cargo to rerun if files change
     println!("cargo:rerun-if-changed=tests/search/acceleration.yaml");
