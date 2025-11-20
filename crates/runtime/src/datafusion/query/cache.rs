@@ -524,7 +524,9 @@ impl Query {
         let cache_key_u64 = cache_key.as_u64();
 
         // Create a background request context that will cache results using the same cache key
-        let background_context = Self::create_background_context(request_context, cache_key);
+        // Clone cache_key so we can use it later in the closure
+        let background_context =
+            Self::create_background_context(request_context, cache_key.clone());
 
         // Clone sql and plan for the async block
         let sql_owned = sql.to_string();
@@ -533,12 +535,14 @@ impl Query {
         // Spawn a detached task for background revalidation
         // Use optionally_get_with to ensure only one revalidation per key runs concurrently
         tokio::spawn(async move {
-            cache::metrics::sql_results::STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(1, &[]);
-
             // optionally_get_with provides automatic single-in-flight: if another task
             // is already running for this key, this will return None immediately
             let result = locks
                 .optionally_get_with(cache_key_u64, async move {
+                    // Only count as a background query when this task actually runs the revalidation
+                    cache::metrics::sql_results::STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES
+                        .add(1, &[]);
+
                     tracing::debug!(
                         cache_key = cache_key_u64,
                         "Starting background revalidation task"
