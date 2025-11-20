@@ -1,0 +1,24 @@
+tests:
+  bench:
+    spicepod_path: s3[parquet]-duckdb[memory]_view.yaml
+    query_set: saffron[parameterized]
+    query_overrides: saffron-views
+    ready_wait: 300
+    validate_results: true
+    runner_type: spicehq-dev-runners
+  load:
+    - spicepod_path: s3[parquet]-duckdb[memory]_view.yaml
+      query_set: saffron[parameterized]
+      query_overrides: saffron-views
+      runner_type: spicehq-dev-runners
+      concurrency: 128
+      duration: 900
+      random_param_set_count: 1000
+    - spicepod_path: s3[parquet]-duckdb[memory]_view.yaml
+      query_set: saffron[parameterized]
+      query_overrides: saffron-views
+      runner_type: spicehq-dev-runners
+      concurrency: 128
+      duration: 900
+      random_param_set_count: 1000
+      http_clients: true
