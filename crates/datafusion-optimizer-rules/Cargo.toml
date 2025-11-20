@@ -23,9 +23,11 @@ runtime-datafusion = { path = '../runtime-datafusion', optional = true }
 r2d2 = { optional = true, workspace = true }
 duckdb = { optional = true, workspace = true }
 futures.workspace = true
-cache = { path = "../cache" }
 itertools = { optional = true, workspace = true }
 url = { optional = true, workspace = true }
+snafu.workspace = true
+tracing.workspace = true
+
 
 [features]
 duckdb = [
@@ -34,7 +36,4 @@ duckdb = [
     "dep:r2d2"
 ]
 cluster = ["dep:arrow", "dep:chrono", "dep:itertools", "dep:datafusion-datasource", "dep:object_store", "dep:runtime-datafusion", "dep:url"]
-r2d2 = { optional = true, workspace = true }
-snafu.workspace = true
-tracing.workspace = true
 

@@ -13319,7 +13319,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "datafusion",
  "datafusion-common",
