@@ -584,7 +584,9 @@ mod tests {
         )
         .expect("valid cache provider");
 
-        (!cache_provider.cache_is_enabled_for_plan(&logical_plan)).then_some(()).expect("cache should be disabled for SHOW TABLES");
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for SHOW TABLES");
     }
 
     #[tokio::test]
@@ -596,7 +598,10 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        cache_provider.cache_is_enabled_for_plan(&logical_plan).then_some(()).expect("cache should be enabled for simple SELECT");
+        cache_provider
+            .cache_is_enabled_for_plan(&logical_plan)
+            .then_some(())
+            .expect("cache should be enabled for simple SELECT");
     }
 
     #[tokio::test]
@@ -608,7 +613,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        (!cache_provider.cache_is_enabled_for_plan(&logical_plan)).then_some(()).expect("cache should be disabled for INSERT INTO");
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for INSERT INTO");
     }
 
     #[tokio::test]
@@ -620,7 +627,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        (!cache_provider.cache_is_enabled_for_plan(&logical_plan)).then_some(()).expect("cache should be disabled for UPDATE");
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for UPDATE");
     }
 
     #[tokio::test]
@@ -632,7 +641,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        (!cache_provider.cache_is_enabled_for_plan(&logical_plan)).then_some(()).expect("cache should be disabled for DELETE");
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for DELETE");
     }
 
     #[tokio::test]
@@ -644,7 +655,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        (!cache_provider.cache_is_enabled_for_plan(&logical_plan)).then_some(()).expect("cache should be disabled for CREATE TABLE");
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for CREATE TABLE");
     }
 
     #[test]
@@ -683,6 +696,8 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        (!cache_provider.cache_is_enabled_for_plan(&logical_plan)).then_some(()).expect("cache should be disabled for COPY");
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for COPY");
     }
 }
