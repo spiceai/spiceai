@@ -339,12 +339,11 @@ impl Https {
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
         .with_health_probe(health_probe)
-        .boxed()
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
             message: format!("Invalid health_probe configuration: {e}"),
             connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
+            source: e.into(),
         })?;
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;

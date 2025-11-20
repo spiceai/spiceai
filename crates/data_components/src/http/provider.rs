@@ -471,8 +471,7 @@ impl HttpTableProvider {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Health probe endpoint returned non-success status: {}",
-                                status
+                                "Health probe endpoint returned non-success status: {status}"
                             ),
                         });
                     }
