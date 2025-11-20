@@ -123,11 +123,6 @@ pub fn new_text_only_nova_multimodal(
     embedding_purpose: NovaEmbeddingPurpose,
     truncation_mode: NovaTruncationMode,
 ) -> BedrockEmbed<NovaEmbedRequest, NovaEmbedResponse> {
-    tracing::debug!(
-        "Initializing Nova Multimodal embedder: dimensions={dimensions}, embedding_purpose={embedding_purpose:?}, truncation_mode={truncation_mode:?}, rate_limit={:?}",
-        client.rate_controller
-    );
-
     let config = Arc::new(NovaConfig {
         model_name: NOVA_MULTIMODAL_EMBED_V2.to_string(),
         dimensions,

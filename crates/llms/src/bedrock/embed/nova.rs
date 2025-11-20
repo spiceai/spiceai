@@ -50,7 +50,6 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
     }
 
     fn extract_embeddings(&self, resp: NovaEmbedResponse) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
-        tracing::debug!("Embedding response look like: {resp:?}");
         let embeddings: Vec<Vec<f32>> = resp.embeddings.into_iter().map(|e| e.embedding).collect();
 
         // Nova doesn't return token count, so we estimate it
@@ -279,8 +278,6 @@ pub enum NovaVideoEmbeddingMode {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NovaSourceObject {
-    // This would contain S3 URI or bytes - implementation depends on use case
-    // For now, keeping it simple as a placeholder
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
