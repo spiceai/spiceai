@@ -35,10 +35,9 @@ pub fn scalar_to_attribute_value(
         ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
         ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
         ScalarValue::TimestampMillisecond(Some(timestamp_in_millis), tz_opt) => {
-            let Some(dt_utc) = DateTime::from_timestamp_millis(timestamp_in_millis.clone()) else {
+            let Some(dt_utc) = DateTime::from_timestamp_millis(*timestamp_in_millis) else {
                 return Err(DataFusionError::Internal(format!(
-                    "Failed to convert timestamp in millis to DateTime: {}",
-                    timestamp_in_millis
+                    "Failed to convert timestamp in millis to DateTime: {timestamp_in_millis}"
                 )));
             };
 
@@ -48,7 +47,7 @@ pub fn scalar_to_attribute_value(
                         DataFusionError::Internal(format!(
                             "Failed to parse TimeZone \"{}\": {}",
                             tz_str,
-                            e.to_string()
+                            e
                         ))
                     })?;
                     dt_utc.with_timezone(&tz)
@@ -58,8 +57,7 @@ pub fn scalar_to_attribute_value(
 
             let Some(formatted) = format_datetime(dt, time_format) else {
                 return Err(DataFusionError::Internal(format!(
-                    "Failed to parse timestamp. Verify format is valid: \"{}\"",
-                    time_format
+                    "Failed to parse timestamp. Verify format is valid: \"{time_format}\""
                 )));
             };
 
