@@ -20,6 +20,10 @@ use crate::bedrock::embed::cohere::{
     CohereConfig, CohereEmbedRequest, CohereEmbedResponse, CohereEmbeddingInputType,
     CohereEmbeddingTruncate, CohereEmbeddingType,
 };
+use crate::bedrock::embed::nova::{
+    NOVA_MULTIMODAL_EMBED_V2, NovaConfig, NovaEmbedRequest, NovaEmbedResponse,
+    NovaEmbeddingPurpose, NovaTruncationMode,
+};
 use crate::bedrock::embed::titan::{
     TITAN_TEXT_EMBED_V2, TitanConfig, TitanEmbedRequest, TitanEmbedResponse,
 };
@@ -45,6 +49,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 pub mod cohere;
+pub mod nova;
 pub mod titan;
 
 #[derive(Debug, Clone)]
@@ -111,9 +116,35 @@ pub fn new_cohere(
     }
 }
 
+#[must_use]
+pub fn new_text_only_nova_multimodal(
+    client: BedrockClient,
+    dimensions: u32,
+    embedding_purpose: NovaEmbeddingPurpose,
+    truncation_mode: NovaTruncationMode,
+) -> BedrockEmbed<NovaEmbedRequest, NovaEmbedResponse> {
+    tracing::debug!(
+        "Initializing Nova Multimodal embedder: dimensions={dimensions}, embedding_purpose={embedding_purpose:?}, truncation_mode={truncation_mode:?}, rate_limit={:?}",
+        client.rate_controller
+    );
+
+    let config = Arc::new(NovaConfig {
+        model_name: NOVA_MULTIMODAL_EMBED_V2.to_string(),
+        dimensions,
+        embedding_purpose,
+        truncation_mode,
+    }) as Arc<dyn BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse>>;
+
+    BedrockEmbed::<NovaEmbedRequest, NovaEmbedResponse> {
+        client,
+        config,
+        cache: None,
+    }
+}
+
 impl<Rq, Rsp> BedrockEmbed<Rq, Rsp>
 where
-    Rq: Serialize + Sized,
+    Rq: Serialize + Sized + Debug,
     Rsp: DeserializeOwned,
 {
     async fn embed_texts(&self, texts: Vec<String>) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
@@ -122,6 +153,11 @@ where
         if request_payloads.is_empty() {
             return Ok((Vec::new(), 0));
         }
+
+        tracing::debug!(
+            "Embedding requests look like: {:?}",
+            request_payloads.first()
+        );
 
         // join all requests, as the inner rate limit will manage concurrency
         let results = futures::future::try_join_all(
@@ -213,7 +249,7 @@ where
 /// [`BedrockEmbeddingConfig`] handles the model-specific request and response payloads expected by AWS Bedrock.
 ///
 /// AWS Bedrock does not have a standard API interface for its models. For each model, or model family, a different API is exposed.
-pub trait BedrockEmbeddingConfig<Rq: Serialize + Sized, Rsp: DeserializeOwned>:
+pub trait BedrockEmbeddingConfig<Rq: Serialize + Sized + Debug, Rsp: DeserializeOwned>:
     Debug + Sync + Send
 {
     fn model_id(&self) -> &String;
