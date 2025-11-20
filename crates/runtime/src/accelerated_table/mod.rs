@@ -764,7 +764,7 @@ impl TableProvider for AcceleratedTable {
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
+        let plan: Arc<dyn ExecutionPlan> = match &self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
             ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
