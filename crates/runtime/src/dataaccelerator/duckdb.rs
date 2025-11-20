@@ -68,6 +68,7 @@ use std::{
 pub(crate) mod settings;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
+pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -526,7 +527,10 @@ pub(crate) async fn create_table_provider(
     let cloned_writer = Arc::clone(&duckdb_writer);
 
     let mut schema_metadata = HashMap::new();
-    schema_metadata.insert("spice.accelerator".to_string(), "duckdb".to_string());
+    schema_metadata.insert(
+        SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+        "duckdb".to_string(),
+    );
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         cloned_writer,

@@ -12,7 +12,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Cte, Expr, Ident, ObjectNamePart, Select, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, VisitMut, With,
+    TableAlias, TableFactor, TableWithJoins, Value, ValueWithSpan, Visit, VisitMut, With,
     visit_expressions, visit_expressions_mut, visit_relations,
 };
 use datafusion::sql::sqlparser::parser::Parser;
@@ -30,21 +30,19 @@ const CTE_NAME: &str = "_intermediate_materialize";
 pub struct DuckDBIntermediateIndexMaterializationOptimizer {}
 
 #[derive(Debug, Clone, PartialEq)]
-struct SelectionWithIdents {
-    expr: Expr,
+struct ExprWithIdents<T> {
+    expr: T,
     references: HashSet<Expr>,
 }
 
-impl SelectionWithIdents {
-    pub fn from(expr: &Expr) -> Self {
+impl<T: Visit + Clone> ExprWithIdents<T> {
+    pub fn from(expr: &T) -> Self {
         let mut references = HashSet::new();
 
         let _ = visit_expressions(expr, |e| {
             if let ident @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) = e {
                 references.insert(ident.clone());
-            } else { /* no-op */
             }
-
             ControlFlow::<()>::Continue(())
         });
 
@@ -92,10 +90,10 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
     }
 
     /// Walk the `Expr` collecting all AND bin-ops
-    fn collect_conjunctive_filters(expr: &Expr) -> Vec<SelectionWithIdents> {
+    fn collect_conjunctive_filters(expr: &Expr) -> Vec<ExprWithIdents<Expr>> {
         Self::split_conjunction(expr)
             .into_iter()
-            .map(SelectionWithIdents::from)
+            .map(ExprWithIdents::from)
             .collect()
     }
 
@@ -120,7 +118,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
     fn build_cte(
         select: &Select,
         indexes: &[(ColumnReference, IndexType)],
-    ) -> Option<(Cte, Vec<SelectionWithIdents>)> {
+    ) -> Option<(Cte, Vec<ExprWithIdents<Expr>>)> {
         // There must be a `WHERE` otherwise we cannot apply the optimization
         let selection = select.selection.as_ref()?;
 
@@ -211,14 +209,8 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             let mut projected_columns = HashSet::new();
 
             for item in &cte_select.projection {
-                let _ = visit_expressions(item, |e| {
-                    if let ident @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)) = e {
-                        projected_columns.insert(ident.clone());
-                    } else { /* no-op */
-                    }
-
-                    ControlFlow::<()>::Continue(())
-                });
+                let with_idents = ExprWithIdents::from(item);
+                projected_columns.extend(with_idents.references);
             }
 
             let mut missing_columns: Vec<_> = remaining_filter_columns
@@ -232,22 +224,23 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
             }
         }
 
-        let flat_projection = cte_select
+        let mut flat_projection = cte_select
             .projection
             .clone()
             .into_iter()
-            .filter_map(|item| {
-                let expr = match item {
-                    SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => expr,
-                    e => return Some(e),
-                };
-
-                let swi = SelectionWithIdents::from(&expr);
-                let reference = swi.references.into_iter().next();
-
-                reference.map(SelectItem::UnnamedExpr)
+            .flat_map(|item| match item {
+                SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => {
+                    ExprWithIdents::from(&expr)
+                        .references
+                        .into_iter()
+                        .map(SelectItem::UnnamedExpr)
+                        .collect::<Vec<_>>()
+                }
+                e => vec![e],
             })
             .collect::<Vec<_>>();
+
+        flat_projection.sort();
 
         cte_select.projection = flat_projection;
         cte_select.group_by = GroupByExpr::Expressions(vec![], vec![]);
@@ -465,6 +458,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_lines)]
     fn test_rewrite_statement() {
         let test_cases: Vec<(&str, Vec<(ColumnReference, IndexType)>, Option<&str>)> = vec![
             // core query we want to optimize
@@ -536,7 +530,7 @@ mod tests {
                 "SELECT d FROM foo WHERE a = 1 AND b = 2 AND c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT d, c FROM foo WHERE a = 1 AND b = 2) SELECT d FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT c, d FROM foo WHERE a = 1 AND b = 2) SELECT d FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
             // ensure order by is preserved
@@ -584,7 +578,7 @@ mod tests {
                 "SELECT foo.d FROM foo WHERE a = 1 AND b = 2 AND c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, c FROM foo WHERE a = 1 AND b = 2) SELECT d FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT c, foo.d FROM foo WHERE a = 1 AND b = 2) SELECT d FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
             // function call in WHERE clause on indexed column
@@ -608,7 +602,15 @@ mod tests {
                 "SELECT foo.d, foo.e FROM foo WHERE foo.a = 1 AND foo.b = 2 AND foo.c = 3",
                 vec![make_index(&["a", "b"])],
                 Some(
-                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.d, foo.e, foo.c FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT d, e FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.c, foo.d, foo.e FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT d, e FROM _intermediate_materialize WHERE true AND true AND c = 3",
+                ),
+            ),
+            // multiple refs in a single positional projection push idents into inner statement
+            (
+                "SELECT concat(foo.d, foo.e) FROM foo WHERE foo.a = 1 AND foo.b = 2 AND foo.c = 3",
+                vec![make_index(&["a", "b"])],
+                Some(
+                    "WITH _intermediate_materialize AS MATERIALIZED (SELECT foo.c, foo.d, foo.e FROM foo WHERE foo.a = 1 AND foo.b = 2) SELECT concat(d, e) FROM _intermediate_materialize WHERE true AND true AND c = 3",
                 ),
             ),
         ];

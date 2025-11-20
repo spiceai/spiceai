@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
+pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
 static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
@@ -77,8 +79,8 @@ impl DuckDBAggregateLogicalPushdown {
             provider
                 .schema()
                 .metadata
-                .get("spice.accelerator")
-                .map(std::string::String::as_str),
+                .get(SPICE_ACCELERATOR_METADATA_KEY)
+                .map(String::as_str),
             Some("duckdb")
         ))
     }
@@ -93,15 +95,13 @@ impl DuckDBAggregateLogicalPushdown {
         };
 
         // Validate its agg expressions to make sure they are supported
-        for expr in &agg.aggr_expr {
-            match expr {
-                Expr::AggregateFunction(AggregateFunction { func, .. })
-                    if SUPPORTED_AGG_FUNCTIONS.contains(func.name()) =>
-                {
-                    continue;
-                }
-                _ => return Ok(None),
+        if !agg.aggr_expr.iter().all(|e| match e {
+            Expr::AggregateFunction(AggregateFunction { func, .. }) => {
+                SUPPORTED_AGG_FUNCTIONS.contains(func.name())
             }
+            _ => false,
+        }) {
+            return Ok(None);
         }
 
         // Scan its children to ensure that there is a unary chain to an accelerated
@@ -179,14 +179,10 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
         // Mark all eligible nodes for DuckDB agg pushdown
         let maybe_marked_agg = plan.transform_down(|p| {
-            match &p {
-                // Skip already marked subtrees
-                LogicalPlan::Extension(ext)
-                    if concrete!(ext.node, DuckDBAggregatePushdownNode).is_some() =>
-                {
-                    return Ok(Transformed::new(p, false, TreeNodeRecursion::Jump));
-                }
-                _ => { /* no-op */ }
+            if let LogicalPlan::Extension(ext) = &p
+                && concrete!(ext.node, DuckDBAggregatePushdownNode).is_some()
+            {
+                return Ok(Transformed::new(p, false, TreeNodeRecursion::Jump));
             }
 
             if let Some(marked_for_pushdown) = Self::try_mark_pushdown(&p)? {
@@ -271,7 +267,7 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
 mod tests {
     use crate::concrete;
     use crate::logical_plan::duckdb::aggregate_pushdown::{
-        DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode,
+        DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode, SPICE_ACCELERATOR_METADATA_KEY,
     };
     use datafusion::catalog::MemTable;
     use datafusion::common::Result;
@@ -304,7 +300,10 @@ mod tests {
             .with_column("group_b", col("id") % lit(2))?;
 
         let mut metadata = HashMap::new();
-        metadata.insert("spice.accelerator".to_string(), "duckdb".to_string());
+        metadata.insert(
+            SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+            "duckdb".to_string(),
+        );
 
         let schema = df.schema().inner().as_ref().clone().with_metadata(metadata);
         let batches = df.collect().await?;
