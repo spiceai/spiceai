@@ -431,10 +431,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
 
-        // Future: Add validation for other refresh mode params here
-        if let Some(_params_ref) = &params {
-            // Placeholder for future parameter validation
-        }
+        // TODO: Add validation for other refresh mode params here if needed.
 
         Ok(Acceleration {
             enabled: acceleration.enabled,
