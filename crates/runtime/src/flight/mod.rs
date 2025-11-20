@@ -482,6 +482,20 @@ pub async fn start(
         );
     }
 
+    #[cfg(feature = "cluster")]
+    if app
+        .as_ref()
+        .and_then(|app| app.runtime.auth.as_ref())
+        .and_then(|auth| auth.api_key.as_ref())
+        .map(|auth| !auth.enabled || auth.keys.is_empty())
+        .unwrap_or(true)
+    {
+        panic!(
+            "Refusing to start in clustered mode without configuring API key authentication.\
+             Read the docs to learn how to declare one: https://spiceai.org/docs/api/auth"
+        );
+    }
+
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
