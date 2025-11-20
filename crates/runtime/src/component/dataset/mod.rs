@@ -109,7 +109,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum TimeFormat {
     #[default]
     Timestamp,
@@ -118,6 +118,7 @@ pub enum TimeFormat {
     UnixMillis,
     ISO8601,
     Date,
+    Format(String),
 }
 
 impl From<spicepod_dataset::TimeFormat> for TimeFormat {
@@ -129,6 +130,7 @@ impl From<spicepod_dataset::TimeFormat> for TimeFormat {
             spicepod_dataset::TimeFormat::Timestamp => TimeFormat::Timestamp,
             spicepod_dataset::TimeFormat::Timestamptz => TimeFormat::Timestamptz,
             spicepod_dataset::TimeFormat::Date => TimeFormat::Date,
+            spicepod_dataset::TimeFormat::Format(string) => TimeFormat::Format(string),
         }
     }
 }

@@ -1042,8 +1042,8 @@ impl DataFusion {
         if let Some(sql) = &refresh_sql {
             refresh = refresh.sql(sql.clone());
         }
-        if let Some(format) = dataset.time_format {
-            refresh = refresh.time_format(format);
+        if let Some(format) = &dataset.time_format {
+            refresh = refresh.time_format(format.clone());
         }
         if let Some(time_col) = &dataset.time_column {
             refresh = refresh.time_column(time_col.clone());
@@ -1051,8 +1051,8 @@ impl DataFusion {
         if let Some(time_partition_column) = &dataset.time_partition_column {
             refresh = refresh.time_partition_column(time_partition_column.clone());
         }
-        if let Some(time_partition_format) = dataset.time_partition_format {
-            refresh = refresh.time_partition_format(time_partition_format);
+        if let Some(time_partition_format) = &dataset.time_partition_format {
+            refresh = refresh.time_partition_format(time_partition_format.clone());
         }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
@@ -1101,9 +1101,9 @@ impl DataFusion {
 
         let retention = Retention::builder()
             .time_column(dataset.time_column.clone())
-            .time_format(dataset.time_format)
+            .time_format(dataset.time_format.clone())
             .time_partition_column(dataset.time_partition_column.clone())
-            .time_partition_format(dataset.time_partition_format)
+            .time_partition_format(dataset.time_partition_format.clone())
             .time_period(dataset.retention_period())
             .check_interval(dataset.retention_check_interval())
             .enabled(acceleration_settings.retention_check_enabled)

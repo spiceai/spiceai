@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
@@ -29,7 +29,7 @@ use crate::param::Params;
 use crate::semantic::Column;
 use crate::vector::VectorStore;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TimeFormat {
@@ -41,6 +41,59 @@ pub enum TimeFormat {
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
+    Format(String),
+}
+
+impl<'de> Deserialize<'de> for TimeFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TimeFormatVisitor;
+
+        impl<'de> de::Visitor<'de> for TimeFormatVisitor {
+            type Value = TimeFormat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a time format variant or format(\"...\")")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<TimeFormat, E>
+            where
+                E: de::Error,
+            {
+                // Check if it's the format(...) syntax
+                if value.starts_with("format(") && value.ends_with(")") {
+                    // Extract the format string between format(" and ")
+                    let inner = &value[7..value.len() - 1]; // Skip "format(" and ")"
+
+                    // Handle both format("...") and format('...')
+                    let format_str = if (inner.starts_with('"') && inner.ends_with('"'))
+                        || (inner.starts_with('\'') && inner.ends_with('\''))
+                    {
+                        &inner[1..inner.len() - 1]
+                    } else {
+                        return Err(E::custom("format string must be quoted"));
+                    };
+
+                    return Ok(TimeFormat::Format(format_str.to_string()));
+                }
+
+                // Try matching predefined variants
+                match value {
+                    "timestamp" => Ok(TimeFormat::Timestamp),
+                    "timestamptz" => Ok(TimeFormat::Timestamptz),
+                    "unix_seconds" => Ok(TimeFormat::UnixSeconds),
+                    "unix_millis" => Ok(TimeFormat::UnixMillis),
+                    "ISO8601" => Ok(TimeFormat::ISO8601),
+                    "date" => Ok(TimeFormat::Date),
+                    _ => Err(E::custom(format!("unknown time format: {}", value))),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(TimeFormatVisitor)
+    }
 }
 
 impl std::fmt::Display for TimeFormat {

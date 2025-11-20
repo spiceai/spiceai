@@ -74,9 +74,9 @@ impl super::AcceleratedTable {
                             let Some(converter) = create_timestamp_filter_converter(
                                 &accelerator,
                                 time_column,
-                                *time_format,
+                                time_format.clone(),
                                 time_partition_column.as_ref(),
-                                *time_partition_format,
+                                time_partition_format.clone(),
                             ) else {
                                 tracing::error!(
                                     "[retention] Failed to create timestamp filter converter for retention for dataset {dataset_name}",

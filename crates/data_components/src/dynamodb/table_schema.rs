@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::scalar::ScalarValue;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -96,6 +96,24 @@ impl DynamoDBTableSchema {
 
     fn is_filter_supported(&self, expr: &Expr, is_binary_expr_part: bool) -> bool {
         match expr {
+            Expr::Cast(Cast { expr, data_type }) => {
+                is_binary_expr_part
+                    && data_type == &arrow::datatypes::DataType::Utf8
+                    && match expr.as_ref() {
+                        Expr::Column(col) => {
+                            let field = self.table_schema.field_with_name(&col.name);
+                            field
+                                .and_then(|f| {
+                                    Ok(matches!(
+                                        f.data_type(),
+                                        &arrow::datatypes::DataType::Timestamp(_, _)
+                                    ))
+                                })
+                                .unwrap_or(false)
+                        }
+                        _ => false,
+                    }
+            }
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let op_supported = matches!(
                     op,

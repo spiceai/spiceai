@@ -22,6 +22,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use std::sync::Arc;
+use util::time_format::format_datetime;
 
 #[derive(Debug, Clone)]
 enum ExprTimeFormat {
@@ -30,6 +31,7 @@ enum ExprTimeFormat {
     Timestamp,
     Timestamptz(Option<Arc<str>>),
     Date,
+    Format(Option<Arc<str>>, String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +136,20 @@ fn convert_to_expr(
                 None,
             ),
         ),
+        ExprTimeFormat::Format(tz, format) => {
+            // let dt_utc = chrono::DateTime::from_timestamp_nanos(timestamp_in_nanos as i64);
+            binary_expr(
+                cast(col(time_column), DataType::Utf8),
+                op,
+                // lit(dt_utc.format(format).to_string()))
+                // lit(dt_utc.to_rfc3339()))
+                lit(format_datetime(
+                    timestamp_in_nanos as i64,
+                    format,
+                    tz.as_ref().map(|arc| arc.as_ref()),
+                )),
+            )
+        }
     }
 }
 
@@ -164,7 +180,10 @@ fn data_type_to_time_format(
         DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => {
             Some(ExprTimeFormat::Timestamp)
         }
-        DataType::Timestamp(_, tz) => Some(ExprTimeFormat::Timestamptz(tz.to_owned())),
+        DataType::Timestamp(_, tz) => match time_format {
+            Some(TimeFormat::Format(format)) => Some(ExprTimeFormat::Format(tz.to_owned(), format)),
+            _ => Some(ExprTimeFormat::Timestamptz(tz.to_owned())),
+        },
         DataType::Utf8 | DataType::LargeUtf8 => Some(ExprTimeFormat::ISO8601),
         DataType::Date32 => Some(ExprTimeFormat::Date),
         _ => {

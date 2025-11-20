@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
+use crate::dynamodb::timestamp_utils::{parse_iso8601_timestamp, parse_naive_timestamp};
 use arrow::array::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, ListBuilder,
     NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
@@ -23,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_array::builder::ArrayBuilder;
 use aws_sdk_dynamodb::types::AttributeValue;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -392,7 +393,7 @@ fn append_value_to_builder(
                 })?;
             b.append_null();
         }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+        DataType::Timestamp(TimeUnit::Millisecond, tz_opt) => {
             let b = builder
                 .as_any_mut()
                 .downcast_mut::<TimestampMillisecondBuilder>()
@@ -404,10 +405,16 @@ fn append_value_to_builder(
                 })?;
             match value {
                 Some(AttributeValue::S(s)) => {
-                    // Parse ISO8601 string to timestamp (milliseconds since epoch)
-                    match parse_iso8601_timestamp(s) {
-                        Some(millis) => b.append_value(millis),
-                        None => b.append_null(),
+                    if tz_opt.is_some() {
+                        match parse_iso8601_timestamp(s) {
+                            Some(ts) => b.append_value(ts.timestamp_millis()),
+                            None => b.append_null(),
+                        }
+                    } else {
+                        match parse_naive_timestamp(s) {
+                            Some(millis) => b.append_value(millis),
+                            None => b.append_null(),
+                        }
                     }
                 }
                 _ => b.append_null(),
@@ -441,20 +448,6 @@ fn append_value_to_builder(
         }
     }
     Ok(())
-}
-
-fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
-    // Try parsing as RFC3339 (most common ISO8601 format)
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp_millis());
-    }
-
-    // Try parsing as UTC timestamp without explicit timezone
-    if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-        return Some(dt.timestamp_millis());
-    }
-
-    None
 }
 
 fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
@@ -985,7 +978,7 @@ mod tests {
     fn test_timestamp_millisecond() {
         let schema = create_test_schema(vec![Field::new(
             "created_at",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
             true,
         )]);
 
@@ -1004,7 +997,34 @@ mod tests {
             .downcast_ref::<TimestampMillisecondArray>()
             .expect("array");
         assert!(!ts_array.is_null(0));
-        // Value would depend on parse_iso8601_timestamp implementation
+        assert_eq!(ts_array.value(0), 1_705_314_600_000);
+    }
+
+    #[test]
+    fn test_naive_timestamp() {
+        let schema = create_test_schema(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]);
+
+        let mut item = HashMap::new();
+        item.insert(
+            "created_at".to_string(),
+            AttributeValue::S("2024-01-15T10:30:00".to_string()),
+        );
+
+        let items = vec![item];
+        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+
+        let ts_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("array");
+        assert!(!ts_array.is_null(0));
+        assert_eq!(ts_array.value(0), 1_705_314_600_000);
+
     }
 
     #[test]

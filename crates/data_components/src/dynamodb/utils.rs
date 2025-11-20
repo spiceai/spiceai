@@ -17,7 +17,7 @@ use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::{DataFusionError, ScalarValue};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Operator};
 use std::collections::HashMap;
 
 pub fn scalar_to_attribute_value(
@@ -141,6 +141,29 @@ impl<'n> TreeNodeVisitor<'n> for FilterStringVisitor<'_> {
                 self.result_stack
                     .push(format!("({left_str} {op_str} {right_str})"));
                 Ok(TreeNodeRecursion::Continue)
+            }
+            Expr::Cast(Cast { expr, data_type }) => {
+                // For timestamp to UTF-8 casts, the column value is already on the stack
+                // DynamoDB stores timestamps as ISO strings, so no conversion is needed
+                if data_type == &arrow::datatypes::DataType::Utf8 {
+                    // Verify the cast is from a column (as validated in is_filter_supported)
+                    if matches!(expr.as_ref(), Expr::Column(_)) {
+                        // The column alias is already on the stack from the child visit
+                        // We don't need to modify it - just leave it as-is
+                        Ok(TreeNodeRecursion::Continue)
+                    } else {
+                        self.error = Some(DataFusionError::NotImplemented(
+                            "Cast expression only supported for columns".to_string(),
+                        ));
+                        Ok(TreeNodeRecursion::Stop)
+                    }
+                } else {
+                    self.error = Some(DataFusionError::NotImplemented(format!(
+                        "Cast to {:?} not supported",
+                        data_type
+                    )));
+                    Ok(TreeNodeRecursion::Stop)
+                }
             }
             _ => {
                 self.error = Some(DataFusionError::NotImplemented(

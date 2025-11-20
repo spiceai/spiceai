@@ -226,7 +226,7 @@ impl Refresh {
             });
         };
 
-        let time_format = self.time_format.unwrap_or(TimeFormat::Timestamp);
+        let time_format = self.time_format.clone().unwrap_or(TimeFormat::Timestamp);
         let data_type = field.data_type().clone();
 
         validate_time_partition_format(&data_type, &dataset_name, &time_column, time_format)?;
@@ -239,7 +239,10 @@ impl Refresh {
                 });
             };
 
-            let time_partition_format = self.time_partition_format.unwrap_or(TimeFormat::Timestamp);
+            let time_partition_format = self
+                .time_partition_format
+                .clone()
+                .unwrap_or(TimeFormat::Timestamp);
             let partition_data_type = field.data_type().clone();
             validate_time_partition_format(
                 &partition_data_type,
@@ -342,9 +345,10 @@ fn validate_time_partition_format(
             }
         }
         arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
-            if time_format != TimeFormat::Timestamptz {
-                invalid = true;
-            }
+            invalid = match time_format {
+                TimeFormat::Timestamptz | TimeFormat::Format(_) => false,
+                _ => true,
+            };
         }
         arrow::datatypes::DataType::Date32 => {
             if time_format != TimeFormat::Date {

@@ -140,49 +140,49 @@ fn find_max_timestamp_in_stream_inner(
                         DataType::Timestamp(time_unit, _) => {
                             match time_unit {
                                 TimeUnit::Nanosecond =>
-                                    max_ts = max_ts_macro!(TimestampNanosecondArray, max_ts, array, |arr: &TimestampNanosecondArray, i| ts_to_ms(arr.value(i), time_format, TimeUnit::Nanosecond)),
+                                    max_ts = max_ts_macro!(TimestampNanosecondArray, max_ts, array, |arr: &TimestampNanosecondArray, i| ts_to_ms(arr.value(i), time_format.clone(), TimeUnit::Nanosecond)),
                                 TimeUnit::Microsecond =>
-                                    max_ts = max_ts_macro!(TimestampMicrosecondArray, max_ts, array, |arr: &TimestampMicrosecondArray, i| ts_to_ms(arr.value(i), time_format, TimeUnit::Microsecond)),
+                                    max_ts = max_ts_macro!(TimestampMicrosecondArray, max_ts, array, |arr: &TimestampMicrosecondArray, i| ts_to_ms(arr.value(i), time_format.clone(), TimeUnit::Microsecond)),
                                 TimeUnit::Millisecond =>
-                                    max_ts = max_ts_macro!(TimestampMillisecondArray, max_ts, array, |arr: &TimestampMillisecondArray, i| ts_to_ms(arr.value(i), time_format, TimeUnit::Millisecond)),
+                                    max_ts = max_ts_macro!(TimestampMillisecondArray, max_ts, array, |arr: &TimestampMillisecondArray, i| ts_to_ms(arr.value(i), time_format.clone(), TimeUnit::Millisecond)),
                                 TimeUnit::Second =>
-                                    max_ts = max_ts_macro!(TimestampSecondArray, max_ts, array, |arr: &TimestampSecondArray, i| ts_to_ms(arr.value(i), time_format, TimeUnit::Second)),
+                                    max_ts = max_ts_macro!(TimestampSecondArray, max_ts, array, |arr: &TimestampSecondArray, i| ts_to_ms(arr.value(i), time_format.clone(), TimeUnit::Second)),
                             }
                         }
 
                         // Utf8
                         DataType::Utf8 =>
-                            max_ts = max_ts_macro!(StringArray, max_ts, array, |arr: &StringArray, i| string_to_ms(arr.value(i), time_format)),
+                            max_ts = max_ts_macro!(StringArray, max_ts, array, |arr: &StringArray, i| string_to_ms(arr.value(i), time_format.clone())),
                         DataType::LargeUtf8 =>
-                            max_ts = max_ts_macro!(LargeStringArray, max_ts, array, |arr: &LargeStringArray, i| string_to_ms(arr.value(i), time_format)),
+                            max_ts = max_ts_macro!(LargeStringArray, max_ts, array, |arr: &LargeStringArray, i| string_to_ms(arr.value(i), time_format.clone())),
 
                         // Int
                         DataType::Int8 =>
-                            max_ts = max_ts_macro!(Int8Array, max_ts, array, |arr: &Int8Array, i| int_to_ms(i64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(Int8Array, max_ts, array, |arr: &Int8Array, i| int_to_ms(i64::from(arr.value(i)), time_format.clone())),
                         DataType::Int16 =>
-                            max_ts = max_ts_macro!(Int16Array, max_ts, array, |arr: &Int16Array, i| int_to_ms(i64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(Int16Array, max_ts, array, |arr: &Int16Array, i| int_to_ms(i64::from(arr.value(i)), time_format.clone())),
                         DataType::Int32 =>
-                            max_ts = max_ts_macro!(Int32Array, max_ts, array, |arr: &Int32Array, i| int_to_ms(i64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(Int32Array, max_ts, array, |arr: &Int32Array, i| int_to_ms(i64::from(arr.value(i)), time_format.clone())),
                         DataType::Int64 =>
-                            max_ts = max_ts_macro!(Int64Array, max_ts, array, |arr: &Int64Array, i| int_to_ms(arr.value(i), time_format)),
+                            max_ts = max_ts_macro!(Int64Array, max_ts, array, |arr: &Int64Array, i| int_to_ms(arr.value(i), time_format.clone())),
 
                         // UInt
                         DataType::UInt8 =>
-                            max_ts = max_ts_macro!(UInt8Array, max_ts, array, |arr: &UInt8Array, i| int_to_ms(i64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(UInt8Array, max_ts, array, |arr: &UInt8Array, i| int_to_ms(i64::from(arr.value(i)), time_format.clone())),
                         DataType::UInt16 =>
-                            max_ts = max_ts_macro!(UInt16Array, max_ts, array, |arr: &UInt16Array, i| int_to_ms(i64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(UInt16Array, max_ts, array, |arr: &UInt16Array, i| int_to_ms(i64::from(arr.value(i)), time_format.clone())),
                         DataType::UInt32 =>
-                            max_ts = max_ts_macro!(UInt32Array, max_ts, array, |arr: &UInt32Array, i| int_to_ms(i64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(UInt32Array, max_ts, array, |arr: &UInt32Array, i| int_to_ms(i64::from(arr.value(i)), time_format.clone())),
                         DataType::UInt64 =>
-                            max_ts = max_ts_macro!(UInt64Array, max_ts, array, |arr: &UInt64Array, i| uint64_to_ms(arr.value(i), time_format)),
+                            max_ts = max_ts_macro!(UInt64Array, max_ts, array, |arr: &UInt64Array, i| uint64_to_ms(arr.value(i), time_format.clone())),
 
                         // Float
                         DataType::Float16 =>
-                            max_ts = max_ts_macro!(Float16Array, max_ts, array, |arr: &Float16Array, i| float_to_ms(arr.value(i).to_f64(), time_format)),
+                            max_ts = max_ts_macro!(Float16Array, max_ts, array, |arr: &Float16Array, i| float_to_ms(arr.value(i).to_f64(), time_format.clone())),
                         DataType::Float32 =>
-                            max_ts = max_ts_macro!(Float32Array, max_ts, array, |arr: &Float32Array, i| float_to_ms(f64::from(arr.value(i)), time_format)),
+                            max_ts = max_ts_macro!(Float32Array, max_ts, array, |arr: &Float32Array, i| float_to_ms(f64::from(arr.value(i)), time_format.clone())),
                         DataType::Float64 =>
-                            max_ts = max_ts_macro!(Float64Array, max_ts, array, |arr: &Float64Array, i| float_to_ms(arr.value(i), time_format)),
+                            max_ts = max_ts_macro!(Float64Array, max_ts, array, |arr: &Float64Array, i| float_to_ms(arr.value(i), time_format.clone())),
 
                         // Date32
                         DataType::Date32 =>

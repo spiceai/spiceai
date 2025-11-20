@@ -433,7 +433,7 @@ impl RefreshTask {
                     streaming_data_update,
                     self.federated.schema(),
                     refresh.time_column.clone(),
-                    refresh.time_format,
+                    refresh.time_format.clone(),
                     source_name,
                 )
                 .await
@@ -881,10 +881,10 @@ impl RefreshTask {
         TimestampFilterConvert::create(
             field,
             refresh.time_column.clone(),
-            refresh.time_format,
+            refresh.time_format.clone(),
             partition_field,
             refresh.time_partition_column.clone(),
-            refresh.time_partition_format,
+            refresh.time_partition_format.clone(),
         )
     }
 
@@ -1115,7 +1115,8 @@ impl RefreshTask {
                     TimeFormat::ISO8601
                     | TimeFormat::Timestamp
                     | TimeFormat::Timestamptz
-                    | TimeFormat::Date,
+                    | TimeFormat::Date
+                    | TimeFormat::Format(_),
                 )
                 | None => unreachable!("refresh.validate_time_format should've returned error"),
             }

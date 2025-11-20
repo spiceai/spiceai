@@ -174,8 +174,17 @@ impl DynamoDBTableProvider {
             Some(depth) => unnest_dynamodb_items(items, depth)?,
         };
 
+        tracing::debug!(
+            "DynamoDB items for schema inference: {:#?}",
+            &unnested_items[..unnested_items.len().min(2)]
+        );
+
+        let schema = infer_arrow_schema_from_items(&unnested_items)?;
+
+        tracing::debug!("DynamoDB inferred schema: {:#?}", schema);
+
         Ok((
-            infer_arrow_schema_from_items(&unnested_items)?,
+            schema,
             partition_key,
             sort_key,
             flattened_fields,
@@ -272,7 +281,15 @@ impl TableProvider for DynamoDBTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        Ok(self.table_schema.supports_filters_pushdown(filters))
+        let result = Ok(self.table_schema.supports_filters_pushdown(filters));
+
+        tracing::debug!(
+            "DynamoDBTableProvider supports_filters_pushdown: {:#?}, result: {:?}",
+            filters,
+            result
+        );
+
+        result
     }
 }
 
