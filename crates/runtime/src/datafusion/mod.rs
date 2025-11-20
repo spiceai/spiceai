@@ -1017,8 +1017,11 @@ impl DataFusion {
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
-        let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+        // For caching mode, we always start ready since it fetches data on-demand.
+        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        if !initial_load_complete
+            && let Ok(checkpoint) =
+                DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
