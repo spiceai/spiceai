@@ -385,10 +385,28 @@ impl HttpTableProvider {
         self
     }
 
-    #[must_use]
-    pub fn with_health_probe(mut self, health_probe: Option<String>) -> Self {
+    pub fn with_health_probe(mut self, health_probe: Option<String>) -> Result<Self> {
+        if let Some(ref path) = health_probe {
+            // Basic validation for health probe path
+            ensure!(
+                path.starts_with('/'),
+                ConfigurationSnafu {
+                    message: format!("health_probe path must start with '/'. Got: '{path}'",)
+                }
+            );
+            ensure!(
+                path.len() <= MAX_REQUEST_PATH_LENGTH,
+                ConfigurationSnafu {
+                    message: format!(
+                        "health_probe path is too long ({} characters). Maximum allowed is {}",
+                        path.len(),
+                        MAX_REQUEST_PATH_LENGTH
+                    )
+                }
+            );
+        }
         self.health_probe = health_probe;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -448,14 +466,24 @@ impl HttpTableProvider {
                         self.base_url,
                         status
                     );
+                    // For custom health probe, require successful status (2xx)
+                    if !status.is_success() {
+                        return Err(Error::HttpClientError {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Health probe endpoint returned non-success status: {}",
+                                status
+                            ),
+                        });
+                    }
                 } else {
                     tracing::debug!(
-                        "HTTP endpoint validation response: {} (status: {}). 404 is expected for the random probe path.",
+                        "HTTP endpoint validation response: {} (status: {}). Any status (including 404) is expected for the random probe path.",
                         self.base_url,
                         status
                     );
+                    // Any response (including 404) means the endpoint is reachable
                 }
-                // Any response (including 404) means the endpoint is reachable
                 Ok(())
             }
             Err(e) => {
