@@ -163,23 +163,35 @@ impl CachedQueryResult {
     pub fn cached_at(&self) -> Instant {
         self.cached_at
     }
+
+    /// Returns the accurate deep memory size of this cache entry.
+    /// Includes array data, `RecordBatch` overhead, and schema size.
+    #[must_use]
+    pub fn memory_size(&self) -> u64 {
+        let mut size = std::mem::size_of::<Self>() as u64;
+
+        match &self.data {
+            CachedData::Raw(batches) => {
+                for batch in batches.iter() {
+                    // Use RecordBatch's get_array_memory_size which accounts for all array data
+                    size += batch.get_array_memory_size() as u64;
+                    // Add RecordBatch struct overhead (small fixed cost per batch)
+                    size += std::mem::size_of::<RecordBatch>() as u64;
+                }
+            }
+            CachedData::Encoded(bytes) => {
+                size += bytes.len() as u64;
+            }
+        }
+
+        size
+    }
 }
 
 impl Sizeable for CachedQueryResult {
     fn get_memory_size(&self) -> usize {
-        match &self.data {
-            CachedData::Raw(batches) => batches
-                .iter()
-                .map(|batch| {
-                    batch
-                        .columns()
-                        .iter()
-                        .map(|array| array.get_array_memory_size())
-                        .sum::<usize>()
-                })
-                .sum(),
-            CachedData::Encoded(bytes) => bytes.len(),
-        }
+        // Delegate to accurate memory_size() method, cap at usize::MAX
+        self.memory_size().try_into().unwrap_or(usize::MAX)
     }
 }
 
@@ -255,5 +267,141 @@ impl QueryResult {
     #[must_use]
     pub fn new(data: SendableRecordBatchStream, cache_status: CacheStatus) -> Self {
         QueryResult { data, cache_status }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn test_memory_size_raw_batches() {
+        // Create a schema with different data types
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("int_col", DataType::Int32, false),
+            Field::new("string_col", DataType::Utf8, true),
+        ]));
+
+        // Create record batches with known data
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    Some("hello"),
+                    Some("world"),
+                    Some("test"),
+                    None,
+                    Some("data"),
+                ])),
+            ],
+        )
+        .expect("should create batch");
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![6, 7, 8])),
+                Arc::new(StringArray::from(vec![Some("more"), Some("data"), None])),
+            ],
+        )
+        .expect("should create batch");
+
+        let batches = vec![batch1.clone(), batch2.clone()];
+        let input_tables = Arc::new(HashSet::new());
+        let cached_at = Instant::now();
+
+        let cached_result = CachedQueryResult::new_raw(batches, input_tables, cached_at);
+
+        // Calculate expected size
+        let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
+            + batch1.get_array_memory_size() as u64
+            + std::mem::size_of::<RecordBatch>() as u64
+            + batch2.get_array_memory_size() as u64
+            + std::mem::size_of::<RecordBatch>() as u64;
+
+        let actual_size = cached_result.memory_size();
+
+        assert_eq!(
+            actual_size, expected_size,
+            "Memory size should accurately reflect RecordBatch data size"
+        );
+
+        // Verify the size is reasonable (not zero, not absurdly large)
+        assert!(
+            actual_size > 0,
+            "Memory size should be greater than zero for non-empty batches"
+        );
+        assert!(
+            actual_size < 10_000,
+            "Memory size should be reasonable for small test data"
+        );
+    }
+
+    #[test]
+    fn test_memory_size_encoded_data() {
+        let encoded_data = Bytes::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "test",
+            DataType::Int32,
+            false,
+        )]));
+        let input_tables = Arc::new(HashSet::new());
+        let cached_at = Instant::now();
+
+        let cached_result =
+            CachedQueryResult::new(encoded_data.clone(), schema, input_tables, cached_at, None);
+
+        let expected_size =
+            std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
+        let actual_size = cached_result.memory_size();
+
+        assert_eq!(
+            actual_size, expected_size,
+            "Memory size should equal struct size plus encoded data length"
+        );
+    }
+
+    #[test]
+    fn test_memory_size_empty_batches() {
+        let batches = Vec::new();
+        let input_tables = Arc::new(HashSet::new());
+        let cached_at = Instant::now();
+
+        let cached_result = CachedQueryResult::new_raw(batches, input_tables, cached_at);
+
+        let expected_size = std::mem::size_of::<CachedQueryResult>() as u64;
+        let actual_size = cached_result.memory_size();
+
+        assert_eq!(
+            actual_size, expected_size,
+            "Memory size for empty batches should be just struct overhead"
+        );
+    }
+
+    #[test]
+    fn test_sizeable_trait_implementation() {
+        // Create a result with known size
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("should create batch");
+
+        let cached_result =
+            CachedQueryResult::new_raw(vec![batch], Arc::new(HashSet::new()), Instant::now());
+
+        let memory_size = cached_result.memory_size();
+        let sizeable_size = cached_result.get_memory_size();
+
+        // Should match (unless memory_size exceeds usize::MAX, which won't happen in tests)
+        assert_eq!(
+            sizeable_size as u64, memory_size,
+            "Sizeable trait should delegate to memory_size()"
+        );
     }
 }
