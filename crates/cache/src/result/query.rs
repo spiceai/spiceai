@@ -351,15 +351,11 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new(
-            encoded_data.clone(),
-            schema,
-            input_tables,
-            cached_at,
-            None,
-        );
+        let cached_result =
+            CachedQueryResult::new(encoded_data.clone(), schema, input_tables, cached_at, None);
 
-        let expected_size = std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
+        let expected_size =
+            std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
         let actual_size = cached_result.memory_size();
 
         assert_eq!(
@@ -388,11 +384,7 @@ mod tests {
     #[test]
     fn test_sizeable_trait_implementation() {
         // Create a result with known size
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "col",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -400,11 +392,8 @@ mod tests {
         )
         .expect("should create batch");
 
-        let cached_result = CachedQueryResult::new_raw(
-            vec![batch],
-            Arc::new(HashSet::new()),
-            Instant::now(),
-        );
+        let cached_result =
+            CachedQueryResult::new_raw(vec![batch], Arc::new(HashSet::new()), Instant::now());
 
         let memory_size = cached_result.memory_size();
         let sizeable_size = cached_result.get_memory_size();
