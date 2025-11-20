@@ -1,4 +1,15 @@
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDateTime};
+
+#[derive(Debug)]
+pub enum ParsedDateTime {
+    Naive(NaiveDateTime),
+    WithOffset(DateTime<FixedOffset>),
+}
+
+#[must_use]
+pub fn is_valid_format(value: &str) -> bool {
+    convert_go_format_to_rust(value).is_some()
+}
 
 /// Format a timestamp using go-style formatting.
 #[must_use]
@@ -17,6 +28,38 @@ pub fn format_datetime(dt: DateTime<FixedOffset>, go_format: &str) -> Option<Str
     }
 
     Some(formatted)
+}
+
+#[must_use]
+pub fn parse_datetime(input: &str, go_format: &str) -> Option<ParsedDateTime> {
+    let rust_format = convert_go_format_to_rust(go_format)?;
+
+    // Check if format expects timezone info
+    let has_tz =
+        go_format.contains("Z07") || go_format.contains("-07") || go_format.contains("MST");
+
+    if has_tz {
+        let normalized_input = if go_format.contains("Z07:00") {
+            input.replace('Z', "+00:00")
+        } else if go_format.contains("Z0700") {
+            input.replace('Z', "+0000")
+        } else {
+            input.to_string()
+        };
+
+        DateTime::parse_from_str(&normalized_input, &rust_format)
+            .ok()
+            .map(ParsedDateTime::WithOffset)
+    } else {
+        println!(
+            "foo!!: {:?}",
+            NaiveDateTime::parse_from_str(input, &rust_format)
+        );
+
+        NaiveDateTime::parse_from_str(input, &rust_format)
+            .ok()
+            .map(ParsedDateTime::Naive)
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -183,7 +226,7 @@ fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+    use chrono::{Datelike, FixedOffset, TimeZone, Timelike, Utc};
 
     /// Helper to create a DateTime<FixedOffset> in UTC
     fn make_utc(
@@ -459,5 +502,179 @@ mod tests {
             format_datetime(dt_plus_9, "2006-01-02T15:04:05.000000-07:00"),
             Some("2024-11-19T23:30:45.987654+09:00".to_string()),
         );
+    }
+
+    // Helper to create expected DateTime values
+    fn utc_offset() -> FixedOffset {
+        FixedOffset::east_opt(0).unwrap()
+    }
+
+    fn offset_hours(hours: i32) -> FixedOffset {
+        FixedOffset::east_opt(hours * 3600).unwrap()
+    }
+
+    // Helper to unwrap as WithOffset variant
+    fn expect_with_offset(result: Option<ParsedDateTime>) -> DateTime<FixedOffset> {
+        match result {
+            Some(ParsedDateTime::WithOffset(dt)) => dt,
+            Some(ParsedDateTime::Naive(_)) => panic!("Expected WithOffset, got Naive"),
+            None => panic!("Expected WithOffset, got None"),
+        }
+    }
+
+    // Helper to unwrap as Naive variant
+    fn expect_naive(result: Option<ParsedDateTime>) -> NaiveDateTime {
+        match result {
+            Some(ParsedDateTime::Naive(dt)) => dt,
+            Some(ParsedDateTime::WithOffset(_)) => panic!("Expected Naive, got WithOffset"),
+            None => panic!("Expected Naive, got None"),
+        }
+    }
+
+    // ==================== WithOffset tests ====================
+
+    #[test]
+    fn test_parse_utc_with_z_colon_format() {
+        let result = parse_datetime("2024-01-15T10:30:00Z", "2006-01-02T15:04:05Z07:00");
+        let dt = expect_with_offset(result);
+
+        assert_eq!(dt.offset(), &utc_offset());
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 10);
+        assert_eq!(dt.minute(), 30);
+        assert_eq!(dt.second(), 0);
+    }
+
+    #[test]
+    fn test_parse_utc() {
+        let result = parse_datetime("2023-08-31T12:34:56Z", "2006-01-02T15:04:05Z07:00");
+        let dt = expect_with_offset(result);
+
+        assert_eq!(dt.offset(), &utc_offset());
+        assert_eq!(dt.year(), 2023);
+        assert_eq!(dt.month(), 8);
+    }
+
+    #[test]
+    fn test_parse_utc_with_z_no_colon_format() {
+        let result = parse_datetime("2024-01-15T10:30:00Z", "2006-01-02T15:04:05Z0700");
+        let dt = expect_with_offset(result);
+        assert_eq!(dt.offset(), &utc_offset());
+    }
+
+    #[test]
+    fn test_parse_positive_offset_with_z_format() {
+        let result = parse_datetime("2024-01-15T10:30:00+05:30", "2006-01-02T15:04:05Z07:00");
+        let dt = expect_with_offset(result);
+        let expected_offset = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        assert_eq!(dt.offset(), &expected_offset);
+    }
+
+    #[test]
+    fn test_parse_negative_offset() {
+        let result = parse_datetime("2024-01-15T10:30:00-08:00", "2006-01-02T15:04:05Z07:00");
+        let dt = expect_with_offset(result);
+        assert_eq!(dt.offset(), &offset_hours(-8));
+    }
+
+    #[test]
+    fn test_parse_explicit_plus_zero_offset() {
+        let result = parse_datetime("2024-01-15T10:30:00+00:00", "2006-01-02T15:04:05Z07:00");
+        let dt = expect_with_offset(result);
+        assert_eq!(dt.offset(), &utc_offset());
+    }
+
+    #[test]
+    fn test_parse_non_z_format_with_offset() {
+        let result = parse_datetime("2024-01-15T10:30:00-05:00", "2006-01-02T15:04:05-07:00");
+        let dt = expect_with_offset(result);
+        assert_eq!(dt.offset(), &offset_hours(-5));
+    }
+
+    // ==================== Naive tests ====================
+
+    #[test]
+    fn test_foo() {
+        let formatted = convert_go_format_to_rust("2006-01-02");
+        println!("!!!!!: {:?}", formatted);
+        let result = parse_datetime("2024-01-15", "2006-01-02");
+    }
+
+    #[test]
+    fn test_parse_datetime_without_timezone() {
+        let result = parse_datetime("2024-01-15 10:30:00", "2006-01-02 15:04:05");
+        let dt = expect_naive(result);
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 10);
+        assert_eq!(dt.minute(), 30);
+        assert_eq!(dt.second(), 0);
+
+        let result = parse_datetime("2024/01/15 10+30+00", "2006/01/02 15+04+05");
+        let dt = expect_naive(result);
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 10);
+        assert_eq!(dt.minute(), 30);
+        assert_eq!(dt.second(), 0);
+    }
+
+    // ==================== Error cases ====================
+
+    #[test]
+    fn test_parse_invalid_format_returns_none() {
+        let result = parse_datetime("not-a-date", "2006-01-02T15:04:05Z07:00");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_mismatched_format_returns_none() {
+        let result = parse_datetime("2024/01/15", "2006-01-02T15:04:05Z07:00");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_naive_with_invalid_input_returns_none() {
+        let result = parse_datetime("not-a-date", "2006-01-02");
+        assert!(result.is_none());
+    }
+
+    // ==================== Roundtrip tests ====================
+
+    #[test]
+    fn test_parse_roundtrip_with_z() {
+        let input = "2024-06-20T14:30:45Z";
+        let format = "2006-01-02T15:04:05Z07:00";
+
+        let parsed = expect_with_offset(parse_datetime(input, format));
+        let formatted = format_datetime(parsed, format).unwrap();
+
+        assert_eq!(formatted, input);
+    }
+
+    #[test]
+    fn test_parse_roundtrip_with_offset() {
+        let input = "2024-06-20T14:30:45+05:30";
+        let format = "2006-01-02T15:04:05Z07:00";
+
+        let parsed = expect_with_offset(parse_datetime(input, format));
+        let formatted = format_datetime(parsed, format).unwrap();
+
+        assert_eq!(formatted, input);
+    }
+
+    #[test]
+    fn test_parse_roundtrip_z0700() {
+        let input = "2024-06-20T14:30:45Z";
+        let format = "2006-01-02T15:04:05Z0700";
+
+        let parsed = expect_with_offset(parse_datetime(input, format));
+        let formatted = format_datetime(parsed, format).unwrap();
+
+        assert_eq!(formatted, input);
     }
 }

@@ -243,9 +243,7 @@ impl DynamoDBRequestPlanBuilder {
 
         let filter_parts: Vec<String> = filters
             .iter()
-            .map(|expr| {
-                self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter)
-            })
+            .map(|expr| self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter))
             .collect::<DataFusionResult<Vec<String>>>()?;
 
         if filter_parts.is_empty() {
@@ -1282,7 +1280,9 @@ mod tests {
         let filter1 = col("age").gt(lit(18i64));
         let filter2 = col("active").eq(lit(true));
 
-        let (expr, values) = builder.build_filter_expression(&[filter1, filter2]).expect("filter");
+        let (expr, values) = builder
+            .build_filter_expression(&[filter1, filter2])
+            .expect("filter");
 
         assert_eq!(expr, "(#age > :v0) AND (#active = :v1)");
         assert_eq!(values.len(), 2);
@@ -1477,8 +1477,9 @@ mod tests {
         let int_filter = col("age").eq(lit(30i64));
         let bool_filter = col("active").eq(lit(true));
 
-        let (expr, values) =
-            builder.build_filter_expression(&[string_filter, int_filter, bool_filter]).expect("filter");
+        let (expr, values) = builder
+            .build_filter_expression(&[string_filter, int_filter, bool_filter])
+            .expect("filter");
 
         assert!(expr.contains("#name"));
         assert!(expr.contains("#age"));

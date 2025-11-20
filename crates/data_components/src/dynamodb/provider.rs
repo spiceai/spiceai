@@ -86,6 +86,7 @@ impl DynamoDBTableProvider {
                 &table_name,
                 unnest_depth,
                 schema_infer_max_records,
+                &time_format,
             )
             .await?;
 
@@ -112,6 +113,7 @@ impl DynamoDBTableProvider {
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
+        time_format: &str,
     ) -> Result<(
         SchemaRef,
         String,
@@ -181,7 +183,7 @@ impl DynamoDBTableProvider {
             &unnested_items[..unnested_items.len().min(2)]
         );
 
-        let schema = infer_arrow_schema_from_items(&unnested_items)?;
+        let schema = infer_arrow_schema_from_items(&unnested_items, time_format)?;
 
         tracing::debug!("DynamoDB inferred schema: {:?}", schema);
 
@@ -276,6 +278,7 @@ impl TableProvider for DynamoDBTableProvider {
             self.unnest_depth,
             projected_schema,
             total_partitions,
+            self.table_schema.time_format(),
         )))
     }
 
@@ -300,6 +303,7 @@ pub struct DynamoDBTableProviderExec {
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
+    time_format: String,
     properties: PlanProperties,
 }
 
@@ -311,12 +315,14 @@ impl DynamoDBTableProviderExec {
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
         partitions: usize,
+        time_format: String,
     ) -> Self {
         Self {
             client,
             request_plan,
             projected_schema: Arc::clone(&projected_schema),
             unnest_depth,
+            time_format,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
@@ -383,6 +389,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let client = Arc::clone(&self.client);
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
+        let time_format = self.time_format.clone();
 
         let total_partitions = match self.properties.partitioning {
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
@@ -418,8 +425,9 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
                     }
                 };
 
-                let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-                    .map_err(to_execution_error)?;
+                let batch =
+                    dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema), &time_format)
+                        .map_err(to_execution_error)?;
 
                 tx.send(Ok(batch)).await.map_err(to_execution_error)?;
             }

@@ -205,7 +205,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             HashSet::new(),
-            None,
+            "2006-01-02T15:04:05.000Z07:00".to_string(),
         )
     }
 
@@ -225,7 +225,7 @@ mod tests {
             "id".to_string(),
             None,
             flattened,
-            None,
+            "2006-01-02T15:04:05.000Z07:00".to_string(),
         )
     }
 
@@ -249,7 +249,7 @@ mod tests {
             "id".to_string(),
             None,
             HashSet::new(),
-            None,
+            "2006-01-02T15:04:05.000Z07:00".to_string(),
         );
 
         assert_eq!(table_schema.sort_key(), None);

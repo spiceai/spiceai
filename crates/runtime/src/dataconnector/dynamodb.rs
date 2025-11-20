@@ -27,6 +27,7 @@ use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use util::time_format::is_valid_format;
 
 #[derive(Debug)]
 pub struct DynamoDB {
@@ -196,6 +197,13 @@ impl DataConnector for DynamoDB {
             .get("time_format")
             .expose()
             .unwrap_or_else(|_| DEFAULT_TIME_FORMAT);
+        if !is_valid_format(time_format) {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                message: format!("DynamoDB parameter 'time_format' is invalid: \"{time_format}\""),
+                connector_component: ConnectorComponent::from(dataset),
+            });
+        }
 
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),

@@ -16,7 +16,6 @@ limitations under the License.
 
 use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
-use crate::dynamodb::timestamp_utils::{parse_iso8601_timestamp, parse_naive_timestamp};
 use arrow::array::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, ListBuilder,
     NullBuilder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
@@ -27,10 +26,13 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::NaiveDate;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+use util::time_format::{ParsedDateTime, parse_datetime};
 
 pub fn dynamodb_items_to_arrow(
     items: &[HashMap<String, AttributeValue>],
     projected_schema: SchemaRef,
+    time_format: &str,
 ) -> Result<RecordBatch> {
     if items.is_empty() {
         return Ok(RecordBatch::new_empty(projected_schema));
@@ -41,7 +43,7 @@ pub fn dynamodb_items_to_arrow(
         StructBuilder::from_fields(projected_schema.fields().clone(), items.len());
 
     for item in items {
-        append_item_to_struct_builder(item, &mut struct_builder)?;
+        append_item_to_struct_builder(item, &mut struct_builder, time_format)?;
     }
 
     Ok(struct_builder.finish().into())
@@ -50,6 +52,7 @@ pub fn dynamodb_items_to_arrow(
 fn append_item_to_struct_builder(
     item: &HashMap<String, AttributeValue>,
     struct_builder: &mut StructBuilder,
+    time_format: &str,
 ) -> Result<(), Error> {
     // Always append a valid struct row
     struct_builder.append(true);
@@ -61,7 +64,7 @@ fn append_item_to_struct_builder(
         let value = item.get(field_name);
         let field_builder = struct_builder.field_builder_array(idx);
 
-        append_value_to_builder(field_builder, value, field.data_type())?;
+        append_value_to_builder(field_builder, value, field.data_type(), time_format)?;
     }
 
     Ok(())
@@ -72,6 +75,7 @@ fn append_value_to_builder(
     builder: &mut dyn ArrayBuilder,
     value: Option<&AttributeValue>,
     data_type: &DataType,
+    time_format: &str,
 ) -> Result<(), Error> {
     match data_type {
         DataType::Boolean => {
@@ -358,7 +362,12 @@ fn append_value_to_builder(
                     for (idx, field) in fields.iter().enumerate() {
                         let nested_value = map.get(field.name());
                         let nested_builder = b.field_builder_array(idx);
-                        append_value_to_builder(nested_builder, nested_value, field.data_type())?;
+                        append_value_to_builder(
+                            nested_builder,
+                            nested_value,
+                            field.data_type(),
+                            time_format,
+                        )?;
                     }
                 }
                 Some(AttributeValue::Null(_)) | None => {
@@ -368,7 +377,12 @@ fn append_value_to_builder(
                     for idx in 0..fields.len() {
                         let nested_builder = b.field_builder_array(idx);
                         let nested_field = &fields[idx];
-                        append_value_to_builder(nested_builder, None, nested_field.data_type())?;
+                        append_value_to_builder(
+                            nested_builder,
+                            None,
+                            nested_field.data_type(),
+                            time_format,
+                        )?;
                     }
                 }
                 _ => {
@@ -393,7 +407,7 @@ fn append_value_to_builder(
                 })?;
             b.append_null();
         }
-        DataType::Timestamp(TimeUnit::Millisecond, tz_opt) => {
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
             let b = builder
                 .as_any_mut()
                 .downcast_mut::<TimestampMillisecondBuilder>()
@@ -405,16 +419,15 @@ fn append_value_to_builder(
                 })?;
             match value {
                 Some(AttributeValue::S(s)) => {
-                    if tz_opt.is_some() {
-                        match parse_iso8601_timestamp(s) {
-                            Some(ts) => b.append_value(ts.timestamp_millis()),
-                            None => b.append_null(),
+                    if let Some(ts) = parse_datetime(s, time_format) {
+                        match ts {
+                            ParsedDateTime::Naive(ts) => {
+                                b.append_value(ts.and_utc().timestamp_millis())
+                            }
+                            ParsedDateTime::WithOffset(ts) => b.append_value(ts.timestamp_millis()),
                         }
                     } else {
-                        match parse_naive_timestamp(s) {
-                            Some(millis) => b.append_value(millis),
-                            None => b.append_null(),
-                        }
+                        b.append_null();
                     }
                 }
                 _ => b.append_null(),
@@ -516,7 +529,8 @@ mod tests {
         ]);
 
         let items: Vec<HashMap<String, AttributeValue>> = vec![];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.num_columns(), 2);
@@ -549,7 +563,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
         assert_eq!(result.num_columns(), 5);
@@ -603,7 +618,8 @@ mod tests {
         // int_field is missing entirely
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -642,7 +658,8 @@ mod tests {
         item3.insert("value".to_string(), AttributeValue::Null(true));
 
         let items = vec![item1, item2, item3];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 3);
 
@@ -684,7 +701,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -724,7 +742,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -759,7 +778,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -793,7 +813,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -837,8 +858,8 @@ mod tests {
         item.insert("address".to_string(), AttributeValue::M(address_map));
 
         let items = vec![item];
-        let result =
-            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -897,8 +918,8 @@ mod tests {
         // No address field - should be null
 
         let items = vec![item];
-        let result =
-            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -948,8 +969,8 @@ mod tests {
         item.insert("address".to_string(), AttributeValue::M(address_map));
 
         let items = vec![item];
-        let result =
-            dynamodb_items_to_arrow(&items, schema).expect("Failed to create record batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("Failed to create record batch");
 
         assert_eq!(result.num_rows(), 1);
 
@@ -985,11 +1006,12 @@ mod tests {
         let mut item = HashMap::new();
         item.insert(
             "created_at".to_string(),
-            AttributeValue::S("2024-01-15T10:30:00Z".to_string()),
+            AttributeValue::S("2024-01-15T10:30:00.123Z".to_string()),
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let ts_array = result
             .column(0)
@@ -997,7 +1019,7 @@ mod tests {
             .downcast_ref::<TimestampMillisecondArray>()
             .expect("array");
         assert!(!ts_array.is_null(0));
-        assert_eq!(ts_array.value(0), 1_705_314_600_000);
+        assert_eq!(ts_array.value(0), 1_705_314_600_123);
     }
 
     #[test]
@@ -1015,7 +1037,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result =
+            dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05").expect("record_batch");
 
         let ts_array = result
             .column(0)
@@ -1037,7 +1060,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let date_array = result
             .column(0)
@@ -1066,7 +1090,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let int_array = result
             .column(0)
@@ -1095,7 +1120,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let int_array = result
             .column(0)
@@ -1113,7 +1139,8 @@ mod tests {
         item.insert("null_field".to_string(), AttributeValue::Null(true));
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         assert_eq!(result.num_rows(), 1);
         let null_array = result
@@ -1138,7 +1165,8 @@ mod tests {
         item.insert("tags".to_string(), AttributeValue::L(vec![]));
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
@@ -1168,7 +1196,8 @@ mod tests {
         );
 
         let items = vec![item];
-        let result = dynamodb_items_to_arrow(&items, schema).expect("record_batch");
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
 
         let list_array = result
             .column(0)
