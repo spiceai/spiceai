@@ -15,7 +15,7 @@ limitations under the License.
 */
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     str::FromStr,
     sync::{Arc, LazyLock},
@@ -38,7 +38,7 @@ use runtime::{
 use serde_json::{Value, json};
 use spicepod::{
     acceleration::Acceleration,
-    component::embeddings::EmbeddingChunkConfig,
+    component::embeddings::{EmbeddingChunkConfig, Embeddings},
     param::{ParamValue, Params},
     semantic::{Column, ColumnLevelEmbeddingConfig, FullTextSearchConfig},
     vector::VectorStore,
@@ -189,6 +189,15 @@ static TABLE_VECTOR_STORE_OPTIONS: LazyLock<HashMap<String, VectorStore>> = Lazy
         .expect("Failed to parse 'acceleration.yaml' configurations")
 });
 
+static EMBEDDING_MODEL_OPTIONS: LazyLock<Vec<Embeddings>> = LazyLock::new(|| {
+    // `"embeddings.yaml"` has "embeddings" as the top-level key to match spicepod.yaml semantics (but is not full spicepod.yaml).
+    let yaml_format: HashMap<String, Vec<Embeddings>> =
+        serde_yaml::from_str(include_str!("embeddings.yaml"))
+            .expect("Failed to parse 'acceleration.yaml' configurations");
+
+    yaml_format.get("embeddings").cloned().unwrap_or_default()
+});
+
 static MEGA_SCIENCE_COLUMN_CONFIGS: LazyLock<HashMap<String, Vec<Column>>> = LazyLock::new(|| {
     serde_yaml::from_str(include_str!("mega_science.yaml"))
         .expect("Failed to parse 'mega_science.yaml' column configurations")
@@ -250,6 +259,31 @@ impl SearchSpicepodConfiguration {
             columns,
         })
     }
+
+    pub fn embedding_models_used(
+        &self,
+        models_available: &[Embeddings],
+    ) -> Result<Vec<Embeddings>, anyhow::Error> {
+        let mut embedding_names = HashSet::new();
+
+        for col in &self.columns {
+            for clec in &col.embeddings {
+                embedding_names.insert(clec.model.clone());
+            }
+        }
+        embedding_names
+            .iter()
+            .map(|name| {
+                let Some(model) = models_available.iter().find(|m| m.name == *name) else {
+                    return Err(anyhow::anyhow!(
+                        "Embedding model '{}' not found among available models.",
+                        name
+                    ));
+                };
+                Ok(model.clone())
+            })
+            .collect()
+    }
 }
 
 pub fn build_mega_science(mut app: AppBuilder, cfg: &SearchSpicepodConfiguration) -> AppBuilder {
@@ -290,24 +324,33 @@ macro_rules! generate_search_tests {
                 #[tokio::test]
                 #[allow(non_snake_case)]
                 async fn [<test_search_ $slug:snake>]() {
-                    let app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
-                        "minishlab/potion-base-2M",
-                        "hf_minilm",
-                    ));
-
-                    let cfg = SearchSpicepodConfiguration::from_str($slug, &MEGA_SCIENCE_COLUMN_CONFIGS)
-                        .expect("could not initialise configuration");
-                    run_search_w_explain(
-                        build_mega_science(app, &cfg).build(),
-                        basic_vector_search_tests_on_table($slug, "qs"),
-                        true,
-                    )
-                    .await
-                    .expect("failed to run search tests");
+                    search_test_case($slug).await;
                 }
             )*
         }
     };
+}
+
+async fn search_test_case(slug: &'static str) {
+    let mut app = AppBuilder::new("search_app");
+    let cfg = SearchSpicepodConfiguration::from_str(slug, &MEGA_SCIENCE_COLUMN_CONFIGS)
+        .expect("could not initialise configuration");
+
+    for emb in cfg
+        .embedding_models_used(&EMBEDDING_MODEL_OPTIONS)
+        .expect("could not find embedding models")
+    {
+        app = app.with_embedding(emb);
+    }
+    app = build_mega_science(app, &cfg);
+
+    run_search_w_explain(
+        app.build(),
+        basic_vector_search_tests_on_table(slug, "qs"),
+        true,
+    )
+    .await
+    .expect("failed to run search tests");
 }
 
 async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
