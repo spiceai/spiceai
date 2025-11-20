@@ -4714,8 +4714,8 @@ dependencies = [
  "duckdb",
  "futures",
  "r2d2",
- "tokio",
  "snafu",
+ "tokio",
  "tracing",
 ]
 

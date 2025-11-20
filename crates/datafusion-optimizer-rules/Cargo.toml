@@ -17,7 +17,6 @@ datafusion-federation.workspace = true
 datafusion-expr.workspace = true
 datafusion-table-providers.workspace = true
 tokio.workspace = true
-r2d2 = { optional = true, workspace = true }
 duckdb = { optional = true, workspace = true }
 futures.workspace = true
 r2d2 = { optional = true, workspace = true }
