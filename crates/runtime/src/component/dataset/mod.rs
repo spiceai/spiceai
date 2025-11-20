@@ -106,8 +106,8 @@ pub enum Error {
     ))]
     ChunkingNotSupportedForVectorEngine { column: String },
 
-    #[snafu(display("{message}"))]
-    InvalidConfiguration { message: String },
+    #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
+    InvalidConfiguration { config_key: String, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
