@@ -4711,6 +4711,7 @@ dependencies = [
  "duckdb",
  "futures",
  "r2d2",
+ "snafu",
  "tracing",
 ]
 
@@ -13228,6 +13229,7 @@ dependencies = [
  "futures",
  "opentelemetry 0.27.1",
  "runtime-request-context",
+ "snafu",
  "tokio",
  "tracing",
 ]
@@ -13240,6 +13242,7 @@ dependencies = [
  "datafusion",
  "futures",
  "itertools 0.14.0",
+ "snafu",
  "tokio",
  "tracing",
 ]

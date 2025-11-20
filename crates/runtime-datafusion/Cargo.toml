@@ -19,6 +19,7 @@ datafusion-federation = { workspace = true }
 futures.workspace = true
 opentelemetry.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
+snafu.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
