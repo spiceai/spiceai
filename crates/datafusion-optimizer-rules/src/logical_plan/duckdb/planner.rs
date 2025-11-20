@@ -1,7 +1,7 @@
 use crate::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownNode;
 use crate::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownMarkerExec;
 use async_trait::async_trait;
-use datafusion::common::Result;
+use datafusion::common::{Result, plan_err};
 use datafusion::execution::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
@@ -29,7 +29,7 @@ impl ExtensionPlanner for DuckDBLogicalExtensionPlanner {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(logical_marker) = node.as_any().downcast_ref::<DuckDBAggregatePushdownNode>() {
             if physical_inputs.len() != 1 {
-                unreachable!("DuckDBAggregatePushdownNode expects exactly one input")
+                return plan_err!("DuckDBAggregatePushdownNode expects exactly one input");
             }
             Ok(Some(DuckDBAggregatePushdownMarkerExec::new(
                 logical_marker.input_plan.clone(),
