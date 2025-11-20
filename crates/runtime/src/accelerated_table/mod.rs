@@ -203,7 +203,7 @@ pub struct AcceleratedTable {
     refresh_params: Arc<RwLock<refresh::Refresh>>,
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
-synchronized_with: Option<SynchronizedTable>,
+    synchronized_with: Option<SynchronizedTable>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
