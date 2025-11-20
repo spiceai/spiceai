@@ -1,3 +1,8 @@
 allow-expect-in-tests = true
-# Large futures are in tests. 
+disallowed-macros = [
+    { path = "std::assert", reason = "Prefer returning concrete errors instead of assertion panics. If code is truly unreachable, use `unreachable!()` macro." },
+    { path = "std::assert_eq", reason = "Prefer returning concrete errors instead of assertion panics. If code is truly unreachable, use `unreachable!()` macro." },
+    { path = "std::assert_ne", reason = "Prefer returning concrete errors instead of assertion panics. If code is truly unreachable, use `unreachable!()` macro." },
+]
+# Large futures are in tests
 future-size-threshold = 45520
