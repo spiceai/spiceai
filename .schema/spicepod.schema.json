@@ -1504,18 +1504,11 @@
           ]
         },
         "max_stale_while_revalidate": {
+          "description": "Maximum stale-while-revalidate duration to add to the cache TTL.",
           "type": [
             "string",
             "null"
-          ],
-          "description": "Maximum duration for which stale results may be served while revalidation is in progress (SWR mode)."
-        },
-        "stale_while_revalidate_ttl": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "TTL for serving stale results while revalidation is happening (SWR mode)."
+          ]
         }
       },
       "additionalProperties": false
@@ -1740,6 +1733,13 @@
           ]
         },
         "max_size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stale_while_revalidate_ttl": {
+          "description": "Maximum age for serving stale cached results while revalidating in the background.\nWhen set, cached results past their TTL (but within this additional window) will be\nserved immediately while a background refresh is triggered.\nFormat: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
           "type": [
             "string",
             "null"
