@@ -64,7 +64,6 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 mod sink;
-pub mod swr;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 
@@ -205,7 +204,6 @@ pub struct AcceleratedTable {
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
-    swr_ttl: Option<Duration>,
     io_runtime: Handle,
 }
 
@@ -268,7 +266,6 @@ pub struct Builder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
-    swr_ttl: Option<Duration>,
 }
 
 impl Builder {
@@ -305,7 +302,6 @@ impl Builder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
-            swr_ttl: None,
         }
     }
 
@@ -440,12 +436,6 @@ impl Builder {
         self
     }
 
-    /// Set the TTL for SWR mode
-    pub fn swr_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
-        self.swr_ttl = ttl;
-        self
-    }
-
     /// Build the accelerated table
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
@@ -521,10 +511,6 @@ impl Builder {
                     None,
                 )
             }
-            RefreshMode::Swr => {
-                // SWR mode doesn't need initial refresh
-                (refresh::AccelerationRefreshMode::Swr, None)
-            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
@@ -591,7 +577,6 @@ impl Builder {
             refresher,
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
-            swr_ttl: self.swr_ttl,
             io_runtime: self.io_runtime,
         })
     }
@@ -733,11 +718,8 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Check if we're in SWR mode
-        let is_swr_mode = self.refresh_params.read().await.mode == RefreshMode::Swr;
-
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
-        if !self.refresher().initial_load_completed() && !is_swr_mode {
+        if !self.refresher().initial_load_completed() {
             match self.ready_state {
                 ReadyState::OnLoad => {
                     return Err(DataFusionError::External(
@@ -770,24 +752,9 @@ impl TableProvider for AcceleratedTable {
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match (is_swr_mode, &self.zero_results_action) {
-            (true, _) => {
-                // SWR mode: wrap with SWR execution plan to handle staleness and background refresh
-                let federated_provider = self.federated.table_provider().await;
-                Arc::new(swr::SwrScanExec::new(
-                    input,
-                    self.swr_ttl,
-                    federated_provider,
-                    Arc::clone(&self.accelerator),
-                    self.dataset_name.to_string(),
-                    self.io_runtime.clone(),
-                    filters.to_vec(),
-                    projection.cloned(),
-                    limit,
-                ))
-            }
-            (false, ZeroResultsAction::ReturnEmpty) => input,
-            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
+        let plan: Arc<dyn ExecutionPlan> = match &self.zero_results_action {
+            ZeroResultsAction::ReturnEmpty => input,
+            ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
                 fallback_fn,
