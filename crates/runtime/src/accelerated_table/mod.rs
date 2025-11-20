@@ -157,9 +157,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
+
+    #[snafu(display("Failed to start refresh task. The task was already started."))]
+    RefreshTaskAlreadyStarted {},
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum AcceleratedTableBuilderError {
@@ -182,6 +185,19 @@ pub enum AcceleratedTableBuilderError {
         "A synchronized accelerated table requires full refresh mode. Set `refresh_mode` to 'full', and try again."
     ))]
     SynchronizedAcceleratedTableRequiresFullRefresh,
+
+    #[snafu(display(
+        "Refresh mode must be set to `changes` to use a changes stream. For details, visit: https://spiceai.org/docs/features/cdc"
+    ))]
+    ExpectedChangesModeForChangesStream,
+
+    #[snafu(display(
+        "Refresh mode must be set to `append` to use an append stream. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+    ))]
+    ExpectedAppendModeForAppendStream,
+
+    #[snafu(transparent)]
+    AcceleratedTableError { source: Error },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -350,23 +366,13 @@ impl Builder {
     }
 
     /// Set the changes stream for the accelerated table
-    ///
-    /// # Panics
-    ///
-    /// Panics if the refresh mode isn't `RefreshMode::Changes`.
     pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
-        assert!(self.refresh.mode == RefreshMode::Changes);
         self.changes_stream = Some(changes_stream);
         self
     }
 
     /// Set the append stream for the accelerated table
-    ///
-    /// # Panics
-    ///
-    /// Panics if the refresh mode isn't `RefreshMode::Append`.
     pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
-        assert!(self.refresh.mode == RefreshMode::Append);
         self.append_stream = Some(append_stream);
         self
     }
@@ -438,6 +444,14 @@ impl Builder {
     /// Build the accelerated table
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
+        if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
+            return ExpectedChangesModeForChangesStreamSnafu.fail();
+        }
+
+        if self.refresh.mode != RefreshMode::Append && self.append_stream.is_some() {
+            return ExpectedAppendModeForAppendStreamSnafu.fail();
+        }
+
         let on_complete_notification = Arc::new(Notify::new());
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
@@ -539,7 +553,7 @@ impl Builder {
         }
         refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
 
-        let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+        let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
