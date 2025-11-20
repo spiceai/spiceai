@@ -1502,6 +1502,20 @@
             "string",
             "null"
           ]
+        },
+        "max_stale_while_revalidate": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Maximum duration for which stale results may be served while revalidation is in progress (SWR mode)."
+        },
+        "stale_while_revalidate_ttl": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "TTL for serving stale results while revalidation is happening (SWR mode)."
         }
       },
       "additionalProperties": false
