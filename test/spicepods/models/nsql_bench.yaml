@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: "nsql_benchmark"
+name: 'nsql_benchmark'
 
 default_acceleration: &default_acceleration
   enabled: true
@@ -33,15 +33,27 @@ system_prompt: &system_prompt |
     3. Ensure responses are concise and to the point.
 
 models:
-  - name: o3-mini
-    from: openai:o3-mini-2025-01-31
+  - name: gpt-5
+    from: openai:gpt-5
+    params:
+      spice_tools: auto
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      system_prompt: *system_prompt
+  - name: gpt-5-mini
+    from: openai:gpt-5-mini
+    params:
+      spice_tools: auto
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      system_prompt: *system_prompt
+  - name: o1
+    from: openai:o1-2024-12-17
     params:
       spice_tools: auto
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       openai_reasoning_effort: high
       system_prompt: *system_prompt
-  - name: o1
-    from: openai:o1-2024-12-17
+  - name: o3-mini
+    from: openai:o3-mini-2025-01-31
     params:
       spice_tools: auto
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
@@ -53,35 +65,23 @@ models:
       hf_token: ${ secrets:SPICE_HF_TOKEN }
       spice_tools: auto
       system_prompt: *system_prompt
-  - name: grok2
-    from: xai:grok-2-1212
+  - name: claude-sonnet-4-5
+    from: anthropic:claude-sonnet-4-5
+    params:
+      spice_tools: auto
+      anthropic_api_key: ${ secrets:SPICE_ANTHROPIC_API_KEY }
+      system_prompt: *system_prompt
+  - name: grok3
+    from: xai:grok-3
     params:
       spice_tools: auto
       xai_api_key: ${secrets:SPICE_XAI_API_KEY}
       system_prompt: *system_prompt
-  - name: gpt-4o-mini
-    from: openai:gpt-4o-mini
+  - name: grok4
+    from: xai:grok-4
     params:
       spice_tools: auto
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
-      system_prompt: *system_prompt
-  - name: gpt-4o
-    from: openai:gpt-4o
-    params:
-      spice_tools: auto
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
-      system_prompt: *system_prompt
-  - name: gpt-5
-    from: openai:gpt-5
-    params:
-      spice_tools: auto
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
-      system_prompt: *system_prompt
-  - name: claude-3-5-sonnet
-    from: anthropic:claude-3-5-sonnet-20240620
-    params:
-      spice_tools: auto
-      anthropic_api_key: ${ secrets:SPICE_ANTHROPIC_API_KEY }
+      xai_api_key: ${secrets:SPICE_XAI_API_KEY}
       system_prompt: *system_prompt
 
 evals:

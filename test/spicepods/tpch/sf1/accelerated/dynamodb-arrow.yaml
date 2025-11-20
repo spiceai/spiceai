@@ -14,7 +14,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 8
+      scan_segments: 8
     acceleration: *acceleration
 
   - from: dynamodb:tpch_lineitem
@@ -23,7 +23,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 48
+      scan_segments: 48
     acceleration: *acceleration
 
   - from: dynamodb:tpch_nation
@@ -32,7 +32,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 1
+      scan_segments: 1
     acceleration: *acceleration
 
   - from: dynamodb:tpch_orders
@@ -41,7 +41,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 16
+      scan_segments: 16
     acceleration: *acceleration
 
   - from: dynamodb:tpch_part
@@ -50,7 +50,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 8
+      scan_segments: 8
     acceleration: *acceleration
 
   - from: dynamodb:tpch_partsupp
@@ -59,7 +59,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 16
+      scan_segments: 16
     acceleration: *acceleration
 
   - from: dynamodb:tpch_region
@@ -68,7 +68,7 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 1
+      scan_segments: 1
     acceleration: *acceleration
 
   - from: dynamodb:tpch_supplier
@@ -77,5 +77,5 @@ datasets:
       dynamodb_aws_region: ap-northeast-2
       dynamodb_aws_access_key_id: ${ env:AWS_DYNAMODB_ACCESS_KEY_ID }
       dynamodb_aws_secret_access_key: ${ env:AWS_DYNAMODB_SECRET_ACCESS_KEY }
-      scan_partitions: 4
+      scan_segments: 4
     acceleration: *acceleration
