@@ -186,6 +186,7 @@ fn model2vec(
 }
 
 #[cfg(feature = "bedrock")]
+#[allow(clippy::too_many_lines)]
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
@@ -293,7 +294,9 @@ async fn bedrock(
             });
         }
 
-        let embedding_purpose_str = params.get("embedding_purpose").map(|s| s.expose_secret());
+        let embedding_purpose_str = params
+            .get("embedding_purpose")
+            .map(ExposeSecret::expose_secret);
         let embedding_purpose = embedding_purpose_str
             .map(NovaEmbeddingPurpose::from_str)
             .transpose()
