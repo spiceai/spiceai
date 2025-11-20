@@ -524,9 +524,7 @@ impl Query {
         let cache_key_u64 = cache_key.as_u64();
 
         // Create a background request context that will cache results using the same cache key
-        // Clone cache_key so we can use it later in the closure
-        let background_context =
-            Self::create_background_context(request_context, cache_key.clone());
+        let background_context = Self::create_background_context(request_context, cache_key);
 
         // Clone sql and plan for the async block
         let sql_owned = sql.to_string();
@@ -607,18 +605,15 @@ impl Query {
                 })
                 .await;
 
-            match result {
-                Some(()) => {
-                    // This task was the one that ran the revalidation
-                }
-                None => {
-                    // Another task is already revalidating this key
-                    tracing::debug!(
-                        cache_key = cache_key_u64,
-                        "Background revalidation already in progress for this cache key, skipped"
-                    );
-                    cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
-                }
+            if let Some(()) = result {
+                // This task was the one that ran the revalidation
+            } else {
+                // Another task is already revalidating this key
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation already in progress for this cache key, skipped"
+                );
+                cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             }
         });
     }
@@ -1536,6 +1531,7 @@ mod tests {
             .await;
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_single_in_flight_revalidation() {
         // This test validates that concurrent stale-while-revalidate requests
@@ -1607,14 +1603,13 @@ mod tests {
                 ctx_clone
                     .scope(async move {
                         let result = query.run().await.expect("query should succeed");
-                        tracing::debug!("Request {} got status: {:?}", i, result.cache_status);
+                        tracing::debug!("Request {i} got status: {:?}", result.cache_status);
 
                         // All requests should get stale data
                         assert_eq!(
                             result.cache_status,
                             CacheStatus::CacheStaleWhileRevalidate,
-                            "Request {} should get stale data",
-                            i
+                            "Request {i} should get stale data"
                         );
 
                         let records = result
@@ -1632,8 +1627,7 @@ mod tests {
                                 .expect("must read i64 array")
                                 .value(0),
                             100,
-                            "Request {} should get stale value 100",
-                            i
+                            "Request {i} should get stale value 100"
                         );
                     })
                     .await;
@@ -1645,7 +1639,7 @@ mod tests {
         for (i, handle) in handles.into_iter().enumerate() {
             handle
                 .await
-                .unwrap_or_else(|_| panic!("Request {} should not panic", i));
+                .unwrap_or_else(|_| panic!("Request {i} should not panic"));
         }
 
         // Step 4: Wait for background revalidation to complete (single-in-flight ensures only ONE ran)
