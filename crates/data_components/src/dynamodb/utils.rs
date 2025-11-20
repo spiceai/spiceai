@@ -15,13 +15,13 @@ limitations under the License.
 */
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
+use chrono::{DateTime, FixedOffset};
 use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use std::collections::HashMap;
-use chrono::{DateTime, FixedOffset};
-use util::time_format::format_datetime;
 use std::str::FromStr;
+use util::time_format::format_datetime;
 
 pub fn scalar_to_attribute_value(
     scalar: &ScalarValue,
@@ -36,30 +36,34 @@ pub fn scalar_to_attribute_value(
         ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
         ScalarValue::TimestampMillisecond(Some(timestamp_in_millis), tz_opt) => {
             let Some(dt_utc) = DateTime::from_timestamp_millis(timestamp_in_millis.clone()) else {
-                return Err(DataFusionError::Internal(
-                    format!("Failed to convert timestamp in millis to DateTime: {}", timestamp_in_millis),
-                ));
+                return Err(DataFusionError::Internal(format!(
+                    "Failed to convert timestamp in millis to DateTime: {}",
+                    timestamp_in_millis
+                )));
             };
 
             let dt: DateTime<FixedOffset> = match tz_opt {
                 Some(tz_str) => {
-                    let tz = FixedOffset::from_str(tz_str)
-                        .map_err(|e| DataFusionError::Internal(
-                            format!("Failed to parse TimeZone \"{}\": {}", tz_str, e.to_string()),
-                        ))?;
+                    let tz = FixedOffset::from_str(tz_str).map_err(|e| {
+                        DataFusionError::Internal(format!(
+                            "Failed to parse TimeZone \"{}\": {}",
+                            tz_str,
+                            e.to_string()
+                        ))
+                    })?;
                     dt_utc.with_timezone(&tz)
                 }
                 None => dt_utc.fixed_offset(),
             };
 
             let Some(formatted) = format_datetime(dt, time_format) else {
-                return Err(DataFusionError::Internal(
-                    format!("Failed to parse timestamp. Verify format is valid: \"{}\"", time_format),
-                ))
+                return Err(DataFusionError::Internal(format!(
+                    "Failed to parse timestamp. Verify format is valid: \"{}\"",
+                    time_format
+                )));
             };
 
             Ok(AttributeValue::S(formatted))
-
         }
         ScalarValue::Null => Ok(AttributeValue::Null(true)),
         _ => Err(DataFusionError::NotImplemented(

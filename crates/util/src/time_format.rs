@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, Timelike};
+use chrono::{DateTime, FixedOffset};
 
 /// Format a timestamp using go-style formatting.
 #[must_use]
@@ -19,6 +19,7 @@ pub fn format_datetime(dt: DateTime<FixedOffset>, go_format: &str) -> Option<Str
     Some(formatted)
 }
 
+#[allow(clippy::too_many_lines)]
 fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
     if go_format.is_empty() {
         return None;
@@ -32,7 +33,7 @@ fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
             let mut num_str = ch.to_string();
             while let Some(&next_ch) = chars.peek() {
                 if next_ch.is_ascii_digit() {
-                    num_str.push(chars.next().unwrap());
+                    num_str.push(chars.next().unwrap_or_default());
                 } else {
                     break;
                 }
@@ -92,7 +93,7 @@ fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
             let mut word = ch.to_string();
             while let Some(&next_ch) = chars.peek() {
                 if next_ch.is_ascii_alphabetic() {
-                    word.push(chars.next().unwrap());
+                    word.push(chars.next().unwrap_or_default());
                 } else {
                     break;
                 }
@@ -182,7 +183,7 @@ fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, TimeZone, Utc};
+    use chrono::{FixedOffset, TimeZone, Timelike, Utc};
 
     /// Helper to create a DateTime<FixedOffset> in UTC
     fn make_utc(

@@ -117,12 +117,7 @@ impl DynamoDBTableSchema {
             Expr::Column(col) => {
                 let field = self.table_schema.field_with_name(&col.name);
                 field
-                    .map(|f| {
-                        matches!(
-                            f.data_type(),
-                            &arrow::datatypes::DataType::Timestamp(_, _)
-                        )
-                    })
+                    .map(|f| matches!(f.data_type(), &arrow::datatypes::DataType::Timestamp(_, _)))
                     .unwrap_or(false)
             }
             _ => false,
@@ -423,13 +418,17 @@ mod tests {
     fn test_timestamp_filter_pushdown() {
         let schema = create_test_schema();
 
-        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)));
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1725366896155),
+            None,
+        )));
         let filters = vec![&f1];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
 
-        let f2 = lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)).eq(col("created_at"));
+        let f2 =
+            lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)).eq(col("created_at"));
         let filters = vec![&f2];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 1);
@@ -440,7 +439,10 @@ mod tests {
     fn test_timestamp_filter_pushdown_complex() {
         let schema = create_test_schema();
 
-        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)));
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1725366896155),
+            None,
+        )));
         let f2 = col("age").eq(lit(25i64)).and(f1);
         let f3 = col("name").eq(lit("John"));
 

@@ -191,7 +191,11 @@ impl DataConnector for DynamoDB {
             }
         };
 
-        let time_format = self.params.get("time_format").expose().unwrap_or_else(|_| DEFAULT_TIME_FORMAT);
+        let time_format = self
+            .params
+            .get("time_format")
+            .expose()
+            .unwrap_or_else(|_| DEFAULT_TIME_FORMAT);
 
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),
@@ -200,7 +204,6 @@ impl DataConnector for DynamoDB {
             schema_infer_max_records,
             config_segments,
             time_format.to_string(),
-
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
