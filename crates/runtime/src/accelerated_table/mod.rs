@@ -204,6 +204,7 @@ pub struct AcceleratedTable {
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
+    #[allow(dead_code)]
     io_runtime: Handle,
 }
 
