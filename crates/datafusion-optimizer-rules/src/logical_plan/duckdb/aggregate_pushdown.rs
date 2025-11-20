@@ -1,7 +1,7 @@
 use crate::concrete;
-use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, DataFusionError};
+use datafusion::common::{Result, plan_err};
 use datafusion::datasource::source_as_provider;
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion_expr::expr::AggregateFunction;
@@ -256,7 +256,9 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        assert_eq!(inputs.len(), 1, "DuckDBAggregatePushdownNode is unary");
+        if inputs.len() != 1 {
+            return plan_err!("DuckDBAggregatePushdownNode expects exactly one input");
+        }
         Ok(DuckDBAggregatePushdownNode {
             input_plan: inputs[0].clone(),
         })

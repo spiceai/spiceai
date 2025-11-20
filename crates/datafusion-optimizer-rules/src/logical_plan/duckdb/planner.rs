@@ -28,11 +28,9 @@ impl ExtensionPlanner for DuckDBLogicalExtensionPlanner {
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(logical_marker) = node.as_any().downcast_ref::<DuckDBAggregatePushdownNode>() {
-            assert_eq!(
-                physical_inputs.len(),
-                1,
-                "DuckDBAggregatePushdownNode is unary"
-            );
+            if physical_inputs.len() != 1 {
+                unreachable!("DuckDBAggregatePushdownNode expects exactly one input")
+            }
             Ok(Some(DuckDBAggregatePushdownMarkerExec::new(
                 logical_marker.input_plan.clone(),
                 Arc::clone(&physical_inputs[0]),
