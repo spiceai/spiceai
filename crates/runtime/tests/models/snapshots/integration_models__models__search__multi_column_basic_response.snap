@@ -9,40 +9,40 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 3 are in 18?"
+        "answer": "\n2."
       },
       "primary_key": {
-        "id": 463
+        "id": 612
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "primary_key": {
-        "id": 1277
+        "id": 361
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+        "question": "How many groups of 2 are in 14?"
       },
       "primary_key": {
-        "id": 948
+        "id": 462
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 5 are in 25?"
+        "answer": " is 2."
       },
       "primary_key": {
-        "id": 464
+        "id": 349
       },
       "score": 0.01
     }
