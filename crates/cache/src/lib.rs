@@ -192,7 +192,7 @@ mod blake3_compat {
 
     impl Hasher for Blake3Wrapper {
         fn finish(&self) -> u64 {
-            let hash = self.hasher.finalize();
+            let hash = self.hasher.clone().finalize();
             let bytes = hash.as_bytes();
             u64::from_le_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
