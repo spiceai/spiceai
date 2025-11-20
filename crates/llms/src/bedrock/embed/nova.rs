@@ -53,7 +53,13 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
         let embeddings: Vec<Vec<f32>> = resp.embeddings.into_iter().map(|e| e.embedding).collect();
 
         // Nova doesn't return token count, so we estimate it
-        let total_chars: u32 = embeddings.len() as u32 * self.dimensions;
+        let total_chars: u32 =
+            u32::try_from(embeddings.len()).map_err(|e| EmbedError::FailedToExtractEmbeddings {
+                message: format!(
+                    "Too many embeddings ({}) in single request",
+                    embeddings.len()
+                ),
+            })? * self.dimensions;
         let estimated_tokens = total_chars / 4; // Rough estimate: 4 chars per token
 
         Ok((embeddings, estimated_tokens))
@@ -123,7 +129,7 @@ impl FromStr for NovaEmbeddingPurpose {
             "AUDIO_RETRIEVAL" => Ok(NovaEmbeddingPurpose::AudioRetrieval),
             "CLASSIFICATION" => Ok(NovaEmbeddingPurpose::Classification),
             "CLUSTERING" => Ok(NovaEmbeddingPurpose::Clustering),
-            _ => Err(format!("Invalid NovaEmbeddingPurpose: {}", s)),
+            _ => Err(format!("Invalid NovaEmbeddingPurpose: {s}")),
         }
     }
 }
