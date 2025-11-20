@@ -17314,6 +17314,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "backoff",
+ "chrono",
  "ctrlc",
  "datafusion",
  "humantime",

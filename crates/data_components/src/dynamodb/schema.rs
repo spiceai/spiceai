@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::{Error, Result};
+use crate::dynamodb::timestamp_utils::{parse_iso8601_timestamp, parse_naive_timestamp};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
@@ -69,9 +70,13 @@ fn infer_dynamodb_type(value: &AttributeValue) -> Result<DataType> {
     Ok(match value {
         AttributeValue::Bool(_) => DataType::Boolean,
         AttributeValue::S(s) => {
-            // Try to detect temporal types
-            if is_iso8601_timestamp(s) {
-                DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC")))
+            if let Some(ts) = parse_iso8601_timestamp(s) {
+                DataType::Timestamp(
+                    TimeUnit::Millisecond,
+                    Some(Arc::from(ts.offset().to_string())),
+                )
+            } else if parse_naive_timestamp(s).is_some() {
+                DataType::Timestamp(TimeUnit::Millisecond, None)
             } else if is_date_yyyy_mm_dd(s) {
                 DataType::Date32
             } else {
@@ -198,13 +203,6 @@ fn unify_struct_fields(fields1: &Fields, fields2: &Fields) -> DataType {
     result_fields.sort_by(|a, b| a.name().cmp(b.name()));
 
     DataType::Struct(Fields::from(result_fields))
-}
-
-fn is_iso8601_timestamp(s: &str) -> bool {
-    // Try parsing as ISO8601 timestamp
-    // Handles formats like: 2023-08-31T12:34:56Z, 2023-08-31T12:34:56.123Z, 2023-08-31T12:34:56+00:00
-    chrono::DateTime::parse_from_rfc3339(s).is_ok()
-        || s.parse::<chrono::DateTime<chrono::Utc>>().is_ok()
 }
 
 fn is_date_yyyy_mm_dd(s: &str) -> bool {
@@ -428,29 +426,6 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn test_map_types() {
-    //     let mut inner_map = HashMap::new();
-    //     inner_map.insert("name".to_string(), av_string("Alice"));
-    //     inner_map.insert("age".to_string(), av_number("30"));
-    //
-    //     let mut item = HashMap::new();
-    //     item.insert("user".to_string(), AttributeValue::M(inner_map));
-    //     item.insert("metadata".to_string(), AttributeValue::M(HashMap::new()));
-    //
-    //     let items = vec![item];
-    //     let schema = infer_arrow_schema_from_items(&items).expect("schema");
-    //     let field_map: HashMap<String, &DataType> = schema
-    //         .fields()
-    //         .iter()
-    //         .map(|f| (f.name().clone(), f.data_type()))
-    //         .collect();
-    //
-    //     // Maps should be treated as strings (JSON) by default
-    //     assert_eq!(field_map.get("user"), Some(&&DataType::Utf8));
-    //     assert_eq!(field_map.get("metadata"), Some(&&DataType::Utf8));
-    // }
-
     #[test]
     fn test_type_unification_numeric_promotion_int_to_float() {
         let mut item1 = HashMap::new();
@@ -643,10 +618,15 @@ mod tests {
         let schema = infer_arrow_schema_from_items(&items).expect("schema");
         let created_at_field = schema.field_with_name("created_at").expect("arrow schema");
 
-        assert!(matches!(
-            created_at_field.data_type(),
-            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
-        ));
+        let tz = Some(Arc::from("+00:00"));
+        let dt = created_at_field.data_type();
+
+        match dt {
+            DataType::Timestamp(TimeUnit::Millisecond, actual_tz) => {
+                assert_eq!(actual_tz, &tz);
+            }
+            _ => panic!("Unexpected data type!"),
+        }
     }
 
     #[test]
@@ -654,7 +634,7 @@ mod tests {
         let items = vec![
             HashMap::from([(
                 "event_time".to_string(),
-                av_string("2023-08-31T12:34:56+00:00"),
+                av_string("2023-08-31T12:34:56-05:00"),
             )]),
             HashMap::from([(
                 "event_time".to_string(),
@@ -665,9 +645,32 @@ mod tests {
         let schema = infer_arrow_schema_from_items(&items).expect("schema");
         let event_time_field = schema.field_with_name("event_time").expect("arrow schema");
 
+        let tz = Some(Arc::from("-05:00"));
+        let dt = event_time_field.data_type();
+
+        match dt {
+            DataType::Timestamp(TimeUnit::Millisecond, actual_tz) => {
+                assert_eq!(actual_tz, &tz);
+            }
+            _ => panic!("Unexpected data type!"),
+        }
+    }
+
+    #[test]
+    fn test_naive_timestamp_detection() {
+        let items = vec![
+            HashMap::from([("event_time".to_string(), av_string("2023-08-31T12:34:56"))]),
+            HashMap::from([("event_time".to_string(), av_string("2024-01-15T08:22:11"))]),
+        ];
+
+        let schema = infer_arrow_schema_from_items(&items).expect("schema");
+        let event_time_field = schema.field_with_name("event_time").expect("arrow schema");
+
+        let dt = event_time_field.data_type();
+
         assert!(matches!(
-            event_time_field.data_type(),
-            DataType::Timestamp(TimeUnit::Millisecond, Some(_))
+            dt,
+            DataType::Timestamp(TimeUnit::Millisecond, None)
         ));
     }
 

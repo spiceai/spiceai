@@ -50,6 +50,7 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
+const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
@@ -74,6 +75,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("scan_segments")
         .description("Number of segments. 'auto' by default.")
         .default(SEGMENTS_AUTO_STR),
+    ParameterSpec::runtime("time_format")
+        .description("Go-style time format used to formatting timestamps for filter pushdown.")
+        .default(DEFAULT_TIME_FORMAT),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -187,12 +191,16 @@ impl DataConnector for DynamoDB {
             }
         };
 
+        let time_format = self.params.get("time_format").expose().unwrap_or_else(|_| DEFAULT_TIME_FORMAT);
+
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),
             Arc::from(table_name),
             unnest_depth,
             schema_infer_max_records,
             config_segments,
+            time_format.to_string(),
+
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {

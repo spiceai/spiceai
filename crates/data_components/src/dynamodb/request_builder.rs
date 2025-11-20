@@ -435,10 +435,12 @@ fn try_extract_key_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
     use aws_sdk_dynamodb::types::AttributeValue;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
     use std::sync::Arc;
+    use datafusion::common::ScalarValue;
 
     fn create_test_schema() -> DynamoDBTableSchema {
         let schema = Arc::new(Schema::new(vec![
@@ -448,6 +450,11 @@ mod tests {
             Field::new("age", DataType::Int64, true),
             Field::new("active", DataType::Boolean, true),
             Field::new("user.email", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
         ]));
 
         let mut flattened_fields = HashSet::new();
@@ -459,6 +466,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             flattened_fields,
+            Some("2006-01-02T15:04:05.000Z07:00".to_string()),
         )
     }
 
@@ -1044,6 +1052,7 @@ mod tests {
             "id".to_string(),
             None, // No sort key
             HashSet::new(),
+            None,
         );
 
         let builder = DynamoDBRequestPlanBuilder::new(table_schema);
@@ -1399,6 +1408,58 @@ mod tests {
                 .expect("expr_to_filter_string");
             assert!(result.contains(expected_str));
         }
+    }
+
+    #[test]
+    fn test_filter_with_timestamp_string_comparison() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filter = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)));
+        let (expr, values) = builder.build_filter_expression(&[filter]);
+        assert_eq!(expr, "(#created_at > :v0)");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+
+        let filter = lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)).eq(col("created_at"));
+        let (expr, values) = builder.build_filter_expression(&[filter]);
+        assert_eq!(expr, "(:v0 = #created_at)");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_filter_with_timestamp_string_comparison_complex() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)));
+        let f2 = col("age").eq(lit(25)).and(f1);
+        let f3 = col("name").eq(lit("John"));
+        let (expr, values) = builder.build_filter_expression(&[f2, f3]);
+        assert_eq!(
+            expr,
+            "((#age = :v0) AND (#created_at > :v1)) AND (#name = :v2)"
+        );
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::N("25".to_string()))
+        );
+        assert_eq!(
+            values.get(":v1"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+        assert_eq!(
+            values.get(":v2"),
+            Some(&AttributeValue::S("John".to_string()))
+        );
     }
 
     #[test]
