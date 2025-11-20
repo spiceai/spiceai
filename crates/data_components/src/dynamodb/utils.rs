@@ -45,8 +45,7 @@ pub fn scalar_to_attribute_value(
                 Some(tz_str) => {
                     let tz = FixedOffset::from_str(tz_str).map_err(|e| {
                         DataFusionError::Internal(format!(
-                            "Failed to parse TimeZone \"{}\": {}",
-                            tz_str, e
+                            "Failed to parse TimeZone \"{tz_str}\": {e}"
                         ))
                     })?;
                     dt_utc.with_timezone(&tz)

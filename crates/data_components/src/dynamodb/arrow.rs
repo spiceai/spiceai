@@ -26,7 +26,6 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::NaiveDate;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use util::time_format::{ParsedDateTime, parse_datetime};
 
 pub fn dynamodb_items_to_arrow(
@@ -422,7 +421,7 @@ fn append_value_to_builder(
                     if let Some(ts) = parse_datetime(s, time_format) {
                         match ts {
                             ParsedDateTime::Naive(ts) => {
-                                b.append_value(ts.and_utc().timestamp_millis())
+                                b.append_value(ts.and_utc().timestamp_millis());
                             }
                             ParsedDateTime::WithOffset(ts) => b.append_value(ts.timestamp_millis()),
                         }
