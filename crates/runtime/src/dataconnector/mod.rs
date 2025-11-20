@@ -51,6 +51,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
+use tracing::Level;
 
 use std::future::Future;
 
@@ -597,6 +598,13 @@ pub async fn get_data(
 
     for filter in filters {
         df = df.filter(filter).map_err(find_datafusion_root)?;
+    }
+
+    if tracing::enabled!(Level::DEBUG)
+        && let Ok(explained) = df.clone().explain(false, false)
+        && let Ok(explained) = explained.to_string().await
+    {
+        tracing::debug!("Data refresh plan for {}:\n{}", table_name, explained);
     }
 
     let sql = Unparser::default()

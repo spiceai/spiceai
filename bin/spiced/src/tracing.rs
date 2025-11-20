@@ -85,7 +85,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "datafusion",
 ];
 
-const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
+const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {

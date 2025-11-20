@@ -563,6 +563,26 @@ impl Runtime {
         self.datasets_health_monitor.clone()
     }
 
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
@@ -683,26 +703,32 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let auth = endpoint_auth
-            .http_auth
-            .clone()
-            .unwrap_or_else(|| Arc::new(auth::no_auth::NoAuth));
+        let (auth, has_auth) = match endpoint_auth.http_auth.clone() {
+            Some(auth) => (auth, true),
+            None => (
+                Arc::new(auth::no_auth::NoAuth) as Arc<dyn runtime_auth::HttpAuth + Send + Sync>,
+                false,
+            ),
+        };
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
-        let http_future = self.start_runtime_task(
-            HTTP_SERVER,
-            Some(http_shutdown.clone()),
-            http::start(
-                cloned_config.http_bind_address,
-                self_ref,
-                cloned_config.into(),
-                cloned_tls_config,
-                auth,
-                Some(http_shutdown),
+        let http_future = self
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
+                http::start(
+                    cloned_config.http_bind_address,
+                    self_ref,
+                    cloned_config.into(),
+                    cloned_tls_config,
+                    auth,
+                    has_auth,
+                    Some(http_shutdown),
+                )
+                .map_err(Error::from),
             )
-            .map_err(Error::from),
-        );
+            .map_err(Error::from);
 
         // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;

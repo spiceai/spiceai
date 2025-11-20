@@ -129,7 +129,9 @@ impl MemTable {
             return Ok(());
         }
         // Keep track of uniquness of rows per constraint.
-        let mut constraint_keys: Vec<HashSet<_>> = Vec::with_capacity(constraints.iter().len());
+        let mut constraint_keys: Vec<
+            HashSet<String, std::hash::BuildHasherDefault<twox_hash::XxHash3_64>>,
+        > = Vec::with_capacity(constraints.iter().len());
         for b in &self.batches {
             let p = &*b.read().await;
             let p: Vec<_> = p.iter().collect();
@@ -138,16 +140,15 @@ impl MemTable {
                     Constraint::PrimaryKey(pk) => {
                         let pks = primary_key_identifier(&p, pk)?;
                         check_and_filter_non_null_unique_primary_keys::<
-                            std::collections::hash_map::RandomState,
+                            std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
                         >(&pks, constraint_keys.get(i))?
                     }
                     Constraint::Unique(u) => {
                         let ids = constraint_identifiers(&p, u)?;
                         let as_str: Vec<_> = ids.iter().map(String::as_str).collect();
-                        check_and_filter_unique_constraint::<std::collections::hash_map::RandomState>(
-                            &as_str,
-                            constraint_keys.get(i),
-                        )?
+                        check_and_filter_unique_constraint::<
+                            std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
+                        >(&as_str, constraint_keys.get(i))?
                     }
                 };
                 // Keep track of ids to ensure uniqueness across all partitions.
@@ -902,12 +903,13 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
-        let mut new_key_set: HashSet<String> = HashSet::new();
+        let mut new_key_set: HashSet<String, std::hash::BuildHasherDefault<twox_hash::XxHash3_64>> =
+            HashSet::default();
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
             new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::collections::hash_map::RandomState,
+                std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
             >(&new_primary_key_ids, None)?;
         }
 
@@ -929,7 +931,7 @@ impl DataSink for MemSink {
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
                             let _ = check_and_filter_non_null_unique_primary_keys::<
-                                std::collections::hash_map::RandomState,
+                                std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
                             >(&batch_pks, Some(&new_key_set))?;
                         }
                     }

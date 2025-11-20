@@ -21,11 +21,14 @@ use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{CreateExternalTable, ExprSchemable, TableProviderFilterPushDown};
+use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_table_partition::Partition;
+use runtime_table_partition::creator::filename::{
+    encode_key, parse_partition_value, to_hive_partition_dir,
+};
 use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -908,34 +911,14 @@ impl CayennePartitionCreator {
         format!("{}_{}", self.table_name, partition_value)
     }
 
-    fn partition_data_type(&self) -> Result<DataType, creator::Error> {
-        if let Ok(field) = self.schema.field_with_name(self.partition_column_label()) {
-            return Ok(field.data_type().clone());
-        }
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).map_err(|e| {
-            creator::Error::InferringPartitions {
-                source: Box::new(e),
-            }
-        })?;
-
-        self.partition_by
-            .expression
-            .data_type_and_nullable(&df_schema)
-            .map(|(data_type, _)| data_type)
-            .map_err(|e| creator::Error::InferringPartitions {
-                source: Box::new(e),
-            })
-    }
-
     /// Generate partition directory path from partition value
-    fn partition_dir(&self, partition_value: &ScalarValue) -> PathBuf {
-        let partition_str = partition_value.to_string();
-        let partition_column_name = self.partition_column_label();
-
-        // Use Hive-style partitioning: partition_column=value
-        let partition_name = format!("{partition_column_name}={partition_str}");
-        self.base_path.join(partition_name)
+    fn partition_dir(&self, partition_value: &ScalarValue) -> Result<PathBuf, creator::Error> {
+        let partition_dir =
+            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])
+                .map_err(|e| creator::Error::CreatePartition {
+                    source: Box::new(e),
+                })?;
+        Ok(self.base_path.join(partition_dir))
     }
 }
 
@@ -945,7 +928,7 @@ impl PartitionCreator for CayennePartitionCreator {
         &self,
         partition_value: ScalarValue,
     ) -> Result<Partition, creator::Error> {
-        let partition_dir = self.partition_dir(&partition_value);
+        let partition_dir = self.partition_dir(&partition_value)?;
         let partition_path = partition_dir.to_string_lossy().to_string();
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
@@ -956,7 +939,10 @@ impl PartitionCreator for CayennePartitionCreator {
         })?;
 
         // Create partition metadata in catalog
-        let partition_value_str = partition_value.to_string();
+        let partition_value_str =
+            encode_key(&partition_value).map_err(|e| creator::Error::CreatePartition {
+                source: Box::new(e),
+            })?;
         let partition_column_name = self.partition_column_label().to_string();
 
         let partition_metadata = cayenne::PartitionMetadata {
@@ -1016,13 +1002,18 @@ impl PartitionCreator for CayennePartitionCreator {
 
         let mut result = Vec::new();
 
-        let partition_data_type = self.partition_data_type()?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).map_err(|e| {
+            creator::Error::InferringPartitions {
+                source: Box::new(e),
+            }
+        })?;
 
         for partition_meta in partitions {
-            // Parse partition value
-            let partition_value = ScalarValue::try_from_string(
-                partition_meta.partition_value.clone(),
-                &partition_data_type,
+            // Parse partition value using proper NULL handling
+            let partition_value = parse_partition_value(
+                &df_schema,
+                &self.partition_by,
+                &partition_meta.partition_value,
             )
             .map_err(|e| creator::Error::InferringPartitions {
                 source: Box::new(e),
@@ -1053,11 +1044,35 @@ impl PartitionCreator for CayennePartitionCreator {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Cayenne doesn't support filter pushdown yet, but partition pruning works
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        // Partition pruning works for filters on partition columns, even though
+        // Cayenne doesn't have native filter pushdown to the storage layer
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+
+        let partition_columns = self.partition_by.expression.column_refs();
+
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                let filter_columns = filter.column_refs();
+
+                // Check if filter columns match partition columns (ignoring table qualifiers)
+                // Both `order_date` and `table.order_date` should match partition column `order_date`
+                let matches_partition_cols = filter_columns.is_empty()
+                    || filter_columns.iter().all(|filter_col| {
+                        partition_columns
+                            .iter()
+                            .any(|part_col| filter_col.name == part_col.name)
+                    });
+
+                // If filter references partition columns or contains the partition expression,
+                // it can be used for partition pruning
+                if matches_partition_cols {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 }
 

@@ -137,7 +137,7 @@ impl McpToolCatalog {
 
                 // Security: Validate command path to prevent command injection
                 if DANGEROUS_PATH_GLOB_SET.is_match(command) {
-                    return Err(super::Error::CouldNotConstructTool {
+                    return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
                             "Invalid command path '{command}'. Path contains dangerous components"
@@ -147,7 +147,7 @@ impl McpToolCatalog {
 
                 // Security: Limit number of arguments to prevent resource exhaustion
                 if args.len() > MAX_ARGS {
-                    return Err(super::Error::CouldNotConstructTool {
+                    return Err(Error::CouldNotConstructTool {
                         name: "mcp_stdio".to_string(),
                         e: format!(
                             "Too many arguments ({}). Maximum allowed: {MAX_ARGS}",
@@ -159,7 +159,7 @@ impl McpToolCatalog {
                 // Security: Validate argument lengths to prevent buffer overflow attacks
                 for (i, arg) in args.iter().enumerate() {
                     if arg.len() > MAX_ARG_LENGTH {
-                        return Err(super::Error::CouldNotConstructTool {
+                        return Err(Error::CouldNotConstructTool {
                             name: "mcp_stdio".to_string(),
                             e: format!(
                                 "Argument {i} too long ({} bytes). Maximum allowed: {MAX_ARG_LENGTH} bytes",
@@ -186,7 +186,7 @@ impl McpToolCatalog {
             MCPConfig::Https { url } => {
                 // Security: Validate URL scheme (only https allowed, http for localhost testing)
                 if url.scheme() != "https" && url.scheme() != "http" {
-                    return Err(super::Error::CouldNotConstructTool {
+                    return Err(Error::CouldNotConstructTool {
                         name: "mcp_https".to_string(),
                         e: format!(
                             "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
