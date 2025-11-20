@@ -24,7 +24,10 @@ use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::{
     self,
-    embed::cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
+    embed::{
+        cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate, CohereEmbeddingType},
+        nova::{NovaEmbeddingPurpose, NovaTruncationMode},
+    },
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
@@ -183,6 +186,7 @@ fn model2vec(
 }
 
 #[cfg(feature = "bedrock")]
+#[allow(clippy::too_many_lines)]
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
@@ -234,28 +238,29 @@ async fn bedrock(
             bedrock::embed::new_titan_v2(client, normalize, dimensions).set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
-        let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
+        let truncate = if let Some(truncate_str) =
+            extract_secret!(params, "truncate_mode").or(extract_secret!(params, "truncate"))
+        {
             CohereEmbeddingTruncate::from_str(truncate_str)
                 .boxed()
                 .map_err(|e| EmbedError::InvalidParamError {
-                    param_key: "truncate",
+                    param_key: "truncate_mode",
                     value: truncate_str.to_string(),
                     reason: e.to_string(),
                 })?
         } else {
             CohereEmbeddingTruncate::default()
         };
-        let input_type = if let Some(input_type_str) = extract_secret!(params, "input_type") {
-            CohereEmbeddingInputType::from_str(input_type_str).map_err(|e| {
-                EmbedError::InvalidParamError {
-                    param_key: "input_type",
-                    value: input_type_str.to_string(),
-                    reason: e.to_string(),
-                }
+        let input_type_str = extract_secret!(params, "input_type");
+        let input_type = input_type_str
+            .map(CohereEmbeddingInputType::from_str)
+            .transpose()
+            .map_err(|e| EmbedError::InvalidParamError {
+                param_key: "input_type",
+                value: input_type_str.unwrap_or_default().to_string(),
+                reason: e.to_string(),
             })?
-        } else {
-            CohereEmbeddingInputType::default()
-        };
+            .unwrap_or_default();
         Ok(Arc::new(
             bedrock::embed::new_cohere(
                 client,
@@ -263,6 +268,66 @@ async fn bedrock(
                 truncate,
                 input_type,
                 CohereEmbeddingType::Float,
+            )
+            .set_cache(embeddings_cache),
+        ) as Arc<dyn Embed>)
+    } else if model_id.starts_with("amazon.nova-2-multimodal-embeddings") {
+        let Some(dimensions) = params
+            .get("dimensions")
+            .map(|s| s.expose_secret().parse::<u32>())
+            .transpose()
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
+            })?
+        else {
+            return Err(EmbedError::MissingParamError {
+                param_key: "dimensions",
+            });
+        };
+
+        if !matches!(dimensions, 256 | 384 | 1024 | 3072) {
+            return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!(
+                    "Invalid dimensions '{dimensions}' for Nova model. Must be 256, 384, 1024, or 3072"
+                )
+                .into(),
+            });
+        }
+
+        let embedding_purpose_str = params
+            .get("embedding_purpose")
+            .map(ExposeSecret::expose_secret);
+        let embedding_purpose = embedding_purpose_str
+            .map(NovaEmbeddingPurpose::from_str)
+            .transpose()
+            .map_err(|_| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!(
+                    "Invalid 'embedding_purpose' parameter: '{}'",
+                    embedding_purpose_str.unwrap_or_default()
+                )
+                .into(),
+            })?
+            .unwrap_or_default();
+
+        let truncate = if let Some(truncate_str) =
+            extract_secret!(params, "truncate_mode").or(extract_secret!(params, "truncate"))
+        {
+            NovaTruncationMode::from_str(truncate_str)
+                .boxed()
+                .map_err(|e| EmbedError::InvalidParamError {
+                    param_key: "truncate_mode",
+                    value: truncate_str.to_string(),
+                    reason: e.to_string(),
+                })?
+        } else {
+            NovaTruncationMode::default()
+        };
+        Ok(Arc::new(
+            bedrock::embed::new_text_only_nova_multimodal(
+                client,
+                dimensions,
+                embedding_purpose,
+                truncate,
             )
             .set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
