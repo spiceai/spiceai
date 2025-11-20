@@ -310,7 +310,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "serde",
  "snafu",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2214,7 +2214,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2698,14 +2698,18 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "async-compression",
  "async-openai",
  "async-stream",
  "async-trait",
+ "blake3",
  "byte-unit",
+ "bytes",
+ "criterion 0.7.0",
  "datafusion",
  "fundu",
  "futures",
@@ -3189,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "snafu",
  "text-splitter",
@@ -4107,7 +4111,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4188,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4698,7 +4702,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-stream",
@@ -4715,6 +4719,7 @@ dependencies = [
  "object_store",
  "r2d2",
  "runtime-datafusion",
+ "snafu",
  "tracing",
  "url",
 ]
@@ -4929,7 +4934,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=5394b17d6ac668db14ab02dcbc0c30fefbf3b790#5394b17d6ac668db14ab02dcbc0c30fefbf3b790"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=ec122b03325b86e8f5f194292419f73d26ba7d52#ec122b03325b86e8f5f194292419f73d26ba7d52"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4980,7 +4985,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5297,7 +5302,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5361,7 +5366,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -5684,7 +5689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5752,7 +5757,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "futures",
  "snafu",
@@ -6030,7 +6035,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6045,7 +6050,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6058,7 +6063,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -6082,7 +6087,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -7477,7 +7482,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -8077,7 +8082,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8685,7 +8690,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -9494,7 +9499,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -9508,9 +9513,11 @@ dependencies = [
  "serde_json",
  "snafu",
  "spicepod",
+ "tokio",
  "tracing",
  "tract-core",
  "tract-onnx",
+ "util",
 ]
 
 [[package]]
@@ -10003,7 +10010,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "snafu",
  "tokio",
@@ -10027,7 +10034,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10910,7 +10917,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -10921,7 +10928,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "clap",
  "opentelemetry-proto",
@@ -10990,7 +10997,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -11114,7 +11121,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "chunking",
@@ -12137,7 +12144,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.35",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -12174,9 +12181,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12846,7 +12853,7 @@ dependencies = [
 [[package]]
 name = "rmcp"
 version = "0.1.5"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=ec71bd9b735c87cc903c33ed643a04bfd661273e#ec71bd9b735c87cc903c33ed643a04bfd661273e"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a66f66ae345a0fafde1e2ee496ec137d77aef82a#a66f66ae345a0fafde1e2ee496ec137d77aef82a"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -12878,7 +12885,7 @@ dependencies = [
 [[package]]
 name = "rmcp-macros"
 version = "0.1.5"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=ec71bd9b735c87cc903c33ed643a04bfd661273e#ec71bd9b735c87cc903c33ed643a04bfd661273e"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a66f66ae345a0fafde1e2ee496ec137d77aef82a#a66f66ae345a0fafde1e2ee496ec137d77aef82a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12989,7 +12996,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -13152,6 +13159,7 @@ dependencies = [
  "tracing-subscriber",
  "tract-core",
  "turso",
+ "twox-hash",
  "url",
  "util",
  "utoipa",
@@ -13165,7 +13173,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -13193,7 +13201,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "futures",
  "num_cpus",
@@ -13204,7 +13212,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "axum",
@@ -13219,7 +13227,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -13232,25 +13240,27 @@ dependencies = [
  "futures",
  "opentelemetry 0.27.1",
  "runtime-request-context",
+ "snafu",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
  "futures",
  "itertools 0.14.0",
+ "snafu",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -13273,7 +13283,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13297,7 +13307,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -13322,7 +13332,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "futures",
  "governor",
@@ -13333,7 +13343,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "async-trait",
@@ -13353,7 +13363,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -13381,7 +13391,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -13578,7 +13588,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13731,7 +13741,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13743,7 +13753,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -13845,7 +13855,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
@@ -13994,7 +14004,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14697,7 +14707,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14741,7 +14751,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14777,7 +14787,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -14798,8 +14808,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spicepod-validator"
+version = "1.10.0-unstable"
+dependencies = [
+ "app",
+ "clap",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
 name = "spicepodschema"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "schemars 1.1.0",
  "serde_json",
@@ -14808,7 +14828,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "clap",
  "runtime",
@@ -15569,7 +15589,7 @@ checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
 name = "telemetry"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -15593,7 +15613,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -15656,7 +15676,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -15665,6 +15685,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "datafusion",
  "duckdb",
  "flight_client",
  "futures",
@@ -15698,7 +15719,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
@@ -15784,7 +15805,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.0",
+ "hashbrown 0.15.5",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark",
@@ -16037,7 +16058,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "secrecy",
  "snafu",
@@ -16404,7 +16425,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -16458,6 +16479,7 @@ dependencies = [
  "futures-util",
  "http 1.3.1",
  "http-body 1.0.1",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tower 0.5.2",
@@ -16480,7 +16502,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -17312,14 +17334,16 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
  "backoff",
  "ctrlc",
+ "datafusion",
  "humantime",
  "rand 0.9.2",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -18410,7 +18434,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -18992,7 +19016,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 dependencies = [
  "async-openai",
  "async-trait",

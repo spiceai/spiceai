@@ -161,7 +161,8 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
     )
     .build();
 
-    let (start_refresh, mut on_refresh_complete) = runner.start();
+    let (start_refresh, mut on_refresh_complete) =
+        runner.start().expect("Should start refresh task");
 
     start_refresh.send(None).await.map_err(|e| e.to_string())?;
 

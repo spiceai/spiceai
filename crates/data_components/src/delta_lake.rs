@@ -77,6 +77,11 @@ pub enum Error {
         "Failed to plan or execute a Delta Lake table due to the following error: {source}"
     ))]
     DeltaTableExecutionError { source: DataFusionError },
+
+    #[snafu(display(
+        "Invalid Delta Lake Table partition value count. The PartitionedFile has a different number of partition values than the number of partition columns."
+    ))]
+    InvalidPartitionValueCount,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

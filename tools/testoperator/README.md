@@ -290,9 +290,9 @@ Run model evaluations (evals) test. In addition to the common options, supports 
 
 ### Running Vector Search Tests
 
-Running vector search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
 
-`testoperator run vector-search [OPTIONS]`
+`testoperator run search [OPTIONS]`
 
 ### Running Append Tests
 

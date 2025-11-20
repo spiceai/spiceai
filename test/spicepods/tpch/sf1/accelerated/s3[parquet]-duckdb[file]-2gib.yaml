@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-duckdb[file]
+name: s3[parquet]-duckdb[file]-2gib
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer.parquet
     name: customer

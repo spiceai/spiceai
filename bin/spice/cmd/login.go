@@ -604,6 +604,11 @@ func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConf
 		slog.Error(fmt.Sprintf("Error writing %s file", env_file), "error", err)
 		os.Exit(1)
 	}
+
+	if err := os.Chmod(env_file, 0600); err != nil {
+		slog.Error("failed to set file permissions", "file", env_file, "error", err)
+		os.Exit(1)
+	}
 }
 
 func init() {

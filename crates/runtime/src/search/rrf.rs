@@ -842,7 +842,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "https://github.com/spiceai/spiceai/issues/7861"] // For some reason, BytesProcessedExec is failing to acquire a RequestContext even though the other RRF tests do fine
+    // #[ignore = "https://github.com/spiceai/spiceai/issues/7861"] // For some reason, BytesProcessedExec is failing to acquire a RequestContext even though the other RRF tests do fine
     // https://github.com/spiceai/spiceai/issues/7861
     async fn test_recency_scoring() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;

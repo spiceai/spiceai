@@ -59,7 +59,8 @@ pub(crate) async fn start<A>(
     rt: Arc<Runtime>,
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
-    auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
+    auth_provider: Arc<dyn HttpAuth + Send + Sync>,
+    has_auth: bool,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -74,13 +75,12 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    let routes = routes::routes(
-        &rt,
-        config,
-        vsearch,
-        auth_provider.map(AuthLayer::new),
-        &cors_config,
-    );
+    let auth_layer = if has_auth {
+        Some(AuthLayer::new(auth_provider))
+    } else {
+        None
+    };
+    let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
     drop(app);
 
     let listener = TcpListener::bind(&bind_address)
@@ -242,7 +242,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("to accept connection");
             process_tcp_stream(stream, ok_router(), shutdown_rx);
         });
-        let client = reqwest::Client::new();
+        let client = build_test_http_client();
         let resp = timeout(
             Duration::from_secs(2),
             client.get(format!("http://{addr}/")).send(),
@@ -288,7 +288,7 @@ mod tests {
 
         // the request handler will hang until the connection is closed
         let request_completion_handle = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = build_test_http_client();
             client.get(format!("http://{addr}/")).send().await
         });
 
@@ -314,5 +314,13 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    fn build_test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|err| panic!("failed to build test http client: {err}"))
     }
 }
