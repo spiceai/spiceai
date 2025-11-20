@@ -1,21 +1,20 @@
-use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
+use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
 };
-use ::datafusion::execution::SessionStateBuilder;
-use ::datafusion::prelude::SessionConfig;
 use app::App;
+use arrow_flight::FlightClient;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
-use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
+use ballista_core::serde::BallistaCodec;
 use ballista_core::utils::create_grpc_client_connection;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
@@ -27,9 +26,12 @@ use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
+use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::prelude::SessionConfig;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+use flight_client::Credentials;
 use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
@@ -39,6 +41,8 @@ use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_stream::StreamExt;
+use tonic::metadata::MetadataMap;
 use url::Url;
 use uuid::Uuid;
 
@@ -92,9 +96,25 @@ pub async fn initialize_cluster_executor(
                 .into(),
             })?;
 
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
-        .max_encoding_message_size(usize::MAX)
-        .max_decoding_message_size(usize::MAX);
+    let Some(api_key) = rt.config.cluster.scheduler_api_key.clone() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to start executor without an API key".into(),
+        });
+    };
+
+    let scheduler = SchedulerGrpcClient::with_interceptor(
+        scheduler_connection,
+        move |mut req: tonic::Request<_>| {
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {api_key}").parse().expect("Must serialize API key"),
+            );
+
+            Ok(req)
+        },
+    )
+    .max_encoding_message_size(usize::MAX)
+    .max_decoding_message_size(usize::MAX);
 
     // Try to bind the same flight port Spice usually does, but if we cannot, bind a different
     // port to allow for easy local deployments
@@ -264,14 +284,25 @@ async fn executor_bind_app(
     scheduler_flight_url: String,
     executor_id: String,
 ) -> crate::Result<()> {
+    let Some(api_key) = rt.config.cluster.scheduler_api_key.clone() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to start executor without an API key".into(),
+        });
+    };
+
     let flight_client = flight_client::FlightClient::try_new(
         scheduler_flight_url.clone().into(),
-        flight_client::Credentials::anonymous(),
+        Credentials::Anonymous,
         None,
     )
     .await
     .boxed()
     .context(FailedToStartClusterExecutorSnafu)?;
+
+    let mut flight_client = FlightClient::new_from_inner(flight_client.client().clone());
+    flight_client.add_header("authorization", format!("Bearer {api_key}").as_str())
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
 
     let action = arrow_flight::Action {
         r#type: "GetAppDefinition".to_string(),
@@ -279,21 +310,16 @@ async fn executor_bind_app(
     };
 
     let response = flight_client
-        .client()
-        .clone()
         .do_action(action)
         .await
         .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-
-    let mut stream = response.into_inner();
-    if let Some(result) = stream
-        .message()
-        .await
-        .boxed()
         .context(FailedToStartClusterExecutorSnafu)?
+        .next()
+        .await;
+
+    if let Some(Ok(bytes)) = response
     {
-        let app_def: App = serde_json::from_slice(&result.body)
+        let app_def: App = serde_json::from_slice(&bytes)
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
 
