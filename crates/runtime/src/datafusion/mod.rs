@@ -381,6 +381,11 @@ impl DataFusion {
     }
 
     #[must_use]
+    pub fn caching(&self) -> Arc<Caching> {
+        Arc::clone(&self.caching)
+    }
+
+    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);
@@ -1815,10 +1820,10 @@ impl DataFusion {
         Ok(plan)
     }
 
-    pub(crate) fn clear_cached_plans(&self) {
+    pub(crate) async fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
         if let Some(cache_provider) = self.plans_cache_provider() {
-            cache_provider.invalidate_all();
+            cache_provider.invalidate_all().await;
         }
     }
 
@@ -1991,7 +1996,7 @@ mod tests {
         };
 
         cache_provider.checkpoint().await; // Ensure entry gets logged
-        assert_eq!(cache_provider.item_count(), 1);
+        assert_eq!(cache_provider.item_count().await, 1);
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
@@ -2003,6 +2008,6 @@ mod tests {
             unreachable!("Cache provider should be available");
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
-        assert_eq!(cache_provider.item_count(), 1);
+        assert_eq!(cache_provider.item_count().await, 1);
     }
 }
