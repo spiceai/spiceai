@@ -220,6 +220,7 @@ pub struct HttpTableProvider {
     max_query_length: usize,
     allow_body_filters: bool,
     max_body_bytes: usize,
+    health_probe: Option<String>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -260,6 +261,7 @@ impl HttpTableProvider {
             max_query_length: DEFAULT_MAX_QUERY_LENGTH,
             allow_body_filters: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            health_probe: None,
         }
     }
 
@@ -384,6 +386,12 @@ impl HttpTableProvider {
     }
 
     #[must_use]
+    pub fn with_health_probe(mut self, health_probe: Option<String>) -> Self {
+        self.health_probe = health_probe;
+        self
+    }
+
+    #[must_use]
     pub fn base_table_schema() -> Schema {
         Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
@@ -403,34 +411,50 @@ impl HttpTableProvider {
         )
     }
 
-    /// Validates the HTTP endpoint by attempting a request to a non-existent path.
-    /// This helps detect issues like DNS errors, connection problems, or invalid URLs
-    /// early in the initialization process.
+    /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
+    /// or a non-existent path otherwise.
+    /// This helps detect issues like DNS errors, connection problems,
+    /// or invalid URLs early in the initialization process.
     pub async fn validate_endpoint(&self) -> Result<()> {
-        use rand::Rng;
-        use rand::distr::Alphanumeric;
+        let test_url = if let Some(ref health_probe_path) = self.health_probe {
+            let mut test_url = self.base_url.clone();
+            test_url.set_path(health_probe_path);
+            test_url
+        } else {
+            use rand::Rng;
+            use rand::distr::Alphanumeric;
 
-        // Generate a random path that should return 404
-        let random_suffix: String = rand::rng()
-            .sample_iter(Alphanumeric)
-            .take(16)
-            .map(char::from)
-            .collect();
-        let test_path = format!("/__spice_health_check_{random_suffix}");
+            // Generate a random path that should return 404
+            let random_suffix: String = rand::rng()
+                .sample_iter(Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect();
+            let test_path = format!("/__spice_health_check_{random_suffix}");
 
-        let mut test_url = self.base_url.clone();
-        test_url.set_path(&test_path);
+            let mut test_url = self.base_url.clone();
+            test_url.set_path(&test_path);
+            test_url
+        };
 
         tracing::debug!("Validating HTTP endpoint: {}", self.base_url);
 
         match self.client.get(test_url).send().await {
             Ok(response) => {
                 let status = response.status();
-                tracing::debug!(
-                    "HTTP endpoint validation response: {} (status: {})",
-                    self.base_url,
-                    status
-                );
+                if self.health_probe.is_some() {
+                    tracing::debug!(
+                        "HTTP endpoint validation response using health probe: {} (status: {})",
+                        self.base_url,
+                        status
+                    );
+                } else {
+                    tracing::debug!(
+                        "HTTP endpoint validation response: {} (status: {}). 404 is expected for the random probe path.",
+                        self.base_url,
+                        status
+                    );
+                }
                 // Any response (including 404) means the endpoint is reachable
                 Ok(())
             }
