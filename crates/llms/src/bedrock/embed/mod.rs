@@ -143,6 +143,15 @@ where
     Rsp: DeserializeOwned,
 {
     async fn embed_texts(&self, texts: Vec<String>) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
+        let mut estimated_tokens: u32 = texts
+            .iter()
+            .map(|t| u32::try_from(t.len()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| EmbedError::FailedToExtractEmbeddings {
+                message: format!("Too many embeddings ({}) in single request", texts.len()),
+            })?
+            .sum();
+        estimated_tokens = estimated_tokens.div_ceil(4); // Rough estimate: 4 characters per token + buffer
         let request_payloads = self.config.to_request_blobs(texts)?;
 
         if request_payloads.is_empty() {
@@ -162,18 +171,24 @@ where
         )
         .await?;
 
-        let results = results.into_iter().fold(
-            (Vec::new(), 0),
+        let (vectors, input_tokens_opt) = results.into_iter().fold(
+            (Vec::new(), Some(0)),
             |(mut acc_vectors, acc_tokens), (vectors, tokens)| {
                 acc_vectors.extend(vectors);
-                (acc_vectors, acc_tokens + tokens)
+                (
+                    acc_vectors,
+                    match (acc_tokens, tokens) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        _ => None,
+                    },
+                )
             },
         );
 
-        Ok(results)
+        Ok((vectors, input_tokens_opt.unwrap_or(estimated_tokens)))
     }
 
-    async fn process_single_request(&self, req: Rq) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
+    async fn process_single_request(&self, req: Rq) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)> {
         let body = serde_json::to_string(&req)
             .boxed()
             .context(FailedToPrepareInputSnafu)?;
@@ -250,11 +265,13 @@ pub trait BedrockEmbeddingConfig<Rq: Serialize + Sized + Debug, Rsp: Deserialize
     fn model_id(&self) -> &String;
     fn dimensions(&self) -> i32;
 
-    /// For given text to embed, construct a set of request payloads (i.e. [`Blob`]) to provider to Bedrock runtime.
+    /// For given text to embed, construct a set of request payloads (i.e. [`Blob`]) to provider to Bedrock runtime and return an estimated number of model tokens produced
+    ///
+    /// The token estimate will be used if [`Self::extract_embeddings`] cannot provide a token count from the response.
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<Rq>>;
 
     /// For responses content from AWS Bedrock, extract the embedding vectors and the number of tokens embedded.
-    fn extract_embeddings(&self, resp: Rsp) -> EmbedResult<(Vec<Vec<f32>>, u32)>;
+    fn extract_embeddings(&self, resp: Rsp) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)>;
 }
 
 #[async_trait]

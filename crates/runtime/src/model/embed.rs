@@ -237,11 +237,13 @@ async fn bedrock(
             bedrock::embed::new_titan_v2(client, normalize, dimensions).set_cache(embeddings_cache),
         ) as Arc<dyn Embed>)
     } else if model_id.starts_with("cohere.embed") {
-        let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
+        let truncate = if let Some(truncate_str) =
+            extract_secret!(params, "truncate_mode").or(extract_secret!(params, "truncate"))
+        {
             CohereEmbeddingTruncate::from_str(truncate_str)
                 .boxed()
                 .map_err(|e| EmbedError::InvalidParamError {
-                    param_key: "truncate",
+                    param_key: "truncate_mode",
                     value: truncate_str.to_string(),
                     reason: e.to_string(),
                 })?
@@ -285,27 +287,32 @@ async fn bedrock(
         if !matches!(dimensions, 256 | 384 | 1024 | 3072) {
             return Err(EmbedError::FailedToInstantiateEmbeddingModel {
                 source: format!(
-                    "Invalid dimensions '{dimensions}' for Titan model. Must be 256, 384, 1024, or 3072"
+                    "Invalid dimensions '{dimensions}' for Nova model. Must be 256, 384, 1024, or 3072"
                 )
                 .into(),
             });
         }
 
-        let embedding_purpose = params
-            .get("embedding_purpose")
-            .map(|s| s.expose_secret())
+        let embedding_purpose_str = params.get("embedding_purpose").map(|s| s.expose_secret());
+        let embedding_purpose = embedding_purpose_str
             .map(NovaEmbeddingPurpose::from_str)
             .transpose()
-            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-                source: format!("Failed to parse 'dimensions' parameter: {e}").into(),
+            .map_err(|_| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: format!(
+                    "Invalid 'embedding_purpose' parameter: '{}'",
+                    embedding_purpose_str.unwrap_or_default()
+                )
+                .into(),
             })?
             .unwrap_or_default();
 
-        let truncate = if let Some(truncate_str) = extract_secret!(params, "truncate") {
+        let truncate = if let Some(truncate_str) =
+            extract_secret!(params, "truncate_mode").or(extract_secret!(params, "truncate"))
+        {
             NovaTruncationMode::from_str(truncate_str)
                 .boxed()
                 .map_err(|e| EmbedError::InvalidParamError {
-                    param_key: "truncate",
+                    param_key: "truncate_mode",
                     value: truncate_str.to_string(),
                     reason: e.to_string(),
                 })?

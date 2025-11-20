@@ -49,20 +49,14 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
         }
     }
 
-    fn extract_embeddings(&self, resp: NovaEmbedResponse) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
-        let embeddings: Vec<Vec<f32>> = resp.embeddings.into_iter().map(|e| e.embedding).collect();
-
-        // Nova doesn't return token count, so we estimate it
-        let total_chars: u32 =
-            u32::try_from(embeddings.len()).map_err(|e| EmbedError::FailedToExtractEmbeddings {
-                message: format!(
-                    "Too many embeddings ({}) in single request",
-                    embeddings.len()
-                ),
-            })? * self.dimensions;
-        let estimated_tokens = total_chars / 4; // Rough estimate: 4 chars per token
-
-        Ok((embeddings, estimated_tokens))
+    fn extract_embeddings(
+        &self,
+        resp: NovaEmbedResponse,
+    ) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)> {
+        Ok((
+            resp.embeddings.into_iter().map(|e| e.embedding).collect(),
+            None,
+        ))
     }
 
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<NovaEmbedRequest>> {
@@ -160,7 +154,7 @@ impl FromStr for NovaTruncationMode {
             "END" => Ok(NovaTruncationMode::End),
             "NONE" => Ok(NovaTruncationMode::None),
             _ => Err(EmbedError::InvalidParamError {
-                param_key: "input_type",
+                param_key: "truncation_mode",
                 value: s.to_string(),
                 reason: format!(
                     "For Nova multi-modal model, 'truncation_mode' must be one of: {:?}",
