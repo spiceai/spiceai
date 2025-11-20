@@ -33,10 +33,11 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
 pub mod lru_cache;
-mod metrics;
+pub mod metrics;
 mod simple_cache;
 mod utils;
 
+pub mod encoding;
 pub mod key;
 pub mod result;
 
@@ -106,9 +107,9 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
-    fn invalidate_all(&self);
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
+    async fn invalidate_all(&self);
+    async fn size_bytes(&self) -> u64;
+    async fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
 }
@@ -323,6 +324,9 @@ pub struct QueryResultsCacheProvider {
     stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
+    encoder: Option<Arc<dyn encoding::Encoder>>,
+    encoding: spicepod::component::caching::Encoding,
+    hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -378,12 +382,17 @@ impl QueryResultsCacheProvider {
         let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
         let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
 
+        let encoder = encoding::get_encoder(config.encoding);
+
         let cache_provider = QueryResultsCacheProvider {
             cache,
             cache_max_size,
             ttl,
             stale_while_revalidate_ttl,
             ignore_schemas,
+            encoder,
+            encoding: config.encoding,
+            hashing_algorithm: config.hashing_algorithm,
         };
 
         Ok(cache_provider)
@@ -445,13 +454,13 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn size(&self) -> u64 {
-        self.cache.size_bytes()
+    pub async fn size(&self) -> u64 {
+        self.cache.size_bytes().await
     }
 
     #[must_use]
-    pub fn item_count(&self) -> u64 {
-        self.cache.item_count()
+    pub async fn item_count(&self) -> u64 {
+        self.cache.item_count().await
     }
 
     /// Returns the base TTL for cache entries (used for staleness checks).
@@ -482,6 +491,20 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub fn stale_while_revalidate_ttl(&self) -> Option<std::time::Duration> {
         self.stale_while_revalidate_ttl
+    }
+
+    #[must_use]
+    pub fn encoder(&self) -> Option<Arc<dyn encoding::Encoder>> {
+        self.encoder.as_ref().map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        use spicepod::component::caching::Encoding;
+        match self.encoding {
+            Encoding::None => "none",
+            Encoding::Zstd => "zstd",
+        }
     }
 
     #[must_use]
@@ -522,9 +545,11 @@ impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item ttl: {:?}",
+            "max size: {:.2}, item ttl: {:?}, hashing algorithm: {:?}, encoding: {}",
             Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
-            self.ttl
+            self.ttl,
+            self.hashing_algorithm,
+            self.encoding_name(),
         )
     }
 }
@@ -618,6 +643,33 @@ mod tests {
                 .expect("valid cache provider");
 
         assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[test]
+    fn test_display_includes_encoding() {
+        let config_none = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::None,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_none = QueryResultsCacheProvider::try_new(&config_none, Box::new([]))
+            .expect("valid cache provider");
+        let display_none = format!("{cache_none}");
+        assert!(
+            display_none.contains("encoding: none"),
+            "Display should include encoding: none, got: {display_none}"
+        );
+
+        let config_zstd = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::Zstd,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_zstd = QueryResultsCacheProvider::try_new(&config_zstd, Box::new([]))
+            .expect("valid cache provider");
+        let display_zstd = format!("{cache_zstd}");
+        assert!(
+            display_zstd.contains("encoding: zstd"),
+            "Display should include encoding: zstd, got: {display_zstd}"
+        );
     }
 
     #[tokio::test]

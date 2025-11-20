@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::execution::RecordBatchStream;
 use datafusion::execution::SendableRecordBatchStream;
@@ -31,32 +32,124 @@ use futures::task::{Context, Poll};
 
 use crate::AsTableRefs;
 use crate::Sizeable;
+use crate::encoding::Encoder;
 
 use super::CacheStatus;
 
+/// Cached data storage - either raw `RecordBatches` (no encoding) or encoded bytes.
+#[derive(Debug, Clone)]
+pub enum CachedData {
+    /// Raw `RecordBatches` stored directly (encoding: none)
+    Raw(Arc<Vec<RecordBatch>>),
+    /// IPC-serialized bytes, additionally compressed (e.g., with zstd)
+    Encoded(Bytes),
+}
+
 #[derive(Clone)]
 pub struct CachedQueryResult {
-    pub records: Arc<Vec<RecordBatch>>,
+    /// Cached record batches (raw or encoded)
+    data: CachedData,
+    /// Schema for the cached data
     pub schema: Arc<Schema>,
+    /// Input tables referenced by the query
     pub input_tables: Arc<HashSet<TableReference>>,
     /// Timestamp when the result was cached.
     cached_at: Instant,
+    /// Encoder used to decode the data
+    encoder: Option<Arc<dyn Encoder>>,
 }
 
 impl CachedQueryResult {
-    /// Create a new cached query result with the provided cached-at timestamp.
+    /// Create a new cached query result with raw `RecordBatches`.
     #[must_use]
-    pub fn new(
-        records: Arc<Vec<RecordBatch>>,
-        schema: Arc<Schema>,
+    pub fn new_raw(
+        batches: Vec<RecordBatch>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
     ) -> Self {
+        let schema = if batches.is_empty() {
+            Arc::new(Schema::empty())
+        } else {
+            batches[0].schema()
+        };
+
         Self {
-            records,
+            data: CachedData::Raw(Arc::new(batches)),
             schema,
             input_tables,
             cached_at,
+            encoder: None,
+        }
+    }
+
+    /// Create a new cached query result with encoded data.
+    #[must_use]
+    pub fn new(
+        encoded_data: Bytes,
+        schema: Arc<Schema>,
+        input_tables: Arc<HashSet<TableReference>>,
+        cached_at: Instant,
+        encoder: Option<Arc<dyn Encoder>>,
+    ) -> Self {
+        Self {
+            data: CachedData::Encoded(encoded_data),
+            schema,
+            input_tables,
+            cached_at,
+            encoder,
+        }
+    }
+
+    /// Create a cached query result from record batches.
+    /// Only store encoded data if an encoder is provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails.
+    pub async fn from_batches(
+        records: &[RecordBatch],
+        input_tables: Arc<HashSet<TableReference>>,
+        cached_at: Instant,
+        encoder: Option<Arc<dyn Encoder>>,
+    ) -> Result<Self, crate::encoding::Error> {
+        let schema = if records.is_empty() {
+            Arc::new(Schema::empty())
+        } else {
+            records[0].schema()
+        };
+
+        // Only store encoded data if an encoder is provided
+        let data = if let Some(encoder) = encoder.as_ref() {
+            let encoded_data = encoder.encode(records).await?;
+            CachedData::Encoded(Bytes::from(encoded_data))
+        } else {
+            CachedData::Raw(Arc::new(records.to_vec()))
+        };
+
+        Ok(Self {
+            data,
+            schema,
+            input_tables,
+            cached_at,
+            encoder,
+        })
+    }
+
+    /// Decode and return the cached record batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding fails.
+    pub async fn records(&self) -> Result<Vec<RecordBatch>, crate::encoding::Error> {
+        match &self.data {
+            CachedData::Raw(batches) => Ok((**batches).clone()),
+            CachedData::Encoded(bytes) => {
+                if let Some(encoder) = &self.encoder {
+                    encoder.decode(bytes).await
+                } else {
+                    Err(crate::encoding::Error::NoEncoderSpecified)
+                }
+            }
         }
     }
 
@@ -74,10 +167,19 @@ impl CachedQueryResult {
 
 impl Sizeable for CachedQueryResult {
     fn get_memory_size(&self) -> usize {
-        self.records
-            .iter()
-            .map(arrow::array::RecordBatch::get_array_memory_size)
-            .sum()
+        match &self.data {
+            CachedData::Raw(batches) => batches
+                .iter()
+                .map(|batch| {
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|array| array.get_array_memory_size())
+                        .sum::<usize>()
+                })
+                .sum(),
+            CachedData::Encoded(bytes) => bytes.len(),
+        }
     }
 }
 

@@ -2702,11 +2702,13 @@ version = "1.9.0-rc.4"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "async-compression",
  "async-openai",
  "async-stream",
  "async-trait",
  "blake3",
  "byte-unit",
+ "bytes",
  "criterion 0.7.0",
  "datafusion",
  "fundu",

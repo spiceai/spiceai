@@ -24,8 +24,8 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
         StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
         UInt64Array,
@@ -125,32 +125,50 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
     }
 });
 
-fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
+fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
     if expected_type == actual_type {
         return true;
     }
 
     // Check for logical equivalence, with a lenient set of rules
     // E.g. a number could be returned as a string, number, or float.
-    matches!(
-        (expected_type, actual_type),
-        (DataType::Float32, DataType::Float64)
-            | (
-                DataType::Float64 | DataType::Int64,
-                DataType::Decimal128(_, _)
+    match (expected_type, actual_type) {
+        // Handle timestamp timezone differences
+        (DataType::Timestamp(unit1, tz1), DataType::Timestamp(unit2, tz2)) => {
+            // Same time unit is required
+            if unit1 != unit2 {
+                return false;
+            }
+            // Allow timezone differences between None and Some("UTC")
+            matches!(
+                (tz1.as_deref(), tz2.as_deref()),
+                (None, Some("UTC" | "+00:00")) | (Some("UTC" | "+00:00"), None)
             )
-            | (DataType::Int32, DataType::Int64)
-            | (
-                DataType::Int64,
-                DataType::Int32
-                    | DataType::Float64
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-            )
-            | (DataType::Utf8, DataType::LargeUtf8)
-            | (DataType::LargeUtf8, DataType::Utf8)
-    )
+        }
+        // Existing numeric and string type equivalences
+        _ => matches!(
+            (expected_type, actual_type),
+            (DataType::Float32, DataType::Float64)
+                | (
+                    DataType::Float64 | DataType::Int64,
+                    DataType::Decimal128(_, _)
+                )
+                | (DataType::Int32, DataType::Int64)
+                | (
+                    DataType::Int64,
+                    DataType::Int32
+                        | DataType::Int8
+                        | DataType::Float64
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                )
+                | (DataType::Utf8, DataType::LargeUtf8)
+                | (DataType::LargeUtf8, DataType::Utf8)
+                | (DataType::Date32, DataType::Date64)
+                | (DataType::Date64, DataType::Date32)
+        ),
+    }
 }
 
 fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) -> bool {
@@ -162,7 +180,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .fields()
         .iter()
         .zip(actual_schema.fields().iter())
-        .all(|(f1, f2)| datatype_equivalent(f1.data_type().clone(), f2.data_type().clone()))
+        .all(|(f1, f2)| datatype_equivalent(f1.data_type(), f2.data_type()))
 }
 
 macro_rules! downcast_and_stringify {
@@ -258,6 +276,20 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             let date = NaiveDate::from_ymd_opt(1970, 1, 1)
                 .ok_or_else(|| anyhow!("Invalid base date"))?
                 .checked_add_signed(chrono::Duration::days(i64::from(days)))
+                .ok_or_else(|| anyhow!("Date out of range"))?;
+            Ok(Some(date.format("%Y-%m-%d").to_string()))
+        }
+
+        DataType::Date64 => {
+            let millis = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast Date64 array"))?
+                .value(index);
+            let days = millis / 86_400_000; // Convert milliseconds to days
+            let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+                .ok_or_else(|| anyhow!("Invalid base date"))?
+                .checked_add_signed(chrono::Duration::days(days))
                 .ok_or_else(|| anyhow!("Date out of range"))?;
             Ok(Some(date.format("%Y-%m-%d").to_string()))
         }

@@ -1016,6 +1016,13 @@
         "name"
       ]
     },
+    "Encoding": {
+      "type": "string",
+      "enum": [
+        "none",
+        "zstd"
+      ]
+    },
     "Eval": {
       "type": "object",
       "properties": {
@@ -1703,6 +1710,11 @@
         "enabled": {
           "type": "boolean",
           "default": true
+        },
+        "encoding": {
+          "description": "Encoding algorithm for compressing cached results.",
+          "$ref": "#/$defs/Encoding",
+          "default": "none"
         },
         "eviction_policy": {
           "type": [
