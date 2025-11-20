@@ -129,7 +129,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::new();
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for DESCRIBE query");
     }
 
     #[tokio::test]
@@ -140,7 +142,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["information_schema.tables".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for SHOW TABLES query");
     }
 
     #[tokio::test]
@@ -151,7 +155,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for simple SELECT query");
     }
 
     #[tokio::test]
@@ -163,7 +169,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for JOIN query");
     }
 
     #[tokio::test]
@@ -174,7 +182,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["state".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for subquery");
     }
 
     #[tokio::test]
@@ -192,7 +202,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for nested subqueries with aliases");
     }
 
     #[tokio::test]
@@ -211,7 +223,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for UNION with subqueries");
     }
 
     #[tokio::test]
@@ -229,7 +243,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for JOIN with subquery in FROM clause");
     }
 
     fn create_session_context() -> SessionContext {

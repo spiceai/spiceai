@@ -19,6 +19,7 @@ async-compression = { version = "=0.4.19", features = [
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+blake3 = "1.8"
 byte-unit.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
@@ -30,11 +31,13 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
-twox-hash = { workspace = true, optional = true }
+twox-hash.workspace = true
 
 [dev-dependencies]
+criterion = "0.7"
 rstest = "0.25.0"
+tokio = { workspace = true, features = ["test-util"] }
 
-[features]
-default = []
-xxhash = ["dep:twox-hash"]
+[[bench]]
+harness = false
+name = "hash_algorithms"

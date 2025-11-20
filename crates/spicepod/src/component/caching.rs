@@ -32,11 +32,13 @@ pub enum CacheKeyType {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HashingAlgorithm {
-    #[default]
     #[serde(rename = "siphash")]
     Siphash,
     #[serde(rename = "ahash")]
     Ahash,
+    #[serde(rename = "blake3")]
+    Blake3,
+    #[default]
     #[serde(rename = "xxh3")]
     XXH3,
     #[serde(rename = "xxh32")]

@@ -307,7 +307,6 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
-    #[cfg(feature = "xxhash")]
     use spicepod::component::caching::HashingAlgorithm;
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
@@ -385,12 +384,12 @@ mod tests {
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.expect("Failed to get from cache");
-        assert_eq!(
-            retrieved.records().await.expect("Failed to decode").len(),
-            result.records().await.expect("Failed to decode").len()
-        );
+        let retrieved = retrieved.expect("cache should contain the key");
+        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
+        let result_len = result.records().await.expect("Failed to decode").len();
+        (retrieved_len == result_len)
+            .then_some(())
+            .expect("retrieved and result should have same length");
     }
 
     #[rstest]
@@ -404,7 +403,10 @@ mod tests {
 
         // Try to get a non-existent key
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain nonexistent key");
     }
 
     #[rstest]
@@ -428,7 +430,10 @@ mod tests {
 
         // Verify the value is in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_some());
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before invalidation");
 
         // Invalidate the cache for the table
         cache
@@ -437,7 +442,10 @@ mod tests {
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after invalidation");
     }
 
     #[rstest]
@@ -463,7 +471,10 @@ mod tests {
 
         // Verify the value is in the cache
         let retrieved = cache.get_raw_key(&raw_cache_key).await;
-        assert!(retrieved.is_some());
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before invalidation");
 
         // Invalidate the cache for the table
         cache
@@ -472,14 +483,20 @@ mod tests {
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&raw_cache_key).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after invalidation");
     }
 
     #[rstest]
-    #[case::siphash(RandomState::default())]
-    #[case::ahash(ahash::RandomState::default())]
+    #[case::siphash(HashingAlgorithm::Siphash)]
+    #[case::ahash(HashingAlgorithm::Ahash)]
+    #[case::blake3(HashingAlgorithm::Blake3)]
     #[tokio::test]
-    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
+    async fn test_cache_ttl(#[case] hashing_algo: HashingAlgorithm) {
+        let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
+
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
@@ -490,17 +507,22 @@ mod tests {
 
         // Verify the value is in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
-        assert!(retrieved.is_some());
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before TTL expiry");
 
         // Wait for the TTL to expire
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after TTL expiry");
     }
 
-    #[cfg(feature = "xxhash")]
     #[rstest]
     #[case::xxh3(HashingAlgorithm::XXH3)]
     #[case::xxh32(HashingAlgorithm::XXH32)]
@@ -520,13 +542,19 @@ mod tests {
 
         // Verify the value is in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
-        assert!(retrieved.is_some());
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before TTL expiry");
 
         // Wait for the TTL to expire
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // Verify the value is no longer in the cache
         let retrieved = cache.get_raw_key(&key().as_u64()).await;
-        assert!(retrieved.is_none());
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after TTL expiry");
     }
 }

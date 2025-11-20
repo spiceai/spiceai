@@ -670,7 +670,7 @@ mod tests {
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let runtime = RuntimeBuilder::new().build().await;
 

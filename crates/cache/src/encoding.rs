@@ -189,15 +189,23 @@ mod tests {
             .encode(&original)
             .await
             .expect("encode should succeed");
-        assert!(!encoded_data.is_empty());
+        (!encoded_data.is_empty())
+            .then_some(())
+            .expect("encoded data should not be empty");
 
         let decoded = encoder
             .decode(&encoded_data)
             .await
             .expect("decode should succeed");
-        assert_eq!(decoded.len(), original.len());
-        assert_eq!(decoded[0].num_rows(), original[0].num_rows());
-        assert_eq!(decoded[0].num_columns(), original[0].num_columns());
+        (decoded.len() == original.len())
+            .then_some(())
+            .expect("decoded and original should have same length");
+        (decoded[0].num_rows() == original[0].num_rows())
+            .then_some(())
+            .expect("decoded and original should have same num_rows");
+        (decoded[0].num_columns() == original[0].num_columns())
+            .then_some(())
+            .expect("decoded and original should have same num_columns");
     }
 
     #[tokio::test]
@@ -206,13 +214,19 @@ mod tests {
         let empty: Vec<RecordBatch> = vec![];
 
         let encoded_data = encoder.encode(&empty).await.expect("encode should succeed");
-        assert!(encoded_data.is_empty());
+        encoded_data
+            .is_empty()
+            .then_some(())
+            .expect("encoded empty data should be empty");
 
         let decoded = encoder
             .decode(&encoded_data)
             .await
             .expect("decode should succeed");
-        assert!(decoded.is_empty());
+        decoded
+            .is_empty()
+            .then_some(())
+            .expect("decoded empty data should be empty");
     }
 
     #[tokio::test]
