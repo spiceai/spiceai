@@ -50,6 +50,38 @@ use tokio::sync::RwLock;
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
+/// A wrapper around `XxHash3_64` that uses a fixed seed (0) for deterministic hashing.
+/// This is necessary because `XxHash3_64::default()` may use a random seed for DOS protection,
+/// which would make `HashSets` with different hasher instances incompatible for lookups.
+#[derive(Clone)]
+struct XxHash3_64WithFixedSeed {
+    hasher: twox_hash::XxHash3_64,
+}
+
+impl Default for XxHash3_64WithFixedSeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XxHash3_64WithFixedSeed {
+    fn new() -> Self {
+        Self {
+            hasher: twox_hash::XxHash3_64::with_seed(7),
+        }
+    }
+}
+
+impl std::hash::Hasher for XxHash3_64WithFixedSeed {
+    fn finish(&self) -> u64 {
+        self.hasher.clone().finish()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.hasher.write(bytes);
+    }
+}
+
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
 
@@ -130,7 +162,7 @@ impl MemTable {
         }
         // Keep track of uniquness of rows per constraint.
         let mut constraint_keys: Vec<
-            HashSet<String, std::hash::BuildHasherDefault<twox_hash::XxHash3_64>>,
+            HashSet<String, std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>>,
         > = Vec::with_capacity(constraints.iter().len());
         for b in &self.batches {
             let p = &*b.read().await;
@@ -140,14 +172,14 @@ impl MemTable {
                     Constraint::PrimaryKey(pk) => {
                         let pks = primary_key_identifier(&p, pk)?;
                         check_and_filter_non_null_unique_primary_keys::<
-                            std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
+                            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                         >(&pks, constraint_keys.get(i))?
                     }
                     Constraint::Unique(u) => {
                         let ids = constraint_identifiers(&p, u)?;
                         let as_str: Vec<_> = ids.iter().map(String::as_str).collect();
                         check_and_filter_unique_constraint::<
-                            std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
+                            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                         >(&as_str, constraint_keys.get(i))?
                     }
                 };
@@ -903,13 +935,15 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
-        let mut new_key_set: HashSet<String, std::hash::BuildHasherDefault<twox_hash::XxHash3_64>> =
-            HashSet::default();
+        let mut new_key_set: HashSet<
+            String,
+            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+        > = HashSet::default();
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
             new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
+                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
             >(&new_primary_key_ids, None)?;
         }
 
@@ -931,7 +965,7 @@ impl DataSink for MemSink {
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
                             let _ = check_and_filter_non_null_unique_primary_keys::<
-                                std::hash::BuildHasherDefault<twox_hash::XxHash3_64>,
+                                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                             >(&batch_pks, Some(&new_key_set))?;
                         }
                     }
