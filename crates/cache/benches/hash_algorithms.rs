@@ -17,7 +17,7 @@ limitations under the License.
 #![allow(clippy::expect_used)] // Benchmarks can panic
 
 use cache::{get_hash_builder, key::CacheKey};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use spicepod::component::caching::HashingAlgorithm;
 use std::hash::BuildHasher;
 use std::hint::black_box;
@@ -154,10 +154,16 @@ fn bench_hash_large_query(c: &mut Criterion) {
 /// Benchmark throughput - how many queries can be hashed per second
 fn bench_hash_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("hash_throughput");
-    
+
     // Generate a diverse set of queries
     let queries: Vec<String> = (0..1000)
-        .map(|i| format!("SELECT * FROM table_{} WHERE id = {} AND status = 'active'", i % 10, i))
+        .map(|i| {
+            format!(
+                "SELECT * FROM table_{} WHERE id = {} AND status = 'active'",
+                i % 10,
+                i
+            )
+        })
         .collect();
 
     let algorithms = [
@@ -190,7 +196,7 @@ fn bench_hash_throughput(c: &mut Criterion) {
 /// This tests how well the hash spreads across the space
 fn bench_hash_distribution(c: &mut Criterion) {
     let mut group = c.benchmark_group("hash_distribution");
-    
+
     // Generate queries with minimal differences to test avalanche effect
     let queries: Vec<String> = (0..100)
         .map(|i| format!("SELECT * FROM users WHERE id = {i}"))

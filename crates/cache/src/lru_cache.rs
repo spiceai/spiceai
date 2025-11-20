@@ -507,7 +507,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;
