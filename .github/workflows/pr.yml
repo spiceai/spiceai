@@ -188,7 +188,6 @@ jobs:
           AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-          NEXTEST_FLAG: --features=xxhash
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
       - if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -207,7 +206,7 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
-      
+
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
         uses: ./.github/actions/push-snap-changes
