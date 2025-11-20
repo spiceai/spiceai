@@ -87,7 +87,7 @@ tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
-twox-hash = { workspace = true, optional = true }
+twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
@@ -125,7 +125,6 @@ postgres = [
 s3_vectors = [
     "dep:s3_vectors",
     "dep:s3_vectors_metadata_filter",
-    "dep:twox-hash",
 ]
 sharepoint = ["dep:graph-rs-sdk"]
 snowflake = ["dep:snowflake-api"]
