@@ -782,7 +782,7 @@ impl Refresher {
     ///
     /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
     pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
-        if matches!(self.refresh.read().await.mode, RefreshMode::Full) {
+        if !matches!(self.refresh.read().await.mode, RefreshMode::Full) {
             unreachable!(
                 "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
             );

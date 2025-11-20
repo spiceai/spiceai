@@ -189,12 +189,12 @@ pub enum AcceleratedTableBuilderError {
     #[snafu(display(
         "Refresh mode must be set to `changes` to use a changes stream. For details, visit: https://spiceai.org/docs/features/cdc"
     ))]
-    ExpectedChangesStreamForChangesMode,
+    ExpectedChangesModeForChangesStream,
 
     #[snafu(display(
         "Refresh mode must be set to `append` to use an append stream. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
     ))]
-    ExpectedAppendStreamForAppendMode,
+    ExpectedAppendModeForAppendStream,
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
@@ -445,11 +445,11 @@ impl Builder {
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
-            return ExpectedChangesStreamForChangesModeSnafu.fail();
+            return ExpectedChangesModeForChangesStreamSnafu.fail();
         }
 
         if self.refresh.mode != RefreshMode::Append && self.append_stream.is_some() {
-            return ExpectedAppendStreamForAppendModeSnafu.fail();
+            return ExpectedAppendModeForAppendStreamSnafu.fail();
         }
 
         let on_complete_notification = Arc::new(Notify::new());
