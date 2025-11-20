@@ -549,7 +549,8 @@ mod tests {
     fn test_parse_positive_offset_with_z_format() {
         let result = parse_datetime("2024-01-15T10:30:00+05:30", "2006-01-02T15:04:05Z07:00");
         let dt = expect_with_offset(result);
-        let expected_offset = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("Expected FixedOffset");
+        let expected_offset =
+            FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("Expected FixedOffset");
         assert_eq!(dt.offset(), &expected_offset);
     }
 
