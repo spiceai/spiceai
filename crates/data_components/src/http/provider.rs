@@ -455,31 +455,29 @@ impl HttpTableProvider {
             test_url
         };
 
-        tracing::debug!("Validating HTTP endpoint: {}", self.base_url);
+        tracing::debug!("Validating HTTP endpoint: {test_url}");
 
-        match self.client.get(test_url).send().await {
+        match self.client.get(test_url.clone()).send().await {
             Ok(response) => {
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
-                        "HTTP endpoint validation response using health probe: {} (status: {})",
-                        self.base_url,
-                        status
+                        "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
                     );
                     // For custom health probe, require successful status (2xx)
                     if !status.is_success() {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Health probe endpoint returned non-success status: {status}"
+                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
+                                self.base_url,
+                                test_url.path()
                             ),
                         });
                     }
                 } else {
                     tracing::debug!(
-                        "HTTP endpoint validation response: {} (status: {}). Any status (including 404) is expected for the random probe path.",
-                        self.base_url,
-                        status
+                        "HTTP endpoint validation response: {test_url} (status: {status}). Any status (including 404) is expected for the random probe path."
                     );
                     // Any response (including 404) means the endpoint is reachable
                 }
