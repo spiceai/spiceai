@@ -19,10 +19,22 @@ use std::{any::Any, fmt::Debug};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::Result;
+use snafu::prelude::*;
 
 pub mod analyzer;
 mod provider;
 pub use provider::*;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Index table scans should have only one input. Received {input_len} inputs."))]
+    MultipleInputs { input_len: usize },
+
+    #[snafu(display(
+        "Index table scans should have no expressions. Received {expr_len} expressions."
+    ))]
+    NoExpressions { expr_len: usize },
+}
 
 #[async_trait]
 pub trait Index: Debug + Send + Sync + 'static {

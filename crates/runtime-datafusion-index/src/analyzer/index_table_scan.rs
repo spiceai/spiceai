@@ -237,11 +237,28 @@ impl UserDefinedLogicalNodeCore for IndexTableScanNode {
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        assert_eq!(inputs.len(), 1, "should have one input");
-        assert_eq!(exprs.len(), 0, "should have no expressions");
+        if inputs.len() != 1 {
+            return Err(DataFusionError::External(
+                crate::Error::MultipleInputs {
+                    input_len: inputs.len(),
+                }
+                .into(),
+            ));
+        }
+
+        if !exprs.is_empty() {
+            return Err(DataFusionError::External(
+                crate::Error::NoExpressions {
+                    expr_len: exprs.len(),
+                }
+                .into(),
+            ));
+        }
+
         let Some(input) = inputs.into_iter().next() else {
-            panic!("should have one input");
+            unreachable!("should have one input");
         };
+
         Ok(Self {
             input,
             indexes: self.indexes.clone(),
