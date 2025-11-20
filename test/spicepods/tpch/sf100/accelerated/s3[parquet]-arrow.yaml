@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-cayenne[file]
+name: s3[parquet]-arrow
 datasets:
   - from: s3://benchmarks/tpch_sf100/customer.parquet
     name: customer
@@ -13,8 +13,6 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration: &acceleration
       enabled: true
-      engine: cayenne
-      mode: file
   - from: s3://benchmarks/tpch_sf100/lineitem.parquet
     name: lineitem
     params: *s3_params
