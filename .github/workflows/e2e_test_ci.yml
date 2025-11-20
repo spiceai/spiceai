@@ -308,8 +308,12 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
-          # time to initialize added dataset
-          sleep 10
+  
+      - name: Wait for dataset to be ready
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
