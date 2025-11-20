@@ -66,6 +66,7 @@ struct HttpProviderParams {
     max_query_length: usize,
     allow_body_filters: bool,
     max_body_bytes: usize,
+    health_probe: Option<String>,
 }
 
 impl Https {
@@ -154,6 +155,13 @@ impl Https {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
 
+        let health_probe = self
+            .params
+            .get("health_probe")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+
         HttpProviderParams {
             file_format,
             acceleration_enabled: dataset.is_accelerated(),
@@ -167,6 +175,7 @@ impl Https {
             max_query_length,
             allow_body_filters,
             max_body_bytes,
+            health_probe,
         }
     }
 
@@ -315,6 +324,7 @@ impl Https {
             max_query_length,
             allow_body_filters,
             max_body_bytes,
+            health_probe,
         } = self.resolve_http_provider_params(dataset);
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
@@ -327,7 +337,8 @@ impl Https {
         .with_backoff_method(backoff_method)
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
-        .with_headers(custom_headers);
+        .with_headers(custom_headers)
+        .with_health_probe(health_probe);
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
@@ -464,6 +475,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("health_probe")
+            .description("Custom path to use for health probe validation (e.g., '/health' or '/health?check=liveness'). If not specified, a random non-existent path is used."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters

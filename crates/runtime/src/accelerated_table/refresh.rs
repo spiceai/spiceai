@@ -270,6 +270,10 @@ impl Refresh {
             RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
+            // Cache mode performs periodic refreshes but only refreshes stale data based on TTL
+            RefreshMode::Cache => {
+                return NextRefresh::WaitFor(Duration::ZERO);
+            }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
 
@@ -417,6 +421,7 @@ pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
+    Cache,
 }
 
 pub struct Refresher {
@@ -621,6 +626,7 @@ impl Refresher {
             (AccelerationRefreshMode::Changes(stream), _) => {
                 return Ok(Some(self.start_changes_stream(stream)));
             }
+            (AccelerationRefreshMode::Cache, _) => return Ok(None),
         };
 
         let mut refresh_task_runner = RefreshTaskRunner::builder(
