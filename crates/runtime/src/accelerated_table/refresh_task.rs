@@ -1052,6 +1052,17 @@ impl RefreshTask {
         let df = max_timestamp_df(&Arc::clone(&self.accelerator), ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
+
+        if tracing::enabled!(Level::DEBUG)
+            && let Ok(explained) = df.clone().explain(false, false)
+            && let Ok(explained) = explained.to_string().await
+        {
+            tracing::debug!(
+                "Find max timestamp plan for {}:\n{}",
+                self.dataset_name,
+                explained
+            );
+        }
         let result = &df
             .collect()
             .await
