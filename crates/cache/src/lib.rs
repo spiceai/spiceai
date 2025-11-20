@@ -192,7 +192,9 @@ mod blake3_compat {
 
     impl Hasher for Blake3Wrapper {
         fn finish(&self) -> u64 {
-            // Use finalize_xof() to avoid cloning the hasher.
+            // blake3::Hasher::finalize_xof() doesn't consume self, so we must clone
+            // to get the hash value while preserving the hasher state for potential reuse.
+            // This is the intended design of blake3's incremental API.
             let mut xof = self.hasher.finalize_xof();
             let mut bytes = [0u8; 8];
             xof.fill(&mut bytes);

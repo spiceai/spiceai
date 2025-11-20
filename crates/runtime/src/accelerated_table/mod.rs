@@ -590,7 +590,6 @@ impl Builder {
             refresher,
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
-            io_runtime: self.io_runtime,
         })
     }
 }
