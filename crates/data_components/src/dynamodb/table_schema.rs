@@ -102,7 +102,7 @@ impl DynamoDBTableSchema {
     }
 
     /// returns true for cases like:
-    /// `Column(created_at) > TimestampMillisecond(1725366896155, Some("+00:00"))`
+    /// `Column(created_at) > TimestampMillisecond(1_725_366_896_155, Some("+00:00"))`
     fn is_timestamp_filter(&self, left: &Expr, op: Operator, right: &Expr) -> bool {
         (self.is_timestamp_column(left)
             && is_comparison_operator(op)
@@ -419,7 +419,7 @@ mod tests {
         let schema = create_test_schema();
 
         let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
-            Some(1725366896155),
+            Some(1_725_366_896_155),
             None,
         )));
         let filters = vec![&f1];
@@ -428,7 +428,7 @@ mod tests {
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
 
         let f2 =
-            lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)).eq(col("created_at"));
+            lit(ScalarValue::TimestampMillisecond(Some(1_725_366_896_155), None)).eq(col("created_at"));
         let filters = vec![&f2];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 1);
@@ -440,7 +440,7 @@ mod tests {
         let schema = create_test_schema();
 
         let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
-            Some(1725366896155),
+            Some(1_725_366_896_155),
             None,
         )));
         let f2 = col("age").eq(lit(25i64)).and(f1);

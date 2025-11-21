@@ -1415,7 +1415,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filter = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
-            Some(1725366896155),
+            Some(1_725_366_896_155),
             None,
         )));
         let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
@@ -1427,7 +1427,7 @@ mod tests {
         );
 
         let filter =
-            lit(ScalarValue::TimestampMillisecond(Some(1725366896155), None)).eq(col("created_at"));
+            lit(ScalarValue::TimestampMillisecond(Some(1_725_366_896_155), None)).eq(col("created_at"));
         let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
         assert_eq!(expr, "(:v0 = #created_at)");
         assert_eq!(values.len(), 1);
@@ -1443,7 +1443,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
-            Some(1725366896155),
+            Some(1_725_366_896_155),
             None,
         )));
         let f2 = col("age").eq(lit(25)).and(f1);
