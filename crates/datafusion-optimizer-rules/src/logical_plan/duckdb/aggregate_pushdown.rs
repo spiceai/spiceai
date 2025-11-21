@@ -87,7 +87,6 @@ impl DuckDBAggregateLogicalPushdown {
 
     /// If this aggregate's root scan is from a `DuckDB` accelerated source, with supported expressions,
     /// wrap it in a marker node for pushdown rewriting during physical planning
-    #[allow(clippy::needless_continue)]
     fn try_mark_pushdown(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         // Find an aggregate node
         let LogicalPlan::Aggregate(agg) = plan else {
