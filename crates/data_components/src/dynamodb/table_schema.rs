@@ -28,7 +28,7 @@ pub struct DynamoDBTableSchema {
     partition_key: String,
     sort_key: Option<String>,
     flattened_fields: HashSet<String>,
-    time_format: String,
+    time_format: Arc<String>,
 }
 
 impl DynamoDBTableSchema {
@@ -38,7 +38,7 @@ impl DynamoDBTableSchema {
         partition_key: String,
         sort_key: Option<String>,
         flattened_fields: HashSet<String>,
-        time_format: String,
+        time_format: &str,
     ) -> Self {
         Self {
             table_name,
@@ -46,7 +46,7 @@ impl DynamoDBTableSchema {
             partition_key,
             sort_key,
             flattened_fields,
-            time_format,
+            time_format: Arc::from(time_format.to_string()),
         }
     }
 
@@ -58,8 +58,8 @@ impl DynamoDBTableSchema {
         &self.table_schema
     }
 
-    pub fn time_format(&self) -> String {
-        self.time_format.clone()
+    pub fn time_format(&self) -> Arc<String> {
+        Arc::clone(&self.time_format)
     }
 
     pub fn partition_key(&self) -> &str {
@@ -205,7 +205,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             HashSet::new(),
-            "2006-01-02T15:04:05.000Z07:00".to_string(),
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -225,7 +225,7 @@ mod tests {
             "id".to_string(),
             None,
             flattened,
-            "2006-01-02T15:04:05.000Z07:00".to_string(),
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -249,7 +249,7 @@ mod tests {
             "id".to_string(),
             None,
             HashSet::new(),
-            "2006-01-02T15:04:05.000Z07:00".to_string(),
+            "2006-01-02T15:04:05.000Z07:00",
         );
 
         assert_eq!(table_schema.sort_key(), None);

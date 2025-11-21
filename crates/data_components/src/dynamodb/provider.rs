@@ -96,7 +96,7 @@ impl DynamoDBTableProvider {
             partition_key,
             sort_key,
             flattened_fields,
-            time_format,
+            &time_format,
         );
         Ok(Self {
             client,
@@ -179,13 +179,18 @@ impl DynamoDBTableProvider {
         };
 
         tracing::debug!(
-            "DynamoDB items for schema inference: {:?}",
+            "DynamoDB items for schema inference: table_name={:?}, items={:?}",
+            table_name,
             &unnested_items[..unnested_items.len().min(2)]
         );
 
         let schema = infer_arrow_schema_from_items(&unnested_items, time_format)?;
 
-        tracing::debug!("DynamoDB inferred schema: {:?}", schema);
+        tracing::debug!(
+            "DynamoDB inferred schema: table_name={:?}, schema={:?}",
+            table_name,
+            schema
+        );
 
         Ok((
             schema,
@@ -289,7 +294,8 @@ impl TableProvider for DynamoDBTableProvider {
         let result = Ok(self.table_schema.supports_filters_pushdown(filters));
 
         tracing::debug!(
-            "DynamoDBTableProvider supports_filters_pushdown: {:?}, result: {:?}",
+            "DynamoDBTableProvider supports_filters_pushdown: table={}, filters={:?}, result={:?}",
+            self.table_schema.table_name(),
             filters,
             result
         );
@@ -303,7 +309,7 @@ pub struct DynamoDBTableProviderExec {
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
-    time_format: String,
+    time_format: Arc<String>,
     properties: PlanProperties,
 }
 
@@ -315,7 +321,7 @@ impl DynamoDBTableProviderExec {
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
         partitions: usize,
-        time_format: String,
+        time_format: Arc<String>,
     ) -> Self {
         Self {
             client,
