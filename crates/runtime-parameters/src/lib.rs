@@ -14,15 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
-
 use itertools::Itertools;
 use runtime_secrets::Secrets;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 use tokio::sync::RwLock;
 
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const AWS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 5] = &[
+    ("aws_access_key_id", "key"),
+    ("aws_secret_access_key", "secret"),
+    ("aws_region", "region"),
+    ("aws_session_token", "session_token"),
+    ("aws_endpoint", "endpoint"),
+];
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -264,6 +271,21 @@ impl Parameters {
     #[must_use]
     pub fn prefix(&self) -> &'static str {
         self.prefix
+    }
+
+    /// `delta_lake` manually initializes an object store not via the registry, and it uses
+    /// `aws_` prefixed parameters. But after serialization, `ParquetExec` et al. have S3 URI schemes
+    /// so they initialize using the registry.
+    pub fn canonicalize_s3_fragments(&mut self) {
+        let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
+
+        for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS {
+            if let Some(value) = params.remove(*prefixed_key) {
+                params.insert((*registry_key).to_string(), value);
+            }
+        }
+
+        self.params = params.into_iter().collect();
     }
 }
 

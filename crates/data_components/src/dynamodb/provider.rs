@@ -86,6 +86,7 @@ impl DynamoDBTableProvider {
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
         stream_poll_interval_ms: u64,
+        time_format: String,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let streams_client = Arc::new(
@@ -100,6 +101,7 @@ impl DynamoDBTableProvider {
                 &table_name,
                 unnest_depth,
                 schema_infer_max_records,
+                &time_format,
             )
             .await?;
 
@@ -109,6 +111,7 @@ impl DynamoDBTableProvider {
             partition_key,
             sort_key,
             flattened_fields,
+            &time_format,
         );
 
         // Create constraints with the primary key indices
@@ -147,6 +150,7 @@ impl DynamoDBTableProvider {
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
+        time_format: &str,
     ) -> Result<(
         SchemaRef,
         String,
@@ -211,8 +215,22 @@ impl DynamoDBTableProvider {
             Some(depth) => unnest_dynamodb_items(items, depth)?,
         };
 
+        tracing::debug!(
+            "DynamoDB items for schema inference: table_name={:?}, items={:?}",
+            table_name,
+            &unnested_items[..unnested_items.len().min(2)]
+        );
+
+        let schema = infer_arrow_schema_from_items(&unnested_items, time_format)?;
+
+        tracing::debug!(
+            "DynamoDB inferred schema: table_name={:?}, schema={:?}",
+            table_name,
+            schema
+        );
+
         Ok((
-            infer_arrow_schema_from_items(&unnested_items)?,
+            schema,
             partition_key,
             sort_key,
             flattened_fields,
@@ -337,6 +355,7 @@ impl TableProvider for DynamoDBTableProvider {
             self.unnest_depth,
             projected_schema,
             total_partitions,
+            self.table_schema.time_format(),
         )))
     }
 
@@ -344,7 +363,16 @@ impl TableProvider for DynamoDBTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        Ok(self.table_schema.supports_filters_pushdown(filters))
+        let result = Ok(self.table_schema.supports_filters_pushdown(filters));
+
+        tracing::debug!(
+            "DynamoDBTableProvider supports_filters_pushdown: table={}, filters={:?}, result={:?}",
+            self.table_schema.table_name(),
+            filters,
+            result
+        );
+
+        result
     }
 }
 
@@ -353,6 +381,7 @@ pub struct DynamoDBTableProviderExec {
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
+    time_format: Arc<String>,
     properties: PlanProperties,
 }
 
@@ -364,12 +393,14 @@ impl DynamoDBTableProviderExec {
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
         partitions: usize,
+        time_format: Arc<String>,
     ) -> Self {
         Self {
             client,
             request_plan,
             projected_schema: Arc::clone(&projected_schema),
             unnest_depth,
+            time_format,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
@@ -436,6 +467,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let client = Arc::clone(&self.client);
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
+        let time_format = Arc::clone(&self.time_format);
 
         let total_partitions = match self.properties.partitioning {
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
@@ -471,8 +503,9 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
                     }
                 };
 
-                let batch = dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema))
-                    .map_err(to_execution_error)?;
+                let batch =
+                    dynamodb_items_to_arrow(&unnested_items, Arc::clone(&schema), &time_format)
+                        .map_err(to_execution_error)?;
 
                 tx.send(Ok(batch)).await.map_err(to_execution_error)?;
             }
