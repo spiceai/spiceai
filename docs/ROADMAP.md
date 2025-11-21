@@ -15,29 +15,13 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v1.9 (November 2025)](https://github.com/spiceai/spiceai/milestone/78)
-
-**Focus:** Real-Time Ingestion, Write, and Security.
-
-- **Search**:
-  - Amazon S3 Vectors index spilling.
-  - Full-Text-Search Scalability.
-- **Security**:
-  - Authentication improvements.
-  - Security hardening.
-- **Data Connectors**:
-  - DynamoDB Streams Data Connector.
-- **Snapshots**:
-  - Resiliency improvements.
-  - Debezium and DynamoDB Streams support.
-- **DataFusion**: Upgrade to v50.
-
 ### [v1.10 (December 2025)](https://github.com/spiceai/spiceai/milestone/79)
 
 **Focus:** Lakehouse Architecture.
 
-- **DuckDB**: Upgrade to v1.4.x.
 - **DataFusion**: Upgrade to v51.
+- **Data Connectors**:
+  - DynamoDB Streams Data Connector.
 
 ### v1.1x (H1 2026)
 
