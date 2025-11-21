@@ -77,7 +77,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Number of segments. 'auto' by default.")
         .default(SEGMENTS_AUTO_STR),
     ParameterSpec::runtime("time_format")
-        .description("Go-style time format used to parsing/formatting timestamps")
+        .description("Go-style time format used for parsing/formatting timestamps")
         .default(DEFAULT_TIME_FORMAT),
 ];
 

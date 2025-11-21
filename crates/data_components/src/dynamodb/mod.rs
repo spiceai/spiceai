@@ -22,7 +22,6 @@ mod request_builder;
 mod request_plan;
 mod schema;
 mod table_schema;
-mod timestamp_utils;
 mod unnest;
 mod utils;
 

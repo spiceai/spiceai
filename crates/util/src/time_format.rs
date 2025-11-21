@@ -51,11 +51,6 @@ pub fn parse_datetime(input: &str, go_format: &str) -> Option<ParsedDateTime> {
             .ok()
             .map(ParsedDateTime::WithOffset)
     } else {
-        println!(
-            "foo!!: {:?}",
-            NaiveDateTime::parse_from_str(input, &rust_format)
-        );
-
         NaiveDateTime::parse_from_str(input, &rust_format)
             .ok()
             .map(ParsedDateTime::Naive)
