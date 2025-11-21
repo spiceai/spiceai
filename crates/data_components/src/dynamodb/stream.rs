@@ -1,4 +1,21 @@
-use super::{DowncastBuilderSnafu, Result, StreamError};
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use super::{
+    DowncastBuilderSnafu, FailedToCreateChangeBatchSnafu, FailedToUnnestSnafu, Result, StreamError,
+};
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
@@ -39,11 +56,8 @@ pub fn process_batch(
 
                     let (unnested_streams_item, _) = match unnest_depth {
                         None => (streams_item, HashSet::new()),
-                        Some(depth) => unnest_dynamodb_item(&streams_item, depth).map_err(|e| {
-                            StreamError::DeserializationError {
-                                message: e.to_string(),
-                            }
-                        })?,
+                        Some(depth) => unnest_dynamodb_item(&streams_item, depth)
+                            .context(FailedToUnnestSnafu)?,
                     };
 
                     let op = if matches!(event_name, OperationType::Insert) {
@@ -61,7 +75,10 @@ pub fn process_batch(
                     let streams_keys_item = streams_to_dynamodb_item(keys_item.clone());
                     ("d", streams_keys_item)
                 }
-                _ => continue,
+                operation => {
+                    tracing::debug!("Unexpected OperationType from DynamoDB Streams: {operation}",);
+                    continue;
+                }
             },
             _ => continue,
         };
@@ -75,27 +92,19 @@ pub fn process_batch(
 
             match field.name().as_str() {
                 "op" => {
-                    let str_builder =
-                        downcast_builder::<StringBuilder>(field_builder).map_err(|e| {
-                            StreamError::DeserializationError {
-                                message: e.to_string(),
-                            }
-                        })?;
+                    let str_builder = downcast_builder::<StringBuilder>(field_builder)
+                        .context(DowncastBuilderSnafu)?;
                     str_builder.append_value(op_str);
                 }
                 "primary_keys" => {
                     let list_builder =
                         downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)
-                            .map_err(|e| StreamError::DeserializationError {
-                                message: e.to_string(),
-                            })?;
+                            .context(DowncastBuilderSnafu)?;
                     if primary_keys.is_empty() {
                         list_builder.append(false);
                     } else {
                         let str_builder = downcast_builder::<StringBuilder>(list_builder.values())
-                            .map_err(|e| StreamError::DeserializationError {
-                                message: e.to_string(),
-                            })?;
+                            .context(DowncastBuilderSnafu)?;
                         for key in primary_keys {
                             str_builder.append_value(key);
                         }
@@ -104,14 +113,9 @@ pub fn process_batch(
                 }
                 "data" => {
                     let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
-                        .map_err(|e| StreamError::DeserializationError {
-                            message: e.to_string(),
-                        })?;
-                    append_item_to_struct_builder(&item_data, data_struct_builder).map_err(
-                        |e| StreamError::DeserializationError {
-                            message: e.to_string(),
-                        },
-                    )?;
+                        .context(DowncastBuilderSnafu)?;
+                    append_item_to_struct_builder(&item_data, data_struct_builder)
+                        .context(DowncastBuilderSnafu)?
                 }
                 _ => unreachable!("Unexpected field in changes schema {}", field.name()),
             }
@@ -122,9 +126,7 @@ pub fn process_batch(
     let record_batch: RecordBatch = struct_array.into();
 
     let change_batch =
-        ChangeBatch::try_new(record_batch).map_err(|e| StreamError::DeserializationError {
-            message: e.to_string(),
-        })?;
+        ChangeBatch::try_new(record_batch).context(FailedToCreateChangeBatchSnafu)?;
 
     Ok(ChangeEnvelope::new(
         Box::new(DynamoDBStreamCommitter::new()),
@@ -162,12 +164,8 @@ fn streams_to_dynamodb_attribute(value: &StreamsAttributeValue) -> DynamoDbAttri
     }
 }
 
-fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Result<&mut T> {
-    let builder = builder
-        .as_any_mut()
-        .downcast_mut::<T>()
-        .context(DowncastBuilderSnafu)?;
-    Ok(builder)
+fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Option<&mut T> {
+    builder.as_any_mut().downcast_mut::<T>().ok()
 }
 
 struct DynamoDBStreamCommitter;

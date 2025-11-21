@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::cdc::ChangeBatchError;
 use snafu::Snafu;
 use std::sync::Arc;
 
@@ -67,18 +68,21 @@ pub enum Error {
 
     #[snafu(display("Table has no partition key"))]
     MissingPartitionKey,
-
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
-    DowncastBuilder,
 }
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
-    #[snafu(display("Failed to receive a DynamoDB Stream record : {source}"))]
+    #[snafu(display("Failed to receive DynamoDB Stream record: {source}"))]
     FailedToReceiveMessage {
         source: dynamo_subscriber::error::Error,
     },
 
-    #[snafu(display("Failed to deserialize a DynamoDB Stream record : {message}"))]
-    DeserializationError { message: String },
+    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    DowncastBuilder,
+
+    #[snafu(display("Failed to unnest DynamoDB Stream record: {source}"))]
+    FailedToUnnest { source: Error },
+
+    #[snafu(display("Failed to deserialize DynamoDB Stream record: {source}"))]
+    FailedToCreateChangeBatch { source: ChangeBatchError },
 }
