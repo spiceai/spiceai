@@ -20,9 +20,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use snafu::prelude::*;
-use twox_hash::XxHash64;
-
-const HASH_SEED: u64 = 7;
+use twox_hash::XxHash3_64;
 
 const INDEX_NAME_MAX_LENGTH: usize = 45;
 const COLUMN_NAME_MAX_LENGTH: usize = 5;
@@ -195,7 +193,7 @@ fn truncate(s: &str, len: usize) -> String {
 }
 
 fn hash_to_hex(input: &str) -> String {
-    let hash = XxHash64::oneshot(HASH_SEED, input.as_bytes());
+    let hash = XxHash3_64::oneshot(input.as_bytes());
     format!("{hash:x}")
 }
 
@@ -348,8 +346,14 @@ mod tests {
         let index_name = "mydataset";
         let column_name = "_my.column";
         let partition_by = &[col(column_name)];
+        let partition_value = ScalarValue::from("blahh");
 
-        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.7f7c5.blahh")?;
+        // Generate the partitioned index name using the actual hashing logic
+        let partitioned_name =
+            PartitionedIndexName::new(index_name, column_name, partition_by, &partition_value)?;
+        let generated_index = partitioned_name.to_index_name();
+
+        let this = PartitionedIndexName::from_index_name(&generated_index)?;
 
         assert_eq!(
             this.belongs_with(index_name, column_name, partition_by),

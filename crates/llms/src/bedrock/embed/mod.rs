@@ -20,6 +20,10 @@ use crate::bedrock::embed::cohere::{
     CohereConfig, CohereEmbedRequest, CohereEmbedResponse, CohereEmbeddingInputType,
     CohereEmbeddingTruncate, CohereEmbeddingType,
 };
+use crate::bedrock::embed::nova::{
+    NOVA_MULTIMODAL_EMBED_V2, NovaConfig, NovaEmbedRequest, NovaEmbedResponse,
+    NovaEmbeddingPurpose, NovaTruncationMode,
+};
 use crate::bedrock::embed::titan::{
     TITAN_TEXT_EMBED_V2, TitanConfig, TitanEmbedRequest, TitanEmbedResponse,
 };
@@ -45,6 +49,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 pub mod cohere;
+pub mod nova;
 pub mod titan;
 
 #[derive(Debug, Clone)]
@@ -111,17 +116,57 @@ pub fn new_cohere(
     }
 }
 
+#[must_use]
+pub fn new_text_only_nova_multimodal(
+    client: BedrockClient,
+    dimensions: u32,
+    embedding_purpose: NovaEmbeddingPurpose,
+    truncation_mode: NovaTruncationMode,
+) -> BedrockEmbed<NovaEmbedRequest, NovaEmbedResponse> {
+    tracing::debug!(
+        "Initializing Nova multimodal embedder: dimensions={dimensions}, embedding_purpose={embedding_purpose:?}, truncation_mode={truncation_mode:?}, rate_limit={:?}",
+        client.rate_controller
+    );
+    let config = Arc::new(NovaConfig {
+        model_name: NOVA_MULTIMODAL_EMBED_V2.to_string(),
+        dimensions,
+        embedding_purpose,
+        truncation_mode,
+    }) as Arc<dyn BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse>>;
+
+    BedrockEmbed::<NovaEmbedRequest, NovaEmbedResponse> {
+        client,
+        config,
+        cache: None,
+    }
+}
+
 impl<Rq, Rsp> BedrockEmbed<Rq, Rsp>
 where
-    Rq: Serialize + Sized,
+    Rq: Serialize + Sized + Debug,
     Rsp: DeserializeOwned,
 {
     async fn embed_texts(&self, texts: Vec<String>) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
+        let mut estimated_tokens: u32 = texts
+            .iter()
+            .map(|t| u32::try_from(t.len()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| EmbedError::FailedToExtractEmbeddings {
+                message: format!("Too many embeddings ({}) in single request", texts.len()),
+            })?
+            .into_iter()
+            .sum();
+        estimated_tokens = estimated_tokens.div_ceil(4); // Rough estimate: 4 characters per token + buffer
         let request_payloads = self.config.to_request_blobs(texts)?;
 
         if request_payloads.is_empty() {
             return Ok((Vec::new(), 0));
         }
+
+        tracing::debug!(
+            "Embedding requests look like: {:?}",
+            request_payloads.first()
+        );
 
         // join all requests, as the inner rate limit will manage concurrency
         let results = futures::future::try_join_all(
@@ -131,18 +176,24 @@ where
         )
         .await?;
 
-        let results = results.into_iter().fold(
-            (Vec::new(), 0),
+        let (vectors, input_tokens_opt) = results.into_iter().fold(
+            (Vec::new(), Some(0)),
             |(mut acc_vectors, acc_tokens), (vectors, tokens)| {
                 acc_vectors.extend(vectors);
-                (acc_vectors, acc_tokens + tokens)
+                (
+                    acc_vectors,
+                    match (acc_tokens, tokens) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        _ => None,
+                    },
+                )
             },
         );
 
-        Ok(results)
+        Ok((vectors, input_tokens_opt.unwrap_or(estimated_tokens)))
     }
 
-    async fn process_single_request(&self, req: Rq) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
+    async fn process_single_request(&self, req: Rq) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)> {
         let body = serde_json::to_string(&req)
             .boxed()
             .context(FailedToPrepareInputSnafu)?;
@@ -213,17 +264,19 @@ where
 /// [`BedrockEmbeddingConfig`] handles the model-specific request and response payloads expected by AWS Bedrock.
 ///
 /// AWS Bedrock does not have a standard API interface for its models. For each model, or model family, a different API is exposed.
-pub trait BedrockEmbeddingConfig<Rq: Serialize + Sized, Rsp: DeserializeOwned>:
+pub trait BedrockEmbeddingConfig<Rq: Serialize + Sized + Debug, Rsp: DeserializeOwned>:
     Debug + Sync + Send
 {
     fn model_id(&self) -> &String;
     fn dimensions(&self) -> i32;
 
-    /// For given text to embed, construct a set of request payloads (i.e. [`Blob`]) to provider to Bedrock runtime.
+    /// For given text to embed, construct a set of request payloads (i.e. [`Blob`]) to provider to Bedrock runtime and return an estimated number of model tokens produced
+    ///
+    /// The token estimate will be used if [`Self::extract_embeddings`] cannot provide a token count from the response.
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<Rq>>;
 
     /// For responses content from AWS Bedrock, extract the embedding vectors and the number of tokens embedded.
-    fn extract_embeddings(&self, resp: Rsp) -> EmbedResult<(Vec<Vec<f32>>, u32)>;
+    fn extract_embeddings(&self, resp: Rsp) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)>;
 }
 
 #[async_trait]

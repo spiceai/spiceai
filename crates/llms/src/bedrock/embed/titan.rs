@@ -43,8 +43,11 @@ impl BedrockEmbeddingConfig<TitanEmbedRequest, TitanEmbedResponse> for TitanConf
         }
     }
 
-    fn extract_embeddings(&self, resp: TitanEmbedResponse) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
-        Ok((vec![resp.embedding], resp.input_text_token_count))
+    fn extract_embeddings(
+        &self,
+        resp: TitanEmbedResponse,
+    ) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)> {
+        Ok((vec![resp.embedding], Some(resp.input_text_token_count)))
     }
 
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<TitanEmbedRequest>> {
