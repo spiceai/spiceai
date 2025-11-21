@@ -86,6 +86,14 @@ pub enum Error {
         column: usize,
         query: String,
     },
+
+    #[snafu(display(
+        "Failed to build a valid regex from pagination parameters due to the resource name {resource_name}. {source}"
+    ))]
+    InvalidPaginationRegex {
+        source: regex::Error,
+        resource_name: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -50,6 +50,7 @@ members = [
     "tools/otelpublisher/",
     "tools/spicepodschema/",
     "tools/spiceschema",
+    "tools/spicepod-validator",
     "tools/testoperator",
     "tools/parsley",
 ]
@@ -65,7 +66,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.90"
-version = "1.9.0-unstable"
+version = "1.10.0-unstable"
 
 [workspace.dependencies]
 ahash = "0.8.12"
@@ -212,7 +213,7 @@ rand = "0.9.2"
 rdkafka = { version = "0.38.0" }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
-rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "ec71bd9b735c87cc903c33ed643a04bfd661273e" }
+rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a66f66ae345a0fafde1e2ee496ec137d77aef82a" }
 roaring = "0.11"
 rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
@@ -256,7 +257,7 @@ tonic = { version = "0.13", features = [
 ] }
 tonic-health = { version = "0.13" }
 tower = "0.5.2"
-tower-http = { version = "0.6.2", features = ["cors"] }
+tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
@@ -319,7 +320,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "7650a35285a04b540b695858128d980d1d1e3d23" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "7650a35285a04b540b695858128d980d1d1e3d23" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "5394b17d6ac668db14ab02dcbc0c30fefbf3b790" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "ec122b03325b86e8f5f194292419f73d26ba7d52" } # spiceai
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai:spiceai-50
 

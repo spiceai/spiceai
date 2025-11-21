@@ -53,7 +53,7 @@
       "program": "${workspaceFolder}/target/debug/testoperator",
       "args": [
         "run",
-        "vector-search",
+        "search",
         "--ready-wait",
         "1800",
         "--concurrency",

@@ -26,6 +26,7 @@ use snafu::{ResultExt as _, Snafu};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+pub mod compute_query;
 pub mod list_provider;
 pub mod partition;
 pub mod query_provider;

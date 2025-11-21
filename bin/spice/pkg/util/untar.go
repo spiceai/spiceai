@@ -56,7 +56,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -161,9 +160,30 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	return nil
 }
 
+// dangerousPatterns contains glob patterns that indicate path traversal attempts
+// or absolute paths that should be rejected in tar archives
+var dangerousPatterns = []string{
+	"*/..*", // Unix parent directory traversal
+	"*..*",  // Parent at start (Unix)
+	`*\..*`, // Windows parent directory traversal
+	"*..*",  // Parent at start (Windows)
+	"/*",    // Unix absolute path
+	`?:*`,   // Windows drive letter
+	`\\*`,   // Windows UNC path or absolute
+}
+
 func validRelPath(p string) bool {
-	if p == "" || strings.Contains(p, `\`) || strings.HasPrefix(p, "/") || strings.Contains(p, "../") {
+	if p == "" {
 		return false
 	}
+
+	// Use filepath.Match to detect path traversal patterns on all platforms
+	// This handles both Unix (/) and Windows (\) path separators correctly
+	for _, pattern := range dangerousPatterns {
+		if matched, _ := filepath.Match(pattern, p); matched {
+			return false
+		}
+	}
+
 	return true
 }

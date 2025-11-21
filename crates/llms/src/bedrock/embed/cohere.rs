@@ -191,7 +191,7 @@ impl BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse> for CohereC
     fn extract_embeddings(
         &self,
         mut resp: CohereEmbedResponse,
-    ) -> EmbedResult<(Vec<Vec<f32>>, u32)> {
+    ) -> EmbedResult<(Vec<Vec<f32>>, Option<u32>)> {
         // Estimate token count for Cohere models (approximate)
         let estimated_tokens: u32 = if let Some(texts) = resp.texts {
             texts
@@ -212,7 +212,7 @@ impl BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse> for CohereC
                 ),
             })?;
 
-        Ok((float_embedding, estimated_tokens))
+        Ok((float_embedding, Some(estimated_tokens)))
     }
 
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<CohereEmbedRequest>> {

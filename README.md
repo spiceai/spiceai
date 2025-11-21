@@ -177,6 +177,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mysql`                            | MySQL                                 | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
+| `dynamodb`                         | Amazon DynamoDB                       | Release Candidate |                              |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Beta              | Parquet                      |
@@ -189,7 +190,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
-| `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV, JSON           |
