@@ -87,10 +87,10 @@ impl DuckDBAggregateLogicalPushdown {
 
     /// If this aggregate's root scan is from a `DuckDB` accelerated source, with supported expressions,
     /// wrap it in a marker node for pushdown rewriting during physical planning
-    fn try_mark_pushdown(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    fn try_mark_pushdown(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         // Find an aggregate node
-        let LogicalPlan::Aggregate(agg) = plan else {
-            return Ok(None);
+        let LogicalPlan::Aggregate(ref agg) = plan else {
+            return Ok(Transformed::no(plan));
         };
 
         // Validate its agg expressions to make sure they are supported
@@ -100,7 +100,7 @@ impl DuckDBAggregateLogicalPushdown {
             }
             _ => false,
         }) {
-            return Ok(None);
+            return Ok(Transformed::no(plan));
         }
 
         // Scan its children to ensure that there is a unary chain to an accelerated
@@ -117,17 +117,21 @@ impl DuckDBAggregateLogicalPushdown {
         })?;
 
         if found {
-            Ok(Some(LogicalPlan::Extension(Extension {
-                node: DuckDBAggregatePushdownNode::new(plan.clone()),
-            })))
+            Ok(Transformed::new(
+                LogicalPlan::Extension(Extension {
+                    node: DuckDBAggregatePushdownNode::new(plan.clone()),
+                }),
+                true,
+                TreeNodeRecursion::Jump,
+            ))
         } else {
-            Ok(None)
+            Ok(Transformed::no(plan))
         }
     }
 
     /// Try to find a unary path to a marker node from the current node, then swap it
-    fn try_percolate_marker_node(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
-        let with_erased_marker = plan.clone().transform_down(|p| {
+    fn try_percolate_marker_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+        let mut maybe_percolated = plan.transform_down(|p| {
             if p.inputs().len() > 1 || matches!(p, LogicalPlan::Analyze(_)) {
                 return Ok(Transformed::new(p, false, TreeNodeRecursion::Stop));
             }
@@ -151,13 +155,16 @@ impl DuckDBAggregateLogicalPushdown {
             ))
         })?;
 
-        if with_erased_marker.transformed {
-            Ok(Some(LogicalPlan::Extension(Extension {
-                node: DuckDBAggregatePushdownNode::new(with_erased_marker.data),
-            })))
+        if maybe_percolated.transformed {
+            maybe_percolated.tnr = TreeNodeRecursion::Jump;
+            maybe_percolated.data = LogicalPlan::Extension(Extension {
+                node: DuckDBAggregatePushdownNode::new(maybe_percolated.data),
+            });
         } else {
-            Ok(None)
+            maybe_percolated.tnr = TreeNodeRecursion::Continue;
         }
+
+        Ok(maybe_percolated)
     }
 }
 
@@ -181,17 +188,9 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
             if let LogicalPlan::Extension(ext) = &p
                 && concrete!(ext.node, DuckDBAggregatePushdownNode).is_some()
             {
-                return Ok(Transformed::new(p, false, TreeNodeRecursion::Jump));
-            }
-
-            if let Some(marked_for_pushdown) = Self::try_mark_pushdown(&p)? {
-                Ok(Transformed::new(
-                    marked_for_pushdown,
-                    true,
-                    TreeNodeRecursion::Jump,
-                ))
+                Ok(Transformed::new(p, false, TreeNodeRecursion::Jump))
             } else {
-                Ok(Transformed::no(p))
+                Self::try_mark_pushdown(p)
             }
         })?;
 
@@ -204,14 +203,9 @@ impl OptimizerRule for DuckDBAggregateLogicalPushdown {
         // do this in two steps since the previous only operates on aggregate nodes (it is not
         // possible to walk up at the point in time of rewriting), and trying to account for all
         // invariants in one steps is difficult to follow
-        let rewritten_plan = maybe_marked_agg.data;
-        rewritten_plan.transform_down(|p| {
-            if let Some(percolated) = Self::try_percolate_marker_node(&p)? {
-                Ok(Transformed::new(percolated, true, TreeNodeRecursion::Jump))
-            } else {
-                Ok(Transformed::no(p))
-            }
-        })
+        maybe_marked_agg
+            .data
+            .transform_down(Self::try_percolate_marker_node)
     }
 }
 
@@ -579,6 +573,7 @@ mod tests {
             .await?;
 
         let rewritten = optimizer.rewrite(plan, &ctx.state())?;
+
         assert!(
             rewritten.transformed,
             "Query with complex GROUP BY must be rewritten"
