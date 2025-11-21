@@ -16,9 +16,11 @@ async-stream.workspace = true
 async-trait.workspace = true
 cache = { path = "../cache" }
 datafusion.workspace = true
+datafusion-federation.workspace = true
 datafusion-datasource = { optional = true, workspace = true }
 datafusion-expr.workspace = true
 datafusion-table-providers.workspace = true
+tokio.workspace = true
 runtime-datafusion = { path = '../runtime-datafusion', optional = true }
 r2d2 = { optional = true, workspace = true }
 duckdb = { optional = true, workspace = true }
