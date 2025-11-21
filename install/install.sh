@@ -36,9 +36,18 @@ getSystemInfo() {
 
     OS=$(echo `uname`|tr '[:upper:]' '[:lower:]')
 
-    # Most linux distro needs root permission to copy the file to /usr/local/bin
-    if [[ "$OS" == "linux" || "$OS" == "darwin" ]] && [ "$SPICE_CLI_INSTALL_DIR" == "/usr/local/bin" ]; then
-        USE_SUDO="true"
+    # Determine if sudo is needed based on install directory permissions
+    if [[ -d "$SPICE_CLI_INSTALL_DIR" ]]; then
+        # Directory exists, check if we can write to it
+        if [[ ! -w "$SPICE_CLI_INSTALL_DIR" ]]; then
+            USE_SUDO="true"
+        fi
+    else
+        # Directory doesn't exist, check parent directory
+        local parent_dir=$(dirname "$SPICE_CLI_INSTALL_DIR")
+        if [[ ! -w "$parent_dir" ]]; then
+            USE_SUDO="true"
+        fi
     fi
 }
 
@@ -179,7 +188,22 @@ installFile() {
     fi
 
     chmod o+x $tmp_root_spice_cli
-    cp "$tmp_root_spice_cli" "$SPICE_CLI_INSTALL_DIR"
+    
+    # Create directory if it doesn't exist
+    if [ ! -d "$SPICE_CLI_INSTALL_DIR" ]; then
+        if [ "$USE_SUDO" == "true" ]; then
+            runAsRoot mkdir -p "$SPICE_CLI_INSTALL_DIR"
+        else
+            mkdir -p "$SPICE_CLI_INSTALL_DIR"
+        fi
+    fi
+    
+    # Copy the file with sudo if needed
+    if [ "$USE_SUDO" == "true" ]; then
+        runAsRoot cp "$tmp_root_spice_cli" "$SPICE_CLI_INSTALL_DIR"
+    else
+        cp "$tmp_root_spice_cli" "$SPICE_CLI_INSTALL_DIR"
+    fi
 
     if [ -f "$SPICE_CLI_FILE" ]; then
         echo "$SPICE_CLI_FILENAME installed into $SPICE_CLI_INSTALL_DIR successfully."
@@ -208,28 +232,85 @@ cleanup() {
 SHELL_TO_USE=null
 MOST_RECENT_MODIFIED=0
 
-checkShell() {
-  SHELL=$HOME/$1
-  if [[ -f "$SHELL" ]]; then
-    if [[ "$OS" == "linux" ]]; then
-      MODIFIED_TIME=`date +%s -r "$SHELL"`
-    elif [[ "$OS" == "darwin" ]]; then
-      MODIFIED_TIME=`/usr/bin/stat -f%c "$SHELL"`
+detectShell() {
+    # First, try to detect from SHELL environment variable
+    if [[ -n "$SHELL" ]]; then
+        case "$SHELL" in
+            */bash)
+                DETECTED_SHELL="bash"
+                ;;
+            */zsh)
+                DETECTED_SHELL="zsh"
+                ;;
+            */fish)
+                DETECTED_SHELL="fish"
+                ;;
+            */ksh)
+                DETECTED_SHELL="ksh"
+                ;;
+            */tcsh|*/csh)
+                DETECTED_SHELL="csh"
+                ;;
+            *)
+                DETECTED_SHELL="unknown"
+                ;;
+        esac
+    else
+        DETECTED_SHELL="unknown"
     fi
+}
 
-    if (( $MODIFIED_TIME > $MOST_RECENT_MODIFIED )); then
-      SHELL_TO_USE=$SHELL
-      MOST_RECENT_MODIFIED=$MODIFIED_TIME
+checkShell() {
+    local shell_file="$HOME/$1"
+    if [[ -f "$shell_file" ]]; then
+        local modified_time
+        if [[ "$OS" == "linux" ]]; then
+            modified_time=$(date +%s -r "$shell_file" 2>/dev/null || echo 0)
+        elif [[ "$OS" == "darwin" ]]; then
+            modified_time=$(/usr/bin/stat -f%c "$shell_file" 2>/dev/null || echo 0)
+        else
+            modified_time=0
+        fi
+
+        if (( modified_time > MOST_RECENT_MODIFIED )); then
+            SHELL_TO_USE="$shell_file"
+            MOST_RECENT_MODIFIED=$modified_time
+        fi
     fi
-  fi
+}
+
+getShellPathCommand() {
+    local shell_type="$1"
+    local path_line=""
+    
+    case "$shell_type" in
+        bash|ksh)
+            path_line="export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
+            ;;
+        zsh)
+            path_line="export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
+            ;;
+        fish)
+            path_line="fish_add_path \$HOME/.spice/bin"
+            ;;
+        csh)
+            path_line="setenv PATH \"\$HOME/$SPICE_BIN:\$PATH\""
+            ;;
+        *)
+            path_line="export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
+            ;;
+    esac
+    
+    echo "$path_line"
 }
 
 addToProfile() {
-  echo -e "Adding the line:\n"
-  echo -e "  ${white}$1${reset}\n"
-  echo -e "to your shell profile at '${blue}$SHELL_TO_USE${reset}'\n"
-  echo -e "$1" >> $SHELL_TO_USE
-  echo "Added! You may need to restart your shell to be able to run 'spice'"
+    local path_cmd="$1"
+    echo -e "Adding the line:\n"
+    echo -e "  ${white}$path_cmd${reset}\n"
+    echo -e "to your shell profile at '${blue}$SHELL_TO_USE${reset}'\n"
+    echo -e "$path_cmd" >> "$SHELL_TO_USE"
+    echo "Added! You may need to restart your shell or run 'source $SHELL_TO_USE' to use 'spice'"
 }
 
 installCompleted() {
@@ -241,12 +322,21 @@ installCompleted() {
 # -----------------------------------------------------------------------------
 trap "fail_trap" EXIT
 
-mkdir -p $SPICE_CLI_INSTALL_DIR
-
 getSystemInfo
 verifySupported
 checkHttpRequestCLI
 checkJqInstalled
+
+# Create install directory before checking sudo requirements
+if [ ! -d "$SPICE_CLI_INSTALL_DIR" ]; then
+    # Try to create without sudo first
+    if ! mkdir -p "$SPICE_CLI_INSTALL_DIR" 2>/dev/null; then
+        USE_SUDO="true"
+    fi
+fi
+
+# Re-check sudo requirements after attempting to create directory
+getSystemInfo
 
 if [ -z "$1" ]; then
     echo "Getting the latest Spice.ai CLI..."
@@ -261,26 +351,69 @@ downloadFile $ret_val
 installFile
 cleanup
 
-SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".zshrc" ".zprofile" ".config/fish/config.fish")
+# Detect the current shell
+detectShell
 
-for i in "${SHELLS_TO_CHECK[@]}"; do checkShell $i; done
+# Check shell profile files based on detected shell and common locations
+if [[ "$DETECTED_SHELL" == "bash" ]]; then
+    SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".profile")
+elif [[ "$DETECTED_SHELL" == "zsh" ]]; then
+    SHELLS_TO_CHECK=(".zshrc" ".zprofile" ".zshenv")
+elif [[ "$DETECTED_SHELL" == "fish" ]]; then
+    SHELLS_TO_CHECK=(".config/fish/config.fish")
+elif [[ "$DETECTED_SHELL" == "ksh" ]]; then
+    SHELLS_TO_CHECK=(".kshrc" ".profile")
+elif [[ "$DETECTED_SHELL" == "csh" ]]; then
+    SHELLS_TO_CHECK=(".cshrc" ".tcshrc")
+else
+    # Unknown shell, check all common profiles
+    SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".zshrc" ".zprofile" ".profile" ".config/fish/config.fish" ".kshrc")
+fi
+
+for shell_file in "${SHELLS_TO_CHECK[@]}"; do 
+    checkShell "$shell_file"
+done
 
 if [[ "$SHELL_TO_USE" == "null" ]]; then
-  echo "Unable to find the shell profile, not adding the Spice CLI to PATH"
-  echo "Manually add 'export PATH=$HOME/$SPICE_BIN:\$PATH' to your shell profile"
+    echo -e "${yellow}Unable to detect shell profile automatically.${reset}"
+    echo "Manually add one of the following to your shell profile:"
+    echo ""
+    echo "  For bash/zsh/ksh: export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
+    echo "  For fish:         fish_add_path \$HOME/.spice/bin"
+    echo "  For csh/tcsh:     setenv PATH \"\$HOME/$SPICE_BIN:\$PATH\""
 else
-  if grep -Fq $SPICE_BIN $SHELL_TO_USE
-  then
-    echo "The Spice CLI is already in your PATH!"
-  else
-    echo -e "${yellow}The Spice CLI is not in your PATH${reset}\n"
-
-    if [[ "$SHELL_TO_USE" == "$HOME/.config/fish/config.fish" ]]; then
-      addToProfile "fish_add_path \$HOME/.spice/bin"
+    if grep -Fq "$SPICE_BIN" "$SHELL_TO_USE" 2>/dev/null; then
+        echo "The Spice CLI is already in your PATH!"
     else
-      addToProfile "export PATH=$HOME/$SPICE_BIN:\$PATH"
+        echo -e "${yellow}The Spice CLI is not in your PATH${reset}\n"
+
+        # Determine shell type from file path
+        local shell_type="unknown"
+        case "$SHELL_TO_USE" in
+            *fish/config.fish)
+                shell_type="fish"
+                ;;
+            *.zshrc|*.zprofile|*.zshenv)
+                shell_type="zsh"
+                ;;
+            *.bashrc|*.bash_profile)
+                shell_type="bash"
+                ;;
+            *.kshrc)
+                shell_type="ksh"
+                ;;
+            *.cshrc|*.tcshrc)
+                shell_type="csh"
+                ;;
+            *.profile)
+                # .profile could be bash, ksh, or sh - use bash syntax as most compatible
+                shell_type="bash"
+                ;;
+        esac
+
+        local path_command=$(getShellPathCommand "$shell_type")
+        addToProfile "$path_command"
     fi
-  fi
 fi
 
 installCompleted
