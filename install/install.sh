@@ -390,7 +390,10 @@ if [[ "$SHELL_TO_USE" == "null" ]]; then
     echo "  For bash/zsh/ksh: export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
     echo "  For fish:         fish_add_path \$HOME/.spice/bin"
     echo "  For csh/tcsh:     setenv PATH \"\$HOME/$SPICE_BIN:\$PATH\""
+    echo ""
 else
+    echo "Detected shell profile: $SHELL_TO_USE"
+    
     # Check if PATH is already configured properly (look for actual export/setenv/fish_add_path commands)
     PATH_ALREADY_SET=false
     if grep -E "(export PATH=.*\.spice/bin|fish_add_path.*\.spice/bin|setenv PATH.*\.spice/bin)" "$SHELL_TO_USE" >/dev/null 2>&1; then
