@@ -94,7 +94,7 @@ impl Default for App {
         App {
             name: "DEFAULT".to_string(),
             secrets: vec![],
-            extensions: Default::default(),
+            extensions: HashMap::default(),
             catalogs: vec![],
             datasets: vec![],
             views: vec![],
@@ -104,7 +104,7 @@ impl Default for App {
             tools: vec![],
             workers: vec![],
             spicepods: vec![],
-            runtime: Default::default(),
+            runtime: Runtime::default(),
             management: None,
             snapshots: None,
         }
