@@ -51,6 +51,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use dynamo_subscriber::error::StreamResult;
 use dynamo_subscriber::{Client as StreamsClient, SDKClient};
 use futures::Stream;
 use futures::pin_mut;
@@ -252,35 +253,37 @@ impl DynamoDBTableProvider {
         }
     }
 
-    #[must_use]
-    pub fn changes_stream_from_latest(&self) -> ChangesStream {
+    fn wrap_changes_stream<S>(&self, stream: S) -> ChangesStream
+    where
+        S: Stream<Item = StreamResult> + Send + 'static,
+    {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
+        let time_format = Arc::clone(&self.table_schema.time_format());
 
-        let stream = self.streams_client.stream_from_latest().map(move |batch| {
-            process_batch(batch, &table_schema, &primary_keys, unnest_depth)
-                .map_err(crate::cdc::StreamError::DynamoDB)
+        let stream = stream.map(move |batch| {
+            process_batch(
+                batch,
+                &table_schema,
+                &primary_keys,
+                unnest_depth,
+                &time_format,
+            )
+            .map_err(crate::cdc::StreamError::DynamoDB)
         });
 
         Box::pin(stream)
     }
 
     #[must_use]
+    pub fn changes_stream_from_latest(&self) -> ChangesStream {
+        self.wrap_changes_stream(self.streams_client.stream_from_latest())
+    }
+
+    #[must_use]
     pub fn changes_stream_from_trim_horizon(&self) -> ChangesStream {
-        let table_schema = Arc::clone(self.table_schema.schema());
-        let primary_keys = self.table_schema.primary_keys().clone();
-        let unnest_depth = self.unnest_depth;
-
-        let stream = self
-            .streams_client
-            .stream_from_trim_horizon()
-            .map(move |batch| {
-                process_batch(batch, &table_schema, &primary_keys, unnest_depth)
-                    .map_err(crate::cdc::StreamError::DynamoDB)
-            });
-
-        Box::pin(stream)
+        self.wrap_changes_stream(self.streams_client.stream_from_trim_horizon())
     }
 }
 
