@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
+chrono.workspace = true
 ctrlc = "3.5"
 humantime = "2.1.0"
 rand.workspace = true
