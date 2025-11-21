@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,13 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! General [`datafusion::physical_optimizer::PhysicalOptimizerRule`] not in [`datafusion`] by default.
+use std::io::Result;
 
-#[cfg(feature = "duckdb")]
-pub mod duckdb_intermediate_index;
-pub mod hash_join_optimization;
+fn main() -> Result<()> {
+    let proto_files = std::fs::read_dir("proto")?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "proto"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
 
-#[cfg(feature = "cluster")]
-pub mod cluster;
+    if !proto_files.is_empty() {
+        prost_build::compile_protos(&proto_files, &["proto"])?;
+    }
 
-pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
+    Ok(())
+}

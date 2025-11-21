@@ -27,6 +27,7 @@ members = [
     "crates/runtime-datafusion",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
+    "crates/runtime-proto",
     "crates/runtime-parameters",
     "crates/runtime-secrets",
     "crates/runtime-table-partition",
@@ -206,6 +207,9 @@ percent-encoding = "2.3.1"
 pin-project = "1.1"
 postcard = { version = "1.1.3", features = ["use-std"] }
 prometheus = "0.13"
+prost = { version = "0.13.1", default-features = false, features = [
+    "prost-derive",
+] }
 r2d2 = "0.8.10"
 rand = "0.9.2"
 rdkafka = { version = "0.38.0" }
@@ -322,9 +326,9 @@ datafusion-table-providers = { git = "https://github.com/datafusion-contrib/data
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai:spiceai-50
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }      # spiceai/spiceai-50
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" }  # spiceai/spiceai-50
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990" } # spiceai/spiceai-50
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "336bb6e117e8c8f65e652ad720485d11779dc28c" }      # spiceai/spiceai-50
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "336bb6e117e8c8f65e652ad720485d11779dc28c" }  # spiceai/spiceai-50
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "336bb6e117e8c8f65e652ad720485d11779dc28c" } # spiceai/spiceai-50
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d" } # spiceai-0.16.0
 

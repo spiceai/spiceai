@@ -13,16 +13,30 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::secrets;
+use runtime_request_context::Extension;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-pub mod config;
-pub mod execution_plan;
-pub mod extension;
-pub mod schema_provider;
+#[derive(Clone)]
+pub struct SecretsContextExtension {
+    secrets: Arc<RwLock<secrets::Secrets>>,
+}
 
-use snafu::prelude::*;
+impl SecretsContextExtension {
+    #[must_use]
+    pub fn new(secrets: Arc<RwLock<secrets::Secrets>>) -> Self {
+        Self { secrets }
+    }
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Invalid children count. Expected only one input, got {children_count}."))]
-    InvalidChildrenCount { children_count: usize },
+    #[must_use]
+    pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
+        Arc::clone(&self.secrets)
+    }
+}
+
+impl Extension for SecretsContextExtension {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

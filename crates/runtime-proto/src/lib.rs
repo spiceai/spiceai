@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,13 +14,4 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! General [`datafusion::physical_optimizer::PhysicalOptimizerRule`] not in [`datafusion`] by default.
-
-#[cfg(feature = "duckdb")]
-pub mod duckdb_intermediate_index;
-pub mod hash_join_optimization;
-
-#[cfg(feature = "cluster")]
-pub mod cluster;
-
-pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;
+include!(concat!(env!("OUT_DIR"), "/spice.protobuf.rs"));
