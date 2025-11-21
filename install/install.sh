@@ -382,13 +382,20 @@ if [[ "$SHELL_TO_USE" == "null" ]]; then
     echo "  For fish:         fish_add_path \$HOME/.spice/bin"
     echo "  For csh/tcsh:     setenv PATH \"\$HOME/$SPICE_BIN:\$PATH\""
 else
-    if grep -Fq "$SPICE_BIN" "$SHELL_TO_USE" 2>/dev/null; then
-        echo "The Spice CLI is already in your PATH!"
+    # Check if PATH is already configured properly (look for actual export/setenv/fish_add_path commands)
+    PATH_ALREADY_SET=false
+    if grep -E "(export PATH=.*$SPICE_BIN|fish_add_path.*\.spice/bin|setenv PATH.*$SPICE_BIN)" "$SHELL_TO_USE" >/dev/null 2>&1; then
+        PATH_ALREADY_SET=true
+    fi
+    
+    if [ "$PATH_ALREADY_SET" = true ]; then
+        echo "The Spice CLI PATH configuration is already present in $SHELL_TO_USE"
+        echo "Run 'source $SHELL_TO_USE' or restart your shell to use 'spice'"
     else
-        echo -e "${yellow}The Spice CLI is not in your PATH${reset}\n"
+        echo -e "${yellow}Adding Spice CLI to your PATH${reset}\n"
 
         # Determine shell type from file path
-        local shell_type="unknown"
+        shell_type="unknown"
         case "$SHELL_TO_USE" in
             *fish/config.fish)
                 shell_type="fish"
@@ -411,7 +418,7 @@ else
                 ;;
         esac
 
-        local path_command=$(getShellPathCommand "$shell_type")
+        path_command=$(getShellPathCommand "$shell_type")
         addToProfile "$path_command"
     fi
 fi
