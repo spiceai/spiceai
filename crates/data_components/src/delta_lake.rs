@@ -72,6 +72,11 @@ pub enum Error {
         "Delta Lake Table checkpoint files are missing or incorrect. Recreate the checkpoint for the Delta Lake Table and try again. {source}"
     ))]
     DeltaCheckpointError { source: delta_kernel::Error },
+
+    #[snafu(display(
+        "Invalid Delta Lake Table partition value count. The PartitionedFile has a different number of partition values than the number of partition columns."
+    ))]
+    InvalidPartitionValueCount,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

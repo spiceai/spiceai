@@ -482,11 +482,15 @@ impl Ai {
         let ordered_results: Vec<Option<String>> =
             results.into_iter().map(|(_, result)| result).collect();
 
-        debug_assert_eq!(
-            ordered_results.len(),
-            array_len,
-            "Result array length must match input array length"
-        );
+        // debug assertion only
+        #[allow(clippy::disallowed_macros)]
+        {
+            debug_assert_eq!(
+                ordered_results.len(),
+                array_len,
+                "Result array length must match input array length"
+            );
+        }
 
         Ok(Arc::new(StringArray::from(ordered_results)) as ArrayRef)
     }
