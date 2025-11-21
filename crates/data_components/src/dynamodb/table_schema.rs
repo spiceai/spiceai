@@ -64,7 +64,7 @@ impl DynamoDBTableSchema {
         &self.table_schema
     }
 
-    pub fn primary_keys(&self) -> &Vec<String> {
+    pub fn primary_keys(&self) -> &[String] {
         &self.primary_keys
     }
 
