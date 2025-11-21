@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
@@ -48,10 +48,13 @@ impl Display for SpicedVersion {
     }
 }
 
-pub struct SpicedInstance {
-    child: Option<Child>,
-    tempdir: Option<TempDir>,
-    version: Option<SpicedVersion>,
+pub enum SpicedInstance {
+    Existing,
+    Owned {
+        child: Child,
+        tempdir: TempDir,
+        version: SpicedVersion,
+    },
 }
 
 pub struct StartRequest {
@@ -123,11 +126,7 @@ impl StartRequest {
 impl SpicedInstance {
     #[must_use]
     pub fn empty() -> Self {
-        Self {
-            child: None,
-            tempdir: None,
-            version: None,
-        }
+        Self::Existing
     }
 
     /// Start a spiced instance
@@ -184,16 +183,16 @@ impl SpicedInstance {
 
         let child = cmd.spawn()?;
 
-        Ok(Self {
-            child: Some(child),
-            tempdir: Some(tempdir),
-            version: Some(SpicedVersion::new(version)),
+        Ok(Self::Owned {
+            child,
+            tempdir,
+            version: SpicedVersion::new(version),
         })
     }
 
     #[must_use]
     pub fn version(&self) -> &str {
-        let Some(version) = self.version.as_ref() else {
+        let Self::Owned { version, .. } = self else {
             return "unknown";
         };
 
@@ -201,12 +200,11 @@ impl SpicedInstance {
     }
 
     pub fn get_tempdir_path(&self) -> Result<PathBuf> {
-        Ok(self
-            .tempdir
-            .as_ref()
-            .context(anyhow::anyhow!("tempdir must be set to retrieve path"))?
-            .path()
-            .to_path_buf())
+        let Self::Owned { tempdir, .. } = self else {
+            anyhow::bail!("SpicedInstance is not owned, no tempdir available");
+        };
+
+        Ok(tempdir.path().to_path_buf())
     }
 
     /// Get a spice client for the spiced instance
@@ -296,7 +294,7 @@ impl SpicedInstance {
     ///
     /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
-        let Some(mut child) = self.child.take() else {
+        let Self::Owned { child, .. } = self else {
             return Ok(());
         };
 
@@ -326,20 +324,17 @@ impl SpicedInstance {
     /// Returns an instance of a `Process` for the spiced instance
     /// This allows tracking the spiced process, without owning the spiced instance
     pub fn process(&self) -> Result<Process> {
-        Ok(Process::new(Pid::from_u32(
-            self.child
-                .as_ref()
-                .context(anyhow::anyhow!(
-                    "child process must be set to retrieve process"
-                ))?
-                .id(),
-        )))
+        let Self::Owned { child, .. } = self else {
+            anyhow::bail!("SpicedInstance is not owned, no process available");
+        };
+
+        Ok(Process::new(Pid::from_u32(child.id())))
     }
 }
 
 impl Drop for SpicedInstance {
     fn drop(&mut self) {
-        let Some(child) = &mut self.child else {
+        let Self::Owned { child, .. } = self else {
             return;
         };
 
