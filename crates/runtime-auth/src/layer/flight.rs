@@ -76,6 +76,7 @@ fn get_authorization_value<'a>(
     let Some(auth_header) = metadata.get("authorization") else {
         return Err(Status::unauthenticated("Missing authorization header"));
     };
+
     let Ok(auth_header_str) = auth_header.to_str() else {
         return Err(Status::unauthenticated("Invalid authorization header"));
     };

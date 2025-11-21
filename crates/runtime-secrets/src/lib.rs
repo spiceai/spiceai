@@ -87,11 +87,14 @@ impl Secrets {
 
     #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn new_for_cluster_executor(scheduler_url: String, executor_id: String) -> Self {
+    pub fn new_for_cluster_executor(
+        flight_client: arrow_flight::FlightClient,
+        executor_id: String,
+    ) -> Self {
         let mut stores = IndexMap::new();
         stores.insert(
             "scheduler_rpc".to_string(),
-            Arc::new(SchedulerRPCSecretStore::new(scheduler_url, executor_id))
+            Arc::new(SchedulerRPCSecretStore::new(flight_client, executor_id))
                 as Arc<dyn SecretStore>,
         );
 

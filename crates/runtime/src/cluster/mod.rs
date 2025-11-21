@@ -1,20 +1,22 @@
+use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
-use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
 };
+use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::prelude::SessionConfig;
 use app::App;
 use arrow_flight::FlightClient;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
+use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::executor_resource::Resource;
 use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::serde::BallistaCodec;
 use ballista_core::utils::create_grpc_client_connection;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
@@ -26,12 +28,11 @@ use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
-use ::datafusion::execution::SessionStateBuilder;
-use ::datafusion::prelude::SessionConfig;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use flight_client::Credentials;
+use flight_client::arrow_flight_factory::make_arrow_flight_client;
 use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
@@ -107,7 +108,9 @@ pub async fn initialize_cluster_executor(
         move |mut req: tonic::Request<_>| {
             req.metadata_mut().insert(
                 "authorization",
-                format!("Bearer {api_key}").parse().expect("Must serialize API key"),
+                format!("Bearer {api_key}")
+                    .parse()
+                    .expect("Must serialize API key"),
             );
 
             Ok(req)
@@ -290,17 +293,8 @@ async fn executor_bind_app(
         });
     };
 
-    let flight_client = flight_client::FlightClient::try_new(
-        scheduler_flight_url.clone().into(),
-        Credentials::Anonymous,
-        None,
-    )
-    .await
-    .boxed()
-    .context(FailedToStartClusterExecutorSnafu)?;
-
-    let mut flight_client = FlightClient::new_from_inner(flight_client.client().clone());
-    flight_client.add_header("authorization", format!("Bearer {api_key}").as_str())
+    let mut flight_client = make_arrow_flight_client(&scheduler_flight_url, Some(api_key))
+        .await
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
@@ -317,8 +311,7 @@ async fn executor_bind_app(
         .next()
         .await;
 
-    if let Some(Ok(bytes)) = response
-    {
+    if let Some(Ok(bytes)) = response {
         let app_def: App = serde_json::from_slice(&bytes)
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
@@ -326,8 +319,7 @@ async fn executor_bind_app(
         *rt.app.write().await = Some(Arc::new(app_def));
     }
 
-    *rt.secrets.write().await =
-        Secrets::new_for_cluster_executor(scheduler_flight_url, executor_id);
+    *rt.secrets.write().await = Secrets::new_for_cluster_executor(flight_client, executor_id);
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;

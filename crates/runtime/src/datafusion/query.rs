@@ -62,6 +62,8 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
+use datafusion::common::config_err;
+use datafusion::config::ExtensionOptions;
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -69,6 +71,7 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 use super::managed_runtime;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
+use crate::datafusion::query::Error::UnableToExecuteQuery;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
@@ -166,16 +169,26 @@ impl Query {
             return Ok(self.df.ctx.state());
         }
 
+        let Some(ref api_key) = self.df.cluster_config.scheduler_api_key else {
+            return config_err!("API key is required for scheduler to perform planning")
+                .map_err(|e| UnableToExecuteQuery { source: e });
+        };
+
         let cfg = self
             .df
             .ctx
             .copied_config()
             .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec());
 
+        let mut ballista_config = cfg.ballista_config();
+        ballista_config
+            .set("spice.api_key", api_key)
+            .context(UnableToExecuteQuerySnafu)?;
+
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
                 self.df.cluster_config.scheduler_url.to_string(),
-                cfg.ballista_config(),
+                ballista_config,
                 SpiceLogicalCodec::new_codec(),
                 DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
             );

@@ -32,6 +32,7 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
+use spicepod::component::runtime::ApiKey;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -201,9 +202,6 @@ impl RuntimeBuilder {
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
-        #[cfg(feature = "cluster")]
-        let cluster_config = Arc::new(self.runtime_config.cluster.clone());
-
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         let mut df_builder = DataFusion::builder(
@@ -220,6 +218,28 @@ impl RuntimeBuilder {
 
         #[cfg(feature = "cluster")]
         {
+            let mut cluster_config = self.runtime_config.cluster.clone();
+
+            if let Some(api_key) = self
+                .app
+                .as_ref()
+                .and_then(|a| a.runtime.auth.as_ref())
+                .and_then(|a| a.api_key.as_ref())
+                .and_then(|ak| {
+                    if ak.enabled {
+                        ak.keys.first().cloned()
+                    } else {
+                        None
+                    }
+                })
+            {
+                cluster_config.scheduler_api_key = match api_key {
+                    ApiKey::ReadOnly { key } => Some(key),
+                    ApiKey::ReadWrite { key } => Some(key),
+                };
+            }
+
+            let cluster_config = Arc::new(cluster_config);
             df_builder = df_builder.with_cluster_config(cluster_config);
         };
 

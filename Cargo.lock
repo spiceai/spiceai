@@ -13371,6 +13371,7 @@ dependencies = [
  "base64 0.22.1",
  "dotenvy",
  "flight_client",
+ "futures",
  "indexmap 2.12.0",
  "keyring",
  "logos",
