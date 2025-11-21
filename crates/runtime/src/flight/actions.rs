@@ -238,7 +238,7 @@ pub(crate) async fn do_action(
 
             let exposed = value.expose_secret();
             let response = ExecutorExpandSecretResponse {
-                key: request.key.clone(),
+                key: request.key,
                 value: exposed.to_string(),
             };
 
