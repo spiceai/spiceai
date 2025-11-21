@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::{
-    DowncastBuilderSnafu, FailedToCreateChangeBatchSnafu, FailedToUnnestSnafu, Result, StreamError,
+    DowncastBuilderSnafu, FailedToAddItemToStructSnafu, FailedToCreateChangeBatchSnafu,
+    FailedToUnnestSnafu, Result, StreamError,
 };
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
@@ -115,7 +116,7 @@ pub fn process_batch(
                     let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
                         .context(DowncastBuilderSnafu)?;
                     append_item_to_struct_builder(&item_data, data_struct_builder)
-                        .context(DowncastBuilderSnafu)?
+                        .context(FailedToAddItemToStructSnafu)?
                 }
                 _ => unreachable!("Unexpected field in changes schema {}", field.name()),
             }
@@ -165,7 +166,7 @@ fn streams_to_dynamodb_attribute(value: &StreamsAttributeValue) -> DynamoDbAttri
 }
 
 fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Option<&mut T> {
-    builder.as_any_mut().downcast_mut::<T>().ok()
+    builder.as_any_mut().downcast_mut::<T>()
 }
 
 struct DynamoDBStreamCommitter;

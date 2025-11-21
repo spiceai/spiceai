@@ -85,4 +85,7 @@ pub enum StreamError {
 
     #[snafu(display("Failed to deserialize DynamoDB Stream record: {source}"))]
     FailedToCreateChangeBatch { source: ChangeBatchError },
+
+    #[snafu(display("Failed to add item to struct: {source}"))]
+    FailedToAddItemToStruct { source: Error },
 }
