@@ -1986,7 +1986,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990#5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=336bb6e117e8c8f65e652ad720485d11779dc28c#336bb6e117e8c8f65e652ad720485d11779dc28c"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2020,7 +2020,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990#5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=336bb6e117e8c8f65e652ad720485d11779dc28c#336bb6e117e8c8f65e652ad720485d11779dc28c"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2049,7 +2049,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990#5d71a6d3f07bf99f7b32e74f3b68b17a1e1e7990"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=336bb6e117e8c8f65e652ad720485d11779dc28c#336bb6e117e8c8f65e652ad720485d11779dc28c"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4704,17 +4704,24 @@ dependencies = [
 name = "datafusion-optimizer-rules"
 version = "1.10.0-unstable"
 dependencies = [
+ "arrow",
  "async-stream",
  "async-trait",
  "cache",
+ "chrono",
  "datafusion",
+ "datafusion-datasource",
  "datafusion-expr",
  "datafusion-table-providers",
  "duckdb",
  "futures",
+ "itertools 0.14.0",
+ "object_store",
  "r2d2",
+ "runtime-datafusion",
  "snafu",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -13146,6 +13153,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-proto",
  "runtime-rate-control",
  "runtime-request-context",
  "runtime-secrets",
@@ -13348,6 +13356,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-proto"
+version = "1.10.0-unstable"
+dependencies = [
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "datafusion-physical-plan",
+ "datafusion-proto",
+ "prost 0.13.5",
+ "prost-build",
+]
+
+[[package]]
 name = "runtime-rate-control"
 version = "1.10.0-unstable"
 dependencies = [
@@ -13382,6 +13403,7 @@ dependencies = [
 name = "runtime-secrets"
 version = "1.10.0-unstable"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
@@ -13389,11 +13411,14 @@ dependencies = [
  "aws-sdk-sts",
  "base64 0.22.1",
  "dotenvy",
+ "flight_client",
  "indexmap 2.12.0",
  "keyring",
  "logos",
+ "prost 0.13.5",
  "rand 0.9.2",
  "reqwest",
+ "runtime-proto",
  "secrecy",
  "serde_json",
  "snafu",
