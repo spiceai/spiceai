@@ -318,7 +318,7 @@ struct PartitionedUnionExec {
 
 impl PartitionedUnionExec {
     fn new(partitions: Vec<Arc<dyn ExecutionPlan>>) -> Self {
-        let inner_union = Arc::new(UnionExec::new(partitions.clone()));
+        let inner_union = Arc::new(UnionExec::new(partitions));
         Self { inner_union }
     }
 }
