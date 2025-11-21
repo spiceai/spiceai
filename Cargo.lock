@@ -310,7 +310,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "serde",
  "snafu",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "snafu",
  "text-splitter",
@@ -4109,7 +4109,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4190,7 +4190,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4700,7 +4700,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4975,7 +4975,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5356,7 +5356,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -5747,7 +5747,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "futures",
  "snafu",
@@ -6025,7 +6025,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6040,7 +6040,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6053,7 +6053,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -6077,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -8680,7 +8680,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -9489,7 +9489,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10000,7 +10000,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "snafu",
  "tokio",
@@ -10907,7 +10907,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -10918,7 +10918,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "clap",
  "opentelemetry-proto",
@@ -10987,7 +10987,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "bytes",
  "futures",
@@ -11111,7 +11111,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "bytes",
  "chunking",
@@ -12986,7 +12986,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "app",
@@ -13161,7 +13161,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -13189,7 +13189,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "futures",
  "num_cpus",
@@ -13200,7 +13200,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "app",
  "axum",
@@ -13215,7 +13215,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -13234,7 +13234,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -13246,7 +13246,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -13269,7 +13269,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13293,7 +13293,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -13305,7 +13305,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "futures",
  "governor",
@@ -13316,7 +13316,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "app",
  "async-trait",
@@ -13336,7 +13336,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13360,7 +13360,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -13710,7 +13710,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13722,7 +13722,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -13824,7 +13824,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -13973,7 +13973,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14676,7 +14676,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14720,7 +14720,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "app",
  "clap",
@@ -14756,7 +14756,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -14778,7 +14778,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "app",
  "clap",
@@ -14788,7 +14788,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "schemars 1.1.0",
  "serde_json",
@@ -14797,7 +14797,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "clap",
  "runtime",
@@ -15558,7 +15558,7 @@ checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
 name = "telemetry"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -15645,7 +15645,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "app",
@@ -15688,7 +15688,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow-json",
  "clap",
@@ -16027,7 +16027,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "secrecy",
  "snafu",
@@ -16394,7 +16394,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -16471,7 +16471,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -17303,7 +17303,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -18985,7 +18985,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-openai",
  "async-trait",
