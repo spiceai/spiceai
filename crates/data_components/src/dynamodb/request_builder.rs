@@ -1426,8 +1426,11 @@ mod tests {
             Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
         );
 
-        let filter =
-            lit(ScalarValue::TimestampMillisecond(Some(1_725_366_896_155), None)).eq(col("created_at"));
+        let filter = lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        ))
+        .eq(col("created_at"));
         let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
         assert_eq!(expr, "(:v0 = #created_at)");
         assert_eq!(values.len(), 1);

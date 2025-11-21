@@ -427,8 +427,11 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
 
-        let f2 =
-            lit(ScalarValue::TimestampMillisecond(Some(1_725_366_896_155), None)).eq(col("created_at"));
+        let f2 = lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        ))
+        .eq(col("created_at"));
         let filters = vec![&f2];
         let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 1);
