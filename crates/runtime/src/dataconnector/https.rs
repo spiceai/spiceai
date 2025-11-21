@@ -160,7 +160,7 @@ impl Https {
             .get("health_probe")
             .expose()
             .ok()
-            .map(ToString::to_string);
+            .map(std::string::ToString::to_string);
 
         HttpProviderParams {
             file_format,
@@ -338,7 +338,13 @@ impl Https {
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
-        .with_health_probe(health_probe);
+        .with_health_probe(health_probe)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: "https".to_string(),
+            message: format!("Invalid health_probe configuration: {e}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: e.into(),
+        })?;
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
@@ -476,7 +482,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("health_probe")
-            .description("Custom path to use for health probe validation (e.g., '/health' or '/health?check=liveness'). If not specified, a random non-existent path is used."),
+            .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
