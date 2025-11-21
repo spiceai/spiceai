@@ -384,7 +384,7 @@ if [[ "$SHELL_TO_USE" == "null" ]]; then
 else
     # Check if PATH is already configured properly (look for actual export/setenv/fish_add_path commands)
     PATH_ALREADY_SET=false
-    if grep -E "(export PATH=.*$SPICE_BIN|fish_add_path.*\.spice/bin|setenv PATH.*$SPICE_BIN)" "$SHELL_TO_USE" >/dev/null 2>&1; then
+    if grep -E "(export PATH=.*\.spice/bin|fish_add_path.*\.spice/bin|setenv PATH.*\.spice/bin)" "$SHELL_TO_USE" >/dev/null 2>&1; then
         PATH_ALREADY_SET=true
     fi
     
