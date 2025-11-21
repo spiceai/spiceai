@@ -72,10 +72,6 @@ fn infer_dynamodb_type(value: &AttributeValue, time_format: &str) -> Result<Data
     Ok(match value {
         AttributeValue::Bool(_) => DataType::Boolean,
         AttributeValue::S(s) => {
-
-            println!("s: {} - {:?} - {:?}", s, time_format, parse_datetime(s, time_format));
-
-
             if let Some(ts) = parse_datetime(s, time_format) {
                 match ts {
                     ParsedDateTime::Naive(_) => DataType::Timestamp(TimeUnit::Millisecond, None),

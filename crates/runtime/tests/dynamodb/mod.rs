@@ -231,7 +231,6 @@ async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
 async fn dynamodb_nulls() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
@@ -581,7 +580,10 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
                 "${ env:AWS_DYNAMODB_SECRET }".to_string(),
             ),
             ("unnest_depth".to_string(), "1".to_string()),
-            ("time_format".to_string(), "2006-01-02T15:04:05.000Z07:00".to_string()),
+            (
+                "time_format".to_string(),
+                "2006-01-02T15:04:05.000Z07:00".to_string(),
+            ),
         ]
         .into_iter()
         .collect(),

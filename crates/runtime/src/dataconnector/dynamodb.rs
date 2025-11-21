@@ -200,7 +200,9 @@ impl DataConnector for DynamoDB {
         if !is_valid_format(time_format) {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "dynamodb".to_string(),
-                message: format!("DynamoDB parameter 'time_format' is invalid: \"{time_format}\". Refer to https://spiceai.org/docs/components/data-connectors/dynamodb"),
+                message: format!(
+                    "DynamoDB parameter 'time_format' is invalid: \"{time_format}\". Refer to https://spiceai.org/docs/components/data-connectors/dynamodb"
+                ),
                 connector_component: ConnectorComponent::from(dataset),
             });
         }
