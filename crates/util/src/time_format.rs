@@ -495,6 +495,7 @@ mod tests {
     }
 
     // Helper to unwrap as WithOffset variant
+    #[allow(clippy::needless_pass_by_value)]
     fn expect_with_offset(result: Option<ParsedDateTime>) -> DateTime<FixedOffset> {
         match result {
             Some(ParsedDateTime::WithOffset(dt)) => dt,
@@ -504,6 +505,7 @@ mod tests {
     }
 
     // Helper to unwrap as Naive variant
+    #[allow(clippy::needless_pass_by_value)]
     fn expect_naive(result: Option<ParsedDateTime>) -> NaiveDateTime {
         match result {
             Some(ParsedDateTime::Naive(dt)) => dt,
