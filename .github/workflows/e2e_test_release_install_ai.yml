@@ -2,6 +2,11 @@ name: E2E Test Release Installation (AI)
 on:
   workflow_dispatch:
     inputs:
+      install_script_branch:
+        description: 'Branch to use for install script (leave empty to use install.spiceai.org)'
+        required: false
+        type: string
+        default: ''
       platform_option:
         description: 'Which platform do you want to run on? (Default is all)'
         required: false
@@ -121,18 +126,33 @@ jobs:
           rm -rf ~/.spice/bin/
 
       - name: install Spice (https://install.spiceai.org)
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && inputs.install_script_branch == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl https://install.spiceai.org | /bin/bash
 
+      - name: install Spice (from branch)
+        if: matrix.target.target_os != 'windows' && inputs.install_script_branch != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/spiceai/spiceai/${{ inputs.install_script_branch }}/install/install.sh" | /bin/bash
+
       - name: install Spice (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.target_os == 'windows' && inputs.install_script_branch == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+
+      - name: install Spice (Windows from branch)
+        if: matrix.target.target_os == 'windows' && inputs.install_script_branch != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $url = "https://raw.githubusercontent.com/spiceai/spiceai/${{ inputs.install_script_branch }}/install/Install.ps1"
+          curl -L $url -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
       - name: add Spice bin to PATH
         if: matrix.target.target_os != 'windows'

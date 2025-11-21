@@ -142,15 +142,12 @@ downloadFile() {
     LATEST_RELEASE_TAG=$1
 
     SPICE_CLI_ARTIFACT="${SPICE_CLI_FILENAME}_${OS}_${ARCH}.tar.gz"
-    SPICE_CLI_CHECKSUM="${SPICE_CLI_ARTIFACT}.sha256"
     DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
     DOWNLOAD_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICE_CLI_ARTIFACT}"
-    CHECKSUM_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICE_CLI_CHECKSUM}"
 
     # Create the temp directory
     SPICE_TMP_ROOT=$(mktemp -dt spice-install-XXXXXX)
     ARTIFACT_TMP_FILE="$SPICE_TMP_ROOT/$SPICE_CLI_ARTIFACT"
-    CHECKSUM_TMP_FILE="$SPICE_TMP_ROOT/$SPICE_CLI_CHECKSUM"
 
     echo "Downloading $DOWNLOAD_URL ..."
 
@@ -159,13 +156,26 @@ downloadFile() {
           $@
     }
 
-    parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_ARTIFACT\"))[0].id"
-
-    asset_id=`gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$parser"`
-    if [ "$asset_id" = "null" ]; then
+    # Get asset info including checksum from GitHub API
+    asset_parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_ARTIFACT\"))[0]"
+    asset_info=$(gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$asset_parser")
+    
+    asset_id=$(echo "$asset_info" | jq -r '.id')
+    if [ "$asset_id" = "null" ] || [ -z "$asset_id" ]; then
       echo "ERROR: version not found $VERSION"
       exit 1
-    fi;
+    fi
+    
+    # Extract checksum from label or name (format: "sha256:hash" or similar)
+    asset_label=$(echo "$asset_info" | jq -r '.label // empty')
+    asset_state=$(echo "$asset_info" | jq -r '.state // empty')
+    
+    # Try to get checksum from the asset's label or check for a checksum in uploader comments
+    EXPECTED_CHECKSUM=""
+    if [[ "$asset_label" =~ sha256:([a-fA-F0-9]{64}) ]]; then
+        EXPECTED_CHECKSUM="${BASH_REMATCH[1]}"
+        echo "Found checksum in asset metadata: sha256:$EXPECTED_CHECKSUM"
+    fi
 
     # Download the binary
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
@@ -183,28 +193,8 @@ downloadFile() {
         exit 1
     fi
     
-    # Download the checksum file
-    echo "Downloading checksum file..."
-    checksum_parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_CHECKSUM\"))[0].id"
-    checksum_asset_id=`gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$checksum_parser"`
-    
-    if [ "$checksum_asset_id" != "null" ]; then
-        if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-            gh_curl -H "Accept:application/octet-stream" -SsL \
-                https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$checksum_asset_id \
-                -o "$CHECKSUM_TMP_FILE"
-        else
-            gh_wget -q --auth-no-challenge --header='Accept:application/octet-stream' \
-                https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$checksum_asset_id \
-                -O "$CHECKSUM_TMP_FILE"
-        fi
-    else
-        echo "Warning: Checksum file not found for this release, skipping verification"
-        CHECKSUM_TMP_FILE=""
-    fi
-    
-    # Verify checksum if available
-    if [ -n "$CHECKSUM_TMP_FILE" ] && [ -f "$CHECKSUM_TMP_FILE" ]; then
+    # Verify checksum if available from GitHub API
+    if [ -n "$EXPECTED_CHECKSUM" ]; then
         echo "Verifying checksum..."
         
         # Detect available checksum tool
@@ -221,19 +211,18 @@ downloadFile() {
             # Calculate actual checksum
             actual_checksum=$($CHECKSUM_CMD "$ARTIFACT_TMP_FILE" | awk '{print $1}')
             
-            # Read expected checksum from file
-            expected_checksum=$(cat "$CHECKSUM_TMP_FILE" | awk '{print $1}')
-            
-            if [ "$actual_checksum" = "$expected_checksum" ]; then
+            if [ "$actual_checksum" = "$EXPECTED_CHECKSUM" ]; then
                 echo "✓ Checksum verified successfully"
             else
                 echo "ERROR: Checksum verification failed!"
-                echo "Expected: $expected_checksum"
+                echo "Expected: $EXPECTED_CHECKSUM"
                 echo "Actual:   $actual_checksum"
                 echo "This could indicate a corrupted download or security issue."
                 exit 1
             fi
         fi
+    else
+        echo "Warning: No checksum found in GitHub release metadata, skipping verification"
     fi
     
     # Verify the downloaded file is a valid gzip archive
@@ -492,10 +481,24 @@ else
     
     if [ "$PATH_ALREADY_SET" = true ]; then
         echo -e "${yellow}Note:${reset} The Spice CLI PATH configuration is already present in $SHELL_TO_USE"
-        echo ""
-        echo "If 'spice' command is not found, run one of the following:"
-        echo "  source $SHELL_TO_USE"
-        echo "  OR restart your terminal"
+        
+        # Try to make it available in current shell if interactive
+        if [ -t 0 ]; then
+            export PATH="$HOME/$SPICE_BIN:$PATH"
+            
+            if command -v spice >/dev/null 2>&1; then
+                echo "✓ 'spice' command is now available in your current shell!"
+            else
+                echo ""
+                echo "To use 'spice', restart your terminal or run:"
+                echo "  source $SHELL_TO_USE"
+            fi
+        else
+            echo ""
+            echo "If 'spice' command is not found, run one of the following:"
+            echo "  source $SHELL_TO_USE"
+            echo "  OR restart your terminal"
+        fi
         echo ""
     else
         echo -e "${yellow}Adding Spice CLI to your PATH${reset}\n"
@@ -526,6 +529,30 @@ else
 
         path_command=$(getShellPathCommand "$shell_type")
         addToProfile "$path_command"
+        
+        # Try to source the profile to make spice available immediately
+        # This only works if the install script is being run interactively (not piped)
+        if [ -t 0 ]; then
+            echo ""
+            echo "Attempting to activate PATH in current shell..."
+            
+            # For the current shell session, directly update PATH
+            export PATH="$HOME/$SPICE_BIN:$PATH"
+            
+            if command -v spice >/dev/null 2>&1; then
+                echo "✓ 'spice' command is now available in your current shell!"
+                echo "  Run 'spice version' to verify"
+            else
+                echo "Note: 'spice' will be available after restarting your terminal or running:"
+                echo "  source $SHELL_TO_USE"
+            fi
+        else
+            echo ""
+            echo "To use 'spice' immediately, run:"
+            echo "  export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
+            echo ""
+            echo "Or restart your terminal for persistent changes."
+        fi
     fi
 fi
 
