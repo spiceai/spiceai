@@ -463,7 +463,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             flattened_fields,
-            "2006-01-02T15:04:05.000Z07:00".to_string(),
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -1049,7 +1049,7 @@ mod tests {
             "id".to_string(),
             None, // No sort key
             HashSet::new(),
-            "2006-01-02T15:04:05.000Z07:00".to_string(),
+            "2006-01-02T15:04:05.000Z07:00",
         );
 
         let builder = DynamoDBRequestPlanBuilder::new(table_schema);
