@@ -395,7 +395,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let client = Arc::clone(&self.client);
         let request_plan = self.request_plan.clone();
         let unnest_depth = self.unnest_depth;
-        let time_format = self.time_format.clone();
+        let time_format = Arc::clone(&self.time_format);
 
         let total_partitions = match self.properties.partitioning {
             Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _) => 1,
