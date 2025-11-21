@@ -47,10 +47,7 @@ use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 
 #[cfg(feature = "cluster")]
-use {
-    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
-    crate::datafusion::cluster,
-};
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode};
 
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -117,6 +114,8 @@ pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -665,6 +664,13 @@ impl Runtime {
             ),
             _ => None,
         };
+
+        #[cfg(feature = "cluster")]
+        if self.config.cluster.mode.is_some() {
+            tracing::warn!(
+                "Distributed Query (Alpha) is in preview and should not be used in production."
+            );
+        }
 
         // Start Flight server
         let flight_shutdown = CancellationToken::new();

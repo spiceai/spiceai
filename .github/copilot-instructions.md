@@ -472,6 +472,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 5. testoperator is the test harness
 6. Workspace uses Rust edition 2024
 7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
+8. New files should include copyright header. The current year is 2025. Required file types: `.rs`, `.go`
 
 ## Adding Features Checklist
 

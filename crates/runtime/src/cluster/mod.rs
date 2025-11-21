@@ -1,11 +1,12 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
-use crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::datafusion::cluster::codec::spice_physical_codec::SpicePhysicalCodec;
-use crate::datafusion::cluster::config::SpiceClusterConfig;
-use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer;
-use crate::datafusion::cluster::physical_plan::optimizer::union_projection_pushdown::UnionProjectionPushdownOptimizer;
+use crate::dataconnector::listing;
+use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
-use crate::{FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, Runtime};
+use crate::{
+    FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
+};
+use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::prelude::SessionConfig;
 use app::App;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
@@ -24,26 +25,27 @@ use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::SessionConfig;
+use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
+use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
+use datafusion_datasource::ListingTableUrl;
+use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
+use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
+use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use url::Url;
 use uuid::Uuid;
 
-pub mod codec;
-pub mod config;
-pub mod datafusion_scheduler_ext;
-pub mod physical_plan;
+pub mod datafusion;
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
-    tracing::warn!("Distributed Query (Alpha) is in preview and should not be used in production.");
-
     let scheduler = create_scheduler_server(rt).await?;
 
     rt.df
@@ -60,13 +62,10 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
+#[allow(clippy::too_many_lines)]
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
-    tracing::warn!("Distributed Query (Alpha) is in preview and should not be used in production.");
-
-    executor_bind_app(&rt, rt.config.cluster.scheduler_url.to_string()).await?;
-
     let runtime_handle = Arc::clone(&rt);
 
     let runtime_producer: RuntimeProducer =
@@ -168,15 +167,36 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    rt.status.update_cluster("executor", ComponentStatus::Ready);
-
-    Ok(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec).map_err(|e| {
-            FailedToStartClusterExecutor {
-                source: Box::new(e),
-            }
-        }),
+    // Bind app manifest to runtime
+    executor_bind_app(
+        &rt,
+        rt.config.cluster.scheduler_url.to_string(),
+        executor_id,
     )
+    .await?;
+
+    let (tx_ready, rx_ready) = oneshot::channel::<String>();
+
+    let executor_poll_loop = tokio::spawn(
+        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, Some(tx_ready)).map_err(
+            |e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            },
+        ),
+    );
+
+    Ok(async move {
+        let _ = rx_ready
+            .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+        rt.status.update_cluster("executor", ComponentStatus::Ready);
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
+        executor_poll_loop
+            .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?
+    })
 }
 
 async fn create_scheduler_server(
@@ -211,8 +231,7 @@ async fn create_scheduler_server(
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env(io_runtime.clone()))
-                    .with_physical_optimizer_rule(DistributeFileScanOptimizer::new())
-                    .with_physical_optimizer_rule(UnionProjectionPushdownOptimizer::new())
+                    .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
                     .build(),
             )
         })),
@@ -238,13 +257,15 @@ async fn create_scheduler_server(
     .context(FailedToStartClusterSchedulerSnafu)
 }
 
-/// Initializes relevant `App` runtime components retrieved from the scheduler node
+/// - Initializes relevant `App` runtime components retrieved from the scheduler node
+/// - Initializes and binds `SchedulerRPCSecretStore`
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
-    scheduler_flight_url: impl Into<Arc<str>>,
+    scheduler_flight_url: String,
+    executor_id: String,
 ) -> crate::Result<()> {
     let flight_client = flight_client::FlightClient::try_new(
-        scheduler_flight_url.into(),
+        scheduler_flight_url.clone().into(),
         flight_client::Credentials::anonymous(),
         None,
     )
@@ -279,10 +300,80 @@ async fn executor_bind_app(
         *rt.app.write().await = Some(Arc::new(app_def));
     }
 
+    *rt.secrets.write().await =
+        Secrets::new_for_cluster_executor(scheduler_flight_url, executor_id);
+
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
+
+    Ok(())
+}
+
+/// Traverses dataset definitions and reifies `ListingTableUrl`s, triggering object store
+/// registration for each.
+async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
+    let app = rt.app();
+    let app = app.read().await;
+    let Some(ref app) = *app else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Runtime did not bind an App.".into(),
+        });
+    };
+    for dataset in Arc::clone(&rt).get_valid_datasets(app, LogErrors(true)) {
+        let mut params = ConnectorParamsBuilder::new(dataset.source().into(), (&dataset).into())
+            .build(Arc::clone(&rt.secrets), rt.tokio_io_runtime())
+            .await
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        // Either this is a URL with a scheme, or a URL with a connector name prefixing it
+        let url = match dataset.from.as_str().split_once(':') {
+            Some((_, rest)) if !rest.starts_with("//") => rest,
+            _ => dataset.from.as_str(),
+        };
+
+        let Ok(mut parsed) = Url::parse(url) else {
+            tracing::warn!("Unable to configure Dataset URL {}", url);
+            continue;
+        };
+
+        if parsed.scheme() == "file" {
+            tracing::warn!(
+                "Dataset {} has a file:// scheme and may not be resolvable without a shared mount.",
+                dataset.name
+            );
+            continue;
+        }
+
+        // Not all connectors have the same parameter structures for S3 -- this makes all fragment
+        // keys match the spec expected by the S3 connector and `SpiceObjectRegistry`.
+        params.parameters.canonicalize_s3_fragments();
+
+        let unprefixed = params
+            .parameters
+            .into_iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>();
+
+        parsed.set_fragment(Some(
+            listing::build_fragments(&params.parameters, unprefixed).as_str(),
+        ));
+
+        let listing_table_url = ListingTableUrl::parse(parsed)
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        let _ = rt
+            .df
+            .ctx
+            .runtime_env()
+            .object_store(listing_table_url)
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        tracing::info!("Configured object storage for Dataset {}", dataset.name);
+    }
 
     Ok(())
 }
