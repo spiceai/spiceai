@@ -170,18 +170,6 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	return nil
 }
 
-// dangerousPatterns contains glob patterns that indicate path traversal attempts
-// or absolute paths that should be rejected in tar archives
-var dangerousPatterns = []string{
-	"*/..*", // Unix parent directory traversal
-	"*..*",  // Parent at start (Unix)
-	`*\..*`, // Windows parent directory traversal
-	"*..*",  // Parent at start (Windows)
-	"/*",    // Unix absolute path
-	`?:*`,   // Windows drive letter
-	`\\*`,   // Windows UNC path or absolute
-}
-
 // isSubpath checks that the target (child) path is within the root directory,
 // preventing directory traversal or absolute path escapes.
 func isSubpath(root, target string) bool {
