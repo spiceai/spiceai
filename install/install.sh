@@ -142,12 +142,15 @@ downloadFile() {
     LATEST_RELEASE_TAG=$1
 
     SPICE_CLI_ARTIFACT="${SPICE_CLI_FILENAME}_${OS}_${ARCH}.tar.gz"
+    SPICE_CLI_CHECKSUM="${SPICE_CLI_ARTIFACT}.sha256"
     DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
     DOWNLOAD_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICE_CLI_ARTIFACT}"
+    CHECKSUM_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICE_CLI_CHECKSUM}"
 
     # Create the temp directory
     SPICE_TMP_ROOT=$(mktemp -dt spice-install-XXXXXX)
     ARTIFACT_TMP_FILE="$SPICE_TMP_ROOT/$SPICE_CLI_ARTIFACT"
+    CHECKSUM_TMP_FILE="$SPICE_TMP_ROOT/$SPICE_CLI_CHECKSUM"
 
     echo "Downloading $DOWNLOAD_URL ..."
 
@@ -164,6 +167,7 @@ downloadFile() {
       exit 1
     fi;
 
+    # Download the binary
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
         gh_curl -H "Accept:application/octet-stream" -SsL \
             https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
@@ -175,19 +179,91 @@ downloadFile() {
     fi
 
     if [ ! -f "$ARTIFACT_TMP_FILE" ]; then
-        echo "failed to download $DOWNLOAD_URL ..."
+        echo "Failed to download $DOWNLOAD_URL"
         exit 1
     fi
+    
+    # Download the checksum file
+    echo "Downloading checksum file..."
+    checksum_parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_CHECKSUM\"))[0].id"
+    checksum_asset_id=`gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$checksum_parser"`
+    
+    if [ "$checksum_asset_id" != "null" ]; then
+        if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
+            gh_curl -H "Accept:application/octet-stream" -SsL \
+                https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$checksum_asset_id \
+                -o "$CHECKSUM_TMP_FILE"
+        else
+            gh_wget -q --auth-no-challenge --header='Accept:application/octet-stream' \
+                https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$checksum_asset_id \
+                -O "$CHECKSUM_TMP_FILE"
+        fi
+    else
+        echo "Warning: Checksum file not found for this release, skipping verification"
+        CHECKSUM_TMP_FILE=""
+    fi
+    
+    # Verify checksum if available
+    if [ -n "$CHECKSUM_TMP_FILE" ] && [ -f "$CHECKSUM_TMP_FILE" ]; then
+        echo "Verifying checksum..."
+        
+        # Detect available checksum tool
+        if command -v sha256sum >/dev/null 2>&1; then
+            CHECKSUM_CMD="sha256sum"
+        elif command -v shasum >/dev/null 2>&1; then
+            CHECKSUM_CMD="shasum -a 256"
+        else
+            echo "Warning: No SHA256 checksum tool found (sha256sum or shasum), skipping verification"
+            CHECKSUM_CMD=""
+        fi
+        
+        if [ -n "$CHECKSUM_CMD" ]; then
+            # Calculate actual checksum
+            actual_checksum=$($CHECKSUM_CMD "$ARTIFACT_TMP_FILE" | awk '{print $1}')
+            
+            # Read expected checksum from file
+            expected_checksum=$(cat "$CHECKSUM_TMP_FILE" | awk '{print $1}')
+            
+            if [ "$actual_checksum" = "$expected_checksum" ]; then
+                echo "✓ Checksum verified successfully"
+            else
+                echo "ERROR: Checksum verification failed!"
+                echo "Expected: $expected_checksum"
+                echo "Actual:   $actual_checksum"
+                echo "This could indicate a corrupted download or security issue."
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Verify the downloaded file is a valid gzip archive
+    if ! file "$ARTIFACT_TMP_FILE" | grep -q "gzip compressed"; then
+        echo "Downloaded file is not a valid gzip archive"
+        echo "File type: $(file "$ARTIFACT_TMP_FILE")"
+        exit 1
+    fi
+    
+    echo "Download successful ($(du -h "$ARTIFACT_TMP_FILE" | cut -f1))"
 }
 
 installFile() {
-    tar xf "$ARTIFACT_TMP_FILE" -C "$SPICE_TMP_ROOT"
+    echo "Extracting archive..."
+    if ! tar xf "$ARTIFACT_TMP_FILE" -C "$SPICE_TMP_ROOT" 2>/dev/null; then
+        echo "Failed to extract archive"
+        exit 1
+    fi
+    
     local tmp_root_spice_cli="$SPICE_TMP_ROOT/$SPICE_CLI_FILENAME"
 
     if [ ! -f "$tmp_root_spice_cli" ]; then
         echo "Failed to unpack Spice CLI executable."
+        echo "Expected file: $tmp_root_spice_cli"
+        echo "Archive contents:"
+        tar tzf "$ARTIFACT_TMP_FILE" 2>/dev/null | head -10
         exit 1
     fi
+    
+    echo "Extracted: $SPICE_CLI_FILENAME ($(du -h "$tmp_root_spice_cli" | cut -f1))"
 
     chmod o+x $tmp_root_spice_cli
     
@@ -209,6 +285,20 @@ installFile() {
 
     if [ -f "$SPICE_CLI_FILE" ]; then
         echo "$SPICE_CLI_FILENAME installed into $SPICE_CLI_INSTALL_DIR successfully."
+        
+        # Verify the binary is executable and works
+        if [ -x "$SPICE_CLI_FILE" ]; then
+            # Test that the binary can at least print version/help
+            if "$SPICE_CLI_FILE" version >/dev/null 2>&1 || "$SPICE_CLI_FILE" --version >/dev/null 2>&1 || "$SPICE_CLI_FILE" --help >/dev/null 2>&1; then
+                echo "Verified: $SPICE_CLI_FILENAME binary is working correctly."
+            else
+                echo -e "${yellow}Warning:${reset} Binary installed but may not be working correctly."
+                echo "Try running '$SPICE_CLI_FILE --help' to test."
+            fi
+        else
+            echo -e "${yellow}Warning:${reset} Binary installed but is not executable."
+            echo "You may need to run: chmod +x $SPICE_CLI_FILE"
+        fi
     else
         echo "Failed to install $SPICE_CLI_FILENAME"
         exit 1
