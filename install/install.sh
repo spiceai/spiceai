@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Spice.ai installer script
+# Version: 2.0.0 (2025-11-21)
 
 # colors
 blue="\033[0;94m"
@@ -351,6 +353,13 @@ downloadFile $ret_val
 installFile
 cleanup
 
+# Skip PATH configuration when installing to system directories
+if [[ "$SPICE_CLI_INSTALL_DIR" == "/usr/local/bin" ]] || [[ "$SPICE_CLI_INSTALL_DIR" == "/usr/bin" ]]; then
+    echo -e "\nInstalled to system directory. The 'spice' command should be available immediately."
+    installCompleted
+    exit 0
+fi
+
 # Detect the current shell
 detectShell
 
@@ -389,8 +398,12 @@ else
     fi
     
     if [ "$PATH_ALREADY_SET" = true ]; then
-        echo "The Spice CLI PATH configuration is already present in $SHELL_TO_USE"
-        echo "Run 'source $SHELL_TO_USE' or restart your shell to use 'spice'"
+        echo -e "${yellow}Note:${reset} The Spice CLI PATH configuration is already present in $SHELL_TO_USE"
+        echo ""
+        echo "If 'spice' command is not found, run one of the following:"
+        echo "  source $SHELL_TO_USE"
+        echo "  OR restart your terminal"
+        echo ""
     else
         echo -e "${yellow}Adding Spice CLI to your PATH${reset}\n"
 
