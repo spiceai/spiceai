@@ -549,7 +549,7 @@ else
         else
             echo ""
             echo "To use 'spice' immediately, run:"
-            echo "  export PATH=\"\$HOME/$SPICE_BIN:\$PATH\""
+            echo "  source $SHELL_TO_USE"
             echo ""
             echo "Or restart your terminal for persistent changes."
         fi
