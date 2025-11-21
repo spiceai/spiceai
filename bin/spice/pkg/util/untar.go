@@ -56,6 +56,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -92,11 +93,20 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 		if err != nil {
 			return fmt.Errorf("tar error: %v", err)
 		}
-		if !validRelPath(f.Name) {
-			return fmt.Errorf("tar contained invalid name error %q", f.Name)
-		}
 		rel := filepath.FromSlash(f.Name)
 		abs := filepath.Join(dir, rel)
+		// Check that abs is within the target directory, preventing directory traversal
+		dirAbs, errAbs := filepath.Abs(dir)
+		if errAbs != nil {
+			return fmt.Errorf("failed to resolve target directory: %v", errAbs)
+		}
+		absAbs, errAbs2 := filepath.Abs(abs)
+		if errAbs2 != nil {
+			return fmt.Errorf("failed to resolve extraction path: %v", errAbs2)
+		}
+		if !isSubpath(dirAbs, absAbs) {
+			return fmt.Errorf("tar contained invalid name: potential path traversal or absolute path %q", f.Name)
+		}
 
 		fi := f.FileInfo()
 		mode := fi.Mode()
@@ -160,30 +170,14 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	return nil
 }
 
-// dangerousPatterns contains glob patterns that indicate path traversal attempts
-// or absolute paths that should be rejected in tar archives
-var dangerousPatterns = []string{
-	"*/..*", // Unix parent directory traversal
-	"*..*",  // Parent at start (Unix)
-	`*\..*`, // Windows parent directory traversal
-	"*..*",  // Parent at start (Windows)
-	"/*",    // Unix absolute path
-	`?:*`,   // Windows drive letter
-	`\\*`,   // Windows UNC path or absolute
-}
-
-func validRelPath(p string) bool {
-	if p == "" {
-		return false
+// isSubpath checks that the target (child) path is within the root directory,
+// preventing directory traversal or absolute path escapes.
+func isSubpath(root, target string) bool {
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
+	// Ensure trailing separator on root, so subpath (itself) matches
+	if !strings.HasSuffix(root, string(os.PathSeparator)) {
+		root += string(os.PathSeparator)
 	}
-
-	// Use filepath.Match to detect path traversal patterns on all platforms
-	// This handles both Unix (/) and Windows (\) path separators correctly
-	for _, pattern := range dangerousPatterns {
-		if matched, _ := filepath.Match(pattern, p); matched {
-			return false
-		}
-	}
-
-	return true
+	return strings.HasPrefix(target, root)
 }
