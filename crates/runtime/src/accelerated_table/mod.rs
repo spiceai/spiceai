@@ -284,7 +284,7 @@ pub struct Builder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
-    cache_ttl: Option<Duration>,
+    caching_ttl: Option<Duration>,
 }
 
 impl Builder {
@@ -321,7 +321,7 @@ impl Builder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
-            cache_ttl: None,
+            caching_ttl: None,
         }
     }
 
@@ -447,8 +447,8 @@ impl Builder {
     }
 
     /// Set the TTL for cache mode
-    pub fn cache_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
-        self.cache_ttl = ttl;
+    pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
+        self.caching_ttl = ttl;
         self
     }
 
@@ -605,7 +605,7 @@ impl Builder {
             refresher,
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
-            cache_ttl: self.cache_ttl,
+            cache_ttl: self.caching_ttl,
             io_runtime: self.io_runtime,
         })
     }
@@ -747,11 +747,11 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Check if we're in cache mode
-        let is_cache_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+        // Check if we're in caching mode
+        let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
 
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
-        if !self.refresher().initial_load_completed() && !is_cache_mode {
+        if !self.refresher().initial_load_completed() && !is_caching_mode {
             match self.ready_state {
                 ReadyState::OnLoad => {
                     return Err(DataFusionError::External(
@@ -784,9 +784,9 @@ impl TableProvider for AcceleratedTable {
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match (is_cache_mode, &self.zero_results_action) {
+        let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
-                // Cache mode: wrap with cache execution plan to handle staleness and background refresh
+                // Caching mode: wrap with cache execution plan to handle staleness and background refresh
                 let federated_provider = self.federated.table_provider().await;
                 Arc::new(cache::CacheAccelerationScanExec::new(
                     input,
