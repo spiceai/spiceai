@@ -354,7 +354,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             if node_key == old_exec_key {
                 let new_exec = duck_exec
                     .clone()
-                    .with_optimized_sql(format!("{new_statement}"));
+                    .with_optimized_sql(format!("{new_statement}"), None);
 
                 Ok(Transformed::yes(Arc::new(new_exec)))
             } else {
