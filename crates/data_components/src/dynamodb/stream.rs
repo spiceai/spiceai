@@ -116,7 +116,7 @@ pub fn process_batch(
                     let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
                         .context(DowncastBuilderSnafu)?;
                     append_item_to_struct_builder(&item_data, data_struct_builder)
-                        .context(FailedToAddItemToStructSnafu)?
+                        .context(FailedToAddItemToStructSnafu)?;
                 }
                 _ => unreachable!("Unexpected field in changes schema {}", field.name()),
             }
