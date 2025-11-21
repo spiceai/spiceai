@@ -525,28 +525,22 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - opendal 0.54.1, Apache-2.0 
   <br/>https://github.com/apache/opendal
 
-- opentelemetry 0.27.1, Apache-2.0 
+- opentelemetry 0.29.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry 0.30.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry
-
-- opentelemetry-http 0.27.0, Apache-2.0 
+- opentelemetry-http 0.29.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry-prometheus 0.27.0, Apache-2.0 
+- opentelemetry-prometheus 0.29.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry-proto 0.30.0, Apache-2.0 
+- opentelemetry-proto 0.29.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
-- opentelemetry-zipkin 0.27.0, Apache-2.0 
+- opentelemetry-zipkin 0.29.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-zipkin
 
-- opentelemetry_sdk 0.27.1, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
-
-- opentelemetry_sdk 0.30.0, Apache-2.0 
+- opentelemetry_sdk 0.29.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk
 
 - oracle 0.6.3, Apache-2.0 OR UPL-1.0 
@@ -807,7 +801,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tracing-log 0.2.0, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
-- tracing-opentelemetry 0.28.0, MIT 
+- tracing-opentelemetry 0.30.0, MIT 
   <br/>https://github.com/tokio-rs/tracing-opentelemetry
 
 - tracing-subscriber 0.3.20, MIT 
@@ -908,4 +902,3 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - zip 4.6.1, MIT 
   <br/>https://github.com/zip-rs/zip2.git
-

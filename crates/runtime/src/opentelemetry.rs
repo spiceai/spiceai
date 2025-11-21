@@ -43,19 +43,17 @@ use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use runtime_auth::GrpcAuth;
-use runtime_auth::layer::grpc::make_interceptor;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
-use tonic::Response;
-use tonic::Status;
-use tonic::async_trait;
-use tonic::codec::CompressionEncoding;
-use tonic::service::InterceptorLayer;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tonic_health::pb::health_server::Health;
-use tonic_health::pb::health_server::HealthServer;
+use tonic_health012::pb::health_server::Health;
+use tonic_health012::pb::health_server::HealthServer;
+use tonic012::Request;
+use tonic012::Response;
+use tonic012::Status;
+use tonic012::async_trait;
+use tonic012::codec::CompressionEncoding;
+use tonic012::transport::{Identity, Server, ServerTlsConfig};
 
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -68,7 +66,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to serve: {source}"))]
-    UnableToServe { source: tonic::transport::Error },
+    UnableToServe { source: tonic012::transport::Error },
 
     #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
@@ -97,7 +95,7 @@ pub enum Error {
     FirstMetricDataPointHasNoValue { metric: String },
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
-    UnableToConfigureTls { source: tonic::transport::Error },
+    UnableToConfigureTls { source: tonic012::transport::Error },
 
     #[snafu(display(
         "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
@@ -205,7 +203,7 @@ impl MetricsService for Service {
 }
 
 async fn create_health_service() -> HealthServer<impl Health> {
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (mut health_reporter, health_service) = tonic_health012::server::health_reporter();
     health_reporter
         .set_serving::<MetricsServiceServer<Service>>()
         .await;
@@ -591,7 +589,7 @@ pub async fn start(
     bind_address: SocketAddr,
     datafusion: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
-    grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
+    _grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
@@ -615,7 +613,6 @@ pub async fn start(
     }
 
     let server = server
-        .layer(InterceptorLayer::new(make_interceptor(grpc_auth)))
         .add_service(create_health_service().await)
         .add_service(svc);
 
@@ -641,7 +638,7 @@ pub async fn start(
     Ok(())
 }
 
-fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+fn is_address_in_use_error(err: &tonic012::transport::Error) -> bool {
     let mut source: Option<&dyn std::error::Error> = Some(err);
     while let Some(e) = source {
         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {

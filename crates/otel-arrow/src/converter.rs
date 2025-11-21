@@ -480,11 +480,13 @@ impl OtelToArrowConverter {
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
     ) {
+        let time_unix_nano = system_time_to_nanos(sum.time);
+        let start_time_unix_nano = system_time_to_nanos(sum.start_time);
+
         for data_point in &sum.data_points {
-            self.time_unix_nano_builder
-                .append_option(data_point.time.map(system_time_to_nanos));
+            self.time_unix_nano_builder.append_value(time_unix_nano);
             self.start_time_unix_nano_builder
-                .append_option(data_point.start_time.map(system_time_to_nanos));
+                .append_value(start_time_unix_nano);
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -516,11 +518,13 @@ impl OtelToArrowConverter {
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
     ) {
+        let time_unix_nano = system_time_to_nanos(gauge.time);
+        let start_time_unix_nano = gauge.start_time.map(system_time_to_nanos);
+
         for data_point in &gauge.data_points {
-            self.time_unix_nano_builder
-                .append_option(data_point.time.map(system_time_to_nanos));
+            self.time_unix_nano_builder.append_value(time_unix_nano);
             self.start_time_unix_nano_builder
-                .append_option(data_point.start_time.map(system_time_to_nanos));
+                .append_option(start_time_unix_nano);
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -551,11 +555,13 @@ impl OtelToArrowConverter {
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
     ) {
+        let time_unix_nano = system_time_to_nanos(histogram.time);
+        let start_time_unix_nano = system_time_to_nanos(histogram.start_time);
+
         for data_point in &histogram.data_points {
-            self.time_unix_nano_builder
-                .append_value(system_time_to_nanos(data_point.time));
+            self.time_unix_nano_builder.append_value(time_unix_nano);
             self.start_time_unix_nano_builder
-                .append_value(system_time_to_nanos(data_point.start_time));
+                .append_value(start_time_unix_nano);
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);

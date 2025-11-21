@@ -29,7 +29,7 @@ use opentelemetry_proto::tonic::{
 use tonic::{
     IntoRequest,
     metadata::MetadataValue,
-    transport::{Channel, ClientTlsConfig},
+    transport::{Certificate, Channel, ClientTlsConfig},
 };
 
 #[derive(Parser)]
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut otel_endpoint = args.otel_endpoint;
     let channel = if let Some(tls_root_certificate_file) = args.tls_root_certificate_file {
         let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
-        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
+        let tls_root_certificate = Certificate::from_pem(tls_root_certificate);
         let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
         if otel_endpoint == "http://localhost:50052" {
             otel_endpoint = "https://localhost:50052".to_string();

@@ -92,7 +92,7 @@ object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.30", features = [
+opentelemetry-proto = { version = "0.29.0", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -161,6 +161,11 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
+tonic-health012 = { package = "tonic-health", version = "0.12" }
+tonic012 = { package = "tonic", version = "0.12", features = [
+    "gzip",
+    "tls-native-roots",
+] }
 tools = { path = "../tools" }
 tower.workspace = true
 tower-http.workspace = true

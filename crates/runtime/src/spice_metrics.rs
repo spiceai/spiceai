@@ -20,7 +20,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
-use opentelemetry_sdk::metrics::MetricError;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -46,6 +46,7 @@ pub enum Error {
 
 /// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.
 /// This ensures `DataFusion` can gracefully shut down, even when metrics persist.
+#[derive(Clone)]
 pub struct SpiceMetricsExporter {
     datafusion: Weak<DataFusion>,
 }
@@ -60,7 +61,7 @@ impl SpiceMetricsExporter {
 
 #[async_trait]
 impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
+    async fn export(&self, metrics: RecordBatch) -> OTelSdkResult {
         let data_update = DataUpdate {
             schema: metrics.schema(),
             data: vec![metrics],
@@ -69,22 +70,14 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
 
         let Some(df) = self.datafusion.upgrade() else {
             // this should never happen as the exporter must be shutdown before the DataFusion instance is dropped
-            return Err(MetricError::Other(
+            return Err(OTelSdkError::InternalFailure(
                 "Failed to export metrics as the DataFusion instance has already been dropped.\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
             ));
         };
 
         df.write_data(&get_metrics_table_reference(), data_update)
             .await
-            .map_err(|e| MetricError::Other(e.to_string()))
-    }
-
-    async fn force_flush(&self) -> Result<(), MetricError> {
-        Ok(())
-    }
-
-    fn shutdown(&self) -> Result<(), MetricError> {
-        Ok(())
+            .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))
     }
 }
 

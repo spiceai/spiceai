@@ -14,16 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 
 use app::spicepod::component::runtime::OutputLevel;
 use app::{App, spicepod::component::runtime::TracingConfig};
-use futures::future::BoxFuture;
-use opentelemetry::InstrumentationScope;
+use opentelemetry::{InstrumentationScope, trace::TracerProvider};
 use opentelemetry_sdk::{
     Resource,
-    export::trace::{ExportResult, SpanData, SpanExporter},
-    trace::TracerProvider,
+    error::OTelSdkResult,
+    trace::{SdkTracerProvider, SpanData, SpanExporter},
 };
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
@@ -195,30 +194,29 @@ where
         .transpose()?
         .flatten();
 
-    let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
-        task_history::otel_exporter::TaskHistoryExporter::new(
-            df,
-            captured_output,
-            min_sql_duration_ms,
-            captured_plan,
-            min_plan_duration_ms,
-        ),
-    )];
+    let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
+        df,
+        captured_output,
+        min_sql_duration_ms,
+        captured_plan,
+        min_plan_duration_ms,
+    );
 
-    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config).await {
-        exporters.push(zipkin_exporter);
+    let zipkin_exporter = zipkin_task_history_otel_exporter(config).await?;
+
+    let exporter = OtelExportMultiplexer::new(task_history_exporter, zipkin_exporter);
+
+    let mut provider_builder = SdkTracerProvider::builder().with_batch_exporter(exporter);
+    let mut resource_builder = Resource::builder_empty();
+    if let Some(app_name) = app_name.as_ref() {
+        resource_builder = resource_builder.with_service_name(app_name.clone());
     }
-
-    let exporter = OtelExportMultiplexer::new(exporters);
-
-    let mut provider_builder =
-        TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
-    provider_builder = provider_builder.with_resource(Resource::default());
+    provider_builder = provider_builder.with_resource(resource_builder.build());
     let provider = provider_builder.build();
     let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
+    let tracer = provider.tracer_with_scope(scope);
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
@@ -230,9 +228,9 @@ where
 }
 
 async fn zipkin_task_history_otel_exporter(
-    app_name: Option<String>,
     config: Option<&TracingConfig>,
-) -> Result<Option<Box<dyn SpanExporter>>, Box<dyn std::error::Error>> {
+) -> Result<Option<opentelemetry_zipkin::ZipkinExporter>, Box<dyn std::error::Error + Send + Sync>>
+{
     let Some(config) = config else {
         return Ok(None);
     };
@@ -251,18 +249,13 @@ async fn zipkin_task_history_otel_exporter(
         return Ok(None);
     }
 
-    let service_name: Cow<'static, str> = match app_name {
-        Some(name) => Cow::Owned(name),
-        None => Cow::Borrowed("Spice.ai"),
-    };
+    let exporter = opentelemetry_zipkin::ZipkinExporter::builder()
+        .with_service_address(([0, 0, 0, 0], 0).into())
+        .with_http_client(Client::new())
+        .with_collector_endpoint(zipkin_endpoint)
+        .build()?;
 
-    Ok(Some(Box::new(
-        opentelemetry_zipkin::new_pipeline()
-            .with_service_name(service_name)
-            .with_collector_endpoint(zipkin_endpoint)
-            .with_http_client(Client::new())
-            .init_exporter()?,
-    )))
+    Ok(Some(exporter))
 }
 
 async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
@@ -279,50 +272,62 @@ async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
 
 #[derive(Debug)]
 struct OtelExportMultiplexer {
-    exporters: Vec<Box<dyn SpanExporter>>,
+    task_history_exporter: task_history::otel_exporter::TaskHistoryExporter,
+    zipkin_exporter: Option<opentelemetry_zipkin::ZipkinExporter>,
 }
 
 impl OtelExportMultiplexer {
-    pub fn new(exporters: Vec<Box<dyn SpanExporter>>) -> Self {
-        Self { exporters }
+    pub fn new(
+        task_history_exporter: task_history::otel_exporter::TaskHistoryExporter,
+        zipkin_exporter: Option<opentelemetry_zipkin::ZipkinExporter>,
+    ) -> Self {
+        Self {
+            task_history_exporter,
+            zipkin_exporter,
+        }
     }
 }
 
 impl SpanExporter for OtelExportMultiplexer {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        let mut futures = Vec::new();
-        for exporter in &mut self.exporters {
-            futures.push(exporter.export(batch.clone()));
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let mut futures: Vec<Pin<Box<dyn std::future::Future<Output = OTelSdkResult> + Send>>> =
+            Vec::with_capacity(2);
+        futures.push(Box::pin(self.task_history_exporter.export(batch.clone())));
+        if let Some(exporter) = &self.zipkin_exporter {
+            futures.push(Box::pin(exporter.export(batch)));
         }
 
-        Box::pin(async move {
-            futures::future::join_all(futures).await;
-
+        async move {
+            let results = futures::future::join_all(futures).await;
+            for result in results {
+                let _ = result;
+            }
             Ok(())
-        })
+        }
     }
 
-    fn shutdown(&mut self) {
-        for exporter in &mut self.exporters {
-            exporter.shutdown();
+    fn shutdown(&mut self) -> OTelSdkResult {
+        self.task_history_exporter.shutdown()?;
+        if let Some(exporter) = &mut self.zipkin_exporter {
+            exporter.shutdown()?;
         }
+        Ok(())
     }
 
-    fn force_flush(&mut self) -> BoxFuture<'static, ExportResult> {
-        let mut futures = Vec::new();
-        for exporter in &mut self.exporters {
-            futures.push(exporter.force_flush());
+    fn force_flush(&mut self) -> OTelSdkResult {
+        self.task_history_exporter.force_flush()?;
+        if let Some(exporter) = &mut self.zipkin_exporter {
+            exporter.force_flush()?;
         }
-
-        Box::pin(async move {
-            futures::future::join_all(futures).await;
-
-            Ok(())
-        })
+        Ok(())
     }
 
     fn set_resource(&mut self, resource: &Resource) {
-        for exporter in &mut self.exporters {
+        self.task_history_exporter.set_resource(resource);
+        if let Some(exporter) = &mut self.zipkin_exporter {
             exporter.set_resource(resource);
         }
     }

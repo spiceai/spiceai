@@ -16,24 +16,28 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use opentelemetry_sdk::metrics::{
-    MetricError, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
+use opentelemetry_sdk::{
+    error::{OTelSdkError, OTelSdkResult},
+    metrics::{Temporality, data::ResourceMetrics, exporter::PushMetricExporter},
 };
 
 use crate::converter::OtelToArrowConverter;
 
 #[async_trait]
 pub trait ArrowExporter: Send + Sync + 'static {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError>;
+    async fn export(&self, metrics: RecordBatch) -> OTelSdkResult;
 
-    async fn force_flush(&self) -> Result<(), MetricError>;
-
-    /// Shutdown the exporter.
-    ///
     /// # Errors
-    ///
-    /// This function will return an error if the shutdown couldn't complete successfully.
-    fn shutdown(&self) -> Result<(), MetricError>;
+    /// Returns an error if the exporter fails to flush metrics.
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns an error if shutting down the exporter fails.
+    fn shutdown(&self) -> OTelSdkResult {
+        Ok(())
+    }
 }
 
 pub struct OtelArrowExporter<E: ArrowExporter> {
@@ -55,19 +59,28 @@ impl<E: ArrowExporter> OtelArrowExporter<E> {
 }
 
 #[async_trait]
-impl<E: ArrowExporter> PushMetricExporter for OtelArrowExporter<E> {
-    async fn export(&self, metrics: &mut ResourceMetrics) -> Result<(), MetricError> {
+impl<E: ArrowExporter + Clone> PushMetricExporter for OtelArrowExporter<E> {
+    fn export(
+        &self,
+        metrics: &mut ResourceMetrics,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         let mut converter = OtelToArrowConverter::new(metrics.scope_metrics.len());
-        let batch = converter.convert(metrics)?;
+        let exporter = self.exporter.clone();
 
-        self.exporter.export(batch).await
+        async move {
+            let batch = converter
+                .convert(metrics)
+                .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?;
+
+            exporter.export(batch).await
+        }
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
-        self.exporter.force_flush().await
+    fn force_flush(&self) -> OTelSdkResult {
+        self.exporter.force_flush()
     }
 
-    fn shutdown(&self) -> Result<(), MetricError> {
+    fn shutdown(&self) -> OTelSdkResult {
         self.exporter.shutdown()
     }
 

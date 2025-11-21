@@ -17,8 +17,8 @@ use csv::Writer;
 use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
-use tonic::transport::Channel;
-use tonic_health::{ServingStatus, pb::health_client::HealthClient};
+use tonic_health012::{ServingStatus, pb::health_client::HealthClient};
+use tonic012::transport::Channel;
 
 use axum::{
     Extension, Json,
@@ -211,7 +211,7 @@ async fn get_opentelemetry_status(
     let mut client = HealthClient::new(channel);
 
     let resp = client
-        .check(tonic_health::pb::HealthCheckRequest {
+        .check(tonic_health012::pb::HealthCheckRequest {
             service: String::new(),
         })
         .await?;
