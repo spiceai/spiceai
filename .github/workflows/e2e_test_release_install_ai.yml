@@ -174,12 +174,25 @@ jobs:
           $url = "https://raw.githubusercontent.com/spiceai/spiceai/$branch/install/Install.ps1"
           curl -L $url -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
-      - name: add Spice bin to PATH
+      - name: verify PATH configuration (Unix)
+        if: matrix.target.target_os != 'windows'
+        run: |
+          # Start a new bash session to test if PATH was properly configured
+          bash -l -c 'spice version'
+
+      - name: verify PATH configuration (Windows)
+        if: matrix.target.target_os == 'windows'
+        shell: pwsh
+        run: |
+          # Start a new PowerShell session to test if PATH was properly configured
+          pwsh -Command "spice version"
+
+      - name: add Spice bin to PATH for workflow steps
         if: matrix.target.target_os != 'windows'
         run: |
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
-      - name: add Spice bin to PATH (Windows)
+      - name: add Spice bin to PATH for workflow steps (Windows)
         if: matrix.target.target_os == 'windows'
         run: |
           Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
