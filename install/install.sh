@@ -528,14 +528,20 @@ else
         path_command=$(getShellPathCommand "$shell_type")
         addToProfile "$path_command"
         
-        # Try to source the profile to make spice available immediately
-        # This only works if the install script is being run interactively (not piped)
+        # Try to activate PATH in current shell
         if [ -t 0 ]; then
             echo ""
             echo "Attempting to activate PATH in current shell..."
             
-            # For the current shell session, directly update PATH
-            export PATH="$HOME/$SPICE_BIN:$PATH"
+            # Try to source the profile file for current shell
+            if [[ "$shell_type" == "bash" ]] && [[ "$SHELL" == */bash ]]; then
+                source "$SHELL_TO_USE" 2>/dev/null || export PATH="$HOME/$SPICE_BIN:$PATH"
+            elif [[ "$shell_type" == "zsh" ]] && [[ "$SHELL" == */zsh ]]; then
+                source "$SHELL_TO_USE" 2>/dev/null || export PATH="$HOME/$SPICE_BIN:$PATH"
+            else
+                # Fallback: directly update PATH for current session
+                export PATH="$HOME/$SPICE_BIN:$PATH"
+            fi
             
             if command -v spice >/dev/null 2>&1; then
                 echo "✓ 'spice' command is now available in your current shell!"
