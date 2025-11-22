@@ -744,7 +744,7 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        use crate::accelerated_table::cache::CacheRefreshHelper;
+        use crate::accelerated_table::caching::CacheRefreshHelper;
 
         // Get the TTL from refresh settings - default to 30 seconds if not specified
         let ttl = refresh.check_interval.unwrap_or(Duration::from_secs(30));

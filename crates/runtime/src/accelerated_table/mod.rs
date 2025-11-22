@@ -57,7 +57,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
-pub mod cache;
+pub mod caching;
 pub mod federation;
 mod metrics;
 pub mod refresh;
@@ -793,7 +793,7 @@ impl TableProvider for AcceleratedTable {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
                 let federated_provider = self.federated.table_provider().await;
-                Arc::new(cache::CacheAccelerationScanExec::new(
+                Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
                     federated_provider,

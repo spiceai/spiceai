@@ -403,8 +403,8 @@ impl CacheRefreshHelper {
     }
 }
 
-/// Cache acceleration execution plan that checks staleness and triggers background refresh
-pub struct CacheAccelerationScanExec {
+/// Caching acceleration execution plan that checks staleness and triggers background refresh
+pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
     ttl: Option<Duration>,
     federated: Arc<dyn TableProvider>,
@@ -416,7 +416,7 @@ pub struct CacheAccelerationScanExec {
     limit: Option<usize>,
 }
 
-impl CacheAccelerationScanExec {
+impl CachingAccelerationScanExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
@@ -488,21 +488,21 @@ impl CacheAccelerationScanExec {
     }
 }
 
-impl std::fmt::Debug for CacheAccelerationScanExec {
+impl std::fmt::Debug for CachingAccelerationScanExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "CacheAccelerationScanExec")
+        write!(f, "CachingAccelerationScanExec")
     }
 }
 
-impl DisplayAs for CacheAccelerationScanExec {
+impl DisplayAs for CachingAccelerationScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CacheAccelerationScanExec")
+        write!(f, "CachingAccelerationScanExec")
     }
 }
 
-impl ExecutionPlan for CacheAccelerationScanExec {
+impl ExecutionPlan for CachingAccelerationScanExec {
     fn name(&self) -> &'static str {
-        "CacheAccelerationScanExec"
+        "CachingAccelerationScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -652,5 +652,402 @@ impl ExecutionPlan for CacheAccelerationScanExec {
 
         let adapter = RecordBatchStreamAdapter::new(schema, cache_miss_or_stale_stream);
         Ok(Box::pin(adapter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    fn create_test_schema_with_refresh_timestamp() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    fn create_test_schema_without_refresh_timestamp() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+    }
+
+    fn create_test_schema_with_request_params() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    #[test]
+    fn test_is_data_stale_no_refresh_column() {
+        let schema = create_test_schema_without_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
+
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(id_array), Arc::new(name_array)])
+                .expect("Failed to create batch");
+
+        let ttl = Duration::from_secs(60);
+        let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
+        assert!(result, "Data without refresh column should be considered stale");
+    }
+
+    #[test]
+    fn test_is_data_stale_fresh_data() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
+
+        // Create timestamps that are very recent (within TTL)
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 10_000_000_000),  // 10 seconds ago
+            Some(now - 20_000_000_000),  // 20 seconds ago
+            Some(now - 5_000_000_000),   // 5 seconds ago
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let ttl = Duration::from_secs(60); // 60 second TTL
+        let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
+        assert!(!result, "Data refreshed within TTL should not be stale");
+    }
+
+    #[test]
+    fn test_is_data_stale_stale_data() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 90_000_000_000),  // 90 seconds ago (stale)
+            Some(now - 120_000_000_000), // 120 seconds ago (stale)
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let ttl = Duration::from_secs(60); // 60 second TTL
+        let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
+        assert!(result, "Data older than TTL should be stale");
+    }
+
+    #[test]
+    fn test_is_data_stale_null_timestamps() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![None, None]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let ttl = Duration::from_secs(60);
+        let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
+        assert!(result, "Data with null timestamps should be considered stale");
+    }
+
+    #[test]
+    fn test_is_data_stale_mixed_timestamps() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Mix of fresh and stale timestamps - if ANY is stale, the whole batch is stale
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 10_000_000_000),  // 10 seconds ago (fresh)
+            Some(now - 90_000_000_000),  // 90 seconds ago (stale)
+            Some(now - 5_000_000_000),   // 5 seconds ago (fresh)
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let ttl = Duration::from_secs(60);
+        let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
+        assert!(
+            result,
+            "Data with any stale timestamp should be considered stale"
+        );
+    }
+
+    #[test]
+    fn test_is_data_stale_ttl_boundary() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let ttl = Duration::from_secs(60);
+        #[allow(clippy::cast_possible_truncation)]
+        let ttl_nanos = ttl.as_nanos() as i64;
+
+        // Well within TTL boundary - this should NOT be stale
+        let refresh_timestamps_fresh =
+            TimestampNanosecondArray::from(vec![Some(now - ttl_nanos + 1_000_000_000), Some(now - ttl_nanos + 2_000_000_000)]);  // 1-2 seconds within boundary
+
+        let batch_fresh = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array.clone()),
+                Arc::new(name_array.clone()),
+                Arc::new(refresh_timestamps_fresh),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let result_fresh = is_data_stale(&batch_fresh, ttl).expect("Should successfully check staleness");
+        assert!(!result_fresh, "Data well within TTL boundary should not be stale");
+        
+        // Well past the TTL boundary - this SHOULD be stale
+        let refresh_timestamps_stale =
+            TimestampNanosecondArray::from(vec![Some(now - ttl_nanos - 1_000_000_000), Some(now - ttl_nanos - 2_000_000_000)]);  // 1-2 seconds past boundary
+
+        let batch_stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps_stale),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let result_stale = is_data_stale(&batch_stale, ttl).expect("Should successfully check staleness");
+        assert!(result_stale, "Data well past TTL boundary should be stale");
+    }
+
+    #[test]
+    fn test_is_data_stale_empty_batch() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(Vec::<i32>::new());
+        let name_array = StringArray::from(Vec::<&str>::new());
+        let refresh_timestamps = TimestampNanosecondArray::from(Vec::<Option<i64>>::new());
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let ttl = Duration::from_secs(60);
+        let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
+        assert!(!result, "Empty batch should not be considered stale");
+    }
+
+    #[test]
+    fn test_extract_filters_from_row_all_columns_present() {
+        let schema = create_test_schema_with_request_params();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let path_array = StringArray::from(vec![Some("/api/users"), Some("/api/posts")]);
+        let query_array = StringArray::from(vec![Some("page=1"), Some("limit=10")]);
+        let body_array = StringArray::from(vec![Some("{\"id\":1}"), Some("{\"id\":2}")]);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![Some(now), Some(now)]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(path_array),
+                Arc::new(query_array),
+                Arc::new(body_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let filters =
+            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        assert_eq!(filters.len(), 3, "Should extract 3 filters");
+    }
+
+    #[test]
+    fn test_extract_filters_from_row_with_nulls() {
+        let schema = create_test_schema_with_request_params();
+        let id_array = Int32Array::from(vec![1]);
+        let path_array = StringArray::from(vec![Some("/api/users")]);
+        let query_array = StringArray::from(vec![None::<&str>]); // Null query
+        let body_array = StringArray::from(vec![Some("{\"id\":1}")]);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![Some(now)]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(path_array),
+                Arc::new(query_array),
+                Arc::new(body_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let filters =
+            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        // Only path and body should be extracted (query is null)
+        assert_eq!(filters.len(), 2, "Should only extract non-null filters");
+    }
+
+    #[test]
+    fn test_extract_filters_from_row_with_empty_strings() {
+        let schema = create_test_schema_with_request_params();
+        let id_array = Int32Array::from(vec![1]);
+        let path_array = StringArray::from(vec![Some("")]);  // Empty string
+        let query_array = StringArray::from(vec![Some("page=1")]);
+        let body_array = StringArray::from(vec![Some("")]);  // Empty string
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![Some(now)]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(path_array),
+                Arc::new(query_array),
+                Arc::new(body_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let filters =
+            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        // Only query should be extracted (path and body are empty strings)
+        assert_eq!(
+            filters.len(),
+            1,
+            "Should not extract filters for empty strings"
+        );
+    }
+
+    #[test]
+    fn test_extract_filters_from_row_missing_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let id_array = Int32Array::from(vec![1]);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![Some(now)]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_array), Arc::new(refresh_timestamps)],
+        )
+        .expect("Failed to create batch");
+
+        let filters =
+            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        assert_eq!(
+            filters.len(),
+            0,
+            "Should extract 0 filters when columns are missing"
+        );
     }
 }
