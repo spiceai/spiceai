@@ -185,7 +185,7 @@ downloadFile() {
 
 installFile() {
     echo "Extracting archive..."
-    if ! tar xzf "$ARTIFACT_TMP_FILE" -C "$SPICE_TMP_ROOT" 2>/dev/null; then
+    if ! tar xf "$ARTIFACT_TMP_FILE" -C "$SPICE_TMP_ROOT" 2>/dev/null; then
         echo "Failed to extract archive"
         echo "The downloaded file may be corrupted or is not a valid tar.gz archive"
         exit 1
@@ -418,7 +418,7 @@ if [[ "$SHELL_TO_USE" == "null" ]]; then
     echo -e "${yellow}No shell profile found.${reset}"
     
     # Determine the appropriate profile to create
-    local profile_to_create=""
+    profile_to_create=""
     if [[ "$DETECTED_SHELL" == "bash" ]]; then
         profile_to_create="$HOME/.bash_profile"
     elif [[ "$DETECTED_SHELL" == "zsh" ]]; then
@@ -533,9 +533,9 @@ else
             
             # Try to source the profile file for current shell
             if [[ "$shell_type" == "bash" ]] && [[ "$SHELL" == */bash ]]; then
-                source "$SHELL_TO_USE" 2>/dev/null || export PATH="$HOME/$SPICE_BIN:$PATH"
+                . "$SHELL_TO_USE" 2>/dev/null || export PATH="$HOME/$SPICE_BIN:$PATH"
             elif [[ "$shell_type" == "zsh" ]] && [[ "$SHELL" == */zsh ]]; then
-                source "$SHELL_TO_USE" 2>/dev/null || export PATH="$HOME/$SPICE_BIN:$PATH"
+                . "$SHELL_TO_USE" 2>/dev/null || export PATH="$HOME/$SPICE_BIN:$PATH"
             else
                 # Fallback: directly update PATH for current session
                 export PATH="$HOME/$SPICE_BIN:$PATH"
