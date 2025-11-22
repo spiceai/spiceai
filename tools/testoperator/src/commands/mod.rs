@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::args::DatasetTestArgs;
+use crate::args::{DatasetTestArgs, QuerySetLoader};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
@@ -35,6 +35,7 @@ pub(crate) mod dispatch;
 pub(crate) mod evals;
 pub(crate) mod http;
 pub(crate) mod load;
+pub(crate) mod query;
 pub(crate) mod search;
 pub(crate) mod throughput;
 mod util;

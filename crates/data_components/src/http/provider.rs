@@ -220,6 +220,7 @@ pub struct HttpTableProvider {
     max_query_length: usize,
     allow_body_filters: bool,
     max_body_bytes: usize,
+    health_probe: Option<String>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -260,6 +261,7 @@ impl HttpTableProvider {
             max_query_length: DEFAULT_MAX_QUERY_LENGTH,
             allow_body_filters: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            health_probe: None,
         }
     }
 
@@ -383,6 +385,30 @@ impl HttpTableProvider {
         self
     }
 
+    pub fn with_health_probe(mut self, health_probe: Option<String>) -> Result<Self> {
+        if let Some(ref path) = health_probe {
+            // Basic validation for health probe path
+            ensure!(
+                path.starts_with('/'),
+                ConfigurationSnafu {
+                    message: format!("health_probe path must start with '/'. Got: '{path}'",)
+                }
+            );
+            ensure!(
+                path.len() <= MAX_REQUEST_PATH_LENGTH,
+                ConfigurationSnafu {
+                    message: format!(
+                        "health_probe path is too long ({} characters). Maximum allowed is {}",
+                        path.len(),
+                        MAX_REQUEST_PATH_LENGTH
+                    )
+                }
+            );
+        }
+        self.health_probe = health_probe;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn base_table_schema() -> Schema {
         Schema::new(vec![
@@ -403,35 +429,58 @@ impl HttpTableProvider {
         )
     }
 
-    /// Validates the HTTP endpoint by attempting a request to a non-existent path.
-    /// This helps detect issues like DNS errors, connection problems, or invalid URLs
-    /// early in the initialization process.
+    /// Validates the HTTP endpoint by attempting a request to a custom health probe path if configured,
+    /// or a non-existent path otherwise.
+    /// This helps detect issues like DNS errors, connection problems,
+    /// or invalid URLs early in the initialization process.
     pub async fn validate_endpoint(&self) -> Result<()> {
-        use rand::Rng;
-        use rand::distr::Alphanumeric;
+        let test_url = if let Some(ref health_probe_path) = self.health_probe {
+            let mut test_url = self.base_url.clone();
+            test_url.set_path(health_probe_path);
+            test_url
+        } else {
+            use rand::Rng;
+            use rand::distr::Alphanumeric;
 
-        // Generate a random path that should return 404
-        let random_suffix: String = rand::rng()
-            .sample_iter(Alphanumeric)
-            .take(16)
-            .map(char::from)
-            .collect();
-        let test_path = format!("/__spice_health_check_{random_suffix}");
+            // Generate a random path that should return 404
+            let random_suffix: String = rand::rng()
+                .sample_iter(Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect();
+            let test_path = format!("/__spice_health_check_{random_suffix}");
 
-        let mut test_url = self.base_url.clone();
-        test_url.set_path(&test_path);
+            let mut test_url = self.base_url.clone();
+            test_url.set_path(&test_path);
+            test_url
+        };
 
-        tracing::debug!("Validating HTTP endpoint: {}", self.base_url);
+        tracing::debug!("Validating HTTP endpoint: {test_url}");
 
-        match self.client.get(test_url).send().await {
+        match self.client.get(test_url.clone()).send().await {
             Ok(response) => {
                 let status = response.status();
-                tracing::debug!(
-                    "HTTP endpoint validation response: {} (status: {})",
-                    self.base_url,
-                    status
-                );
-                // Any response (including 404) means the endpoint is reachable
+                if self.health_probe.is_some() {
+                    tracing::debug!(
+                        "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
+                    );
+                    // For custom health probe, require successful status (2xx)
+                    if !status.is_success() {
+                        return Err(Error::HttpClientError {
+                            status: status.as_u16(),
+                            message: format!(
+                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
+                                self.base_url,
+                                test_url.path()
+                            ),
+                        });
+                    }
+                } else {
+                    tracing::debug!(
+                        "HTTP endpoint validation response: {test_url} (status: {status}). Any status (including 404) is expected for the random probe path."
+                    );
+                    // Any response (including 404) means the endpoint is reachable
+                }
                 Ok(())
             }
             Err(e) => {

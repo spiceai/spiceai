@@ -441,6 +441,10 @@ fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
     false
 }
 
+/// Starts flight service
+/// # Panics
+/// If running in clustered mode, will panic unless TLS is configured or user manually overrides
+/// this safety check, as RPC will transmit sensitive information to executors.
 pub async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,
@@ -466,13 +470,25 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
+    #[cfg(feature = "cluster")]
+    if tls_config.is_none()
+        && rt.config.cluster.mode.is_some()
+        && !rt.config.cluster.allow_insecure_connections
+    {
+        panic!(
+            "Refusing to start in clustered mode without a valid TLS configuration. \
+            To acknowledge and override, pass --allow-insecure-connections as an argument to spiced.\
+            Both schedulers and executors must share the same TLS configuration."
+        );
+    }
+
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
     #[allow(unused_mut)]
     let mut server = server
-        .layer(RequestContextLayer::new(app, rt.datafusion()))
+        .layer(RequestContextLayer::new(app, rt.datafusion(), rt.secrets()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
