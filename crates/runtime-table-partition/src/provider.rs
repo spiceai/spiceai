@@ -591,7 +591,7 @@ mod tests {
 
         // With 2 partitions and no filters, should produce a UnionExec
         assert!(
-            plan.as_any().is::<UnionExec>(),
+            plan.as_any().is::<PartitionedUnionExec>(),
             "Expected UnionExec for multiple partitions"
         );
     }
