@@ -29,6 +29,7 @@ use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use tower_http::follow_redirect::policy::PolicyExt;
 use util::time_format::is_valid_format;
 
 #[derive(Debug)]
@@ -142,40 +143,21 @@ impl DataConnector for DynamoDB {
         .load()
         .await;
 
-        let schema_infer_max_records_str =
-            match self.params.get("schema_infer_max_records").expose() {
-                ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
-                ExposedParamLookup::Absent(_) => DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR,
-            };
+        let schema_infer_max_records = self
+            .params
+            .get("schema_infer_max_records")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(10);
 
-        let schema_infer_max_records = i32::from_str(schema_infer_max_records_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
-            dataconnector: "dynamodb".to_string(),
-            message: format!(
-                "DynamoDB parameter 'schema_infer_max_records' must be an integer, not {schema_infer_max_records_str}"),
-            connector_component: ConnectorComponent::from(dataset)
-        })?;
-
-        let stream_poll_interval_ms_str = match self.params.get("stream_poll_interval_ms").expose()
-        {
-            ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
-            ExposedParamLookup::Absent(_) => DEFAULT_STREAM_POLL_INTERVAL_MS_STR,
-        };
-
-        let stream_poll_interval_ms = u64::from_str(stream_poll_interval_ms_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
-            dataconnector: "dynamodb".to_string(),
-            message: format!(
-                "DynamoDB parameter 'stream_poll_interval_ms' must be an integer, not {stream_poll_interval_ms_str}"),
-            connector_component: ConnectorComponent::from(dataset)
-        })?;
-
-        if stream_poll_interval_ms == 0 {
-            return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "dynamodb".to_string(),
-                message: "DynamoDB parameter 'stream_poll_interval_ms' must be positive"
-                    .to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-            });
-        }
+        let stream_poll_interval_ms = self
+            .params
+            .get("stream_poll_interval_ms_str")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200);
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
