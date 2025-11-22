@@ -417,26 +417,45 @@ done
 
 # If no shell profile was found, create one based on detected shell
 if [[ "$SHELL_TO_USE" == "null" ]]; then
+    echo -e "${yellow}No shell profile found.${reset}"
+    
+    # Determine the appropriate profile to create
+    local profile_to_create=""
     if [[ "$DETECTED_SHELL" == "bash" ]]; then
-        SHELL_TO_USE="$HOME/.bash_profile"
-        touch "$SHELL_TO_USE"
-        echo "Created new shell profile: $SHELL_TO_USE"
+        profile_to_create="$HOME/.bash_profile"
     elif [[ "$DETECTED_SHELL" == "zsh" ]]; then
-        SHELL_TO_USE="$HOME/.zprofile"
-        touch "$SHELL_TO_USE"
-        echo "Created new shell profile: $SHELL_TO_USE"
+        profile_to_create="$HOME/.zprofile"
     elif [[ "$DETECTED_SHELL" == "fish" ]]; then
-        SHELL_TO_USE="$HOME/.config/fish/config.fish"
-        mkdir -p "$HOME/.config/fish"
-        touch "$SHELL_TO_USE"
-        echo "Created new shell profile: $SHELL_TO_USE"
+        profile_to_create="$HOME/.config/fish/config.fish"
     elif [[ "$DETECTED_SHELL" == "ksh" ]]; then
-        SHELL_TO_USE="$HOME/.profile"
-        touch "$SHELL_TO_USE"
-        echo "Created new shell profile: $SHELL_TO_USE"
+        profile_to_create="$HOME/.profile"
     elif [[ "$DETECTED_SHELL" == "csh" ]]; then
-        SHELL_TO_USE="$HOME/.cshrc"
-        touch "$SHELL_TO_USE"
+        profile_to_create="$HOME/.cshrc"
+    else
+        profile_to_create="$HOME/.profile"
+    fi
+    
+    # Check if running interactively
+    if [ -t 0 ]; then
+        echo "Would you like to create $profile_to_create? (y/n)"
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            if [[ "$profile_to_create" == *"config.fish"* ]]; then
+                mkdir -p "$HOME/.config/fish"
+            fi
+            touch "$profile_to_create"
+            SHELL_TO_USE="$profile_to_create"
+            echo "Created new shell profile: $SHELL_TO_USE"
+        else
+            echo "Skipping profile creation."
+        fi
+    else
+        # Non-interactive (e.g., piped from curl), create automatically
+        if [[ "$profile_to_create" == *"config.fish"* ]]; then
+            mkdir -p "$HOME/.config/fish"
+        fi
+        touch "$profile_to_create"
+        SHELL_TO_USE="$profile_to_create"
         echo "Created new shell profile: $SHELL_TO_USE"
     fi
 fi
