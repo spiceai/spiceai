@@ -13,6 +13,24 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+//! Search integration tests for Spice runtime.
+//!
+//! Each test function runs a single configured `spicepod.yaml` and a single data source. Spice runtime configurations
+//! are defined in YAML, and test functions are generated (at `build.rs`, into `generated_search_tests.rs`) for all
+//!  combinations of:
+//!   - Acceleration, in `acceleration.yaml`
+//!   - Vector Store, in `vector_store.yaml`
+//!
+//! In combination with, for each source of data (currently only `./megascience`):
+//!   - Search tables, in `megascience/tables.yaml`. Either a [`spicepod::component::View`] or
+//!      [`spicepod::component::Dataset`] component. A data source might require multiple (e.g. a view atop a dataset),
+//!       but tests are run on one table (`.[].table_name` in YAML).
+//!   - Column configurations, in `megascience/columns.yaml`.
+//!   - Test cases, in `megascience/tests.yaml`
+//!
+//! All tests are run only with the `extended_tests` feature flag.
+
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
