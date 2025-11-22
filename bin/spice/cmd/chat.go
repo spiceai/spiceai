@@ -701,6 +701,9 @@ spice chat --model <model> "What is Spice.ai?"
 			}
 
 			if strings.ToLower(message) == ".clear history" {
+				// Clear session history (in-memory)
+				line.ClearHistory()
+				// Clear persistent history
 				if historyMgr != nil {
 					historyMgr.Clear()
 					if err := historyMgr.Save(); err != nil {
@@ -1159,6 +1162,9 @@ func runRemoteChatREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, ht
 		}
 
 		if strings.ToLower(message) == ".clear history" {
+			// Clear session history (in-memory)
+			line.ClearHistory()
+			// Clear persistent history
 			if historyMgr != nil {
 				historyMgr.Clear()
 				if err := historyMgr.Save(); err != nil {
