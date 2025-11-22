@@ -406,7 +406,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
 /// Uses DuckDB accelerator which supports upsert-based multi-filter caching.
-/// 
+///
 /// NOTE: Currently DuckDB caching mode has issues - queries return empty results.
 /// Investigation needed. Test runs when duckdb feature is enabled but is currently failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -476,8 +476,19 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
                 .limit(0, Some(1))?;
 
             let batches1 = df1.collect().await?;
-            eprintln!("TEST: Step 1 returned {} batches with {} rows", batches1.len(), if !batches1.is_empty() { batches1[0].num_rows() } else { 0 });
-            assert!(!batches1.is_empty(), "Step 1: Should have results from HTTP API");
+            eprintln!(
+                "TEST: Step 1 returned {} batches with {} rows",
+                batches1.len(),
+                if !batches1.is_empty() {
+                    batches1[0].num_rows()
+                } else {
+                    0
+                }
+            );
+            assert!(
+                !batches1.is_empty(),
+                "Step 1: Should have results from HTTP API"
+            );
             assert_eq!(batches1[0].num_rows(), 1, "Step 1: Should have 1 row");
 
             // STEP 2: Query for "jennifer" - cache miss (should NOT overwrite "michael")
@@ -492,8 +503,19 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
                 .limit(0, Some(1))?;
 
             let batches2 = df2.collect().await?;
-            eprintln!("TEST: Step 2 returned {} batches with {} rows", batches2.len(), if !batches2.is_empty() { batches2[0].num_rows() } else { 0 });
-            assert!(!batches2.is_empty(), "Step 2: Should have results from HTTP API");
+            eprintln!(
+                "TEST: Step 2 returned {} batches with {} rows",
+                batches2.len(),
+                if !batches2.is_empty() {
+                    batches2[0].num_rows()
+                } else {
+                    0
+                }
+            );
+            assert!(
+                !batches2.is_empty(),
+                "Step 2: Should have results from HTTP API"
+            );
             assert_eq!(batches2[0].num_rows(), 1, "Step 2: Should have 1 row");
 
             // STEP 3: Query for "michael" again - should be cache hit
@@ -509,8 +531,19 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
                 .limit(0, Some(1))?;
 
             let batches3 = df3.collect().await?;
-            eprintln!("TEST: Step 3 returned {} batches with {} rows", batches3.len(), if !batches3.is_empty() { batches3[0].num_rows() } else { 0 });
-            assert!(!batches3.is_empty(), "Step 3: Should return cached michael data");
+            eprintln!(
+                "TEST: Step 3 returned {} batches with {} rows",
+                batches3.len(),
+                if !batches3.is_empty() {
+                    batches3[0].num_rows()
+                } else {
+                    0
+                }
+            );
+            assert!(
+                !batches3.is_empty(),
+                "Step 3: Should return cached michael data"
+            );
             assert_eq!(batches3[0].num_rows(), 1, "Step 3: Should have 1 row");
 
             let batch3 = &batches3[0];
@@ -538,8 +571,19 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
                 .limit(0, Some(1))?;
 
             let batches4 = df4.collect().await?;
-            eprintln!("TEST: Step 4 returned {} batches with {} rows", batches4.len(), if !batches4.is_empty() { batches4[0].num_rows() } else { 0 });
-            assert!(!batches4.is_empty(), "Step 4: Should return cached jennifer data");
+            eprintln!(
+                "TEST: Step 4 returned {} batches with {} rows",
+                batches4.len(),
+                if !batches4.is_empty() {
+                    batches4[0].num_rows()
+                } else {
+                    0
+                }
+            );
+            assert!(
+                !batches4.is_empty(),
+                "Step 4: Should return cached jennifer data"
+            );
             assert_eq!(batches4[0].num_rows(), 1, "Step 4: Should have 1 row");
 
             let batch4 = &batches4[0];
