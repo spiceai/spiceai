@@ -737,6 +737,16 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // In caching mode, we handle filters ourselves (not pushed to accelerator)
+        // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
+        let is_caching_mode = futures::executor::block_on(async {
+            self.refresh_params.read().await.mode == RefreshMode::Caching
+        });
+
+        if is_caching_mode {
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+        }
+
         match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
             ZeroResultsAction::UseSource => {
@@ -754,6 +764,13 @@ impl TableProvider for AcceleratedTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Check if we're in caching mode
         let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+
+        tracing::debug!(
+            "AcceleratedTable::scan dataset={}, caching_mode={}, num_filters={}",
+            self.dataset_name,
+            is_caching_mode,
+            filters.len()
+        );
 
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
         if !self.refresher().initial_load_completed() && !is_caching_mode {
@@ -778,9 +795,15 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
+        // In caching mode, don't pass filters to the accelerator scan - we need to see
+        // ALL cached data to determine if we have a cache hit or miss. The CacheAccelerationScanExec
+        // will handle applying filters and fetching from source on cache miss.
+        // DataFusion will apply a FilterExec on top based on supports_filters_pushdown returning Inexact.
+        let accelerator_filters = if is_caching_mode { &[][..] } else { filters };
+
         let input = self
             .accelerator
-            .scan(state, projection, filters, limit)
+            .scan(state, projection, accelerator_filters, limit)
             .await?;
 
         let federated = Arc::clone(&self.federated);
@@ -803,7 +826,12 @@ impl TableProvider for AcceleratedTable {
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
-                ))
+                ));
+                tracing::debug!(
+                    "Created CacheAccelerationScanExec for dataset {}",
+                    self.dataset_name
+                );
+                cache_plan
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,
             (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(

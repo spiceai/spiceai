@@ -285,9 +285,9 @@ impl CacheRefreshHelper {
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
 
-        // Insert into accelerator (overwrite to replace stale data)
+        // Insert into accelerator (append in caching mode to support multiple filter combinations)
         let insert_plan = accelerator
-            .insert_into(&state, plan, InsertOp::Overwrite)
+            .insert_into(&state, plan, InsertOp::Append)
             .await?;
 
         // Execute the insertion
@@ -543,8 +543,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        eprintln!("!!! CacheAccelerationScanExec::execute called for partition {}", partition);
+        tracing::debug!(
+            "CacheAccelerationScanExec::execute dataset={}, partition={}, num_filters={}",
+            self.dataset_name,
+            partition,
+            self.filters.len()
+        );
+        
         // Execute the accelerator scan
         let mut accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
+        eprintln!("!!! Got accelerator stream");
         let schema = accelerator_stream.schema();
         let schema_clone = Arc::clone(&schema);
 
@@ -558,10 +567,13 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
         let cache_miss_or_stale_stream = futures::stream::once(async move {
+            eprintln!("!!! About to poll accelerator stream");
             // Check if accelerator has data
             if let Some(first_batch) = accelerator_stream.next().await {
+                eprintln!("!!! Accelerator stream returned batch");
                 match first_batch {
-                    Ok(batch) => {
+                    Ok(batch) if batch.num_rows() > 0 => {
+                        eprintln!("!!! Batch has {} rows - cache hit!", batch.num_rows());
                         tracing::trace!("Cache: Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
 
                         // Check if data is stale and trigger background refresh if needed
@@ -595,6 +607,35 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         );
                         Box::pin(adapter) as SendableRecordBatchStream
                     }
+                    Ok(batch) => {
+                        eprintln!("!!! Batch has 0 rows - cache miss!");
+                        // Empty batch (0 rows) - treat as cache miss
+                        tracing::info!("Cache: Cache miss for dataset {} - accelerator returned 0 rows, fetching from source", dataset_name);
+
+                        // Fetch from source synchronously
+                        match CacheRefreshHelper::fetch_from_source_on_miss(Arc::clone(&federated), Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
+                            Ok(batches) if !batches.is_empty() => {
+                                let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+                                tracing::info!("Cache: Fetched {} batches ({} total rows) from source for dataset {}",
+                                    batches.len(),
+                                    total_rows,
+                                    dataset_name);
+
+                                let batch_schema = batches[0].schema();
+                                let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                                let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                                Box::pin(adapter) as SendableRecordBatchStream
+                            }
+                            Ok(_) | Err(_) => {
+                                // Source returned no data or error
+                                let empty_stream = RecordBatchStreamAdapter::new(
+                                    Arc::clone(&schema_clone),
+                                    futures::stream::empty(),
+                                );
+                                Box::pin(empty_stream) as SendableRecordBatchStream
+                            }
+                        }
+                    }
                     Err(e) => {
                         // Error from accelerator - return the error
                         let error_stream = RecordBatchStreamAdapter::new(
@@ -605,6 +646,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                 }
             } else {
+                eprintln!("!!! Accelerator stream returned None - cache miss!");
                 // Cache miss - accelerator returned no data
                 tracing::info!("Cache: Cache miss for dataset {} - fetching from source", dataset_name);
 

@@ -28,6 +28,7 @@ mod checkpoint_postgres;
 mod checkpoint_sqlite;
 #[cfg(feature = "turso")]
 mod checkpoint_turso;
+mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod cron;
 #[cfg(feature = "sqlite")]
