@@ -180,20 +180,14 @@ downloadFile() {
         exit 1
     fi
     
-    # Verify the downloaded file is a valid gzip archive
-    if ! file "$ARTIFACT_TMP_FILE" | grep -q "gzip compressed"; then
-        echo "Downloaded file is not a valid gzip archive"
-        echo "File type: $(file "$ARTIFACT_TMP_FILE")"
-        exit 1
-    fi
-    
     echo "Download successful ($(du -h "$ARTIFACT_TMP_FILE" | cut -f1))"
 }
 
 installFile() {
     echo "Extracting archive..."
-    if ! tar xf "$ARTIFACT_TMP_FILE" -C "$SPICE_TMP_ROOT" 2>/dev/null; then
+    if ! tar xzf "$ARTIFACT_TMP_FILE" -C "$SPICE_TMP_ROOT" 2>/dev/null; then
         echo "Failed to extract archive"
+        echo "The downloaded file may be corrupted or is not a valid tar.gz archive"
         exit 1
     fi
     
