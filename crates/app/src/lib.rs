@@ -89,6 +89,28 @@ impl App {
     }
 }
 
+impl Default for App {
+    fn default() -> Self {
+        App {
+            name: "DEFAULT".to_string(),
+            secrets: vec![],
+            extensions: HashMap::default(),
+            catalogs: vec![],
+            datasets: vec![],
+            views: vec![],
+            models: vec![],
+            embeddings: vec![],
+            evals: vec![],
+            tools: vec![],
+            workers: vec![],
+            spicepods: vec![],
+            runtime: Runtime::default(),
+            management: None,
+            snapshots: None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to load spicepod {}: {source}", path.display()))]

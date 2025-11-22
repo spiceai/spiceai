@@ -14,21 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{
+    datafusion::{DataFusion, request_context_extension::DataFusionContextExtension},
+    model::ModelContextExtension,
+    secrets,
+};
+use app::App;
+use runtime_request_context::{Protocol, RequestContext};
 use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-
-use crate::{
-    datafusion::{DataFusion, request_context_extension::DataFusionContextExtension},
-    model::ModelContextExtension,
-};
-use app::App;
-use runtime_request_context::{Protocol, RequestContext};
+use tokio::sync::RwLock;
 
 use crate::datafusion::app_context_extension::AppContextExtension;
+use crate::datafusion::secrets_context_extension::SecretsContextExtension;
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
 
@@ -37,12 +39,17 @@ use tower::{Layer, Service};
 pub struct RequestContextLayer {
     app: Option<Arc<App>>,
     df: Arc<DataFusion>,
+    secrets: Arc<RwLock<secrets::Secrets>>,
 }
 
 impl RequestContextLayer {
     #[must_use]
-    pub fn new(app: Option<Arc<App>>, df: Arc<DataFusion>) -> Self {
-        Self { app, df }
+    pub fn new(
+        app: Option<Arc<App>>,
+        df: Arc<DataFusion>,
+        secrets: Arc<RwLock<secrets::Secrets>>,
+    ) -> Self {
+        Self { app, df, secrets }
     }
 }
 
@@ -54,6 +61,7 @@ impl<S> Layer<S> for RequestContextLayer {
             inner,
             app: self.app.clone(),
             df: Arc::clone(&self.df),
+            secrets: Arc::clone(&self.secrets),
         }
     }
 }
@@ -63,6 +71,7 @@ pub struct RequestContextMiddleware<S> {
     inner: S,
     app: Option<Arc<App>>,
     df: Arc<DataFusion>,
+    secrets: Arc<RwLock<secrets::Secrets>>,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for RequestContextMiddleware<S>
@@ -91,6 +100,7 @@ where
                 .with_extension(DataFusionContextExtension::new(Arc::clone(&self.df)))
                 .with_extension(ModelContextExtension::new())
                 .with_extension(AppContextExtension::new(self.app.clone()))
+                .with_extension(SecretsContextExtension::new(Arc::clone(&self.secrets)))
                 .from_headers(headers)
                 .build(),
         );

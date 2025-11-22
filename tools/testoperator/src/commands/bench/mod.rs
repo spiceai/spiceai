@@ -74,7 +74,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -173,7 +173,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path())?;
+    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path()?)?;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;

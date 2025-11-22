@@ -1,0 +1,105 @@
+use crate::Runtime;
+use crate::metrics::telemetry::track_bytes_processed;
+use arrow_schema::Schema;
+use ballista_core::serde::BallistaPhysicalExtensionCodec;
+use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion_expr::ScalarUDF;
+use datafusion_expr::registry::FunctionRegistry;
+use datafusion_proto::generated::datafusion_common;
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use prost::Message;
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
+use runtime_proto::{BytesProcessedExecNode, SchemaCastScanExecNode};
+use std::fmt::Debug;
+use std::sync::Arc;
+
+/// Serialization support for custom Spice execution nodes
+pub struct SpicePhysicalCodec {
+    inner: Arc<dyn PhysicalExtensionCodec>,
+    runtime: Option<Arc<Runtime>>,
+}
+
+impl Debug for SpicePhysicalCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpicePhysicalCodec")
+    }
+}
+
+impl SpicePhysicalCodec {
+    pub fn new(runtime: Arc<Runtime>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
+            runtime: Some(runtime),
+        }))
+    }
+
+    /// Used during encode and decode
+    fn runtime(&self) -> Result<Arc<Runtime>> {
+        self.runtime.clone().ok_or(DataFusionError::Execution(
+            "SpicePhysicalCodec did not bind a Runtime handle. This is a bug.".to_string(),
+        ))
+    }
+}
+
+impl PhysicalExtensionCodec for SpicePhysicalCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn ExecutionPlan>],
+        registry: &dyn FunctionRegistry,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Ok(plan) = self.inner.try_decode(buf, inputs, registry) {
+            return Ok(plan);
+        }
+
+        if let Ok(node) = SchemaCastScanExecNode::decode(buf) {
+            let schema = datafusion_common::Schema::decode(&*node.schema)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let exec = Arc::new(SchemaCastScanExec::new(
+                Arc::clone(&inputs[0]),
+                Arc::new(Schema::try_from(&schema)?),
+            ));
+
+            Ok(exec)
+        } else if BytesProcessedExecNode::decode(buf).is_ok() {
+            Ok(Arc::new(
+                BytesProcessedExec::new(
+                    Arc::clone(&inputs[0]),
+                    Arc::new(Box::new(track_bytes_processed)),
+                )
+                .fallback_to_new_context(),
+            ))
+        } else {
+            exec_err!("Cannot deserialize unknown execution plan")
+        }
+    }
+
+    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+        if let Some(concrete) = node.as_any().downcast_ref::<SchemaCastScanExec>() {
+            let mut schema_buf = vec![];
+            let serialized_schema = datafusion_common::Schema::try_from(concrete.schema())?;
+            serialized_schema
+                .encode(&mut schema_buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let node = SchemaCastScanExecNode { schema: schema_buf };
+            node.encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        } else if node.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
+            let node = BytesProcessedExecNode {};
+            node.encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        } else {
+            return self.inner.try_encode(node, buf);
+        }
+
+        Ok(())
+    }
+
+    fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+        self.runtime()?.df.ctx.udf(name)
+    }
+}
