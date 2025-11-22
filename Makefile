@@ -79,7 +79,7 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -87,11 +87,19 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures
 
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \

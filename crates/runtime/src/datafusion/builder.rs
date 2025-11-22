@@ -47,8 +47,15 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+
 #[cfg(feature = "duckdb")]
-use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
+use {
+    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
+    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
+    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
+    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
+};
+
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -243,18 +250,23 @@ impl DataFusionBuilder {
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
             ))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         #[cfg(feature = "duckdb")]
         {
-            state = state.with_physical_optimizer_rule(
-                DuckDBIntermediateIndexMaterializationOptimizer::new(),
-            );
+            state = state
+                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
+                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
+                .with_physical_optimizer_rule(
+                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
+                );
         }
+
+        state = state
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                Arc::new(Box::new(track_bytes_processed)),
+            )));
 
         let mut state = state.build();
 
@@ -465,6 +477,8 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        #[cfg(feature = "duckdb")]
+        DuckDBLogicalExtensionPlanner::new(),
     ]
 }
 

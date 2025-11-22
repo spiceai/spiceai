@@ -1,24 +1,35 @@
 [package]
-name = "datafusion-optimizer-rules"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
+name = "datafusion-optimizer-rules"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-datafusion.workspace = true
-datafusion-expr.workspace = true
-datafusion-table-providers.workspace = true
-r2d2 = { optional = true, workspace = true }
-duckdb = { optional = true, workspace = true }
+arrow = { optional = true, workspace = true }
+chrono = { optional = true, workspace = true }
+object_store = { optional = true, workspace = true }
 async-stream.workspace = true
 async-trait.workspace = true
-tracing.workspace = true
-futures.workspace = true
 cache = { path = "../cache" }
+datafusion.workspace = true
+datafusion-federation.workspace = true
+datafusion-datasource = { optional = true, workspace = true }
+datafusion-expr.workspace = true
+datafusion-table-providers.workspace = true
+tokio.workspace = true
+runtime-datafusion = { path = '../runtime-datafusion', optional = true }
+r2d2 = { optional = true, workspace = true }
+duckdb = { optional = true, workspace = true }
+futures.workspace = true
+itertools = { optional = true, workspace = true }
+url = { optional = true, workspace = true }
+snafu.workspace = true
+tracing.workspace = true
+
 
 [features]
 duckdb = [
@@ -26,3 +37,5 @@ duckdb = [
     "dep:duckdb",
     "dep:r2d2"
 ]
+cluster = ["dep:arrow", "dep:chrono", "dep:itertools", "dep:datafusion-datasource", "dep:object_store", "dep:runtime-datafusion", "dep:url"]
+
