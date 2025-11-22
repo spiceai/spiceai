@@ -156,25 +156,12 @@ downloadFile() {
           $@
     }
 
-    # Get asset info including checksum from GitHub API
-    asset_parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_ARTIFACT\"))[0]"
-    asset_info=$(gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$asset_parser")
-    
-    asset_id=$(echo "$asset_info" | jq -r '.id')
+    parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_ARTIFACT\"))[0].id"
+
+    asset_id=$(gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$parser")
     if [ "$asset_id" = "null" ] || [ -z "$asset_id" ]; then
       echo "ERROR: version not found $VERSION"
       exit 1
-    fi
-    
-    # Extract checksum from label or name (format: "sha256:hash" or similar)
-    asset_label=$(echo "$asset_info" | jq -r '.label // empty')
-    asset_state=$(echo "$asset_info" | jq -r '.state // empty')
-    
-    # Try to get checksum from the asset's label or check for a checksum in uploader comments
-    EXPECTED_CHECKSUM=""
-    if [[ "$asset_label" =~ sha256:([a-fA-F0-9]{64}) ]]; then
-        EXPECTED_CHECKSUM="${BASH_REMATCH[1]}"
-        echo "Found checksum in asset metadata: sha256:$EXPECTED_CHECKSUM"
     fi
 
     # Download the binary
@@ -191,38 +178,6 @@ downloadFile() {
     if [ ! -f "$ARTIFACT_TMP_FILE" ]; then
         echo "Failed to download $DOWNLOAD_URL"
         exit 1
-    fi
-    
-    # Verify checksum if available from GitHub API
-    if [ -n "$EXPECTED_CHECKSUM" ]; then
-        echo "Verifying checksum..."
-        
-        # Detect available checksum tool
-        if command -v sha256sum >/dev/null 2>&1; then
-            CHECKSUM_CMD="sha256sum"
-        elif command -v shasum >/dev/null 2>&1; then
-            CHECKSUM_CMD="shasum -a 256"
-        else
-            echo "Warning: No SHA256 checksum tool found (sha256sum or shasum), skipping verification"
-            CHECKSUM_CMD=""
-        fi
-        
-        if [ -n "$CHECKSUM_CMD" ]; then
-            # Calculate actual checksum
-            actual_checksum=$($CHECKSUM_CMD "$ARTIFACT_TMP_FILE" | awk '{print $1}')
-            
-            if [ "$actual_checksum" = "$EXPECTED_CHECKSUM" ]; then
-                echo "✓ Checksum verified successfully"
-            else
-                echo "ERROR: Checksum verification failed!"
-                echo "Expected: $EXPECTED_CHECKSUM"
-                echo "Actual:   $actual_checksum"
-                echo "This could indicate a corrupted download or security issue."
-                exit 1
-            fi
-        fi
-    else
-        echo "Warning: No checksum found in GitHub release metadata, skipping verification"
     fi
     
     # Verify the downloaded file is a valid gzip archive
