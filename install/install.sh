@@ -394,24 +394,52 @@ fi
 detectShell
 
 # Check shell profile files based on detected shell and common locations
+# Prioritize login shell profiles (.bash_profile, .zprofile) over interactive (.bashrc, .zshrc)
+# because login shells are commonly used in CI/CD and when starting new shell sessions
 if [[ "$DETECTED_SHELL" == "bash" ]]; then
-    SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".profile")
+    SHELLS_TO_CHECK=(".bash_profile" ".profile" ".bashrc")
 elif [[ "$DETECTED_SHELL" == "zsh" ]]; then
-    SHELLS_TO_CHECK=(".zshrc" ".zprofile" ".zshenv")
+    SHELLS_TO_CHECK=(".zprofile" ".zshenv" ".zshrc")
 elif [[ "$DETECTED_SHELL" == "fish" ]]; then
     SHELLS_TO_CHECK=(".config/fish/config.fish")
 elif [[ "$DETECTED_SHELL" == "ksh" ]]; then
-    SHELLS_TO_CHECK=(".kshrc" ".profile")
+    SHELLS_TO_CHECK=(".profile" ".kshrc")
 elif [[ "$DETECTED_SHELL" == "csh" ]]; then
     SHELLS_TO_CHECK=(".cshrc" ".tcshrc")
 else
-    # Unknown shell, check all common profiles
-    SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".zshrc" ".zprofile" ".profile" ".config/fish/config.fish" ".kshrc")
+    # Unknown shell, check all common profiles (login shells first)
+    SHELLS_TO_CHECK=(".bash_profile" ".profile" ".zprofile" ".bashrc" ".zshrc" ".config/fish/config.fish" ".kshrc")
 fi
 
 for shell_file in "${SHELLS_TO_CHECK[@]}"; do 
     checkShell "$shell_file"
 done
+
+# If no shell profile was found, create one based on detected shell
+if [[ "$SHELL_TO_USE" == "null" ]]; then
+    if [[ "$DETECTED_SHELL" == "bash" ]]; then
+        SHELL_TO_USE="$HOME/.bash_profile"
+        touch "$SHELL_TO_USE"
+        echo "Created new shell profile: $SHELL_TO_USE"
+    elif [[ "$DETECTED_SHELL" == "zsh" ]]; then
+        SHELL_TO_USE="$HOME/.zprofile"
+        touch "$SHELL_TO_USE"
+        echo "Created new shell profile: $SHELL_TO_USE"
+    elif [[ "$DETECTED_SHELL" == "fish" ]]; then
+        SHELL_TO_USE="$HOME/.config/fish/config.fish"
+        mkdir -p "$HOME/.config/fish"
+        touch "$SHELL_TO_USE"
+        echo "Created new shell profile: $SHELL_TO_USE"
+    elif [[ "$DETECTED_SHELL" == "ksh" ]]; then
+        SHELL_TO_USE="$HOME/.profile"
+        touch "$SHELL_TO_USE"
+        echo "Created new shell profile: $SHELL_TO_USE"
+    elif [[ "$DETECTED_SHELL" == "csh" ]]; then
+        SHELL_TO_USE="$HOME/.cshrc"
+        touch "$SHELL_TO_USE"
+        echo "Created new shell profile: $SHELL_TO_USE"
+    fi
+fi
 
 if [[ "$SHELL_TO_USE" == "null" ]]; then
     echo -e "${yellow}Unable to detect shell profile automatically.${reset}"
