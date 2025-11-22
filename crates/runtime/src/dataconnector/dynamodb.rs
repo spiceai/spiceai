@@ -29,7 +29,6 @@ use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
-use tower_http::follow_redirect::policy::PolicyExt;
 use util::time_format::is_valid_format;
 
 #[derive(Debug)]
