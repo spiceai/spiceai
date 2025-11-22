@@ -150,7 +150,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
 
       - name: install Spice (Windows)
         if: matrix.target.target_os == 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''

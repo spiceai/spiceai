@@ -106,11 +106,10 @@ checkJqInstalled() {
 function gh_curl() {
     if [ -z "$GITHUB_TOKEN" ]
     then
-        curl -H "Cache-Control: no-cache" \
+        curl \
             $@
     else
         curl -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Cache-Control: no-cache" \
             $@
     fi
 }
@@ -118,11 +117,10 @@ function gh_curl() {
 function gh_wget() {
     if [ -z "$GITHUB_TOKEN" ]
     then
-        wget --header="Cache-Control: no-cache" \
+        wget \
             $@
     else
         wget --header="Authorization: token $GITHUB_TOKEN" \
-            --header="Cache-Control: no-cache" \
             $@
     fi
 }
