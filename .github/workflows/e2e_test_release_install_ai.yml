@@ -148,8 +148,8 @@ jobs:
         if: matrix.target.target_os != 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BRANCH: ${{ inputs.install_script_branch || github.head_ref || github.ref_name }}
         run: |
+          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
           curl -sSL "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
 
       - name: install Spice (Windows)
