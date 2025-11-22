@@ -213,9 +213,19 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             V::record_item_count(self.item_count().await);
             V::record_size(self.size_bytes().await);
             V::record_max_size(self.max_size() as u64);
@@ -235,9 +245,19 @@ impl<
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
 
-        if now_seconds.saturating_sub(last_emitted) >= 5 {
-            self.metrics_last_reported_time
-                .store(now_seconds, Ordering::Relaxed);
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             V::record_item_count(self.item_count().await);
             V::record_size(self.size_bytes().await);
         }
@@ -355,7 +375,7 @@ mod tests {
             .expect("Failed to create record batch")
     }
 
-    fn create_test_cached_result() -> CachedQueryResult {
+    async fn create_test_cached_result() -> CachedQueryResult {
         let record_batch = create_test_record_batch();
         let mut input_tables = HashSet::new();
         input_tables.insert(TableReference::Bare {
@@ -370,6 +390,7 @@ mod tests {
             std::time::Instant::now(),
             encoder,
         )
+        .await
         .expect("Failed to create cached result")
     }
 
@@ -410,7 +431,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_secs(60), hasher, CacheEngine::Moka);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key.as_u64(), result.clone()).await;
@@ -453,7 +474,7 @@ mod tests {
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         let get_key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
@@ -517,7 +538,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher, CacheEngine::Moka);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;
@@ -547,7 +568,7 @@ mod tests {
         let cache: LruCache<CachedQueryResult, _> =
             LruCache::new(10, Duration::from_millis(100), hasher, CacheEngine::Moka);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
-        let result = create_test_cached_result();
+        let result = create_test_cached_result().await;
 
         // Put a value in the cache
         cache.put_raw_key(&key().as_u64(), result).await;

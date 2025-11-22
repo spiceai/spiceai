@@ -2214,7 +2214,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -4707,16 +4707,26 @@ dependencies = [
 name = "datafusion-optimizer-rules"
 version = "1.9.0-rc.4"
 dependencies = [
+ "arrow",
  "async-stream",
  "async-trait",
  "cache",
+ "chrono",
  "datafusion",
+ "datafusion-datasource",
  "datafusion-expr",
+ "datafusion-federation",
  "datafusion-table-providers",
  "duckdb",
  "futures",
+ "itertools 0.14.0",
+ "object_store",
  "r2d2",
+ "runtime-datafusion",
+ "snafu",
+ "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5297,7 +5307,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5684,7 +5694,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7112,6 +7122,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "hickory-proto"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
+dependencies = [
+ "async-trait",
+ "cfg-if",
+ "data-encoding",
+ "enum-as-inner",
+ "futures-channel",
+ "futures-io",
+ "futures-util",
+ "idna 1.1.0",
+ "ipnet",
+ "once_cell",
+ "rand 0.9.2",
+ "ring",
+ "thiserror 2.0.17",
+ "tinyvec",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "hickory-resolver"
 version = "0.24.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7119,7 +7154,7 @@ checksum = "cbb117a1ca520e111743ab2f6688eddee69db4e0ea242545a604dce8a66fd22e"
 dependencies = [
  "cfg-if",
  "futures-util",
- "hickory-proto",
+ "hickory-proto 0.24.4",
  "ipconfig",
  "lru-cache",
  "once_cell",
@@ -7128,6 +7163,27 @@ dependencies = [
  "resolv-conf",
  "smallvec",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hickory-resolver"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "hickory-proto 0.25.2",
+ "ipconfig",
+ "moka",
+ "once_cell",
+ "parking_lot 0.12.5",
+ "rand 0.9.2",
+ "resolv-conf",
+ "smallvec",
+ "thiserror 2.0.17",
  "tokio",
  "tracing",
 ]
@@ -7477,7 +7533,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -8077,7 +8133,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9572,8 +9628,8 @@ dependencies = [
  "futures-io",
  "futures-util",
  "hex",
- "hickory-proto",
- "hickory-resolver",
+ "hickory-proto 0.24.4",
+ "hickory-resolver 0.24.4",
  "hmac",
  "macro_magic",
  "md-5",
@@ -10007,10 +10063,10 @@ dependencies = [
 name = "ns_lookup"
 version = "1.9.0-rc.4"
 dependencies = [
+ "hickory-resolver 0.25.2",
  "snafu",
  "tokio",
  "tracing",
- "trust-dns-resolver",
  "url",
 ]
 
@@ -10029,7 +10085,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10566,7 +10622,9 @@ version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 dependencies = [
+ "critical-section",
  "parking_lot_core 0.9.12",
+ "portable-atomic",
 ]
 
 [[package]]
@@ -12151,7 +12209,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.35",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -12188,9 +12246,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -13121,6 +13179,7 @@ dependencies = [
  "runtime-datafusion-udfs",
  "runtime-object-store",
  "runtime-parameters",
+ "runtime-proto",
  "runtime-rate-control",
  "runtime-request-context",
  "runtime-secrets",
@@ -13164,6 +13223,7 @@ dependencies = [
  "tracing-subscriber",
  "tract-core",
  "turso",
+ "twox-hash",
  "url",
  "util",
  "utoipa",
@@ -13244,6 +13304,7 @@ dependencies = [
  "futures",
  "opentelemetry 0.27.1",
  "runtime-request-context",
+ "snafu",
  "tokio",
  "tracing",
 ]
@@ -13256,6 +13317,7 @@ dependencies = [
  "datafusion",
  "futures",
  "itertools 0.14.0",
+ "snafu",
  "tokio",
  "tracing",
 ]
@@ -13320,6 +13382,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-proto"
+version = "1.9.0-rc.4"
+dependencies = [
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "datafusion-physical-plan",
+ "datafusion-proto",
+ "prost 0.13.5",
+ "prost-build",
+]
+
+[[package]]
 name = "runtime-rate-control"
 version = "1.9.0-rc.4"
 dependencies = [
@@ -13354,6 +13429,7 @@ dependencies = [
 name = "runtime-secrets"
 version = "1.9.0-rc.4"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
@@ -13361,11 +13437,14 @@ dependencies = [
  "aws-sdk-sts",
  "base64 0.22.1",
  "dotenvy",
+ "flight_client",
  "indexmap 2.12.0",
  "keyring",
  "logos",
+ "prost 0.13.5",
  "rand 0.9.2",
  "reqwest",
+ "runtime-proto",
  "secrecy",
  "serde_json",
  "snafu",
@@ -13573,7 +13652,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15598,7 +15677,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15790,7 +15869,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.0",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark",
@@ -17324,6 +17403,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "backoff",
+ "chrono",
  "ctrlc",
  "datafusion",
  "humantime",
@@ -18419,7 +18499,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
