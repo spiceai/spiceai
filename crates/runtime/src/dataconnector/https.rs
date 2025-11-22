@@ -203,16 +203,33 @@ impl Https {
     fn spawn_endpoint_validation(
         provider: Arc<data_components::http::provider::HttpTableProvider>,
         dataset_name: String,
+        check_range_support: bool,
     ) {
         tokio::spawn(async move {
-            if let Err(e) = provider.validate_endpoint().await {
-                tracing::warn!(
-                    "HTTP endpoint validation failed for dataset '{}': {}. \
-                    The endpoint may be temporarily unavailable or misconfigured. \
-                    Queries will continue but may fail if the endpoint is not accessible.",
-                    dataset_name,
-                    e
-                );
+            match provider.validate_endpoint().await {
+                Ok(()) => {
+                    if check_range_support {
+                        // After basic validation succeeds, check for range support
+                        if let Err(e) = provider.check_range_support().await {
+                            tracing::warn!(
+                                "HTTP server for dataset '{}' does not support range requests: {}. \
+                                This may cause issues when reading Parquet files. \
+                                Configure your HTTP server to include 'Accept-Ranges: bytes' header.",
+                                dataset_name,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "HTTP endpoint validation failed for dataset '{}': {}. \
+                        The endpoint may be temporarily unavailable or misconfigured. \
+                        Queries will continue but may fail if the endpoint is not accessible.",
+                        dataset_name,
+                        e
+                    );
+                }
             }
         });
     }
@@ -244,6 +261,22 @@ impl Https {
             }
         }
         custom_headers
+    }
+
+    /// Check if the HTTP server supports range requests by sending a HEAD request
+    async fn check_range_support(client: &Client, url: &Url) -> bool {
+        let Ok(response) = client.head(url.as_str()).send().await else {
+            return false; // If HEAD fails, assume no range support
+        };
+
+        // Check for Accept-Ranges header
+        if let Some(accept_ranges) = response.headers().get("accept-ranges")
+            && let Ok(value) = accept_ranges.to_str()
+        {
+            return value != "none";
+        }
+
+        false
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
@@ -369,7 +402,7 @@ impl Https {
         }
 
         let provider = Arc::new(provider);
-        Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
+        Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string(), false);
 
         Ok(provider)
     }
@@ -416,6 +449,37 @@ impl DataConnector for Https {
                 extension.as_str(),
                 "parquet" | "csv" | "tsv" | "arrow" | "avro"
             );
+        }
+
+        // Parquet files require range request support for efficient reading
+        // Check if the server supports range requests before using ListingTable
+        let is_parquet = file_format == "parquet"
+            || (file_format == "auto" && dataset.from.to_lowercase().ends_with(".parquet"));
+
+        if is_parquet {
+            let url = Url::parse(&dataset.from).boxed().map_err(|e| {
+                DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    message: format!("{} is not a valid URL", dataset.from),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e,
+                }
+            })?;
+
+            let client = self.build_http_client(dataset)?;
+            let supports_range = Self::check_range_support(&client, &url).await;
+
+            if !supports_range {
+                tracing::warn!(
+                    "HTTP server does not support range requests for dataset '{}' (missing or invalid Accept-Ranges header). \
+                    Falling back to full file download mode. \
+                    This may be slower and use more memory. \
+                    To use efficient streaming, configure your HTTP server to include 'Accept-Ranges: bytes' header.",
+                    dataset.name
+                );
+                // Fall back to HttpTableProvider which downloads the entire file
+                return self.create_http_table_provider(dataset);
+            }
         }
 
         if is_structured_format {

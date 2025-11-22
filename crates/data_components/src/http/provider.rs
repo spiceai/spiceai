@@ -35,6 +35,7 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
+use futures::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
@@ -490,6 +491,31 @@ impl HttpTableProvider {
         }
     }
 
+    /// Check if the HTTP server supports range requests by sending a HEAD request
+    /// Returns Ok(()) if range requests are supported, Err otherwise
+    pub async fn check_range_support(&self) -> Result<()> {
+        let response = self
+            .client
+            .head(self.base_url.as_str())
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+
+        // Check for Accept-Ranges header
+        if let Some(accept_ranges) = response.headers().get("accept-ranges")
+            && let Ok(value) = accept_ranges.to_str()
+            && value != "none"
+        {
+            return Ok(());
+        }
+
+        Err(Error::Configuration {
+            message:
+                "Server does not support range requests (missing or invalid Accept-Ranges header)"
+                    .to_string(),
+        })
+    }
+
     fn parse_cache_control(cache_control_header: Option<&str>) -> Duration {
         let mut max_age = Duration::from_secs(0);
 
@@ -637,6 +663,7 @@ impl HttpTableProvider {
         Arc::unwrap_or_clone(content_arc)
     }
 
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -707,10 +734,69 @@ impl HttpTableProvider {
                     .and_then(|v| v.to_str().ok());
                 let max_age = Self::parse_cache_control(cache_control_header);
 
-                let content = response
-                    .text()
-                    .await
-                    .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
+                // Check if we should show download progress
+                let content_length = response.content_length();
+                let should_show_progress = content_length.is_some_and(|len| len > 10_000_000); // Show for files > 10MB
+
+                let content = if should_show_progress {
+                    let total_size = content_length.unwrap_or(0);
+                    let total_mb = total_size as f64 / 1_048_576.0;
+                    tracing::info!("Downloading {} ({:.2} MB)...", path_for_detection, total_mb);
+
+                    let mut downloaded: u64 = 0;
+                    let mut last_progress = 0u64;
+                    let mut buffer = Vec::with_capacity(total_size.try_into().unwrap_or(0));
+                    let start_time = SystemTime::now();
+
+                    let mut stream = response.bytes_stream();
+
+                    while let Some(chunk_result) = stream.next().await {
+                        let chunk = chunk_result
+                            .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
+                        buffer.extend_from_slice(&chunk);
+                        downloaded += chunk.len() as u64;
+
+                        // Log progress every 10%
+                        let progress = (downloaded * 100) / total_size;
+                        if progress >= last_progress + 10 {
+                            let elapsed = start_time.elapsed().unwrap_or(Duration::from_secs(1));
+                            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+                            let speed_mbps = (downloaded as f64 / 1_048_576.0) / elapsed_secs;
+                            let downloaded_mb = downloaded as f64 / 1_048_576.0;
+
+                            tracing::info!(
+                                "Download progress: {}% ({:.2}/{:.2} MB, {:.2} MB/s)",
+                                progress,
+                                downloaded_mb,
+                                total_mb,
+                                speed_mbps
+                            );
+                            last_progress = progress;
+                        }
+                    }
+
+                    let total_elapsed = start_time.elapsed().unwrap_or(Duration::from_secs(1));
+                    let avg_speed =
+                        (downloaded as f64 / 1_048_576.0) / total_elapsed.as_secs_f64().max(0.001);
+                    tracing::info!(
+                        "Download complete: {} ({:.2} MB in {:.1}s, avg {:.2} MB/s)",
+                        path_for_detection,
+                        total_mb,
+                        total_elapsed.as_secs_f64(),
+                        avg_speed
+                    );
+
+                    String::from_utf8(buffer).map_err(|e| {
+                        RetryError::permanent(Error::Configuration {
+                            message: format!("Invalid UTF-8 in response body: {e}"),
+                        })
+                    })?
+                } else {
+                    response
+                        .text()
+                        .await
+                        .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?
+                };
 
                 let detected_format = if detected_format.is_empty() {
                     let inferred = Self::infer_format_from_content(&content);
