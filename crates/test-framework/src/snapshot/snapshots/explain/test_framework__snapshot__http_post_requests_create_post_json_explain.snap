@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: create_post_json"
+snapshot_kind: text
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                      |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                 |
+|               |  Projection: create_post.request_path, create_post.request_body, create_post.content                                                                                                      |
+|               |   TableScan: create_post projection=[request_path, request_body, content]                                                                                                                 |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                        |
+|               |   CooperativeExec                                                                                                                                                                         |
+|               |     BytesProcessedExec                                                                                                                                                                    |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "create_post"."request_path", "create_post"."request_body", "create_post"."content" FROM "create_post" |
+|               |                                                                                                                                                                                           |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

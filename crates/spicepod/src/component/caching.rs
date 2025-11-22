@@ -32,9 +32,13 @@ pub enum CacheKeyType {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HashingAlgorithm {
-    #[default]
+    #[serde(rename = "siphash")]
     Siphash,
+    #[serde(rename = "ahash")]
     Ahash,
+    #[serde(rename = "blake3")]
+    Blake3,
+    #[default]
     #[serde(rename = "xxh3")]
     XXH3,
     #[serde(rename = "xxh32")]
@@ -43,6 +47,15 @@ pub enum HashingAlgorithm {
     XXH64,
     #[serde(rename = "xxh128")]
     XXH128,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    #[default]
+    None,
+    Zstd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,6 +121,15 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    /// Maximum age for serving stale cached results while revalidating in the background.
+    /// When set, cached results past their TTL (but within this additional window) will be
+    /// served immediately while a background refresh is triggered.
+    /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_while_revalidate_ttl: Option<String>,
+    /// Encoding algorithm for compressing cached results.
+    #[serde(default)]
+    pub encoding: Encoding,
 }
 
 // serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
@@ -121,6 +143,8 @@ impl Default for SQLResultsCacheConfig {
             eviction_policy: None,
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
+            stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
         }
     }
 }
@@ -138,6 +162,8 @@ pub struct ResultsCache {
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    /// Maximum stale-while-revalidate duration to add to the cache TTL.
+    pub max_stale_while_revalidate: Option<String>,
 }
 
 impl Default for ResultsCache {
@@ -149,6 +175,7 @@ impl Default for ResultsCache {
             eviction_policy: None,
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            max_stale_while_revalidate: None,
         }
     }
 }
@@ -162,6 +189,8 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             eviction_policy: val.eviction_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
+            stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
         }
     }
 }

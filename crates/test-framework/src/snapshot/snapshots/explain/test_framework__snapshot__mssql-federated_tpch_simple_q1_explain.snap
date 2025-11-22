@@ -6,14 +6,13 @@ description: "Query: tpch_simple_q1"
 | plan_type     | plan                                                                        |
 +---------------+-----------------------------------------------------------------------------+
 | logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                  |
-|               |   BytesProcessedNode                                                        |
-|               |     TableScan: lineitem projection=[l_orderkey]                             |
+|               |   TableScan: lineitem projection=[l_orderkey]                               |
 | physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]          |
 |               |   CoalescePartitionsExec                                                    |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]    |
 |               |       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
-|               |         BytesProcessedExec                                                  |
-|               |           CooperativeExec                                                   |
+|               |         CooperativeExec                                                     |
+|               |           BytesProcessedExec                                                |
 |               |             SqlServerExec sql=SELECT l_orderkey FROM lineitem               |
 |               |                                                                             |
 +---------------+-----------------------------------------------------------------------------+

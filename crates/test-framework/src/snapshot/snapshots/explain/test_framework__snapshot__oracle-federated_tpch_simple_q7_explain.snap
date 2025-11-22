@@ -8,12 +8,11 @@ description: "Query: tpch_simple_q7"
 | logical_plan  | SubqueryAlias: c                                                                              |
 |               |   Projection: orders.O_ORDERKEY AS KEY                                                        |
 |               |     Limit: skip=0, fetch=10                                                                   |
-|               |       BytesProcessedNode                                                                      |
-|               |         TableScan: orders projection=[O_ORDERKEY], fetch=10                                   |
+|               |       TableScan: orders projection=[O_ORDERKEY], fetch=10                                     |
 | physical_plan | ProjectionExec: expr=[O_ORDERKEY@0 as KEY]                                                    |
-|               |   BytesProcessedExec                                                                          |
-|               |     GlobalLimitExec: skip=0, fetch=10                                                         |
-|               |       CooperativeExec                                                                         |
+|               |   GlobalLimitExec: skip=0, fetch=10                                                           |
+|               |     CooperativeExec                                                                           |
+|               |       BytesProcessedExec                                                                      |
 |               |         OracleExec sql=SELECT "O_ORDERKEY" FROM "TPCH_SF1"."ORDERS"  FETCH FIRST 10 ROWS ONLY |
 |               |                                                                                               |
 +---------------+-----------------------------------------------------------------------------------------------+

@@ -1,0 +1,8 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+expression: explain_plan
+---
+UnionExec
+  PartitionMemTableExec: partition_value=1736985600000000000, filters=[timestamp > TimestampNanosecond(1737028800000000000, None)]
+  PartitionMemTableExec: partition_value=1737072000000000000, filters=[timestamp > TimestampNanosecond(1737028800000000000, None)]
+  PartitionMemTableExec: partition_value=1737158400000000000, filters=[timestamp > TimestampNanosecond(1737028800000000000, None)]

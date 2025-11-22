@@ -13,6 +13,7 @@ app = { path = "../app" }
 async-trait.workspace = true
 axum.workspace = true
 futures.workspace = true
+headers = "0.4"
 http.workspace = true
 opentelemetry.workspace = true
 percent-encoding.workspace = true

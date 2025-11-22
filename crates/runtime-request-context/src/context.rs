@@ -448,18 +448,36 @@ impl RequestContextBuilder {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
                 CacheControl::Cache(cache_key_type)
             }
-            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, duration) => {
+            CacheControl::MaxStale(CacheKeyType::Default, duration) => {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
-                CacheControl::CacheWithStaleWhileRevalidate(cache_key_type, duration)
+                CacheControl::MaxStale(cache_key_type, duration)
+            }
+            CacheControl::MinFresh(CacheKeyType::Default, duration) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::MinFresh(cache_key_type, duration)
+            }
+            CacheControl::OnlyIfCached(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::OnlyIfCached(cache_key_type)
             }
             // If sanitized out, fall back to default
             CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
                 CacheControl::Cache(CacheKeyType::Default)
             }
-            CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::ClientSupplied, duration)
+            CacheControl::MaxStale(CacheKeyType::ClientSupplied, duration)
                 if user_cache_key.is_none() =>
             {
-                CacheControl::CacheWithStaleWhileRevalidate(CacheKeyType::Default, duration)
+                CacheControl::MaxStale(CacheKeyType::Default, duration)
+            }
+            CacheControl::MinFresh(CacheKeyType::ClientSupplied, duration)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::MinFresh(CacheKeyType::Default, duration)
+            }
+            CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::OnlyIfCached(CacheKeyType::Default)
             }
             cache_control => cache_control,
         };

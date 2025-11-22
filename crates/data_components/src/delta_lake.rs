@@ -72,6 +72,16 @@ pub enum Error {
         "Delta Lake Table checkpoint files are missing or incorrect. Recreate the checkpoint for the Delta Lake Table and try again. {source}"
     ))]
     DeltaCheckpointError { source: delta_kernel::Error },
+
+    #[snafu(display(
+        "Failed to plan or execute a Delta Lake table due to the following error: {source}"
+    ))]
+    DeltaTableExecutionError { source: DataFusionError },
+
+    #[snafu(display(
+        "Invalid Delta Lake Table partition value count. The PartitionedFile has a different number of partition values than the number of partition columns."
+    ))]
+    InvalidPartitionValueCount,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -191,7 +201,8 @@ impl DeltaTable {
             ),
         };
 
-        let snapshot = Snapshot::try_new(table_url.clone(), engine.as_ref(), None)
+        let snapshot = Snapshot::builder_for(table_url.clone())
+            .build(engine.as_ref())
             .map_err(handle_delta_error)?;
 
         let arrow_schema = Self::get_schema(&snapshot);
@@ -230,7 +241,7 @@ impl DeltaTable {
         parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
         partitioned_files: &[PartitionedFile],
         physical_expr: &Arc<dyn PhysicalExpr>,
-    ) -> Arc<dyn ExecutionPlan> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // this is needed to pass the plan_extension
         let projection = Some(
             projection
@@ -260,8 +271,16 @@ impl DeltaTable {
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
+        // Matches keying used by `ObjectStoreRegistry::get_url_key`
+        let object_store_url = ObjectStoreUrl::parse(format!(
+            "{}://{}",
+            self.table_url.scheme(),
+            &self.table_url[url::Position::BeforeHost..url::Position::AfterPort]
+        ))
+        .context(DeltaTableExecutionSnafu)?;
+
         let file_scan_config_builder = FileScanConfigBuilder::new(
-            ObjectStoreUrl::local_filesystem(),
+            object_store_url,
             Arc::clone(schema),
             Arc::new(parquet_source),
         )
@@ -270,7 +289,9 @@ impl DeltaTable {
         .with_table_partition_cols(partition_cols.to_vec())
         .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 
-        DataSourceExec::from_data_source(file_scan_config_builder.build())
+        Ok(DataSourceExec::from_data_source(
+            file_scan_config_builder.build(),
+        ))
     }
 }
 
@@ -376,7 +397,8 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        let snapshot = Snapshot::try_new(self.table_url.clone(), self.engine.as_ref(), None)
+        let snapshot = Snapshot::builder_for(self.table_url.clone())
+            .build(self.engine.as_ref())
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
@@ -395,7 +417,7 @@ impl TableProvider for DeltaTable {
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
             projection,
-        );
+        )?;
         let engine = Arc::clone(&self.engine);
 
         // Clone the filters since we need to move them into the spawn_blocking closure
@@ -408,7 +430,7 @@ impl TableProvider for DeltaTable {
                 // partition pruning is already handled separately later in the code
 
                 let mut scan_builder =
-                    ScanBuilder::new(Arc::new(snapshot)).with_schema(projected_delta_schema);
+                    ScanBuilder::new(snapshot).with_schema(projected_delta_schema);
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_predicate(&filters_clone) {
@@ -555,15 +577,17 @@ impl TableProvider for DeltaTable {
                 .collect::<Vec<_>>(),
         )?;
 
-        Ok(self.create_parquet_exec(
-            projection,
-            limit,
-            &Arc::new(schema),
-            &partition_cols,
-            &parquet_file_reader_factory,
-            &filtered_partitioned_files,
-            &physical_expr,
-        ))
+        Ok(self
+            .create_parquet_exec(
+                projection,
+                limit,
+                &Arc::new(schema),
+                &partition_cols,
+                &parquet_file_reader_factory,
+                &filtered_partitioned_files,
+                &physical_expr,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?)
     }
 }
 
@@ -589,16 +613,19 @@ fn project_delta_schema(
     arrow_schema: &SchemaRef,
     schema: delta_kernel::schema::SchemaRef,
     projections: Option<&Vec<usize>>,
-) -> delta_kernel::schema::SchemaRef {
+) -> Result<delta_kernel::schema::SchemaRef, DataFusionError> {
     if let Some(projections) = projections {
         let projected_fields = projections
             .iter()
             .filter_map(|i| schema.field(arrow_schema.field(*i).name()))
             .cloned()
             .collect::<Vec<_>>();
-        Arc::new(delta_kernel::schema::Schema::new(projected_fields))
+        Ok(Arc::new(
+            delta_kernel::schema::Schema::try_new(projected_fields)
+                .map_err(map_delta_error_to_datafusion_err)?,
+        ))
     } else {
-        schema
+        Ok(schema)
     }
 }
 

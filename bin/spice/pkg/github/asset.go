@@ -59,9 +59,9 @@ func DownloadReleaseAsset(gh *GitHubClient, release *RepoRelease, assetName stri
 		return errors.New("no matching asset found")
 	}
 
-	assetUrl := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/assets/%d", gh.Owner, gh.Repo, asset.ID)
+	assetUrl := fmt.Sprintf("https://assets.spiceai.io/%s/%s/releases/download/%s/%s", gh.Owner, gh.Repo, release.TagName, assetName)
 
-	body, err := gh.call("GET", assetUrl, nil, "application/octet-stream")
+	body, err := gh.callWithProgress("GET", assetUrl, nil, "application/octet-stream", asset.Size)
 	if err != nil {
 		return err
 	}

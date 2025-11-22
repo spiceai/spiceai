@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: multiple_post_bodies"
+snapshot_kind: text
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                  |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                             |
+|               |  Projection: multiple_posts.request_path, multiple_posts.request_body, multiple_posts.content                                                                                                         |
+|               |   TableScan: multiple_posts projection=[request_path, request_body, content]                                                                                                                          |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                    |
+|               |   CooperativeExec                                                                                                                                                                                     |
+|               |     BytesProcessedExec                                                                                                                                                                                |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "multiple_posts"."request_path", "multiple_posts"."request_body", "multiple_posts"."content" FROM "multiple_posts" |
+|               |                                                                                                                                                                                                       |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: verify_structure"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                    |
++---------------+---------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: httpbin_json projection=[request_path, content]                                              |
+| physical_plan | CooperativeExec                                                                                         |
+|               |   BytesProcessedExec                                                                                    |
+|               |     HttpExec: base_url=https://httpbin.org/json, format=auto, partitions=[(path="", query="", body="")] |
+|               |                                                                                                         |
++---------------+---------------------------------------------------------------------------------------------------------+

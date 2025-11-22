@@ -46,6 +46,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/history"
 	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
 	"github.com/spiceai/spiceai/bin/spice/pkg/input"
+	"github.com/spiceai/spiceai/bin/spice/pkg/sqlcompleter"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -290,11 +291,48 @@ func runCloudREPL(cmd *cobra.Command, apiKey string) error {
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 
-	// Use the consolidated REPL
-	return runREPL("spice-cloud", cloudExecutor)
+	// Create metadata fetcher for autocomplete
+	cloudMetadataFetcher := func(ctx context.Context, query string) ([]string, error) {
+		reader, err := spiceClient.Query(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Release()
+
+		var results []string
+		for reader.Next() {
+			record := reader.Record()
+			if record.NumCols() == 0 {
+				continue
+			}
+
+			// Get the first column
+			col := record.Column(0)
+
+			// Convert to string array
+			if stringArray, ok := col.(*array.String); ok {
+				for i := 0; i < stringArray.Len(); i++ {
+					if !stringArray.IsNull(i) {
+						results = append(results, stringArray.Value(i))
+					}
+				}
+			}
+		}
+
+		if err := reader.Err(); err != nil {
+			return nil, err
+		}
+
+		return results, nil
+	}
+
+	// Use the consolidated REPL with metadata support
+	return runREPLWithMetadata("spice-cloud", cloudExecutor, cloudMetadataFetcher)
 }
 
 func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint string) error {
@@ -366,20 +404,62 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 
-	// Use the consolidated REPL
-	return runREPL(grpcEndpoint, grpcExecutor)
+	// Create metadata fetcher for autocomplete
+	metadataFetcher := func(ctx context.Context, query string) ([]string, error) {
+		reader, err := spiceClient.Query(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Release()
+
+		var results []string
+		for reader.Next() {
+			record := reader.Record()
+			if record.NumCols() == 0 {
+				continue
+			}
+
+			// Get the first column
+			col := record.Column(0)
+
+			// Convert to string array
+			if stringArray, ok := col.(*array.String); ok {
+				for i := 0; i < stringArray.Len(); i++ {
+					if !stringArray.IsNull(i) {
+						results = append(results, stringArray.Value(i))
+					}
+				}
+			}
+		}
+
+		if err := reader.Err(); err != nil {
+			return nil, err
+		}
+
+		return results, nil
+	}
+
+	// Use the consolidated REPL with metadata support
+	return runREPLWithMetadata(grpcEndpoint, grpcExecutor, metadataFetcher)
 }
 
-// runREPL provides a common REPL experience for all SQL execution modes
-func runREPL(endpoint string, executor QueryExecutor) error {
-	return runREPLWithHealth(endpoint, executor, 0, false)
+// runREPLWithMetadata provides a common REPL experience with metadata fetching support
+func runREPLWithMetadata(endpoint string, executor QueryExecutor, metadataFetcher sqlcompleter.MetadataFetcher) error {
+	return runREPLWithHealthAndMetadata(endpoint, executor, metadataFetcher, 0, false)
 }
 
 // runREPLWithHealth provides a common REPL experience with optional health check info
 func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration time.Duration, healthOk bool) error {
+	return runREPLWithHealthAndMetadata(endpoint, executor, nil, checkDuration, healthOk)
+}
+
+// runREPLWithHealthAndMetadata provides a common REPL experience with optional health check info and metadata fetching
+func runREPLWithHealthAndMetadata(endpoint string, executor QueryExecutor, metadataFetcher sqlcompleter.MetadataFetcher, checkDuration time.Duration, healthOk bool) error {
 	fmt.Println("Welcome to the Spice.ai SQL REPL! Type 'help' for help.")
 	fmt.Println()
 	if endpoint == "spice-cloud" {
@@ -408,11 +488,26 @@ func runREPLWithHealth(endpoint string, executor QueryExecutor, checkDuration ti
 		}
 	}()
 
-	// Load history into liner
+	// Load history into liner and setup SQL-aware completer
 	if historyMgr != nil {
 		historyMgr.LoadIntoLiner(line)
-		// Enable tab completion based on history
-		line.SetCompleter(historyMgr.GetCompleter())
+
+		// Create SQL-aware completer
+		sqlComp := sqlcompleter.New()
+		sqlComp.SetHistoryCompleter(historyMgr.GetCompleter())
+
+		// Set metadata fetcher if provided
+		if metadataFetcher != nil {
+			sqlComp.SetMetadataFetcher(metadataFetcher)
+			// Perform initial metadata refresh synchronously to ensure autocomplete works immediately
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := sqlComp.RefreshMetadata(ctx); err != nil {
+				slog.Debug("failed to refresh metadata for autocomplete", "error", err)
+			}
+			cancel()
+		}
+
+		line.SetCompleter(sqlComp.Complete)
 	}
 
 	// Set up signal handling for query cancellation
@@ -656,6 +751,8 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		fmt.Println()
 		fmt.Printf("Time: %v seconds. %d rows%s. %s (%s/sec).\n",
 			duration.Seconds(), rowCount, cachedStr, humanize.IBytes(dataSize), humanize.IBytes(uint64(transferRate)))
+		// Flush stdout to ensure readline can properly track cursor position
+		_ = os.Stdout.Sync()
 		return nil
 	}
 

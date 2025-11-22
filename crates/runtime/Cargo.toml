@@ -104,9 +104,7 @@ percent-encoding.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
-prost = { version = "0.13.1", default-features = false, features = [
-    "prost-derive",
-] }
+prost.workspace = true
 rand.workspace = true
 rayon = "1.11.0"
 regex.workspace = true
@@ -129,6 +127,7 @@ runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
@@ -169,6 +168,7 @@ tracing-futures.workspace = true
 tracing-subscriber.workspace = true
 tract-core.workspace = true
 turso = { workspace = true, optional = true }
+twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
@@ -182,9 +182,9 @@ x509-certificate.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-async-graphql = "7.0.16"
+async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
-azure_core = "0.28.0"
+azure_core = "0.30.1"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
@@ -224,11 +224,15 @@ cluster = [
     "dep:ballista-scheduler",
     "dep:ballista-executor",
     "dep:datafusion-proto",
+    "runtime-datafusion/cluster",
+    "datafusion-optimizer-rules/cluster",
+    "runtime-secrets/cluster"
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
+    "cluster",
     "keyring-secret-store",
     "aws-secrets-manager",
     "sharepoint",
@@ -296,7 +300,6 @@ turso = [
     "dep:rusqlite",
 ]
 vortex = ["dep:vortex-datafusion", "dep:vortex"]
-xxhash = ["cache/xxhash"]
 
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }

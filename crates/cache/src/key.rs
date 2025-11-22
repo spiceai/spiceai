@@ -120,7 +120,7 @@ impl CacheKey<'_> {
     }
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
 pub struct RawCacheKey(u64);
 
 impl RawCacheKey {

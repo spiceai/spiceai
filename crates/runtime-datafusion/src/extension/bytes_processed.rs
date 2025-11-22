@@ -176,7 +176,7 @@ impl BytesProcessedExec {
     }
 
     #[must_use]
-    fn fallback_to_new_context(mut self) -> Self {
+    pub fn fallback_to_new_context(mut self) -> Self {
         self.fallback_to_new_context = true;
         self
     }
@@ -258,9 +258,17 @@ impl ExecutionPlan for BytesProcessedExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        assert_eq!(children.len(), 1, "should have one input");
+        if children.len() != 1 {
+            return Err(DataFusionError::External(
+                crate::Error::InvalidChildrenCount {
+                    children_count: children.len(),
+                }
+                .into(),
+            ));
+        }
+
         let Some(input) = children.into_iter().next() else {
-            panic!("should have one input");
+            unreachable!("should have one input");
         };
         Ok(Arc::new(Self {
             input_exec: input,

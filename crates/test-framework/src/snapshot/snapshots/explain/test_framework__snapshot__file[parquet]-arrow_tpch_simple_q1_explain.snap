@@ -6,13 +6,12 @@ description: "Query: tpch_simple_q1"
 | plan_type     | plan                                                                                                                                                                                      |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_orderkey)]]                                                                                                                                |
-|               |   BytesProcessedNode                                                                                                                                                                      |
-|               |     TableScan: lineitem projection=[l_orderkey]                                                                                                                                           |
+|               |   TableScan: lineitem projection=[l_orderkey]                                                                                                                                             |
 | physical_plan | AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_orderkey)]                                                                                                                        |
 |               |   CoalescePartitionsExec                                                                                                                                                                  |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_orderkey)]                                                                                                                  |
-|               |       BytesProcessedExec                                                                                                                                                                  |
-|               |         SchemaCastScanExec                                                                                                                                                                |
+|               |       SchemaCastScanExec                                                                                                                                                                  |
+|               |         BytesProcessedExec                                                                                                                                                                |
 |               |           DataSourceExec: partitions=32, partition_sizes=[23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 22, 22, 22] |
 |               |                                                                                                                                                                                           |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

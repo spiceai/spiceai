@@ -33,6 +33,14 @@ impl<T> Default for SearchVisitor<T> {
 impl SearchVisitor<()> {
     /// # Errors
     /// Returns an error if the plan visitor encounters an error during traversal
+    pub fn vec_down(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+        SearchVisitor::default()
+            .down(|p| Some(Arc::clone(p)))
+            .find(plan)
+    }
+
+    /// # Errors
+    /// Returns an error if the plan visitor encounters an error during traversal
     pub fn collect_concrete_down<C: ExecutionPlan + 'static>(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {

@@ -80,6 +80,7 @@ default = [
     "mongodb",
     "iceberg-write",
     "turso",
+    "cluster",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -110,4 +111,3 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
-xxhash = ["runtime/xxhash"]

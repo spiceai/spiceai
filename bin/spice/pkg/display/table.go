@@ -18,6 +18,7 @@ package display
 
 import (
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -94,4 +95,6 @@ func Table(colNames []string, colTypes []string, rows [][]string, colWidths []in
 		fmt.Print("+")
 	}
 	fmt.Println()
+	// Flush stdout to ensure readline/liner can properly track cursor position
+	_ = os.Stdout.Sync()
 }

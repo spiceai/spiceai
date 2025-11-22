@@ -278,11 +278,23 @@ func (c *RuntimeContext) EnsureInstalled(flavor constants.Flavor, autoUpgrade bo
 		slog.Info("Spice runtime installation required")
 		shouldInstall = true
 	} else {
-		upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
-		if err != nil {
-			slog.Warn("error checking for runtime upgrade", "error", err)
-		} else if upgradeVersion != "" && autoUpgrade {
-			shouldInstall = true
+		// Check if version is locked (specific version intentionally installed)
+		if c.IsVersionLocked() {
+			lockedVersion, _ := c.GetVersionLock()
+			upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
+			if err != nil {
+				slog.Warn("error checking for runtime upgrade", "error", err)
+			} else if upgradeVersion != "" {
+				slog.Info(fmt.Sprintf("A newer version %s is available, but version %s is locked. Run 'spice upgrade' to upgrade.", upgradeVersion, lockedVersion))
+			}
+			// Don't auto-upgrade when version is locked
+		} else {
+			upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
+			if err != nil {
+				slog.Warn("error checking for runtime upgrade", "error", err)
+			} else if upgradeVersion != "" && autoUpgrade {
+				shouldInstall = true
+			}
 		}
 	}
 
@@ -379,6 +391,110 @@ func (c *RuntimeContext) InstallMatchingRuntime(flavor constants.Flavor, allowAc
 	return nil
 }
 
+func (c *RuntimeContext) InstallSpecificRuntime(version string, flavor constants.Flavor, allowAccelerator bool) error {
+	err := c.prepareInstallDir()
+	if err != nil {
+		return err
+	}
+
+	// Install runtime for the specified version
+	release, err := github.GetRuntimeRelease(version)
+	if err != nil {
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
+
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
+	if err != nil {
+		slog.Error("downloading Spice.ai runtime binaries", "error", err)
+		return err
+	}
+
+	releaseFilePath := filepath.Join(c.spiceBinDir, constants.SpiceRuntimeFilename)
+
+	err = util.MakeFileExecutable(releaseFilePath)
+	if err != nil {
+		slog.Error("downloading Spice runtime binaries.", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
+
+	// Set version lock to prevent auto-upgrades
+	err = c.SetVersionLock(release.TagName)
+	if err != nil {
+		slog.Warn("failed to set version lock", "error", err)
+	}
+
+	// Update the runtime version cache file
+	runtimeVersionFile := filepath.Join(c.spiceRuntimeDir, "spiced_version.txt")
+	if err := os.WriteFile(runtimeVersionFile, []byte(release.TagName+"\n"), 0644); err != nil {
+		slog.Warn("failed to update runtime version cache", "error", err)
+	}
+
+	return nil
+}
+
+func (c *RuntimeContext) InstallSpecificVersion(version string, flavor constants.Flavor, allowAccelerator bool) error {
+	err := c.prepareInstallDir()
+	if err != nil {
+		return err
+	}
+
+	// Install runtime for the specified version
+	release, err := github.GetRuntimeRelease(version)
+	if err != nil {
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
+
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
+	if err != nil {
+		slog.Error("downloading Spice.ai runtime binaries", "error", err)
+		return err
+	}
+
+	releaseFilePath := filepath.Join(c.spiceBinDir, constants.SpiceRuntimeFilename)
+
+	err = util.MakeFileExecutable(releaseFilePath)
+	if err != nil {
+		slog.Error("downloading Spice runtime binaries.", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
+
+	// Install CLI for the specified version
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai CLI %s ...\n", release.TagName))
+
+	assetName := github.GetAssetName(constants.SpiceCliFilename)
+	err = github.DownloadAsset(release, c.spiceBinDir, assetName)
+	if err != nil {
+		slog.Error("downloading Spice.ai CLI binary", "error", err)
+		return err
+	}
+
+	cliFilePath := filepath.Join(c.spiceBinDir, constants.SpiceCliFilename)
+
+	err = util.MakeFileExecutable(cliFilePath)
+	if err != nil {
+		slog.Error("making CLI binary executable", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice CLI installed into %s successfully.\n", c.spiceBinDir))
+
+	// Set version lock to prevent auto-upgrades
+	err = c.SetVersionLock(release.TagName)
+	if err != nil {
+		slog.Warn("failed to set version lock", "error", err)
+	}
+
+	return nil
+}
+
 func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 	currentVersion, err := c.Version()
 	if err != nil {
@@ -396,6 +512,40 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 	}
 
 	return cliVersion, nil
+}
+
+func (c *RuntimeContext) SetVersionLock(version string) error {
+	lockFilePath := filepath.Join(c.spiceRuntimeDir, ".version_lock")
+	return os.WriteFile(lockFilePath, []byte(version), 0644)
+}
+
+func (c *RuntimeContext) GetVersionLock() (string, error) {
+	lockFilePath := filepath.Join(c.spiceRuntimeDir, ".version_lock")
+	data, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func (c *RuntimeContext) ClearVersionLock() error {
+	lockFilePath := filepath.Join(c.spiceRuntimeDir, ".version_lock")
+	err := os.Remove(lockFilePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (c *RuntimeContext) IsVersionLocked() bool {
+	lockedVersion, err := c.GetVersionLock()
+	if err != nil {
+		return false
+	}
+	return lockedVersion != ""
 }
 
 func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {

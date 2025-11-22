@@ -315,6 +315,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent.to_string(),
     )));
     if let Some(helper) = rl.helper_mut() {
+        // Perform initial refresh to populate autocomplete immediately with a 2-second timeout
+        let refresh_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), helper.refresh_now()).await;
+        if refresh_result.is_err() {
+            tracing::debug!("Initial autocomplete metadata refresh timed out after 2 seconds");
+        }
+        // Start background refresh task for updates
         helper.start_refreshing(300);
     }
 
@@ -473,6 +480,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     "{} Unexpected Flight error: {e}. Check connection or query syntax.",
                     Colour::Red.paint("Error:")
                 );
+                let _ = std::io::stdout().flush();
             }
         }
     }
@@ -648,6 +656,7 @@ fn display_records(
             if from_cache { " (cached)" } else { "" }
         );
     }
+    let _ = std::io::stdout().flush();
     Ok(pretty_batches)
 }
 
@@ -713,8 +722,9 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 }
 
 /// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+/// 280 is 2x 140,the X post length limit.
 fn lines_need_truncation(lines: &[&str]) -> bool {
-    lines.iter().any(|line| line.len() > 120)
+    lines.iter().any(|line| line.len() > 280)
 }
 
 fn display_grpc_error(err: &Status) {
@@ -786,6 +796,7 @@ fn display_grpc_error(err: &Status) {
         "{} {user_err_msg}",
         Colour::Red.paint(format!("{error_type}:"))
     );
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]

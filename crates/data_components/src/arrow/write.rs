@@ -50,6 +50,38 @@ use tokio::sync::RwLock;
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
+/// A wrapper around `XxHash3_64` that uses a fixed seed (0) for deterministic hashing.
+/// This is necessary because `XxHash3_64::default()` may use a random seed for DOS protection,
+/// which would make `HashSets` with different hasher instances incompatible for lookups.
+#[derive(Clone)]
+struct XxHash3_64WithFixedSeed {
+    hasher: twox_hash::XxHash3_64,
+}
+
+impl Default for XxHash3_64WithFixedSeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XxHash3_64WithFixedSeed {
+    fn new() -> Self {
+        Self {
+            hasher: twox_hash::XxHash3_64::with_seed(7),
+        }
+    }
+}
+
+impl std::hash::Hasher for XxHash3_64WithFixedSeed {
+    fn finish(&self) -> u64 {
+        self.hasher.clone().finish()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.hasher.write(bytes);
+    }
+}
+
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
 
@@ -129,7 +161,9 @@ impl MemTable {
             return Ok(());
         }
         // Keep track of uniquness of rows per constraint.
-        let mut constraint_keys: Vec<HashSet<_>> = Vec::with_capacity(constraints.iter().len());
+        let mut constraint_keys: Vec<
+            HashSet<String, std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>>,
+        > = Vec::with_capacity(constraints.iter().len());
         for b in &self.batches {
             let p = &*b.read().await;
             let p: Vec<_> = p.iter().collect();
@@ -138,16 +172,15 @@ impl MemTable {
                     Constraint::PrimaryKey(pk) => {
                         let pks = primary_key_identifier(&p, pk)?;
                         check_and_filter_non_null_unique_primary_keys::<
-                            std::collections::hash_map::RandomState,
+                            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                         >(&pks, constraint_keys.get(i))?
                     }
                     Constraint::Unique(u) => {
                         let ids = constraint_identifiers(&p, u)?;
                         let as_str: Vec<_> = ids.iter().map(String::as_str).collect();
-                        check_and_filter_unique_constraint::<std::collections::hash_map::RandomState>(
-                            &as_str,
-                            constraint_keys.get(i),
-                        )?
+                        check_and_filter_unique_constraint::<
+                            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+                        >(&as_str, constraint_keys.get(i))?
                     }
                 };
                 // Keep track of ids to ensure uniqueness across all partitions.
@@ -797,23 +830,31 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
 // Public wrappers for benchmarking with standard hasher
 #[cfg(feature = "bench")]
 pub mod bench_wrappers {
-    use super::*;
-    use std::collections::hash_map::RandomState;
+    use std::collections::{HashSet, hash_map::RandomState};
+
+    use super::{
+        RecordBatch, Result,
+        check_and_filter_non_null_unique_primary_keys as check_and_filter_pks_impl,
+        check_and_filter_unique_constraint as check_constraint_impl,
+        extract_primary_keys_str as extract_pks_impl, filter_existing as filter_existing_impl,
+    };
 
     /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
+    #[allow(clippy::implicit_hasher)]
     pub fn check_and_filter_non_null_unique_primary_keys(
         pks: &[Option<String>],
         existing_pks: Option<&HashSet<String>>,
     ) -> Result<HashSet<String>> {
-        super::check_and_filter_non_null_unique_primary_keys::<RandomState>(pks, existing_pks)
+        check_and_filter_pks_impl::<RandomState>(pks, existing_pks)
     }
 
     /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
+    #[allow(clippy::implicit_hasher)]
     pub fn check_and_filter_unique_constraint(
         ids: &[&str],
         existing_ids: Option<&HashSet<String>>,
     ) -> Result<HashSet<String>> {
-        super::check_and_filter_unique_constraint::<RandomState>(ids, existing_ids)
+        check_constraint_impl::<RandomState>(ids, existing_ids)
     }
 
     /// Public wrapper for benchmarking `extract_primary_keys_str`
@@ -821,16 +862,17 @@ pub mod bench_wrappers {
         batch: &RecordBatch,
         pk_indices_ordered: &[usize],
     ) -> Result<Vec<Option<String>>> {
-        super::extract_primary_keys_str(batch, pk_indices_ordered)
+        extract_pks_impl(batch, pk_indices_ordered)
     }
 
     /// Public wrapper for benchmarking `filter_existing`
+    #[allow(clippy::implicit_hasher)]
     pub fn filter_existing(
         existing_batches: &mut Vec<RecordBatch>,
         overwriting_primary_keys: &HashSet<String>,
         pk_indices_ordered: &[usize],
     ) -> Result<()> {
-        super::filter_existing::<RandomState>(
+        filter_existing_impl::<RandomState>(
             existing_batches,
             overwriting_primary_keys,
             pk_indices_ordered,
@@ -893,12 +935,15 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
-        let mut new_key_set: HashSet<String> = HashSet::new();
+        let mut new_key_set: HashSet<
+            String,
+            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+        > = HashSet::default();
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
             new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::collections::hash_map::RandomState,
+                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
             >(&new_primary_key_ids, None)?;
         }
 
@@ -920,7 +965,7 @@ impl DataSink for MemSink {
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
                             let _ = check_and_filter_non_null_unique_primary_keys::<
-                                std::collections::hash_map::RandomState,
+                                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                             >(&batch_pks, Some(&new_key_set))?;
                         }
                     }
