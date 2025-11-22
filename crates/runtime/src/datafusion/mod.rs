@@ -988,11 +988,19 @@ impl DataFusion {
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
 
-        // Only pass constraints from the source table if we're not using refresh_sql or caching mode
-        // When refresh_sql is used, the schema might have different column ordering,
-        // which would make the constraint indices invalid
-        // For caching mode, we use InsertOp::Overwrite which conflicts with primary key constraints
-        let constraints = if refresh_sql.is_none() && !matches!(refresh_mode, RefreshMode::Caching) {
+        // Determine if we should pass constraints to the accelerator
+        // Only pass constraints if:
+        // 1. Not using refresh_sql (schema might have different column ordering)
+        // 2. Not using Arrow/MemTable with caching mode (ColumnReference sorting limitation)
+        //
+        // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
+        // For caching mode with Arrow: constraints cause "Primary key values must be unique" error
+        //   due to ColumnReference sorting in datafusion-table-providers
+        let use_constraints = refresh_sql.is_none()
+            && !(matches!(refresh_mode, RefreshMode::Caching)
+                && acceleration_settings.engine == Engine::Arrow);
+
+        let constraints = if use_constraints {
             match &*source_table_provider {
                 FederatedTable::Immediate(table_provider) => table_provider.constraints(),
                 FederatedTable::Deferred(_) => None,
@@ -1025,7 +1033,7 @@ impl DataFusion {
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
         } else if let Ok(checkpoint) =
-                DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+            DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have

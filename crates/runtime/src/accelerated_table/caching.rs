@@ -39,7 +39,7 @@ use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
 
 /// Check if cached data is stale based on TTL
-#[allow(clippy::cast_possible_wrap)] // SystemTime cast to i64 is safe for reasonable timestamps  
+#[allow(clippy::cast_possible_wrap)] // SystemTime cast to i64 is safe for reasonable timestamps
 fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<bool> {
     // Find the refreshed_at column
     let schema = batch.schema();
@@ -115,7 +115,7 @@ impl CacheRefreshHelper {
         let stale_threshold = now - ttl_nanos;
 
         tracing::debug!(
-            "Cache: Querying for stale rows in dataset {} with TTL {:?} (threshold: {})",
+            "Caching: Querying for stale rows in dataset {} with TTL {:?} (threshold: {})",
             dataset_name,
             ttl,
             stale_threshold
@@ -123,8 +123,14 @@ impl CacheRefreshHelper {
 
         // Scan the accelerator with a filter for stale rows
         // WHERE fetched_at < threshold
-        let filters = vec![col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(Some(stale_threshold), None)))];
-        
+        let filters =
+            vec![
+                col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(
+                    Some(stale_threshold),
+                    None,
+                ))),
+            ];
+
         let plan = accelerator.scan(&state, None, &filters, None).await?;
         let task_ctx = Arc::new(TaskContext::default());
         let mut total_refreshed = 0;
@@ -132,17 +138,17 @@ impl CacheRefreshHelper {
         // For each stale request combination, re-fetch from the source
         for partition in 0..plan.properties().output_partitioning().partition_count() {
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
-            
+
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
-                
+
                 for row_idx in 0..batch.num_rows() {
                     // Extract the filter parameters for this row
                     let filters = Self::extract_filters_from_row(&batch, row_idx)?;
-                    
+
                     // Re-fetch from the federated source with these filters
                     tracing::debug!(
-                        "Cache: Refreshing stale data for dataset {} with {} filters",
+                        "Caching: Refreshing stale data for dataset {} with {} filters",
                         dataset_name,
                         filters.len()
                     );
@@ -153,13 +159,16 @@ impl CacheRefreshHelper {
                         dataset_name,
                         &filters,
                         None,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(batches) => {
-                            total_refreshed += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                            total_refreshed +=
+                                batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Cache: Failed to refresh stale data for dataset {}: {}",
+                                "Caching: Failed to refresh stale data for dataset {}: {}",
                                 dataset_name,
                                 e
                             );
@@ -170,7 +179,7 @@ impl CacheRefreshHelper {
         }
 
         tracing::info!(
-            "Cache: Refreshed {} stale rows for dataset {}",
+            "Caching: Refreshed {} stale rows for dataset {}",
             total_refreshed,
             dataset_name
         );
@@ -191,37 +200,43 @@ impl CacheRefreshHelper {
 
         // Extract request_path
         if let Some((idx, _)) = schema.column_with_name("request_path") {
-            let array = batch.column(idx)
+            let array = batch
+                .column(idx)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| datafusion::error::DataFusionError::Execution(
-                    "request_path column is not a StringArray".to_string()
-                ))?;
-            
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "request_path column is not a StringArray".to_string(),
+                    )
+                })?;
+
             if !array.is_null(row_idx) {
                 let value = array.value(row_idx).to_string();
                 // Only add filter if value is non-empty (empty string means no path filter)
                 if !value.is_empty() {
-                    tracing::debug!("Cache: Extracted request_path filter: {}", value);
+                    tracing::debug!("Caching: Extracted request_path filter: {}", value);
                     filters.push(col("request_path").eq(lit(value)));
                 }
             }
         }
 
-        // Extract request_query  
+        // Extract request_query
         if let Some((idx, _)) = schema.column_with_name("request_query") {
-            let array = batch.column(idx)
+            let array = batch
+                .column(idx)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| datafusion::error::DataFusionError::Execution(
-                    "request_query column is not a StringArray".to_string()
-                ))?;
-            
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "request_query column is not a StringArray".to_string(),
+                    )
+                })?;
+
             if !array.is_null(row_idx) {
                 let value = array.value(row_idx).to_string();
                 // Only add filter if value is non-empty (empty string means no query filter)
                 if !value.is_empty() {
-                    tracing::debug!("Cache: Extracted request_query filter: {}", value);
+                    tracing::debug!("Caching: Extracted request_query filter: {}", value);
                     filters.push(col("request_query").eq(lit(value)));
                 }
             }
@@ -229,24 +244,30 @@ impl CacheRefreshHelper {
 
         // Extract request_body
         if let Some((idx, _)) = schema.column_with_name("request_body") {
-            let array = batch.column(idx)
+            let array = batch
+                .column(idx)
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| datafusion::error::DataFusionError::Execution(
-                    "request_body column is not a StringArray".to_string()
-                ))?;
-            
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "request_body column is not a StringArray".to_string(),
+                    )
+                })?;
+
             if !array.is_null(row_idx) {
                 let value = array.value(row_idx).to_string();
                 // Only add filter if value is non-empty (empty string means no body filter)
                 if !value.is_empty() {
-                    tracing::debug!("Cache: Extracted request_body filter: {}", value);
+                    tracing::debug!("Caching: Extracted request_body filter: {}", value);
                     filters.push(col("request_body").eq(lit(value)));
                 }
             }
         }
 
-        tracing::debug!("Cache: Extracted {} total filters from row (including empty values)", filters.len());
+        tracing::debug!(
+            "Caching: Extracted {} total filters from row (including empty values)",
+            filters.len()
+        );
         Ok(filters)
     }
 
@@ -265,7 +286,7 @@ impl CacheRefreshHelper {
         let schema = batches[0].schema();
 
         tracing::info!(
-            "Cache: Inserting {} batches ({} total rows) into accelerator for dataset {}",
+            "Caching: Inserting {} batches ({} total rows) into accelerator for dataset {}",
             batches.len(),
             batches
                 .iter()
@@ -285,17 +306,30 @@ impl CacheRefreshHelper {
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
 
-        // Insert into accelerator (append in caching mode to support multiple filter combinations)
-        let insert_plan = accelerator
-            .insert_into(&state, plan, InsertOp::Append)
-            .await?;
+        // Determine insert operation based on accelerator type
+        // DuckDB and Cayenne accelerators support upsert-based multi-filter caching via InsertOp::Append
+        // with primary key constraints on metadata columns (request_path, request_query, request_body).
+        // Arrow/MemTable has a limitation where ColumnReference sorts columns alphabetically,
+        // which breaks primary key validation, so we use Overwrite mode for Arrow.
+        let accelerator_type_name = std::any::type_name_of_val(accelerator.as_ref());
+        let insert_op = if accelerator_type_name.contains("MemTable")
+            || accelerator_type_name.contains("DeletionTableProviderAdapter")
+        {
+            // Arrow accelerator - use Overwrite to avoid ColumnReference sorting issue
+            InsertOp::Overwrite
+        } else {
+            // DuckDB, Cayenne, or other SQL-based accelerators - use Append for upsert
+            InsertOp::Append
+        };
+
+        let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
 
         // Execute the insertion
         let task_ctx = Arc::new(TaskContext::default());
         datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
 
         tracing::info!(
-            "Cache: Successfully inserted data into accelerator for dataset {}",
+            "Caching: Successfully inserted data into accelerator for dataset {}",
             dataset_name
         );
         Ok(())
@@ -310,13 +344,13 @@ impl CacheRefreshHelper {
         limit: Option<usize>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
         tracing::debug!(
-            "Cache: Fetching from source on cache miss for dataset {} with {} filters, limit={:?}",
+            "Caching: Fetching from source on cache miss for dataset {} with {} filters, limit={:?}",
             dataset_name,
             filters.len(),
             limit
         );
         for (i, filter) in filters.iter().enumerate() {
-            tracing::debug!("Cache: Filter {}: {:?}", i, filter);
+            tracing::debug!("Caching: Filter {}: {:?}", i, filter);
         }
 
         let ctx = SessionContext::new();
@@ -339,12 +373,8 @@ impl CacheRefreshHelper {
         }
 
         // Store in accelerator for future queries
-        Self::insert_into_accelerator(
-            Arc::clone(&accelerator),
-            dataset_name,
-            all_batches.clone(),
-        )
-        .await?;
+        Self::insert_into_accelerator(Arc::clone(&accelerator), dataset_name, all_batches.clone())
+            .await?;
 
         Ok(all_batches)
     }
@@ -379,7 +409,7 @@ impl CacheRefreshHelper {
 
         if all_batches.is_empty() {
             tracing::debug!(
-                "Cache: No data fetched from source for dataset {}",
+                "Caching: No data fetched from source for dataset {}",
                 dataset_name
             );
             return Ok(0);
@@ -391,7 +421,7 @@ impl CacheRefreshHelper {
             .sum();
 
         tracing::debug!(
-            "Cache: Fetched {} rows from source for dataset {}",
+            "Caching: Fetched {} rows from source for dataset {}",
             total_rows,
             dataset_name
         );
@@ -466,7 +496,7 @@ impl CachingAccelerationScanExec {
         limit: Option<usize>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
         tracing::debug!(
-            "Cache: Fetching fresh data from source for dataset {}",
+            "Caching: Fetching fresh data from source for dataset {}",
             dataset_name
         );
 
@@ -543,17 +573,15 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        eprintln!("!!! CacheAccelerationScanExec::execute called for partition {}", partition);
         tracing::debug!(
             "CacheAccelerationScanExec::execute dataset={}, partition={}, num_filters={}",
             self.dataset_name,
             partition,
             self.filters.len()
         );
-        
+
         // Execute the accelerator scan
         let mut accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
-        eprintln!("!!! Got accelerator stream");
         let schema = accelerator_stream.schema();
         let schema_clone = Arc::clone(&schema);
 
@@ -567,19 +595,16 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
         let cache_miss_or_stale_stream = futures::stream::once(async move {
-            eprintln!("!!! About to poll accelerator stream");
             // Check if accelerator has data
             if let Some(first_batch) = accelerator_stream.next().await {
-                eprintln!("!!! Accelerator stream returned batch");
                 match first_batch {
                     Ok(batch) if batch.num_rows() > 0 => {
-                        eprintln!("!!! Batch has {} rows - cache hit!", batch.num_rows());
-                        tracing::trace!("Cache: Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
+                        tracing::trace!("Caching: Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
 
                         // Check if data is stale and trigger background refresh if needed
                         if let Some(ttl) = ttl
                             && is_data_stale(&batch, ttl).unwrap_or(false) {
-                                tracing::debug!("Cache: Data is stale for dataset {}, triggering background refresh", dataset_name);
+                                tracing::debug!("Caching: Data is stale for dataset {}, triggering background refresh", dataset_name);
 
                                 let federated_clone = Arc::clone(&federated);
                                 let accelerator_clone = Arc::clone(&accelerator);
@@ -594,7 +619,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                                         &filters_clone,
                                         limit,
                                     ).await {
-                                        tracing::error!("Cache: Background refresh failed for dataset {}: {}", dataset_name_clone, e);
+                                        tracing::error!("Caching: Background refresh failed for dataset {}: {}", dataset_name_clone, e);
                                     }
                                 });
                             }
@@ -607,16 +632,15 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         );
                         Box::pin(adapter) as SendableRecordBatchStream
                     }
-                    Ok(batch) => {
-                        eprintln!("!!! Batch has 0 rows - cache miss!");
+                    Ok(_batch) => {
                         // Empty batch (0 rows) - treat as cache miss
-                        tracing::info!("Cache: Cache miss for dataset {} - accelerator returned 0 rows, fetching from source", dataset_name);
+                        tracing::info!("Caching: Cache miss for dataset {} - accelerator returned 0 rows, fetching from source", dataset_name);
 
                         // Fetch from source synchronously
                         match CacheRefreshHelper::fetch_from_source_on_miss(Arc::clone(&federated), Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
                             Ok(batches) if !batches.is_empty() => {
                                 let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
-                                tracing::info!("Cache: Fetched {} batches ({} total rows) from source for dataset {}",
+                                tracing::info!("Caching: Fetched {} batches ({} total rows) from source for dataset {}",
                                     batches.len(),
                                     total_rows,
                                     dataset_name);
@@ -646,23 +670,22 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                 }
             } else {
-                eprintln!("!!! Accelerator stream returned None - cache miss!");
                 // Cache miss - accelerator returned no data
-                tracing::info!("Cache: Cache miss for dataset {} - fetching from source", dataset_name);
+                tracing::info!("Caching: Cache miss for dataset {} - fetching from source", dataset_name);
 
                 // Fetch from source synchronously
                 match CacheRefreshHelper::fetch_from_source_on_miss(federated, Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
                     Ok(batches) if !batches.is_empty() => {
                         let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
-                        tracing::info!("Cache: Fetched {} batches ({} total rows) from source for dataset {}",
+                        tracing::info!("Caching: Fetched {} batches ({} total rows) from source for dataset {}",
                             batches.len(),
                             total_rows,
                             dataset_name);
-                        
+
                         // Debug: log the schema and first batch data
                         if let Some(first_batch) = batches.first() {
-                            tracing::info!("Cache: Fetched batch schema: {:?}", first_batch.schema());
-                            tracing::info!("Cache: First batch data: {:?}", first_batch);
+                            tracing::info!("Caching: Fetched batch schema: {:?}", first_batch.schema());
+                            tracing::info!("Caching: First batch data: {:?}", first_batch);
                         }
 
                         // Use the schema from the fetched batches, not from the accelerator scan
@@ -673,7 +696,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                     Ok(_) => {
                         // Source also returned no data
-                        tracing::debug!("Cache: Cache miss - source also has no data for dataset {}", dataset_name);
+                        tracing::debug!("Caching: Cache miss - source also has no data for dataset {}", dataset_name);
                         let empty_stream = RecordBatchStreamAdapter::new(
                             Arc::clone(&schema_clone),
                             futures::stream::empty(),
@@ -681,7 +704,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         Box::pin(empty_stream) as SendableRecordBatchStream
                     }
                     Err(e) => {
-                        tracing::error!("Cache: Cache miss fetch failed for dataset {}: {}", dataset_name, e);
+                        tracing::error!("Caching: Cache miss fetch failed for dataset {}: {}", dataset_name, e);
                         let error_stream = RecordBatchStreamAdapter::new(
                             Arc::clone(&schema_clone),
                             futures::stream::once(async move { Err(e) }),
@@ -744,13 +767,18 @@ mod tests {
         let id_array = Int32Array::from(vec![1, 2, 3]);
         let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
 
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(id_array), Arc::new(name_array)])
-                .expect("Failed to create batch");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .expect("Failed to create batch");
 
         let ttl = Duration::from_secs(60);
         let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
-        assert!(result, "Data without refresh column should be considered stale");
+        assert!(
+            result,
+            "Data without refresh column should be considered stale"
+        );
     }
 
     #[test]
@@ -767,9 +795,9 @@ mod tests {
             .as_nanos() as i64;
 
         let refresh_timestamps = TimestampNanosecondArray::from(vec![
-            Some(now - 10_000_000_000),  // 10 seconds ago
-            Some(now - 20_000_000_000),  // 20 seconds ago
-            Some(now - 5_000_000_000),   // 5 seconds ago
+            Some(now - 10_000_000_000), // 10 seconds ago
+            Some(now - 20_000_000_000), // 20 seconds ago
+            Some(now - 5_000_000_000),  // 5 seconds ago
         ]);
 
         let batch = RecordBatch::try_new(
@@ -839,7 +867,10 @@ mod tests {
 
         let ttl = Duration::from_secs(60);
         let result = is_data_stale(&batch, ttl).expect("Should successfully check staleness");
-        assert!(result, "Data with null timestamps should be considered stale");
+        assert!(
+            result,
+            "Data with null timestamps should be considered stale"
+        );
     }
 
     #[test]
@@ -856,9 +887,9 @@ mod tests {
 
         // Mix of fresh and stale timestamps - if ANY is stale, the whole batch is stale
         let refresh_timestamps = TimestampNanosecondArray::from(vec![
-            Some(now - 10_000_000_000),  // 10 seconds ago (fresh)
-            Some(now - 90_000_000_000),  // 90 seconds ago (stale)
-            Some(now - 5_000_000_000),   // 5 seconds ago (fresh)
+            Some(now - 10_000_000_000), // 10 seconds ago (fresh)
+            Some(now - 90_000_000_000), // 90 seconds ago (stale)
+            Some(now - 5_000_000_000),  // 5 seconds ago (fresh)
         ]);
 
         let batch = RecordBatch::try_new(
@@ -896,8 +927,10 @@ mod tests {
         let ttl_nanos = ttl.as_nanos() as i64;
 
         // Well within TTL boundary - this should NOT be stale
-        let refresh_timestamps_fresh =
-            TimestampNanosecondArray::from(vec![Some(now - ttl_nanos + 1_000_000_000), Some(now - ttl_nanos + 2_000_000_000)]);  // 1-2 seconds within boundary
+        let refresh_timestamps_fresh = TimestampNanosecondArray::from(vec![
+            Some(now - ttl_nanos + 1_000_000_000),
+            Some(now - ttl_nanos + 2_000_000_000),
+        ]); // 1-2 seconds within boundary
 
         let batch_fresh = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -909,12 +942,18 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let result_fresh = is_data_stale(&batch_fresh, ttl).expect("Should successfully check staleness");
-        assert!(!result_fresh, "Data well within TTL boundary should not be stale");
-        
+        let result_fresh =
+            is_data_stale(&batch_fresh, ttl).expect("Should successfully check staleness");
+        assert!(
+            !result_fresh,
+            "Data well within TTL boundary should not be stale"
+        );
+
         // Well past the TTL boundary - this SHOULD be stale
-        let refresh_timestamps_stale =
-            TimestampNanosecondArray::from(vec![Some(now - ttl_nanos - 1_000_000_000), Some(now - ttl_nanos - 2_000_000_000)]);  // 1-2 seconds past boundary
+        let refresh_timestamps_stale = TimestampNanosecondArray::from(vec![
+            Some(now - ttl_nanos - 1_000_000_000),
+            Some(now - ttl_nanos - 2_000_000_000),
+        ]); // 1-2 seconds past boundary
 
         let batch_stale = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -926,7 +965,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let result_stale = is_data_stale(&batch_stale, ttl).expect("Should successfully check staleness");
+        let result_stale =
+            is_data_stale(&batch_stale, ttl).expect("Should successfully check staleness");
         assert!(result_stale, "Data well past TTL boundary should be stale");
     }
 
@@ -980,8 +1020,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters =
-            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+            .expect("Should extract filters");
         assert_eq!(filters.len(), 3, "Should extract 3 filters");
     }
 
@@ -1013,8 +1053,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters =
-            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+            .expect("Should extract filters");
         // Only path and body should be extracted (query is null)
         assert_eq!(filters.len(), 2, "Should only extract non-null filters");
     }
@@ -1023,9 +1063,9 @@ mod tests {
     fn test_extract_filters_from_row_with_empty_strings() {
         let schema = create_test_schema_with_request_params();
         let id_array = Int32Array::from(vec![1]);
-        let path_array = StringArray::from(vec![Some("")]);  // Empty string
+        let path_array = StringArray::from(vec![Some("")]); // Empty string
         let query_array = StringArray::from(vec![Some("page=1")]);
-        let body_array = StringArray::from(vec![Some("")]);  // Empty string
+        let body_array = StringArray::from(vec![Some("")]); // Empty string
 
         #[allow(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
@@ -1047,8 +1087,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters =
-            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+            .expect("Should extract filters");
         // Only query should be extracted (path and body are empty strings)
         assert_eq!(
             filters.len(),
@@ -1084,8 +1124,8 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let filters =
-            CacheRefreshHelper::extract_filters_from_row(&batch, 0).expect("Should extract filters");
+        let filters = CacheRefreshHelper::extract_filters_from_row(&batch, 0)
+            .expect("Should extract filters");
         assert_eq!(
             filters.len(),
             0,

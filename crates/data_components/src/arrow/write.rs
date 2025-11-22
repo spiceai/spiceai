@@ -219,6 +219,8 @@ impl MemTable {
         on_conflict: &ColumnReference,
     ) -> Result<()> {
         let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
+        let schema = self.schema();
+        let pk_names: Vec<String> = pk.iter().map(|&idx| schema.field(idx).name().clone()).collect();
 
         if on_conflict_cols.len() != pk.len() {
             return Err(DataFusionError::Execution(
@@ -226,16 +228,13 @@ impl MemTable {
             ));
         }
 
-        let schema = self.schema();
-
-        if on_conflict_cols
-            .iter()
-            .zip(pk.iter())
-            .any(|(c, pk)| c != schema.field(*pk).name())
-        {
-            return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
-            ));
+        for (i, (c, pk_idx)) in on_conflict_cols.iter().zip(pk.iter()).enumerate() {
+            let pk_name = schema.field(*pk_idx).name();
+            if c != pk_name {
+                return Err(DataFusionError::Execution(
+                    "Primary key must match the on_conflict definition".to_string(),
+                ));
+            }
         }
 
         Ok(())

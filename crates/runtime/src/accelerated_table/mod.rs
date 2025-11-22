@@ -765,13 +765,6 @@ impl TableProvider for AcceleratedTable {
         // Check if we're in caching mode
         let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
 
-        tracing::debug!(
-            "AcceleratedTable::scan dataset={}, caching_mode={}, num_filters={}",
-            self.dataset_name,
-            is_caching_mode,
-            filters.len()
-        );
-
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
         if !self.refresher().initial_load_completed() && !is_caching_mode {
             match self.ready_state {
@@ -795,17 +788,13 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // In caching mode, don't pass filters to the accelerator scan - we need to see
-        // ALL cached data to determine if we have a cache hit or miss. The CacheAccelerationScanExec
-        // will handle applying filters and fetching from source on cache miss.
-        // DataFusion will apply a FilterExec on top based on supports_filters_pushdown returning Inexact.
-        let accelerator_filters = if is_caching_mode { &[][..] } else { filters };
-
+        // In caching mode with Overwrite, pass filters to accelerator so it can check for cached data.
+        // MemTable may return Unsupported for filter pushdown, but we still pass them.
+        // If accelerator returns 0 rows → cache miss → fetch and overwrite.
         let input = self
             .accelerator
-            .scan(state, projection, accelerator_filters, limit)
+            .scan(state, projection, filters, limit)
             .await?;
-
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
@@ -826,12 +815,7 @@ impl TableProvider for AcceleratedTable {
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
-                ));
-                tracing::debug!(
-                    "Created CacheAccelerationScanExec for dataset {}",
-                    self.dataset_name
-                );
-                cache_plan
+                ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,
             (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
