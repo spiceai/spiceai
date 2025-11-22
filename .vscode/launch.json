@@ -82,7 +82,8 @@
         "--load-steps",
         "10",
         "--load-interval",
-        "30",
+        "240",
+        "--disable-progress-bars",
         "-p",
         "./test/spicepods/tpch/sf1/accelerated/append/file_duckdb_file.yaml"
       ],

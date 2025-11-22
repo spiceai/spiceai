@@ -54,9 +54,10 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
             .with_end_duration(Duration::from_secs(60 * 60))
             .with_tempdir_path(start_request.get_tempdir_path())
             .with_load_interval(Duration::from_secs(args.load_interval))
-            .with_load_steps(args.load_steps),
+            .with_load_steps(args.load_steps)
+            .with_conflict_testing(args.enable_conflict_testing),
     )
-    .with_progress_bars(false)
+    .with_progress_bars(!args.test_args.common.disable_progress_bars)
     .start_appending()
     .await?;
 

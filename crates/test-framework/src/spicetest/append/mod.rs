@@ -51,6 +51,7 @@ pub struct NotStarted {
     tempdir_path: Option<PathBuf>,
     load_interval: Option<Duration>,
     load_steps: Option<u16>,
+    enable_conflict_testing: bool,
 }
 
 impl NotStarted {
@@ -101,6 +102,12 @@ impl NotStarted {
         self
     }
 
+    #[must_use]
+    pub fn with_conflict_testing(mut self, enable_conflict_testing: bool) -> Self {
+        self.enable_conflict_testing = enable_conflict_testing;
+        self
+    }
+
     pub fn get_tempdir_path(&self) -> Result<&PathBuf> {
         self.tempdir_path
             .as_ref()
@@ -146,7 +153,7 @@ impl SpiceTest<NotStarted> {
             self.state.end_duration,
             self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
-        );
+        ).with_conflict_testing(self.state.enable_conflict_testing);
 
         if let Some(load_interval) = self.state.load_interval {
             append_config = append_config.with_load_interval(load_interval);
@@ -208,7 +215,8 @@ impl SpiceTest<AppendStarted> {
                 .with_flight_client(spice_client.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
                 .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate_row_counts(false);
+                .with_validate_row_counts(false)
+                .with_silent(!self.use_progress_bars);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
