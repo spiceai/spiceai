@@ -764,11 +764,7 @@ impl RefreshTask {
             ttl,
         )
         .await
-        .map_err(|e| {
-            RetryError::permanent(super::Error::FailedToRefreshDataset {
-                source: e,
-            })
-        })?;
+        .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
 
         tracing::info!(
             "Cache: Completed stale row refresh for dataset {} - refreshed {} rows",

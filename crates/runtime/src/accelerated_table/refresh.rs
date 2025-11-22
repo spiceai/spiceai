@@ -623,7 +623,9 @@ impl Refresher {
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
             (
-                AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver) | AccelerationRefreshMode::Caching(receiver),
+                AccelerationRefreshMode::Append(receiver)
+                | AccelerationRefreshMode::Full(receiver)
+                | AccelerationRefreshMode::Caching(receiver),
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
