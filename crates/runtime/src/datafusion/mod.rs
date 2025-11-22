@@ -986,10 +986,13 @@ impl DataFusion {
             source_schema
         };
 
-        // Only pass constraints from the source table if we're not using refresh_sql
+        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+
+        // Only pass constraints from the source table if we're not using refresh_sql or caching mode
         // When refresh_sql is used, the schema might have different column ordering,
         // which would make the constraint indices invalid
-        let constraints = if refresh_sql.is_none() {
+        // For caching mode, we use InsertOp::Overwrite which conflicts with primary key constraints
+        let constraints = if refresh_sql.is_none() && !matches!(refresh_mode, RefreshMode::Caching) {
             match &*source_table_provider {
                 FederatedTable::Immediate(table_provider) => table_provider.constraints(),
                 FederatedTable::Deferred(_) => None,
@@ -1012,15 +1015,16 @@ impl DataFusion {
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
 
-        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
-
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         // For caching mode, we always start ready since it fetches data on-demand.
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
-        if !initial_load_complete
-            && let Ok(checkpoint) =
+        if initial_load_complete {
+            // Caching mode datasets are always ready immediately
+            self.runtime_status
+                .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+        } else if let Ok(checkpoint) =
                 DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {

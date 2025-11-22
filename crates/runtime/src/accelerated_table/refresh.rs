@@ -258,6 +258,7 @@ impl Refresh {
         refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> NextRefresh {
+        tracing::debug!("startup_next_refresh called with mode: {:?}", self.mode);
         let previous_checkpoint = match self.mode {
             RefreshMode::Full => {
                 // If there is no checkpoint, we need to start a refresh.
@@ -267,13 +268,14 @@ impl Refresh {
                 last_checkpoint.last_checkpoint_time().await.ok().flatten()
             }
             // Append and Changes modes are always refreshed since they stream changes from the source table.
-            #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
             RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
-            // Caching mode performs periodic refreshes but only refreshes stale data based on TTL
+            // Caching mode doesn't need an initial refresh - it starts ready immediately
+            // and only refreshes data on-demand through cache misses
             RefreshMode::Caching => {
-                return NextRefresh::WaitFor(Duration::ZERO);
+                tracing::debug!("Caching mode detected - skipping initial refresh");
+                return NextRefresh::Disabled;
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
@@ -422,7 +424,7 @@ pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
-    Caching,
+    Caching(Receiver<Option<RefreshOverrides>>),
 }
 
 pub struct Refresher {
@@ -619,16 +621,14 @@ impl Refresher {
         };
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
-            #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
             (
-                AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver),
+                AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver) | AccelerationRefreshMode::Caching(receiver),
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
                 return Ok(Some(self.start_changes_stream(stream)));
             }
-            (AccelerationRefreshMode::Caching, _) => return Ok(None),
         };
 
         let mut refresh_task_runner = RefreshTaskRunner::builder(

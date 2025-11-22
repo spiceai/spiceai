@@ -124,6 +124,7 @@ struct CachedResponse {
     cached_at: SystemTime,
     max_age: Duration,
     detected_format: Option<String>,
+    response_date: Option<SystemTime>,
 }
 
 impl CachedResponse {
@@ -194,6 +195,7 @@ struct HttpFetchResult {
     content: String,
     max_age: Duration,
     detected_format: String,
+    response_date: Option<SystemTime>,
 }
 
 impl HttpFetchResult {
@@ -416,6 +418,7 @@ impl HttpTableProvider {
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
+            Field::new("fetched_at", DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), true),
         ])
     }
 
@@ -629,6 +632,7 @@ impl HttpTableProvider {
             cached_at: SystemTime::now(),
             max_age: result.max_age,
             detected_format: Some(result.detected_format),
+            response_date: result.response_date,
         };
 
         let mut cache_write = self.cache.write().await;
@@ -707,6 +711,16 @@ impl HttpTableProvider {
                     .and_then(|v| v.to_str().ok());
                 let max_age = Self::parse_cache_control(cache_control_header);
 
+                // Extract Date header from response
+                let response_date = response
+                    .headers()
+                    .get(reqwest::header::DATE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|date_str| {
+                        // Parse HTTP date format (RFC 2822/RFC 1123)
+                        httpdate::parse_http_date(date_str).ok()
+                    });
+
                 let content = response
                     .text()
                     .await
@@ -724,6 +738,7 @@ impl HttpTableProvider {
                     content,
                     max_age,
                     detected_format,
+                    response_date,
                 })
             }
         })
@@ -939,6 +954,13 @@ impl HttpExec {
             .await
             .map_err(DataFusionError::from)?;
 
+        // Get the response date from cache (if available)
+        let cache_key = HttpTableProvider::get_cache_key(path_val, query_val, body_val);
+        let response_date = {
+            let cache = provider.cache.read().await;
+            cache.get(&cache_key).and_then(|cached| cached.response_date)
+        };
+
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.as_deref().unwrap_or("");
         let query_for_batch = query.as_deref().unwrap_or("");
@@ -962,6 +984,22 @@ impl HttpExec {
         }
 
         // Create columns with the same number of rows
+        // Use response Date header if available, otherwise use current time
+        let timestamp_nanos = if let Some(date) = response_date {
+            i64::try_from(
+                date.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
+                    .as_nanos()
+            )
+            .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| DataFusionError::Execution(format!("Failed to get current time: {e}")))?;
+            i64::try_from(now.as_nanos())
+                .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
+        };
+
         let columns = self
             .projected_schema
             .fields()
@@ -977,6 +1015,10 @@ impl HttpExec {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
+                "fetched_at" => {
+                    use arrow::array::TimestampNanosecondArray;
+                    Ok(Arc::new(TimestampNanosecondArray::from(vec![timestamp_nanos; num_rows])) as ArrayRef)
+                }
                 _ => Err(DataFusionError::Execution(format!(
                     "Unsupported field name: {}",
                     field.name()

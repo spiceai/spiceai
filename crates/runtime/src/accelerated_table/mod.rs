@@ -536,8 +536,13 @@ impl Builder {
                 )
             }
             RefreshMode::Caching => {
-                // Cache mode doesn't need initial refresh
-                (refresh::AccelerationRefreshMode::Caching, None)
+                // Cache mode supports manual refresh triggers to force refresh of stale data
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Caching(on_start_refresh),
+                    Some(start_refresh),
+                )
             }
         };
 

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
@@ -221,7 +222,9 @@ impl Https {
     fn parse_custom_headers(&self, dataset_name: &str) -> HeaderMap {
         let mut custom_headers = HeaderMap::new();
         if let Some(headers_str) = self.params.get("http_headers").expose().ok() {
-            for header in headers_str.split(',') {
+            // Split by semicolon or comma
+            let delimiter = if headers_str.contains(';') { ';' } else { ',' };
+            for header in headers_str.split(delimiter) {
                 let parts: Vec<&str> = header.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     let name = parts[0].trim();
@@ -385,6 +388,21 @@ impl DataConnector for Https {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        // Validate acceleration mode for HTTP connector
+        if let Some(acceleration) = &dataset.acceleration
+            && acceleration.enabled {
+                let refresh_mode = self.resolve_refresh_mode(acceleration.refresh_mode);
+
+                // HTTP connector only supports append or caching mode unless refresh_sql is provided
+                if matches!(refresh_mode, RefreshMode::Full) && dataset.refresh_sql().is_none() {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: "HTTP connector with acceleration mode 'full' requires 'refresh_sql' to be specified. Supported acceleration modes without refresh_sql are 'append' or 'caching'.".to_string(),
+                    });
+                }
+            }
+
         // Determine file format - default to "auto" if not specified
         let file_format = self
             .params
