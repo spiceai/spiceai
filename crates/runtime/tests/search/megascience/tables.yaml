@@ -1,0 +1,63 @@
+dataset:
+  table_name: qs
+  datasets:
+    - name: qs
+      from: s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl
+      params:
+        client_timeout: 120s
+  views: []
+
+view_join:
+  table_name: qs
+  datasets:
+    - name: megascience
+      from: s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl
+      params:
+        client_timeout: 120s
+  views:
+    - name: qs
+      sql: 'SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id'
+    - name: v1
+      sql: 'SELECT id, question, reference_answer FROM megascience'
+    - name: v2
+      sql: 'SELECT id, answer, source, subject FROM megascience'
+
+view_union_all:
+  table_name: qs
+  datasets:
+    - name: megascience
+      from: s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl
+      params:
+        client_timeout: 120s
+  views:
+    - name: v1
+      sql: "SELECT * FROM megascience where subject!='math'"
+    - name: v2
+      sql: "SELECT * FROM megascience where subject='math'"
+    - name: qs
+      sql: 'SELECT * FROM v1 UNION ALL SELECT * FROM v2'
+
+view_union_all_join:
+  table_name: qs
+  datasets:
+    - name: megascience
+      from: s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl
+      params:
+        client_timeout: 120s
+  views:
+    - name: v1
+      sql: "SELECT id, question, reference_answer FROM megascience where subject!='math'"
+    - name: v2
+      sql: "SELECT id, answer, source, subject FROM megascience where subject!='math'"
+      acceleration:
+        enabled: true
+    - name: v3
+      sql: "SELECT * FROM megascience where subject='math'"
+    - name: qs
+      sql: |
+        SELECT v1.*, v2.answer, v2.source, v2.subject
+        FROM v1
+        INNER JOIN v2 ON v1.id = v2.id
+        UNION ALL (
+          SELECT id, question, reference_answer, answer, source, subject FROM v3
+        )

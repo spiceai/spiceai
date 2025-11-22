@@ -16,7 +16,8 @@ duckdb_file:
   enabled: true
   engine: duckdb
   mode: file
-
-cayenne:
-  enabled: true
-  engine: cayenne
+## Cayenne Does not support FixedSizeArrays yet
+# cayenne:
+#   enabled: true
+#   engine: cayenne
+#   mode: file
