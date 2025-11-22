@@ -130,13 +130,10 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
 pub enum HashBuilder {
     Ahash(ahash::RandomState),
     Siphash(std::hash::RandomState),
-    #[cfg(feature = "xxhash")]
+    Blake3,
     XxHash3(std::hash::BuildHasherDefault<twox_hash::XxHash3_64>),
-    #[cfg(feature = "xxhash")]
     XxHash32(std::hash::BuildHasherDefault<twox_hash::XxHash32>),
-    #[cfg(feature = "xxhash")]
     XxHash64(std::hash::BuildHasherDefault<twox_hash::XxHash64>),
-    #[cfg(feature = "xxhash")]
     XxHash128,
 }
 
@@ -147,13 +144,10 @@ impl std::hash::BuildHasher for HashBuilder {
         match self {
             HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
             HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
+            HashBuilder::Blake3 => Box::new(blake3_compat::Blake3Wrapper::new()),
             HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
         }
     }
@@ -167,26 +161,52 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
     match hashing_algorithm {
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
         HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
-        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::Blake3 => Ok(HashBuilder::Blake3),
         HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(std::hash::BuildHasherDefault::<
             twox_hash::XxHash3_64,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(std::hash::BuildHasherDefault::<
             twox_hash::XxHash32,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
             twox_hash::XxHash64,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128),
-        #[allow(unreachable_patterns)]
-        _ => Err(Error::InvalidHashingAlgorithm),
     }
 }
 
-#[cfg(feature = "xxhash")]
+mod blake3_compat {
+    use std::hash::Hasher;
+
+    pub struct Blake3Wrapper {
+        hasher: blake3::Hasher,
+    }
+
+    impl Blake3Wrapper {
+        pub fn new() -> Self {
+            Self {
+                hasher: blake3::Hasher::new(),
+            }
+        }
+    }
+
+    impl Hasher for Blake3Wrapper {
+        fn finish(&self) -> u64 {
+            // blake3::Hasher::finalize_xof() doesn't consume self, so we must clone
+            // to get the hash value while preserving the hasher state for potential reuse.
+            // This is the intended design of blake3's incremental API.
+            let mut xof = self.hasher.finalize_xof();
+            let mut bytes = [0u8; 8];
+            xof.fill(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.hasher.update(bytes);
+        }
+    }
+}
+
 mod xxhash_compat {
     use std::hash::Hasher;
 
@@ -564,7 +584,9 @@ mod tests {
         )
         .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for SHOW TABLES");
     }
 
     #[tokio::test]
@@ -576,7 +598,10 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        cache_provider
+            .cache_is_enabled_for_plan(&logical_plan)
+            .then_some(())
+            .expect("cache should be enabled for simple SELECT");
     }
 
     #[tokio::test]
@@ -588,7 +613,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for INSERT INTO");
     }
 
     #[tokio::test]
@@ -600,7 +627,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for UPDATE");
     }
 
     #[tokio::test]
@@ -612,7 +641,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for DELETE");
     }
 
     #[tokio::test]
@@ -624,7 +655,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for CREATE TABLE");
     }
 
     #[test]
@@ -663,6 +696,8 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for COPY");
     }
 }

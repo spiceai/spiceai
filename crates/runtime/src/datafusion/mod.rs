@@ -95,8 +95,6 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
-#[cfg(feature = "cluster")]
-pub mod cluster;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -106,6 +104,7 @@ pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
+pub mod secrets_context_extension;
 mod sql_validator;
 pub mod udf;
 
@@ -1971,7 +1970,7 @@ mod tests {
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let df = Arc::new(
             DataFusion::builder(

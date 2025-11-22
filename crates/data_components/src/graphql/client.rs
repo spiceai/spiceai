@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::rate_limit::RateLimiter;
+use crate::{graphql::InvalidPaginationRegexSnafu, rate_limit::RateLimiter};
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 
@@ -496,11 +496,11 @@ impl PaginationParameters {
         (None, None)
     }
 
-    fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> String {
-        #[allow(clippy::needless_raw_string_hashes)]
-        let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
-        let regex =
-            Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
+    fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> Result<String> {
+        let pattern = format!(r"{}\s*\(.*\)", self.resource_name);
+        let regex = Regex::new(&pattern).context(InvalidPaginationRegexSnafu {
+            resource_name: self.resource_name.clone(),
+        })?;
 
         let arguments = self.parameters_string(limit, cursor);
 
@@ -513,7 +513,7 @@ impl PaginationParameters {
             ),
         );
 
-        new_query.to_string()
+        Ok(new_query.to_string())
     }
 
     fn get_next_cursor_from_response(&self, response: &Value) -> Option<String> {
@@ -714,15 +714,16 @@ impl GraphQLQuery {
         self
     }
 
-    #[must_use]
-    pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> String {
+    pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> Result<String> {
         let query = self.ast.to_string();
 
-        if let Some(pagination_parameters) = &self.pagination_parameters {
-            pagination_parameters.apply(&query, limit, cursor)
-        } else {
-            query
-        }
+        Ok(
+            if let Some(pagination_parameters) = &self.pagination_parameters {
+                pagination_parameters.apply(&query, limit, cursor)?
+            } else {
+                query
+            },
+        )
     }
 
     pub fn limit_reached(&mut self, limit: Option<usize>, record_count: usize) -> bool {
@@ -847,7 +848,7 @@ impl GraphQLClient {
                 })?;
         }
 
-        let query_string = query.to_string(limit, cursor.clone());
+        let query_string = query.to_string(limit, cursor.clone())?;
 
         // Validate query string is not empty
         if query_string.trim().is_empty() {
@@ -1574,7 +1575,9 @@ mod tests {
         let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
-        let new_query = query.to_string(None, Some("new_cursor".to_string()));
+        let new_query = query
+            .to_string(None, Some("new_cursor".to_string()))
+            .expect("Should build query");
         let expected_query = r#"query {
   users (first: 10, after: "new_cursor") {
     name
@@ -1600,7 +1603,9 @@ mod tests {
         let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
-        let new_query = query.to_string(None, Some("new_cursor".to_string()));
+        let new_query = query
+            .to_string(None, Some("new_cursor".to_string()))
+            .expect("Should build query");
         let expected_query = r#"query {
   users (first: 10, after: "new_cursor") {
     name
@@ -1626,7 +1631,9 @@ mod tests {
         let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
-        let new_query = query.to_string(Some(5), Some("new_cursor".to_string()));
+        let new_query = query
+            .to_string(Some(5), Some("new_cursor".to_string()))
+            .expect("Should build query");
         let expected_query = r#"query {
   users (first: 5, after: "new_cursor") {
     name
