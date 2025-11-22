@@ -64,8 +64,8 @@ impl DynamoDBTableSchema {
         &self.table_schema
     }
 
-    pub fn primary_keys(&self) -> &[String] {
-        &self.primary_keys
+    pub fn primary_keys(&self) -> Vec<String> {
+        self.primary_keys.clone()
     }
 
     pub fn time_format(&self) -> Arc<String> {
