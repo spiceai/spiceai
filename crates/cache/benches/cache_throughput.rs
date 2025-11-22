@@ -41,10 +41,13 @@ impl Sizeable for BenchValue {
 
 impl CacheMetrics for BenchValue {
     fn record_hit() {}
+    fn record_miss() {}
     fn record_request() {}
     fn record_item_count(_count: u64) {}
     fn record_size(_size: u64) {}
     fn record_max_size(_size: u64) {}
+    fn record_eviction() {}
+    fn update_hit_ratio(_hits: u64, _total: u64) {}
 }
 
 impl AsTableRefs for BenchValue {
