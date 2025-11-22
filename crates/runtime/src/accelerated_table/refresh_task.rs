@@ -1276,7 +1276,7 @@ impl DataLoadTracing {
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
         let batch_size = batch.get_array_memory_size();
-        
+
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
         self.bytes_received += batch_size;
@@ -1286,22 +1286,31 @@ impl DataLoadTracing {
             let pretty_records = util::pretty_print_number(self.num_records_received);
             let elapsed = self.start_time.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
-            
+
             // Calculate throughput
+            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_sign_loss)]
             let throughput = if elapsed_secs > 0.0 {
                 let bytes_per_sec = (self.bytes_received as f64 / elapsed_secs) as usize;
                 format!("{}/s", util::human_readable_bytes(bytes_per_sec))
             } else {
                 "calculating...".to_string()
             };
-            
+
             let size = util::human_readable_bytes(self.bytes_received);
             let elapsed_str = format!("{}s", elapsed.as_secs());
 
             if is_spice_internal_dataset(&self.dataset) {
-                tracing::debug!("Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}", self.dataset);
+                tracing::debug!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             } else {
-                tracing::info!("Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}", self.dataset);
+                tracing::info!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             }
 
             self.last_updated_time = Instant::now();
@@ -1479,9 +1488,14 @@ mod tests {
         let mut tracing = DataLoadTracing::new(&dataset);
 
         // Create a test batch
-        let schema = Arc::new(Schema::new(vec![Field::new("col1", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
 
         let batch_size = batch.get_array_memory_size();
         let num_rows = batch.num_rows();
