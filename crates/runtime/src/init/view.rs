@@ -23,7 +23,9 @@ use crate::{
     metrics,
     secrets::Secrets,
     status,
-    topological_ordering::construct_effected_in_topological_order,
+    topological_ordering::{
+        construct_effected_in_topological_order, construct_topological_ordering,
+    },
     view, warn_spaced,
 };
 use app::App;
@@ -37,7 +39,48 @@ impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
         let views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
-        for view in views {
+        // Determine the dependency order for views based on their SQL dependencies
+        let views_in_dependency_order = match views
+            .iter()
+            .map(|v| {
+                let statements =
+                    DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {})
+                        .boxed()?;
+                let Some(statement) = statements.into_iter().next() else {
+                    return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "no statements found in view {}",
+                        v.name
+                    )));
+                };
+
+                let deps = view::get_dependent_table_names(&statement);
+                Ok((v.name.clone(), deps))
+            })
+            .collect::<Result<HashMap<TableReference, Vec<TableReference>>, _>>()
+        {
+            Ok(deps) => {
+                if let Some(ordered_names) = construct_topological_ordering(deps) {
+                    // Return views in topological order
+                    ordered_names
+                        .into_iter()
+                        .filter_map(|name| views.iter().find(|v| v.name == name).cloned())
+                        .collect::<Vec<_>>()
+                } else {
+                    tracing::warn!(
+                        "Circular dependency detected in views. Loading views in original order."
+                    );
+                    views
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Unable to determine dependency order for views: {e}. Loading views in original order."
+                );
+                views
+            }
+        };
+
+        for view in views_in_dependency_order {
             let runtime = Arc::clone(&self);
             let secrets = runtime.secrets();
             if let Err(e) = runtime.load_view(&view, secrets) {
