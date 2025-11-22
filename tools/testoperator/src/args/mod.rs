@@ -24,6 +24,9 @@ pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
 
+mod append;
+pub use append::AppendTestArgs;
+
 pub mod dispatch;
 use dispatch::DispatchArgs;
 
@@ -55,7 +58,7 @@ pub enum TestCommands {
     HttpOverhead(HttpOverheadTestArgs),
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
-    Append(DatasetTestArgs),
+    Append(AppendTestArgs),
     Search(SearchTestArgs),
 }
 

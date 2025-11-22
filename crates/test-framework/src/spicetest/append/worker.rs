@@ -44,6 +44,16 @@ impl AppendConfig {
             temp_directory,
         }
     }
+
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = load_interval;
+        self
+    }
+
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = load_steps;
+        self
+    }
 }
 
 pub(crate) struct AppendWorker {

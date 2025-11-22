@@ -21,6 +21,7 @@ spiceai.workspace = true
 hf-hub = { workspace = true }
 
 [features]
+default = ["append"]
 anonymous_telemetry = []
 aws-secrets-manager = []
 clickhouse = []

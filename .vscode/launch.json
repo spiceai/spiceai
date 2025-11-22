@@ -68,6 +68,29 @@
       "preLaunchTask": "rust: cargo build testoperator"
     },
     {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Append)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "run",
+        "append",
+      "--ready-wait",
+        "300",
+        "--query-set",
+        "tpch",
+        "--load-steps",
+        "10",
+        "--load-interval",
+        "30",
+        "-p",
+        "./test/spicepods/tpch/sf1/accelerated/append/file_duckdb_file.yaml"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
       "name": "spice version",
       "type": "go",
       "request": "launch",
