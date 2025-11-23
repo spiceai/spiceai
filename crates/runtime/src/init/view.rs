@@ -23,7 +23,9 @@ use crate::{
     metrics,
     secrets::Secrets,
     status,
-    topological_ordering::construct_effected_in_topological_order,
+    topological_ordering::{
+        construct_effected_in_topological_order, construct_topological_ordering,
+    },
     view, warn_spaced,
 };
 use app::App;
@@ -33,11 +35,80 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
+/// Extract view dependencies from SQL and return them in topological order.
+/// Returns None if dependencies cannot be determined or a cycle is detected.
+fn order_views_by_dependencies(views: &[Arc<View>]) -> Option<Vec<Arc<View>>> {
+    let deps_result = views
+        .iter()
+        .map(|v| {
+            let statements =
+                DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {}).boxed()?;
+            let Some(statement) = statements.into_iter().next() else {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "no statements found in view {}",
+                    v.name
+                )));
+            };
+
+            let deps = view::get_dependent_table_names(&statement);
+            Ok((v.name.clone(), deps))
+        })
+        .collect::<Result<HashMap<TableReference, Vec<TableReference>>, _>>();
+
+    match deps_result {
+        Ok(deps) => {
+            // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
+            let view_names: HashSet<_> = deps.keys().cloned().collect();
+            let view_only_deps: HashMap<_, _> = deps
+                .into_iter()
+                .map(|(view, deps)| {
+                    let filtered_deps: Vec<_> = deps
+                        .into_iter()
+                        .filter(|dep| view_names.contains(dep))
+                        .collect();
+                    (view, filtered_deps)
+                })
+                .collect();
+
+            if let Some(ordered_names) = construct_topological_ordering(view_only_deps) {
+                // Return views in topological order
+                Some(
+                    ordered_names
+                        .into_iter()
+                        .filter_map(|name| {
+                            let view = views.iter().find(|v| v.name == name).cloned();
+                            if view.is_none() {
+                                tracing::warn!("View {name} returned by topological ordering but not found in views vector");
+                            }
+                            view
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                tracing::warn!(
+                    "Circular dependency detected in views. Loading views in original order."
+                );
+                None
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Unable to determine dependency order for views: {e}. Loading views in original order."
+            );
+            None
+        }
+    }
+}
+
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
         let views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
-        for view in views {
+        // Determine the dependency order for views based on their SQL dependencies
+        let views_in_dependency_order =
+            order_views_by_dependencies(&views).unwrap_or_else(|| views.clone());
+
+        for view in views_in_dependency_order {
             let runtime = Arc::clone(&self);
             let secrets = runtime.secrets();
             if let Err(e) = runtime.load_view(&view, secrets) {
@@ -287,26 +358,51 @@ impl Runtime {
 
         // Get ordering of views to load, including those unchanged but with dependencies that have changed
         // If we can't determine the order, we'll just load the views in the order they are in the app
-        let affected_views_in_order_of_dependencies = match valid_views
-            .iter()
-            .map(|v| {
-                let Some(statement) =
-                    DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {})
-                        .boxed()?.pop_front() else {
-                            return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!("no statements found in view {}", v.name)));
-                        };
+        let affected_views_in_order_of_dependencies = {
+            let deps_result = valid_views
+                .iter()
+                .map(|v| {
+                    let Some(statement) =
+                        DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {})
+                            .boxed()?
+                            .pop_front()
+                    else {
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                            "no statements found in view {}",
+                            v.name
+                        )));
+                    };
 
-                let deps = view::get_dependent_table_names(&statement);
-                Ok((v.name.clone(), deps))
-            })
-            .collect::<Result<HashMap<TableReference, Vec<TableReference>>, _>>()
-        {
-            Err(e) => {
-                tracing::warn!("Unable to determine order to update views: {e}. Will still attempt to update views.");
-                None
+                    let deps = view::get_dependent_table_names(&statement);
+                    Ok((v.name.clone(), deps))
+                })
+                .collect::<Result<HashMap<TableReference, Vec<TableReference>>, _>>();
+
+            match deps_result {
+                Err(e) => {
+                    tracing::warn!(
+                        "Unable to determine order to update views: {e}. Will still attempt to update views."
+                    );
+                    None
+                }
+                Ok(deps) => {
+                    // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
+                    let view_names: HashSet<_> = deps.keys().cloned().collect();
+                    let view_only_deps: HashMap<_, _> = deps
+                        .into_iter()
+                        .map(|(view, deps)| {
+                            let filtered_deps: Vec<_> = deps
+                                .into_iter()
+                                .filter(|dep| view_names.contains(dep))
+                                .collect();
+                            (view, filtered_deps)
+                        })
+                        .collect();
+                    construct_effected_in_topological_order(view_only_deps, &views_that_changed)
+                }
             }
-            Ok(deps) => construct_effected_in_topological_order(deps,&views_that_changed ),
-        }.unwrap_or(valid_views.iter().map(|v| v.name.clone()).collect());
+            .unwrap_or_else(|| valid_views.iter().map(|v| v.name.clone()).collect())
+        };
 
         for view_name in affected_views_in_order_of_dependencies {
             if let Some(view) = valid_views.iter().find(|v| v.name == view_name) {

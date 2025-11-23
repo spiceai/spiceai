@@ -1,3 +1,6 @@
+use crate::common::plan_node_key::PlanNodeKey;
+use crate::common::search_visitor::SearchVisitor;
+use crate::concrete;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -8,9 +11,6 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_optimizer_rules::common::plan_node_key::PlanNodeKey;
-use datafusion_optimizer_rules::common::search_visitor::SearchVisitor;
-use datafusion_optimizer_rules::concrete;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -180,9 +180,9 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::DistributeFileScanOptimizer;
-    use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::tests::create_partitioned_file;
-    use crate::datafusion::cluster::physical_plan::optimizer::distribute_file_scan::tests::{
+    use crate::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
+    use crate::physical_plan::cluster::distribute_file_scan::tests::create_partitioned_file;
+    use crate::physical_plan::cluster::distribute_file_scan::tests::{
         DEFAULT_CONFIG_OPTIONS, create_data_source_exec,
     };
     use datafusion::physical_expr::expressions::col;
@@ -203,8 +203,8 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn test_projection_pushdown() {
+    #[test]
+    fn test_projection_pushdown() {
         let files = vec![
             create_partitioned_file("file:///file4.parquet", 256_000_000, None),
             create_partitioned_file("file:///file5.parquet", 256_000_000, None),

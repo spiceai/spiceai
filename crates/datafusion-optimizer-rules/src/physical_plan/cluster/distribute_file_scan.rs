@@ -1,4 +1,4 @@
-use crate::datafusion::cluster::config::SpiceClusterConfig;
+use crate::concrete;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -13,8 +13,8 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
-use datafusion_optimizer_rules::concrete;
 use itertools::Itertools;
+use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use std::cmp::max;
 use std::sync::Arc;
 
@@ -41,8 +41,8 @@ use std::sync::Arc;
 ///     DataSourceExec: file_groups={1 group: [[wiki_a.parquet:43660370..87320740]]}, file_type=parquet
 /// ```
 ///
-/// Limits are handled by the default physical pushdown mechanism and are currently
-/// replicated per scan.
+/// If a `DataSourceExec` has a limit pushed down, then it is not split, but may be repartitioned
+/// for projections above it.
 #[derive(Debug)]
 pub struct DistributeFileScanOptimizer {}
 
@@ -226,16 +226,37 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let transformed = plan.transform_up(|plan| {
-            let maybe_file_scan = concrete!(plan, DataSourceExec)
+        let Some(spice_config) = config.extensions.get::<SpiceClusterConfig>() else {
+            return exec_err!(
+                "SpiceClusterConfig not bound. Did you forget `.with_option_extension(Arc::new(SpiceClusterConfig::default()))`?"
+            );
+        };
+
+        let transformed = plan.transform_up(|p| {
+            let maybe_file_scan = concrete!(p, DataSourceExec)
                 .and_then(|d| concrete!(d.data_source(), FileScanConfig));
 
             let Some(file_scan_config) = maybe_file_scan else {
-                return Ok(Transformed::no(plan));
+                return Ok(Transformed::no(p));
             };
 
+            // Only repartition sufficiently large LIMIT scans
+            // TODO: statistics + check upstream projections for transforms
+            match file_scan_config.limit {
+                Some(limit)
+                    if limit as u64 >= spice_config.execution.file_scan_min_repartition_limit =>
+                {
+                    return Ok(Transformed::yes(Self::with_stage_repartition(
+                        p,
+                        config.execution.target_partitions,
+                    )?));
+                }
+                Some(_) => return Ok(Transformed::no(p)),
+                None => {}
+            }
+
             let Some(new_stages) = Self::scan_to_stages(file_scan_config, config)? else {
-                return Ok(Transformed::no(plan));
+                return Ok(Transformed::no(p));
             };
 
             let exploded_scans = new_stages
@@ -276,13 +297,13 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::common::plan_node_key::PlanNodeKey;
+    use crate::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
-    use datafusion_optimizer_rules::common::plan_node_key::PlanNodeKey;
-    use datafusion_optimizer_rules::common::search_visitor::SearchVisitor;
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;
@@ -337,8 +358,8 @@ pub mod tests {
         DataSourceExec::from_data_source(fsc)
     }
 
-    #[tokio::test]
-    async fn test_respects_byte_size_setting() {
+    #[test]
+    fn test_respects_byte_size_setting() {
         let optimizer = DistributeFileScanOptimizer::new();
 
         // Default = 128MB per filegroup
@@ -383,8 +404,8 @@ pub mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_respects_max_stages() {
+    #[test]
+    fn test_respects_max_stages() {
         let optimizer = DistributeFileScanOptimizer::new();
 
         let files = (0..10000)
@@ -417,8 +438,8 @@ pub mod tests {
         assert_eq!(data_source_execs.len(), 200);
     }
 
-    #[tokio::test]
-    async fn test_small_read_bail_out() {
+    #[test]
+    fn test_small_read_bail_out() {
         let optimizer = DistributeFileScanOptimizer::new();
 
         let plan = create_data_source_exec(vec![create_partitioned_file(

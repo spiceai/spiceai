@@ -68,6 +68,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::Bench(args)) => {
             commands::bench::run(&args).await?;
         }
+        Commands::Run(TestCommands::Query(args)) => {
+            commands::query::run(&args).await?;
+        }
         Commands::Run(TestCommands::DataConsistency(args)) => {
             commands::data_consistency::run(&args).await?;
         }
@@ -93,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::Search(args)) => {
             commands::search::run(&args).await?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unsupported command"));
         }
     }
 

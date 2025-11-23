@@ -47,8 +47,15 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+
 #[cfg(feature = "duckdb")]
-use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
+use {
+    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
+    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
+    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
+    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
+};
+
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -115,6 +122,7 @@ pub struct DataFusionBuilder {
     cluster_config: Arc<ClusterConfig>,
     metrics: Option<Metrics>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -157,6 +165,7 @@ impl DataFusionBuilder {
             cluster_config: Arc::new(ClusterConfig::default()),
             metrics: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -218,6 +227,15 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -243,18 +261,23 @@ impl DataFusionBuilder {
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
             ))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         #[cfg(feature = "duckdb")]
         {
-            state = state.with_physical_optimizer_rule(
-                DuckDBIntermediateIndexMaterializationOptimizer::new(),
-            );
+            state = state
+                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
+                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
+                .with_physical_optimizer_rule(
+                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
+                );
         }
+
+        state = state
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                Arc::new(Box::new(track_bytes_processed)),
+            )));
 
         let mut state = state.build();
 
@@ -341,6 +364,7 @@ impl DataFusionBuilder {
             cpu_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
+            resource_monitor: self.resource_monitor,
             #[cfg(feature = "cluster")]
             cluster_config: self.cluster_config,
             #[cfg(feature = "cluster")]
@@ -419,7 +443,27 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
+    // If no memory limit is specified, default to 70% of total memory (container-aware)
+    let effective_memory_limit = memory_limit.or_else(|| {
+        let total_memory = crate::resource_monitor::get_total_memory();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let default_limit = (total_memory as f64 * 0.70) as u64;
+
+        tracing::debug!(
+            "No memory limit specified, defaulting to 70% of total memory: {}",
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                util::human_readable_bytes(default_limit as usize)
+            }
+        );
+        Some(default_limit)
+    });
+
+    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
         let limit = if let Ok(limit) = limit.try_into() {
             limit
         } else {
@@ -465,6 +509,8 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        #[cfg(feature = "duckdb")]
+        DuckDBLogicalExtensionPlanner::new(),
     ]
 }
 

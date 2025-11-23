@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod config;
 pub mod execution_plan;
 pub mod extension;
 pub mod schema_provider;
