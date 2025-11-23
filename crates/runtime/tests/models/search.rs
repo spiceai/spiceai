@@ -18,7 +18,6 @@ use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings}
 use crate::models::openai::get_openai_embeddings;
 #[cfg(feature = "s3_vectors")]
 use crate::models::s3_vectors::basic_vector_search_tests;
-use crate::models::s3_vectors::search::{init_vector_store_w_index_name, prepare_for_aws_tests};
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
@@ -32,12 +31,11 @@ use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
-use itertools::{Either, Itertools};
+use itertools::Itertools;
 use reqwest::header::HeaderMap;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
 use runtime::component::dataset::acceleration::Engine;
-use runtime::component::view::View;
 use runtime::config::Config;
 use serde_json::{Value, json};
 use spicepod::acceleration::Acceleration;
@@ -153,7 +151,7 @@ impl std::fmt::Display for SearchTableComponentType {
             Self::ViewUnionAll => "view_union_all",
             Self::ViewUnionAllJoin => "view_union_all_join",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -166,7 +164,7 @@ impl FromStr for SearchTableComponentType {
             "view_join" => Ok(Self::ViewJoin),
             "view_union_all" => Ok(Self::ViewUnionAll),
             "view_union_all_join" => Ok(Self::ViewUnionAllJoin),
-            _ => Err(format!("Unknown SearchTableComponentType: '{}'", s)),
+            _ => Err(format!("Unknown SearchTableComponentType: '{s}'")),
         }
     }
 }
@@ -190,8 +188,7 @@ static MEGA_SCIENCE_COLUMN_CONFIGS: LazyLock<HashMap<&str, Vec<Column>>> = LazyL
 });
 
 impl SearchSpicepodConfiguration {
-    // search.duckdb.no_vector_engine.join_view.hybrid_single_column
-    pub fn from_str(
+    pub(super) fn from_str(
         id: &str,
         column_configs: &HashMap<&str, Vec<Column>>,
     ) -> Result<Self, anyhow::Error> {
@@ -228,8 +225,8 @@ impl SearchSpicepodConfiguration {
                             "s3_vectors_index".to_string(),
                             format!(
                                 "{engine}-{}-{}-{}",
-                                table_component.replace("_", "-"),
-                                column_configuration.replace("_", "-"),
+                                table_component.replace('_', "-"),
+                                column_configuration.replace('_', "-"),
                                 rand::random::<u8>() % 11
                             ),
                         ),
@@ -282,16 +279,16 @@ pub fn build_mega_science(mut app: AppBuilder, cfg: &SearchSpicepodConfiguration
     let (ds, views) = match cfg.table_component {
         SearchTableComponentType::Dataset => {
             let mut ds = get_mega_science_dataset(Some("qs"), question.cloned(), answer.cloned());
-            ds.vectors = cfg.vector.clone();
-            ds.acceleration = cfg.acceleration.clone();
+            ds.vectors.clone_from(&cfg.vector);
+            ds.acceleration.clone_from(&cfg.acceleration);
             (ds, vec![])
         }
         SearchTableComponentType::ViewUnionAllJoin => {
             let (ds, mut views) =
                 get_mega_science_view(Some("qs"), question.cloned(), answer.cloned());
             if let Some(v) = views.last_mut() {
-                v.vectors = cfg.vector.clone();
-                v.acceleration = cfg.acceleration.clone();
+                v.vectors.clone_from(&cfg.vector);
+                v.acceleration.clone_from(&cfg.acceleration);
             }
             (ds, views)
         }

@@ -32,7 +32,7 @@ pub(super) struct SearchTable {
 
 // Enrich the `table_name` [`View`]/[`Dataset`] in the `SearchTable` with the given columns and acceleration.
 pub fn enrich_table(
-    mut t: SearchTable,
+    t: SearchTable,
     columns: Vec<Column>,
     vector: Option<VectorStore>,
     acceleration: &Acceleration,
@@ -46,14 +46,14 @@ pub fn enrich_table(
     if let Some(ds) = datasets.iter_mut().find(|ds| ds.name() == table_name) {
         ds.acceleration = Some(acceleration.clone());
         ds.columns.extend(columns.clone());
-        ds.vectors = vector.clone();
-    };
+        ds.vectors.clone_from(&vector);
+    }
 
     if let Some(v) = views.iter_mut().find(|v| v.name() == table_name) {
         v.acceleration = Some(acceleration.clone());
         v.columns.extend(columns);
         v.vectors = vector;
-    };
+    }
 
-    return (views, datasets);
+    (views, datasets)
 }
