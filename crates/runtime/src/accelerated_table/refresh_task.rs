@@ -112,6 +112,7 @@ pub struct RefreshTaskBuilder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTaskBuilder {
@@ -135,6 +136,7 @@ impl RefreshTaskBuilder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -160,6 +162,15 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> RefreshTaskBuilder {
+        self.resource_monitor = Some(monitor);
         self
     }
 
@@ -208,6 +219,7 @@ impl RefreshTaskBuilder {
                 .collect(),
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
+            resource_monitor: self.resource_monitor,
         }
     }
 }
@@ -226,6 +238,7 @@ pub struct RefreshTask {
     enabled_metrics: HashSet<String>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTask {
@@ -573,6 +586,7 @@ impl RefreshTask {
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
 
+        let resource_monitor = self.resource_monitor.clone();
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
@@ -582,6 +596,7 @@ impl RefreshTask {
                     dataset_name.to_string(),
                     notify_written_data_stat_available,
                     DataLoadTracing::new(&self.dataset_name),
+                    resource_monitor,
                 ),
                 move |(
                     mut stream,
@@ -589,6 +604,7 @@ impl RefreshTask {
                     ds_name,
                     notify_refresh_stat_available,
                     mut tracing,
+                    resource_monitor,
                 )| async move {
                     if let Some(batch) = stream.next().await {
                         match batch {
@@ -596,6 +612,12 @@ impl RefreshTask {
                                 tracing.on_new_batch_received(&batch);
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
+
+                                // Check memory usage after processing each batch
+                                if let Some(ref monitor) = resource_monitor {
+                                    monitor.check_memory_usage(&ds_name);
+                                }
+
                                 Some((
                                     Ok(batch),
                                     (
@@ -604,6 +626,7 @@ impl RefreshTask {
                                         ds_name,
                                         notify_refresh_stat_available,
                                         tracing,
+                                        resource_monitor,
                                     ),
                                 ))
                             }
@@ -615,6 +638,7 @@ impl RefreshTask {
                                     ds_name,
                                     notify_refresh_stat_available,
                                     tracing,
+                                    resource_monitor,
                                 ),
                             )),
                         }
