@@ -413,7 +413,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 #[ignore = "DuckDB caching mode needs investigation - queries return empty"]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+        "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
     ));
 
     test_request_context()
@@ -453,16 +453,23 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             }
 
             configure_test_datafusion();
+            eprintln!("TEST: Building runtime...");
             let status = Arc::new(Runtime::builder().with_app(app).build().await);
 
+            eprintln!("TEST: Loading components (DuckDB initialization)...");
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                    eprintln!("TEST: TIMEOUT waiting for datasets to load");
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
-                () = Arc::clone(&status).load_components() => {}
+                () = Arc::clone(&status).load_components() => {
+                    eprintln!("TEST: Components loaded successfully");
+                }
             }
 
+            eprintln!("TEST: Checking runtime ready...");
             runtime_ready_check(&status).await;
+            eprintln!("TEST: Runtime is ready!");
 
             // STEP 1: Query for "michael" - cache miss
             eprintln!("TEST: Step 1 - Query for 'michael' (cache miss)...");

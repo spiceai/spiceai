@@ -312,21 +312,50 @@ impl CacheRefreshHelper {
         // Arrow/MemTable has a limitation where ColumnReference sorts columns alphabetically,
         // which breaks primary key validation, so we use Overwrite mode for Arrow.
         let accelerator_type_name = std::any::type_name_of_val(accelerator.as_ref());
+        tracing::info!(
+            "Caching: Accelerator type name for dataset {}: {}",
+            dataset_name,
+            accelerator_type_name
+        );
         let insert_op = if accelerator_type_name.contains("MemTable")
             || accelerator_type_name.contains("DeletionTableProviderAdapter")
         {
             // Arrow accelerator - use Overwrite to avoid ColumnReference sorting issue
+            tracing::info!(
+                "Caching: Using InsertOp::Overwrite for Arrow accelerator (dataset={})",
+                dataset_name
+            );
             InsertOp::Overwrite
         } else {
             // DuckDB, Cayenne, or other SQL-based accelerators - use Append for upsert
+            tracing::info!(
+                "Caching: Using InsertOp::Append for SQL accelerator (dataset={})",
+                dataset_name
+            );
             InsertOp::Append
         };
 
+        tracing::info!(
+            "Caching: About to call accelerator.insert_into for dataset={}",
+            dataset_name
+        );
         let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
+        tracing::info!(
+            "Caching: insert_into returned plan for dataset={}, about to execute...",
+            dataset_name
+        );
 
         // Execute the insertion
         let task_ctx = Arc::new(TaskContext::default());
+        tracing::info!(
+            "Caching: About to collect insert plan execution for dataset={}",
+            dataset_name
+        );
         datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
+        tracing::info!(
+            "Caching: Insert plan execution COMPLETE for dataset={}",
+            dataset_name
+        );
 
         tracing::info!(
             "Caching: Successfully inserted data into accelerator for dataset {}",
@@ -343,38 +372,77 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Vec<RecordBatch>> {
-        tracing::debug!(
-            "Caching: Fetching from source on cache miss for dataset {} with {} filters, limit={:?}",
+        tracing::info!(
+            "Caching: FETCH FROM SOURCE STARTED on cache miss for dataset {} with {} filters, limit={:?}",
             dataset_name,
             filters.len(),
             limit
         );
         for (i, filter) in filters.iter().enumerate() {
-            tracing::debug!("Caching: Filter {}: {:?}", i, filter);
+            tracing::info!("Caching: Source fetch filter {}: {:?}", i, filter);
         }
 
         let ctx = SessionContext::new();
         let state = ctx.state();
 
         // Query source with same filters/limit but all columns
+        tracing::info!(
+            "Caching: About to SCAN federated source for dataset={}",
+            dataset_name
+        );
         let plan = federated.scan(&state, None, filters, limit).await?;
+        tracing::info!(
+            "Caching: Federated source SCAN successful for dataset={}, plan has {} partitions",
+            dataset_name,
+            plan.properties().output_partitioning().partition_count()
+        );
         let task_ctx = Arc::new(TaskContext::default());
 
         // Execute and collect
         let mut all_batches = Vec::new();
         for partition in 0..plan.properties().output_partitioning().partition_count() {
+            tracing::info!(
+                "Caching: Executing federated source partition {} for dataset={}",
+                partition,
+                dataset_name
+            );
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
+            tracing::info!(
+                "Caching: Federated source partition {} stream created for dataset={}, reading batches...",
+                partition,
+                dataset_name
+            );
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
+                tracing::info!(
+                    "Caching: Federated source partition {} returned batch with {} rows for dataset={}",
+                    partition,
+                    batch.num_rows(),
+                    dataset_name
+                );
                 if batch.num_rows() > 0 {
                     all_batches.push(batch);
                 }
             }
+            tracing::info!(
+                "Caching: Finished reading federated source partition {} for dataset={}",
+                partition,
+                dataset_name
+            );
         }
 
         // Store in accelerator for future queries
+        tracing::info!(
+            "Caching: About to INSERT {} batches into accelerator for dataset={}",
+            all_batches.len(),
+            dataset_name
+        );
         Self::insert_into_accelerator(Arc::clone(&accelerator), dataset_name, all_batches.clone())
             .await?;
+        tracing::info!(
+            "Caching: INSERT into accelerator COMPLETE for dataset={}",
+            dataset_name
+        );
 
         Ok(all_batches)
     }
@@ -573,11 +641,15 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        tracing::debug!(
-            "CacheAccelerationScanExec::execute dataset={}, partition={}, num_filters={}",
+        tracing::info!(
+            "CacheAccelerationScanExec::execute STARTING - dataset={}, partition={}, num_filters={}",
             self.dataset_name,
             partition,
             self.filters.len()
+        );
+        tracing::info!(
+            "CacheAccelerationScanExec::execute filters: {:?}",
+            self.filters
         );
 
         // Execute the accelerator scan
@@ -593,13 +665,33 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let ttl = self.ttl;
         let io_runtime = self.io_runtime.clone();
 
+        tracing::info!(
+            "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
+            dataset_name
+        );
+
         // Use stream::once pattern to handle cache miss like FallbackOnZeroResultsScanExec
         let cache_miss_or_stale_stream = futures::stream::once(async move {
+            tracing::info!(
+                "CacheAccelerationScanExec cache check STARTED for dataset={}",
+                dataset_name
+            );
+
             // Check if accelerator has data
+            tracing::info!(
+                "CacheAccelerationScanExec about to read FIRST BATCH from accelerator stream for dataset={}",
+                dataset_name
+            );
             if let Some(first_batch) = accelerator_stream.next().await {
+                tracing::info!(
+                    "CacheAccelerationScanExec FIRST BATCH received for dataset={}, checking result...",
+                    dataset_name
+                );
                 match first_batch {
                     Ok(batch) if batch.num_rows() > 0 => {
-                        tracing::trace!("Caching: Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
+                        tracing::info!("Caching: CACHE HIT - Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
+                        tracing::info!("Caching: CACHE HIT batch schema: {:?}", batch.schema());
+                        tracing::info!("Caching: CACHE HIT batch data (first few rows): {:?}", batch);
 
                         // Check if data is stale and trigger background refresh if needed
                         if let Some(ttl) = ttl
@@ -634,7 +726,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                     Ok(_batch) => {
                         // Empty batch (0 rows) - treat as cache miss
-                        tracing::info!("Caching: Cache miss for dataset {} - accelerator returned 0 rows, fetching from source", dataset_name);
+                        tracing::info!("Caching: CACHE MISS (0 rows) for dataset {} - accelerator returned empty batch, fetching from source", dataset_name);
 
                         // Fetch from source synchronously
                         match CacheRefreshHelper::fetch_from_source_on_miss(Arc::clone(&federated), Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
@@ -671,7 +763,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 }
             } else {
                 // Cache miss - accelerator returned no data
-                tracing::info!("Caching: Cache miss for dataset {} - fetching from source", dataset_name);
+                tracing::info!("Caching: CACHE MISS (no first batch) for dataset {} - accelerator returned None, fetching from source", dataset_name);
 
                 // Fetch from source synchronously
                 match CacheRefreshHelper::fetch_from_source_on_miss(federated, Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
