@@ -392,7 +392,8 @@ pub trait S3Vectors {
 pub mod tests {
     use core::panic;
 
-    use aws_config::{BehaviorVersion, Region};
+    use aws_config::Region;
+    use aws_sdk_credential_bridge::default_aws_config;
     use aws_sdk_s3vectors::{
         error::SdkError,
         types::{PutInputVector, VectorData},
@@ -402,7 +403,7 @@ pub mod tests {
     #[allow(clippy::too_many_lines)]
     #[ignore = "reason unknown"]
     async fn test_s3_vectors() -> Result<(), String> {
-        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        let config = default_aws_config().load().await;
         let mut config_builder = config.into_builder();
         config_builder.set_region(Region::from_static("us-east-2"));
         let config = config_builder.build();

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod credential_provider;
+pub mod user_agent;
 use std::{sync::Arc, time::Duration};
 
 use aws_config::{BehaviorVersion, SdkConfig};
@@ -67,9 +68,20 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// This is a convenience function to ensure all AWS SDK configuration uses
 /// the same behavior version consistently across the codebase.
+///
+/// # Panics
+///
+/// Panics if the Spice user agent string cannot be converted to a valid AWS SDK app name.
+/// This should never happen in practice as the user agent is a static, well-formed string.
 #[must_use]
 pub fn default_aws_config() -> aws_config::ConfigLoader {
-    aws_config::defaults(BehaviorVersion::v2025_08_07())
+    let user_agent = user_agent::user_agent();
+    let app_name = aws_config::AppName::new(user_agent).unwrap_or_else(|e| {
+        tracing::error!("Failed to create AWS app name from user agent '{user_agent}': {e}");
+        panic!("Invalid AWS app name: {e}");
+    });
+
+    aws_config::defaults(BehaviorVersion::v2025_08_07()).app_name(app_name)
 }
 
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();

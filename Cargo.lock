@@ -13787,6 +13787,7 @@ version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-sdk-credential-bridge",
  "aws-sdk-s3vectors",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
