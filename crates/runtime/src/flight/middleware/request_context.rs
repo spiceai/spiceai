@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use crate::{
-    datafusion::{DataFusion, flight_session_extension::FlightSessionExtension, request_context_extension::DataFusionContextExtension},
+    datafusion::{
+        DataFusion, flight_session_extension::FlightSessionExtension,
+        request_context_extension::DataFusionContextExtension,
+    },
     flight::SessionStore,
     model::ModelContextExtension,
     secrets,
@@ -52,7 +55,12 @@ impl RequestContextLayer {
         session_store: SessionStore,
         secrets: Arc<RwLock<secrets::Secrets>>,
     ) -> Self {
-        Self { app, df, session_store, secrets }
+        Self {
+            app,
+            df,
+            session_store,
+            secrets,
+        }
     }
 }
 
@@ -99,25 +107,25 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         let headers = req.headers();
-        
+
         // Try to get or create a session for this request
-        let session_ext = self.session_store.get_or_create_session_from_http(
-            req.headers(),
-            &self.df.ctx,
-        ).map(FlightSessionExtension::new);
-        
+        let session_ext = self
+            .session_store
+            .get_or_create_session_from_http(req.headers(), &self.df.ctx)
+            .map(FlightSessionExtension::new);
+
         let mut builder = RequestContext::builder(Protocol::Flight)
             .with_app_opt(self.app.clone())
             .with_extension(DataFusionContextExtension::new(Arc::clone(&self.df)))
             .with_extension(ModelContextExtension::new())
             .with_extension(AppContextExtension::new(self.app.clone()))
             .with_extension(SecretsContextExtension::new(Arc::clone(&self.secrets)));
-        
+
         // Add session extension if we have one
         if let Some(session_ext) = session_ext {
             builder = builder.with_extension(session_ext);
         }
-        
+
         let request_context = Arc::new(builder.from_headers(headers).build());
 
         req.extensions_mut()
