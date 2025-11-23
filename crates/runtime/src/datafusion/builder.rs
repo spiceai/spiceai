@@ -122,6 +122,7 @@ pub struct DataFusionBuilder {
     cluster_config: Arc<ClusterConfig>,
     metrics: Option<Metrics>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -164,6 +165,7 @@ impl DataFusionBuilder {
             cluster_config: Arc::new(ClusterConfig::default()),
             metrics: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -222,6 +224,15 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
         self
     }
 
@@ -353,6 +364,7 @@ impl DataFusionBuilder {
             cpu_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
+            resource_monitor: self.resource_monitor,
             #[cfg(feature = "cluster")]
             cluster_config: self.cluster_config,
             #[cfg(feature = "cluster")]
@@ -431,7 +443,27 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
+    // If no memory limit is specified, default to 70% of total memory (container-aware)
+    let effective_memory_limit = memory_limit.or_else(|| {
+        let total_memory = crate::resource_monitor::get_total_memory();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let default_limit = (total_memory as f64 * 0.70) as u64;
+
+        tracing::debug!(
+            "No memory limit specified, defaulting to 70% of total memory: {}",
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                util::human_readable_bytes(default_limit as usize)
+            }
+        );
+        Some(default_limit)
+    });
+
+    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
         let limit = if let Ok(limit) = limit.try_into() {
             limit
         } else {
