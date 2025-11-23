@@ -1972,7 +1972,10 @@ mod tests {
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
-        assert_eq!(*schema.field(4).data_type(), DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None));
+        assert_eq!(
+            *schema.field(4).data_type(),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
+        );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
