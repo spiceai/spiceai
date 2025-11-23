@@ -206,6 +206,9 @@ impl RuntimeBuilder {
 
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
+        // Create resource monitor early so it can be passed to DataFusion
+        let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -216,7 +219,8 @@ impl RuntimeBuilder {
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
         .with_caching(caching)
-        .with_metrics(metrics);
+        .with_metrics(metrics)
+        .with_resource_monitor(resource_monitor.clone());
 
         #[cfg(feature = "cluster")]
         {
@@ -283,6 +287,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };
 

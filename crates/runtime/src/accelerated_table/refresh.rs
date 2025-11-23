@@ -442,6 +442,7 @@ pub struct Refresher {
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -489,6 +490,7 @@ impl Refresher {
             metrics: None,
             cpu_runtime,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -560,6 +562,14 @@ impl Refresher {
     #[must_use]
     pub fn initial_load_completed(&self) -> bool {
         self.initial_load_completed.load(Ordering::Relaxed)
+    }
+
+    pub fn with_resource_monitor(
+        &mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> &mut Self {
+        self.resource_monitor = Some(monitor);
+        self
     }
 
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
@@ -641,6 +651,11 @@ impl Refresher {
         refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
 
         refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
+
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            refresh_task_runner =
+                refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
 
         let mut refresh_task_runner = refresh_task_runner.build();
 

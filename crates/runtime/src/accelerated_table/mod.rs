@@ -281,6 +281,7 @@ pub struct Builder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl Builder {
@@ -317,6 +318,7 @@ impl Builder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -362,6 +364,14 @@ impl Builder {
 
     pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    pub fn with_resource_monitor(
+        &mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> &mut Self {
+        self.resource_monitor = Some(monitor);
         self
     }
 
@@ -552,6 +562,10 @@ impl Builder {
             refresher.semaphore(semaphore);
         }
         refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
+
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            refresher.with_resource_monitor(resource_monitor.clone());
+        }
 
         let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
         let refresher = Arc::new(refresher);
@@ -764,7 +778,7 @@ impl TableProvider for AcceleratedTable {
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
+        let plan: Arc<dyn ExecutionPlan> = match &self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
             ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
