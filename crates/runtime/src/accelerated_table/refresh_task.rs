@@ -1254,36 +1254,65 @@ impl RefreshTask {
 struct DataLoadTracing {
     dataset: TableReference,
     num_records_received: usize,
+    bytes_received: usize,
+    start_time: Instant,
     last_updated_time: Instant,
     log_interval: Duration,
 }
 
 impl DataLoadTracing {
     fn new(dataset: &TableReference) -> Self {
+        let now = Instant::now();
         Self {
             dataset: dataset.clone(),
             num_records_received: 0,
-            last_updated_time: Instant::now(),
+            bytes_received: 0,
+            start_time: now,
+            last_updated_time: now,
             log_interval: Duration::from_secs(10),
         }
     }
 
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
+        let batch_size = batch.get_array_memory_size();
+
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
+        self.bytes_received += batch_size;
 
-        // trace num loaded records and reset every 10 seconds
+        // Log progress every 10 seconds showing cumulative stats
         if self.last_updated_time.elapsed() > self.log_interval {
             let pretty_records = util::pretty_print_number(self.num_records_received);
+            let elapsed = self.start_time.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+
+            // Calculate throughput
+            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_sign_loss)]
+            let throughput = if elapsed_secs > 0.0 {
+                let bytes_per_sec = (self.bytes_received as f64 / elapsed_secs) as usize;
+                format!("{}/s", util::human_readable_bytes(bytes_per_sec))
+            } else {
+                "calculating...".to_string()
+            };
+
+            let size = util::human_readable_bytes(self.bytes_received);
+            let elapsed_str = format!("{}s", elapsed.as_secs());
 
             if is_spice_internal_dataset(&self.dataset) {
-                tracing::debug!("Dataset {} received {pretty_records} records", self.dataset);
+                tracing::debug!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             } else {
-                tracing::info!("Dataset {} received {pretty_records} records", self.dataset);
+                tracing::info!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             }
 
-            self.num_records_received = 0;
             self.last_updated_time = Instant::now();
         }
     }
@@ -1443,5 +1472,40 @@ fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_data_load_tracing_tracks_bytes_and_rows() {
+        let dataset = TableReference::bare("test_dataset");
+        let mut tracing = DataLoadTracing::new(&dataset);
+
+        // Create a test batch
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
+
+        let batch_size = batch.get_array_memory_size();
+        let num_rows = batch.num_rows();
+
+        // Process the batch
+        tracing.on_new_batch_received(&batch);
+
+        // Verify state
+        assert_eq!(tracing.num_records_received, num_rows);
+        assert_eq!(tracing.bytes_received, batch_size);
+        assert!(tracing.bytes_received > 0);
     }
 }
