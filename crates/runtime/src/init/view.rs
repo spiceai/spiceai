@@ -35,78 +35,78 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
+/// Represents a validated view with its parsed dependencies
+pub(crate) struct ValidatedView {
+    pub(crate) view: Arc<View>,
+    pub(crate) dependencies: Vec<TableReference>,
+}
+
 /// Extract view dependencies from SQL and return them in topological order.
-/// Returns None if dependencies cannot be determined or a cycle is detected.
-fn order_views_by_dependencies(views: &[Arc<View>]) -> Option<Vec<Arc<View>>> {
-    let deps_result = views
+/// Returns None if a cycle is detected.
+fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<Arc<View>>> {
+    if validated_views.is_empty() {
+        return None;
+    }
+
+    // Build dependency map
+    let deps_map: HashMap<TableReference, Vec<TableReference>> = validated_views
         .iter()
-        .map(|v| {
-            let statements =
-                DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {}).boxed()?;
-            let Some(statement) = statements.into_iter().next() else {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "no statements found in view {}",
-                    v.name
-                )));
-            };
+        .map(|vv| (vv.view.name.clone(), vv.dependencies.clone()))
+        .collect();
 
-            let deps = view::get_dependent_table_names(&statement);
-            Ok((v.name.clone(), deps))
-        })
-        .collect::<Result<HashMap<TableReference, Vec<TableReference>>, _>>();
-
-    match deps_result {
-        Ok(deps) => {
-            // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
-            let view_names: HashSet<_> = deps.keys().cloned().collect();
-            let view_only_deps: HashMap<_, _> = deps
+    // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
+    let view_names: HashSet<_> = deps_map.keys().cloned().collect();
+    let view_only_deps: HashMap<_, _> = deps_map
+        .into_iter()
+        .map(|(view, deps)| {
+            let filtered_deps: Vec<_> = deps
                 .into_iter()
-                .map(|(view, deps)| {
-                    let filtered_deps: Vec<_> = deps
-                        .into_iter()
-                        .filter(|dep| view_names.contains(dep))
-                        .collect();
-                    (view, filtered_deps)
-                })
+                .filter(|dep| view_names.contains(dep))
                 .collect();
+            (view, filtered_deps)
+        })
+        .collect();
 
-            if let Some(ordered_names) = construct_topological_ordering(view_only_deps) {
-                // Return views in topological order
-                Some(
-                    ordered_names
-                        .into_iter()
-                        .filter_map(|name| {
-                            let view = views.iter().find(|v| v.name == name).cloned();
-                            if view.is_none() {
-                                tracing::warn!("View {name} returned by topological ordering but not found in views vector");
-                            }
-                            view
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                tracing::warn!(
-                    "Circular dependency detected in views. Loading views in original order."
-                );
-                None
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Unable to determine dependency order for views: {e}. Loading views in original order."
-            );
-            None
-        }
+    if let Some(ordered_names) = construct_topological_ordering(view_only_deps) {
+        // Return views in topological order
+        Some(
+            ordered_names
+                .into_iter()
+                .filter_map(|name| {
+                    let view = validated_views
+                        .iter()
+                        .find(|vv| vv.view.name == name)
+                        .map(|vv| Arc::clone(&vv.view));
+                    if view.is_none() {
+                        tracing::warn!("View {name} returned by topological ordering but not found in views vector");
+                    }
+                    view
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        tracing::warn!("Circular dependency detected in views. Loading views in original order.");
+        Some(
+            validated_views
+                .iter()
+                .map(|vv| Arc::clone(&vv.view))
+                .collect(),
+        )
     }
 }
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
-        let views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
 
         // Determine the dependency order for views based on their SQL dependencies
-        let views_in_dependency_order =
-            order_views_by_dependencies(&views).unwrap_or_else(|| views.clone());
+        let views_in_dependency_order = order_views_by_dependencies(&validated_views)
+            .unwrap_or_else(|| {
+                validated_views
+                    .iter()
+                    .map(|vv| Arc::clone(&vv.view))
+                    .collect()
+            });
 
         for view in views_in_dependency_order {
             let runtime = Arc::clone(&self);
@@ -118,15 +118,17 @@ impl Runtime {
         }
     }
 
-    /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
+    /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.
+    /// Skips any that fail to parse and logs an error for them.
     pub(crate) fn get_valid_views(
         self: Arc<Self>,
         app: &Arc<App>,
         log_errors: LogErrors,
-    ) -> Vec<Arc<View>> {
+    ) -> Vec<ValidatedView> {
         let rt_ref = Arc::clone(&self);
+        let status = Arc::clone(&self.status);
 
-        let datasets = self
+        let datasets = Arc::clone(&self)
             .get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())
@@ -151,10 +153,74 @@ impl Runtime {
                                 "View name is already in use by a dataset."
                             );
                         }
-                        None
-                    } else {
-                        Some(Arc::new(view))
+                        return None;
                     }
+
+                    // Validate SQL and extract dependencies in a single parse
+                    let sql = view.sql.as_ref();
+                    let statements = match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+                        Ok(stmts) => stmts,
+                        Err(e) => {
+                            if log_errors.0 {
+                                metrics::views::LOAD_ERROR.add(1, &[]);
+                                tracing::error!("View '{}' has invalid SQL: {}", view.name, e);
+                                status.update_view(&view.name, status::ComponentStatus::Error);
+                            }
+                            return None;
+                        }
+                    };
+
+                    if statements.is_empty() {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!("View '{}' has empty SQL statement", view.name);
+                            status.update_view(&view.name, status::ComponentStatus::Error);
+                        }
+                        return None;
+                    }
+
+                    if statements.len() > 1 {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View '{}' contains multiple SQL statements. Only one SELECT statement is allowed per view",
+                                view.name
+                            );
+                            status.update_view(&view.name, status::ComponentStatus::Error);
+                        }
+                        return None;
+                    }
+
+                    let statement = statements.into_iter().next()?;
+
+                    // Validate it's a SELECT statement (views should only contain queries)
+                    // DataFusion's Statement enum wraps sqlparser statements
+                    let is_query = match &statement {
+                        datafusion::sql::parser::Statement::Statement(boxed_stmt) => {
+                            matches!(**boxed_stmt, datafusion::sql::sqlparser::ast::Statement::Query(_))
+                        }
+                        _ => false,
+                    };
+
+                    if !is_query {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View '{}' must contain a SELECT query",
+                                view.name
+                            );
+                            status.update_view(&view.name, status::ComponentStatus::Error);
+                        }
+                        return None;
+                    }
+
+                    // Extract dependencies from the validated statement
+                    let dependencies = view::get_dependent_table_names(&statement);
+
+                    Some(ValidatedView {
+                        view: Arc::new(view),
+                        dependencies,
+                    })
                 }
                 Err(e) => {
                     if log_errors.0 {
@@ -170,10 +236,11 @@ impl Runtime {
     /// Initialize views configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `DuckDB`).
-    pub(crate) async fn initialize_views_accelerators(&self, views: &[Arc<View>]) {
+    pub(crate) async fn initialize_views_accelerators(&self, views: &[ValidatedView]) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        for view in views {
+        for validated_view in views {
+            let view = &validated_view.view;
             // Non-accelerated views or disabled acceleration don't need initialization
             if view.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
                 continue;
@@ -227,9 +294,10 @@ impl Runtime {
     ) -> Vec<Arc<View>> {
         let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
         futures::stream::iter(valid_views)
-            .filter_map(|view| async move {
+            .filter_map(|validated_view| async move {
+                let view = &validated_view.view;
                 match (view.is_accelerated(), view.is_accelerator_initialized().await) {
-                    (true, true) | (false, _) => Some(Arc::clone(&view)),
+                    (true, true) | (false, _) => Some(Arc::clone(view)),
                     (true, false) => {
                         if log_errors.0 {
                             metrics::views::LOAD_ERROR.add(1, &[]);
@@ -321,21 +389,25 @@ impl Runtime {
         current_app: &Arc<App>,
         new_app: &Arc<App>,
     ) {
-        let valid_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
-        let existing_views = Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
+        let validated_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
+        let existing_validated_views =
+            Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
 
-        let views_that_changed = valid_views
+        let views_that_changed = validated_views
             .iter()
-            .filter_map(|v| {
-                match existing_views.iter().find(|vv| v.name == vv.name) {
-                    Some(old_v) => {
-                        if old_v == v {
+            .filter_map(|vv| {
+                match existing_validated_views
+                    .iter()
+                    .find(|evv| vv.view.name == evv.view.name)
+                {
+                    Some(old_vv) => {
+                        if old_vv.view == vv.view {
                             None // No change, don't include
                         } else {
-                            Some(v.name.clone()) // Changed, include the name
+                            Some(vv.view.name.clone()) // Changed, include the name
                         }
                     }
-                    None => Some(v.name.clone()), // New view, include the name
+                    None => Some(vv.view.name.clone()), // New view, include the name
                 }
             })
             .collect_vec();
@@ -359,63 +431,53 @@ impl Runtime {
         // Get ordering of views to load, including those unchanged but with dependencies that have changed
         // If we can't determine the order, we'll just load the views in the order they are in the app
         let affected_views_in_order_of_dependencies = {
-            let deps_result = valid_views
+            // Build dependency map from already-parsed dependencies
+            let view_names: HashSet<_> = validated_views
                 .iter()
-                .map(|v| {
-                    let Some(statement) =
-                        DFParser::parse_sql_with_dialect(v.sql.as_ref(), &PostgreSqlDialect {})
-                            .boxed()?
-                            .pop_front()
-                    else {
-                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                            "no statements found in view {}",
-                            v.name
-                        )));
-                    };
+                .map(|vv| vv.view.name.clone())
+                .collect();
 
-                    let deps = view::get_dependent_table_names(&statement);
-                    Ok((v.name.clone(), deps))
-                })
-                .collect::<Result<HashMap<TableReference, Vec<TableReference>>, _>>();
-
-            match deps_result {
-                Err(e) => {
-                    tracing::warn!(
-                        "Unable to determine order to update views: {e}. Will still attempt to update views."
-                    );
-                    None
-                }
-                Ok(deps) => {
-                    // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
-                    let view_names: HashSet<_> = deps.keys().cloned().collect();
-                    let view_only_deps: HashMap<_, _> = deps
-                        .into_iter()
-                        .map(|(view, deps)| {
-                            let filtered_deps: Vec<_> = deps
-                                .into_iter()
-                                .filter(|dep| view_names.contains(dep))
-                                .collect();
-                            (view, filtered_deps)
-                        })
+            // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
+            let view_only_deps: HashMap<_, _> = validated_views
+                .iter()
+                .map(|vv| {
+                    let filtered_deps: Vec<_> = vv
+                        .dependencies
+                        .iter()
+                        .filter(|dep| view_names.contains(dep))
+                        .cloned()
                         .collect();
-                    construct_effected_in_topological_order(view_only_deps, &views_that_changed)
-                }
-            }
-            .unwrap_or_else(|| valid_views.iter().map(|v| v.name.clone()).collect())
+                    (vv.view.name.clone(), filtered_deps)
+                })
+                .collect();
+
+            construct_effected_in_topological_order(view_only_deps, &views_that_changed)
+                .unwrap_or_else(|| {
+                    validated_views
+                        .iter()
+                        .map(|vv| vv.view.name.clone())
+                        .collect()
+                })
         };
 
         for view_name in affected_views_in_order_of_dependencies {
-            if let Some(view) = valid_views.iter().find(|v| v.name == view_name) {
+            if let Some(validated_view) =
+                validated_views.iter().find(|vv| vv.view.name == view_name)
+            {
                 let runtime = Arc::clone(&self);
-                if existing_views.iter().any(|v| v.name == view.name) {
+                if existing_validated_views
+                    .iter()
+                    .any(|evv| evv.view.name == validated_view.view.name)
+                {
                     // Update view even if unchanged, as it may have dependencies that have changed
-                    runtime.update_view(view).await;
+                    runtime.update_view(&validated_view.view).await;
                 } else {
-                    runtime
-                        .status
-                        .update_view(&view.name, status::ComponentStatus::Initializing);
+                    runtime.status.update_view(
+                        &validated_view.view.name,
+                        status::ComponentStatus::Initializing,
+                    );
                     let secrets = runtime.secrets();
-                    let _ = runtime.load_view(view, secrets);
+                    let _ = runtime.load_view(&validated_view.view, secrets);
                 }
             }
         }
