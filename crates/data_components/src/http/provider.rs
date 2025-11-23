@@ -784,6 +784,11 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
     ) -> Result<String> {
+        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
+        if self.acceleration_enabled {
+            return self.fetch_and_cache(path, query, body).await;
+        }
+
         let cache_key = Self::get_cache_key(path, query, body);
 
         // Try to get from cache
@@ -1957,19 +1962,22 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
         assert_eq!(schema.field(3).name(), "content");
+        assert_eq!(schema.field(4).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(4).data_type(), DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None));
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
+        assert!(schema.field(4).is_nullable()); // fetched_at is nullable
     }
 
     #[test]

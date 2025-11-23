@@ -306,33 +306,28 @@ impl CacheRefreshHelper {
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
 
-        // Determine insert operation based on accelerator type
-        // DuckDB and Cayenne accelerators support upsert-based multi-filter caching via InsertOp::Append
-        // with primary key constraints on metadata columns (request_path, request_query, request_body).
-        // Arrow/MemTable has a limitation where ColumnReference sorts columns alphabetically,
-        // which breaks primary key validation, so we use Overwrite mode for Arrow.
-        let accelerator_type_name = std::any::type_name_of_val(accelerator.as_ref());
-        tracing::info!(
-            "Caching: Accelerator type name for dataset {}: {}",
-            dataset_name,
-            accelerator_type_name
-        );
-        let insert_op = if accelerator_type_name.contains("MemTable")
-            || accelerator_type_name.contains("DeletionTableProviderAdapter")
-        {
-            // Arrow accelerator - use Overwrite to avoid ColumnReference sorting issue
+        // Determine insert operation based on accelerator capabilities
+        // SQL-based accelerators (DuckDB, Cayenne, etc.) support upsert via InsertOp::Append with ON CONFLICT
+        // Arrow/MemTable doesn't have constraints or ON CONFLICT support, so it must use InsertOp::Replace
+        // We detect this by checking if the schema has primary key constraints defined
+        let accelerator_schema = accelerator.schema();
+        let has_constraints = !accelerator_schema.metadata().is_empty() 
+            && accelerator_schema.metadata().contains_key("primary_key");
+        
+        let insert_op = if has_constraints {
+            // SQL accelerator with constraints - use Append for upsert
             tracing::info!(
-                "Caching: Using InsertOp::Overwrite for Arrow accelerator (dataset={})",
-                dataset_name
-            );
-            InsertOp::Overwrite
-        } else {
-            // DuckDB, Cayenne, or other SQL-based accelerators - use Append for upsert
-            tracing::info!(
-                "Caching: Using InsertOp::Append for SQL accelerator (dataset={})",
+                "Caching: Using InsertOp::Append for SQL accelerator with constraints (dataset={})",
                 dataset_name
             );
             InsertOp::Append
+        } else {
+            // Arrow accelerator without constraints - use Replace
+            tracing::info!(
+                "Caching: Using InsertOp::Replace for Arrow accelerator (dataset={})",
+                dataset_name
+            );
+            InsertOp::Replace
         };
 
         tracing::info!(
@@ -351,7 +346,7 @@ impl CacheRefreshHelper {
             "Caching: About to collect insert plan execution for dataset={}",
             dataset_name
         );
-        datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
+        let result = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
         tracing::info!(
             "Caching: Insert plan execution COMPLETE for dataset={}",
             dataset_name
@@ -641,17 +636,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        tracing::info!(
-            "CacheAccelerationScanExec::execute STARTING - dataset={}, partition={}, num_filters={}",
-            self.dataset_name,
-            partition,
-            self.filters.len()
-        );
-        tracing::info!(
-            "CacheAccelerationScanExec::execute filters: {:?}",
-            self.filters
-        );
-
         // Execute the accelerator scan
         let mut accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
         let schema = accelerator_stream.schema();
@@ -683,35 +667,31 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 dataset_name
             );
             if let Some(first_batch) = accelerator_stream.next().await {
-                tracing::info!(
-                    "CacheAccelerationScanExec FIRST BATCH received for dataset={}, checking result...",
-                    dataset_name
-                );
                 match first_batch {
                     Ok(batch) if batch.num_rows() > 0 => {
-                        tracing::info!("Caching: CACHE HIT - Accelerator returned data for dataset {}: {} rows", dataset_name, batch.num_rows());
-                        tracing::info!("Caching: CACHE HIT batch schema: {:?}", batch.schema());
-                        tracing::info!("Caching: CACHE HIT batch data (first few rows): {:?}", batch);
-
                         // Check if data is stale and trigger background refresh if needed
                         if let Some(ttl) = ttl
                             && is_data_stale(&batch, ttl).unwrap_or(false) {
-                                tracing::debug!("Caching: Data is stale for dataset {}, triggering background refresh", dataset_name);
-
                                 let federated_clone = Arc::clone(&federated);
                                 let accelerator_clone = Arc::clone(&accelerator);
                                 let dataset_name_clone = dataset_name.clone();
                                 let filters_clone = filters.clone();
 
                                 io_runtime.spawn(async move {
-                                    if let Err(e) = CacheRefreshHelper::refresh_from_source(
+                                    tracing::info!("Caching: Background refresh task STARTED for dataset {}", dataset_name_clone);
+                                    match CacheRefreshHelper::refresh_from_source(
                                         federated_clone,
                                         accelerator_clone,
                                         &dataset_name_clone,
                                         &filters_clone,
                                         limit,
                                     ).await {
-                                        tracing::error!("Caching: Background refresh failed for dataset {}: {}", dataset_name_clone, e);
+                                        Ok(rows) => {
+                                            tracing::info!("Caching: Background refresh task COMPLETED for dataset {}, refreshed {} rows", dataset_name_clone, rows);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Caching: Background refresh failed for dataset {}: {}", dataset_name_clone, e);
+                                        }
                                     }
                                 });
                             }

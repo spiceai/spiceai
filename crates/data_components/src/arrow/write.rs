@@ -934,6 +934,11 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
+        //
+        // For InsertOp::Replace, we allow duplicate primary keys in new data because the operation will:
+        // 1. Remove all existing rows matching ANY of the new primary keys
+        // 2. Insert all new rows (even if they share primary keys)
+        // This is essential for caching scenarios where multiple result rows share the same request metadata.
         let mut new_key_set: HashSet<
             String,
             std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
@@ -941,9 +946,26 @@ impl DataSink for MemSink {
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
-            new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
-            >(&new_primary_key_ids, None)?;
+            
+            // For InsertOp::Replace, we don't require unique primary keys in new data
+            // because we'll remove all existing rows with these keys before inserting
+            if matches!(self.overwrite, InsertOp::Replace) {
+                // Just collect unique keys and check for nulls, don't enforce uniqueness
+                for id in &new_primary_key_ids {
+                    if let Some(key) = id {
+                        new_key_set.insert(key.to_string());
+                    } else {
+                        return Err(DataFusionError::Execution(
+                            "Primary key values cannot be null".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                // For Append/Overwrite, require unique primary keys
+                new_key_set = check_and_filter_non_null_unique_primary_keys::<
+                    std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+                >(&new_primary_key_ids, None)?;
+            }
         }
 
         let mut writable_targets: Vec<_> =

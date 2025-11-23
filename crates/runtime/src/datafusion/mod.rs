@@ -989,16 +989,11 @@ impl DataFusion {
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
 
         // Determine if we should pass constraints to the accelerator
-        // Only pass constraints if:
-        // 1. Not using refresh_sql (schema might have different column ordering)
-        // 2. Not using Arrow/MemTable with caching mode (ColumnReference sorting limitation)
+        // Only pass constraints if not using refresh_sql (schema might have different column ordering)
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
-        // For caching mode with Arrow: constraints cause "Primary key values must be unique" error
-        //   due to ColumnReference sorting in datafusion-table-providers
-        let use_constraints = refresh_sql.is_none()
-            && !(matches!(refresh_mode, RefreshMode::Caching)
-                && acceleration_settings.engine == Engine::Arrow);
+        // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
+        let use_constraints = refresh_sql.is_none();
 
         let constraints = if use_constraints {
             match &*source_table_provider {
@@ -1134,6 +1129,13 @@ impl DataFusion {
         accelerated_table_builder.ready_state(dataset.ready_state);
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
+
+        // For caching mode, set the TTL from refresh_check_interval
+        if refresh_mode == RefreshMode::Caching {
+            if let Some(check_interval) = acceleration_settings.refresh_check_interval {
+                accelerated_table_builder.caching_ttl(Some(check_interval));
+            }
+        }
 
         if acceleration_settings.snapshots.create_enabled()
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
