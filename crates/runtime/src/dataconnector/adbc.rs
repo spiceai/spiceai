@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use adbc_core::options::{AdbcVersion, OptionDatabase};
+use adbc_core::{Driver, LOAD_FLAG_DEFAULT};
+use adbc_driver_manager::ManagedDriver;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
-use adbc_core::{Driver, LOAD_FLAG_DEFAULT};
-use adbc_core::options::{AdbcVersion, OptionDatabase};
-use adbc_driver_manager::ManagedDriver;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -40,14 +40,10 @@ pub enum Error {
     MissingAdbcDriver,
 
     #[snafu(display("Failed to load ADBC driver: {source}"))]
-    UnableToLoadDriver {
-        source: adbc_core::error::Error,
-    },
+    UnableToLoadDriver { source: adbc_core::error::Error },
 
     #[snafu(display("Failed to create ADBC database: {source}"))]
-    UnableToCreateDatabase {
-        source: adbc_core::error::Error,
-    },
+    UnableToCreateDatabase { source: adbc_core::error::Error },
 
     #[snafu(display("Failed to create ADBC connection pool: {source}"))]
     UnableToCreateConnectionPool {
@@ -112,12 +108,10 @@ impl DataConnectorFactory for AdbcFactory {
                 .get("adbc_driver")
                 .expose()
                 .context(MissingAdbcDriverSnafu)
-                .map_err(|e| {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "adbc".to_string(),
-                        connector_component: params.component.clone(),
-                        source: Box::new(e),
-                    }
+                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: params.component.clone(),
+                    source: Box::new(e),
                 })?;
 
             let driver_path = params.parameters.get("adbc_driver_path").expose().ok();
@@ -143,7 +137,10 @@ impl DataConnectorFactory for AdbcFactory {
 
             // Allow passing through any other parameters as database options
             for (key, value) in params.parameters.iter() {
-                if !key.starts_with("adbc_") && key != "connection_pool_size" && key != "connection_pool_min_idle" {
+                if !key.starts_with("adbc_")
+                    && key != "connection_pool_size"
+                    && key != "connection_pool_min_idle"
+                {
                     db_options.push((
                         OptionDatabase::Other(key.to_string()),
                         value.expose_secret().into(),
@@ -161,7 +158,7 @@ impl DataConnectorFactory for AdbcFactory {
                 })?;
 
             let mut conn_options: HashMap<String, String> = HashMap::new();
-            
+
             // Extract connection-specific options if needed
             for (key, value) in params.parameters.iter() {
                 if key.starts_with("conn_") {
@@ -271,7 +268,7 @@ mod tests {
     fn test_factory_parameters() {
         let factory = AdbcFactory::new();
         let params = factory.parameters();
-        
+
         // Verify all expected parameters are present
         let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
         assert!(param_names.contains(&"adbc_driver"));
@@ -295,10 +292,13 @@ mod tests {
 
         let result = factory.create(params).await;
         assert!(result.is_err());
-        
+
         if let Err(e) = result {
             let err_msg = e.to_string();
-            assert!(err_msg.contains("adbc_driver"), "Error should mention missing adbc_driver parameter");
+            assert!(
+                err_msg.contains("adbc_driver"),
+                "Error should mention missing adbc_driver parameter"
+            );
         }
     }
 
@@ -309,7 +309,7 @@ mod tests {
         let params = create_test_params("sqlite", ":memory:");
 
         let result = factory.create(params).await;
-        
+
         // This may fail if the ADBC SQLite driver is not installed
         // but the test verifies the connector construction logic works
         match result {
@@ -320,7 +320,9 @@ mod tests {
                 // Expected failure if driver not available
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("load") || err_msg.contains("driver") || err_msg.contains("connect"),
+                    err_msg.contains("load")
+                        || err_msg.contains("driver")
+                        || err_msg.contains("connect"),
                     "Error should be related to driver loading or connection: {err_msg}"
                 );
             }
@@ -337,8 +339,7 @@ mod tests {
         params_map.insert("custom_option".to_string(), "value".to_string());
         params_map.insert("conn_timeout".to_string(), "30".to_string());
 
-        let params = crate::parameters::Parameters::try_new(params_map)
-            .expect("valid parameters");
+        let params = crate::parameters::Parameters::try_new(params_map).expect("valid parameters");
 
         // Verify parameters can be retrieved
         assert_eq!(params.get("adbc_driver").expose().ok(), Some("sqlite"));
@@ -362,26 +363,26 @@ mod tests {
                     None,
                 )
                 .ok()
-                .and_then(|mut d| d.new_database_with_opts(vec![(OptionDatabase::Uri, ":memory:".into())]).ok())
+                .and_then(|mut d| {
+                    d.new_database_with_opts(vec![(OptionDatabase::Uri, ":memory:".into())])
+                        .ok()
+                })
                 .expect("test database"),
                 None,
             )
             .expect("test pool"),
         );
-        
+
         let adbc_factory = AdbcTableFactory::new(pool);
         let connector = Adbc { adbc_factory };
-        
+
         assert!(connector.as_any().is::<Adbc>());
     }
 
     #[test]
     fn test_error_display() {
         let err = Error::MissingAdbcDriver;
-        assert_eq!(
-            err.to_string(),
-            "Missing required parameter: adbc_driver"
-        );
+        assert_eq!(err.to_string(), "Missing required parameter: adbc_driver");
 
         // Test that error can be converted to Box<dyn Error>
         let _boxed: Box<dyn std::error::Error> = Box::new(err);
