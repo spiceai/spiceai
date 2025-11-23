@@ -58,6 +58,8 @@ use std::future::Future;
 pub mod listing;
 
 pub mod abfs;
+#[cfg(feature = "adbc")]
+pub mod adbc;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
@@ -378,6 +380,8 @@ pub async fn create_new_connector(
 
 pub async fn register_all() {
     register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
+    #[cfg(feature = "adbc")]
+    register_connector_factory("adbc", adbc::AdbcFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
     #[cfg(feature = "delta_lake")]

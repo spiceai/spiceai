@@ -215,6 +215,7 @@ aws-secrets-manager = [
     "dep:aws-sdk-sts",
     "runtime-secrets/aws-secrets-manager",
 ]
+adbc = ["data_components/adbc"]
 bedrock = ["dep:aws-config"]
 clickhouse = [
     "dep:clickhouse-rs",

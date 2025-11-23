@@ -96,6 +96,64 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         SnowflakeConnection { api }
     }
 
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let query = format!("SHOW TABLES IN {schema}");
+        let res = self
+            .api
+            .exec(&query)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetTables {
+                source: e.to_string().into(),
+            })?;
+
+        match res {
+            snowflake_api::QueryResult::Json(resp) => {
+                let tables: Vec<String> = resp
+                    .value
+                    .as_array()
+                    .ok_or_else(|| dbconnection::Error::UnableToGetTables {
+                        source: "Expected array response".to_string().into(),
+                    })?
+                    .iter()
+                    .filter_map(|row| row.get("name").and_then(|v| v.as_str().map(String::from)))
+                    .collect();
+                Ok(tables)
+            }
+            _ => Err(dbconnection::Error::UnableToGetTables {
+                source: "Unexpected response type".to_string().into(),
+            }),
+        }
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let query = "SHOW SCHEMAS";
+        let res = self
+            .api
+            .exec(query)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: e.to_string().into(),
+            })?;
+
+        match res {
+            snowflake_api::QueryResult::Json(resp) => {
+                let schemas: Vec<String> = resp
+                    .value
+                    .as_array()
+                    .ok_or_else(|| dbconnection::Error::UnableToGetSchemas {
+                        source: "Expected array response".to_string().into(),
+                    })?
+                    .iter()
+                    .filter_map(|row| row.get("name").and_then(|v| v.as_str().map(String::from)))
+                    .collect();
+                Ok(schemas)
+            }
+            _ => Err(dbconnection::Error::UnableToGetSchemas {
+                source: "Unexpected response type".to_string().into(),
+            }),
+        }
+    }
+
     async fn get_schema(
         &self,
         table_reference: &TableReference,

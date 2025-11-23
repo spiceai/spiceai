@@ -19,6 +19,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "adbc_core"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5b891479797b5588e320f7fd3caf15faba311cf8f8a76911195b6a3d55304eb"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
+name = "adbc_driver_manager"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "844df935978b736a83ac34fc60b81ef06d792389ba00e37e2c0e3db09986512e"
+dependencies = [
+ "adbc_core",
+ "adbc_ffi",
+ "arrow-array",
+ "arrow-schema",
+ "libloading",
+ "toml 0.9.8",
+]
+
+[[package]]
+name = "adbc_ffi"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c30e0f28a8363a76a8ec802934223ea5811ea658308c7403c8beb9aa86fa808f"
+dependencies = [
+ "adbc_core",
+ "arrow-array",
+ "arrow-schema",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -310,7 +345,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "serde",
  "snafu",
@@ -620,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -634,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1283,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1376,7 +1411,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.3.1",
  "http-body 0.4.6",
- "lru",
+ "lru 0.12.5",
  "percent-encoding",
  "regex-lite",
  "sha2",
@@ -2119,18 +2154,6 @@ checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 
 [[package]]
 name = "bb8"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89aabfae550a5c44b43ab941844ffcd2e993cb6900b342debf59e9ea74acdb8"
-dependencies = [
- "async-trait",
- "futures-util",
- "parking_lot 0.12.5",
- "tokio",
-]
-
-[[package]]
-name = "bb8"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "212d8b8e1a22743d9241575c6ba822cf9c8fef34771c86ab7e477a4fbfd254e5"
@@ -2146,19 +2169,18 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a471c2e1027f28a98972d3d38bd2612efd05cf7b27d6cc1566ec901537e2d1c8"
 dependencies = [
- "bb8 0.9.0",
+ "bb8",
  "oracle",
  "tokio",
 ]
 
 [[package]]
 name = "bb8-postgres"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56ac82c42eb30889b5c4ee4763a24b8c566518171ebea648cd7e3bc532c60680"
+checksum = "e570e6557cd0f88d28d32afa76644873271a70dc22656df565b2021c4036aa9c"
 dependencies = [
- "async-trait",
- "bb8 0.8.6",
+ "bb8",
  "tokio",
  "tokio-postgres",
 ]
@@ -2214,7 +2236,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2698,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3193,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "snafu",
  "text-splitter",
@@ -4111,7 +4133,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4125,7 +4147,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-smithy-async",
  "base64 0.22.1",
- "bb8 0.9.0",
+ "bb8",
  "bb8-oracle",
  "bigdecimal",
  "bytes",
@@ -4192,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4702,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "async-stream",
@@ -4936,20 +4958,22 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=9fa10f280175667a54ca18b55aa1320e82737840#9fa10f280175667a54ca18b55aa1320e82737840"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=d191d6634859fea92a136cc988db1b187477ab38#d191d6634859fea92a136cc988db1b187477ab38"
 dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
  "arrow",
  "arrow-json",
  "arrow-schema",
  "async-stream",
  "async-trait",
- "bb8 0.8.6",
+ "bb8",
  "bb8-postgres",
  "bigdecimal",
- "bitflags 2.10.0",
  "byte-unit",
  "byteorder",
  "chrono",
+ "dashmap",
  "datafusion",
  "datafusion-federation",
  "duckdb",
@@ -4959,22 +4983,25 @@ dependencies = [
  "futures",
  "geo-types",
  "hickory-resolver 0.25.2",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "mongodb",
- "mysql_async",
+ "mysql_async 0.36.1",
  "native-tls",
  "num-bigint",
  "num-traits",
  "pem",
  "postgres-native-tls",
  "r2d2",
- "rand 0.8.5",
+ "r2d2_adbc",
+ "rand 0.9.2",
+ "regex",
  "rusqlite",
  "rust_decimal",
  "sea-query",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
  "time",
  "tokio",
@@ -4987,7 +5014,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5304,7 +5331,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5368,7 +5395,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -5691,7 +5718,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5759,7 +5786,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "futures",
  "snafu",
@@ -6037,7 +6064,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6052,7 +6079,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6065,7 +6092,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -6089,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6984,20 +7011,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hdrhistogram"
-version = "7.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
-dependencies = [
- "base64 0.21.7",
- "byteorder",
- "crossbeam-channel",
- "flate2",
- "nom 7.1.3",
- "num-traits",
-]
-
-[[package]]
 name = "headers"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7530,7 +7543,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -8120,7 +8133,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8581,8 +8594,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.28.0"
-source = "git+https://github.com/spiceai/rusqlite.git?rev=97054b6af725caf5d3e952e349746706e00d0ea5#97054b6af725caf5d3e952e349746706e00d0ea5"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
 dependencies = [
  "cc",
  "pkg-config",
@@ -8728,7 +8742,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -8871,6 +8885,15 @@ name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "lru"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f8cc7106155f10bdf99a6f379688f543ad6596a415375b36a59a054ceda1198"
 dependencies = [
  "hashbrown 0.15.5",
 ]
@@ -9436,7 +9459,7 @@ dependencies = [
  "tokio-rayon",
  "tokio-tungstenite 0.24.0",
  "toktrie_hf_tokenizers",
- "toml",
+ "toml 0.8.23",
  "tqdm",
  "tracing",
  "tracing-subscriber",
@@ -9537,7 +9560,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -9781,15 +9804,44 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
- "hdrhistogram",
  "keyed_priority_queue",
- "lru",
- "mysql_common",
+ "lru 0.12.5",
+ "mysql_common 0.34.1",
  "native-tls",
  "pem",
  "percent-encoding",
  "pin-project",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "socket2 0.5.10",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-util",
+ "twox-hash",
+ "url",
+]
+
+[[package]]
+name = "mysql_async"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "277ce2f2459b2af4cc6d0a0b7892381f80800832f57c533f03e2845f4ea331ea"
+dependencies = [
+ "bytes",
+ "crossbeam-queue",
+ "flate2",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "keyed_priority_queue",
+ "lru 0.14.0",
+ "mysql_common 0.35.5",
+ "native-tls",
+ "pem",
+ "percent-encoding",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -9808,7 +9860,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34a9141e735d5bb02414a7ac03add09522466d4db65bdd827069f76ae0850e58"
 dependencies = [
  "base64 0.22.1",
- "bigdecimal",
  "bitflags 2.10.0",
  "btoi",
  "byteorder",
@@ -9831,9 +9882,38 @@ dependencies = [
  "sha2",
  "subprocess",
  "thiserror 1.0.69",
- "time",
  "uuid 1.18.1",
  "zstd",
+]
+
+[[package]]
+name = "mysql_common"
+version = "0.35.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbb9f371618ce723f095c61fbcdc36e8936956d2b62832f9c7648689b338e052"
+dependencies = [
+ "base64 0.22.1",
+ "bigdecimal",
+ "bitflags 2.10.0",
+ "btoi",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "crc32fast",
+ "flate2",
+ "getrandom 0.3.4",
+ "mysql-common-derive",
+ "num-bigint",
+ "num-traits",
+ "regex",
+ "saturating",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.17",
+ "time",
+ "uuid 1.18.1",
 ]
 
 [[package]]
@@ -10048,7 +10128,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "hickory-resolver 0.25.2",
  "snafu",
@@ -10072,7 +10152,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10957,7 +11037,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -10968,7 +11048,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "clap",
  "opentelemetry-proto",
@@ -11037,7 +11117,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "bytes",
  "futures",
@@ -11161,7 +11241,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "bytes",
  "chunking",
@@ -12184,7 +12264,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.35",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -12221,9 +12301,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12256,6 +12336,16 @@ dependencies = [
  "log",
  "parking_lot 0.12.5",
  "scheduled-thread-pool",
+]
+
+[[package]]
+name = "r2d2_adbc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "530f1d047af6b0ac597f6609d907d3f43c1fac4dffb683901f62f73103128b5f"
+dependencies = [
+ "adbc_core",
+ "r2d2",
 ]
 
 [[package]]
@@ -13036,7 +13126,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "app",
@@ -13124,7 +13214,7 @@ dependencies = [
  "model_components",
  "moka",
  "mongodb",
- "mysql_async",
+ "mysql_async 0.35.1",
  "notify",
  "ns_lookup",
  "object_store",
@@ -13215,7 +13305,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -13243,7 +13333,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "futures",
  "num_cpus",
@@ -13254,7 +13344,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "app",
  "axum",
@@ -13269,7 +13359,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -13289,7 +13379,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -13302,7 +13392,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -13325,7 +13415,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13349,7 +13439,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -13361,7 +13451,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -13374,7 +13464,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "futures",
  "governor",
@@ -13385,7 +13475,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "app",
  "async-trait",
@@ -13405,7 +13495,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -13433,7 +13523,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -13454,8 +13544,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.31.0"
-source = "git+https://github.com/spiceai/rusqlite.git?rev=97054b6af725caf5d3e952e349746706e00d0ea5#97054b6af725caf5d3e952e349746706e00d0ea5"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
 dependencies = [
  "bitflags 2.10.0",
  "chrono",
@@ -13630,7 +13721,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13783,7 +13874,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13795,7 +13886,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -13897,7 +13988,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14015,8 +14106,9 @@ dependencies = [
 
 [[package]]
 name = "sea-query"
-version = "0.32.0-rc.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+version = "0.32.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a5d1c518eaf5eda38e5773f902b26ab6d5e9e9e2bb2349ca6c64cf96f80448c"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -14028,14 +14120,16 @@ dependencies = [
 
 [[package]]
 name = "sea-query-derive"
-version = "0.4.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bae0cbad6ab996955664982739354128c58d16e126114fe88c2a493642502aab"
 dependencies = [
+ "darling 0.20.11",
  "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.108",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -14046,7 +14140,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14308,6 +14402,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_spanned"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e24345aa0fe688594e73770a5f6d1b216508b4f93484c0026d521acd30134392"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -14749,7 +14852,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14793,7 +14896,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "app",
  "clap",
@@ -14829,7 +14932,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -14851,7 +14954,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "app",
  "clap",
@@ -14861,7 +14964,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "schemars 1.1.0",
  "serde_json",
@@ -14870,7 +14973,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "clap",
  "runtime",
@@ -15478,7 +15581,7 @@ dependencies = [
  "itertools 0.14.0",
  "levenshtein_automata",
  "log",
- "lru",
+ "lru 0.12.5",
  "lz4_flex",
  "measure_time",
  "memmap2",
@@ -15631,7 +15734,7 @@ checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
 name = "telemetry"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -15655,7 +15758,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15718,7 +15821,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "app",
@@ -15761,7 +15864,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow-json",
  "clap",
@@ -15847,7 +15950,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.0",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark",
@@ -16100,7 +16203,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "secrecy",
  "snafu",
@@ -16232,9 +16335,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rusqlite"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2cc5f712424f089fc6549afe39773e9f8914ce170c45b546be24830b482b127"
+checksum = "b65501378eb676f400c57991f42cbd0986827ab5c5200c53f206d710fb32a945"
 dependencies = [
  "crossbeam-channel",
  "rusqlite",
@@ -16343,9 +16446,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
  "serde",
- "serde_spanned",
+ "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
  "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "toml"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0dc8b1fb61449e27716ec0e1bdf0f6b8f3e8f6b05391e8497b8b6d7804ea6d8"
+dependencies = [
+ "serde_spanned 1.0.3",
+ "toml_datetime 0.7.3",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
 ]
 
 [[package]]
@@ -16374,7 +16490,7 @@ checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
 dependencies = [
  "indexmap 2.12.0",
  "serde",
- "serde_spanned",
+ "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
  "toml_write",
  "winnow",
@@ -16406,6 +16522,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toml_writer"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df8b2b54733674ad286d16267dcfc7a71ed5c776e4ac7aa3c3e2561f7c637bf2"
 
 [[package]]
 name = "tonic"
@@ -16467,7 +16589,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -16544,7 +16666,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -17330,7 +17452,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -18431,7 +18553,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -19013,7 +19135,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.10.0-unstable"
+version = "0.32.0"
 dependencies = [
  "async-openai",
  "async-trait",

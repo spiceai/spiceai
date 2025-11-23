@@ -92,6 +92,46 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         unreachable!()
     }
 
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let mut conn = self.conn.lock().await;
+        let query = format!("SELECT name FROM system.tables WHERE database = '{schema}'");
+        let block = conn
+            .query(&query)
+            .fetch_all()
+            .await
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+
+        let tables = block
+            .rows()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Result<Vec<String>, clickhouse_rs::errors::Error>>()
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+
+        Ok(tables)
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let mut conn = self.conn.lock().await;
+        let query = "SELECT name FROM system.databases WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')";
+        let block = conn
+            .query(query)
+            .fetch_all()
+            .await
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+
+        let schemas = block
+            .rows()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Result<Vec<String>, clickhouse_rs::errors::Error>>()
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+
+        Ok(schemas)
+    }
+
     async fn get_schema(
         &self,
         table_reference: &TableReference,
