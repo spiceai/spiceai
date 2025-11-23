@@ -24,7 +24,7 @@ use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
 use std::{collections::HashMap, fmt::Write, fs, sync::Arc};
 
-use crate::dbconnection::snowflakeconn::SnowflakeConnection;
+use crate::dbconnection::snowflakeconn::{SnowflakeConnection, SnowflakeConnectionInner, SnowflakeProtocol};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -82,20 +82,45 @@ pub enum Error {
         "Failed to save decrypted private key content as PEM. Verify filesystem permissions, and try again. {source}"
     ))]
     FailedToCreatePem { source: pkcs8::der::Error },
+
+    #[snafu(display(
+        "ADBC connection error: {source}"
+    ))]
+    AdbcConnectionError {
+        source: snowflake_adbc::Error,
+    },
+}
+
+enum SnowflakePoolInner {
+    Http(Arc<SnowflakeApi>),
+    Adbc(Arc<snowflake_adbc::Database>),
 }
 
 pub struct SnowflakeConnectionPool {
-    pub api: Arc<SnowflakeApi>,
+    inner: SnowflakePoolInner,
     join_push_down: JoinPushDown,
 }
 
 impl SnowflakeConnectionPool {
-    // Creates a new instance of `SnowflakeConnectionPool`.
+    /// Creates a new instance of `SnowflakeConnectionPool`.
     ///
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
+        let protocol = params
+            .get("protocol")
+            .map(SecretBox::expose_secret)
+            .and_then(|s| s.parse::<SnowflakeProtocol>().ok())
+            .unwrap_or_default();
+
+        match protocol {
+            SnowflakeProtocol::Http => Self::new_http(params).await,
+            SnowflakeProtocol::Adbc => Self::new_adbc(params).await,
+        }
+    }
+
+    async fn new_http(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
         let username = params
             .get("username")
             .map(SecretBox::expose_secret)
@@ -176,7 +201,75 @@ impl SnowflakeConnectionPool {
         }
 
         Ok(Self {
-            api: Arc::new(api),
+            inner: SnowflakePoolInner::Http(Arc::new(api)),
+            join_push_down: JoinPushDown::AllowedFor(join_push_context_str),
+        })
+    }
+
+    async fn new_adbc(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
+        let mut db_params = HashMap::new();
+
+        // Required parameters
+        for key in &["username", "account"] {
+            if let Some(value) = params.get(*key).map(SecretBox::expose_secret) {
+                let mut value_str = value.to_string();
+                if *key == "account" {
+                    value_str = value_str.replace('.', "-");
+                }
+                db_params.insert(key.to_string(), value_str);
+            } else {
+                return Err(Error::MissingRequiredSecret {
+                    name: key.to_string(),
+                });
+            }
+        }
+
+        // Optional parameters
+        for key in &["warehouse", "database", "schema", "role"] {
+            if let Some(value) = params.get(*key).map(SecretBox::expose_secret) {
+                db_params.insert(key.to_string(), value.to_string());
+            }
+        }
+
+        // Authentication
+        if let Some(private_key_path) = params.get("private_key_path").map(SecretBox::expose_secret) {
+            let private_key_path_str: &str = private_key_path;
+            let mut private_key_pem =
+                fs::read_to_string(private_key_path_str).context(ErrorReadingPrivateKeyFileSnafu {
+                    file_path: private_key_path_str,
+                })?;
+
+            let (label, data) =
+                SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
+
+            if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
+                let passphrase = params
+                    .get("private_key_passphrase")
+                    .map(SecretBox::expose_secret)
+                    .context(MissingRequiredSecretSnafu {
+                        name: "private_key_passphrase",
+                    })?;
+
+                private_key_pem = decode_pkcs8_encrypted_data(&data, passphrase)?;
+            }
+
+            db_params.insert("private_key".to_string(), private_key_pem);
+        } else if let Some(password) = params.get("password").map(SecretBox::expose_secret) {
+            db_params.insert("password".to_string(), password.to_string());
+        } else {
+            return Err(Error::MissingRequiredSecret {
+                name: "password or private_key_path".to_string(),
+            });
+        }
+
+        let database = snowflake_adbc::Database::new(db_params).context(AdbcConnectionSnafu)?;
+
+        let username = params.get("username").map(SecretBox::expose_secret).map_or("", |s| s);
+        let account = params.get("account").map(SecretBox::expose_secret).map_or("", |s| s);
+        let join_push_context_str = format!("username={},account={}", username, account);
+
+        Ok(Self {
+            inner: SnowflakePoolInner::Adbc(Arc::new(database)),
             join_push_down: JoinPushDown::AllowedFor(join_push_context_str),
         })
     }
@@ -262,11 +355,25 @@ impl DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> for SnowflakeConnect
         Box<dyn DbConnection<Arc<SnowflakeApi>, &'static dyn Sync>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let api = Arc::clone(&self.api);
-
-        let conn = SnowflakeConnection { api };
-
-        Ok(Box::new(conn))
+        match &self.inner {
+            SnowflakePoolInner::Http(api) => {
+                let conn = SnowflakeConnection {
+                    inner: SnowflakeConnectionInner::Http(Arc::clone(api)),
+                };
+                Ok(Box::new(conn))
+            }
+            SnowflakePoolInner::Adbc(database) => {
+                let connection = database
+                    .connect()
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                
+                let conn = SnowflakeConnection {
+                    inner: SnowflakeConnectionInner::Adbc(connection),
+                };
+                Ok(Box::new(conn))
+            }
+        }
     }
 
     fn join_push_down(&self) -> JoinPushDown {

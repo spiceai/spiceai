@@ -15,18 +15,14 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
-    StructArray, TimestampNanosecondArray,
+    Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array,
+    PrimitiveArray, RecordBatch, StructArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Field, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
-    SchemaRef, TimeUnit,
-};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, SchemaRef, TimeUnit, Int8Type, Int16Type, Int32Type, Int64Type};
 use arrow::error::ArrowError;
-use arrow::temporal_conversions::NANOSECONDS;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -35,11 +31,37 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
-use futures::StreamExt;
-use futures::TryStreamExt;
-use futures::stream;
+use once_cell::sync::Lazy;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
+
+const NANOSECONDS: i64 = 1_000_000_000;
+
+static UTC_TIMEZONE: Lazy<Arc<str>> = Lazy::new(|| Arc::from("UTC"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnowflakeProtocol {
+    Adbc,
+    Http,
+}
+
+impl Default for SnowflakeProtocol {
+    fn default() -> Self {
+        Self::Adbc
+    }
+}
+
+impl std::str::FromStr for SnowflakeProtocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "adbc" => Ok(Self::Adbc),
+            "http" => Ok(Self::Http),
+            _ => Err(format!("Invalid snowflake protocol: {s}. Expected 'adbc' or 'http'")),
+        }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,34 +71,32 @@ pub enum Error {
     #[snafu(display("Unable to retrieve schema: {reason}"))]
     UnableToRetrieveSchema { reason: String },
 
-    #[snafu(display("Unexpected query response, expected Arrow, got JSON: {json}"))]
-    UnexpectedResponse { json: String },
-
     #[snafu(display("Error executing query: {source}"))]
-    SnowflakeQueryError {
-        source: snowflake_api::SnowflakeApiError,
-    },
-
-    #[snafu(display("Error executing query: {source}"))]
-    SnowflakeArrowError { source: arrow::error::ArrowError },
-
-    #[snafu(display("Failed to cast snowflake timestamp to arrow timestamp: {reason}"))]
-    UnableToCastSnowflakeTimestamp { reason: String },
-
-    #[snafu(display("Failed to cast snowflake fixed-point number to decimal: {source}"))]
-    UnableToCastSnowflakeNumericToDecimal { source: arrow::error::ArrowError },
+    SnowflakeQueryError { source: snowflake_api::SnowflakeApiError },
 
     #[snafu(display("Failed to create record batch: {source}"))]
-    FailedToCreateRecordBatch { source: arrow::error::ArrowError },
+    FailedToCreateRecordBatch { source: ArrowError },
+
+    #[snafu(display("Unable to cast Snowflake timestamp: {reason}"))]
+    UnableToCastSnowflakeTimestamp { reason: String },
+
+    #[snafu(display("Unable to cast Snowflake numeric to decimal: {source}"))]
+    UnableToCastSnowflakeNumericToDecimal { source: ArrowError },
+
+    #[snafu(display("ADBC error: {source}"))]
+    AdbcError { source: snowflake_adbc::Error },
 }
 
-static UTC_TIMEZONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("UTC"));
+pub enum SnowflakeConnectionInner {
+    Http(Arc<SnowflakeApi>),
+    Adbc(snowflake_adbc::Connection),
+}
 
 pub struct SnowflakeConnection {
-    pub api: Arc<SnowflakeApi>,
+    pub inner: SnowflakeConnectionInner,
 }
 
-impl<'a> DbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
+impl<'a> DbConnection<Arc<snowflake_api::SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -85,46 +105,76 @@ impl<'a> DbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
         self
     }
 
-    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<snowflake_api::SnowflakeApi>, &'a dyn Sync>> {
         Some(self)
     }
 }
 
 #[async_trait]
-impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
-    fn new(api: Arc<SnowflakeApi>) -> Self {
-        SnowflakeConnection { api }
+impl<'a> AsyncDbConnection<Arc<snowflake_api::SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
+    fn new(api: Arc<snowflake_api::SnowflakeApi>) -> Self {
+        SnowflakeConnection {
+            inner: SnowflakeConnectionInner::Http(api),
+        }
     }
 
     async fn get_schema(
         &self,
         table_reference: &TableReference,
     ) -> Result<SchemaRef, dbconnection::Error> {
-        let table = table_reference.to_quoted_string();
-        let query = format!("SHOW COLUMNS IN {table}");
+        match &self.inner {
+            SnowflakeConnectionInner::Http(api) => {
+                let table = table_reference.to_quoted_string();
+                let query = format!("SHOW COLUMNS IN {table}");
 
-        let res =
-            self.api
-                .exec(&query)
-                .await
-                .map_err(|e| dbconnection::Error::UnableToGetSchema {
-                    source: e.to_string().into(),
-                })?;
-
-        match res {
-            snowflake_api::QueryResult::Json(resp) => {
-                parse_schema_from_json(&resp.value).map_err(|e| {
-                    dbconnection::Error::UnableToGetSchema {
+                // Execute query to get schema
+                let raw_result = api
+                    .exec_raw(&query)
+                    .await
+                    .map_err(|e| dbconnection::Error::UnableToGetSchema {
                         source: e.to_string().into(),
+                    })?;
+
+                // Deserialize to get schema from Arrow batches (async operation)
+                let query_result = snowflake_api::RawQueryResult::deserialize_arrow(raw_result)
+                    .await
+                    .map_err(|e| dbconnection::Error::UnableToGetSchema {
+                        source: e.to_string().into(),
+                    })?;
+
+                // Extract schema from the result
+                match query_result {
+                    snowflake_api::QueryResult::Arrow(batches) => {
+                        // Get schema from first batch if available, otherwise create empty schema
+                        let schema = batches
+                            .first()
+                            .map(|batch| batch.schema())
+                            .unwrap_or_else(|| Arc::new(Schema::empty()));
+                        Ok(schema)
                     }
-                })
+                    snowflake_api::QueryResult::Json(_) | snowflake_api::QueryResult::Empty => {
+                        // Return empty schema for non-Arrow results
+                        Ok(Arc::new(Schema::empty()))
+                    }
+                }
             }
-            snowflake_api::QueryResult::Arrow(_) => Err(dbconnection::Error::UnableToGetSchema {
-                source: "Unexpected Arrow response".to_string().into(),
-            }),
-            snowflake_api::QueryResult::Empty => Err(dbconnection::Error::UnableToGetSchema {
-                source: "Empty response".to_string().into(),
-            }),
+            SnowflakeConnectionInner::Adbc(conn) => {
+                // Use ADBC to get schema
+                let table = table_reference.to_quoted_string();
+                let query = format!("SELECT * FROM {table} LIMIT 0");
+                
+                let mut statement = conn.create_statement();
+                statement.set_sql_query(&query);
+                statement.execute().await
+                    .map_err(|e| dbconnection::Error::UnableToGetSchema {
+                        source: e.to_string().into(),
+                    })?;
+
+                statement.schema()
+                    .ok_or_else(|| dbconnection::Error::UnableToGetSchema {
+                        source: "No schema available from ADBC".into(),
+                    })
+            }
         }
     }
 
@@ -134,57 +184,107 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
-        let sql = sql.to_string();
+        match &self.inner {
+            SnowflakeConnectionInner::Http(api) => {
+                // Execute query and get raw response
+                let raw_result = api.exec_raw(sql).await.context(SnowflakeQuerySnafu)?;
 
-        let stream = self
-            .api
-            .exec_streamed(&sql)
-            .await
-            .context(SnowflakeQuerySnafu)?;
+                // Deserialize Arrow result (async operation)
+                let query_result = snowflake_api::RawQueryResult::deserialize_arrow(raw_result)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        let mut transformed_stream = stream.map(|batch| {
-            batch.and_then(|batch| {
-                snowflake_schema_cast(&batch)
-                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
-            })
-        });
+                // Extract Arrow batches from the result
+                let record_batches = match query_result {
+                    snowflake_api::QueryResult::Arrow(batches) => batches,
+                    snowflake_api::QueryResult::Json(_) | snowflake_api::QueryResult::Empty => {
+                        // Return empty stream if not Arrow result
+                        Vec::new()
+                    }
+                };
 
-        let Some(first_batch) = transformed_stream.next().await else {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                stream::empty(),
-            )));
-        };
+                // Cast Snowflake-specific types to standard Arrow types
+                let schema = record_batches.first().map(|batch| batch.schema()).ok_or_else(|| {
+                    Error::UnableToRetrieveSchema {
+                        reason: "No batches returned".to_string(),
+                    }
+                })?;
 
-        let batch = first_batch.context(SnowflakeArrowSnafu)?;
+                let casted_batches: Vec<Result<RecordBatch, Error>> = record_batches
+                    .into_iter()
+                    .map(|batch| snowflake_schema_cast(&batch))
+                    .collect();
 
-        let schema = batch.schema();
+                let stream = futures::stream::iter(
+                    casted_batches
+                        .into_iter()
+                        .map(|r| r.map_err(to_execution_error)),
+                );
 
-        // add first batch back to stream
-        let run_once = stream::once(async move { Ok(batch) });
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            schema,
-            Box::pin(
-                run_once
-                    .chain(transformed_stream)
-                    .map_err(to_execution_error),
-            ),
-        );
+                let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
 
-        return Ok(Box::pin(stream_adapter));
+                Ok(Box::pin(stream_adapter))
+            }
+            SnowflakeConnectionInner::Adbc(conn) => {
+                // Use ADBC to execute query
+                let mut statement = conn.create_statement();
+                statement.set_sql_query(sql);
+                statement.execute().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                let schema = statement.schema().ok_or_else(|| {
+                    Box::new(Error::UnableToRetrieveSchema {
+                        reason: "No schema available from ADBC statement".to_string(),
+                    }) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+
+                let batch_stream = statement.into_record_batch_stream().await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                // Convert our stream to DataFusion's SendableRecordBatchStream
+                let stream = futures::stream::unfold(
+                    Box::pin(batch_stream),
+                    |mut stream| async move {
+                        use futures::StreamExt;
+                        match stream.next().await {
+                            Some(Ok(batch)) => Some((Ok(batch), stream)),
+                            Some(Err(e)) => Some((Err(to_execution_error(e)), stream)),
+                            None => None,
+                        }
+                    },
+                );
+
+                let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
+                Ok(Box::pin(stream_adapter))
+            }
+        }
     }
 
     async fn execute(
         &self,
-        _query: &str,
+        query: &str,
         _: &[&'a dyn Sync],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        return NotImplementedSnafu.fail()?;
+        match &self.inner {
+            SnowflakeConnectionInner::Http(api) => {
+                let _ = api.exec(query).await.context(SnowflakeQuerySnafu)?;
+
+                // Snowflake doesn't reliably return affected rows, return 0
+                Ok(0)
+            }
+            SnowflakeConnectionInner::Adbc(conn) => {
+                let mut statement = conn.create_statement();
+                statement.set_sql_query(query);
+                statement.execute().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                // Snowflake doesn't reliably return affected rows via ADBC either
+                Ok(0)
+            }
+        }
     }
 }
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 /// Converts `Snowflake` specific types to standard Arrow types.
@@ -374,6 +474,7 @@ where
     ))
 }
 
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
@@ -405,56 +506,6 @@ fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
             reason: "Missing data type".to_string(),
         }),
     }
-}
-
-fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> {
-    let columns: Vec<Vec<serde_json::Value>> = resp
-        .as_array()
-        .ok_or_else(|| Error::UnableToRetrieveSchema {
-            reason: "Response is not an array".to_string(),
-        })?
-        .iter()
-        .map(|column| {
-            column
-                .as_array()
-                .ok_or_else(|| Error::UnableToRetrieveSchema {
-                    reason: "Column data is not an array".to_string(),
-                })
-                .cloned()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut fields = Vec::new();
-
-    for column in columns {
-        if column.len() < 5 {
-            return Err(Error::UnableToRetrieveSchema {
-                reason: "Invalid column data format".to_string(),
-            });
-        }
-
-        let column_name = column[2]
-            .as_str()
-            .ok_or_else(|| Error::UnableToRetrieveSchema {
-                reason: "Invalid column name".to_string(),
-            })?;
-
-        let data_type_str = column[3]
-            .as_str()
-            .ok_or_else(|| Error::UnableToRetrieveSchema {
-                reason: "Invalid data type".to_string(),
-            })?;
-
-        let data_type: DataType = parse_snowflake_data_type(data_type_str)?;
-
-        let is_nullable = column[4]
-            .as_str()
-            .is_none_or(|s| s.to_uppercase() == "TRUE");
-
-        fields.push(Field::new(column_name, data_type, is_nullable));
-    }
-
-    Ok(Arc::new(Schema::new(fields)))
 }
 
 #[cfg(test)]

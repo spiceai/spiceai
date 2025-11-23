@@ -74,6 +74,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("warehouse").secret(),
     ParameterSpec::component("role").secret(),
     ParameterSpec::component("auth_type"),
+    ParameterSpec::component("protocol"),
 ];
 
 // https://github.com/apache/datafusion-sqlparser-rs/blob/87d190734c7b978e8252b110c9529d7a93a30cf0/src/keywords.rs#L1061

@@ -20,6 +20,7 @@ datafusion-table-providers = { workspace = true }
 dyn-clone = { version = "1.0.17", optional = true }
 futures.workspace = true
 odbc-api = { workspace = true, optional = true }
+once_cell = "1.21.3"
 pkcs8 = { version = "0.10.2", features = [
   "encryption",
   "pem",
@@ -30,12 +31,14 @@ serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+snowflake_adbc = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 tokio-util = { workspace = true }
 tracing.workspace = true
 util = { path = "../util" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [features]
@@ -63,7 +66,7 @@ postgres = [
   "datafusion-table-providers/postgres",
   "datafusion-table-providers/postgres-federation",
 ]
-snowflake = ["dep:snowflake-api", "dep:pkcs8", "dep:serde_json"]
+snowflake = ["dep:snowflake-api", "dep:snowflake_adbc", "dep:serde_json", "dep:pkcs8"]
 sqlite = [
   "datafusion-table-providers/sqlite",
   "datafusion-table-providers/sqlite-federation",
