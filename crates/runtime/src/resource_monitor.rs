@@ -201,7 +201,7 @@ impl ResourceMonitor {
     pub fn current_usage_percent(&self) -> f64 {
         let inner = self.inner.read();
         let mut system = System::new();
-        system.refresh_memory();
+        system.refresh_processes(ProcessesToUpdate::Some(&[inner.pid]), true);
         let process_memory = system.process(inner.pid).map(Process::memory).unwrap_or(0);
         if inner.total_memory == 0 {
             return 0.0;
