@@ -104,9 +104,7 @@ percent-encoding.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
-prost = { version = "0.13.1", default-features = false, features = [
-    "prost-derive",
-] }
+prost.workspace = true
 rand.workspace = true
 rayon = "1.11.0"
 regex.workspace = true
@@ -129,6 +127,7 @@ runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
@@ -226,6 +225,8 @@ cluster = [
     "dep:ballista-executor",
     "dep:datafusion-proto",
     "runtime-datafusion/cluster",
+    "datafusion-optimizer-rules/cluster",
+    "runtime-secrets/cluster"
 ]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
