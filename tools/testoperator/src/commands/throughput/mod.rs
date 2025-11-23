@@ -66,7 +66,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end()?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     // throughput test
     println!("Running throughput test");

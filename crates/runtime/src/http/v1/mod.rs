@@ -233,29 +233,19 @@ pub async fn to_http_response(
 ) -> (StatusCode, HeaderMap, String) {
     let mut headers = HeaderMap::new();
 
-    // Offload CPU-intensive serialization to blocking thread pool to avoid blocking async runtime
-    let res = tokio::task::spawn_blocking(move || match format {
+    let res = match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
         ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
             arrow_to_vnd_sql_json_v1(&data, meta)
         }
-    })
-    .await;
+    };
 
     let body = match res {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
-        }
+        Ok(body) => body,
         Err(e) => {
-            tracing::error!("Serialization task panicked: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                headers,
-                "Serialization failed".to_string(),
-            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
         }
     };
 

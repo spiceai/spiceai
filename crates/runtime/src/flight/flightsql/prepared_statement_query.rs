@@ -964,7 +964,7 @@ mod tests {
         let plan_cache = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ))
         .as_tabled_provider();
 
@@ -986,7 +986,7 @@ mod tests {
 
         // Verify it starts empty
         assert_eq!(
-            cache_provider.item_count(),
+            cache_provider.item_count().await,
             0,
             "Plan cache should be empty initially"
         );
@@ -1020,7 +1020,7 @@ mod tests {
         let plan_cache = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ))
         .as_tabled_provider();
 

@@ -1,0 +1,20 @@
+[package]
+name = "runtime-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-proto = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13.1"

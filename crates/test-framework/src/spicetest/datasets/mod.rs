@@ -70,6 +70,7 @@ pub struct NotStarted {
     scale_factor: f64,
     http_client: bool,
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    reference_schema: Option<String>,
 }
 
 impl NotStarted {
@@ -127,6 +128,12 @@ impl NotStarted {
         validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Self {
         self.validation_data = Some(validation_data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
         self
     }
 }
@@ -197,16 +204,10 @@ impl SpiceTest<NotStarted> {
 
         let mut query_workers = Vec::new();
         for id in 0..self.state.parallel_count {
-            let spice_client = self
-                .get_spiced()?
-                .spice_client(self.api_key.clone(), self.state.disable_caching)
-                .await?;
-
             let mut worker = SpiceTestQueryWorker::new(
                 id,
                 self.state.query_set.clone(),
                 self.state.end_condition,
-                spice_client,
                 self.name.clone(),
             )
             .with_explain_plan_snapshot(self.explain_plan_snapshot)
@@ -220,10 +221,20 @@ impl SpiceTest<NotStarted> {
 
             if self.state.http_client {
                 worker = worker.with_http_client(http_client.clone());
+            } else {
+                let spice_client = self
+                    .get_spiced()?
+                    .spice_client(self.api_key.clone(), self.state.disable_caching)
+                    .await?;
+                worker = worker.with_flight_client(spice_client);
             }
 
             if let Some(validation_data) = &self.state.validation_data {
                 worker = worker.with_validation_data(validation_data.clone());
+            }
+
+            if let Some(reference_schema) = &self.state.reference_schema {
+                worker = worker.with_reference_schema(Some(reference_schema.clone()));
             }
 
             query_workers.push(worker.start());

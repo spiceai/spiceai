@@ -93,11 +93,20 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 		if err != nil {
 			return fmt.Errorf("tar error: %v", err)
 		}
-		if !validRelPath(f.Name) {
-			return fmt.Errorf("tar contained invalid name error %q", f.Name)
-		}
 		rel := filepath.FromSlash(f.Name)
 		abs := filepath.Join(dir, rel)
+		// Check that abs is within the target directory, preventing directory traversal
+		dirAbs, errAbs := filepath.Abs(dir)
+		if errAbs != nil {
+			return fmt.Errorf("failed to resolve target directory: %v", errAbs)
+		}
+		absAbs, errAbs2 := filepath.Abs(abs)
+		if errAbs2 != nil {
+			return fmt.Errorf("failed to resolve extraction path: %v", errAbs2)
+		}
+		if !isSubpath(dirAbs, absAbs) {
+			return fmt.Errorf("tar contained invalid name: potential path traversal or absolute path %q", f.Name)
+		}
 
 		fi := f.FileInfo()
 		mode := fi.Mode()
@@ -161,9 +170,14 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	return nil
 }
 
-func validRelPath(p string) bool {
-	if p == "" || strings.Contains(p, `\`) || strings.HasPrefix(p, "/") || strings.Contains(p, "../") {
-		return false
+// isSubpath checks that the target (child) path is within the root directory,
+// preventing directory traversal or absolute path escapes.
+func isSubpath(root, target string) bool {
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
+	// Ensure trailing separator on root, so subpath (itself) matches
+	if !strings.HasSuffix(root, string(os.PathSeparator)) {
+		root += string(os.PathSeparator)
 	}
-	return true
+	return strings.HasPrefix(target, root)
 }

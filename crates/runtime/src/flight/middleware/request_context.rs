@@ -14,22 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{
+    datafusion::{DataFusion, flight_session_extension::FlightSessionExtension, request_context_extension::DataFusionContextExtension},
+    flight::SessionStore,
+    model::ModelContextExtension,
+    secrets,
+};
+use app::App;
+use runtime_request_context::{Protocol, RequestContext};
 use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-
-use crate::{
-    datafusion::{DataFusion, flight_session_extension::FlightSessionExtension, request_context_extension::DataFusionContextExtension},
-    flight::SessionStore,
-    model::ModelContextExtension,
-};
-use app::App;
-use runtime_request_context::{Protocol, RequestContext};
+use tokio::sync::RwLock;
 
 use crate::datafusion::app_context_extension::AppContextExtension;
+use crate::datafusion::secrets_context_extension::SecretsContextExtension;
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
 
@@ -39,12 +41,18 @@ pub struct RequestContextLayer {
     app: Option<Arc<App>>,
     df: Arc<DataFusion>,
     session_store: SessionStore,
+    secrets: Arc<RwLock<secrets::Secrets>>,
 }
 
 impl RequestContextLayer {
     #[must_use]
-    pub fn new(app: Option<Arc<App>>, df: Arc<DataFusion>, session_store: SessionStore) -> Self {
-        Self { app, df, session_store }
+    pub fn new(
+        app: Option<Arc<App>>,
+        df: Arc<DataFusion>,
+        session_store: SessionStore,
+        secrets: Arc<RwLock<secrets::Secrets>>,
+    ) -> Self {
+        Self { app, df, session_store, secrets }
     }
 }
 
@@ -57,6 +65,7 @@ impl<S> Layer<S> for RequestContextLayer {
             app: self.app.clone(),
             df: Arc::clone(&self.df),
             session_store: self.session_store.clone(),
+            secrets: Arc::clone(&self.secrets),
         }
     }
 }
@@ -67,6 +76,7 @@ pub struct RequestContextMiddleware<S> {
     app: Option<Arc<App>>,
     df: Arc<DataFusion>,
     session_store: SessionStore,
+    secrets: Arc<RwLock<secrets::Secrets>>,
 }
 
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for RequestContextMiddleware<S>
@@ -90,25 +100,18 @@ where
 
         let headers = req.headers();
         
-        // Debug: Log header presence
-        tracing::debug!("Flight request headers: authorization={}, x-session-id={}", 
-            headers.contains_key("authorization"),
-            headers.contains_key("x-session-id")
-        );
-        
         // Try to get or create a session for this request
         let session_ext = self.session_store.get_or_create_session_from_http(
             req.headers(),
             &self.df.ctx,
         ).map(FlightSessionExtension::new);
         
-        tracing::debug!("Session extension created: {}", session_ext.is_some());
-        
         let mut builder = RequestContext::builder(Protocol::Flight)
             .with_app_opt(self.app.clone())
             .with_extension(DataFusionContextExtension::new(Arc::clone(&self.df)))
             .with_extension(ModelContextExtension::new())
-            .with_extension(AppContextExtension::new(self.app.clone()));
+            .with_extension(AppContextExtension::new(self.app.clone()))
+            .with_extension(SecretsContextExtension::new(Arc::clone(&self.secrets)));
         
         // Add session extension if we have one
         if let Some(session_ext) = session_ext {

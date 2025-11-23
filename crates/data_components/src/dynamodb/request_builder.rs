@@ -82,7 +82,7 @@ impl DynamoDBRequestPlanBuilder {
                 limit_i32,
             )
         } else {
-            Ok(self.build_scan_request(filters, projection_expr, attribute_names, limit_i32))
+            self.build_scan_request(filters, projection_expr, attribute_names, limit_i32)
         }
     }
 
@@ -111,7 +111,7 @@ impl DynamoDBRequestPlanBuilder {
                 query_params = query_params.limit(l);
             }
         } else {
-            let (filter_str, filter_values) = self.build_filter_expression(other_filters);
+            let (filter_str, filter_values) = self.build_filter_expression(other_filters)?;
             key_values.extend(filter_values);
             query_params = query_params.filter_expression(filter_str);
         }
@@ -138,7 +138,7 @@ impl DynamoDBRequestPlanBuilder {
         projection: Option<String>,
         attribute_names: HashMap<String, String>,
         limit: Option<i32>,
-    ) -> DynamoDBRequestPlan {
+    ) -> DataFusionResult<DynamoDBRequestPlan> {
         let mut scan_params =
             ScanParamsBuilder::default().table_name(self.schema.table_name().to_string());
 
@@ -150,7 +150,7 @@ impl DynamoDBRequestPlanBuilder {
                 scan_params = scan_params.limit(l);
             }
         } else {
-            let (filter_str, attribute_values) = self.build_filter_expression(filters);
+            let (filter_str, attribute_values) = self.build_filter_expression(filters)?;
             if !filter_str.is_empty() {
                 scan_params = scan_params.filter_expression(filter_str);
             }
@@ -168,7 +168,7 @@ impl DynamoDBRequestPlanBuilder {
         }
 
         let scan = scan_params.build();
-        DynamoDBRequestPlan::Scan(scan)
+        Ok(DynamoDBRequestPlan::Scan(scan))
     }
 
     fn extract_attribute_names(&self, filters: &[Expr]) -> HashMap<String, String> {
@@ -233,9 +233,9 @@ impl DynamoDBRequestPlanBuilder {
     fn build_filter_expression(
         &self,
         filters: &[Expr],
-    ) -> (String, HashMap<String, AttributeValue>) {
+    ) -> DataFusionResult<(String, HashMap<String, AttributeValue>)> {
         if filters.is_empty() {
-            return (String::new(), HashMap::new());
+            return Ok((String::new(), HashMap::new()));
         }
 
         let mut attribute_values = HashMap::new();
@@ -243,18 +243,15 @@ impl DynamoDBRequestPlanBuilder {
 
         let filter_parts: Vec<String> = filters
             .iter()
-            .filter_map(|expr| {
-                self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter)
-                    .ok()
-            })
-            .collect();
+            .map(|expr| self.expr_to_filter_string(expr, &mut attribute_values, &mut value_counter))
+            .collect::<DataFusionResult<Vec<String>>>()?;
 
         if filter_parts.is_empty() {
-            return (String::new(), HashMap::new());
+            return Ok((String::new(), HashMap::new()));
         }
 
         let filter_expr = filter_parts.join(" AND ");
-        (filter_expr, attribute_values)
+        Ok((filter_expr, attribute_values))
     }
 
     fn expr_to_filter_string(
@@ -435,8 +432,10 @@ fn try_extract_key_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
     use aws_sdk_dynamodb::types::AttributeValue;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{col, lit};
     use std::sync::Arc;
 
@@ -448,6 +447,11 @@ mod tests {
             Field::new("age", DataType::Int64, true),
             Field::new("active", DataType::Boolean, true),
             Field::new("user.email", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
         ]));
 
         let mut flattened_fields = HashSet::new();
@@ -459,6 +463,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             flattened_fields,
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -1044,6 +1049,7 @@ mod tests {
             "id".to_string(),
             None, // No sort key
             HashSet::new(),
+            "2006-01-02T15:04:05.000Z07:00",
         );
 
         let builder = DynamoDBRequestPlanBuilder::new(table_schema);
@@ -1259,7 +1265,7 @@ mod tests {
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
         let filter = col("age").eq(lit(25i64));
-        let (expr, values) = builder.build_filter_expression(&[filter]);
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
 
         assert_eq!(expr, "(#age = :v0)");
         assert_eq!(values.len(), 1);
@@ -1274,7 +1280,9 @@ mod tests {
         let filter1 = col("age").gt(lit(18i64));
         let filter2 = col("active").eq(lit(true));
 
-        let (expr, values) = builder.build_filter_expression(&[filter1, filter2]);
+        let (expr, values) = builder
+            .build_filter_expression(&[filter1, filter2])
+            .expect("filter");
 
         assert_eq!(expr, "(#age > :v0) AND (#active = :v1)");
         assert_eq!(values.len(), 2);
@@ -1287,7 +1295,7 @@ mod tests {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
-        let (expr, values) = builder.build_filter_expression(&[]);
+        let (expr, values) = builder.build_filter_expression(&[]).expect("filter");
 
         assert!(expr.is_empty());
         assert!(values.is_empty());
@@ -1300,7 +1308,7 @@ mod tests {
 
         // (age > 18 AND active = true)
         let filter = col("age").gt(lit(18i64)).and(col("active").eq(lit(true)));
-        let (expr, values) = builder.build_filter_expression(&[filter]);
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
 
         assert_eq!(expr, "((#age > :v0) AND (#active = :v1))");
         assert_eq!(values.len(), 2);
@@ -1402,6 +1410,68 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_with_timestamp_string_comparison() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let filter = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        )));
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
+        assert_eq!(expr, "(#created_at > :v0)");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+
+        let filter = lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        ))
+        .eq(col("created_at"));
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
+        assert_eq!(expr, "(:v0 = #created_at)");
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_filter_with_timestamp_string_comparison_complex() {
+        let schema = create_test_schema();
+        let builder = DynamoDBRequestPlanBuilder::new(schema);
+
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        )));
+        let f2 = col("age").eq(lit(25)).and(f1);
+        let f3 = col("name").eq(lit("John"));
+        let (expr, values) = builder.build_filter_expression(&[f2, f3]).expect("filter");
+        assert_eq!(
+            expr,
+            "((#age = :v0) AND (#created_at > :v1)) AND (#name = :v2)"
+        );
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values.get(":v0"),
+            Some(&AttributeValue::N("25".to_string()))
+        );
+        assert_eq!(
+            values.get(":v1"),
+            Some(&AttributeValue::S("2024-09-03T12:34:56.155Z".to_string()))
+        );
+        assert_eq!(
+            values.get(":v2"),
+            Some(&AttributeValue::S("John".to_string()))
+        );
+    }
+
+    #[test]
     fn test_filter_with_different_data_types() {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
@@ -1410,8 +1480,9 @@ mod tests {
         let int_filter = col("age").eq(lit(30i64));
         let bool_filter = col("active").eq(lit(true));
 
-        let (expr, values) =
-            builder.build_filter_expression(&[string_filter, int_filter, bool_filter]);
+        let (expr, values) = builder
+            .build_filter_expression(&[string_filter, int_filter, bool_filter])
+            .expect("filter");
 
         assert!(expr.contains("#name"));
         assert!(expr.contains("#age"));
@@ -1426,7 +1497,7 @@ mod tests {
 
         let filter = col(r#""user.email""#).eq(lit("john@example.com"));
 
-        let (expr, values) = builder.build_filter_expression(&[filter]);
+        let (expr, values) = builder.build_filter_expression(&[filter]).expect("filter");
 
         assert_eq!(expr, "(#user.#email = :v0)");
         assert_eq!(values.len(), 1);

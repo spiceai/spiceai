@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, health::HealthMonitor, wait_test_and_memory};
+use crate::{
+    args::{DatasetTestArgs, QuerySetLoader},
+    health::HealthMonitor,
+    wait_test_and_memory,
+};
 use std::time::Duration;
 use test_framework::{
     TestType,
@@ -56,7 +60,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))

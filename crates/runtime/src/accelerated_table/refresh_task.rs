@@ -112,6 +112,7 @@ pub struct RefreshTaskBuilder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTaskBuilder {
@@ -135,6 +136,7 @@ impl RefreshTaskBuilder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -160,6 +162,15 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> RefreshTaskBuilder {
+        self.resource_monitor = Some(monitor);
         self
     }
 
@@ -208,6 +219,7 @@ impl RefreshTaskBuilder {
                 .collect(),
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
+            resource_monitor: self.resource_monitor,
         }
     }
 }
@@ -226,6 +238,7 @@ pub struct RefreshTask {
     enabled_metrics: HashSet<String>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTask {
@@ -313,6 +326,7 @@ impl RefreshTask {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
         self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
@@ -340,6 +354,44 @@ impl RefreshTask {
             None
         };
 
+        // For table providers with refresh skip support, check if the refresh can be skipped to
+        // avoid unnecessary data fetching when the underlying data is unchanged.
+        if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
+            let table_provider = self.federated.table_provider().await;
+
+            match data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                table_provider.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(true)) => {
+                    tracing::debug!(
+                        "Skipping refresh for {} - data unchanged",
+                        self.dataset_name
+                    );
+
+                    for label_set in &dataset_metrics_label_sets {
+                        metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                    }
+
+                    self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Ready)
+                        .await;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Data may have changed or provider does not support skipping; continue with refresh.
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
+                        self.dataset_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
             match refresh.mode {
                 RefreshMode::Disabled => {
@@ -368,6 +420,11 @@ impl RefreshTask {
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
+                // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+                // This is expected and should not be logged as an error.
+                if self.runtime_status.is_shutdown() {
+                    return Ok(());
+                }
                 self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
                     .await;
                 return Err(e);
@@ -396,27 +453,27 @@ impl RefreshTask {
                 (streaming_data_update, None)
             };
 
-        self.write_streaming_data_update(
-            Some(start_time),
-            streaming_data_update,
-            refresh.sql.as_deref(),
-        )
-        .await
-        .inspect_err(|e| {
+        if let Err(e) = self
+            .write_streaming_data_update(
+                Some(start_time),
+                streaming_data_update,
+                refresh.sql.as_deref(),
+            )
+            .await
+        {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
-            if !self.runtime_status.is_shutdown() {
-                tracing::warn!(
-                    "Failed to load data for {} {}: {}",
-                    self.component_type(),
-                    include_source_to_table_name(
-                        &self.dataset_name,
-                        self.federated_source.as_deref()
-                    ),
-                    inner_err_from_retry_ref(e)
-                );
+            if self.runtime_status.is_shutdown() {
+                return Ok(());
             }
-        })?;
+            tracing::warn!(
+                "Failed to load data for {} {}: {}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+                inner_err_from_retry_ref(&e)
+            );
+            return Err(e);
+        }
 
         // Only record metrics if a refresh was successful
         self.handle_metrics(
@@ -439,15 +496,17 @@ impl RefreshTask {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
                 Ok(None) => None,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
-                        self.component_type(),
-                        include_source_to_table_name(
-                            &self.dataset_name,
-                            self.federated_source.as_deref()
-                        ),
-                        e
-                    );
+                    if !self.runtime_status.is_shutdown() {
+                        tracing::warn!(
+                            "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
+                            self.component_type(),
+                            include_source_to_table_name(
+                                &self.dataset_name,
+                                self.federated_source.as_deref()
+                            ),
+                            e
+                        );
+                    }
                     None
                 }
             }
@@ -527,6 +586,7 @@ impl RefreshTask {
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
 
+        let resource_monitor = self.resource_monitor.clone();
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
@@ -536,6 +596,7 @@ impl RefreshTask {
                     dataset_name.to_string(),
                     notify_written_data_stat_available,
                     DataLoadTracing::new(&self.dataset_name),
+                    resource_monitor,
                 ),
                 move |(
                     mut stream,
@@ -543,6 +604,7 @@ impl RefreshTask {
                     ds_name,
                     notify_refresh_stat_available,
                     mut tracing,
+                    resource_monitor,
                 )| async move {
                     if let Some(batch) = stream.next().await {
                         match batch {
@@ -550,6 +612,12 @@ impl RefreshTask {
                                 tracing.on_new_batch_received(&batch);
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
+
+                                // Check memory usage after processing each batch
+                                if let Some(ref monitor) = resource_monitor {
+                                    monitor.check_memory_usage(&ds_name);
+                                }
+
                                 Some((
                                     Ok(batch),
                                     (
@@ -558,6 +626,7 @@ impl RefreshTask {
                                         ds_name,
                                         notify_refresh_stat_available,
                                         tracing,
+                                        resource_monitor,
                                     ),
                                 ))
                             }
@@ -569,6 +638,7 @@ impl RefreshTask {
                                     ds_name,
                                     notify_refresh_stat_available,
                                     tracing,
+                                    resource_monitor,
                                 ),
                             )),
                         }
@@ -659,18 +729,29 @@ impl RefreshTask {
             .await
             .map_err(RetryError::permanent)
         {
-            Ok(timestamp) => match self
-                .get_full_or_incremental_append_update(refresh, timestamp)
-                .await
-            {
-                Ok(data) => match self.except_existing_records_from(refresh, data).await {
-                    Ok(data) => Ok(data),
+            Ok(timestamp) => {
+                tracing::debug!(
+                    "Found max timestamp for {} {}: {:?}",
+                    self.component_type(),
+                    self.dataset_name,
+                    timestamp
+                );
+
+                match self
+                    .get_full_or_incremental_append_update(refresh, timestamp)
+                    .await
+                {
+                    Ok(data) => match self.except_existing_records_from(refresh, data).await {
+                        Ok(data) => Ok(data),
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            },
+                }
+            }
             Err(e) => {
-                tracing::error!("No latest timestamp is found: {e}");
+                if !self.runtime_status.is_shutdown() {
+                    tracing::error!("No latest timestamp is found: {e}");
+                }
                 Err(e)
             }
         }
@@ -1197,36 +1278,65 @@ impl RefreshTask {
 struct DataLoadTracing {
     dataset: TableReference,
     num_records_received: usize,
+    bytes_received: usize,
+    start_time: Instant,
     last_updated_time: Instant,
     log_interval: Duration,
 }
 
 impl DataLoadTracing {
     fn new(dataset: &TableReference) -> Self {
+        let now = Instant::now();
         Self {
             dataset: dataset.clone(),
             num_records_received: 0,
-            last_updated_time: Instant::now(),
+            bytes_received: 0,
+            start_time: now,
+            last_updated_time: now,
             log_interval: Duration::from_secs(10),
         }
     }
 
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
+        let batch_size = batch.get_array_memory_size();
+
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
+        self.bytes_received += batch_size;
 
-        // trace num loaded records and reset every 10 seconds
+        // Log progress every 10 seconds showing cumulative stats
         if self.last_updated_time.elapsed() > self.log_interval {
             let pretty_records = util::pretty_print_number(self.num_records_received);
+            let elapsed = self.start_time.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+
+            // Calculate throughput
+            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_sign_loss)]
+            let throughput = if elapsed_secs > 0.0 {
+                let bytes_per_sec = (self.bytes_received as f64 / elapsed_secs) as usize;
+                format!("{}/s", util::human_readable_bytes(bytes_per_sec))
+            } else {
+                "calculating...".to_string()
+            };
+
+            let size = util::human_readable_bytes(self.bytes_received);
+            let elapsed_str = format!("{}s", elapsed.as_secs());
 
             if is_spice_internal_dataset(&self.dataset) {
-                tracing::debug!("Dataset {} received {pretty_records} records", self.dataset);
+                tracing::debug!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             } else {
-                tracing::info!("Dataset {} received {pretty_records} records", self.dataset);
+                tracing::info!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             }
 
-            self.num_records_received = 0;
             self.last_updated_time = Instant::now();
         }
     }
@@ -1386,5 +1496,40 @@ fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_data_load_tracing_tracks_bytes_and_rows() {
+        let dataset = TableReference::bare("test_dataset");
+        let mut tracing = DataLoadTracing::new(&dataset);
+
+        // Create a test batch
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
+
+        let batch_size = batch.get_array_memory_size();
+        let num_rows = batch.num_rows();
+
+        // Process the batch
+        tracing.on_new_batch_received(&batch);
+
+        // Verify state
+        assert_eq!(tracing.num_records_received, num_rows);
+        assert_eq!(tracing.bytes_received, batch_size);
+        assert!(tracing.bytes_received > 0);
     }
 }

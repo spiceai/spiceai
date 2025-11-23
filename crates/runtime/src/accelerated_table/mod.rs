@@ -115,7 +115,7 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display(
-        "Failed to find latest timestamp in accelerated table. Is the 'time_column' parameter correct?"
+        "Failed to find latest timestamp in accelerated table: {source}. Is the 'time_column' parameter correct?"
     ))]
     FailedToQueryLatestTimestamp { source: DataFusionError },
 
@@ -157,9 +157,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
+
+    #[snafu(display("Failed to start refresh task. The task was already started."))]
+    RefreshTaskAlreadyStarted {},
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum AcceleratedTableBuilderError {
@@ -182,6 +185,19 @@ pub enum AcceleratedTableBuilderError {
         "A synchronized accelerated table requires full refresh mode. Set `refresh_mode` to 'full', and try again."
     ))]
     SynchronizedAcceleratedTableRequiresFullRefresh,
+
+    #[snafu(display(
+        "Refresh mode must be set to `changes` to use a changes stream. For details, visit: https://spiceai.org/docs/features/cdc"
+    ))]
+    ExpectedChangesModeForChangesStream,
+
+    #[snafu(display(
+        "Refresh mode must be set to `append` to use an append stream. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+    ))]
+    ExpectedAppendModeForAppendStream,
+
+    #[snafu(transparent)]
+    AcceleratedTableError { source: Error },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -265,6 +281,7 @@ pub struct Builder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl Builder {
@@ -301,6 +318,7 @@ impl Builder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -349,24 +367,22 @@ impl Builder {
         self
     }
 
+    pub fn with_resource_monitor(
+        &mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> &mut Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
     /// Set the changes stream for the accelerated table
-    ///
-    /// # Panics
-    ///
-    /// Panics if the refresh mode isn't `RefreshMode::Changes`.
     pub fn changes_stream(&mut self, changes_stream: ChangesStream) -> &mut Self {
-        assert!(self.refresh.mode == RefreshMode::Changes);
         self.changes_stream = Some(changes_stream);
         self
     }
 
     /// Set the append stream for the accelerated table
-    ///
-    /// # Panics
-    ///
-    /// Panics if the refresh mode isn't `RefreshMode::Append`.
     pub fn append_stream(&mut self, append_stream: ChangesStream) -> &mut Self {
-        assert!(self.refresh.mode == RefreshMode::Append);
         self.append_stream = Some(append_stream);
         self
     }
@@ -438,6 +454,14 @@ impl Builder {
     /// Build the accelerated table
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
+        if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
+            return ExpectedChangesModeForChangesStreamSnafu.fail();
+        }
+
+        if self.refresh.mode != RefreshMode::Append && self.append_stream.is_some() {
+            return ExpectedAppendModeForAppendStreamSnafu.fail();
+        }
+
         let on_complete_notification = Arc::new(Notify::new());
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
@@ -539,7 +563,11 @@ impl Builder {
         }
         refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
 
-        let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            refresher.with_resource_monitor(resource_monitor.clone());
+        }
+
+        let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
@@ -750,7 +778,7 @@ impl TableProvider for AcceleratedTable {
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
+        let plan: Arc<dyn ExecutionPlan> = match &self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => input,
             ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),

@@ -290,9 +290,9 @@ Run model evaluations (evals) test. In addition to the common options, supports 
 
 ### Running Vector Search Tests
 
-Running vector search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
 
-`testoperator run vector-search [OPTIONS]`
+`testoperator run search [OPTIONS]`
 
 ### Running Append Tests
 
@@ -309,3 +309,15 @@ Append tests are not built by default, as the File connector source generation r
 ```sh
 testoperator run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
 ```
+
+### Running queries on existing `spiced` instances
+
+Testoperator supports running query sets against `spiced` instances that are already running. This option is useful for running testoperator quickly, locally, for development or performance comparisons (e.g. between versions, changes, etc).
+
+To run queries on an existing `spiced` instance, ensure your `spiced` instance is running and ready. Then, run testoperator with:
+
+```sh
+testoperator run query --query-set tpch --query-overrides duckdb
+```
+
+Testoperator will run without explain plan or result snapshotting. Result validation is supported with `--validate`. Telemetry and metrics emission is not supported.

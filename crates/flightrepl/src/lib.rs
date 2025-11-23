@@ -22,6 +22,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use ansi_term::Colour;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
 use arrow_flight::{
@@ -136,6 +139,22 @@ const SPECIAL_COMMANDS: [&str; 8] = [
     ".clear history",
 ];
 const PROMPT_COLOR: Colour = Colour::Fixed(8);
+
+/// Set secure permissions (0600) on a file to ensure only the user can read/write it
+#[cfg(unix)]
+fn set_secure_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_secure_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    // On Windows, file permissions work differently
+    // The file is created with user-only access by default
+    Ok(())
+}
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -315,6 +334,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent.to_string(),
     )));
     if let Some(helper) = rl.helper_mut() {
+        // Perform initial refresh to populate autocomplete immediately with a 2-second timeout
+        let refresh_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), helper.refresh_now()).await;
+        if refresh_result.is_err() {
+            tracing::debug!("Initial autocomplete metadata refresh timed out after 2 seconds");
+        }
+        // Start background refresh task for updates
         helper.start_refreshing(300);
     }
 
@@ -396,10 +422,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 // Clear the readline history
                 let _ = rl.clear_history();
                 // Save the empty history to file (if path is available)
-                if let Some(ref path) = history_path
-                    && let Err(e) = rl.save_history(path)
-                {
-                    eprintln!("Warning: Failed to save cleared history: {e}");
+                if let Some(ref path) = history_path {
+                    if let Err(e) = rl.save_history(path) {
+                        eprintln!("Warning: Failed to save cleared history: {e}");
+                    } else if let Err(e) = set_secure_permissions(path) {
+                        eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+                    }
                 }
                 println!("Query history cleared.");
                 let _ = std::io::stdout().flush();
@@ -479,10 +507,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     }
 
     // Save history before exiting (if path is available)
-    if let Some(ref path) = history_path
-        && let Err(e) = rl.save_history(path)
-    {
-        eprintln!("Warning: Failed to save history on exit: {e}");
+    if let Some(ref path) = history_path {
+        if let Err(e) = rl.save_history(path) {
+            eprintln!("Warning: Failed to save history on exit: {e}");
+        } else if let Err(e) = set_secure_permissions(path) {
+            eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+        }
     }
 
     if let Some(helper) = rl.helper_mut() {
@@ -715,8 +745,9 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 }
 
 /// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+/// 280 is 2x 140,the X post length limit.
 fn lines_need_truncation(lines: &[&str]) -> bool {
-    lines.iter().any(|line| line.len() > 120)
+    lines.iter().any(|line| line.len() > 280)
 }
 
 fn display_grpc_error(err: &Status) {

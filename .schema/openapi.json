@@ -7,7 +7,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "1.9.0-unstable"
+    "version": "1.10.0-unstable"
   },
   "servers": [
     {
@@ -4396,7 +4396,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\nreturned within the response under `.primary_key`, not `.data`."
+            "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`."
           },
           "datasets": {
             "type": [
