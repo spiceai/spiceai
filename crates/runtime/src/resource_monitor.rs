@@ -15,8 +15,7 @@ limitations under the License.
 */
 
 use parking_lot::RwLock;
-use std::fs;
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 /// Monitors process resource usage and provides warnings at configurable thresholds.
@@ -72,7 +71,7 @@ fn get_container_memory_limit() -> Option<u64> {
 /// For containerized deployments, returns the container memory limit from cgroup.
 /// For bare-metal deployments, returns the system's total memory.
 ///
-/// This function is used internally by `ResourceMonitor` and by DataFusion
+/// This function is used internally by `ResourceMonitor` and by `DataFusion`
 /// to set default memory limits.
 #[must_use]
 pub fn get_total_memory() -> u64 {
@@ -122,7 +121,13 @@ impl ResourceMonitor {
     ///
     /// # Arguments
     /// * `context` - A descriptive context string (e.g., dataset name) to include in warning messages
+    ///
+    /// # Performance
+    /// This method performs blocking I/O operations (process info refresh). When calling from
+    /// async contexts, wrap in `tokio::task::spawn_blocking` to avoid blocking the async runtime.
     pub fn check_memory_usage(&self, context: &str) {
+        const THRESHOLDS: &[u8] = &[70, 80, 90, 95, 99];
+
         let mut inner = self.inner.write();
 
         let mut system = System::new();
@@ -146,69 +151,19 @@ impl ResourceMonitor {
         }
 
         // Only warn once per threshold crossing
-        if usage_percent >= 99 && inner.last_warning_threshold < 99 {
-            #[allow(clippy::cast_possible_truncation)]
-            tracing::warn!(
-                "Memory usage at 99% ({} / {}) while loading {}",
-                util::human_readable_bytes(process_memory as usize),
-                util::human_readable_bytes(inner.total_memory as usize),
-                context
-            );
-            inner.last_warning_threshold = 99;
-        } else if usage_percent >= 95 && inner.last_warning_threshold < 95 {
-            #[allow(clippy::cast_possible_truncation)]
-            tracing::warn!(
-                "Memory usage at 95% ({} / {}) while loading {}",
-                util::human_readable_bytes(process_memory as usize),
-                util::human_readable_bytes(inner.total_memory as usize),
-                context
-            );
-            inner.last_warning_threshold = 95;
-        } else if usage_percent >= 90 && inner.last_warning_threshold < 90 {
-            #[allow(clippy::cast_possible_truncation)]
-            tracing::warn!(
-                "Memory usage at 90% ({} / {}) while loading {}",
-                util::human_readable_bytes(process_memory as usize),
-                util::human_readable_bytes(inner.total_memory as usize),
-                context
-            );
-            inner.last_warning_threshold = 90;
-        } else if usage_percent >= 80 && inner.last_warning_threshold < 80 {
-            #[allow(clippy::cast_possible_truncation)]
-            tracing::warn!(
-                "Memory usage at 80% ({} / {}) while loading {}",
-                util::human_readable_bytes(process_memory as usize),
-                util::human_readable_bytes(inner.total_memory as usize),
-                context
-            );
-            inner.last_warning_threshold = 80;
-        } else if usage_percent >= 70 && inner.last_warning_threshold < 70 {
-            #[allow(clippy::cast_possible_truncation)]
-            tracing::warn!(
-                "Memory usage at 70% ({} / {}) while loading {}",
-                util::human_readable_bytes(process_memory as usize),
-                util::human_readable_bytes(inner.total_memory as usize),
-                context
-            );
-            inner.last_warning_threshold = 70;
-        }
-    }
-
-    /// Returns the current memory usage percentage.
-    ///
-    /// Returns `None` if the process information cannot be retrieved.
-    #[must_use]
-    pub fn current_usage_percent(&self) -> f64 {
-        let inner = self.inner.read();
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::Some(&[inner.pid]), true);
-        let process_memory = system.process(inner.pid).map(Process::memory).unwrap_or(0);
-        if inner.total_memory == 0 {
-            return 0.0;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        {
-            (process_memory as f64 / inner.total_memory as f64) * 100.0
+        #[allow(clippy::cast_possible_truncation)]
+        for &threshold in THRESHOLDS.iter().rev() {
+            if usage_percent >= threshold && inner.last_warning_threshold < threshold {
+                tracing::warn!(
+                    "Memory usage at {}% ({} / {}) while loading {}",
+                    threshold,
+                    util::human_readable_bytes(process_memory as usize),
+                    util::human_readable_bytes(inner.total_memory as usize),
+                    context
+                );
+                inner.last_warning_threshold = threshold;
+                break;
+            }
         }
     }
 }

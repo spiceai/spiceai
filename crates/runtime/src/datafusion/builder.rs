@@ -453,10 +453,12 @@ pub(crate) fn runtime_env(
         )]
         let default_limit = (total_memory as f64 * 0.70) as u64;
 
-        #[allow(clippy::cast_possible_truncation)]
         tracing::debug!(
             "No memory limit specified, defaulting to 70% of total memory: {}",
-            util::human_readable_bytes(default_limit as usize)
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                util::human_readable_bytes(default_limit as usize)
+            }
         );
         Some(default_limit)
     });
