@@ -1,0 +1,16 @@
+---
+source: crates/data_components/tests/http_provider_test.rs
+description: HTTP provider - multiple JSON objects (array)
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                            |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: tvmaze.request_path = Utf8("/search/people") AND tvmaze.request_query = Utf8("q=michael")                                                                               |
+|               |   TableScan: tvmaze projection=[request_path, request_query, content], partial_filters=[tvmaze.request_path = Utf8("/search/people"), tvmaze.request_query = Utf8("q=michael")] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
+|               |   FilterExec: request_path@0 = /search/people AND request_query@1 = q=michael                                                                                                   |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                                       |
+|               |       CooperativeExec                                                                                                                                                           |
+|               |         HttpExec: base_url=https://api.tvmaze.com/, format=json, partitions=[(path="/search/people", query="q=michael", body="")]                                               |
+|               |                                                                                                                                                                                 |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

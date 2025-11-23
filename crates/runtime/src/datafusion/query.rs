@@ -53,8 +53,6 @@ mod tracker;
 use {
     crate::config::ClusterMode,
     crate::datafusion::builder::default_extension_planners,
-    crate::datafusion::cluster::codec::spice_logical_codec::SpiceLogicalCodec,
-    crate::datafusion::cluster::config::SpiceClusterConfig,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
     datafusion::physical_planner::DefaultPhysicalPlanner,
@@ -69,11 +67,15 @@ use futures::StreamExt;
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
+#[cfg(feature = "cluster")]
+use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
+#[cfg(feature = "cluster")]
+use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 

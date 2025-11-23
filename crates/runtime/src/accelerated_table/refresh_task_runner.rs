@@ -148,6 +148,9 @@ pub struct RefreshTaskRunner {
 type RefreshRunFuture =
     BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
 
+type RefreshTaskStartSender = Sender<Option<RefreshOverrides>>;
+type RefreshTaskCompletionReceiver = Receiver<super::Result<()>>;
+
 impl RefreshTaskRunner {
     #[must_use]
     pub fn builder(
@@ -170,16 +173,12 @@ impl RefreshTaskRunner {
         )
     }
 
-    /// # Panics
-    ///
-    /// Panics if `start` is called more than once for the same runner instance.
     pub fn start(
         &mut self,
-    ) -> (
-        Sender<Option<RefreshOverrides>>,
-        Receiver<super::Result<()>>,
-    ) {
-        assert!(self.task.is_none());
+    ) -> super::Result<(RefreshTaskStartSender, RefreshTaskCompletionReceiver)> {
+        if self.task.is_some() {
+            return Err(super::Error::RefreshTaskAlreadyStarted {});
+        }
 
         let (start_refresh, mut on_start_refresh) = mpsc::channel::<Option<RefreshOverrides>>(1);
 
@@ -253,7 +252,7 @@ impl RefreshTaskRunner {
             }
         }));
 
-        (start_refresh, on_refresh_complete)
+        Ok((start_refresh, on_refresh_complete))
     }
 
     /// Subscribes a new acceleration table provider to the existing `AccelerationSink` managed by this `RefreshTask`.

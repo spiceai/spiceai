@@ -470,7 +470,7 @@ impl Runtime {
 
         // Updating a dataset may cause the cached LogicalPlans to be
         // obsolete, so we remove them
-        self.df.clear_cached_plans();
+        self.df.clear_cached_plans().await;
 
         match Arc::clone(&self)
             .load_dataset_connector(Arc::clone(&ds))

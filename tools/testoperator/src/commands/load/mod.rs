@@ -109,7 +109,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     print_batches(&records)?;
     let spiced_instance = test.end()?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     // load test
     println!("Running load test");
