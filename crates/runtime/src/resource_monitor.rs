@@ -95,13 +95,14 @@ impl ResourceMonitor {
         system.refresh_memory();
 
         // Prefer container memory limit if available, otherwise use system memory
-        let total_memory = get_container_memory_limit().unwrap_or_else(|| {
+        let container_limit = get_container_memory_limit();
+        let total_memory = container_limit.unwrap_or_else(|| {
             let system_memory = system.total_memory();
             tracing::debug!("Using system memory limit: {} bytes", system_memory);
             system_memory
         });
 
-        if get_container_memory_limit().is_some() {
+        if container_limit.is_some() {
             tracing::debug!("Detected container memory limit: {} bytes", total_memory);
         }
 
