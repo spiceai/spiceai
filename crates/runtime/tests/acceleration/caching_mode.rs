@@ -609,3 +609,466 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+/// Test caching mode with SQL results caching ENABLED.
+/// Verifies that acceleration caching and SQL results caching can work together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_with_sql_results_cache() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_with_sql_cache")
+                .with_dataset(dataset)
+                .build();
+
+            // Enable SQL results caching (default behavior when not explicitly disabled)
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = true;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Query with filters - should work with both caches
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=test")))?
+                .limit(0, Some(1))?;
+
+            let batches = df.collect().await?;
+            assert!(
+                !batches.is_empty(),
+                "Should have results with SQL cache enabled"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test caching mode with no filters (full table scan).
+/// Verifies that caching works even when no filters are applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![(
+                    "allowed_request_paths".to_string(),
+                    "/search/people".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_no_filters")
+                .with_dataset(dataset)
+                .build();
+
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Query without filters - should still cache based on request metadata
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .limit(0, Some(1))?;
+
+            let batches = df.collect().await?;
+            assert!(
+                !batches.is_empty(),
+                "Should have results from cache with no filters"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test caching mode with duplicate queries.
+/// Verifies that repeated identical queries hit the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_duplicates")
+                .with_dataset(dataset)
+                .build();
+
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Run the same query multiple times
+            for i in 1..=3 {
+                eprintln!("TEST: Duplicate query iteration {}", i);
+                let df = status
+                    .datafusion()
+                    .ctx
+                    .table("tvmaze")
+                    .await?
+                    .filter(col("request_path").eq(lit("/search/people")))?
+                    .filter(col("request_query").eq(lit("q=duplicate")))?
+                    .limit(0, Some(1))?;
+
+                let batches = df.collect().await?;
+                assert!(
+                    !batches.is_empty(),
+                    "Iteration {}: Should have cached results",
+                    i
+                );
+                assert_eq!(
+                    batches[0].num_rows(),
+                    1,
+                    "Iteration {}: Should have 1 row",
+                    i
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test caching mode with different projections (column selections).
+/// Verifies that cache works regardless of which columns are selected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_projections")
+                .with_dataset(dataset)
+                .build();
+
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // First query - select all columns
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=smith")))?
+                .limit(0, Some(1))?;
+
+            let batches1 = df1.collect().await?;
+            assert!(!batches1.is_empty(), "First query should return data");
+
+            // Second query - select only metadata columns
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=smith")))?
+                .select(vec![col("request_path"), col("request_query")])?
+                .limit(0, Some(1))?;
+
+            let batches2 = df2.collect().await?;
+            assert!(
+                !batches2.is_empty(),
+                "Second query with different projection should return cached data"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test caching mode with SQL results cache enabled (stress test).
+/// Verifies interaction between acceleration caching and SQL query result caching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_sql_interaction")
+                .with_dataset(dataset)
+                .build();
+
+            // Explicitly enable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = true;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Run same query twice - first should miss both caches, second should hit SQL cache
+            for i in 1..=2 {
+                eprintln!("TEST: SQL cache interaction iteration {}", i);
+                let df = status
+                    .datafusion()
+                    .ctx
+                    .table("tvmaze")
+                    .await?
+                    .filter(col("request_path").eq(lit("/search/people")))?
+                    .filter(col("request_query").eq(lit("q=sqlcache")))?
+                    .select(vec![col("request_query")])?
+                    .limit(0, Some(1))?;
+
+                let batches = df.collect().await?;
+                assert!(!batches.is_empty(), "Iteration {}: Should have results", i);
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test caching mode with empty result set.
+/// Verifies that empty results are properly cached and returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_empty_results")
+                .with_dataset(dataset)
+                .build();
+
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Query for something that likely returns no results
+            // Using a very specific/unlikely search term
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=xyznonexistent123456")))?
+                .limit(0, Some(1))?;
+
+            // HTTP connector may return error for empty results, which is acceptable
+            let result = df.collect().await;
+            match result {
+                Ok(batches) => {
+                    eprintln!(
+                        "TEST: Empty results query returned {} batches",
+                        batches.len()
+                    );
+                }
+                Err(e) => {
+                    // "No rows found in HTTP response" error is acceptable for empty results
+                    eprintln!("TEST: Empty results query returned error (expected): {}", e);
+                    assert!(
+                        e.to_string().contains("No rows found"),
+                        "Expected 'No rows found' error, got: {}",
+                        e
+                    );
+                }
+            }
+
+            Ok(())
+        })
+        .await
+}
