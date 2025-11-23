@@ -104,6 +104,7 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
 
@@ -480,6 +481,8 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     #[allow(dead_code)] // used in "cluster" feature
     config: Arc<Config>,
 }
@@ -545,6 +548,11 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
     }
 
     #[must_use]
