@@ -2,7 +2,7 @@
 source: crates/runtime-table-partition/tests/partition_table_provider.rs
 expression: explain_plan
 ---
-UnionExec
+PartitionedUnionExec
   PartitionMemTableExec: partition_value=0, filters=[user_id > Int32(50), user_id <= Int32(70)]
   PartitionMemTableExec: partition_value=1, filters=[user_id > Int32(50), user_id <= Int32(70)]
   PartitionMemTableExec: partition_value=3, filters=[user_id > Int32(50), user_id <= Int32(70)]
