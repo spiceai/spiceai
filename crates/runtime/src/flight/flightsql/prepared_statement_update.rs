@@ -200,6 +200,8 @@ pub(crate) async fn do_put_update(
             }
         }
     }
+    encoder.finish().map_err(error_to_status)?;
+
     if total_rows > 1 {
         return Err(Status::invalid_argument(
             "parameters should contain a single row",

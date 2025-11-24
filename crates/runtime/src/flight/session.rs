@@ -47,11 +47,12 @@ limitations under the License.
 
 use dashmap::DashMap;
 use datafusion::prelude::SessionContext;
+use http::HeaderMap;
 use std::sync::Arc;
 use tonic::metadata::MetadataMap;
 use uuid::Uuid;
 
-/// Manages Flight SQL sessions, mapping session IDs to DataFusion `SessionContext` instances.
+/// Manages Flight SQL sessions, mapping session IDs to `DataFusion` `SessionContext` instances.
 ///
 /// This enables stateful operations like SQL PREPARE/EXECUTE across multiple Flight SQL requests.
 #[derive(Clone)]
@@ -79,6 +80,7 @@ impl SessionStore {
     /// Creates a new session with a unique ID and returns both the ID and the context.
     ///
     /// The session context is created from the provided base context's state.
+    #[must_use]
     pub fn create_session(&self, base_ctx: &SessionContext) -> (String, Arc<SessionContext>) {
         let session_id = Uuid::new_v4().hyphenated().to_string();
         let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
@@ -104,6 +106,7 @@ impl SessionStore {
     /// using the provided base context.
     ///
     /// Returns `None` if no authorization header is present.
+    #[must_use]
     pub fn get_or_create_session(
         &self,
         metadata: &MetadataMap,
@@ -134,7 +137,7 @@ impl SessionStore {
         headers: &http::HeaderMap,
         base_ctx: &SessionContext,
     ) -> Option<Arc<SessionContext>> {
-        let session_id = extract_session_id_from_http(headers)?;
+        let session_id = extract_session_id_from_headers(headers)?;
 
         tracing::debug!(
             "Flight SQL session: ID={}, existing_sessions={}",
@@ -158,6 +161,7 @@ impl SessionStore {
     /// Removes a session from the store.
     ///
     /// Returns `true` if the session existed and was removed.
+    #[must_use]
     pub fn remove_session(&self, session_id: &str) -> bool {
         self.sessions.remove(session_id).is_some()
     }
@@ -184,23 +188,23 @@ impl Default for SessionStore {
 /// Returns None if neither header is present.
 fn extract_session_id(metadata: &MetadataMap) -> Option<String> {
     // Try x-session-id header (standard approach)
-    if let Some(session_header) = metadata.get("x-session-id") {
-        if let Ok(session_id) = session_header.to_str() {
-            return Some(session_id.to_string());
-        }
+    if let Some(session_header) = metadata.get("x-session-id")
+        && let Ok(session_id) = session_header.to_str()
+    {
+        return Some(session_id.to_string());
     }
 
     // Fallback to Authorization Bearer token for compatibility
     // This allows clients that use handshake() to have session persistence
     // even if they don't explicitly set x-session-id headers
-    if let Some(auth_header) = metadata.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                return Some(token.to_string());
-            }
-            if let Some(token) = auth_str.strip_prefix("bearer ") {
-                return Some(token.to_string());
-            }
+    if let Some(auth_header) = metadata.get("authorization")
+        && let Ok(auth_str) = auth_header.to_str()
+    {
+        if let Some(token) = auth_str.strip_prefix("Bearer ") {
+            return Some(token.to_string());
+        }
+        if let Some(token) = auth_str.strip_prefix("bearer ") {
+            return Some(token.to_string());
         }
     }
 
@@ -214,25 +218,23 @@ fn extract_session_id(metadata: &MetadataMap) -> Option<String> {
 /// 2. Authorization header Bearer token (fallback for compatibility)
 ///
 /// Returns None if neither header is present.
-fn extract_session_id_from_http(headers: &http::HeaderMap) -> Option<String> {
-    // Try x-session-id header (standard approach)
-    if let Some(session_header) = headers.get("x-session-id") {
-        if let Ok(session_id) = session_header.to_str() {
-            return Some(session_id.to_string());
-        }
+fn extract_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    // First try x-session-id header (preferred)
+    if let Some(session_header) = headers.get("x-session-id")
+        && let Ok(session_id) = session_header.to_str()
+    {
+        return Some(session_id.to_string());
     }
 
-    // Fallback to Authorization Bearer token for compatibility
-    // This allows clients that use handshake() to have session persistence
-    // even if they don't explicitly set x-session-id headers
-    if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                return Some(token.to_string());
-            }
-            if let Some(token) = auth_str.strip_prefix("bearer ") {
-                return Some(token.to_string());
-            }
+    // Fall back to authorization header for backward compatibility
+    if let Some(auth_header) = headers.get("authorization")
+        && let Ok(auth_str) = auth_header.to_str()
+    {
+        if let Some(token) = auth_str.strip_prefix("Bearer ") {
+            return Some(token.to_string());
+        }
+        if let Some(token) = auth_str.strip_prefix("bearer ") {
+            return Some(token.to_string());
         }
     }
 

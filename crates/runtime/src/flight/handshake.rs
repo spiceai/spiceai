@@ -45,17 +45,17 @@ pub(crate) async fn handle(
     let start = track_flight_request("handshake", None).await;
 
     // Validate authentication if required
-    let _auth_token = flight_auth::validate_basic_auth_handshake(metadata, basic_auth)?;
-    
+    let auth_token = flight_auth::validate_basic_auth_handshake(metadata, basic_auth)?;
+
     // Get the base DataFusion context from the request context
     let request_context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&request_context);
-    
+
     // Create a new session from the base context
     let (session_id, _session_ctx) = session_store.create_session(&datafusion.ctx);
-    
+
     tracing::debug!("Created new Flight SQL session: {}", session_id);
-    
+
     // Return the session ID in the response payload
     let result = HandshakeResponse {
         protocol_version: 0,
@@ -64,21 +64,19 @@ pub(crate) async fn handle(
     let result = Ok(result);
     let output = TimedStream::new(futures::stream::iter(vec![result]), || start);
     let mut resp: Response<HandshakeResponseStream> = Response::new(Box::pin(output));
-    
+
     // Add session ID as a header for standard session tracking
     let session_header = MetadataValue::try_from(session_id.clone())
         .map_err(|_| Status::internal("generated session ID could not be parsed"))?;
     resp.metadata_mut().insert("x-session-id", session_header);
-    
+
     // If there was an auth token, still return it for backward compatibility
-    if let Some(auth_token) = _auth_token {
+    if let Some(auth_token) = auth_token {
         let auth_str = format!("Bearer {auth_token}");
         let md = MetadataValue::try_from(auth_str)
             .map_err(|_| Status::internal("generated authorization could not be parsed"))?;
         resp.metadata_mut().insert("authorization", md);
     }
-    
+
     Ok(resp)
 }
-
-

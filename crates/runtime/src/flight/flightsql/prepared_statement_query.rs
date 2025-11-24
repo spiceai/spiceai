@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, ops::ControlFlow};
+use std::{borrow::Cow, ops::ControlFlow, sync::Arc};
 
-use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_flight::{
@@ -35,7 +34,7 @@ use datafusion::sql::sqlparser::{
     dialect::GenericDialect,
     parser::{Parser, ParserError},
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -123,6 +122,7 @@ pub(crate) struct PreparedStatement {
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 mod param_values_serde {
     use arrow::array::RecordBatch;
     use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
@@ -388,7 +388,8 @@ pub(crate) async fn do_get(
 
     // Use the standard flow with the (possibly rewritten) SQL
     // Ensure the query execution happens within the request context scope
-    let (output, from_cache) = context
+    let context_clone = Arc::clone(&context);
+    let (output, from_cache) = context_clone
         .scope(async {
             Box::pin(Service::sql_to_flight_stream(
                 datafusion,
@@ -1154,6 +1155,11 @@ mod tests {
         // 4. The parameterized query pattern (used by prepared statements) functions properly
     }
 
+    #[allow(
+        clippy::similar_names,
+        clippy::redundant_closure_for_method_calls,
+        clippy::too_many_lines
+    )]
     #[tokio::test]
     async fn test_prepare_execute_with_dataframe_api() {
         use arrow::array::{Int64Array, RecordBatch, StringArray};

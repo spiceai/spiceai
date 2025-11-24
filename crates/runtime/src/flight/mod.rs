@@ -451,10 +451,18 @@ fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
     false
 }
 
-/// Starts flight service
+/// Starts the Flight server.
+///
+/// # Errors
+///
+/// Returns an error if the server fails to bind to the specified address or if there are issues
+/// with TLS setup.
+///
 /// # Panics
-/// If running in clustered mode, will panic unless TLS is configured or user manually overrides
-/// this safety check, as RPC will transmit sensitive information to executors.
+///
+/// Panics if running in clustered mode without TLS configuration and the `--allow-insecure-connections`
+/// flag is not set, as RPC will transmit sensitive information to executors.
+#[allow(clippy::too_many_lines)]
 pub async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,
