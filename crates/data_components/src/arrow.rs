@@ -18,15 +18,11 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProviderFactory},
-    common::Constraint,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::util::{
-    column_reference::ColumnReference,
-    on_conflict::OnConflict,
-};
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::sync::Arc;
 
 use crate::delete::DeletionTableProviderAdapter;
@@ -60,11 +56,11 @@ impl TableProviderFactory for ArrowFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let schema: SchemaRef = Arc::new(cmd.schema.as_arrow().clone());
-        
+
         let mut mem_table = MemTable::try_new(schema, vec![])?
             .try_with_constraints(cmd.constraints.clone())
             .await?;
-        
+
         // Only set on_conflict if explicitly provided in options
         // For primary key constraints, MemTable will use them directly without needing on_conflict
         if let Some(on_conflict_str) = cmd.options.get("on_conflict") {

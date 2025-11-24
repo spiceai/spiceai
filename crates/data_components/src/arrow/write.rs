@@ -220,7 +220,6 @@ impl MemTable {
     ) -> Result<()> {
         let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
         let schema = self.schema();
-        let pk_names: Vec<String> = pk.iter().map(|&idx| schema.field(idx).name().clone()).collect();
 
         if on_conflict_cols.len() != pk.len() {
             return Err(DataFusionError::Execution(
@@ -228,7 +227,7 @@ impl MemTable {
             ));
         }
 
-        for (i, (c, pk_idx)) in on_conflict_cols.iter().zip(pk.iter()).enumerate() {
+        for (c, pk_idx) in on_conflict_cols.iter().zip(pk.iter()) {
             let pk_name = schema.field(*pk_idx).name();
             if c != pk_name {
                 return Err(DataFusionError::Execution(
@@ -946,7 +945,7 @@ impl DataSink for MemSink {
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
-            
+
             // For InsertOp::Replace, we don't require unique primary keys in new data
             // because we'll remove all existing rows with these keys before inserting
             if matches!(self.overwrite, InsertOp::Replace) {

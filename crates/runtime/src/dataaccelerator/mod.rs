@@ -251,7 +251,8 @@ impl AcceleratorEngineRegistry {
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
-            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
+            let _primary_keys: Vec<String> =
+                get_primary_keys_from_constraints(constraints, &schema);
         }
 
         if let Some(on_conflict) =
@@ -493,7 +494,10 @@ impl AcceleratorExternalTableBuilder {
 
         if let Some(on_conflict) = self.on_conflict {
             let on_conflict_str = on_conflict.to_string();
-            tracing::info!("[UPSERT DEBUG] Adding on_conflict to options: {}", on_conflict_str);
+            tracing::info!(
+                "[UPSERT DEBUG] Adding on_conflict to options: {}",
+                on_conflict_str
+            );
             options.insert("on_conflict".to_string(), on_conflict_str);
         }
 

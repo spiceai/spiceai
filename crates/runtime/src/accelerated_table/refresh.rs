@@ -281,23 +281,19 @@ impl Refresh {
             RefreshMode::Caching => {
                 // If refresh_check_interval is set, enable periodic refresh for stale data
                 if let Some(check_interval) = self.check_interval {
-                    eprintln!(
-                        "!!!!! CACHING MODE WITH INTERVAL: {:?} !!!!!",
-                        check_interval
-                    );
+                    eprintln!("!!!!! CACHING MODE WITH INTERVAL: {check_interval:?} !!!!!");
                     tracing::info!(
                         "Caching mode with refresh_check_interval={:?} - enabling periodic stale data refresh",
                         check_interval
                     );
                     // Start the periodic timer - the first refresh will happen after check_interval
                     return NextRefresh::WaitFor(check_interval);
-                } else {
-                    eprintln!("!!!!! CACHING MODE WITHOUT INTERVAL !!!!!");
-                    tracing::debug!(
-                        "Caching mode without refresh_check_interval - on-demand refresh only"
-                    );
-                    return NextRefresh::Disabled;
                 }
+                eprintln!("!!!!! CACHING MODE WITHOUT INTERVAL !!!!!");
+                tracing::debug!(
+                    "Caching mode without refresh_check_interval - on-demand refresh only"
+                );
+                return NextRefresh::Disabled;
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
@@ -734,29 +730,22 @@ impl Refresher {
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
         Ok(Some(tokio::spawn(async move {
-            eprintln!(
-                "!!!!! Refresh task loop starting for dataset {} !!!!!",
-                dataset_name
-            );
+            eprintln!("!!!!! Refresh task loop starting for dataset {dataset_name} !!!!!");
             let mut next_scheduled_refresh_timer =
                 initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
 
             eprintln!(
-                "!!!!! Initial refresh delay: {:?}, refresh_check_interval: {:?} !!!!!",
-                initial_refresh_delay, refresh_check_interval
+                "!!!!! Initial refresh delay: {initial_refresh_delay:?}, refresh_check_interval: {refresh_check_interval:?} !!!!!"
             );
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
-                    match next_scheduled_refresh_timer.take() {
-                        Some(timer) => {
-                            eprintln!("!!!!! Timer is set, waiting for it to fire !!!!!");
-                            Box::pin(timer)
-                        }
-                        None => {
-                            eprintln!("!!!!! No timer set, waiting indefinitely !!!!!");
-                            Box::pin(std::future::pending())
-                        }
+                    if let Some(timer) = next_scheduled_refresh_timer.take() {
+                        eprintln!("!!!!! Timer is set, waiting for it to fire !!!!!");
+                        Box::pin(timer)
+                    } else {
+                        eprintln!("!!!!! No timer set, waiting indefinitely !!!!!");
+                        Box::pin(std::future::pending())
                     };
 
                 select! {
@@ -782,7 +771,7 @@ impl Refresher {
                         }
                     },
                     Some(res) = on_refresh_complete.recv() => {
-                        eprintln!("!!!!! Refresh task completion received: {:?} !!!!!", res);
+                        eprintln!("!!!!! Refresh task completion received: {res:?} !!!!!");
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
                         if let Ok(()) = res {

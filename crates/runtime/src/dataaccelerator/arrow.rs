@@ -79,7 +79,7 @@ impl DataAccelerator for ArrowAccelerator {
         let is_caching_mode = source
             .and_then(|s| s.acceleration())
             .and_then(|a| a.refresh_mode.as_ref())
-            .is_some_and(|mode| matches!(mode, RefreshMode::Caching { .. }));
+            .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
 
         let cmd = if is_caching_mode {
             let mut cmd = cmd;

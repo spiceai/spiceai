@@ -22,24 +22,24 @@ limitations under the License.
 //! ## Implementation
 //!
 //! Caching mode uses `InsertOp::Append` with primary key constraints on metadata
-//! columns (request_path, request_query, request_body). This enables automatic upsert
+//! columns (`request_path`, `request_query`, `request_body`). This enables automatic upsert
 //! behavior: when data with the same metadata is inserted, it replaces the existing
 //! cached data. Different filter combinations are cached simultaneously.
 //!
 //! ## Accelerator Support
 //!
-//! **DuckDB and Cayenne**: Full multi-filter caching support with upsert behavior.
+//! **`DuckDB` and Cayenne**: Full multi-filter caching support with upsert behavior.
 //!
 //! **Arrow/MemTable**: Limited to single-query caching due to a datafusion-table-providers
 //! limitation where `ColumnReference::new()` sorts column names alphabetically, causing
 //! primary key validation to fail. This is acceptable since Arrow/MemTable is typically
-//! used for testing, while production deployments use DuckDB or Cayenne.
+//! used for testing, while production deployments use `DuckDB` or Cayenne.
 //!
 //! ## Tests
 //!
 //! - `test_caching_mode_filter_propagation`: Basic cache miss and hit workflow
 //! - `test_caching_mode_multi_filter_limitation`: Verifies overwrite behavior (for Arrow)
-//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with DuckDB (currently ignored due to issues)
+//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `DuckDB` (currently ignored due to issues)
 //! - `test_caching_mode_multi_filter_cayenne`: Multi-filter caching with Cayenne (SQLite+Vortex)
 //! - `test_caching_mode_background_refresh_on_miss`: Background refresh triggered on cache miss
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
@@ -192,10 +192,10 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 /// Test verifying multi-filter caching behavior with Arrow/MemTable accelerator.
 ///
 /// This test demonstrates that with Arrow/MemTable, caching mode uses overwrite behavior
-/// due to the ColumnReference sorting limitation in datafusion-table-providers.
+/// due to the `ColumnReference` sorting limitation in datafusion-table-providers.
 /// This is expected and acceptable since Arrow is primarily for testing.
 ///
-/// For production use with DuckDB or Cayenne accelerators, multi-filter caching
+/// For production use with `DuckDB` or Cayenne accelerators, multi-filter caching
 /// works correctly with upsert behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
@@ -400,7 +400,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
         .await
 }
 
-/// Test verifying ideal multi-filter caching behavior with DuckDB.
+/// Test verifying ideal multi-filter caching behavior with `DuckDB`.
 ///
 /// This test verifies that multiple filter combinations can be cached simultaneously:
 /// 1. Query with filter A → cache miss → fetch → cache stores A
@@ -408,9 +408,9 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 3. Query with filter A → cache hit → served from cache (no HTTP fetch)
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
-/// Uses DuckDB accelerator which supports upsert-based multi-filter caching.
+/// Uses `DuckDB` accelerator which supports upsert-based multi-filter caching.
 ///
-/// NOTE: Currently DuckDB caching mode has issues - queries return empty results.
+/// NOTE: Currently `DuckDB` caching mode has issues - queries return empty results.
 /// Investigation needed. Test runs when duckdb feature is enabled but is currently failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "DuckDB caching mode needs investigation - queries return empty"]
@@ -489,10 +489,10 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             eprintln!(
                 "TEST: Step 1 returned {} batches with {} rows",
                 batches1.len(),
-                if !batches1.is_empty() {
-                    batches1[0].num_rows()
-                } else {
+                if batches1.is_empty() {
                     0
+                } else {
+                    batches1[0].num_rows()
                 }
             );
             assert!(
@@ -516,10 +516,10 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             eprintln!(
                 "TEST: Step 2 returned {} batches with {} rows",
                 batches2.len(),
-                if !batches2.is_empty() {
-                    batches2[0].num_rows()
-                } else {
+                if batches2.is_empty() {
                     0
+                } else {
+                    batches2[0].num_rows()
                 }
             );
             assert!(
@@ -544,10 +544,10 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             eprintln!(
                 "TEST: Step 3 returned {} batches with {} rows",
                 batches3.len(),
-                if !batches3.is_empty() {
-                    batches3[0].num_rows()
-                } else {
+                if batches3.is_empty() {
                     0
+                } else {
+                    batches3[0].num_rows()
                 }
             );
             assert!(
@@ -584,10 +584,10 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             eprintln!(
                 "TEST: Step 4 returned {} batches with {} rows",
                 batches4.len(),
-                if !batches4.is_empty() {
-                    batches4[0].num_rows()
-                } else {
+                if batches4.is_empty() {
                     0
+                } else {
+                    batches4[0].num_rows()
                 }
             );
             assert!(
@@ -626,7 +626,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 ///
 /// Uses Cayenne accelerator which supports upsert-based multi-filter caching.
 ///
-/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to DuckDB - queries return empty results.
+/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
 /// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "sqlite")]
@@ -684,7 +684,11 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
             runtime_ready_check(&status).await;
 
             // STEP 1: Query for "michael" - cache miss
-            let df1 = status.datafusion().ctx.table("tvmaze").await?
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
                 .filter(col("request_query").eq(lit("q=michael")))?
                 .limit(0, Some(1))?;
@@ -968,7 +972,7 @@ async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
 
             // Run the same query multiple times
             for i in 1..=3 {
-                eprintln!("TEST: Duplicate query iteration {}", i);
+                eprintln!("TEST: Duplicate query iteration {i}");
                 let df = status
                     .datafusion()
                     .ctx
@@ -981,15 +985,9 @@ async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
                 let batches = df.collect().await?;
                 assert!(
                     !batches.is_empty(),
-                    "Iteration {}: Should have cached results",
-                    i
+                    "Iteration {i}: Should have cached results"
                 );
-                assert_eq!(
-                    batches[0].num_rows(),
-                    1,
-                    "Iteration {}: Should have 1 row",
-                    i
-                );
+                assert_eq!(batches[0].num_rows(), 1, "Iteration {i}: Should have 1 row");
             }
 
             Ok(())
@@ -1135,7 +1133,7 @@ async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> 
 
             // Run same query twice - first should miss both caches, second should hit SQL cache
             for i in 1..=2 {
-                eprintln!("TEST: SQL cache interaction iteration {}", i);
+                eprintln!("TEST: SQL cache interaction iteration {i}");
                 let df = status
                     .datafusion()
                     .ctx
@@ -1147,7 +1145,7 @@ async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> 
                     .limit(0, Some(1))?;
 
                 let batches = df.collect().await?;
-                assert!(!batches.is_empty(), "Iteration {}: Should have results", i);
+                assert!(!batches.is_empty(), "Iteration {i}: Should have results");
             }
 
             Ok(())
@@ -1227,11 +1225,10 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
                 }
                 Err(e) => {
                     // "No rows found in HTTP response" error is acceptable for empty results
-                    eprintln!("TEST: Empty results query returned error (expected): {}", e);
+                    eprintln!("TEST: Empty results query returned error (expected): {e}");
                     assert!(
                         e.to_string().contains("No rows found"),
-                        "Expected 'No rows found' error, got: {}",
-                        e
+                        "Expected 'No rows found' error, got: {e}"
                     );
                 }
             }
@@ -1309,7 +1306,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
                 .limit(0, Some(1))?;
 
             let batches1_result = df1.collect().await;
-            
+
             // Handle potential API rate limiting or empty results
             let batches1 = match batches1_result {
                 Ok(batches) if !batches.is_empty() && batches[0].num_rows() > 0 => batches,
@@ -1318,7 +1315,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
                     return Ok(());
                 }
             };
-            
+
             assert_eq!(batches1[0].num_rows(), 1, "Should have 1 row");
 
             let batch1 = &batches1[0];
@@ -1361,7 +1358,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
                 "q=background",
                 "Should return cached data"
             );
-            
+
             // Verify data has fetched_at timestamp (proving it was cached by background refresh)
             let fetched_at_array2 = batch2
                 .column(2)
@@ -1457,7 +1454,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 "Should have results from initial query"
             );
             assert_eq!(batches1[0].num_rows(), 1, "Should have 1 row");
-            
+
             // Capture the initial fetched_at timestamp
             let batch1 = &batches1[0];
             let fetched_at_array1 = batch1
@@ -1466,7 +1463,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 .downcast_ref::<TimestampNanosecondArray>()
                 .expect("fetched_at should be TimestampNanosecondArray");
             let initial_fetched_at = fetched_at_array1.value(0);
-            eprintln!("TEST: Step 1 complete - cache populated with fresh data (fetched_at: {})", initial_fetched_at);
+            eprintln!("TEST: Step 1 complete - cache populated with fresh data (fetched_at: {initial_fetched_at})");
 
             // Small delay to ensure cache is populated
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1506,7 +1503,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 "q=staleness",
                 "Should return data (even though stale)"
             );
-            
+
             // Verify this is still the old data (same fetched_at as initial)
             let fetched_at_array2 = batch2
                 .column(2)
@@ -1518,7 +1515,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 stale_fetched_at, initial_fetched_at,
                 "Should return stale data with original timestamp"
             );
-            eprintln!("TEST: Step 3 complete - stale data returned (fetched_at unchanged: {}), background refresh triggered", stale_fetched_at);
+            eprintln!("TEST: Step 3 complete - stale data returned (fetched_at unchanged: {stale_fetched_at}), background refresh triggered");
 
             // Wait for background refresh to complete
             eprintln!("TEST: Waiting for background refresh to update cache...");
@@ -1539,7 +1536,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
             let batches3 = df3.collect().await?;
             assert!(!batches3.is_empty(), "Should have refreshed cache data");
             assert_eq!(batches3[0].num_rows(), 1, "Should have 1 row");
-            
+
             // Verify the fetched_at timestamp was updated (background refresh occurred)
             let batch3 = &batches3[0];
             let fetched_at_array3 = batch3
@@ -1548,14 +1545,12 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
                 .downcast_ref::<TimestampNanosecondArray>()
                 .expect("fetched_at should be TimestampNanosecondArray");
             let refreshed_fetched_at = fetched_at_array3.value(0);
-            
+
             assert!(
                 refreshed_fetched_at > initial_fetched_at,
-                "fetched_at should be updated after background refresh (initial: {}, refreshed: {})",
-                initial_fetched_at,
-                refreshed_fetched_at
+                "fetched_at should be updated after background refresh (initial: {initial_fetched_at}, refreshed: {refreshed_fetched_at})"
             );
-            eprintln!("TEST: Step 4 complete - cache refreshed in background (new fetched_at: {}, delta: {} ns)", 
+            eprintln!("TEST: Step 4 complete - cache refreshed in background (new fetched_at: {}, delta: {} ns)",
                 refreshed_fetched_at,
                 refreshed_fetched_at - initial_fetched_at
             );
@@ -1572,14 +1567,14 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
         .await
 }
 
-/// Test that caching mode with refresh_check_interval periodically refreshes stale data
-/// and evicts old data when retention_period is set.
+/// Test that caching mode with `refresh_check_interval` periodically refreshes stale data
+/// and evicts old data when `retention_period` is set.
 ///
 /// This test verifies:
 /// 1. Initial query populates cache
 /// 2. Data becomes stale after TTL
-/// 3. Periodic refresh task (based on refresh_check_interval) updates stale data automatically
-/// 4. Old data beyond retention_period is evicted from cache
+/// 3. Periodic refresh task (based on `refresh_check_interval`) updates stale data automatically
+/// 4. Old data beyond `retention_period` is evicted from cache
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1655,8 +1650,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
                 .expect("fetched_at should be TimestampNanosecondArray");
             let initial_fetched_at = fetched_at_array.value(0);
             let initial_row_count = results[0].num_rows();
-            eprintln!("TEST: Step 1 complete - cache populated with {} row(s), initial fetched_at: {}", 
-                initial_row_count, initial_fetched_at);
+            eprintln!("TEST: Step 1 complete - cache populated with {initial_row_count} row(s), initial fetched_at: {initial_fetched_at}");
 
             // Step 2: Wait for refresh_check_interval to potentially trigger
             // For caching mode, the interval refresh should check for stale data and refresh it
@@ -1681,7 +1675,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
                 .downcast_ref::<TimestampNanosecondArray>()
                 .expect("fetched_at should be TimestampNanosecondArray");
             let refreshed_fetched_at = fetched_at_array3.value(0);
-            
+
             eprintln!("TEST: Initial fetched_at: {}, After interval: {}, Delta: {} ns",
                 initial_fetched_at, refreshed_fetched_at, refreshed_fetched_at.saturating_sub(initial_fetched_at));
             eprintln!("TEST: Step 3 complete - checked for interval refresh");
@@ -1699,12 +1693,12 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
                 .sql("SELECT content, fetched_at FROM tvmaze WHERE request_query = 'q=lauren'")
                 .await?;
             let results5 = df5.collect().await?;
-            
+
             // After retention, the data should either:
             // 1. Be evicted and cause a fresh fetch (new fetched_at)
             // 2. Or still be there if retention hasn't run yet
             // We'll check if the fetched_at changed significantly
-            if results5.len() > 0 && results5[0].num_rows() > 0 {
+            if !results5.is_empty() && results5[0].num_rows() > 0 {
                 let fetched_at_array5 = results5[0]
                     .column_by_name("fetched_at")
                     .expect("fetched_at column should exist")
@@ -1712,14 +1706,14 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
                     .downcast_ref::<TimestampNanosecondArray>()
                     .expect("fetched_at should be TimestampNanosecondArray");
                 let final_fetched_at = fetched_at_array5.value(0);
-                
-                eprintln!("TEST: Final fetched_at: {}, Delta from initial: {} ns", 
+
+                eprintln!("TEST: Final fetched_at: {}, Delta from initial: {} ns",
                     final_fetched_at, final_fetched_at.saturating_sub(initial_fetched_at));
-                
+
                 // If retention worked and data was re-fetched, it should be significantly newer
                 let age_ns = final_fetched_at.saturating_sub(initial_fetched_at);
                 let age_secs = age_ns / 1_000_000_000;
-                eprintln!("TEST: Data age: {} seconds", age_secs);
+                eprintln!("TEST: Data age: {age_secs} seconds");
             }
 
             eprintln!("\nTEST SUMMARY:");
