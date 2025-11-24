@@ -134,6 +134,8 @@ impl DeletionSink for DuckDBDeletionSink {
                     }
                 };
 
+                // When filters is empty, return 0 to prevent accidental full table deletion.
+                // This is intentional - callers must provide explicit filters for deletion.
                 let count = if filters.is_empty() {
                     0
                 } else {

@@ -107,6 +107,8 @@ impl DeletionSink for PostgresDeletionSink {
         let mut db_conn = self.postgres.connect().await?;
         let postgres_conn = Postgres::postgres_conn(&mut db_conn)?;
         let tx = postgres_conn.conn.transaction().await?;
+        // When filters is empty, return 0 to prevent accidental full table deletion.
+        // This is intentional - callers must provide explicit filters for deletion.
         let count = if self.filters.is_empty() {
             0
         } else {

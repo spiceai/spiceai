@@ -26,7 +26,7 @@ use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::{TableReference, sqlparser::ast::Ident};
+use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
@@ -96,9 +96,9 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
 
-        // Use sqlparser's Ident for proper SQL identifier quoting
-        let schema_ident = Ident::with_quote('\'', schema);
-        let query = format!("SELECT name FROM system.tables WHERE database = {schema_ident}");
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_schema = schema.replace('\'', "''");
+        let query = format!("SELECT name FROM system.tables WHERE database = '{escaped_schema}'");
 
         let block = conn
             .query(&query)
@@ -157,11 +157,11 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
             TableReference::Bare { table } => (self.db.as_ref(), table.as_ref()),
         };
 
-        // Use Ident::with_quote to properly escape SQL identifiers and prevent SQL injection
-        let database_ident = Ident::with_quote('\'', database);
-        let table_ident = Ident::with_quote('\'', table);
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_database = database.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
         let query = format!(
-            "SELECT name, type FROM system.columns WHERE database = {database_ident} AND table = {table_ident}",
+            "SELECT name, type FROM system.columns WHERE database = '{escaped_database}' AND table = '{escaped_table}'",
         );
 
         let block = conn

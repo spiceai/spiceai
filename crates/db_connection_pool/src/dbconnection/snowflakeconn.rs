@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::{TableReference, sqlparser::ast::Ident};
+use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
@@ -97,9 +97,9 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        // Use Snowflake's IDENTIFIER() function with quoted identifier
-        let schema_ident = Ident::with_quote('\'', schema);
-        let query = format!("SHOW TABLES IN SCHEMA IDENTIFIER({schema_ident})");
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_schema = schema.replace('\'', "''");
+        let query = format!("SHOW TABLES IN SCHEMA IDENTIFIER('{escaped_schema}')");
 
         let res =
             self.api

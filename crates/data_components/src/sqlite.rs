@@ -61,6 +61,8 @@ impl DeletionSink for SqliteDeletionSink {
         let mut db_conn = self.sqlite.connect().await?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
         let sqlite = Arc::clone(&self.sqlite);
+        // When filters is empty, return 0 to prevent accidental full table deletion.
+        // This is intentional - callers must provide explicit filters for deletion.
         let count: u64 = if self.filters.is_empty() {
             0
         } else {

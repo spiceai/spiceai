@@ -25,7 +25,7 @@ use datafusion::{
     error::DataFusionError,
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::{TableReference, sqlparser::ast::Ident, unparser::dialect},
+    sql::{TableReference, unparser::dialect},
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -245,12 +245,12 @@ impl SqlWarehouseApi {
         let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing catalog".into(),
         })?;
-        // Use Ident::with_quote to properly escape SQL identifiers and prevent SQL injection
-        let table_name = Ident::with_quote('\'', table.table());
-        let schema_name = Ident::with_quote('\'', table_schema);
-        let catalog_name = Ident::with_quote('\'', table_catalog);
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_table = table.table().replace('\'', "''");
+        let escaped_schema = table_schema.replace('\'', "''");
+        let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = {table_name} AND table_schema = {schema_name} AND table_catalog = {catalog_name}"
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
@@ -609,11 +609,10 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        // Use sqlparser's Ident for proper SQL identifier quoting and escaping.
-        // Ident::with_quote automatically escapes backticks by doubling them (` -> ``) to prevent SQL injection.
-        let schema_ident = Ident::with_quote('`', schema);
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_schema = schema.replace('\'', "''");
         let query = format!(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = {schema_ident}"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = '{escaped_schema}'"
         );
 
         let token = self.api.token_provider.get_token();
