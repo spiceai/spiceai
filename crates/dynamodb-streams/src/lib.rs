@@ -1,10 +1,11 @@
-use crate::types::stream_state::RecordBatch;
+use crate::stream_state::RecordBatch;
 use snafu::Snafu;
 
 pub mod client;
 mod client_sdk;
 pub mod stream;
 pub mod types;
+mod stream_state;
 
 pub type StreamResult = Result<RecordBatch, Error>;
 

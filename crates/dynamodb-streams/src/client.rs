@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use crate::{FailedToInitializeCheckpointSnafu, Result};
 use crate::client_sdk::SDKClient;
-use crate::stream::dynamodb::{DynamodbStream, DynamodbStreamProducer};
+use crate::stream::{DynamodbStream, DynamodbStreamProducer};
 use crate::types::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
-use crate::types::stream_state::initialize_state_from_checkpoint;
+use crate::stream_state::initialize_state_from_checkpoint;
 use aws_config::SdkConfig;
-use snafu::{ResultExt, OptionExt};
+use snafu::OptionExt;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;

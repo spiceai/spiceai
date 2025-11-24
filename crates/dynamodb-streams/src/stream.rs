@@ -1,5 +1,5 @@
 use crate::client_sdk::SDKClient;
-use crate::types::stream_state::{PendingShard, RecordBatch, StreamState};
+use crate::stream_state::{PendingShard, RecordBatch, StreamState};
 use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::{Stream, future::join_all};
