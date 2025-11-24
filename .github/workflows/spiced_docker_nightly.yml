@@ -27,7 +27,7 @@ jobs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -60,7 +60,7 @@ jobs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set Nightly REL_VERSION from current timestamp
         run: python3 ./.github/scripts/get_release_version.py
@@ -85,7 +85,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -173,7 +173,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -314,7 +314,7 @@ jobs:
             fi
           done
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: github.event_name == 'schedule' || inputs.publish
         with:
           fetch-depth: 0
