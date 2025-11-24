@@ -34,18 +34,19 @@ use aws_sdk_dynamodb::types::{
 };
 use std::env;
 
+const TABLE_NAME: &str = "spice_integration_test_v2";
+
 #[tokio::test]
 async fn dynamodb_schema() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-    // init_test_table(table_name).await?;
+    // init_test_table(TABLE_NAME).await?;
 
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -82,13 +83,11 @@ async fn dynamodb_schema() -> Result<(), anyhow::Error> {
 async fn dynamodb_scan_no_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -117,13 +116,11 @@ async fn dynamodb_scan_no_filter() -> Result<(), anyhow::Error> {
 async fn dynamodb_query_no_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -158,13 +155,11 @@ async fn dynamodb_query_no_filter() -> Result<(), anyhow::Error> {
 async fn dynamodb_query_with_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -199,13 +194,11 @@ async fn dynamodb_query_with_filter() -> Result<(), anyhow::Error> {
 async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -224,7 +217,7 @@ async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
 
             run_and_snapshot_query(
                 &rt,
-                "SELECT COUNT(*) as total_count, MAX(col_timestamp) as max_timestamp FROM test_dynamodb;",
+                "SELECT COUNT(*) as total_count, MAX(col_timestamp) as max_timestamp, MAX(col_timestamp_tz) as max_timestamp_tz FROM test_dynamodb;",
                 "aggregation",
             )
             .await?;
@@ -238,13 +231,11 @@ async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
 async fn dynamodb_nulls() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -279,13 +270,11 @@ async fn dynamodb_nulls() -> Result<(), anyhow::Error> {
 async fn dynamodb_not_nulls() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -320,13 +309,11 @@ async fn dynamodb_not_nulls() -> Result<(), anyhow::Error> {
 async fn dynamodb_temporal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -345,7 +332,7 @@ async fn dynamodb_temporal() -> Result<(), anyhow::Error> {
 
             run_and_snapshot_query(
                 &rt,
-                "SELECT id, col_timestamp, col_date, col_time \
+                "SELECT id, col_timestamp, col_timestamp_tz, col_date, col_time \
                  FROM test_dynamodb \
                  WHERE id = 1;",
                 "temporal",
@@ -358,16 +345,53 @@ async fn dynamodb_temporal() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn dynamodb_collections() -> Result<(), anyhow::Error> {
+async fn dynamodb_timestamp_filter_pushdown() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-
-    let table_name = "spice_integration_test";
 
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
+                    "test_dynamodb",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                "explain SELECT * \
+                 FROM test_dynamodb \
+                 WHERE col_timestamp_tz > '2024-12-01 12:34:56.123456789Z' and col_timestamp <= '2024-12-01 12:34:56.123456789Z';",
+                "timestamp_filter_pushdown",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_collections() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(get_test_dataset(
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -402,13 +426,11 @@ async fn dynamodb_collections() -> Result<(), anyhow::Error> {
 async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -442,13 +464,11 @@ async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
 async fn dynamodb_nested_projection_no_nested_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -483,13 +503,11 @@ async fn dynamodb_nested_projection_no_nested_filter() -> Result<(), anyhow::Err
 async fn dynamodb_nested_projection_with_nested_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let table_name = "spice_integration_test";
-
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("dynamodb_federated")
                 .with_dataset(get_test_dataset(
-                    &format!("dynamodb:{table_name}"),
+                    &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
                 ))
                 .build();
@@ -562,6 +580,10 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
                 "${ env:AWS_DYNAMODB_SECRET }".to_string(),
             ),
             ("unnest_depth".to_string(), "1".to_string()),
+            (
+                "time_format".to_string(),
+                "2006-01-02T15:04:05.000Z07:00".to_string(),
+            ),
         ]
         .into_iter()
         .collect(),
@@ -734,7 +756,11 @@ async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     // Temporal types (stored as strings)
     item1.insert(
         "col_timestamp".to_string(),
-        AttributeValue::S("2019-01-01T00:00:00Z".to_string()),
+        AttributeValue::S("2019-01-01T00:00:00.123Z".to_string()),
+    );
+    item1.insert(
+        "col_timestamp_tz".to_string(),
+        AttributeValue::S("2019-01-01T00:00:00.456+05:00".to_string()),
     );
     item1.insert(
         "col_date".to_string(),

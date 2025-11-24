@@ -32,6 +32,8 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::runtime::Tokio;
 use otel_arrow::OtelArrowExporter;
+#[cfg(feature = "cluster")]
+use runtime::config::ClusterMode;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
@@ -190,26 +192,7 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let mut spicepod_load_error: Option<app::Error> = None;
-    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
-        Ok(mut app) => {
-            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-            Some(Arc::new(app))
-        }
-        Err(e) => {
-            // In pods watcher mode, allow runtime to start without a valid spicepod
-            // It will load the spicepod when it becomes available
-            if args.pods_watcher_enabled && args.spicepod.is_none() {
-                spicepod_load_error = Some(e);
-                None
-            } else {
-                // In normal mode, fail immediately if spicepod cannot be loaded
-                return Err(Error::UnableToConstructSpiceApp {
-                    source: Box::new(e),
-                });
-            }
-        }
-    };
+    let (app, spicepod_load_error) = build_app(&args).await?;
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(some_app) = &app
@@ -297,8 +280,9 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+    if let Some(ref metrics_registry) = prometheus_registry {
+        init_metrics(&rt.datafusion(), metrics_registry.clone())
+            .context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -308,6 +292,10 @@ pub async fn run(args: Args) -> Result<()> {
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let rt = Arc::new(rt);
+
+    if prometheus_registry.is_some() {
+        rt.init_cache_metrics();
+    }
 
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
@@ -340,6 +328,45 @@ pub async fn run(args: Args) -> Result<()> {
     rt.shutdown().await;
 
     result
+}
+
+async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
+    #[cfg(feature = "cluster")]
+    if matches!(args.runtime.cluster.mode, Some(ClusterMode::Executor)) {
+        tracing::info!(
+            "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
+        );
+        return Ok((Some(Arc::new(App::default())), None));
+    }
+
+    let spicepod_path = args
+        .spicepod
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+
+    let mut spicepod_load_error: Option<app::Error> = None;
+
+    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            Some(Arc::new(app))
+        }
+        Err(e) => {
+            // In pods watcher mode, allow runtime to start without a valid spicepod
+            // It will load the spicepod when it becomes available
+            if args.pods_watcher_enabled && args.spicepod.is_none() {
+                spicepod_load_error = Some(e);
+                None
+            } else {
+                // In normal mode, fail immediately if spicepod cannot be loaded
+                return Err(Error::UnableToConstructSpiceApp {
+                    source: Box::new(e),
+                });
+            }
+        }
+    };
+
+    Ok((app, spicepod_load_error))
 }
 
 fn init_metrics(

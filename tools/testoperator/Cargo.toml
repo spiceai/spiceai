@@ -9,16 +9,16 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow-json.workspace = true
 clap.workspace = true
+hf-hub = { workspace = true }
 reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+spiceai.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
-serde.workspace = true
-serde_yaml.workspace = true
-serde_json.workspace = true
-arrow-json.workspace = true
-spiceai.workspace = true
-hf-hub = { workspace = true }
 
 [features]
 anonymous_telemetry = []
@@ -31,8 +31,8 @@ dremio = []
 duckdb = []
 flightsql = []
 ftp = []
-keyring-secret-store = []
 imap = []
+keyring-secret-store = []
 models = []
 mssql = []
 mysql = []

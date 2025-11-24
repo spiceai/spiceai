@@ -95,8 +95,6 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
-#[cfg(feature = "cluster")]
-pub mod cluster;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -106,6 +104,7 @@ pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
+pub mod secrets_context_extension;
 mod sql_validator;
 pub mod udf;
 
@@ -343,6 +342,7 @@ pub struct DataFusion {
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     io_runtime: Handle,
     metrics: Option<Metrics>,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
     pub temp_directory: Option<String>,
     #[cfg(feature = "cluster")]
@@ -378,6 +378,11 @@ impl DataFusion {
     #[must_use]
     pub fn runtime_status(&self) -> Arc<status::RuntimeStatus> {
         Arc::clone(&self.runtime_status)
+    }
+
+    #[must_use]
+    pub fn caching(&self) -> Arc<Caching> {
+        Arc::clone(&self.caching)
     }
 
     #[must_use]
@@ -1143,6 +1148,10 @@ impl DataFusion {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
         }
 
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            accelerated_table_builder.with_resource_monitor(resource_monitor.clone());
+        }
+
         if let Some(metrics) = &self.metrics {
             accelerated_table_builder.metrics(metrics.clone());
         }
@@ -1815,10 +1824,10 @@ impl DataFusion {
         Ok(plan)
     }
 
-    pub(crate) fn clear_cached_plans(&self) {
+    pub(crate) async fn clear_cached_plans(&self) {
         tracing::trace!("clearing cached logical plans");
         if let Some(cache_provider) = self.plans_cache_provider() {
-            cache_provider.invalidate_all();
+            cache_provider.invalidate_all().await;
         }
     }
 
@@ -1966,7 +1975,7 @@ mod tests {
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let df = Arc::new(
             DataFusion::builder(
@@ -1991,7 +2000,7 @@ mod tests {
         };
 
         cache_provider.checkpoint().await; // Ensure entry gets logged
-        assert_eq!(cache_provider.item_count(), 1);
+        assert_eq!(cache_provider.item_count().await, 1);
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
@@ -2003,6 +2012,6 @@ mod tests {
             unreachable!("Cache provider should be available");
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
-        assert_eq!(cache_provider.item_count(), 1);
+        assert_eq!(cache_provider.item_count().await, 1);
     }
 }

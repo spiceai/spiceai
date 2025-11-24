@@ -48,10 +48,13 @@ impl Display for SpicedVersion {
     }
 }
 
-pub struct SpicedInstance {
-    child: Child,
-    tempdir: TempDir,
-    version: SpicedVersion,
+pub enum SpicedInstance {
+    Existing,
+    Owned {
+        child: Child,
+        tempdir: TempDir,
+        version: SpicedVersion,
+    },
 }
 
 pub struct StartRequest {
@@ -121,6 +124,11 @@ impl StartRequest {
 }
 
 impl SpicedInstance {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::Existing
+    }
+
     /// Start a spiced instance
     ///
     /// # Errors
@@ -175,7 +183,7 @@ impl SpicedInstance {
 
         let child = cmd.spawn()?;
 
-        Ok(Self {
+        Ok(Self::Owned {
             child,
             tempdir,
             version: SpicedVersion::new(version),
@@ -184,12 +192,19 @@ impl SpicedInstance {
 
     #[must_use]
     pub fn version(&self) -> &str {
-        self.version.0.as_str()
+        let Self::Owned { version, .. } = self else {
+            return "unknown";
+        };
+
+        version.0.as_str()
     }
 
-    #[must_use]
-    pub fn get_tempdir_path(&self) -> PathBuf {
-        self.tempdir.path().to_path_buf()
+    pub fn get_tempdir_path(&self) -> Result<PathBuf> {
+        let Self::Owned { tempdir, .. } = self else {
+            anyhow::bail!("SpicedInstance is not owned, no tempdir available");
+        };
+
+        Ok(tempdir.path().to_path_buf())
     }
 
     /// Get a spice client for the spiced instance
@@ -279,24 +294,28 @@ impl SpicedInstance {
     ///
     /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
+        let Self::Owned { child, .. } = self else {
+            return Ok(());
+        };
+
         #[cfg(not(target_os = "windows"))]
         {
             // Send a SIGTERM to the spiced instance and wait for it to exit
-            let Ok(pid_i32) = self.child.id().try_into() else {
+            let Ok(pid_i32) = child.id().try_into() else {
                 anyhow::bail!("Failed to convert pid to i32");
             };
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid_i32),
                 nix::sys::signal::Signal::SIGTERM,
             )?;
-            self.child.wait()?;
+            child.wait()?;
         }
 
         #[cfg(target_os = "windows")]
         {
             // On Windows, we can use the built-in process termination
-            self.child.kill()?;
-            self.child.wait()?;
+            child.kill()?;
+            child.wait()?;
         }
 
         Ok(())
@@ -304,15 +323,22 @@ impl SpicedInstance {
 
     /// Returns an instance of a `Process` for the spiced instance
     /// This allows tracking the spiced process, without owning the spiced instance
-    #[must_use]
-    pub fn process(&self) -> Process {
-        Process::new(Pid::from_u32(self.child.id()))
+    pub fn process(&self) -> Result<Process> {
+        let Self::Owned { child, .. } = self else {
+            anyhow::bail!("SpicedInstance is not owned, no process available");
+        };
+
+        Ok(Process::new(Pid::from_u32(child.id())))
     }
 }
 
 impl Drop for SpicedInstance {
     fn drop(&mut self) {
-        match self.child.kill() {
+        let Self::Owned { child, .. } = self else {
+            return;
+        };
+
+        match child.kill() {
             Ok(()) => (),
             Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
         }

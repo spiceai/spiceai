@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{AccelerationSource, DataAccelerator};
 use crate::{
     App, Runtime,
     component::{
@@ -54,6 +55,7 @@ use itertools::Itertools;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{
     any::Any,
     cmp::max,
@@ -63,11 +65,10 @@ use std::{
     sync::{Arc, Once},
 };
 
-use super::{AccelerationSource, DataAccelerator};
-
 pub(crate) mod settings;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
+pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -525,10 +526,17 @@ pub(crate) async fn create_table_provider(
     };
     let cloned_writer = Arc::clone(&duckdb_writer);
 
-    let table_provider = Arc::new(PolyTableProvider::new(
+    let mut schema_metadata = HashMap::new();
+    schema_metadata.insert(
+        SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+        "duckdb".to_string(),
+    );
+
+    let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         cloned_writer,
         duckdb_writer,
         read_provider,
+        schema_metadata,
     ));
 
     Ok(table_provider)

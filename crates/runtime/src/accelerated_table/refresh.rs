@@ -442,6 +442,7 @@ pub struct Refresher {
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -489,6 +490,7 @@ impl Refresher {
             metrics: None,
             cpu_runtime,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -562,6 +564,14 @@ impl Refresher {
         self.initial_load_completed.load(Ordering::Relaxed)
     }
 
+    pub fn with_resource_monitor(
+        &mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> &mut Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
     fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
         match max_jitter {
@@ -581,7 +591,7 @@ impl Refresher {
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
@@ -613,13 +623,13 @@ impl Refresher {
         };
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
-            (AccelerationRefreshMode::Disabled, _) => return None,
+            (AccelerationRefreshMode::Disabled, _) => return Ok(None),
             (
                 AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver),
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                return Some(self.start_changes_stream(stream));
+                return Ok(Some(self.start_changes_stream(stream)));
             }
         };
 
@@ -642,9 +652,14 @@ impl Refresher {
 
         refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            refresh_task_runner =
+                refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
+
         let mut refresh_task_runner = refresh_task_runner.build();
 
-        let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
+        let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
         self.refresh_task_runner = Some(refresh_task_runner);
 
         let notifier = self.on_complete_notification.clone();
@@ -686,7 +701,7 @@ impl Refresher {
         //   1. Periodic and manual refreshes happening at the same time
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
-        Some(tokio::spawn(async move {
+        Ok(Some(tokio::spawn(async move {
             let mut next_scheduled_refresh_timer =
                 initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
 
@@ -773,7 +788,7 @@ impl Refresher {
                     }
                 }
             }
-        }))
+        })))
     }
 
     /// Subscribes a new table provider to receive refresh notifications from an existing full refresh mode accelerated table
@@ -782,10 +797,11 @@ impl Refresher {
     ///
     /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
     pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
-        assert!(
-            matches!(self.refresh.read().await.mode, RefreshMode::Full),
-            "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
-        );
+        if !matches!(self.refresh.read().await.mode, RefreshMode::Full) {
+            unreachable!(
+                "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
+            );
+        }
 
         if let Some(refresh_task_runner) = &self.refresh_task_runner {
             refresh_task_runner
@@ -990,7 +1006,10 @@ mod tests {
 
         let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-        let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+        let refresh_handle = refresher
+            .start(acceleration_refresh_mode)
+            .await
+            .expect("Should start refresh task");
 
         trigger
             .send(None)
@@ -1200,7 +1219,10 @@ mod tests {
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
-            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
 
             trigger
                 .send(None)
@@ -1356,7 +1378,10 @@ mod tests {
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
-            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
 
             trigger
                 .send(None)
@@ -1562,7 +1587,10 @@ mod tests {
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
-            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
             trigger
                 .send(None)
                 .await

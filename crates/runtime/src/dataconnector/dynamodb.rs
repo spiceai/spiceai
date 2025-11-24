@@ -27,6 +27,7 @@ use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use util::time_format::is_valid_format;
 
 #[derive(Debug)]
 pub struct DynamoDB {
@@ -50,6 +51,7 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
+const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
@@ -74,6 +76,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("scan_segments")
         .description("Number of segments. 'auto' by default.")
         .default(SEGMENTS_AUTO_STR),
+    ParameterSpec::runtime("time_format")
+        .description("Go-style time format used for parsing/formatting timestamps")
+        .default(DEFAULT_TIME_FORMAT),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -187,12 +192,28 @@ impl DataConnector for DynamoDB {
             }
         };
 
+        let time_format = self
+            .params
+            .get("time_format")
+            .expose()
+            .unwrap_or_else(|_| DEFAULT_TIME_FORMAT);
+        if !is_valid_format(time_format) {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                message: format!(
+                    "DynamoDB parameter 'time_format' is invalid: \"{time_format}\". Refer to https://spiceai.org/docs/components/data-connectors/dynamodb#time-format"
+                ),
+                connector_component: ConnectorComponent::from(dataset),
+            });
+        }
+
         let provider = DynamoDBTableProvider::try_new(
             Arc::new(client),
             Arc::from(table_name),
             unnest_depth,
             schema_infer_max_records,
             config_segments,
+            time_format.to_string(),
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {

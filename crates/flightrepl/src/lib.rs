@@ -22,6 +22,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use ansi_term::Colour;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
 use arrow_flight::{
@@ -136,6 +139,22 @@ const SPECIAL_COMMANDS: [&str; 8] = [
     ".clear history",
 ];
 const PROMPT_COLOR: Colour = Colour::Fixed(8);
+
+/// Set secure permissions (0600) on a file to ensure only the user can read/write it
+#[cfg(unix)]
+fn set_secure_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_secure_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    // On Windows, file permissions work differently
+    // The file is created with user-only access by default
+    Ok(())
+}
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -403,10 +422,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 // Clear the readline history
                 let _ = rl.clear_history();
                 // Save the empty history to file (if path is available)
-                if let Some(ref path) = history_path
-                    && let Err(e) = rl.save_history(path)
-                {
-                    eprintln!("Warning: Failed to save cleared history: {e}");
+                if let Some(ref path) = history_path {
+                    if let Err(e) = rl.save_history(path) {
+                        eprintln!("Warning: Failed to save cleared history: {e}");
+                    } else if let Err(e) = set_secure_permissions(path) {
+                        eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+                    }
                 }
                 println!("Query history cleared.");
                 let _ = std::io::stdout().flush();
@@ -486,10 +507,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     }
 
     // Save history before exiting (if path is available)
-    if let Some(ref path) = history_path
-        && let Err(e) = rl.save_history(path)
-    {
-        eprintln!("Warning: Failed to save history on exit: {e}");
+    if let Some(ref path) = history_path {
+        if let Err(e) = rl.save_history(path) {
+            eprintln!("Warning: Failed to save history on exit: {e}");
+        } else if let Err(e) = set_secure_permissions(path) {
+            eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+        }
     }
 
     if let Some(helper) = rl.helper_mut() {

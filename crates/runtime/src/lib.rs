@@ -47,10 +47,7 @@ use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 
 #[cfg(feature = "cluster")]
-use {
-    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
-    crate::datafusion::cluster,
-};
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode};
 
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -107,6 +104,7 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
 
@@ -117,6 +115,8 @@ pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -481,6 +481,8 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     #[allow(dead_code)] // used in "cluster" feature
     config: Arc<Config>,
 }
@@ -549,6 +551,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
+    }
+
+    #[must_use]
     pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
         Arc::clone(&self.token_provider_registry)
     }
@@ -561,6 +568,26 @@ impl Runtime {
     #[must_use]
     pub fn datasets_health_monitor(&self) -> Option<Arc<DatasetsHealthMonitor>> {
         self.datasets_health_monitor.clone()
+    }
+
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -645,6 +672,13 @@ impl Runtime {
             ),
             _ => None,
         };
+
+        #[cfg(feature = "cluster")]
+        if self.config.cluster.mode.is_some() {
+            tracing::warn!(
+                "Distributed Query (Alpha) is in preview and should not be used in production."
+            );
+        }
 
         // Start Flight server
         let flight_shutdown = CancellationToken::new();
@@ -834,9 +868,9 @@ impl Runtime {
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
     }
 
