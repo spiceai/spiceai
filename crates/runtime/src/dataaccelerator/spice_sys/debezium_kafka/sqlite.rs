@@ -79,7 +79,7 @@ impl DebeziumKafkaSys {
                     ],
                 )?;
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(Error::external)
@@ -108,8 +108,10 @@ impl DebeziumKafkaSys {
                     let primary_keys: String = row.get(2)?;
                     let schema_fields: String = row.get(3)?;
 
-                    let primary_keys: Vec<String> = serde_json::from_str(&primary_keys).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
-                    let schema_fields: Vec<change_event::Field> = serde_json::from_str(&schema_fields).map_err(|e| tokio_rusqlite::Error::Other(Box::new(e)))?;
+                    let primary_keys: Vec<String> = serde_json::from_str(&primary_keys)
+                        .map_err(|_e| rusqlite::Error::InvalidQuery)?;
+                    let schema_fields: Vec<change_event::Field> = serde_json::from_str(&schema_fields)
+                        .map_err(|_e| rusqlite::Error::InvalidQuery)?;
 
                     Ok(DebeziumKafkaMetadata {
                         consumer_group_id,
@@ -118,7 +120,7 @@ impl DebeziumKafkaSys {
                         schema_fields,
                     })
                 } else {
-                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                    Err(rusqlite::Error::QueryReturnedNoRows)
                 }
             })
             .await

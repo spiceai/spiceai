@@ -66,10 +66,9 @@ impl Acceleration {
 
         match on_conflict.1 {
             OnConflictBehavior::Drop => Ok(Some(OnConflict::DoNothing(on_conflict.0.clone()))),
-            OnConflictBehavior::Upsert(options) => Ok(Some(OnConflict::Upsert(
-                on_conflict.0.clone(),
-                options.clone(),
-            ))),
+            OnConflictBehavior::Upsert(_options) => {
+                Ok(Some(OnConflict::Upsert(on_conflict.0.clone())))
+            }
         }
     }
 }

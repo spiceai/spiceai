@@ -4948,7 +4948,7 @@ dependencies = [
  "hickory-resolver 0.25.2",
  "itertools 0.14.0",
  "mongodb",
- "mysql_async 0.36.1",
+ "mysql_async",
  "native-tls",
  "num-bigint",
  "num-traits",
@@ -9746,37 +9746,6 @@ dependencies = [
 
 [[package]]
 name = "mysql_async"
-version = "0.35.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d14cf024116ba8fef4a7fec5abf0bd5de89b9fb29a7e55818a119ac5ec745077"
-dependencies = [
- "bytes",
- "crossbeam",
- "flate2",
- "futures-core",
- "futures-sink",
- "futures-util",
- "keyed_priority_queue",
- "lru 0.12.5",
- "mysql_common 0.34.1",
- "native-tls",
- "pem",
- "percent-encoding",
- "pin-project",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "socket2 0.5.10",
- "thiserror 2.0.17",
- "tokio",
- "tokio-native-tls",
- "tokio-util",
- "twox-hash",
- "url",
-]
-
-[[package]]
-name = "mysql_async"
 version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "277ce2f2459b2af4cc6d0a0b7892381f80800832f57c533f03e2845f4ea331ea"
@@ -9789,7 +9758,7 @@ dependencies = [
  "futures-util",
  "keyed_priority_queue",
  "lru 0.14.0",
- "mysql_common 0.35.5",
+ "mysql_common",
  "native-tls",
  "pem",
  "percent-encoding",
@@ -9803,39 +9772,6 @@ dependencies = [
  "tokio-util",
  "twox-hash",
  "url",
-]
-
-[[package]]
-name = "mysql_common"
-version = "0.34.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34a9141e735d5bb02414a7ac03add09522466d4db65bdd827069f76ae0850e58"
-dependencies = [
- "base64 0.22.1",
- "bitflags 2.10.0",
- "btoi",
- "byteorder",
- "bytes",
- "cc",
- "chrono",
- "cmake",
- "crc32fast",
- "flate2",
- "lazy_static",
- "mysql-common-derive",
- "num-bigint",
- "num-traits",
- "rand 0.8.5",
- "regex",
- "saturating",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "subprocess",
- "thiserror 1.0.69",
- "uuid 1.18.1",
- "zstd",
 ]
 
 [[package]]
@@ -13156,7 +13092,7 @@ dependencies = [
  "model_components",
  "moka",
  "mongodb",
- "mysql_async 0.35.1",
+ "mysql_async",
  "notify",
  "ns_lookup",
  "object_store",
@@ -15190,16 +15126,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.108",
-]
-
-[[package]]
-name = "subprocess"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c2e86926081dda636c546d8c5e641661049d7562a68f5488be4a1f7f66f6086"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]
