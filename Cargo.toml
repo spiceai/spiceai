@@ -280,7 +280,6 @@ vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea
 vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
 vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
 vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
-vortex-dict = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
 vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
 vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
 vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "15ae0a7fea09ea91f2e42578129c58bca7a1cbdf" }
