@@ -1,11 +1,11 @@
 use crate::stream_state::RecordBatch;
 use snafu::Snafu;
 
+pub mod checkpoint;
 pub mod client;
 mod client_sdk;
 pub mod stream;
 mod stream_state;
-pub mod types;
 
 pub type StreamResult = Result<RecordBatch, Error>;
 

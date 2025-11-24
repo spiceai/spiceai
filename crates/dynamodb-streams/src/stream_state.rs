@@ -1,5 +1,5 @@
+use crate::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
 use crate::client_sdk::{ApiShard, SDKClient};
-use crate::types::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::collections::HashMap;
 use std::sync::Arc;
