@@ -22,7 +22,10 @@ use std::{
 };
 
 use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::{
+    runtime::TokioCurrentThread,
+    trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
+};
 use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
 use spicepod::component::runtime::TaskHistoryCapturedOutput;
 use tracing::subscriber::DefaultGuard;
@@ -168,8 +171,10 @@ pub(crate) fn init_tracing_with_task_history(
     );
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
+    let processor = BatchSpanProcessor::builder(task_history_exporter, TokioCurrentThread).build();
+
     let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(task_history_exporter)
+        .with_span_processor(processor)
         .build();
 
     let scope = InstrumentationScope::builder("task_history")

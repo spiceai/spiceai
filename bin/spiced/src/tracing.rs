@@ -22,7 +22,10 @@ use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
 use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
-    trace::{SdkTracerProvider, SpanData, SpanExporter},
+    trace::{
+        SdkTracerProvider, SpanData, SpanExporter,
+        span_processor_with_async_runtime::BatchSpanProcessor,
+    },
 };
 use opentelemetry_zipkin::ZipkinExporter;
 use reqwest::Client;
@@ -211,8 +214,11 @@ where
         .as_ref()
         .map_or_else(|| "Spice.ai".to_string(), Clone::clone);
 
+    let processor =
+        BatchSpanProcessor::builder(exporter, opentelemetry_sdk::runtime::Tokio).build();
+
     let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_span_processor(processor)
         .with_resource(Resource::builder().with_service_name(service_name).build())
         .build();
     let scope = InstrumentationScope::builder("task_history")
