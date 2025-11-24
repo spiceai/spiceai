@@ -17,11 +17,10 @@ limitations under the License.
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use snafu::ensure;
 
 use crate::{
     bedrock::embed::BedrockEmbeddingConfig,
-    embeddings::{Error as EmbedError, FailedToExtractEmbeddingsSnafu, Result as EmbedResult},
+    embeddings::{Error as EmbedError, Result as EmbedResult},
 };
 
 pub const NOVA_MULTIMODAL_EMBED_V2: &str = "amazon.nova-2-multimodal-embeddings-v1:0";
@@ -61,23 +60,21 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<NovaEmbedRequest>> {
         Ok(input_text
             .into_iter()
-            .map(|t| {
-                NovaEmbedRequest {
-                    schema_version: Some("nova-multimodal-embed-v1".to_string()),
-                    task_type: NovaTaskType::SingleEmbedding,
-                    single_embedding_params: NovaSingleEmbeddingParams {
-                        embedding_purpose: self.embedding_purpose.clone(),
-                        embedding_dimension: Some(self.dimensions),
-                        text: Some(NovaTextInput {
-                            truncation_mode: self.truncation_mode.clone(),
-                            value: Some(t),
-                            source: None,
-                        }),
-                        image: None,
-                        audio: None,
-                        video: None,
-                    },
-                }
+            .map(|t| NovaEmbedRequest {
+                schema_version: Some("nova-multimodal-embed-v1".to_string()),
+                task_type: NovaTaskType::SingleEmbedding,
+                single_embedding_params: NovaSingleEmbeddingParams {
+                    embedding_purpose: self.embedding_purpose.clone(),
+                    embedding_dimension: Some(self.dimensions),
+                    text: Some(NovaTextInput {
+                        truncation_mode: self.truncation_mode.clone(),
+                        value: Some(t),
+                        source: None,
+                    }),
+                    image: None,
+                    audio: None,
+                    video: None,
+                },
             })
             .collect::<Vec<NovaEmbedRequest>>())
     }
