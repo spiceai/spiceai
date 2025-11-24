@@ -122,10 +122,10 @@ impl CacheRefreshHelper {
         );
 
         // Scan the accelerator with a filter for stale rows
-        // WHERE fetched_at < threshold
+        // WHERE fetched_at <= threshold (data is at least TTL old)
         let filters =
             vec![
-                col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(
+                col(CACHE_REFRESHED_AT_COLUMN).lt_eq(lit(ScalarValue::TimestampNanosecond(
                     Some(stale_threshold),
                     None,
                 ))),
@@ -137,14 +137,20 @@ impl CacheRefreshHelper {
 
         // For each stale request combination, re-fetch from the source
         for partition in 0..plan.properties().output_partitioning().partition_count() {
+            eprintln!("!!!!! Scanning partition {} for stale rows !!!!!", partition);
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
 
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
+                
+                eprintln!("!!!!! Found batch with {} rows in partition {} !!!!!", batch.num_rows(), partition);
 
                 for row_idx in 0..batch.num_rows() {
+                    eprintln!("!!!!! Processing stale row {} !!!!!", row_idx);
                     // Extract the filter parameters for this row
                     let filters = Self::extract_filters_from_row(&batch, row_idx)?;
+
+                    eprintln!("!!!!! Extracted {} filters, calling fetch_from_source_on_miss !!!!!", filters.len());
 
                     // Re-fetch from the federated source with these filters
                     tracing::debug!(

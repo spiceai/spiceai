@@ -258,7 +258,11 @@ impl Refresh {
         refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> NextRefresh {
-        tracing::debug!("startup_next_refresh called with mode: {:?}", self.mode);
+        tracing::info!(
+            "startup_next_refresh called with mode: {:?}, check_interval: {:?}",
+            self.mode,
+            self.check_interval
+        );
         let previous_checkpoint = match self.mode {
             RefreshMode::Full => {
                 // If there is no checkpoint, we need to start a refresh.
@@ -271,11 +275,29 @@ impl Refresh {
             RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
             }
-            // Caching mode doesn't need an initial refresh - it starts ready immediately
-            // and only refreshes data on-demand through cache misses
+            // Caching mode handles refreshes in two ways:
+            // 1. On-demand through cache misses (primary)
+            // 2. Periodic background refresh of stale data (if refresh_check_interval is set)
             RefreshMode::Caching => {
-                tracing::debug!("Caching mode detected - skipping initial refresh");
-                return NextRefresh::Disabled;
+                // If refresh_check_interval is set, enable periodic refresh for stale data
+                if let Some(check_interval) = self.check_interval {
+                    eprintln!(
+                        "!!!!! CACHING MODE WITH INTERVAL: {:?} !!!!!",
+                        check_interval
+                    );
+                    tracing::info!(
+                        "Caching mode with refresh_check_interval={:?} - enabling periodic stale data refresh",
+                        check_interval
+                    );
+                    // Start the periodic timer - the first refresh will happen after check_interval
+                    return NextRefresh::WaitFor(check_interval);
+                } else {
+                    eprintln!("!!!!! CACHING MODE WITHOUT INTERVAL !!!!!");
+                    tracing::debug!(
+                        "Caching mode without refresh_check_interval - on-demand refresh only"
+                    );
+                    return NextRefresh::Disabled;
+                }
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
@@ -712,18 +734,34 @@ impl Refresher {
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
         Ok(Some(tokio::spawn(async move {
+            eprintln!(
+                "!!!!! Refresh task loop starting for dataset {} !!!!!",
+                dataset_name
+            );
             let mut next_scheduled_refresh_timer =
                 initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
+
+            eprintln!(
+                "!!!!! Initial refresh delay: {:?}, refresh_check_interval: {:?} !!!!!",
+                initial_refresh_delay, refresh_check_interval
+            );
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
                     match next_scheduled_refresh_timer.take() {
-                        Some(timer) => Box::pin(timer),
-                        None => Box::pin(std::future::pending()),
+                        Some(timer) => {
+                            eprintln!("!!!!! Timer is set, waiting for it to fire !!!!!");
+                            Box::pin(timer)
+                        }
+                        None => {
+                            eprintln!("!!!!! No timer set, waiting indefinitely !!!!!");
+                            Box::pin(std::future::pending())
+                        }
                     };
 
                 select! {
                     () = scheduled_refresh_future => {
+                        eprintln!("!!!!! Scheduled refresh timer fired !!!!!");
                         tracing::debug!("Starting scheduled refresh");
                         if let Err(err) = start_refresh.send(None).await {
                             tracing::error!("Failed to execute refresh: {err}");
@@ -744,6 +782,7 @@ impl Refresher {
                         }
                     },
                     Some(res) = on_refresh_complete.recv() => {
+                        eprintln!("!!!!! Refresh task completion received: {:?} !!!!!", res);
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
                         if let Ok(()) = res {
