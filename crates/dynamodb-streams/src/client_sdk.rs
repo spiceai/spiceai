@@ -68,7 +68,6 @@ impl SDKClient {
             .map(|s| ApiShard {
                 shard_id: s.shard_id.unwrap_or_default(),
                 parent_shard_id: s.parent_shard_id,
-                iterator: None,
                 starting_sequence_number: s
                     .sequence_number_range
                     .as_ref()
