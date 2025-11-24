@@ -199,7 +199,7 @@ impl Query {
             if let LogicalPlan::DescribeTable(_) = p {
                 should_distribute = false;
             } else if let LogicalPlan::TableScan(scan) = p
-                && matches!(scan.table_name.schema(), Some("runtime"))
+                && matches!(scan.table_name.schema(), Some(SPICE_RUNTIME_SCHEMA))
             {
                 should_distribute = false;
             }
