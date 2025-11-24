@@ -56,6 +56,7 @@ use datafusion_optimizer_rules::{
     physical_plan::EmptyHashJoinExecPhysicalOptimization,
 };
 use runtime_datafusion::{
+    analyzer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule,
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
 };
@@ -391,6 +392,7 @@ impl AnalyzerRulesBuilder {
         rules.extend([
             Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            Arc::new(AvoidDerivedVectorColumnOnIndexRule {}) as Arc<dyn AnalyzerRule + Send + Sync>,
         ]);
         rules.into_iter().chain(self.extra_rules).collect()
     }

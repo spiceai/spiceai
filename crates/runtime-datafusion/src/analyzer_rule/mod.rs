@@ -15,3 +15,4 @@ limitations under the License.
 */
 pub mod duplicate_plan_node;
 pub use duplicate_plan_node::*;
+pub mod avoid_vector_columns_on_index;

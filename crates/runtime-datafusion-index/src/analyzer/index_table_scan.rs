@@ -143,15 +143,22 @@ impl OptimizerRule for IndexTableScanOptimizerRule {
 }
 
 #[derive(Debug)]
-pub(crate) struct IndexTableScanNode {
+pub struct IndexTableScanNode {
     input: LogicalPlan,
     indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl IndexTableScanNode {
     #[must_use]
-    pub(crate) fn new(input: LogicalPlan, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
+    pub fn new(input: LogicalPlan, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
         Self { input, indexes }
+    }
+
+    pub fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
+        &self.indexes
+    }
+    pub fn input(&self) -> &LogicalPlan {
+        &self.input
     }
 }
 

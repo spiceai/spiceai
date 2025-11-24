@@ -13227,7 +13227,9 @@ dependencies = [
  "datafusion-federation",
  "futures",
  "opentelemetry 0.27.1",
+ "runtime-datafusion-index",
  "runtime-request-context",
+ "search",
  "tokio",
  "tracing",
 ]
@@ -13985,6 +13987,7 @@ dependencies = [
  "datafusion",
  "datafusion-expr",
  "datafusion-functions-json",
+ "datafusion-optimizer-rules",
  "futures",
  "insta",
  "itertools 0.14.0",

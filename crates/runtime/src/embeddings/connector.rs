@@ -335,7 +335,7 @@ fn underlying_federated_table_for_indexed_table(
     {
         if let Some(vector_scan) = src_table_provider
             .as_any()
-            .downcast_ref::<super::index::VectorScanTableProvider>()
+            .downcast_ref::<search::index::VectorScanTableProvider>()
         {
             return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
         }

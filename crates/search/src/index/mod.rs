@@ -26,6 +26,11 @@ pub mod chunking;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
+pub mod vector_table;
+pub use vector_table::VectorScanTableProvider;
+
+use crate::index::{chunking::ChunkedVectorIndex, s3_vectors::S3Vector};
+
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
 /// This trait supports both vector similarity search and full-text search implementations.
 ///
@@ -57,6 +62,17 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
+pub fn derived_columns_from_vector_index(
+    index: &Arc<dyn Index + Send + Sync>,
+) -> Option<Vec<String>> {
+    if let Some(vec) = index.as_any().downcast_ref::<S3Vector>() {
+        return Some(vec.derived_columns());
+    } else if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
+        return Some(vec.derived_columns());
+    }
+    None
+}
+
 pub trait VectorIndex: SearchIndex {
     /// A [`LogicalPlan`] representation of the data within the index. The [`LogicalPlan::schema`] must contain
     ///  - The [`SearchIndex::primary_fields`]
@@ -67,6 +83,10 @@ pub trait VectorIndex: SearchIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError>;
 
     fn dimension(&self) -> i32;
+
+    fn derived_columns(&self) -> Vec<String> {
+        vec![embedding_col(self.search_column().as_str())]
+    }
 }
 
 fn embedding_col(search_column: &str) -> String {

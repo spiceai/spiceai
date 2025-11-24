@@ -20,6 +20,8 @@ futures.workspace = true
 opentelemetry.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
 tracing.workspace = true
+search = { path = "../search",  default-features = false }
+runtime-datafusion-index = {path = "../runtime-datafusion-index" }
 
 [dev-dependencies]
 datafusion-datasource.workspace = true
