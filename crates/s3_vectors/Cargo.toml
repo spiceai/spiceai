@@ -16,5 +16,4 @@ aws-smithy-runtime-api.workspace = true
 aws-smithy-types.workspace = true
 
 [dev-dependencies]
-aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 tokio.workspace = true

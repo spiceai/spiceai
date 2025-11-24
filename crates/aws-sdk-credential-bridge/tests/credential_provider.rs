@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use aws_config::BehaviorVersion;
+
 use aws_sdk_cognitoidentity as cognito_identity;
 use aws_sdk_cognitoidentityprovider as cognito_idp;
 use aws_sdk_cognitoidentityprovider::types::AuthFlowType;
-use aws_sdk_credential_bridge::{S3CredentialProvider, default_aws_config, get_or_init_sdk_config};
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use iceberg::io::AwsCredentialLoad;
 use object_store::CredentialProvider;
 use std::io::Write;
@@ -33,7 +35,7 @@ async fn setup(file: &mut NamedTempFile) -> std::result::Result<(), Box<dyn std:
     let cognito_idp_uri =
         std::env::var("AWS_COGNITO_IDP_URI").expect("AWS_COGNITO_IDP_URI must be set");
 
-    let config = default_aws_config().load().await;
+    let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
 
     let cognito_idp_client = cognito_idp::Client::new(&config);
     let cognito_identity_client = cognito_identity::Client::new(&config);
