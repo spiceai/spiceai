@@ -358,8 +358,6 @@ impl MetastoreBackend for TursoMetastore {
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
-        tracing::debug!("Executing query_row: {}", params.sql);
-
         let mut rows =
             conn.query(params.sql, turso_params)
                 .await
