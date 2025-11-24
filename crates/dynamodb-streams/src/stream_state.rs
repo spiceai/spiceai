@@ -36,7 +36,7 @@ pub struct StreamState {
     stream_arn: String,
     active: HashMap<String, ActiveShard>,
     pending: HashMap<String, PendingShard>,
-    pub initializing: HashMap<String, PendingShard>, // TODO: remove pub
+    initializing: HashMap<String, PendingShard>,
 }
 
 impl StreamState {
@@ -50,8 +50,12 @@ impl StreamState {
         }
     }
 
-    pub fn active_shards(&self) -> impl Iterator<Item = &ActiveShard> {
+    pub fn get_active_shards(&self) -> impl Iterator<Item = &ActiveShard> {
         self.active.values()
+    }
+
+    pub fn get_initializing_shards_ids(&self) -> impl Iterator<Item = &String> {
+        self.initializing.keys()
     }
 
     pub fn handle_poll_result(

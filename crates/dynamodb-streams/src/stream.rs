@@ -1,5 +1,5 @@
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{PendingShard, RecordBatch, StreamState};
+use crate::stream_state::{RecordBatch, StreamState};
 use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::{Stream, future::join_all};
@@ -25,7 +25,7 @@ impl DynamodbStreamProducer {
         let mut batches = Vec::new();
 
         // 1. Poll active shards
-        let futures = self.state.active_shards().map(|shard| {
+        let futures = self.state.get_active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
             tracing::debug!(
                 "Polling shard with iterator: shard_id={}, iterator={}",
@@ -84,7 +84,7 @@ impl DynamodbStreamProducer {
     }
 
     async fn initialize_shards_iterators(&mut self) {
-        let shard_ids: Vec<String> = self.state.initializing.keys().cloned().collect();
+        let shard_ids: Vec<String> = self.state.get_initializing_shards_ids().cloned().collect();
 
         for shard_id in shard_ids {
             match self
