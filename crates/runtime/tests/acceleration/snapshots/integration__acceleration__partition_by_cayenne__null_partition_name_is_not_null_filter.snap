@@ -2,14 +2,13 @@
 source: crates/runtime/tests/acceleration/partition_by_cayenne.rs
 expression: sanitized_plan
 ---
-FilterExec: name@1 IS NOT NULL
-  SchemaCastScanExec
-    UnionExec
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+SchemaCastScanExec
+  PartitionedUnionExec
+    BytesProcessedExec
+      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: name@1 IS NOT NULL
+    BytesProcessedExec
+      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: name@1 IS NOT NULL
+    BytesProcessedExec
+      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: name@1 IS NOT NULL
+    BytesProcessedExec
+      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: name@1 IS NOT NULL

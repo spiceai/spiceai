@@ -74,7 +74,7 @@ jobs:
     name: Build Test Binary
     runs-on: [self-hosted, spiceai-macos]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1 # Shallow clone for faster checkout
 
@@ -120,7 +120,7 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Download test binary
         uses: actions/download-artifact@v6
         with:

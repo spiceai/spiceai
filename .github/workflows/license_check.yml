@@ -44,7 +44,7 @@ jobs:
     name: Check Rust Licenses
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -64,7 +64,7 @@ jobs:
       GOVER: 1.25.3
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v6

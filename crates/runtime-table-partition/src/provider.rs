@@ -20,11 +20,25 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, DFSchema, project_schema},
+    common::{Constraints, DFSchema, Statistics, project_schema},
+    config::ConfigOptions,
     datasource::TableType,
     error::DataFusionError,
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
+    physical_expr::OrderingRequirements,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
+        empty::EmptyExec,
+        execution_plan::{CardinalityEffect, InvariantLevel},
+        filter_pushdown::{
+            ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+        },
+        limit::GlobalLimitExec,
+        metrics::MetricsSet,
+        projection::ProjectionExec,
+        union::UnionExec,
+    },
     prelude::Expr,
 };
 use pruning::prune_partition;
@@ -268,7 +282,7 @@ impl TableProvider for PartitionTableProvider {
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
             })?,
-            plans => Arc::new(UnionExec::new(plans)),
+            plans => Arc::new(PartitionedUnionExec::new(plans)),
         };
 
         if let Some(limit) = limit {
@@ -294,6 +308,174 @@ impl TableProvider for PartitionTableProvider {
         self.insert_strategy
             .execute_insert(input, insert_op, &ctx)
             .await
+    }
+}
+
+#[derive(Debug)]
+struct PartitionedUnionExec {
+    inner_union: Arc<UnionExec>,
+}
+
+impl PartitionedUnionExec {
+    fn new(partitions: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+        let inner_union = Arc::new(UnionExec::new(partitions));
+        Self { inner_union }
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+impl ExecutionPlan for PartitionedUnionExec {
+    fn name(&self) -> &'static str {
+        "PartitionedUnionExec"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "PartitionedUnionExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.inner_union.properties()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner_union.schema()
+    }
+
+    fn check_invariants(&self, check: InvariantLevel) -> Result<(), DataFusionError> {
+        self.inner_union.check_invariants(check)
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.inner_union.required_input_distribution()
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        self.inner_union.required_input_ordering()
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        self.inner_union.maintains_input_order()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        self.inner_union.benefits_from_input_partitioning()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inner_union.children()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if children.is_empty() {
+            return Err(DataFusionError::Plan(
+                "PartitionedUnionExec requires at least one child".to_string(),
+            ));
+        }
+
+        Ok(Arc::new(PartitionedUnionExec::new(children)))
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let children = self.children().into_iter().cloned().collect();
+        self.with_new_children(children)
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(None)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        self.inner_union.execute(partition, context)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.inner_union.metrics()
+    }
+
+    fn statistics(&self) -> Result<Statistics, DataFusionError> {
+        #[allow(deprecated)]
+        self.inner_union.statistics()
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<Statistics, DataFusionError> {
+        self.inner_union.partition_statistics(partition)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.inner_union.supports_limit_pushdown()
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        self.inner_union.cardinality_effect()
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        self.inner_union.try_swapping_with_projection(projection)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription, DataFusionError> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+}
+
+impl DisplayAs for PartitionedUnionExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "PartitionedUnionExec")
+            }
+            DisplayFormatType::TreeRender => Ok(()),
+        }
     }
 }
 
@@ -409,8 +591,8 @@ mod tests {
 
         // With 2 partitions and no filters, should produce a UnionExec
         assert!(
-            plan.as_any().is::<UnionExec>(),
-            "Expected UnionExec for multiple partitions"
+            plan.as_any().is::<PartitionedUnionExec>(),
+            "Expected PartitionedUnionExec for multiple partitions"
         );
     }
 
