@@ -13,22 +13,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Control plane error: {source}"))]
-    ControlPlane {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Data plane error: {source}"))]
-    DataPlane {
+    #[snafu(display("AWS SDK error: {source}"))]
+    SDKError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Stream not found for table: {table_name}"))]
     StreamNotFound { table_name: String },
 
-    #[snafu(display("Failed to initialize checkpoint"))]
-    FailedToInitializeCheckpoint,
-
     #[snafu(display("Stream description not found: {stream_arn}"))]
     StreamDescriptionNotFound { stream_arn: String },
+
+    #[snafu(display("Failed to initialize checkpoint due to empty starting_sequence_number in one of the open shards"))]
+    FailedToInitializeCheckpoint,
 }

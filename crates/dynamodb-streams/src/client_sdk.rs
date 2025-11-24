@@ -28,7 +28,7 @@ impl SDKClient {
             .table_name(&table_name)
             .send()
             .await
-            .map_err(|e| Error::ControlPlane {
+            .map_err(|e| Error::SDKError {
                 source: Box::new(e),
             })?
             .table
@@ -53,7 +53,7 @@ impl SDKClient {
             .set_exclusive_start_shard_id(exclusive_start_shard_id)
             .send()
             .await
-            .map_err(|e| Error::ControlPlane {
+            .map_err(|e| Error::SDKError {
                 source: Box::new(e),
             })?
             .stream_description
@@ -97,7 +97,7 @@ impl SDKClient {
             .set_sequence_number(sequence_number.clone())
             .send()
             .await
-            .map_err(|e| Error::ControlPlane {
+            .map_err(|e| Error::SDKError {
                 source: Box::new(e),
             })?
             .shard_iterator)
@@ -114,7 +114,7 @@ impl SDKClient {
             .set_limit(self.shard_record_limit)
             .send()
             .await
-            .map_err(|e| Error::DataPlane {
+            .map_err(|e| Error::SDKError {
                 source: Box::new(e),
             })?;
 
