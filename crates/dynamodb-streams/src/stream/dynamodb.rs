@@ -114,7 +114,7 @@ impl DynamodbStreamProducer {
             let batches = match self.iterate().await {
                 Ok(b) => b,
                 Err(e) => {
-                    // TODO: What to do here?
+                    // TODO: Add retry logic with backoff
                     tracing::error!("Iteration failed: {}", e);
                     continue;
                 }
