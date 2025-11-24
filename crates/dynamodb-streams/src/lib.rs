@@ -4,8 +4,8 @@ use snafu::Snafu;
 pub mod client;
 mod client_sdk;
 pub mod stream;
-pub mod types;
 mod stream_state;
+pub mod types;
 
 pub type StreamResult = Result<RecordBatch, Error>;
 

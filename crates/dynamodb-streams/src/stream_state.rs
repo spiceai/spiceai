@@ -107,7 +107,6 @@ impl StreamState {
     pub fn reinitialize_shard(&mut self, shard_id: &str) {
         // Remove from active
         if let Some(active_shard) = self.active.remove(shard_id) {
-
             // Add to initializing to get a fresh iterator
             self.initializing.insert(
                 shard_id.to_string(),

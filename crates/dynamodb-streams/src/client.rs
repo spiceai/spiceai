@@ -1,8 +1,8 @@
-use crate::{FailedToInitializeCheckpointSnafu, Result};
 use crate::client_sdk::SDKClient;
 use crate::stream::{DynamodbStream, DynamodbStreamProducer};
-use crate::types::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
 use crate::stream_state::initialize_state_from_checkpoint;
+use crate::types::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
+use crate::{FailedToInitializeCheckpointSnafu, Result};
 use aws_config::SdkConfig;
 use snafu::OptionExt;
 use std::sync::Arc;
@@ -57,7 +57,8 @@ impl Client {
             // Only open shards
             .filter(|s| s.ending_sequence_number.is_none())
             .map(|s| {
-                let sequence_number = s.starting_sequence_number
+                let sequence_number = s
+                    .starting_sequence_number
                     .context(FailedToInitializeCheckpointSnafu)?;
 
                 Ok((
