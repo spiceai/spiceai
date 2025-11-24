@@ -802,9 +802,8 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // In caching mode with Overwrite, pass filters to accelerator so it can check for cached data.
-        // MemTable may return Unsupported for filter pushdown, but we still pass them.
-        // If accelerator returns 0 rows → cache miss → fetch and overwrite.
+        // In caching mode, pass filters to accelerator so it can check for cached data.
+        // If accelerator returns 0 rows → cache miss → fetch from source.
         let input = self
             .accelerator
             .scan(state, projection, filters, limit)

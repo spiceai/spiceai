@@ -39,7 +39,8 @@ limitations under the License.
 //!
 //! - `test_caching_mode_filter_propagation`: Basic cache miss and hit workflow
 //! - `test_caching_mode_multi_filter_limitation`: Verifies overwrite behavior (for Arrow)
-//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching (works with DuckDB/Cayenne, ignored for Arrow)
+//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with DuckDB (currently ignored due to issues)
+//! - `test_caching_mode_multi_filter_cayenne`: Multi-filter caching with Cayenne (SQLite+Vortex)
 //! - `test_caching_mode_background_refresh_on_miss`: Background refresh triggered on cache miss
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
 
@@ -613,6 +614,164 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
             eprintln!("✅ Step 3: 'michael' query → cache hit (no HTTP fetch)");
             eprintln!("✅ Step 4: 'jennifer' query → cache hit (no HTTP fetch)");
             eprintln!("\nBoth filter combinations remain cached simultaneously.");
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test multi-filter caching with Cayenne (SQLite+Vortex) accelerator.
+/// Validates that multiple filter combinations (different query params) can be cached
+/// simultaneously using upsert-based caching with primary key constraints.
+///
+/// Uses Cayenne accelerator which supports upsert-based multi-filter caching.
+///
+/// NOTE: Currently SQLite/Cayenne caching mode has similar issues to DuckDB - queries return empty results.
+/// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sqlite")]
+async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode using Cayenne
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("sqlite".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_multi_filter_cayenne")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results = Some(Default::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // STEP 1: Query for "michael" - cache miss
+            let df1 = status.datafusion().ctx.table("tvmaze").await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=michael")))?
+                .limit(0, Some(1))?;
+
+            let batches1 = df1.collect().await?;
+            assert!(
+                !batches1.is_empty(),
+                "Step 1: Should have results from HTTP API"
+            );
+            assert_eq!(batches1[0].num_rows(), 1, "Step 1: Should have 1 row");
+
+            // STEP 2: Query for "jennifer" - cache miss (should NOT overwrite "michael")
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=jennifer")))?
+                .limit(0, Some(1))?;
+
+            let batches2 = df2.collect().await?;
+            assert!(
+                !batches2.is_empty(),
+                "Step 2: Should have results from HTTP API"
+            );
+            assert_eq!(batches2[0].num_rows(), 1, "Step 2: Should have 1 row");
+
+            // STEP 3: Query for "michael" again - should be cache hit
+            let df3 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=michael")))?
+                .select(vec![col("request_query")])?
+                .limit(0, Some(1))?;
+
+            let batches3 = df3.collect().await?;
+            assert!(
+                !batches3.is_empty(),
+                "Step 3: Should return cached michael data"
+            );
+            assert_eq!(batches3[0].num_rows(), 1, "Step 3: Should have 1 row");
+
+            let batch3 = &batches3[0];
+            let request_query_array3 = batch3
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("request_query should be StringArray");
+            assert_eq!(
+                request_query_array3.value(0),
+                "q=michael",
+                "Should return cached michael data"
+            );
+
+            // STEP 4: Query for "jennifer" again - should be cache hit
+            let df4 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=jennifer")))?
+                .select(vec![col("request_query")])?
+                .limit(0, Some(1))?;
+
+            let batches4 = df4.collect().await?;
+            assert!(
+                !batches4.is_empty(),
+                "Step 4: Should return cached jennifer data"
+            );
+            assert_eq!(batches4[0].num_rows(), 1, "Step 4: Should have 1 row");
+
+            let batch4 = &batches4[0];
+            let request_query_array4 = batch4
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("request_query should be StringArray");
+            assert_eq!(
+                request_query_array4.value(0),
+                "q=jennifer",
+                "Should return cached jennifer data"
+            );
 
             Ok(())
         })
