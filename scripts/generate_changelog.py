@@ -92,7 +92,7 @@ def main():
                         "--repo", f"{owner}/{repo}"
                     ]))
                 username = pr_info["author"]["login"]
-                print(f"- (!!!!!) {commit_title_clean} by [@{username}](https://github.com/{username}) in [#{pr_number}](https://github.com/{owner}/{repo}/pull/{pr_number})")
+                print(f"- {commit_title_clean} by [@{username}](https://github.com/{username}) in [#{pr_number}](https://github.com/{owner}/{repo}/pull/{pr_number})")
             else:
                 # If everything else fails, print commit title with the link to github
                 print(f"- !!!! (PR NOT FOUND): {commit_title} - https://github.com/{owner}/{repo}/commit/{commit_hash}/")
