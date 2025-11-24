@@ -704,6 +704,76 @@ mod tests {
     }
 
     #[test]
+    fn test_api_key_constant_time_comparison() {
+        let key = ApiKey::ReadOnly {
+            key: "secret-api-key-12345".to_string(),
+        };
+
+        // Test exact match
+        assert!(key == *"secret-api-key-12345");
+
+        // Test mismatch at different positions
+        assert!(key != *"xecret-api-key-12345"); // First char different
+        assert!(key != *"secret-api-key-1234x"); // Last char different
+        assert!(key != *"secret-xpi-key-12345"); // Middle char different
+
+        // Test different lengths
+        assert!(key != *"secret-api-key-1234"); // Shorter
+        assert!(key != *"secret-api-key-123456"); // Longer
+        assert!(key != *""); // Empty string
+
+        // Test with ReadWrite variant
+        let rw_key = ApiKey::ReadWrite {
+            key: "rw-key".to_string(),
+        };
+        assert!(rw_key == *"rw-key");
+        assert!(rw_key != *"rw-key2");
+    }
+
+    #[test]
+    fn test_api_key_debug_redaction() {
+        let readonly_key = ApiKey::ReadOnly {
+            key: "super-secret-key".to_string(),
+        };
+        let readwrite_key = ApiKey::ReadWrite {
+            key: "another-secret".to_string(),
+        };
+
+        let readonly_debug = format!("{readonly_key:?}");
+        let readwrite_debug = format!("{readwrite_key:?}");
+
+        // Ensure the actual key values are NOT in the debug output
+        assert!(
+            !readonly_debug.contains("super-secret-key"),
+            "Debug output should not contain the actual key"
+        );
+        assert!(
+            !readwrite_debug.contains("another-secret"),
+            "Debug output should not contain the actual key"
+        );
+
+        // Ensure [REDACTED] is present
+        assert!(
+            readonly_debug.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+        assert!(
+            readwrite_debug.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+
+        // Ensure the variant name is present for debugging purposes
+        assert!(
+            readonly_debug.contains("ReadOnly"),
+            "Debug output should indicate the variant type"
+        );
+        assert!(
+            readwrite_debug.contains("ReadWrite"),
+            "Debug output should indicate the variant type"
+        );
+    }
+
+    #[test]
     fn test_memory_limit_migration() {
         // Test when only memory_limit is present
         let yaml = r"
