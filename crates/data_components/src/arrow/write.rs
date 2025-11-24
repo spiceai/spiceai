@@ -25,9 +25,11 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use futures::stream;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
@@ -100,7 +102,7 @@ pub struct MemTable {
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
 
     pub on_conflict: Option<OnConflict>,
-    
+
     /// Optional columns to sort by during insert operations.
     /// When specified, data is sorted before being written to improve
     /// zone map efficiency for range queries.
@@ -361,7 +363,7 @@ struct MemSink {
     primary_key: Option<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
-    
+
     /// Optional columns to sort by before writing
     sort_columns: Vec<String>,
 }
@@ -1007,17 +1009,16 @@ impl DataSink for MemSink {
                 // Concatenate batches in this partition for sorting
                 let schema = batches[0].schema();
                 let combined_batch = if batches.len() == 1 {
-                    // SAFETY: We've just checked that batches.len() == 1
-                    batches.pop().expect("batch should exist since len == 1")
+                    // SAFETY: We've just checked that batches.len() == 1, so pop() cannot fail
+                    match batches.pop() {
+                        Some(batch) => batch,
+                        None => unreachable!("batches.len() == 1 guarantees pop() succeeds"),
+                    }
                 } else {
                     arrow::compute::concat_batches(&schema, &batches)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
                 };
 
-                // Sort the combined batch
-                use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-                use futures::stream;
-                
                 let sorted_stream = RecordBatchStreamAdapter::new(
                     Arc::clone(&schema),
                     stream::iter(vec![Ok(combined_batch)]),
@@ -1027,8 +1028,7 @@ impl DataSink for MemSink {
                     Box::pin(sorted_stream),
                     &self.sort_columns,
                     context,
-                )
-                .await?;
+                )?;
 
                 // Collect sorted batches
                 batches = datafusion::physical_plan::common::collect(sorted_stream).await?;

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Utilities for working with DataFusion record batch streams.
+//! Utilities for working with `DataFusion` record batch streams.
 
 use std::any::Any;
 use std::fmt;
@@ -23,14 +23,17 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Partitioning,
-};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use parking_lot::Mutex;
 
-/// Sort a record batch stream using DataFusion's SortExec.
+/// Sort a record batch stream using `DataFusion`'s `SortExec`.
 ///
 /// This function sorts the incoming stream by the specified columns,
 /// which can improve query performance through better data locality
@@ -38,12 +41,12 @@ use parking_lot::Mutex;
 ///
 /// # Features
 ///
-/// Uses DataFusion's SortExec which provides:
+/// Uses `DataFusion`'s `SortExec` which provides:
 /// - **Automatic disk spilling**: Handles datasets larger than available memory
 /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
 /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
-/// - **Configurable spill compression**: Supports zstd, lz4_frame, or uncompressed spill files
-/// - **Memory management**: Integrates with DataFusion's memory pool and reservation system
+/// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
+/// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
 ///
 /// # Arguments
 ///
@@ -53,13 +56,13 @@ use parking_lot::Mutex;
 ///
 /// # Returns
 ///
-/// A sorted record batch stream, or the original stream if sort_columns is empty
+/// A sorted record batch stream, or the original stream if `sort_columns` is empty
 /// or contains invalid column names.
 ///
 /// # Errors
 ///
 /// Returns an error if the sort execution fails.
-pub async fn sort_stream(
+pub fn sort_stream(
     stream: SendableRecordBatchStream,
     sort_columns: &[String],
     context: &Arc<TaskContext>,
@@ -68,25 +71,18 @@ pub async fn sort_stream(
         return Ok(stream);
     }
 
-    use datafusion::physical_expr::expressions::Column;
-    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion::physical_plan::sorts::sort::SortExec;
-
     let schema = stream.schema();
 
     // Build sort expressions from configured sort_columns
     let mut sort_exprs = Vec::with_capacity(sort_columns.len());
     for col_name in sort_columns {
         // Validate column exists in schema and get its index
-        let column_index = match schema.index_of(col_name) {
-            Ok(idx) => idx,
-            Err(_) => {
-                tracing::warn!(
-                    "Sort column '{}' not found in schema. Skipping sort.",
-                    col_name
-                );
-                return Ok(stream);
-            }
+        let Ok(column_index) = schema.index_of(col_name) else {
+            tracing::warn!(
+                "Sort column '{}' not found in schema. Skipping sort.",
+                col_name
+            );
+            return Ok(stream);
         };
 
         sort_exprs.push(PhysicalSortExpr {
@@ -121,10 +117,10 @@ pub async fn sort_stream(
     Ok(sorted_stream)
 }
 
-/// Streaming execution plan that forwards an existing RecordBatchStream.
+/// Streaming execution plan that forwards an existing `RecordBatchStream`.
 ///
 /// This is a simple wrapper that allows integrating an existing stream
-/// into DataFusion's ExecutionPlan framework for operations like sorting.
+/// into `DataFusion`'s `ExecutionPlan` framework for operations like sorting.
 #[allow(dead_code)] // schema is used indirectly via PlanProperties
 struct StreamingExec {
     schema: SchemaRef,
@@ -161,7 +157,7 @@ impl DisplayAs for StreamingExec {
 }
 
 impl ExecutionPlan for StreamingExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "StreamingExec"
     }
 
@@ -189,15 +185,14 @@ impl ExecutionPlan for StreamingExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let mut guard = self
-            .stream
-            .try_lock()
-            .ok_or_else(|| DataFusionError::Execution("Failed to acquire stream lock".to_string()))?;
-        
+        let mut guard = self.stream.try_lock().ok_or_else(|| {
+            DataFusionError::Execution("Failed to acquire stream lock".to_string())
+        })?;
+
         let stream = guard
             .take()
             .ok_or_else(|| DataFusionError::Execution("Stream already consumed".to_string()))?;
-        
+
         Ok(stream)
     }
 }
@@ -238,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn test_sort_stream_single_column() {
         let schema = create_test_schema();
-        
+
         // Create unsorted data
         let batch = create_test_batch(
             vec![3, 1, 4, 2],
@@ -246,14 +241,11 @@ mod tests {
             vec![30, 10, 40, 20],
         );
 
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
 
         let context = create_task_context();
         let sorted = sort_stream(Box::pin(stream), &["id".to_string()], &context)
-            .await
             .expect("sort should succeed");
 
         let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(sorted)
@@ -262,13 +254,13 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
-        
+
         let ids = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("ids column");
-        
+
         assert_eq!(ids.values(), &[1, 2, 3, 4]);
     }
 
@@ -289,10 +281,8 @@ mod tests {
         )
         .expect("create batch");
 
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
 
         let context = create_task_context();
         let sorted = sort_stream(
@@ -300,7 +290,6 @@ mod tests {
             &["category".to_string(), "value".to_string()],
             &context,
         )
-        .await
         .expect("sort should succeed");
 
         let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(sorted)
@@ -309,7 +298,7 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
-        
+
         let categories = batch
             .column(0)
             .as_any()
@@ -343,9 +332,8 @@ mod tests {
         );
 
         let context = create_task_context();
-        let result = sort_stream(Box::pin(stream), &[], &context)
-            .await
-            .expect("should return original stream");
+        let result =
+            sort_stream(Box::pin(stream), &[], &context).expect("should return original stream");
 
         let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(result)
             .await
@@ -377,7 +365,6 @@ mod tests {
             &["nonexistent_column".to_string()],
             &context,
         )
-        .await
         .expect("should return original stream");
 
         let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(result)
@@ -408,7 +395,6 @@ mod tests {
 
         let context = create_task_context();
         let sorted = sort_stream(Box::pin(stream), &["id".to_string()], &context)
-            .await
             .expect("sort should succeed");
 
         let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(sorted)
@@ -450,14 +436,11 @@ mod tests {
         )
         .expect("create batch");
 
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
 
         let context = create_task_context();
         let sorted = sort_stream(Box::pin(stream), &["id".to_string()], &context)
-            .await
             .expect("sort should succeed");
 
         let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(sorted)

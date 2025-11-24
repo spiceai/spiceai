@@ -528,9 +528,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("cayenne_segment_cache_mb")
         .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 0 (disabled)")
         .default("0"),
-    ParameterSpec::acceleration("sort_columns")
-        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').")
-        .runtime(),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
 
 #[async_trait]

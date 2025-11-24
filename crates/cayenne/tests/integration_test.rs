@@ -927,12 +927,13 @@ async fn test_cayenne_core_data_types_impl(
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_sorted_insert_impl);
 
-/// Test that sort_columns configuration properly sorts data during insert operations.
+/// Test that `sort_columns` configuration properly sorts data during insert operations.
 ///
 /// This test verifies:
 /// 1. Data is sorted after retention filters and before listing table refresh
 /// 2. Sorting operates on the complete corpus after retention
 /// 3. Zone maps have optimal (non-overlapping) min/max ranges
+#[allow(clippy::too_many_lines)]
 async fn test_cayenne_sorted_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -950,8 +951,10 @@ async fn test_cayenne_sorted_insert_impl(
     ]));
 
     // Configure sort_columns to sort by timestamp
-    let mut vortex_config = cayenne::metadata::VortexConfig::default();
-    vortex_config.sort_columns = vec!["timestamp".to_string()];
+    let vortex_config = cayenne::metadata::VortexConfig {
+        sort_columns: vec!["timestamp".to_string()],
+        ..Default::default()
+    };
 
     let table_options = CreateTableOptions {
         table_name: "sorted_table".to_string(),
@@ -1081,15 +1084,14 @@ async fn test_cayenne_sorted_insert_impl(
 
     // Test range query - with proper sorting, zone maps should enable efficient pruning
     let df = ctx
-        .sql("SELECT * FROM sorted_table WHERE timestamp >= 3 AND timestamp <= 7 ORDER BY timestamp")
+        .sql(
+            "SELECT * FROM sorted_table WHERE timestamp >= 3 AND timestamp <= 7 ORDER BY timestamp",
+        )
         .await?;
     let results = df.collect().await?;
 
     let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(
-        total_rows, 5,
-        "Expected 5 rows in range [3,7] (inclusive)"
-    );
+    assert_eq!(total_rows, 5, "Expected 5 rows in range [3,7] (inclusive)");
 
     let mut filtered_timestamps = Vec::new();
     for batch in &results {

@@ -49,9 +49,8 @@ impl Default for ArrowAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
-    ParameterSpec::acceleration("sort_columns")
-        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').")
-        .runtime(),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
 
 #[async_trait]
@@ -79,12 +78,12 @@ impl DataAccelerator for ArrowAccelerator {
         );
 
         // Extract sort_columns from acceleration params if provided
-        if let Some(source) = source {
-            if let Some(acceleration) = source.get_acceleration() {
-                if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
-                    cmd.options.insert("sort_columns".to_string(), sort_cols_str.clone());
-                }
-            }
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(sort_cols_str) = acceleration.params.get("sort_columns")
+        {
+            cmd.options
+                .insert("sort_columns".to_string(), sort_cols_str.clone());
         }
 
         let ctx = SessionContext::new();

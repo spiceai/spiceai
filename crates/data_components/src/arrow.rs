@@ -75,7 +75,7 @@ impl TableProviderFactory for ArrowFactory {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            
+
             if !sort_columns.is_empty() {
                 mem_table = mem_table.with_sort_columns(sort_columns);
             }

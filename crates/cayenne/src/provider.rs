@@ -989,26 +989,26 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Sort a record batch stream using DataFusion's SortExec for optimal performance.
+    /// Sort a record batch stream using `DataFusion`'s `SortExec` for optimal performance.
     ///
     /// This is used during refresh operations to sort the **entire refresh corpus** before it's
     /// chunked and written to files, ensuring optimal zone map statistics across all Vortex files.
     ///
     /// # External Sort with Disk Spilling
     ///
-    /// Uses DataFusion's `SortExec` which provides:
+    /// Uses `DataFusion`'s `SortExec` which provides:
     /// - **Automatic disk spilling**: Handles datasets larger than available memory
     /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
     /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
-    /// - **Configurable spill compression**: Supports zstd, lz4_frame, or uncompressed spill files
-    /// - **Memory management**: Integrates with DataFusion's memory pool and reservation system
+    /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
+    /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
     ///
     /// # Configuration
     ///
     /// Spill behavior is controlled by runtime configuration:
     /// - `sort_spill_reservation_bytes`: Memory reserved for merge operations (default: 10MB)
     /// - `sort_in_place_threshold_bytes`: Size below which data is sorted in-place (default: 1MB)
-    /// - `spill_compression`: Compression codec for spill files (uncompressed/lz4_frame/zstd)
+    /// - `spill_compression`: Compression codec for spill files (uncompressed, `lz4_frame`, zstd)
     /// - `temp_directory`: Directory for spill files (configured in runtime)
     ///
     /// # Performance
@@ -1021,7 +1021,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if sorting fails or if configured sort columns don't exist.
-    async fn sort_stream(
+    fn sort_stream(
         &self,
         stream: SendableRecordBatchStream,
     ) -> CatalogResult<SendableRecordBatchStream> {
@@ -1043,7 +1043,6 @@ impl CayenneTableProvider {
             &self.vortex_config.sort_columns,
             &task_ctx,
         )
-        .await
         .map_err(|e| CatalogError::InvalidOperation {
             message: format!("Failed to execute sort: {e}"),
         })?;
@@ -1055,7 +1054,7 @@ impl CayenneTableProvider {
     ///
     /// This method:
     /// 1. Reads all data from the current listing table (includes retention filter results)
-    /// 2. Sorts the data using DataFusion's SortExec (with disk spilling)
+    /// 2. Sorts the data using `DataFusion`'s `SortExec` (with disk spilling)
     /// 3. Deletes the old unsorted files
     /// 4. Writes the sorted data back in optimally-sized chunks
     ///
@@ -1075,9 +1074,12 @@ impl CayenneTableProvider {
 
         // Read all data from the current listing table
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| CatalogError::LockPoisoned {
-                operation: "read listing table for sort".to_string(),
-            })?;
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "read listing table for sort".to_string(),
+                })?;
             Arc::clone(&*guard)
         };
 
@@ -1098,7 +1100,7 @@ impl CayenneTableProvider {
             })?;
 
         // Sort the stream using our existing sort logic
-        let sorted_stream = self.sort_stream(stream).await?;
+        let sorted_stream = self.sort_stream(stream)?;
 
         // Delete all existing Vortex files in the snapshot directory before rewriting
         let snapshot_dir = Self::snapshot_dir_path(
@@ -1145,7 +1147,7 @@ impl CayenneTableProvider {
             .map_err(|source| CatalogError::IoError { source })?
         {
             let path = entry.path();
-            
+
             // Only delete files (Vortex files), not subdirectories
             if path.is_file() {
                 tokio::fs::remove_file(&path)
@@ -1429,9 +1431,9 @@ impl CayenneTableProvider {
     ///
     /// # Statistics Handling
     ///
-    /// Vortex automatically computes column statistics (min, max, null_count, distinct_count) when
+    /// Vortex automatically computes column statistics (min, max, `null_count`, `distinct_count`) when
     /// writing files. These statistics are embedded in Vortex file footers. The `ListingTable`
-    /// aggregates these statistics across all files to provide table-level statistics to DataFusion's
+    /// aggregates these statistics across all files to provide table-level statistics to `DataFusion`'s
     /// query optimizer.
     ///
     /// When `sort_columns` is configured, sorted data produces tighter min/max bounds, making
@@ -2788,25 +2790,22 @@ mod tests {
         );
     }
 
-    /// Test that data is sorted when sort_columns is configured
+    /// Test that data is sorted when `sort_columns` is configured
     #[tokio::test]
     async fn test_sort_columns() {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
 
-        let temp_dir =
-            TempDir::new().expect("Failed to create temporary directory for sort test");
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory for sort test");
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path).expect("Failed to create data directory");
 
-        let connection_string = format!("sqlite://{}/cayenne.db", temp_dir.path().to_string_lossy());
+        let connection_string =
+            format!("sqlite://{}/cayenne.db", temp_dir.path().to_string_lossy());
         let catalog = Arc::new(
             crate::CayenneCatalog::new(connection_string).expect("Failed to create catalog"),
         );
-        catalog
-            .init()
-            .await
-            .expect("Failed to initialize catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2815,8 +2814,10 @@ mod tests {
         ]));
 
         // Configure table with sort columns
-        let mut vortex_config = crate::metadata::VortexConfig::default();
-        vortex_config.sort_columns = vec!["timestamp".to_string(), "id".to_string()];
+        let vortex_config = crate::metadata::VortexConfig {
+            sort_columns: vec!["timestamp".to_string(), "id".to_string()],
+            ..Default::default()
+        };
 
         let table_options = crate::metadata::CreateTableOptions {
             table_name: "sorted_test".to_string(),
@@ -2886,21 +2887,19 @@ mod tests {
             .expect("id is Int64Array");
 
         // Verify sorted order: timestamp ascending, then id ascending
-        let expected_timestamps = vec![50i64, 75, 100, 150, 200];
-        let expected_ids = vec![1i64, 2, 5, 4, 3];
+        let expected_timestamps = [50i64, 75, 100, 150, 200];
+        let expected_ids = [1i64, 2, 5, 4, 3];
 
         for i in 0..5 {
             assert_eq!(
                 timestamp_col.value(i),
                 expected_timestamps[i],
-                "Row {} timestamp should be sorted",
-                i
+                "Row {i} timestamp should be sorted"
             );
             assert_eq!(
                 id_col.value(i),
                 expected_ids[i],
-                "Row {} id should match expected order",
-                i
+                "Row {i} id should match expected order"
             );
         }
 
