@@ -423,7 +423,7 @@ impl ExecutionPlan for PartitionedUnionExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        false
+        self.inner_union.supports_limit_pushdown()
     }
 
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -440,9 +440,9 @@ impl ExecutionPlan for PartitionedUnionExec {
 
     fn try_swapping_with_projection(
         &self,
-        _projection: &ProjectionExec,
+        projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        Ok(None)
+        self.inner_union.try_swapping_with_projection(projection)
     }
 
     fn gather_filters_for_pushdown(
