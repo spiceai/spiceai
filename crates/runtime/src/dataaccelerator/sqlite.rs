@@ -98,17 +98,17 @@ impl SqliteAccelerator {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
-        // We need to cast to match the expected signature.
+        // We need to cast to match the expected signature (char** -> *mut *mut i8).
         unsafe {
             sqlite3_auto_extension(Some(std::mem::transmute::<
                 unsafe extern "C" fn(
                     *mut rusqlite::ffi::sqlite3,
-                    *mut *const u8,
+                    *mut *const i8,
                     *const rusqlite::ffi::sqlite3_api_routines,
                 ) -> i32,
                 unsafe extern "C" fn(
                     *mut rusqlite::ffi::sqlite3,
-                    *mut *mut u8,
+                    *mut *mut i8,
                     *const rusqlite::ffi::sqlite3_api_routines,
                 ) -> i32,
             >(sqlite3_decimal_init)));
