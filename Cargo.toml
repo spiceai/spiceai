@@ -11,6 +11,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
     "crates/flightrepl",
