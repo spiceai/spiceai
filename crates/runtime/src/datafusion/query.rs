@@ -62,6 +62,7 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
+#[cfg(feature = "cluster")]
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
