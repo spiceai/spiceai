@@ -97,21 +97,18 @@ impl SqliteAccelerator {
     pub fn new() -> Self {
         // Initialize the decimal extension for SQLite
         //
-        // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
-        // We need to cast to match the expected signature (char** -> *mut *mut i8).
+        // SAFETY: This is safe because sqlite3_decimal_init is a valid SQLite extension init function.
+        // The signature difference between sqlite3_decimal_init (*mut *const c_char) and 
+        // sqlite3_auto_extension's expected signature (*mut *mut c_char) is safe to cast
+        // because the extension init function only reads from the error message pointer.
         unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute::<
-                unsafe extern "C" fn(
-                    *mut rusqlite::ffi::sqlite3,
-                    *mut *const i8,
-                    *const rusqlite::ffi::sqlite3_api_routines,
-                ) -> i32,
-                unsafe extern "C" fn(
-                    *mut rusqlite::ffi::sqlite3,
-                    *mut *mut i8,
-                    *const rusqlite::ffi::sqlite3_api_routines,
-                ) -> i32,
-            >(sqlite3_decimal_init)));
+            type AutoExtFn = unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int;
+            let init_fn: AutoExtFn = std::mem::transmute(sqlite3_decimal_init as *const ());
+            sqlite3_auto_extension(Some(init_fn));
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
