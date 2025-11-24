@@ -28,7 +28,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_expr::EquivalenceProperties;
-use futures::lock::Mutex;
+use parking_lot::Mutex;
 
 /// Sort a record batch stream using DataFusion's SortExec.
 ///
@@ -77,17 +77,17 @@ pub async fn sort_stream(
     // Build sort expressions from configured sort_columns
     let mut sort_exprs = Vec::with_capacity(sort_columns.len());
     for col_name in sort_columns {
-        // Validate column exists in schema
-        if schema.column_with_name(col_name).is_none() {
-            tracing::warn!(
-                "Sort column '{}' not found in schema. Skipping sort.",
-                col_name
-            );
-            return Ok(stream);
-        }
-
-        // Column existence validated above, so index_of will succeed
-        let column_index = schema.index_of(col_name).expect("column validated above");
+        // Validate column exists in schema and get its index
+        let column_index = match schema.index_of(col_name) {
+            Ok(idx) => idx,
+            Err(_) => {
+                tracing::warn!(
+                    "Sort column '{}' not found in schema. Skipping sort.",
+                    col_name
+                );
+                return Ok(stream);
+            }
+        };
 
         sort_exprs.push(PhysicalSortExpr {
             expr: Arc::new(Column::new(col_name, column_index)),

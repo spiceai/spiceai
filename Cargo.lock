@@ -13283,6 +13283,7 @@ dependencies = [
  "datafusion-federation",
  "futures",
  "opentelemetry 0.27.1",
+ "parking_lot 0.12.5",
  "runtime-request-context",
  "snafu",
  "tokio",

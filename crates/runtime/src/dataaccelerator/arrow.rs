@@ -50,7 +50,7 @@ impl Default for ArrowAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::acceleration("sort_columns")
-        .description("Comma-separated list of columns to sort by during inserts. Enables zone map optimization for better query performance on range queries. Example: 'timestamp,user_id'")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').")
         .runtime(),
 ];
 

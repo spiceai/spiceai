@@ -1006,8 +1006,8 @@ impl DataSink for MemSink {
             if !self.sort_columns.is_empty() && !batches.is_empty() {
                 // Concatenate batches in this partition for sorting
                 let schema = batches[0].schema();
-                let combined_batch = if batches.len() == 1 {
-                    batches.into_iter().next().expect("checked len == 1")
+                let combined_batch = if batches.len() == 1 && let Some(batch) = batches.into_iter().next() {
+                    batch
                 } else {
                     arrow::compute::concat_batches(&schema, &batches)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?

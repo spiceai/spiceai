@@ -375,107 +375,6 @@ impl std::fmt::Debug for CayenneTableProvider {
     }
 }
 
-/// Streaming execution plan that forwards an existing RecordBatchStream.
-///
-/// This is a minimal ExecutionPlan implementation that simply yields batches
-/// from a pre-existing stream, allowing us to integrate streaming data sources
-/// (like refresh operations) with DataFusion's physical plan operators.
-struct StreamingExec {
-    schema: SchemaRef,
-    stream: tokio::sync::Mutex<Option<SendableRecordBatchStream>>,
-    properties: datafusion_physical_plan::PlanProperties,
-}
-
-impl StreamingExec {
-    fn new(schema: SchemaRef, stream: SendableRecordBatchStream) -> Self {
-        use datafusion_physical_plan::{Partitioning, execution_plan::{EmissionType, Boundedness}};
-        use datafusion_physical_expr::EquivalenceProperties;
-
-        let properties = datafusion_physical_plan::PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-
-        Self {
-            schema,
-            stream: tokio::sync::Mutex::new(Some(stream)),
-            properties,
-        }
-    }
-}
-
-impl std::fmt::Debug for StreamingExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamingExec")
-            .field("schema", &self.schema)
-            .finish()
-    }
-}
-
-impl datafusion_physical_plan::DisplayAs for StreamingExec {
-    fn fmt_as(
-        &self,
-        _t: datafusion_physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "StreamingExec")
-    }
-}
-
-impl datafusion_physical_plan::ExecutionPlan for StreamingExec {
-    fn name(&self) -> &'static str {
-        "StreamingExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn datafusion_physical_plan::ExecutionPlan>>,
-    ) -> datafusion_common::Result<Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<datafusion_execution::TaskContext>,
-    ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let stream = self
-            .stream
-            .try_lock()
-            .map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    "Stream already taken".to_string(),
-                )
-            })?
-            .take()
-            .ok_or_else(|| {
-                datafusion_common::DataFusionError::Execution(
-                    "Stream already consumed".to_string(),
-                )
-            })?;
-
-        Ok(stream)
-    }
-}
-
 impl CayenneTableProvider {
     /// Construct the path to a snapshot directory.
     ///
@@ -3005,6 +2904,6 @@ mod tests {
             );
         }
 
-        tracing::info!("✓ Data sorted correctly by refresh_sort_columns");
+        tracing::info!("✓ Data sorted correctly by sort_columns");
     }
 }
