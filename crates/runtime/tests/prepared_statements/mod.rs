@@ -65,7 +65,7 @@ async fn test_prepared_statement_with_parameters() -> Result<(), anyhow::Error> 
             // PREPARE should complete successfully
             assert_eq!(prepare_batches.len(), 0, "PREPARE should return no rows");
 
-            // Get explain plan for PREPARE statement  
+            // Get explain plan for PREPARE statement
             let explain_sql = "EXPLAIN PREPARE my_query AS SELECT 1 + 10 AS result";
             let explain_result = rt
                 .datafusion()
@@ -100,7 +100,7 @@ async fn test_prepared_statement_with_parameters() -> Result<(), anyhow::Error> 
 
 // Additional tests to add once EXECUTE physical planning is fully supported:
 // - test_prepared_statement_execute_with_parameters
-// - test_prepared_statement_multiple_parameters  
+// - test_prepared_statement_multiple_parameters
 // - test_prepared_statement_question_mark_placeholders
 //
 // These features are currently tested via Flight SQL in:
