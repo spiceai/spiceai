@@ -2,6 +2,6 @@
 source: crates/runtime-table-partition/tests/partition_table_provider.rs
 expression: explain_plan
 ---
-UnionExec
+PartitionedUnionExec
   PartitionMemTableExec: partition_value=2000, filters=[sales > Int64(2500)]
   PartitionMemTableExec: partition_value=3000, filters=[sales > Int64(2500)]
