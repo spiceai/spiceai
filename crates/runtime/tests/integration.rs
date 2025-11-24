@@ -148,11 +148,12 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
 }
 
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let lineitem_parquet_bytes =
-        reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
-            .await?
-            .bytes()
-            .await?;
+    let lineitem_parquet_bytes = reqwest::get(
+        "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/lineitem/lineitem.parquet",
+    )
+    .await?
+    .bytes()
+    .await?;
 
     let parquet_reader =
         ParquetRecordBatchReaderBuilder::try_new(lineitem_parquet_bytes)?.build()?;
