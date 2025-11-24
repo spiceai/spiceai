@@ -125,11 +125,20 @@ impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self {
-        ODBCConnection {
-            conn: Arc::new(conn.into()),
-            params: Arc::new(HashMap::new()),
-        }
+    fn new(_: Connection<'a>) -> Self {
+        unreachable!()
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Leave unimplemented as each ODBC driver has different capabilities.
+        unimplemented!("ODBC tables() requires driver-specific implementation")
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Leave unimplemented as each ODBC driver has different capabilities.
+        unimplemented!("ODBC schemas() requires driver-specific implementation")
     }
 
     async fn get_schema(

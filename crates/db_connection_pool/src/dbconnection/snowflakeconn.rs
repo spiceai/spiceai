@@ -96,6 +96,78 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         SnowflakeConnection { api }
     }
 
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let query = format!("SHOW TABLES IN SCHEMA {schema}");
+
+        let res =
+            self.api
+                .exec(&query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetTables {
+                    source: e.to_string().into(),
+                })?;
+
+        match res {
+            snowflake_api::QueryResult::Arrow(batches) => {
+                let mut tables = Vec::new();
+                for batch in batches {
+                    if let Some(name_column) = batch.column_by_name("name")
+                        && let Some(array) = name_column
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                    {
+                        for i in 0..array.len() {
+                            if let Some(name) = array.value(i).to_string().into() {
+                                tables.push(name);
+                            }
+                        }
+                    }
+                }
+                Ok(tables)
+            }
+            snowflake_api::QueryResult::Json(_) => Err(dbconnection::Error::UnableToGetTables {
+                source: "Expected Arrow response, got JSON".into(),
+            }),
+            snowflake_api::QueryResult::Empty => Ok(Vec::new()),
+        }
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let query = "SHOW SCHEMAS";
+
+        let res =
+            self.api
+                .exec(query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                    source: e.to_string().into(),
+                })?;
+
+        match res {
+            snowflake_api::QueryResult::Arrow(batches) => {
+                let mut schemas = Vec::new();
+                for batch in batches {
+                    if let Some(name_column) = batch.column_by_name("name")
+                        && let Some(array) = name_column
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                    {
+                        for i in 0..array.len() {
+                            if let Some(name) = array.value(i).to_string().into() {
+                                schemas.push(name);
+                            }
+                        }
+                    }
+                }
+                Ok(schemas)
+            }
+            snowflake_api::QueryResult::Json(_) => Err(dbconnection::Error::UnableToGetSchemas {
+                source: "Expected Arrow response, got JSON".into(),
+            }),
+            snowflake_api::QueryResult::Empty => Ok(Vec::new()),
+        }
+    }
+
     async fn get_schema(
         &self,
         table_reference: &TableReference,

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::RecordBatch,
+    array::{Array, RecordBatch},
     datatypes::{Field, Schema, SchemaRef},
     ipc::reader::StreamReader,
 };
@@ -605,6 +605,120 @@ impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnec
 impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
     fn new(api: Arc<SqlWarehouseApi>) -> Self {
         Self { api }
+    }
+
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let query = format!(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
+        );
+
+        let token = self.api.token_provider.get_token();
+        let payload = json!({
+            "warehouse_id": self.api.sql_warehouse_id,
+            "format": "ARROW_STREAM",
+            "disposition": "EXTERNAL_LINKS",
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
+            "statement": query,
+        });
+
+        let response = self
+            .api
+            .execute_sql_statement(&token, &payload)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetTables {
+                source: Box::new(e),
+            })?;
+
+        SqlWarehouseApi::verify_response_status(&response).map_err(|e| {
+            dbconnection::Error::UnableToGetTables {
+                source: Box::new(e),
+            }
+        })?;
+
+        let mut stream = Arc::clone(&self.api)
+            .fetch_external_links(response)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetTables {
+                source: Box::new(e),
+            })?;
+
+        let mut tables = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| dbconnection::Error::UnableToGetTables {
+                source: Box::new(e),
+            })?;
+
+            if let Some(name_column) = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+            {
+                for i in 0..name_column.len() {
+                    if !name_column.is_null(i) {
+                        tables.push(name_column.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(tables)
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let query = "SELECT schema_name FROM information_schema.schemata";
+
+        let token = self.api.token_provider.get_token();
+        let payload = json!({
+            "warehouse_id": self.api.sql_warehouse_id,
+            "format": "ARROW_STREAM",
+            "disposition": "EXTERNAL_LINKS",
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
+            "statement": query,
+        });
+
+        let response = self
+            .api
+            .execute_sql_statement(&token, &payload)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+        SqlWarehouseApi::verify_response_status(&response).map_err(|e| {
+            dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            }
+        })?;
+
+        let mut stream = Arc::clone(&self.api)
+            .fetch_external_links(response)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+        let mut schemas = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+            if let Some(name_column) = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+            {
+                for i in 0..name_column.len() {
+                    if !name_column.is_null(i) {
+                        schemas.push(name_column.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(schemas)
     }
 
     async fn get_schema(

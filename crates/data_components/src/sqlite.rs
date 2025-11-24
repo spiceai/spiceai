@@ -19,9 +19,8 @@ use datafusion::{
     catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
 };
 use datafusion_table_providers::{
-    sql::sql_provider_datafusion::expr::Engine,
+    sql::sql_provider_datafusion::expr::{self, Engine},
     sqlite::{Sqlite, write::SqliteTableWriter},
-    util,
 };
 use rusqlite::Transaction;
 use std::sync::Arc;
@@ -62,11 +61,18 @@ impl DeletionSink for SqliteDeletionSink {
         let mut db_conn = self.sqlite.connect().await?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
         let sqlite = Arc::clone(&self.sqlite);
-        let sql = util::filters_to_sql(&self.filters, Some(Engine::SQLite))?;
+        let sql_filters: Result<Vec<String>, _> = self
+            .filters
+            .iter()
+            .map(|f| expr::to_sql_with_engine(f, Some(Engine::SQLite)))
+            .collect();
+        let sql = sql_filters
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            .join(" AND ");
 
         let count: u64 = sqlite_conn
             .conn
-            .call(move |conn| {
+            .call(move |conn| -> rusqlite::Result<u64> {
                 let tx = conn.transaction()?;
 
                 let count = delete_from(sqlite.table_name(), &tx, &sql)?;

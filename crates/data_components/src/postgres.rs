@@ -29,7 +29,7 @@ use crate::{
 
 use datafusion_table_providers::{
     postgres::{Postgres, PostgresTableFactory, write::PostgresTableWriter},
-    util,
+    sql::sql_provider_datafusion::expr,
 };
 
 #[async_trait]
@@ -107,12 +107,15 @@ impl DeletionSink for PostgresDeletionSink {
         let mut db_conn = self.postgres.connect().await?;
         let postgres_conn = Postgres::postgres_conn(&mut db_conn)?;
         let tx = postgres_conn.conn.transaction().await?;
-        let count = delete_from(
-            self.postgres.table_name(),
-            &tx,
-            &util::filters_to_sql(&self.filters, None)?,
-        )
-        .await?;
+        let sql_filters: Result<Vec<String>, _> = self
+            .filters
+            .iter()
+            .map(|f| expr::to_sql_with_engine(f, None))
+            .collect();
+        let sql_where = sql_filters
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            .join(" AND ");
+        let count = delete_from(self.postgres.table_name(), &tx, &sql_where).await?;
         tx.commit().await?;
 
         Ok(count)
