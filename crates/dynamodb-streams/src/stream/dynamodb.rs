@@ -1,11 +1,11 @@
 use crate::client_sdk::SDKClient;
 use crate::types::stream_state::{RecordBatch, StreamState};
 use crate::{Result, StreamResult};
+use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::{Stream, future::join_all};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use tokio::{
     sync::mpsc,
     time::{Duration, sleep},
@@ -25,14 +25,19 @@ impl DynamodbStreamProducer {
         let mut batches = Vec::new();
 
         // 1. Poll active shards
-        let futures = self.state.active_shards().map(|shard|  {
+        let futures = self.state.active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
             tracing::debug!(
                 "Polling shard with iterator: shard_id={}, iterator={}",
                 shard.shard_id,
                 shard.iterator
             );
-            async move { (shard.shard_id.clone(), client.get_iterator_records(&shard.iterator).await) }
+            async move {
+                (
+                    shard.shard_id.clone(),
+                    client.get_iterator_records(&shard.iterator).await,
+                )
+            }
         });
 
         let results = join_all(futures).await;
@@ -41,7 +46,9 @@ impl DynamodbStreamProducer {
         for (shard_id, result) in results {
             match result {
                 Ok((next_iter, records)) => {
-                    if let Some(batch) = self.state.handle_poll_result(&shard_id, next_iter, records) {
+                    if let Some(batch) =
+                        self.state.handle_poll_result(&shard_id, next_iter, records)
+                    {
                         batches.push(batch);
                     }
                 }
@@ -66,12 +73,16 @@ impl DynamodbStreamProducer {
         let shard_ids: Vec<String> = self.state.initializing.keys().cloned().collect();
 
         for shard_id in shard_ids {
-            match self.client.get_shard_iterator(
-                &self.stream_arn,
-                &shard_id,
-                &ShardIteratorType::TrimHorizon,
-                None,
-            ).await {
+            match self
+                .client
+                .get_shard_iterator(
+                    &self.stream_arn,
+                    &shard_id,
+                    &ShardIteratorType::TrimHorizon,
+                    None,
+                )
+                .await
+            {
                 Ok(iterator) => {
                     if let Some(iterator) = iterator {
                         self.state.mark_active(shard_id, iterator);

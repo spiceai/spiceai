@@ -168,11 +168,7 @@ impl StreamState {
         }
     }
 
-    fn try_move_to_initializing(
-        &mut self,
-        shard_id: String,
-        shard: PendingShard,
-    ) {
+    fn try_move_to_initializing(&mut self, shard_id: String, shard: PendingShard) {
         let is_blocked = shard
             .parent_shard_id
             .as_ref()
@@ -277,11 +273,15 @@ mod tests {
     use aws_sdk_dynamodbstreams::types::StreamRecord;
 
     fn create_record(seq_num: &str) -> Record {
-        Record::builder().dynamodb(StreamRecord::builder().sequence_number(seq_num).build()).build()
+        Record::builder()
+            .dynamodb(StreamRecord::builder().sequence_number(seq_num).build())
+            .build()
     }
 
     fn create_record_without_seq() -> Record {
-        Record::builder().dynamodb(StreamRecord::builder().build()).build()
+        Record::builder()
+            .dynamodb(StreamRecord::builder().build())
+            .build()
     }
 
     fn create_record_without_dynamodb() -> Record {
@@ -348,7 +348,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -406,7 +409,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -441,7 +447,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -510,7 +519,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: Some("parent-1".to_string()),
@@ -560,7 +572,10 @@ mod tests {
         assert!(state.initializing.contains_key("child"));
 
         assert_eq!(
-            state.initializing.get("child").expect("child should be in initializing"),
+            state
+                .initializing
+                .get("child")
+                .expect("child should be in initializing"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -601,7 +616,10 @@ mod tests {
         assert!(state.initializing.contains_key("shard-1"));
 
         assert_eq!(
-            state.initializing.get("shard-1").expect("shard-1 should be in initializing"),
+            state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing"),
             &PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -652,7 +670,10 @@ mod tests {
         assert!(!state.initializing.contains_key("child"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -685,7 +706,10 @@ mod tests {
         assert!(!state.initializing.contains_key("child"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -718,7 +742,10 @@ mod tests {
         assert!(!state.initializing.contains_key("child"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -752,7 +779,10 @@ mod tests {
         assert!(!state.initializing.contains_key("shard-1"));
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -785,7 +815,10 @@ mod tests {
         assert!(!state.initializing.contains_key("shard-1"));
 
         assert_eq!(
-            state.pending.get("shard-1").expect("shard-1 should be in pending"),
+            state
+                .pending
+                .get("shard-1")
+                .expect("shard-1 should be in pending"),
             &PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -817,7 +850,10 @@ mod tests {
         assert!(state.initializing.contains_key("shard-1"));
 
         assert_eq!(
-            state.initializing.get("shard-1").expect("shard-1 should be in initializing"),
+            state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing"),
             &PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -839,8 +875,8 @@ mod tests {
         );
 
         let shards = vec![
-            create_api_shard("root-1", None, None),           // Should go to initializing
-            create_api_shard("root-2", None, Some("999")),     // Should be ignored (closed)
+            create_api_shard("root-1", None, None), // Should go to initializing
+            create_api_shard("root-2", None, Some("999")), // Should be ignored (closed)
             create_api_shard("child-1", Some("parent-1"), None), // Should go to pending
             create_api_shard("child-2", Some("nonexistent"), None), // Should go to initializing
         ];
@@ -854,7 +890,10 @@ mod tests {
         // root-1: open shard without parent
         assert!(state.initializing.contains_key("root-1"));
         assert_eq!(
-            state.initializing.get("root-1").expect("root-1 should be in initializing"),
+            state
+                .initializing
+                .get("root-1")
+                .expect("root-1 should be in initializing"),
             &PendingShard {
                 shard_id: "root-1".to_string(),
                 parent_shard_id: None,
@@ -869,7 +908,10 @@ mod tests {
         // child-1: blocked by active parent
         assert!(state.pending.contains_key("child-1"));
         assert_eq!(
-            state.pending.get("child-1").expect("child-1 should be in pending"),
+            state
+                .pending
+                .get("child-1")
+                .expect("child-1 should be in pending"),
             &PendingShard {
                 shard_id: "child-1".to_string(),
                 parent_shard_id: Some("parent-1".to_string()),
@@ -879,7 +921,10 @@ mod tests {
         // child-2: parent doesn't exist, not blocked
         assert!(state.initializing.contains_key("child-2"));
         assert_eq!(
-            state.initializing.get("child-2").expect("child-2 should be in initializing"),
+            state
+                .initializing
+                .get("child-2")
+                .expect("child-2 should be in initializing"),
             &PendingShard {
                 shard_id: "child-2".to_string(),
                 parent_shard_id: Some("nonexistent".to_string()),
@@ -917,7 +962,10 @@ mod tests {
         assert!(state.active.contains_key("shard-1"));
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -946,7 +994,10 @@ mod tests {
 
         assert!(state.active.contains_key("shard-1"));
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -993,7 +1044,10 @@ mod tests {
         assert!(!state.initializing.contains_key("shard-1"));
 
         assert_eq!(
-            state.pending.get("shard-1").expect("shard-1 should be in pending"),
+            state
+                .pending
+                .get("shard-1")
+                .expect("shard-1 should be in pending"),
             &PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1028,7 +1082,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1037,7 +1094,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.active.get("shard-2").expect("shard-2 should be in active"),
+            state
+                .active
+                .get("shard-2")
+                .expect("shard-2 should be in active"),
             &ActiveShard {
                 shard_id: "shard-2".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1072,7 +1132,10 @@ mod tests {
         assert!(state.initializing.contains_key("child"));
 
         assert_eq!(
-            state.initializing.get("child").expect("child should be in initializing"),
+            state
+                .initializing
+                .get("child")
+                .expect("child should be in initializing"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1121,7 +1184,10 @@ mod tests {
         assert!(state.pending.contains_key("other-child"));
 
         assert_eq!(
-            state.initializing.get("child-1").expect("child-1 should be in initializing"),
+            state
+                .initializing
+                .get("child-1")
+                .expect("child-1 should be in initializing"),
             &PendingShard {
                 shard_id: "child-1".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1129,7 +1195,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.initializing.get("child-2").expect("child-2 should be in initializing"),
+            state
+                .initializing
+                .get("child-2")
+                .expect("child-2 should be in initializing"),
             &PendingShard {
                 shard_id: "child-2".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1137,7 +1206,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.pending.get("other-child").expect("other-child should be in pending"),
+            state
+                .pending
+                .get("other-child")
+                .expect("other-child should be in pending"),
             &PendingShard {
                 shard_id: "other-child".to_string(),
                 parent_shard_id: Some("other-parent".to_string()),
@@ -1167,7 +1239,10 @@ mod tests {
         assert!(!state.initializing.contains_key("unrelated"));
 
         assert_eq!(
-            state.pending.get("unrelated").expect("unrelated should be in pending"),
+            state
+                .pending
+                .get("unrelated")
+                .expect("unrelated should be in pending"),
             &PendingShard {
                 shard_id: "unrelated".to_string(),
                 parent_shard_id: Some("other-parent".to_string()),
@@ -1211,7 +1286,10 @@ mod tests {
         assert!(state.active.contains_key("grandparent"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("grandparent".to_string()),
@@ -1243,7 +1321,10 @@ mod tests {
         assert!(!state.active.contains_key("shard-1"));
 
         assert_eq!(
-            state.initializing.get("shard-1").expect("shard-1 should be in initializing"),
+            state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing"),
             &PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1280,7 +1361,10 @@ mod tests {
         assert!(state.active.contains_key("parent"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1316,7 +1400,10 @@ mod tests {
         assert!(state.pending.contains_key("parent"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1352,7 +1439,10 @@ mod tests {
         assert!(state.initializing.contains_key("parent"));
 
         assert_eq!(
-            state.pending.get("child").expect("child should be in pending"),
+            state
+                .pending
+                .get("child")
+                .expect("child should be in pending"),
             &PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1360,7 +1450,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.initializing.get("parent").expect("parent should be in initializing"),
+            state
+                .initializing
+                .get("parent")
+                .expect("parent should be in initializing"),
             &PendingShard {
                 shard_id: "parent".to_string(),
                 parent_shard_id: None,
@@ -1391,7 +1484,10 @@ mod tests {
         assert!(state.active.contains_key("shard-1"));
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1411,7 +1507,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1457,7 +1556,10 @@ mod tests {
         assert!(state.pending.contains_key("child"));
 
         assert_eq!(
-            state.active.get("parent").expect("parent should be in active"),
+            state
+                .active
+                .get("parent")
+                .expect("parent should be in active"),
             &ActiveShard {
                 shard_id: "parent".to_string(),
                 parent_shard_id: None,
@@ -1484,7 +1586,10 @@ mod tests {
         assert!(state.active.contains_key("child"));
 
         assert_eq!(
-            state.active.get("child").expect("child should be in active"),
+            state
+                .active
+                .get("child")
+                .expect("child should be in active"),
             &ActiveShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1600,7 +1705,10 @@ mod tests {
         assert!(state.active.contains_key("child-b"));
 
         assert_eq!(
-            state.active.get("child-a").expect("child-a should be in active"),
+            state
+                .active
+                .get("child-a")
+                .expect("child-a should be in active"),
             &ActiveShard {
                 shard_id: "child-a".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1609,7 +1717,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.active.get("child-b").expect("child-b should be in active"),
+            state
+                .active
+                .get("child-b")
+                .expect("child-b should be in active"),
             &ActiveShard {
                 shard_id: "child-b".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1638,7 +1749,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1668,11 +1782,8 @@ mod tests {
             create_record("104"),
         ];
 
-        let batch = state.handle_poll_result(
-            "shard-1",
-            Some("iter-2".to_string()),
-            records.clone(),
-        );
+        let batch =
+            state.handle_poll_result("shard-1", Some("iter-2".to_string()), records.clone());
 
         assert!(batch.is_some());
         let batch = batch.expect("Expected batch to be Some");
@@ -1688,7 +1799,10 @@ mod tests {
         assert_eq!(state.initializing.len(), 0);
 
         assert_eq!(
-            state.active.get("shard-1").expect("shard-1 should be in active"),
+            state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active"),
             &ActiveShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: Some("parent".to_string()),
@@ -1714,7 +1828,10 @@ mod tests {
         assert!(state.initializing.contains_key("shard-1"));
 
         assert_eq!(
-            state.initializing.get("shard-1").expect("shard-1 should be in initializing"),
+            state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing"),
             &PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
@@ -1779,7 +1896,10 @@ mod tests {
         assert!(!state.active.contains_key("parent-1"));
 
         assert_eq!(
-            state.initializing.get("child-1").expect("child-1 should be in initializing"),
+            state
+                .initializing
+                .get("child-1")
+                .expect("child-1 should be in initializing"),
             &PendingShard {
                 shard_id: "child-1".to_string(),
                 parent_shard_id: Some("parent-1".to_string()),
@@ -1787,7 +1907,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.pending.get("child-2").expect("child-2 should be in pending"),
+            state
+                .pending
+                .get("child-2")
+                .expect("child-2 should be in pending"),
             &PendingShard {
                 shard_id: "child-2".to_string(),
                 parent_shard_id: Some("parent-2".to_string()),
@@ -1795,7 +1918,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.active.get("parent-2").expect("parent-2 should be in active"),
+            state
+                .active
+                .get("parent-2")
+                .expect("parent-2 should be in active"),
             &ActiveShard {
                 shard_id: "parent-2".to_string(),
                 parent_shard_id: None,

@@ -103,7 +103,10 @@ impl SDKClient {
             .shard_iterator)
     }
 
-    pub async fn get_iterator_records(&self, iterator: &str) -> Result<(Option<String>, Vec<Record>)> {
+    pub async fn get_iterator_records(
+        &self,
+        iterator: &str,
+    ) -> Result<(Option<String>, Vec<Record>)> {
         let output = self
             .streams
             .get_records()
