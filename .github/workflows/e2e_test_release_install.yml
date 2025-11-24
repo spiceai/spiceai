@@ -2,6 +2,24 @@ name: E2E Test Release Installation
 
 on:
   workflow_dispatch:
+    inputs:
+      install_script_branch:
+        description: 'Branch to use for install script (leave empty to use install.spiceai.org)'
+        required: false
+        type: string
+        default: ''
+  pull_request:
+    paths:
+      - 'install/install.sh'
+      - 'install/Install.ps1'
+      - '.github/workflows/e2e_test_release_install.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'install/install.sh'
+      - 'install/Install.ps1'
+      - '.github/workflows/e2e_test_release_install.yml'
 
 jobs:
   test-install:
@@ -45,19 +63,43 @@ jobs:
           sudo apt install jq -y
 
       - name: install Spice (https://install.spiceai.org)
-        if: matrix.target_os != 'windows'
+        if: matrix.target_os != 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl https://install.spiceai.org | /bin/bash
 
+      - name: install Spice (from branch)
+        if: matrix.target_os != 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
+          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+
       - name: install Spice (Windows)
-        if: matrix.target_os == 'windows'
+        if: matrix.target_os == 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
+
+      - name: install Spice (Windows from branch)
+        if: matrix.target_os == 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $branch = "${{ inputs.install_script_branch }}"
+          if ([string]::IsNullOrEmpty($branch)) {
+            $branch = "${{ github.head_ref }}"
+            if ([string]::IsNullOrEmpty($branch)) {
+              $branch = "${{ github.ref_name }}"
+            }
+          }
+          $url = "https://raw.githubusercontent.com/spiceai/spiceai/$branch/install/Install.ps1"
+          iex ((New-Object System.Net.WebClient).DownloadString($url))
 
       - name: add Spice bin to PATH
         if: matrix.target_os != 'windows'
