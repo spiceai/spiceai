@@ -9,10 +9,12 @@ pub struct ApiShard {
 }
 
 impl ApiShard {
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.shard_id
     }
 
+    #[must_use]
     pub fn parent_id(&self) -> Option<&str> {
         self.parent_shard_id.as_deref()
     }

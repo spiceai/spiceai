@@ -41,6 +41,7 @@ pub struct StreamState {
 }
 
 impl StreamState {
+    #[must_use]
     pub fn new(stream_arn: String) -> Self {
         Self {
             stream_arn,
@@ -69,15 +70,12 @@ impl StreamState {
 
         let parent_id = self.active.get(shard_id)?.parent_shard_id.clone();
 
-        match new_iterator {
-            Some(iter) => {
-                self.active.get_mut(shard_id)?.set_iterator(iter);
-            }
-            None => {
-                self.active.remove(shard_id);
-                self.promote_children(shard_id)
-            }
-        };
+        if let Some(iter) = new_iterator {
+            self.active.get_mut(shard_id)?.set_iterator(iter);
+        } else {
+            self.active.remove(shard_id);
+            self.promote_children(shard_id);
+        }
 
         if records.is_empty() {
             return None;
@@ -106,6 +104,21 @@ impl StreamState {
         })
     }
 
+    pub fn reinitialize_shard(&mut self, shard_id: &str) {
+        // Remove from active
+        if let Some(active_shard) = self.active.remove(shard_id) {
+
+            // Add to initializing to get a fresh iterator
+            self.initializing.insert(
+                shard_id.to_string(),
+                PendingShard {
+                    shard_id: shard_id.to_string(),
+                    parent_shard_id: active_shard.parent_shard_id,
+                },
+            );
+        }
+    }
+
     /// Add discovered shards, returns shard IDs that need initialization
     pub fn add_discovered(&mut self, shards: Vec<ApiShard>) {
         for shard in shards {
@@ -118,14 +131,11 @@ impl StreamState {
                 continue;
             }
 
-            let blocked = shard
-                .parent_id()
-                .map(|p| {
-                    self.active.contains_key(p)
-                        || self.pending.contains_key(p)
-                        || self.initializing.contains_key(p)
-                })
-                .unwrap_or(false);
+            let blocked = shard.parent_id().is_some_and(|p| {
+                self.active.contains_key(p)
+                    || self.pending.contains_key(p)
+                    || self.initializing.contains_key(p)
+            });
 
             let pending_shard = PendingShard {
                 shard_id: shard_id.clone(),
@@ -169,15 +179,11 @@ impl StreamState {
     }
 
     fn try_move_to_initializing(&mut self, shard_id: String, shard: PendingShard) {
-        let is_blocked = shard
-            .parent_shard_id
-            .as_ref()
-            .map(|p| {
-                self.active.contains_key(p)
-                    || self.pending.contains_key(p)
-                    || self.initializing.contains_key(p)
-            })
-            .unwrap_or(false);
+        let is_blocked = shard.parent_shard_id.as_ref().is_some_and(|p| {
+            self.active.contains_key(p)
+                || self.pending.contains_key(p)
+                || self.initializing.contains_key(p)
+        });
 
         if is_blocked {
             self.pending.insert(shard_id.clone(), shard);
@@ -291,9 +297,9 @@ mod tests {
     fn create_api_shard(id: &str, parent: Option<&str>, ending_seq: Option<&str>) -> ApiShard {
         ApiShard {
             shard_id: id.to_string(),
-            parent_shard_id: parent.map(|s| s.to_string()),
+            parent_shard_id: parent.map(std::string::ToString::to_string),
             starting_sequence_number: None,
-            ending_sequence_number: ending_seq.map(|s| s.to_string()),
+            ending_sequence_number: ending_seq.map(std::string::ToString::to_string),
         }
     }
 

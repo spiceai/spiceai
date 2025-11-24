@@ -1,6 +1,6 @@
 use crate::client_sdk::SDKClient;
-use crate::types::stream_state::{RecordBatch, StreamState};
-use crate::{Result, StreamResult};
+use crate::types::stream_state::{PendingShard, RecordBatch, StreamState};
+use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::{Stream, future::join_all};
 use std::pin::Pin;
@@ -53,7 +53,9 @@ impl DynamodbStreamProducer {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Shard {} poll failed: {}", shard_id, e);
+                    // TODO: Handle expired iterator
+                    tracing::error!("Shard poll failed: shard_id={}, {}", shard_id, e);
+                    self.handle_failed_shard(&shard_id, &e).await;
                 }
             }
         }
@@ -67,6 +69,18 @@ impl DynamodbStreamProducer {
         self.initialize_shards_iterators().await;
 
         Ok(batches)
+    }
+
+    async fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
+        // TODO: Finalize logic
+        let is_expired_iterator = error.to_string().contains("ExpiredIterator")
+            || error.to_string().contains("TrimmedDataAccess");
+
+        if is_expired_iterator {
+            tracing::warn!("Iterator expired for shard {}, will reinitialize", shard_id);
+
+            self.state.reinitialize_shard(shard_id);
+        }
     }
 
     async fn initialize_shards_iterators(&mut self) {
@@ -100,6 +114,7 @@ impl DynamodbStreamProducer {
             let batches = match self.iterate().await {
                 Ok(b) => b,
                 Err(e) => {
+                    // TODO: What to do here?
                     tracing::error!("Iteration failed: {}", e);
                     continue;
                 }

@@ -24,6 +24,7 @@ pub struct GlobalCheckpoint {
 impl GlobalCheckpoint {
     /// Returns shards that have no children in this checkpoint (leaf nodes in the lineage tree).
     /// These are the active shards to resume from, as their parents are already exhausted.
+    #[must_use]
     pub fn leaf_shards(&self) -> Vec<(&String, &ShardCheckpoint)> {
         let parent_ids: HashSet<&str> = self
             .shards
