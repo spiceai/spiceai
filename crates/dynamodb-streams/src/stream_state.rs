@@ -1,6 +1,5 @@
-use crate::client_sdk::SDKClient;
+use crate::client_sdk::{ApiShard, SDKClient};
 use crate::types::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
-use crate::types::shard::ApiShard;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,7 +120,7 @@ impl StreamState {
     /// Add discovered shards, returns shard IDs that need initialization
     pub fn add_discovered(&mut self, shards: Vec<ApiShard>) {
         for shard in shards {
-            let shard_id = shard.id().to_string();
+            let shard_id = shard.shard_id.clone();
 
             if self.active.contains_key(&shard_id)
                 || self.pending.contains_key(&shard_id)
@@ -130,15 +129,15 @@ impl StreamState {
                 continue;
             }
 
-            let blocked = shard.parent_id().is_some_and(|p| {
-                self.active.contains_key(p)
-                    || self.pending.contains_key(p)
-                    || self.initializing.contains_key(p)
+            let blocked = shard.parent_shard_id.clone().is_some_and(|p| {
+                self.active.contains_key(&p)
+                    || self.pending.contains_key(&p)
+                    || self.initializing.contains_key(&p)
             });
 
             let pending_shard = PendingShard {
                 shard_id: shard_id.clone(),
-                parent_shard_id: shard.parent_shard_id.clone(),
+                parent_shard_id: (&shard).parent_shard_id.clone(),
             };
 
             if blocked {
@@ -248,22 +247,22 @@ async fn start_children_from_trim_horizon(
     let all_shards = sdk_client.get_all_shards(&state.stream_arn).await?;
 
     for child in all_shards {
-        if child.parent_id() == Some(parent_id) {
+        if child.parent_shard_id == Some(parent_id.to_string()) {
             if let Ok(Some(iterator)) = sdk_client
                 .get_shard_iterator(
                     &state.stream_arn,
-                    child.id(),
+                    &child.shard_id,
                     &ShardIteratorType::TrimHorizon,
                     None,
                 )
                 .await
             {
                 let shard = ActiveShard {
-                    shard_id: child.id().to_string(),
+                    shard_id: child.shard_id.clone(),
                     parent_shard_id: Some(parent_id.to_string()),
                     iterator,
                 };
-                state.active.insert(child.id().to_string(), shard);
+                state.active.insert(child.shard_id.clone(), shard);
             } else {
                 //TODO: Else what?
             }

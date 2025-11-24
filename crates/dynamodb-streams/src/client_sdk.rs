@@ -1,4 +1,3 @@
-use crate::types::shard::ApiShard;
 use crate::{Error, Result};
 use aws_config::SdkConfig;
 use aws_sdk_dynamodb::Client as DbClient;
@@ -10,6 +9,14 @@ pub struct SDKClient {
     db: DbClient,
     streams: StreamsClient,
     shard_record_limit: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApiShard {
+    pub shard_id: String,
+    pub parent_shard_id: Option<String>,
+    pub starting_sequence_number: Option<String>,
+    pub ending_sequence_number: Option<String>, // None = still open
 }
 
 impl SDKClient {

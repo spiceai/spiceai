@@ -24,6 +24,8 @@ pub enum Error {
     #[snafu(display("Stream description not found: {stream_arn}"))]
     StreamDescriptionNotFound { stream_arn: String },
 
-    #[snafu(display("Failed to initialize checkpoint due to empty starting_sequence_number in one of the open shards"))]
+    #[snafu(display(
+        "Failed to initialize checkpoint due to empty starting_sequence_number in one of the open shards"
+    ))]
     FailedToInitializeCheckpoint,
 }
