@@ -160,7 +160,7 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
         !candidate.is_absolute()
             && candidate
                 .components()
-                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir)),
+                .all(|component| matches!(component, Component::Normal(_))),
         InvalidModelNameSnafu {
             name: name.to_string(),
         }

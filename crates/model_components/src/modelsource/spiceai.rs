@@ -107,7 +107,7 @@ impl ModelSource for SpiceAI {
         match sanitized_version.as_str() {
             "latest" => {}
             _ => {
-                let _ = write!(url, "?training_run_id={version}");
+                let _ = write!(url, "?training_run_id={sanitized_version}");
             }
         }
 

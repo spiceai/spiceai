@@ -50,7 +50,7 @@ use app::App;
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode};
 
 use builder::RuntimeBuilder;
-use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
+use cancellable_task::CancellableTaskHandle;
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -72,7 +72,7 @@ use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 
-use tokio::sync::{RwLock, oneshot::error::RecvError};
+use tokio::sync::{RwLock, oneshot, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
@@ -717,13 +717,7 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let (auth, has_auth) = match endpoint_auth.http_auth.clone() {
-            Some(auth) => (auth, true),
-            None => (
-                Arc::new(auth::no_auth::NoAuth) as Arc<dyn runtime_auth::HttpAuth + Send + Sync>,
-                false,
-            ),
-        };
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -737,7 +731,6 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
-                    has_auth,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -1107,6 +1100,9 @@ impl Runtime {
     /// during task registration, in line with Spice.ai's architectural principle that
     /// async code must reach `.await` within 10-100 microseconds and never block the runtime.
     /// See: `docs/PRINCIPLES.md` and `docs/dev/style_guide.md` for details.
+    ///
+    /// Task handles are registered before spawning to ensure they are visible to shutdown
+    /// logic even if the task completes immediately.
     fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
@@ -1116,14 +1112,39 @@ impl Runtime {
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
-
         let tasks = Arc::clone(&self.tasks);
         let component_name = component_name.to_string();
 
         async move {
-            tasks.write().await.insert(component_name, handle);
-            future.await
+            let (notify_abort_task, on_abort_task) = oneshot::channel();
+            let (notify_task_completed, on_task_completed) = oneshot::channel();
+
+            {
+                let handle = cancellable_task::CancellableTaskHandle::new(
+                    notify_abort_task,
+                    cancellation_token,
+                    on_task_completed,
+                );
+
+                tasks.write().await.insert(component_name, handle);
+            }
+
+            let handle: JoinHandle<Result<(), Error>> = tokio::task::spawn(async move {
+                let result = tokio::select! {
+                    res = task_fn => res,
+                    _ = on_abort_task => Ok(()),
+                };
+
+                notify_task_completed.send(()).ok();
+
+                result
+            });
+
+            match handle.await {
+                Ok(result) => result,
+                Err(err) if err.is_cancelled() => Ok(()),
+                Err(err) => Err(err).context(FailedToExecuteTaskSnafu),
+            }
         }
     }
 
@@ -1205,13 +1226,6 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
 
 impl From<http::Error> for Error {
     fn from(err: http::Error) -> Self {
-        match err {
-            http::Error::UnableToBindServerToPort { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToBindServerToPort { source },
-            },
-            http::Error::UnableToStartHttpServer { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToStartHttpServer { source },
-            },
-        }
+        Error::UnableToStartHttpServer { source: err }
     }
 }

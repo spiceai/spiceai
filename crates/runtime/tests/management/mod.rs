@@ -128,8 +128,8 @@ impl DataExportEndpoint {
     }
 
     async fn shutdown(self) {
-        self.runtime.shutdown().await;
         self.shutdown.cancel();
+        self.runtime.shutdown().await;
         match self.server_handle.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {

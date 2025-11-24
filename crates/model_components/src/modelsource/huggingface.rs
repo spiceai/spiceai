@@ -115,22 +115,16 @@ impl ModelSource for Huggingface {
             .context(super::UnableToFetchModelSnafu {})?;
 
         for file in files {
-            // Sanitize file name to prevent path traversal attacks
-            let sanitized_file = util::security::sanitize_filename(&file).map_err(|reason| {
-                super::Error::UnableToLoadConfig {
-                    reason: format!("Invalid file name in files parameter: {reason}"),
-                }
-            })?;
-
+            let trimmed_file = file.trim();
             let download_url = format!(
                 "https://huggingface.co/{}/{}/resolve/{}/{}",
                 caps["org"].to_owned(),
                 caps["model"].to_owned(),
-                revision,
-                sanitized_file,
+                sanitized_revision,
+                trimmed_file,
             );
 
-            let file_path = resolve_model_file_path(root_dir, &versioned_path, &sanitized_file)?;
+            let file_path = resolve_model_file_path(root_dir, &versioned_path, trimmed_file)?;
 
             if std::fs::metadata(&file_path).is_ok() {
                 tracing::info!(
@@ -143,7 +137,10 @@ impl ModelSource for Huggingface {
 
             tracing::info!("Downloading model: {}", download_url);
 
-            if sanitized_file.to_lowercase().ends_with(".onnx") {
+            if file_path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+            {
                 onnx_file_name = file_path.to_string_lossy().into_owned();
             }
 
@@ -169,7 +166,7 @@ impl ModelSource for Huggingface {
                 .await
                 .context(super::UnableToFetchModelSnafu)?;
 
-            util::security::validate_non_empty_bytes(&bytes, &sanitized_file)
+            util::security::validate_non_empty_bytes(&bytes, trimmed_file)
                 .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
 
             let file_path_clone = file_path.clone();

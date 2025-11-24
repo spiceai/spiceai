@@ -80,7 +80,7 @@ impl SpiceModelTool for McpToolWrapper {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        // Security: Validate input size to prevent DoS attacks
+        // Security: Validate input size to prevent excessive memory consumption or processing overhead
         const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1 MB
         if arg.len() > MAX_INPUT_SIZE {
             return Err(format!(

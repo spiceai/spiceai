@@ -223,8 +223,8 @@ impl ScalarUDFImpl for Embed {
                 let ColumnarValue::Array(embeddings) =
                     Self::embed_multiple(&**model, string_array_iter!(arr))?
                 else {
-                    return exec_err!(
-                        "{EMBED_UDF_NAME}: expected array result from embed_multiple"
+                    unreachable!(
+                        "{EMBED_UDF_NAME}: embed_multiple must return ColumnarValue::Array by contract"
                     );
                 };
 
