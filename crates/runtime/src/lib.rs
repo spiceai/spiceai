@@ -721,21 +721,19 @@ impl Runtime {
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
-        let http_future = self
-            .start_runtime_task(
-                HTTP_SERVER,
-                Some(http_shutdown.clone()),
-                http::start(
-                    cloned_config.http_bind_address,
-                    self_ref,
-                    cloned_config.into(),
-                    cloned_tls_config,
-                    auth,
-                    Some(http_shutdown),
-                )
-                .map_err(Error::from),
+        let http_future = self.start_runtime_task(
+            HTTP_SERVER,
+            Some(http_shutdown.clone()),
+            http::start(
+                cloned_config.http_bind_address,
+                self_ref,
+                cloned_config.into(),
+                cloned_tls_config,
+                auth,
+                Some(http_shutdown),
             )
-            .map_err(Error::from);
+            .map_err(Error::from),
+        );
 
         // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;

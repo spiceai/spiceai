@@ -185,10 +185,7 @@ impl ModelSource for Huggingface {
             .await
             .map_err(|e| super::Error::UnableToLoadConfig {
                 reason: format!("Task panicked while writing model file: {e}"),
-            })?
-            .map_err(|e| super::Error::UnableToLoadConfig {
-                reason: format!("Failed to write model file: {e}"),
-            })?;
+            })??;
 
             tracing::info!("Downloaded: {}", file_path.display());
         }
