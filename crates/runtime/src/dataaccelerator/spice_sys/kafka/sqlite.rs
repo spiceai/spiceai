@@ -101,7 +101,10 @@ impl KafkaSys {
                         consumer_group_id,
                         topic,
                         schema: KafkaSys::deserialize_schema(&schema_json)
-                            .map_err(|_err| rusqlite::Error::InvalidQuery)?,
+                            .map_err(|err| {
+                                tracing::warn!("Failed to deserialize Kafka schema from SQLite: {err}");
+                                rusqlite::Error::InvalidQuery
+                            })?,
                     })
                 } else {
                     Err(rusqlite::Error::QueryReturnedNoRows)

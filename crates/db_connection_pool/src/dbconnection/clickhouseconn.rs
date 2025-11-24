@@ -153,12 +153,15 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
 
         let (database, table) = match table_reference {
             TableReference::Full { schema, table, .. }
-            | TableReference::Partial { schema, table } => (schema, table),
-            TableReference::Bare { table } => (&self.db, table),
+            | TableReference::Partial { schema, table } => (schema.as_ref(), table.as_ref()),
+            TableReference::Bare { table } => (self.db.as_ref(), table.as_ref()),
         };
 
+        // Use Ident::with_quote to properly escape SQL identifiers and prevent SQL injection
+        let database_ident = Ident::with_quote('\'', database);
+        let table_ident = Ident::with_quote('\'', table);
         let query = format!(
-            "SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{table}'",
+            "SELECT name, type FROM system.columns WHERE database = {database_ident} AND table = {table_ident}",
         );
 
         let block = conn

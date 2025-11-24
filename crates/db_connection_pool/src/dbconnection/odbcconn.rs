@@ -133,14 +133,18 @@ where
 
     async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
         // ODBC catalog functions are driver-specific and require complex C API calls.
-        // Leave unimplemented as each ODBC driver has different capabilities.
-        unimplemented!("ODBC tables() requires driver-specific implementation")
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "ODBC tables() requires driver-specific implementation".into(),
+        })
     }
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
         // ODBC catalog functions are driver-specific and require complex C API calls.
-        // Leave unimplemented as each ODBC driver has different capabilities.
-        unimplemented!("ODBC schemas() requires driver-specific implementation")
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetSchemas {
+            source: "ODBC schemas() requires driver-specific implementation".into(),
+        })
     }
 
     async fn get_schema(

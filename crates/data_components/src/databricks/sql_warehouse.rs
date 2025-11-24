@@ -245,11 +245,12 @@ impl SqlWarehouseApi {
         let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing catalog".into(),
         })?;
+        // Use Ident::with_quote to properly escape SQL identifiers and prevent SQL injection
+        let table_name = Ident::with_quote('\'', table.table());
+        let schema_name = Ident::with_quote('\'', table_schema);
+        let catalog_name = Ident::with_quote('\'', table_catalog);
         let sql = format!(
-            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}' AND table_catalog = '{}'",
-            table.table(),
-            table_schema,
-            table_catalog
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = {table_name} AND table_schema = {schema_name} AND table_catalog = {catalog_name}"
         );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
@@ -608,7 +609,8 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        // Use sqlparser's Ident for proper SQL identifier quoting
+        // Use sqlparser's Ident for proper SQL identifier quoting and escaping.
+        // Ident::with_quote automatically escapes backticks by doubling them (` -> ``) to prevent SQL injection.
         let schema_ident = Ident::with_quote('`', schema);
         let query = format!(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = {schema_ident}"

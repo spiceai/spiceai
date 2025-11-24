@@ -110,12 +110,12 @@ impl DebeziumKafkaSys {
 
                     let primary_keys: Vec<String> = serde_json::from_str(&primary_keys)
                         .map_err(|err| {
-                            tracing::warn!("Failed to deserialize primary_keys: {err}");
+                            tracing::warn!("Failed to deserialize primary_keys from SQLite: {err}");
                             rusqlite::Error::InvalidQuery
                         })?;
                     let schema_fields: Vec<change_event::Field> = serde_json::from_str(&schema_fields)
                         .map_err(|err| {
-                            tracing::warn!("Failed to deserialize schema_fields: {err}");
+                            tracing::warn!("Failed to deserialize schema_fields from SQLite: {err}");
                             rusqlite::Error::InvalidQuery
                         })?;
 
