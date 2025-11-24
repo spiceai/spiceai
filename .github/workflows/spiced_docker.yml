@@ -117,7 +117,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
         run: echo "Skipping AMD64 image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
@@ -172,7 +172,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
         run: echo "Skipping ARM64 image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Install docker
@@ -252,7 +252,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
         run: echo "Skipping CUDA image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx

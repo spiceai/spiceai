@@ -85,7 +85,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set spicepod path
         id: set_spicepod_path
