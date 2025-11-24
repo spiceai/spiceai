@@ -359,7 +359,7 @@ impl Query {
                 t
             });
 
-            // Special handling for DescribeTable in cluster mode - execute locally
+            // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
             #[cfg(feature = "cluster")]
             let should_distribute =
                 Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
