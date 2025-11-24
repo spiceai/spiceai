@@ -26,7 +26,7 @@ use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::sql::{TableReference, sqlparser::ast::Ident};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
@@ -96,7 +96,9 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
 
-        let query = format!("SELECT name FROM system.tables WHERE database = '{schema}'");
+        // Use sqlparser's Ident for proper SQL identifier quoting
+        let schema_ident = Ident::with_quote('\'', schema);
+        let query = format!("SELECT name FROM system.tables WHERE database = {schema_ident}");
 
         let block = conn
             .query(&query)

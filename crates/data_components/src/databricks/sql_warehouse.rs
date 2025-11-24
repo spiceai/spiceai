@@ -25,7 +25,7 @@ use datafusion::{
     error::DataFusionError,
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
-    sql::{TableReference, unparser::dialect},
+    sql::{TableReference, sqlparser::ast::Ident, unparser::dialect},
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -608,8 +608,10 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // Use sqlparser's Ident for proper SQL identifier quoting
+        let schema_ident = Ident::with_quote('`', schema);
         let query = format!(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = {schema_ident}"
         );
 
         let token = self.api.token_provider.get_token();
@@ -654,10 +656,8 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
             {
-                for i in 0..name_column.len() {
-                    if !name_column.is_null(i) {
-                        tables.push(name_column.value(i).to_string());
-                    }
+                for value in name_column.iter().flatten() {
+                    tables.push(value.to_string());
                 }
             }
         }
@@ -710,10 +710,8 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
             {
-                for i in 0..name_column.len() {
-                    if !name_column.is_null(i) {
-                        schemas.push(name_column.value(i).to_string());
-                    }
+                for value in name_column.iter().flatten() {
+                    schemas.push(value.to_string());
                 }
             }
         }

@@ -126,7 +126,9 @@ where
     'a: 'static,
 {
     fn new(_: Connection<'a>) -> Self {
-        unreachable!()
+        unimplemented!(
+            "ODBCConnection::new() is not used; use the constructor with parameters instead"
+        )
     }
 
     async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {

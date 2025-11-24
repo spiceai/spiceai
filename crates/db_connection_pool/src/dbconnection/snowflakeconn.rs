@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
+use datafusion::sql::{TableReference, sqlparser::ast::Ident};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
@@ -97,7 +97,9 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        let query = format!("SHOW TABLES IN SCHEMA {schema}");
+        // Use Snowflake's IDENTIFIER() function with quoted identifier
+        let schema_ident = Ident::with_quote('\'', schema);
+        let query = format!("SHOW TABLES IN SCHEMA IDENTIFIER({schema_ident})");
 
         let res =
             self.api
@@ -116,10 +118,8 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                             .as_any()
                             .downcast_ref::<arrow::array::StringArray>()
                     {
-                        for i in 0..array.len() {
-                            if let Some(name) = array.value(i).to_string().into() {
-                                tables.push(name);
-                            }
+                        for value in array.iter().flatten() {
+                            tables.push(value.to_string());
                         }
                     }
                 }
@@ -152,10 +152,8 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                             .as_any()
                             .downcast_ref::<arrow::array::StringArray>()
                     {
-                        for i in 0..array.len() {
-                            if let Some(name) = array.value(i).to_string().into() {
-                                schemas.push(name);
-                            }
+                        for value in array.iter().flatten() {
+                            schemas.push(value.to_string());
                         }
                     }
                 }

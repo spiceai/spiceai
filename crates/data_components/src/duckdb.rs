@@ -134,15 +134,19 @@ impl DeletionSink for DuckDBDeletionSink {
                     }
                 };
 
-                let sql_filters: Result<Vec<String>, _> = filters
-                    .iter()
-                    .map(|f| expr::to_sql_with_engine(f, Some(Engine::DuckDB)))
-                    .collect();
-                let sql = sql_filters
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-                    .join(" AND ");
-                let count = delete_from(&table_name.to_string(), tx, &sql)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let count = if filters.is_empty() {
+                    0
+                } else {
+                    let sql_filters: Result<Vec<String>, _> = filters
+                        .iter()
+                        .map(|f| expr::to_sql_with_engine(f, Some(Engine::DuckDB)))
+                        .collect();
+                    let sql = sql_filters
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                        .join(" AND ");
+                    delete_from(&table_name.to_string(), tx, &sql)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                };
 
                 Ok(count)
             },

@@ -61,27 +61,31 @@ impl DeletionSink for SqliteDeletionSink {
         let mut db_conn = self.sqlite.connect().await?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
         let sqlite = Arc::clone(&self.sqlite);
-        let sql_filters: Result<Vec<String>, _> = self
-            .filters
-            .iter()
-            .map(|f| expr::to_sql_with_engine(f, Some(Engine::SQLite)))
-            .collect();
-        let sql = sql_filters
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-            .join(" AND ");
+        let count: u64 = if self.filters.is_empty() {
+            0
+        } else {
+            let sql_filters: Result<Vec<String>, _> = self
+                .filters
+                .iter()
+                .map(|f| expr::to_sql_with_engine(f, Some(Engine::SQLite)))
+                .collect();
+            let sql = sql_filters
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .join(" AND ");
 
-        let count: u64 = sqlite_conn
-            .conn
-            .call(move |conn| -> rusqlite::Result<u64> {
-                let tx = conn.transaction()?;
+            sqlite_conn
+                .conn
+                .call(move |conn| -> rusqlite::Result<u64> {
+                    let tx = conn.transaction()?;
 
-                let count = delete_from(sqlite.table_name(), &tx, &sql)?;
+                    let count = delete_from(sqlite.table_name(), &tx, &sql)?;
 
-                tx.commit()?;
+                    tx.commit()?;
 
-                Ok(count)
-            })
-            .await?;
+                    Ok(count)
+                })
+                .await?
+        };
 
         Ok(count)
     }
