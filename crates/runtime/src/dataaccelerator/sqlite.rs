@@ -98,7 +98,7 @@ impl SqliteAccelerator {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid SQLite extension init function.
-        // The signature difference between sqlite3_decimal_init (*mut *const c_char) and 
+        // The signature difference between sqlite3_decimal_init (*mut *const c_char) and
         // sqlite3_auto_extension's expected signature (*mut *mut c_char) is safe to cast
         // because the extension init function only reads from the error message pointer.
         unsafe {
