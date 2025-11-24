@@ -515,7 +515,6 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -549,5 +548,19 @@ jobs:
         run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Run partition table integration test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
+      
+      - name: Configure Git
+        if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git config --global user.name 'Spice Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
