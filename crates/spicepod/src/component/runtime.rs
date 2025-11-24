@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
+use subtle::ConstantTimeEq;
+
 use super::{
     caching::{Caching, ResultsCache},
     default_true, is_default, is_default_or_none,
@@ -357,12 +359,32 @@ pub struct ApiKeyAuth {
 
 /// API key for authentication. Keys can be read-only or read-write.
 /// The key value is redacted in Debug output to prevent credential leakage.
-#[derive(Clone, PartialEq)]
+///
+/// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+/// constant-time comparison via the `subtle` crate to prevent timing attacks.
+#[derive(Clone)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
 }
+
+/// Constant-time comparison for `ApiKey` to `ApiKey`.
+/// Both variants must match AND the key values must be equal using constant-time comparison.
+impl PartialEq for ApiKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ApiKey::ReadOnly { key: a }, ApiKey::ReadOnly { key: b })
+            | (ApiKey::ReadWrite { key: a }, ApiKey::ReadWrite { key: b }) => {
+                a.as_bytes().ct_eq(b.as_bytes()).into()
+            }
+            // Different variants are never equal
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ApiKey {}
 
 /// Custom Debug implementation that redacts the key value to prevent
 /// credential leakage in logs or error messages.
@@ -454,27 +476,14 @@ impl Serialize for ApiKey {
 impl PartialEq<str> for ApiKey {
     /// Compares the API key with another string using constant-time comparison
     /// to prevent timing attacks that could leak key information.
+    ///
+    /// Uses the `subtle` crate which is specifically designed for cryptographic
+    /// constant-time operations and handles edge cases like length differences
+    /// correctly without leaking timing information.
     fn eq(&self, other: &str) -> bool {
         match self {
             ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => {
-                // Use constant-time comparison to prevent timing attacks.
-                // Even if lengths differ, we still compare to avoid leaking length info.
-                let key_bytes = key.as_bytes();
-                let other_bytes = other.as_bytes();
-
-                // XOR comparison result accumulator
-                let mut result: u8 = u8::from(key_bytes.len() != other_bytes.len());
-
-                // Compare byte-by-byte. If lengths differ, we compare with zeros
-                // to maintain constant time regardless of input.
-                let max_len = key_bytes.len().max(other_bytes.len());
-                for i in 0..max_len {
-                    let a = key_bytes.get(i).copied().unwrap_or(0);
-                    let b = other_bytes.get(i).copied().unwrap_or(0);
-                    result |= a ^ b;
-                }
-
-                result == 0
+                key.as_bytes().ct_eq(other.as_bytes()).into()
             }
         }
     }
