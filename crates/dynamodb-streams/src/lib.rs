@@ -25,6 +25,9 @@ pub enum Error {
     #[snafu(display("Stream not found for table: {table_name}"))]
     StreamNotFound { table_name: String },
 
+    #[snafu(display("Failed to initialize checkpoint"))]
+    FailedToInitializeCheckpoint,
+
     #[snafu(display("Stream description not found: {stream_arn}"))]
     StreamDescriptionNotFound { stream_arn: String },
 }

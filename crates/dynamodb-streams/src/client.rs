@@ -1,9 +1,11 @@
-use crate::Result;
+use std::collections::HashMap;
+use crate::{FailedToInitializeCheckpointSnafu, Result};
 use crate::client_sdk::SDKClient;
 use crate::stream::dynamodb::{DynamodbStream, DynamodbStreamProducer};
 use crate::types::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
 use crate::types::stream_state::initialize_state_from_checkpoint;
 use aws_config::SdkConfig;
+use snafu::{ResultExt, OptionExt};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
@@ -55,21 +57,21 @@ impl Client {
             .into_iter()
             // Only open shards
             .filter(|s| s.ending_sequence_number.is_none())
-            .filter_map(|s| {
-                // TODO: What if starting_sequence_number is empty? Retry? Return error?
-                s.starting_sequence_number.as_ref().map(|seq| {
-                    (
-                        s.shard_id.clone(),
-                        ShardCheckpoint {
-                            sequence_number: seq.clone(),
-                            parent_id: s.parent_shard_id.clone(),
-                            updated_at: SystemTime::now(),
-                            position: CheckpointPosition::At,
-                        },
-                    )
-                })
+            .map(|s| {
+                let sequence_number = s.starting_sequence_number
+                    .context(FailedToInitializeCheckpointSnafu)?;
+
+                Ok((
+                    s.shard_id.clone(),
+                    ShardCheckpoint {
+                        sequence_number,
+                        parent_id: s.parent_shard_id.clone(),
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::At,
+                    },
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         Ok(GlobalCheckpoint {
             stream_arn,
