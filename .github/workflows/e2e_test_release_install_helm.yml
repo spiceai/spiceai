@@ -70,7 +70,7 @@ jobs:
           echo "Arch: $(uname -m)"
 
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       # Set up Docker
       - name: Set up Docker Buildx
