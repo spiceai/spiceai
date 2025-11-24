@@ -40,6 +40,7 @@ impl Client {
 
     #[must_use]
     pub fn buffer(mut self, buffer: usize) -> Self {
+        // TODO: Remove assert
         assert!(buffer > 0, "buffer must be positive");
         self.buffer = buffer;
         self
