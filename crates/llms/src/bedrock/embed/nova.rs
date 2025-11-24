@@ -25,7 +25,6 @@ use crate::{
 };
 
 pub const NOVA_MULTIMODAL_EMBED_V2: &str = "amazon.nova-2-multimodal-embeddings-v1:0";
-const MAX_NOVA_TEXT_LENGTH: usize = 8192;
 
 #[derive(Debug)]
 pub struct NovaConfig {
@@ -60,20 +59,10 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
     }
 
     fn to_request_blobs(&self, input_text: Vec<String>) -> EmbedResult<Vec<NovaEmbedRequest>> {
-        input_text
+        Ok(input_text
             .into_iter()
             .map(|t| {
-                ensure!(
-                    t.len() <= MAX_NOVA_TEXT_LENGTH,
-                    FailedToExtractEmbeddingsSnafu {
-                        message: format!(
-                            "Input text length {} exceeds maximum supported length {MAX_NOVA_TEXT_LENGTH}",
-                            t.len(),
-                        )
-                    }
-                );
-
-                Ok(NovaEmbedRequest {
+                NovaEmbedRequest {
                     schema_version: Some("nova-multimodal-embed-v1".to_string()),
                     task_type: NovaTaskType::SingleEmbedding,
                     single_embedding_params: NovaSingleEmbeddingParams {
@@ -88,9 +77,9 @@ impl BedrockEmbeddingConfig<NovaEmbedRequest, NovaEmbedResponse> for NovaConfig 
                         audio: None,
                         video: None,
                     },
-                })
+                }
             })
-            .collect::<EmbedResult<Vec<NovaEmbedRequest>>>()
+            .collect::<Vec<NovaEmbedRequest>>())
     }
 }
 
