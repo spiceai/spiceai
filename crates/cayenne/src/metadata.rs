@@ -153,7 +153,7 @@ pub struct VortexConfig {
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 256 MB.
+    /// Defaults to 128 MB.
     pub target_vortex_file_size_mb: usize,
 }
 
