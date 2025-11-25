@@ -17,7 +17,7 @@ limitations under the License.
 //! A wrapper `TableProvider` that applies deduplication to incoming batches
 //! before passing them to the underlying accelerator table provider.
 //!
-//! This handles the `UpsertDedup` on_conflict behavior by removing duplicate rows
+//! This handles the `UpsertDedup` `on_conflict` behavior by removing duplicate rows
 //! within incoming batches before they are inserted into the accelerator.
 
 use std::{any::Any, sync::Arc};
@@ -43,7 +43,7 @@ use futures::{StreamExt, stream};
 /// A wrapper `TableProvider` that applies batch deduplication based on `UpsertOptions`
 /// before passing data to the underlying provider.
 ///
-/// This is used to handle the `UpsertDedup` on_conflict behavior, which removes
+/// This is used to handle the `UpsertDedup` `on_conflict` behavior, which removes
 /// duplicate rows (based on primary key) from incoming batches before insertion.
 pub struct UpsertDedupTableProvider {
     /// The underlying table provider for write operations
@@ -63,7 +63,7 @@ impl UpsertDedupTableProvider {
     #[must_use]
     pub fn new(inner: Arc<dyn DeletionTableProvider>, upsert_options: UpsertOptions) -> Self {
         // Clone the Arc as TableProvider for regular operations
-        let inner_tp: Arc<dyn TableProvider> = inner.clone();
+        let inner_tp: Arc<dyn TableProvider> = Arc::<dyn DeletionTableProvider>::clone(&inner);
         Self {
             inner: inner_tp,
             deletion_provider: inner,
@@ -81,7 +81,7 @@ impl std::fmt::Debug for UpsertDedupTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpsertDedupTableProvider")
             .field("upsert_options", &self.upsert_options)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -203,7 +203,7 @@ impl DisplayAs for UpsertDedupExec {
 }
 
 impl ExecutionPlan for UpsertDedupExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "UpsertDedupExec"
     }
 
@@ -289,8 +289,8 @@ impl ExecutionPlan for UpsertDedupExec {
 
 /// Extracts `UpsertOptions` from the command options.
 #[must_use]
-pub fn extract_upsert_options(
-    options: &std::collections::HashMap<String, String>,
+pub fn extract_upsert_options<S: std::hash::BuildHasher>(
+    options: &std::collections::HashMap<String, String, S>,
 ) -> UpsertOptions {
     let remove_duplicates = options
         .get("upsert_remove_duplicates")
@@ -309,16 +309,19 @@ pub fn extract_upsert_options(
 ///
 /// Returns the original provider if deduplication is not needed.
 #[must_use]
-pub fn wrap_with_upsert_dedup_if_needed<T: DeletionTableProvider + 'static>(
+pub fn wrap_with_upsert_dedup_if_needed<
+    T: DeletionTableProvider + 'static,
+    S: std::hash::BuildHasher,
+>(
     provider: Arc<T>,
-    options: &std::collections::HashMap<String, String>,
+    options: &std::collections::HashMap<String, String, S>,
 ) -> (Arc<dyn TableProvider>, Arc<dyn DeletionTableProvider>) {
     let upsert_options = extract_upsert_options(options);
 
     if upsert_options.remove_duplicates || upsert_options.last_write_wins {
         let wrapper = Arc::new(UpsertDedupTableProvider::new(provider, upsert_options));
-        (wrapper.clone(), wrapper)
+        (Arc::<UpsertDedupTableProvider>::clone(&wrapper), wrapper)
     } else {
-        (provider.clone(), provider)
+        (Arc::<T>::clone(&provider), provider)
     }
 }
