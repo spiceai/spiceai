@@ -23,6 +23,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use token_provider::{Result, TokenProvider};
@@ -68,8 +69,7 @@ pub struct GitHubAppTokenProvider {
     app_client_id: Arc<str>,
     private_key: Arc<str>,
     installation_id: Arc<str>,
-    tx: watch::Sender<String>,
-    rx: watch::Receiver<String>,
+    rx: watch::Receiver<SecretString>,
     _handle: Arc<JoinHandle<()>>,
 }
 
@@ -85,11 +85,24 @@ impl std::fmt::Debug for GitHubAppTokenProvider {
 
 impl TokenProvider for GitHubAppTokenProvider {
     fn get_token(&self) -> String {
-        self.rx.borrow().clone()
+        self.rx.borrow().expose_secret().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
-        Some(self.tx.subscribe())
+        let mut secret_rx = self.rx.clone();
+        let (tx, rx) = watch::channel(secret_rx.borrow().expose_secret().to_string());
+        tokio::spawn(async move {
+            loop {
+                if secret_rx.changed().await.is_err() {
+                    break;
+                }
+                let exposed = secret_rx.borrow().expose_secret().to_string();
+                if tx.send(exposed).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(rx)
     }
 }
 
@@ -156,7 +169,6 @@ impl GitHubAppTokenProvider {
             app_client_id,
             private_key,
             installation_id,
-            tx,
             rx,
             _handle: Arc::new(handle),
         })
@@ -165,7 +177,7 @@ impl GitHubAppTokenProvider {
 
 #[derive(Clone)]
 pub struct GitHubToken {
-    pub token: String,
+    pub token: SecretString,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -241,7 +253,7 @@ async fn generate_token(
     #[allow(clippy::items_after_statements)]
     #[derive(Deserialize, Debug)]
     struct TokenResponse {
-        token: String,
+        token: SecretString,
         expires_at: String,
     }
     let resp: TokenResponse = response
