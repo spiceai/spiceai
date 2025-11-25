@@ -113,7 +113,7 @@ impl ModelSource for Huggingface {
         .await
         .map_err(|e| super::Error::UnableToLoadConfig {
             reason: format!("Task panicked while creating directory: {e}"),
-        })??
+        })?
         .context(super::UnableToCreateModelPathSnafu {})?;
 
         let client = reqwest::Client::builder()
