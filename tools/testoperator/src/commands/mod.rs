@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::args::{DatasetTestArgs, QuerySetLoader};
+use crate::args::DatasetTestArgs;
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
