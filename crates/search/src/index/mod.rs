@@ -62,12 +62,19 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
+/// Extracts the derived column names from a vector index implementation.
+///
+/// This function attempts to downcast the given index to known vector index types
+/// and retrieve their derived columns (e.g., embedding columns). Returns `None` if
+/// the index is not a recognized vector index type.
 pub fn derived_columns_from_vector_index(
     index: &Arc<dyn Index + Send + Sync>,
 ) -> Option<Vec<String>> {
+    #[cfg(feature = "s3_vectors")]
     if let Some(vec) = index.as_any().downcast_ref::<S3Vector>() {
         return Some(vec.derived_columns());
-    } else if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
+    }
+    if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
         return Some(vec.derived_columns());
     }
     None
@@ -84,6 +91,9 @@ pub trait VectorIndex: SearchIndex {
 
     fn dimension(&self) -> i32;
 
+    /// Returns column names in [`VectorIndex::list_table_provider`] and/or [`SearchIndex::query_table_provider`] that
+    /// are derived by the vector index (e.g., embedding columns). These are columns that the index computes and adds,
+    ///  rather than columns from the original data.
     fn derived_columns(&self) -> Vec<String> {
         vec![embedding_col(self.search_column().as_str())]
     }
