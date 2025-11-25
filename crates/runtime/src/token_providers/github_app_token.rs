@@ -15,14 +15,16 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use std::time::Duration;
 use token_provider::{Result, TokenProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -161,10 +163,19 @@ impl GitHubAppTokenProvider {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitHubToken {
     pub token: String,
     pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for GitHubToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitHubToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 impl GitHubToken {
     #[allow(clippy::cast_sign_loss)]
