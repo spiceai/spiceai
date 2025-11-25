@@ -20,7 +20,7 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, Statistics};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -42,18 +42,25 @@ use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
+use delta_kernel::expressions::{BinaryExpressionOp, ColumnName, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
-use delta_kernel::schema::{DecimalType, PrimitiveType};
+use delta_kernel::schema::{ColumnNamesAndTypes, DecimalType, PrimitiveType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{ExpressionRef, Predicate};
+use delta_kernel::{actions, DeltaResult, Engine, ExpressionRef, Predicate, RowVisitor};
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
+use std::sync::LazyLock;
+use datafusion::common::stats::Precision;
+use delta_kernel::actions::{get_log_add_schema, get_log_schema, ADD_NAME};
+use delta_kernel::actions::visitors::AddVisitor;
+use delta_kernel::engine_data::{GetData, TypedGetData};
+use delta_kernel::transaction::add_files_schema;
+use opendal::raw::Operation::Stat;
 use tokio::runtime::Handle;
 use url::Url;
 
@@ -368,6 +375,43 @@ fn map_delta_data_type_to_arrow_data_type(
     }
 }
 
+struct CountStatsCollector {
+    total_rows: u64,
+}
+
+impl CountStatsCollector {
+    fn new() -> Self {
+        Self { total_rows: 0 }
+    }
+}
+
+impl RowVisitor for CountStatsCollector {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [delta_kernel::schema::DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| get_log_schema().leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            if let Some(stats_json) = getters[0].get_opt(i, "add.stats")? {
+                if let Ok(stats) = serde_json::from_str::<serde_json::Value>(stats_json) {
+                    if let Some(num_records) = stats.get("numRecords").and_then(|v| v.as_u64()) {
+                        self.total_rows += num_records;
+                    }
+                }
+            } else if let Some(stats_json) = getters[0].get_opt(i, "remove.stats")? {
+                if let Ok(stats) = serde_json::from_str::<serde_json::Value>(stats_json) {
+                    if let Some(num_records) = stats.get("numRecords").and_then(|v| v.as_u64()) {
+                        self.total_rows -= num_records;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl TableProvider for DeltaTable {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -389,6 +433,31 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
+    fn statistics(&self) -> Option<Statistics> {
+        let snapshot = Snapshot::builder_for(self.table_url.clone())
+            .build(self.engine.as_ref())
+            .ok()?;
+
+        let log_schema = get_log_schema();
+
+        let mut actions = snapshot
+            .log_segment()
+            .read_actions(
+                self.engine.as_ref(),
+                log_schema.clone(),
+                log_schema.clone(),
+                None
+            ).ok()?;
+
+        let mut count_stats = CountStatsCollector::new();
+        let _ = actions
+            .flat_map(|b| b.ok())
+            .flat_map(|actions| count_stats.visit_rows_of(&*actions.actions).ok())
+            .collect::<Vec<_>>();
+
+        Some(Statistics::default().with_num_rows(Precision::Exact(count_stats.total_rows as usize)))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
@@ -397,6 +466,8 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
+        println!("stats!!! {:#?}", self.statistics());
+
         let snapshot = Snapshot::builder_for(self.table_url.clone())
             .build(self.engine.as_ref())
             .map_err(map_delta_error_to_datafusion_err)?;
