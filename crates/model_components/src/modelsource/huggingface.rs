@@ -106,7 +106,15 @@ impl ModelSource for Huggingface {
 
         let mut onnx_file_name = String::new();
 
-        std::fs::create_dir_all(&versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
+        tokio::task::spawn_blocking({
+            let versioned_path = versioned_path.clone();
+            move || std::fs::create_dir_all(&versioned_path)
+        })
+        .await
+        .map_err(|e| super::Error::UnableToLoadConfig {
+            reason: format!("Task panicked while creating directory: {e}"),
+        })??
+        .context(super::UnableToCreateModelPathSnafu {})?;
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -126,7 +134,14 @@ impl ModelSource for Huggingface {
 
             let file_path = resolve_model_file_path(root_dir, &versioned_path, trimmed_file)?;
 
-            if std::fs::metadata(&file_path).is_ok() {
+            let file_exists = tokio::task::spawn_blocking({
+                let file_path = file_path.clone();
+                move || std::fs::metadata(&file_path).is_ok()
+            })
+            .await
+            .unwrap_or(false);
+
+            if file_exists {
                 tracing::info!(
                     "File already exists: {}, skipping download",
                     file_path.display()

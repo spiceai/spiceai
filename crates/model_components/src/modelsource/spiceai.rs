@@ -146,7 +146,14 @@ impl ModelSource for SpiceAI {
         let versioned_path = Path::new(&local_path).join(&sanitized_version);
         let file_path = versioned_path.join("model.onnx");
 
-        if std::fs::metadata(&file_path).is_ok() {
+        let file_exists = tokio::task::spawn_blocking({
+            let file_path = file_path.clone();
+            move || std::fs::metadata(&file_path).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+
+        if file_exists {
             tracing::debug!(
                 "File already exists: {}, skipping download",
                 file_path.display()
