@@ -185,7 +185,7 @@ object_store = { version = "0.12.4", features = [
     "azure",
     "http",
 ] }
-odbc-api = { version = "14" }
+odbc-api = { version = "20" }
 opentelemetry = { version = "0.29", default-features = false, features = [
     "metrics",
     "trace",
