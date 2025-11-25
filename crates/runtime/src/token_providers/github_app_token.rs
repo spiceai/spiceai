@@ -184,7 +184,7 @@ pub struct GitHubToken {
 impl fmt::Debug for GitHubToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GitHubToken")
-            .field("token", &"<redacted>")
+            .field("token", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .finish()
     }

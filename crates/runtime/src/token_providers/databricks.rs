@@ -170,7 +170,7 @@ struct TokenResponse {
 impl fmt::Debug for TokenResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenResponse")
-            .field("access_token", &"<redacted>")
+            .field("access_token", &"[REDACTED]")
             .field("token_type", &self.token_type)
             .field("expires_in", &self.expires_in)
             .field("scope", &self.scope)
