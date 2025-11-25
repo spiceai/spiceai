@@ -12,9 +12,8 @@ version.workspace = true
 aws-config.workspace = true
 aws-sdk-dynamodb.workspace = true
 aws-sdk-dynamodbstreams.workspace = true
-aws-smithy-async.workspace = true
 snafu.workspace = true
 tokio.workspace = true
-async-trait.workspace = true
 tracing.workspace = true
 futures.workspace = true
+util = { path = "../util" }

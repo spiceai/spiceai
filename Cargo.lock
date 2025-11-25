@@ -5483,15 +5483,14 @@ dependencies = [
 name = "dynamodb-streams"
 version = "1.10.0-unstable"
 dependencies = [
- "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-dynamodbstreams",
- "aws-smithy-async",
  "futures",
  "snafu",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]

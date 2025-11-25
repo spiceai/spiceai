@@ -39,6 +39,20 @@ pub struct StreamState {
     initializing: HashMap<String, PendingShard>,
 }
 
+/// Manages shard lifecycle across three states to maintain parent-child ordering guarantees.
+///
+/// State Transitions:
+/// - Active: Shards with iterators, ready to poll for records
+/// - Pending: Shards blocked by active/initializing parents (respects lineage order)
+/// - Initializing: Shards awaiting iterator initialization from AWS
+///
+/// Flow:
+/// 1. Discovered shards enter `pending` if parent exists, otherwise `initializing`
+/// 2. `initializing` → `active` when iterator obtained
+/// 3. When parent exhausts, children move `pending` → `initializing`
+/// 4. Failed polls can move `active` → `initializing` for fresh iterator
+///
+/// This ensures parent shards are fully consumed before children begin processing.
 impl StreamState {
     pub fn get_active_shards(&self) -> impl Iterator<Item = &ActiveShard> {
         self.active.values()
@@ -261,7 +275,7 @@ async fn start_children_from_trim_horizon(
                     state.active.insert(child.shard_id.clone(), shard);
                 }
                 Ok(None) => {
-                    tracing::debug!("Empty iterator: shard_id={} {}", child.shard_id);
+                    tracing::debug!("Empty iterator: shard_id={}", child.shard_id);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize shard {}: {}", child.shard_id, e);
