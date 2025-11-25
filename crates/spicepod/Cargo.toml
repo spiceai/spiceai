@@ -21,6 +21,7 @@ serde-value = "0.7.0"
 serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
+subtle = "2.6"
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true

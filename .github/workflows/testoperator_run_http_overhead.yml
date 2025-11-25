@@ -70,7 +70,7 @@ jobs:
           echo "  base=${{ github.event.inputs.base }}"
           echo "  base_component=${{ github.event.inputs.base_component }}"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Validate spicepod file exists
         run: |
