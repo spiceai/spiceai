@@ -116,13 +116,15 @@ impl DynamodbStreamProducer {
         loop {
             match self.iterate().await {
                 Ok(result) => return Ok(result),
-                Err(e) => if let Some(duration) = backoff.next_backoff() {
-                    tracing::debug!("Iteration failed, retrying after {:?}: {}", duration, e);
-                    tokio::time::sleep(duration).await;
-                } else {
-                    tracing::error!("Iteration failed after exhausting retries: {}", e);
-                    return Err(e);
-                },
+                Err(e) => {
+                    if let Some(duration) = backoff.next_backoff() {
+                        tracing::debug!("Iteration failed, retrying after {:?}: {}", duration, e);
+                        tokio::time::sleep(duration).await;
+                    } else {
+                        tracing::error!("Iteration failed after exhausting retries: {}", e);
+                        return Err(e);
+                    }
+                }
             }
         }
     }
