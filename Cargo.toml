@@ -154,6 +154,7 @@ duckdb = "1.4.1"
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
+gethostname = "1.1.0"
 git2 = { version = "0.20", default-features = false, features = [
     "https",
     "ssh",
