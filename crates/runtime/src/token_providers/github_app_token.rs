@@ -93,12 +93,19 @@ impl TokenProvider for GitHubAppTokenProvider {
         let (tx, rx) = watch::channel(secret_rx.borrow().expose_secret().to_string());
         tokio::spawn(async move {
             loop {
-                if secret_rx.changed().await.is_err() {
-                    break;
-                }
-                let exposed = secret_rx.borrow().expose_secret().to_string();
-                if tx.send(exposed).is_err() {
-                    break;
+                tokio::select! {
+                    () = tx.closed() => {
+                        break;
+                    }
+                    changed = secret_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let exposed = secret_rx.borrow().expose_secret().to_string();
+                        if tx.send(exposed).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
