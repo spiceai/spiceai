@@ -129,16 +129,23 @@ impl DataExportEndpoint {
 
     async fn shutdown(self) {
         self.shutdown.cancel();
-        self.runtime.shutdown().await;
-        match self.server_handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+        // Protect against hangs in CI by bounding shutdown waits.
+        if let Err(elapsed) =
+            tokio::time::timeout(Duration::from_secs(15), self.runtime.shutdown()).await
+        {
+            tracing::error!("Runtime shutdown timed out after {elapsed:?}");
+        }
+
+        match tokio::time::timeout(Duration::from_secs(15), self.server_handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => {
                 tracing::debug!("Data export endpoint stopped with error: {err}");
             }
-            Err(join_err) if join_err.is_cancelled() => {}
-            Err(join_err) => {
+            Ok(Err(join_err)) if join_err.is_cancelled() => {}
+            Ok(Err(join_err)) => {
                 tracing::debug!("Data export endpoint join error: {join_err}");
             }
+            Err(elapsed) => tracing::error!("Server task shutdown timed out after {elapsed:?}"),
         }
     }
 }
