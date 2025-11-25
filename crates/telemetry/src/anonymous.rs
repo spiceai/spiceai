@@ -27,7 +27,6 @@ use opentelemetry_sdk::{
         PeriodicReader, SdkMeterProvider, data::ResourceMetrics, exporter::PushMetricExporter,
         reader::MetricReader,
     },
-    runtime::Tokio,
 };
 use otel_arrow::OtelArrowExporter;
 use sha2::{Digest, Sha256};
@@ -42,7 +41,6 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 
 /// How often to send telemetry data to the endpoint
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
-const TELEMETRY_TIMEOUT_SECONDS: u64 = 30;
 
 fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
@@ -60,13 +58,15 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
-    Resource::new(telemetry_properties.into_iter().chain(vec![
-        KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
-        KeyValue::new("name", "spiced"),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-        KeyValue::new("service.instance.id", instance_id),
-        KeyValue::new("spicepod.id", spicepod_id),
-    ]))
+    Resource::builder_empty()
+        .with_attributes(telemetry_properties.into_iter().chain(vec![
+            KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
+            KeyValue::new("name", "spiced"),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            KeyValue::new("service.instance.id", instance_id),
+            KeyValue::new("spicepod.id", spicepod_id),
+        ]))
+        .build()
 }
 
 pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
@@ -84,9 +84,8 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
 
     let oss_telemetry_exporter = OtelArrowExporter::new(exporter);
 
-    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
+    let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone())
         .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
-        .with_timeout(Duration::from_secs(TELEMETRY_TIMEOUT_SECONDS))
         .build();
 
     let initial_reader = InitialReader::new();

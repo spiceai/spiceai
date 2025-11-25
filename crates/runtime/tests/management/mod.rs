@@ -83,7 +83,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             let _ = execute_query(&rt, "SELECT invalid_query as test_event").await;
 
             // Ensure local events are flushed
-            trace_provider.force_flush();
+            let _ = trace_provider.force_flush();
             // Add delay to ensure flushed events are propogated (data export is done every 5 seconds)
             tracing::info!("Waiting 7s for events to be exported...");
             tokio::time::sleep(Duration::from_secs(7)).await;
@@ -94,7 +94,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
 
             // Verify final export during shutdown
             let _ = execute_query(&rt, "SELECT 6789 as test_event").await;
-            trace_provider.force_flush();
+            let _ = trace_provider.force_flush();
             rt.shutdown().await;
             let exported_events = execute_query(&data_endpoint_rt, "SELECT input, captured_output, error_message FROM runtime.task_history where input like '%test_event%' order by input ").await?;
             insta::assert_snapshot!("shutdown_export", pretty_format_batches(&exported_events)?);

@@ -53,7 +53,7 @@ mod nsql {
         HeaderMap, HeaderValue,
         header::{ACCEPT, CONTENT_TYPE},
     };
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     use crate::models::http_post;
 
@@ -65,7 +65,7 @@ mod nsql {
     pub async fn run_nsql_test(
         base_url: &str,
         ts: &TestCase,
-        trace_provider: &TracerProvider,
+        trace_provider: &SdkTracerProvider,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Running test cases {}", ts.name);
         let task_start_time = std::time::SystemTime::now();

@@ -21,8 +21,11 @@ use std::{
     time::Duration,
 };
 
-use opentelemetry::InstrumentationScope;
-use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
+use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
+use opentelemetry_sdk::{
+    runtime::TokioCurrentThread,
+    trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
+};
 use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
 use spicepod::component::runtime::TaskHistoryCapturedOutput;
 use tracing::subscriber::DefaultGuard;
@@ -150,7 +153,7 @@ pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display,
 pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,
-) -> (DefaultGuard, TracerProvider) {
+) -> (DefaultGuard, SdkTracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -168,14 +171,16 @@ pub(crate) fn init_tracing_with_task_history(
     );
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(task_history_exporter, TokioCurrentThread)
+    let processor = BatchSpanProcessor::builder(task_history_exporter, TokioCurrentThread).build();
+
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
         .build();
 
     let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
+    let tracer = provider.tracer_with_scope(scope);
 
     let task_history_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
