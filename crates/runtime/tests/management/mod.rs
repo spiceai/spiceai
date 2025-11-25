@@ -187,7 +187,11 @@ async fn create_data_export_endpoint() -> Result<DataExportEndpoint, anyhow::Err
                 None,
                 EndpointAuth::default().with_flight_basic_auth(api_key_auth),
             )) => result,
-            () = shutdown_token.cancelled() => Ok(()),
+            () = shutdown_token.cancelled() => {
+                // Ensure runtime shutdown completes even if servers were still starting.
+                server_rt.shutdown().await;
+                Ok(())
+            },
         }
     });
 
