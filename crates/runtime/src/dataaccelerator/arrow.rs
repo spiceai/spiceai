@@ -47,7 +47,11 @@ impl Default for ArrowAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_watcher")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+];
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
@@ -62,7 +66,7 @@ impl DataAccelerator for ArrowAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: CreateExternalTable,
+        mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
@@ -81,13 +85,18 @@ impl DataAccelerator for ArrowAccelerator {
             .and_then(|a| a.refresh_mode.as_ref())
             .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
 
-        let cmd = if is_caching_mode {
-            let mut cmd = cmd;
+        if is_caching_mode {
             cmd.constraints = Constraints::new_unverified(vec![]);
-            cmd
-        } else {
-            cmd
-        };
+        }
+
+        // Extract sort_columns from acceleration params if provided
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(sort_cols_str) = acceleration.params.get("sort_columns")
+        {
+            cmd.options
+                .insert("sort_columns".to_string(), sort_cols_str.clone());
+        }
 
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
