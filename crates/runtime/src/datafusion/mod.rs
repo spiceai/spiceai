@@ -1157,7 +1157,10 @@ impl DataFusion {
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
-        if acceleration_settings.disable_federation {
+        // Caching mode requires federation to be disabled so that queries go through
+        // AcceleratedTable::scan to trigger the cache miss/hit logic
+        if acceleration_settings.disable_federation || matches!(refresh_mode, RefreshMode::Caching)
+        {
             accelerated_table_builder.disable_federation();
         }
 

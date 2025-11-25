@@ -137,27 +137,14 @@ impl CacheRefreshHelper {
 
         // For each stale request combination, re-fetch from the source
         for partition in 0..plan.properties().output_partitioning().partition_count() {
-            eprintln!("!!!!! Scanning partition {partition} for stale rows !!!!!");
             let mut stream = plan.execute(partition, Arc::clone(&task_ctx))?;
 
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
 
-                eprintln!(
-                    "!!!!! Found batch with {} rows in partition {} !!!!!",
-                    batch.num_rows(),
-                    partition
-                );
-
                 for row_idx in 0..batch.num_rows() {
-                    eprintln!("!!!!! Processing stale row {row_idx} !!!!!");
                     // Extract the filter parameters for this row
                     let filters = Self::extract_filters_from_row(&batch, row_idx)?;
-
-                    eprintln!(
-                        "!!!!! Extracted {} filters, calling fetch_from_source_on_miss !!!!!",
-                        filters.len()
-                    );
 
                     // Re-fetch from the federated source with these filters
                     tracing::debug!(
@@ -344,20 +331,18 @@ impl CacheRefreshHelper {
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
 
-        // Determine insert operation based on accelerator constraints
-        // SQL-based accelerators (DuckDB, Cayenne, etc.) have primary key constraints and support upsert via InsertOp::Append
-        // Arrow accelerators in caching mode have constraints stripped and use InsertOp::Overwrite to replace entire table
-        let has_constraints = accelerator.constraints().is_some_and(|c| {
-            !c.is_empty()
-                && c.iter()
-                    .any(|constraint| matches!(constraint, Constraint::PrimaryKey(_)))
-        });
-
-        let insert_op = if has_constraints {
-            InsertOp::Append // SQL accelerator with upsert support
-        } else {
-            InsertOp::Overwrite // Arrow accelerator - replace entire table
-        };
+        // For caching mode, we use InsertOp::Overwrite to replace all existing data
+        // because HTTP responses can contain multiple rows with the same filter values
+        // (e.g., search results), which would violate primary key constraints if we used
+        // InsertOp::Append. This means each query overwrites the cache, which is acceptable
+        // for the caching use case.
+        //
+        // Note: True multi-filter caching (storing results from different queries separately)
+        // would require either:
+        // 1. Adding a row number column to make each row unique
+        // 2. Using DELETE WHERE + INSERT instead of overwrite
+        // 3. Storing responses as JSON blobs
+        let insert_op = InsertOp::Overwrite;
 
         tracing::debug!(
             "Caching: insert_into_accelerator calling accelerator.insert_into with op={:?} for dataset={}",
@@ -721,12 +706,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        eprintln!(
-            "!!!!! CachingAccelerationScanExec::execute called for dataset={} partition={} !!!!!",
-            self.dataset_name, partition
-        );
-        tracing::warn!(
-            "======== CachingAccelerationScanExec::execute called for dataset={} partition={} ========",
+        tracing::debug!(
+            "CachingAccelerationScanExec::execute called for dataset={} partition={}",
             self.dataset_name,
             partition
         );
@@ -735,6 +716,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let mut accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
         let schema = accelerator_stream.schema();
         let schema_clone = Arc::clone(&schema);
+
+        // For multi-partition accelerators (e.g., DuckDB), only partition 0 should handle cache miss.
+        // Other partitions should just return accelerator data (or empty if no cached data).
+        // This prevents multiple partitions from concurrently fetching and inserting the same data.
+        let is_primary_partition = partition == 0;
 
         let federated = Arc::clone(&self.federated);
         let accelerator = Arc::clone(&self.accelerator);
@@ -821,49 +807,64 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     }
                     Ok(_batch) => {
                         // Empty batch (0 rows) - treat as cache miss
-                        tracing::debug!(
-                            dataset = %dataset_name,
-                            "CACHING EXEC: CACHE MISS (0 rows) - accelerator returned empty batch, fetching from source"
-                        );
+                        // Only the primary partition (partition 0) handles cache miss fetching
+                        // to avoid multiple partitions trying to insert the same data
+                        if !is_primary_partition {
+                            tracing::debug!(
+                                dataset = %dataset_name,
+                                partition = partition,
+                                "CACHING EXEC: CACHE MISS (0 rows) - non-primary partition, returning empty"
+                            );
+                            let empty_stream = RecordBatchStreamAdapter::new(
+                                Arc::clone(&schema_clone),
+                                futures::stream::empty(),
+                            );
+                            Box::pin(empty_stream) as SendableRecordBatchStream
+                        } else {
+                            tracing::debug!(
+                                dataset = %dataset_name,
+                                "CACHING EXEC: CACHE MISS (0 rows) - accelerator returned empty batch, fetching from source"
+                            );
 
-                        // Fetch from source synchronously
-                        match CacheRefreshHelper::fetch_from_source_on_miss(Arc::clone(&federated), Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
-                            Ok(batches) if !batches.is_empty() => {
-                                let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
-                                tracing::debug!("Caching: Fetched {} batches ({} total rows) from source for dataset {}",
-                                    batches.len(),
-                                    total_rows,
-                                    dataset_name);
+                            // Fetch from source synchronously
+                            match CacheRefreshHelper::fetch_from_source_on_miss(Arc::clone(&federated), Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
+                                Ok(batches) if !batches.is_empty() => {
+                                    let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+                                    tracing::debug!("Caching: Fetched {} batches ({} total rows) from source for dataset {}",
+                                        batches.len(),
+                                        total_rows,
+                                        dataset_name);
 
-                                let batch_schema = batches[0].schema();
-                                let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                                let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                                Box::pin(adapter) as SendableRecordBatchStream
-                            }
-                            Ok(_) => {
-                                // Source returned empty data (no error, just no rows)
-                                tracing::warn!(
-                                    dataset = %dataset_name,
-                                    "Caching: Source returned empty data on cache miss"
-                                );
-                                let empty_stream = RecordBatchStreamAdapter::new(
-                                    Arc::clone(&schema_clone),
-                                    futures::stream::empty(),
-                                );
-                                Box::pin(empty_stream) as SendableRecordBatchStream
-                            }
-                            Err(e) => {
-                                // Error from source - propagate it!
-                                tracing::error!(
-                                    dataset = %dataset_name,
-                                    error = %e,
-                                    "Caching: Error fetching from source on cache miss"
-                                );
-                                let error_stream = RecordBatchStreamAdapter::new(
-                                    Arc::clone(&schema_clone),
-                                    futures::stream::once(async move { Err(e) }),
-                                );
-                                Box::pin(error_stream) as SendableRecordBatchStream
+                                    let batch_schema = batches[0].schema();
+                                    let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                                    let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                                    Box::pin(adapter) as SendableRecordBatchStream
+                                }
+                                Ok(_) => {
+                                    // Source returned empty data (no error, just no rows)
+                                    tracing::warn!(
+                                        dataset = %dataset_name,
+                                        "Caching: Source returned empty data on cache miss"
+                                    );
+                                    let empty_stream = RecordBatchStreamAdapter::new(
+                                        Arc::clone(&schema_clone),
+                                        futures::stream::empty(),
+                                    );
+                                    Box::pin(empty_stream) as SendableRecordBatchStream
+                                }
+                                Err(e) => {
+                                    // Error from source - propagate it!
+                                    tracing::error!(
+                                        dataset = %dataset_name,
+                                        error = %e,
+                                        "Caching: Error fetching from source on cache miss"
+                                    );
+                                    let error_stream = RecordBatchStreamAdapter::new(
+                                        Arc::clone(&schema_clone),
+                                        futures::stream::once(async move { Err(e) }),
+                                    );
+                                    Box::pin(error_stream) as SendableRecordBatchStream
+                                }
                             }
                         }
                     }
@@ -878,45 +879,60 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 }
             } else {
                 // Cache miss - accelerator returned no data
-                tracing::info!("Caching: CACHE MISS (no first batch) for dataset {} - accelerator returned None, fetching from source", dataset_name);
+                // Only the primary partition (partition 0) handles cache miss fetching
+                // to avoid multiple partitions trying to insert the same data
+                if !is_primary_partition {
+                    tracing::debug!(
+                        "Caching: CACHE MISS (no first batch) for dataset {} - non-primary partition {}, returning empty",
+                        dataset_name,
+                        partition
+                    );
+                    let empty_stream = RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema_clone),
+                        futures::stream::empty(),
+                    );
+                    Box::pin(empty_stream) as SendableRecordBatchStream
+                } else {
+                    tracing::info!("Caching: CACHE MISS (no first batch) for dataset {} - accelerator returned None, fetching from source", dataset_name);
 
-                // Fetch from source synchronously
-                match CacheRefreshHelper::fetch_from_source_on_miss(federated, Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
-                    Ok(batches) if !batches.is_empty() => {
-                        let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
-                        tracing::info!("Caching: Fetched {} batches ({} total rows) from source for dataset {}",
-                            batches.len(),
-                            total_rows,
-                            dataset_name);
+                    // Fetch from source synchronously
+                    match CacheRefreshHelper::fetch_from_source_on_miss(federated, Arc::clone(&accelerator), &dataset_name, &filters, limit).await {
+                        Ok(batches) if !batches.is_empty() => {
+                            let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+                            tracing::info!("Caching: Fetched {} batches ({} total rows) from source for dataset {}",
+                                batches.len(),
+                                total_rows,
+                                dataset_name);
 
-                        // Debug: log the schema and first batch data
-                        if let Some(first_batch) = batches.first() {
-                            tracing::info!("Caching: Fetched batch schema: {:?}", first_batch.schema());
-                            tracing::info!("Caching: First batch data: {:?}", first_batch);
+                            // Debug: log the schema and first batch data
+                            if let Some(first_batch) = batches.first() {
+                                tracing::info!("Caching: Fetched batch schema: {:?}", first_batch.schema());
+                                tracing::info!("Caching: First batch data: {:?}", first_batch);
+                            }
+
+                            // Use the schema from the fetched batches, not from the accelerator scan
+                            let batch_schema = batches[0].schema();
+                            let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                            let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                            Box::pin(adapter) as SendableRecordBatchStream
                         }
-
-                        // Use the schema from the fetched batches, not from the accelerator scan
-                        let batch_schema = batches[0].schema();
-                        let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                        let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                        Box::pin(adapter) as SendableRecordBatchStream
-                    }
-                    Ok(_) => {
-                        // Source also returned no data
-                        tracing::debug!("Caching: Cache miss - source also has no data for dataset {}", dataset_name);
-                        let empty_stream = RecordBatchStreamAdapter::new(
-                            Arc::clone(&schema_clone),
-                            futures::stream::empty(),
-                        );
-                        Box::pin(empty_stream) as SendableRecordBatchStream
-                    }
-                    Err(e) => {
-                        tracing::error!("Caching: Cache miss fetch failed for dataset {}: {}", dataset_name, e);
-                        let error_stream = RecordBatchStreamAdapter::new(
-                            Arc::clone(&schema_clone),
-                            futures::stream::once(async move { Err(e) }),
-                        );
-                        Box::pin(error_stream) as SendableRecordBatchStream
+                        Ok(_) => {
+                            // Source also returned no data
+                            tracing::debug!("Caching: Cache miss - source also has no data for dataset {}", dataset_name);
+                            let empty_stream = RecordBatchStreamAdapter::new(
+                                Arc::clone(&schema_clone),
+                                futures::stream::empty(),
+                            );
+                            Box::pin(empty_stream) as SendableRecordBatchStream
+                        }
+                        Err(e) => {
+                            tracing::error!("Caching: Cache miss fetch failed for dataset {}: {}", dataset_name, e);
+                            let error_stream = RecordBatchStreamAdapter::new(
+                                Arc::clone(&schema_clone),
+                                futures::stream::once(async move { Err(e) }),
+                            );
+                            Box::pin(error_stream) as SendableRecordBatchStream
+                        }
                     }
                 }
             }
