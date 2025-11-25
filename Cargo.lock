@@ -3013,6 +3013,7 @@ dependencies = [
  "insta",
  "paste",
  "roaring",
+ "runtime-datafusion",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4166,6 +4167,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest",
+ "runtime-datafusion",
  "rusqlite",
  "s3_vectors",
  "s3_vectors_metadata_filter",
@@ -13218,6 +13220,7 @@ name = "runtime-acceleration"
 version = "1.10.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
@@ -13281,6 +13284,7 @@ dependencies = [
  "datafusion-federation",
  "futures",
  "opentelemetry 0.27.1",
+ "parking_lot 0.12.5",
  "runtime-request-context",
  "snafu",
  "tokio",
@@ -14844,6 +14848,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "snafu",
+ "subtle",
  "tokio",
  "tracing",
  "url",
@@ -19042,9 +19047,9 @@ dependencies = [
 
 [[package]]
 name = "x509-certificate"
-version = "0.23.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66534846dec7a11d7c50a74b7cdb208b9a581cad890b7866430d438455847c85"
+checksum = "ca9eb9a0c822c67129d5b8fcc2806c6bc4f50496b420825069a440669bcfbf7f"
 dependencies = [
  "bcder",
  "bytes",
@@ -19055,7 +19060,7 @@ dependencies = [
  "ring",
  "signature 2.2.0",
  "spki 0.7.3",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "zeroize",
 ]
 

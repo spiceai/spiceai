@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use snafu::prelude::*;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
@@ -44,8 +44,7 @@ pub struct DatabricksM2MTokenProvider {
     endpoint: String,
     client_id: String,
 
-    tx: watch::Sender<String>,
-    rx: watch::Receiver<String>,
+    rx: watch::Receiver<SecretString>,
 
     _handle: Arc<JoinHandle<()>>,
 }
@@ -131,7 +130,6 @@ impl DatabricksM2MTokenProvider {
         Ok(Self {
             endpoint,
             client_id,
-            tx,
             rx,
             _handle: Arc::new(handle),
         })
@@ -140,20 +138,51 @@ impl DatabricksM2MTokenProvider {
 
 impl TokenProvider for DatabricksM2MTokenProvider {
     fn get_token(&self) -> String {
-        self.rx.borrow().clone()
+        self.rx.borrow().expose_secret().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
-        Some(self.tx.subscribe())
+        let mut secret_rx = self.rx.clone();
+        let (tx, rx) = watch::channel(secret_rx.borrow().expose_secret().to_string());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tx.closed() => {
+                        break;
+                    }
+                    changed = secret_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let exposed = secret_rx.borrow().expose_secret().to_string();
+                        if tx.send(exposed).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(rx)
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    access_token: SecretString,
     token_type: String,
     expires_in: u64,
     scope: String,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 async fn get_m2m_access_token(

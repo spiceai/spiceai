@@ -37,6 +37,7 @@ use arrow_flight::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
+    common::utils::quote_identifier,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
@@ -433,7 +434,7 @@ impl FlightSqlExec {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
