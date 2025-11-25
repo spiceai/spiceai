@@ -244,23 +244,29 @@ async fn start_children_from_trim_horizon(
 
     for child in all_shards {
         if child.parent_shard_id == Some(parent_id.to_string()) {
-            if let Ok(Some(iterator)) = sdk_client
+
+            match sdk_client
                 .get_shard_iterator(
                     &state.stream_arn,
                     &child.shard_id,
                     &ShardIteratorType::TrimHorizon,
                     None,
                 )
-                .await
-            {
-                let shard = ActiveShard {
-                    shard_id: child.shard_id.clone(),
-                    parent_shard_id: Some(parent_id.to_string()),
-                    iterator,
-                };
-                state.active.insert(child.shard_id.clone(), shard);
-            } else {
-                //TODO: Else what?
+                .await {
+                Ok(Some(iterator)) => {
+                    let shard = ActiveShard {
+                        shard_id: child.shard_id.clone(),
+                        parent_shard_id: Some(parent_id.to_string()),
+                        iterator,
+                    };
+                    state.active.insert(child.shard_id.clone(), shard);
+                }
+                Ok(None) => {
+                    tracing::debug!("Empty iterator: shard_id={} {}", child.shard_id);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize shard {}: {}", child.shard_id, e);
+                }
             }
         }
     }
