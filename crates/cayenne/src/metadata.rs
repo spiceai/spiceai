@@ -160,20 +160,28 @@ pub struct VortexConfig {
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Enable all SIMD-optimized encodings by default
+            // Enable encodings optimized for read performance
+            // ALP: Excellent for floating-point queries (SIMD-friendly decompression)
             enable_alp: true,
+            // FSST: Fast string decompression, good for string-heavy workloads
             enable_fsst: true,
+            // BitPacking: Very fast SIMD decompression for integers
             enable_bitpacking: true,
-            enable_delta: true,
+            // Delta: Disable for reads - requires sequential decompression
+            enable_delta: false,
+            // RLE: Enable for low-cardinality/repeated values (very fast scans)
             enable_rle: true,
+            // Dictionary: Enable for low-cardinality columns (fast lookups)
             enable_dict: true,
+            // FOR: Fast integer decompression, SIMD-friendly
             enable_for: true,
+            // ZigZag: Minimal overhead, keep enabled for signed integers
             enable_zigzag: true,
-            // Cache configuration
+            // Larger caches improve read performance
             footer_cache_mb: 128,
             segment_cache_mb: 256,
-            // Target file size: 256 MB
-            target_vortex_file_size_mb: 256,
+            // Smaller files = better parallelism and predicate pushdown
+            target_vortex_file_size_mb: 128,
         }
     }
 }
