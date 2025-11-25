@@ -3000,6 +3000,7 @@ dependencies = [
  "insta",
  "paste",
  "roaring",
+ "runtime-datafusion",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4153,6 +4154,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest",
+ "runtime-datafusion",
  "rusqlite",
  "s3_vectors",
  "s3_vectors_metadata_filter",
@@ -13186,6 +13188,7 @@ name = "runtime-acceleration"
 version = "1.10.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
@@ -13249,6 +13252,7 @@ dependencies = [
  "datafusion-federation",
  "futures",
  "opentelemetry 0.27.1",
+ "parking_lot 0.12.5",
  "runtime-request-context",
  "snafu",
  "tokio",

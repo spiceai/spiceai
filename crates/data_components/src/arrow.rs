@@ -68,6 +68,19 @@ impl TableProviderFactory for ArrowFactory {
             );
         }
 
+        // Parse sort_columns if provided
+        if let Some(sort_cols_str) = cmd.options.get("sort_columns") {
+            let sort_columns: Vec<String> = sort_cols_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if !sort_columns.is_empty() {
+                mem_table = mem_table.with_sort_columns(sort_columns);
+            }
+        }
+
         let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
         Ok(Arc::new(delete_adapter))
     }

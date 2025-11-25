@@ -155,6 +155,8 @@ pub struct VortexConfig {
     /// for better parallelism and more granular statistics for query optimization.
     /// Defaults to 256 MB.
     pub target_vortex_file_size_mb: usize,
+    /// Columns to sort data by on refresh operations (empty = no sorting)
+    pub sort_columns: Vec<String>,
 }
 
 impl Default for VortexConfig {
@@ -174,6 +176,8 @@ impl Default for VortexConfig {
             segment_cache_mb: 32,
             // Target file size: 256 MB
             target_vortex_file_size_mb: 256,
+            // No sort columns by default
+            sort_columns: Vec::new(),
         }
     }
 }
