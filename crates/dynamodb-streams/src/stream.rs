@@ -13,11 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::checkpoint::GlobalCheckpoint;
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{DynamoDBStreamBatch, StreamState};
+use crate::stream_state::{DynamoDBStreamBatch, ShardPollResult, StreamState};
 use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::{Stream, future::join_all};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -38,7 +40,7 @@ pub struct DynamodbStreamProducer {
 }
 
 impl DynamodbStreamProducer {
-    async fn collect(&mut self) -> Result<Vec<DynamoDBStreamBatch>> {
+    async fn collect(&mut self) -> Result<DynamoDBStreamBatch> {
         let mut batches = Vec::new();
 
         // 1. Initialize shards that require iterators
@@ -84,7 +86,7 @@ impl DynamodbStreamProducer {
             self.state.add_discovered(shards);
         }
 
-        Ok(batches)
+        Ok(combine_shard_batches(batches))
     }
 
     fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
@@ -126,7 +128,7 @@ impl DynamodbStreamProducer {
         }
     }
 
-    async fn perform_iterate_with_retry(&mut self) -> Result<Vec<DynamoDBStreamBatch>> {
+    async fn perform_iterate_with_retry(&mut self) -> Result<DynamoDBStreamBatch> {
         let mut backoff = self.retry_strategy.clone();
 
         loop {
@@ -147,21 +149,36 @@ impl DynamodbStreamProducer {
 
     pub async fn streaming(mut self) {
         loop {
-            let Ok(batches) = self.perform_iterate_with_retry().await else {
+            let Ok(batch) = self.perform_iterate_with_retry().await else {
                 // Error is logged in `perform_iterate_with_retry`
                 return;
             };
 
-            for batch in batches {
-                if self.sender.send(Ok(batch)).await.is_err() {
-                    return;
-                }
+            if self.sender.send(Ok(batch)).await.is_err() {
+                return;
             }
 
             if let Some(duration) = self.interval {
                 sleep(duration).await;
             }
         }
+    }
+}
+
+fn combine_shard_batches(batches: Vec<ShardPollResult>) -> DynamoDBStreamBatch {
+    let mut records = Vec::new();
+    let mut shards_checkpoints = HashMap::new();
+
+    for batch in batches {
+        records.extend(batch.records);
+        shards_checkpoints.insert(batch.shard_id, batch.checkpoint);
+    }
+
+    DynamoDBStreamBatch {
+        records,
+        checkpoint: GlobalCheckpoint {
+            shards: shards_checkpoints,
+        },
     }
 }
 

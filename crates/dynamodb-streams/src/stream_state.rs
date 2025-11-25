@@ -22,9 +22,8 @@ use std::time::SystemTime;
 
 #[derive(Debug)]
 pub struct DynamoDBStreamBatch {
-    pub shard_id: String,
     pub records: Vec<Record>,
-    pub checkpoint: ShardCheckpoint,
+    pub checkpoint: GlobalCheckpoint,
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,6 +51,12 @@ pub struct StreamState {
     active: HashMap<String, ActiveShard>,
     pending: HashMap<String, PendingShard>,
     initializing: HashMap<String, PendingShard>,
+}
+
+pub struct ShardPollResult {
+    pub shard_id: String,
+    pub records: Vec<Record>,
+    pub checkpoint: ShardCheckpoint,
 }
 
 /// Manages shard lifecycle across three states to maintain parent-child ordering guarantees.
@@ -82,7 +87,7 @@ impl StreamState {
         shard_id: &str,
         new_iterator: Option<String>,
         records: Vec<Record>,
-    ) -> Option<DynamoDBStreamBatch> {
+    ) -> Option<ShardPollResult> {
         tracing::debug!(
             "Processing shard poll: shard_id={:?}, new_iterator={:?}, records_num={:?}",
             shard_id,
@@ -114,7 +119,7 @@ impl StreamState {
         }
         let last_seq = last_seq_opt?;
 
-        Some(DynamoDBStreamBatch {
+        Some(ShardPollResult {
             shard_id: shard_id.to_string(),
             records,
             checkpoint: ShardCheckpoint {
