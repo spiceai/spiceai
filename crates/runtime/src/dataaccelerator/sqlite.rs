@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
+    catalog::TableProviderFactory,
+    datasource::TableProvider,
+    execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
@@ -27,7 +31,7 @@ use datafusion_table_providers::{
 use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
+use std::{any::Any, ffi::OsStr, path::PathBuf, time::Duration};
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
@@ -113,9 +117,7 @@ impl SqliteAccelerator {
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
                 .with_decimal_between(true)
-                // Prepared statements currently map timestamp values incorrectly (see spiceai#7629),
-                // so use the legacy insert path until the upstream fix lands.
-                .with_batch_insert_use_prepared_statements(false)
+                .with_batch_insert_use_prepared_statements(true)
                 .with_function_support(deny_spice_specific_functions()),
         }
     }
