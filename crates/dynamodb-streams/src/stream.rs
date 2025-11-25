@@ -136,14 +136,6 @@ impl DynamodbStreamProducer {
                 return;
             };
 
-            let batches = match self.perform_iterate_with_retry().await {
-                Ok(b) => b,
-                Err(_) => {
-                    // Error is logged in `perform_iterate_with_retry`
-                    return;
-                }
-            };
-
             for batch in batches {
                 if self.sender.send(Ok(batch)).await.is_err() {
                     return;

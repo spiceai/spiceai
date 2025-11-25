@@ -74,7 +74,7 @@ impl Client {
     /// Creates a stream that processes records starting from the given checkpoint.
     ///
     /// The checkpoint must be from the same table and stream. Checkpoints are valid
-    /// for 24 hours (DynamoDB Streams retention period).
+    /// for 24 hours (`DynamoDB` Streams retention period).
     ///
     /// # Errors
     ///
