@@ -74,6 +74,10 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	t0 := time.Now()
 	nFiles := 0
 	madeDir := map[string]bool{}
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve target directory: %w", err)
+	}
 	var reader = r
 	if isGzipped {
 		reader, err = gzip.NewReader(r)
@@ -93,19 +97,9 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 		if err != nil {
 			return fmt.Errorf("tar error: %v", err)
 		}
-		rel := filepath.FromSlash(f.Name)
-		abs := filepath.Join(dir, rel)
-		// Check that abs is within the target directory, preventing directory traversal
-		dirAbs, errAbs := filepath.Abs(dir)
-		if errAbs != nil {
-			return fmt.Errorf("failed to resolve target directory: %v", errAbs)
-		}
-		absAbs, errAbs2 := filepath.Abs(abs)
-		if errAbs2 != nil {
-			return fmt.Errorf("failed to resolve extraction path: %v", errAbs2)
-		}
-		if !isSubpath(dirAbs, absAbs) {
-			return fmt.Errorf("tar contained invalid name: potential path traversal or absolute path %q", f.Name)
+		abs, err := resolveArchivePath(dirAbs, f.Name)
+		if err != nil {
+			return err
 		}
 
 		fi := f.FileInfo()
@@ -170,14 +164,25 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	return nil
 }
 
-// isSubpath checks that the target (child) path is within the root directory,
-// preventing directory traversal or absolute path escapes.
-func isSubpath(root, target string) bool {
-	root = filepath.Clean(root)
-	target = filepath.Clean(target)
-	// Ensure trailing separator on root, so subpath (itself) matches
-	if !strings.HasSuffix(root, string(os.PathSeparator)) {
-		root += string(os.PathSeparator)
+func resolveArchivePath(baseDir, name string) (string, error) {
+	cleanName := filepath.Clean(filepath.FromSlash(name))
+	if cleanName == "." {
+		return "", fmt.Errorf("tar file entry %q contained invalid name", name)
 	}
-	return strings.HasPrefix(target, root)
+	if filepath.IsAbs(cleanName) {
+		return "", fmt.Errorf("tar file entry %q contained absolute path", name)
+	}
+	if cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tar file entry %q attempted directory traversal", name)
+	}
+
+	target := filepath.Join(baseDir, cleanName)
+	rel, err := filepath.Rel(baseDir, target)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve archive path %q: %w", name, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tar file entry %q attempted directory traversal", name)
+	}
+	return target, nil
 }
