@@ -196,11 +196,12 @@ impl StreamState {
 }
 
 pub async fn initialize_state_from_checkpoint(
+    stream_arn: String,
     checkpoint: &GlobalCheckpoint,
     sdk_client: Arc<SDKClient>,
 ) -> crate::Result<StreamState> {
     let mut state = StreamState {
-        stream_arn: checkpoint.stream_arn.clone(),
+        stream_arn: stream_arn.clone(),
         active: HashMap::new(),
         pending: HashMap::new(),
         initializing: HashMap::new(),
@@ -214,7 +215,7 @@ pub async fn initialize_state_from_checkpoint(
 
         match sdk_client
             .get_shard_iterator(
-                &checkpoint.stream_arn,
+                &stream_arn,
                 shard_id,
                 &iterator_type,
                 Some(shard_checkpoint.sequence_number.clone()),

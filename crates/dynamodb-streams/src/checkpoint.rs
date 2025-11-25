@@ -17,7 +17,6 @@ pub enum CheckpointPosition {
 
 #[derive(Clone, Debug)]
 pub struct GlobalCheckpoint {
-    pub stream_arn: String,
     pub shards: HashMap<String, ShardCheckpoint>,
 }
 

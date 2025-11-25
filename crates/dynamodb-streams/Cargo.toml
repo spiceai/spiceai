@@ -18,3 +18,4 @@ tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 futures.workspace = true
+util = { path = "../util" }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use util::retry_strategy::{BackoffMethod, RetryBackoffBuilder};
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -75,7 +76,6 @@ impl Client {
             .collect::<Result<_>>()?;
 
         Ok(GlobalCheckpoint {
-            stream_arn,
             shards: checkpoint_shards,
         })
     }
@@ -84,17 +84,29 @@ impl Client {
         &self,
         checkpoint: GlobalCheckpoint,
     ) -> Result<DynamodbStream> {
-        let state =
-            initialize_state_from_checkpoint(&checkpoint, Arc::clone(&self.sdk_client)).await?;
+        let stream_arn = self
+            .sdk_client
+            .get_stream_arn(self.table_name.clone())
+            .await?;
+        let state = initialize_state_from_checkpoint(
+            stream_arn.clone(),
+            &checkpoint,
+            Arc::clone(&self.sdk_client),
+        )
+        .await?;
 
         let (tx, rx) = mpsc::channel(self.buffer);
 
         let producer = DynamodbStreamProducer {
-            stream_arn: checkpoint.stream_arn.clone(),
+            stream_arn,
             state,
             interval: self.interval,
             sender: tx,
             client: Arc::clone(&self.sdk_client),
+            retry_strategy: RetryBackoffBuilder::new()
+                .method(BackoffMethod::Fibonacci)
+                .max_retries(Some(3))
+                .build(),
         };
 
         tokio::spawn(async move {

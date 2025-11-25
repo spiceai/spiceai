@@ -10,6 +10,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, sleep},
 };
+use util::retry_strategy::{Backoff, RetryBackoff};
 
 #[derive(Debug)]
 pub struct DynamodbStreamProducer {
@@ -18,6 +19,7 @@ pub struct DynamodbStreamProducer {
     pub interval: Option<Duration>,
     pub sender: mpsc::Sender<StreamResult>,
     pub client: Arc<SDKClient>,
+    pub retry_strategy: RetryBackoff,
 }
 
 impl DynamodbStreamProducer {
@@ -53,7 +55,6 @@ impl DynamodbStreamProducer {
                     }
                 }
                 Err(e) => {
-                    // TODO: Handle expired iterator
                     tracing::error!("Shard poll failed: shard_id={}, {}", shard_id, e);
                     self.handle_failed_shard(&shard_id, &e).await;
                 }
@@ -109,14 +110,33 @@ impl DynamodbStreamProducer {
         }
     }
 
+    async fn perform_iterate_with_retry(&mut self) -> Result<Vec<RecordBatch>> {
+        let mut backoff = self.retry_strategy.clone();
+
+        loop {
+            match self.iterate().await {
+                Ok(result) => return Ok(result),
+                Err(e) => match backoff.next_backoff() {
+                    Some(duration) => {
+                        tracing::debug!("Iteration failed, retrying after {:?}: {}", duration, e);
+                        tokio::time::sleep(duration).await;
+                    }
+                    None => {
+                        tracing::error!("Iteration failed after exhausting retries: {}", e);
+                        return Err(e);
+                    }
+                },
+            }
+        }
+    }
+
     pub async fn streaming(mut self) {
         loop {
-            let batches = match self.iterate().await {
+            let batches = match self.perform_iterate_with_retry().await {
                 Ok(b) => b,
-                Err(e) => {
-                    // TODO: Add retry logic with backoff
-                    tracing::error!("Iteration failed: {}", e);
-                    continue;
+                Err(_) => {
+                    // Error is logged in `perform_iterate_with_retry`
+                    return;
                 }
             };
 
