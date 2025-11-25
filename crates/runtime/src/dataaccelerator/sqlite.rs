@@ -42,7 +42,7 @@ use crate::{
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -332,11 +332,14 @@ impl DataAccelerator for SqliteAccelerator {
 
         let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
-        let cloned_writer = Arc::clone(&sqlite_writer);
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) =
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options);
 
         let table_provider = Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            sqlite_writer,
+            write_provider,
+            delete_provider,
             read_provider,
         ));
 

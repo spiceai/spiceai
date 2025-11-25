@@ -29,7 +29,7 @@ use std::{any::Any, sync::Arc};
 
 use crate::{datafusion::udf::deny_spice_specific_functions, parameters::ParameterSpec};
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -168,11 +168,14 @@ impl DataAccelerator for PostgresAccelerator {
 
         let read_provider = Arc::clone(&postgres_writer.read_provider);
         let postgres_writer = Arc::new(postgres_writer.clone());
-        let cloned_writer = Arc::clone(&postgres_writer);
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) =
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(postgres_writer, &cmd.options);
 
         let table_provider = Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            postgres_writer,
+            write_provider,
+            delete_provider,
             read_provider,
         ));
 

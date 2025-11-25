@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
+    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 
 use crate::component::dataset;
@@ -70,5 +70,21 @@ impl Acceleration {
                 Ok(Some(OnConflict::Upsert(on_conflict.0.clone())))
             }
         }
+    }
+
+    /// Returns the `UpsertOptions` if the `on_conflict` behavior is `Upsert`.
+    /// Returns `UpsertOptions::default()` if no `on_conflict` is set.
+    #[must_use]
+    pub fn upsert_options(&self) -> UpsertOptions {
+        self.on_conflict
+            .values()
+            .find_map(|behavior| {
+                if let OnConflictBehavior::Upsert(options) = behavior {
+                    Some(options.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
     }
 }
