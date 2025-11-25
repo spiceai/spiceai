@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraint, Result as DataFusionResult};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, dml::InsertOp};
@@ -809,18 +809,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                         // Empty batch (0 rows) - treat as cache miss
                         // Only the primary partition (partition 0) handles cache miss fetching
                         // to avoid multiple partitions trying to insert the same data
-                        if !is_primary_partition {
-                            tracing::debug!(
-                                dataset = %dataset_name,
-                                partition = partition,
-                                "CACHING EXEC: CACHE MISS (0 rows) - non-primary partition, returning empty"
-                            );
-                            let empty_stream = RecordBatchStreamAdapter::new(
-                                Arc::clone(&schema_clone),
-                                futures::stream::empty(),
-                            );
-                            Box::pin(empty_stream) as SendableRecordBatchStream
-                        } else {
+                        if is_primary_partition {
                             tracing::debug!(
                                 dataset = %dataset_name,
                                 "CACHING EXEC: CACHE MISS (0 rows) - accelerator returned empty batch, fetching from source"
@@ -866,6 +855,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                                     Box::pin(error_stream) as SendableRecordBatchStream
                                 }
                             }
+                        } else {
+                            tracing::debug!(
+                                dataset = %dataset_name,
+                                partition = partition,
+                                "CACHING EXEC: CACHE MISS (0 rows) - non-primary partition, returning empty"
+                            );
+                            let empty_stream = RecordBatchStreamAdapter::new(
+                                Arc::clone(&schema_clone),
+                                futures::stream::empty(),
+                            );
+                            Box::pin(empty_stream) as SendableRecordBatchStream
                         }
                     }
                     Err(e) => {
@@ -881,18 +881,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // Cache miss - accelerator returned no data
                 // Only the primary partition (partition 0) handles cache miss fetching
                 // to avoid multiple partitions trying to insert the same data
-                if !is_primary_partition {
-                    tracing::debug!(
-                        "Caching: CACHE MISS (no first batch) for dataset {} - non-primary partition {}, returning empty",
-                        dataset_name,
-                        partition
-                    );
-                    let empty_stream = RecordBatchStreamAdapter::new(
-                        Arc::clone(&schema_clone),
-                        futures::stream::empty(),
-                    );
-                    Box::pin(empty_stream) as SendableRecordBatchStream
-                } else {
+                if is_primary_partition {
                     tracing::info!("Caching: CACHE MISS (no first batch) for dataset {} - accelerator returned None, fetching from source", dataset_name);
 
                     // Fetch from source synchronously
@@ -934,6 +923,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             Box::pin(error_stream) as SendableRecordBatchStream
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        "Caching: CACHE MISS (no first batch) for dataset {} - non-primary partition {}, returning empty",
+                        dataset_name,
+                        partition
+                    );
+                    let empty_stream = RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema_clone),
+                        futures::stream::empty(),
+                    );
+                    Box::pin(empty_stream) as SendableRecordBatchStream
                 }
             }
         }).flatten();
