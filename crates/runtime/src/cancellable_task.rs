@@ -36,6 +36,18 @@ pub(crate) struct CancellableTaskHandle {
 }
 
 impl CancellableTaskHandle {
+    pub(crate) fn new(
+        notify_abort_task: oneshot::Sender<()>,
+        cancellation_token: Option<CancellationToken>,
+        on_task_completed: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            notify_abort_task,
+            cancellation_token,
+            on_task_completed,
+        }
+    }
+
     pub async fn cancel(mut self, timeout: Duration) {
         let Some(token) = self.cancellation_token.take() else {
             // The task does not support graceful cancellation, so we abort it.
@@ -68,6 +80,7 @@ impl CancellableTaskHandle {
 ///
 /// Returns a future that resolves when the task completes or is canceled,
 /// along with a [`CancellableTaskHandle`] for external task control.
+#[allow(dead_code)]
 pub(crate) fn spawn_cancellable_task<F>(
     task_cancellation: Option<CancellationToken>,
     task_fn: F,
