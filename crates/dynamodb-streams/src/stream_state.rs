@@ -179,12 +179,12 @@ impl StreamState {
 
         for child_id in to_promote {
             if let Some(child) = self.pending.remove(&child_id) {
-                self.try_move_to_initializing(child_id, child);
+                self.try_move_to_initializing(&child_id, child);
             }
         }
     }
 
-    fn try_move_to_initializing(&mut self, shard_id: String, shard: PendingShard) {
+    fn try_move_to_initializing(&mut self, shard_id: &str, shard: PendingShard) {
         let is_blocked = shard.parent_shard_id.as_ref().is_some_and(|p| {
             self.active.contains_key(p)
                 || self.pending.contains_key(p)
@@ -192,9 +192,9 @@ impl StreamState {
         });
 
         if is_blocked {
-            self.pending.insert(shard_id.clone(), shard);
+            self.pending.insert(shard_id.to_string(), shard);
         } else {
-            self.initializing.insert(shard_id.clone(), shard);
+            self.initializing.insert(shard_id.to_string(), shard);
         }
     }
 }

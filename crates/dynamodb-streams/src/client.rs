@@ -30,6 +30,14 @@ impl Client {
         ClientBuilder::new(sdk_config, table_name)
     }
 
+    /// Returns a checkpoint representing the current state of all open shards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The table has no stream enabled
+    /// - AWS API calls fail (network, permissions, etc.)
+    /// - Any open shard is missing a starting sequence number
     pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
         let stream_arn = self
             .sdk_client
@@ -63,6 +71,17 @@ impl Client {
         })
     }
 
+    /// Creates a stream that processes records starting from the given checkpoint.
+    ///
+    /// The checkpoint must be from the same table and stream. Checkpoints are valid
+    /// for 24 hours (DynamoDB Streams retention period).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The stream ARN cannot be retrieved
+    /// - Checkpoint initialization fails (expired shards, invalid sequence numbers)
+    /// - Initial shard iterator requests fail
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: GlobalCheckpoint,

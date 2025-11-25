@@ -56,7 +56,7 @@ impl DynamodbStreamProducer {
                 }
                 Err(e) => {
                     tracing::error!("Shard poll failed: shard_id={}, {}", shard_id, e);
-                    self.handle_failed_shard(&shard_id, &e).await;
+                    self.handle_failed_shard(&shard_id, &e);
                 }
             }
         }
@@ -72,7 +72,7 @@ impl DynamodbStreamProducer {
         Ok(batches)
     }
 
-    async fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
+    fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
         // TODO: Finalize logic
         let is_expired_iterator = error.to_string().contains("ExpiredIterator")
             || error.to_string().contains("TrimmedDataAccess");
@@ -131,6 +131,11 @@ impl DynamodbStreamProducer {
 
     pub async fn streaming(mut self) {
         loop {
+            let Ok(batches) = self.perform_iterate_with_retry().await else {
+                // Error is logged in `perform_iterate_with_retry`
+                return;
+            };
+
             let batches = match self.perform_iterate_with_retry().await {
                 Ok(b) => b,
                 Err(_) => {
