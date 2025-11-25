@@ -145,7 +145,7 @@ impl StreamState {
 
             let pending_shard = PendingShard {
                 shard_id: shard_id.clone(),
-                parent_shard_id: (&shard).parent_shard_id.clone(),
+                parent_shard_id: shard.parent_shard_id.clone(),
             };
 
             if blocked {

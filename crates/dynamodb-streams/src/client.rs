@@ -13,6 +13,7 @@ use tokio::time::Duration;
 use util::retry_strategy::{BackoffMethod, RetryBackoffBuilder};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)]
 pub struct Client {
     sdk_client: Arc<SDKClient>,
     table_name: String,
@@ -109,6 +110,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    #[must_use]
     pub fn new(sdk_config: SdkConfig, table_name: String) -> Self {
         Self {
             sdk_config,
@@ -137,6 +139,7 @@ impl ClientBuilder {
         self
     }
 
+    #[must_use]
     pub fn build(self) -> Client {
         Client {
             sdk_client: Arc::new(SDKClient::new(&self.sdk_config, self.shard_record_limit)),
