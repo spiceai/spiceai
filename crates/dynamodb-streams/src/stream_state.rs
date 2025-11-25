@@ -1341,7 +1341,7 @@ mod tests {
             parent_shard_id: None,
         };
 
-        state.try_move_to_initializing("shard-1".to_string(), shard);
+        state.try_move_to_initializing("shard-1", shard);
 
         assert_eq!(state.active.len(), 0);
         assert_eq!(state.pending.len(), 0);
@@ -1381,7 +1381,7 @@ mod tests {
             parent_shard_id: Some("parent".to_string()),
         };
 
-        state.try_move_to_initializing("child".to_string(), shard);
+        state.try_move_to_initializing("child", shard);
 
         assert_eq!(state.active.len(), 1);
         assert_eq!(state.pending.len(), 1);
@@ -1420,7 +1420,7 @@ mod tests {
             parent_shard_id: Some("parent".to_string()),
         };
 
-        state.try_move_to_initializing("child".to_string(), shard);
+        state.try_move_to_initializing("child", shard);
 
         assert_eq!(state.active.len(), 0);
         assert_eq!(state.pending.len(), 2);
@@ -1459,7 +1459,7 @@ mod tests {
             parent_shard_id: Some("parent".to_string()),
         };
 
-        state.try_move_to_initializing("child".to_string(), shard);
+        state.try_move_to_initializing("child", shard);
 
         assert_eq!(state.active.len(), 0);
         assert_eq!(state.pending.len(), 1);
@@ -1851,7 +1851,7 @@ mod tests {
             parent_shard_id: None,
         };
 
-        state.try_move_to_initializing("shard-1".to_string(), shard);
+        state.try_move_to_initializing("shard-1", shard);
 
         assert_eq!(state.active.len(), 0);
         assert_eq!(state.pending.len(), 0);
