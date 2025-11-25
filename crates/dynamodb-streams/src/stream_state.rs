@@ -40,7 +40,6 @@ pub struct StreamState {
 }
 
 impl StreamState {
-
     pub fn get_active_shards(&self) -> impl Iterator<Item = &ActiveShard> {
         self.active.values()
     }
@@ -244,7 +243,6 @@ async fn start_children_from_trim_horizon(
 
     for child in all_shards {
         if child.parent_shard_id == Some(parent_id.to_string()) {
-
             match sdk_client
                 .get_shard_iterator(
                     &state.stream_arn,
@@ -252,7 +250,8 @@ async fn start_children_from_trim_horizon(
                     &ShardIteratorType::TrimHorizon,
                     None,
                 )
-                .await {
+                .await
+            {
                 Ok(Some(iterator)) => {
                     let shard = ActiveShard {
                         shard_id: child.shard_id.clone(),
