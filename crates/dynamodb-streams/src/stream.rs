@@ -38,7 +38,7 @@ pub struct DynamodbStreamProducer {
 }
 
 impl DynamodbStreamProducer {
-    async fn iterate(&mut self) -> Result<Vec<DynamoDBStreamBatch>> {
+    async fn collect(&mut self) -> Result<Vec<DynamoDBStreamBatch>> {
         let mut batches = Vec::new();
 
         // 1. Initialize shards that require iterators
@@ -119,6 +119,7 @@ impl DynamodbStreamProducer {
                     }
                 }
                 Err(e) => {
+                    // TODO: Handle failures - https://github.com/spiceai/spiceai/issues/8074
                     tracing::warn!("Failed to initialize shard {}: {}", shard_id, e);
                 }
             }
@@ -129,7 +130,7 @@ impl DynamodbStreamProducer {
         let mut backoff = self.retry_strategy.clone();
 
         loop {
-            match self.iterate().await {
+            match self.collect().await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     if let Some(duration) = backoff.next_backoff() {
