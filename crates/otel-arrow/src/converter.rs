@@ -484,7 +484,7 @@ impl OtelToArrowConverter {
             self.time_unix_nano_builder
                 .append_value(system_time_to_nanos(sum.time));
             self.start_time_unix_nano_builder
-                .append_value(system_time_to_nanos(sum.start_time));
+                .append_option(Some(system_time_to_nanos(sum.start_time)));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -555,7 +555,7 @@ impl OtelToArrowConverter {
             self.time_unix_nano_builder
                 .append_value(system_time_to_nanos(histogram.time));
             self.start_time_unix_nano_builder
-                .append_value(system_time_to_nanos(histogram.start_time));
+                .append_option(Some(system_time_to_nanos(histogram.start_time)));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
