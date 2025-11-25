@@ -40,15 +40,6 @@ pub struct StreamState {
 }
 
 impl StreamState {
-    #[must_use]
-    pub fn new(stream_arn: String) -> Self {
-        Self {
-            stream_arn,
-            active: HashMap::new(),
-            pending: HashMap::new(),
-            initializing: HashMap::new(),
-        }
-    }
 
     pub fn get_active_shards(&self) -> impl Iterator<Item = &ActiveShard> {
         self.active.values()
@@ -280,6 +271,18 @@ async fn start_children_from_trim_horizon(
 mod tests {
     use super::*;
     use aws_sdk_dynamodbstreams::types::StreamRecord;
+
+    impl StreamState {
+        #[must_use]
+        pub fn new(stream_arn: String) -> Self {
+            Self {
+                stream_arn,
+                active: HashMap::new(),
+                pending: HashMap::new(),
+                initializing: HashMap::new(),
+            }
+        }
+    }
 
     fn create_record(seq_num: &str) -> Record {
         Record::builder()

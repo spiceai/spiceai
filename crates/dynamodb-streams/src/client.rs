@@ -5,6 +5,7 @@ use crate::stream_state::initialize_state_from_checkpoint;
 use crate::{FailedToInitializeCheckpointSnafu, Result};
 use aws_config::SdkConfig;
 use snafu::OptionExt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
@@ -24,27 +25,8 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
 impl Client {
     #[must_use]
-    pub fn new(sdk_config: &SdkConfig, table_name: String) -> Self {
-        Self {
-            sdk_client: Arc::new(SDKClient::new(sdk_config, None)),
-            table_name,
-            interval: Some(DEFAULT_INTERVAL),
-            buffer: DEFAULT_BUFFER_SIZE,
-        }
-    }
-
-    #[must_use]
-    pub fn interval(mut self, interval: Option<Duration>) -> Self {
-        self.interval = interval;
-        self
-    }
-
-    #[must_use]
-    pub fn buffer(mut self, buffer: usize) -> Self {
-        // TODO: Remove assert
-        assert!(buffer > 0, "buffer must be positive");
-        self.buffer = buffer;
-        self
+    pub fn builder(sdk_config: SdkConfig, table_name: String) -> ClientBuilder {
+        ClientBuilder::new(sdk_config, table_name)
     }
 
     pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
@@ -114,5 +96,53 @@ impl Client {
         });
 
         Ok(DynamodbStream { receiver: rx })
+    }
+}
+
+#[derive(Debug)]
+pub struct ClientBuilder {
+    sdk_config: SdkConfig,
+    table_name: String,
+    interval: Option<Duration>,
+    buffer: usize,
+    shard_record_limit: Option<i32>,
+}
+
+impl ClientBuilder {
+    pub fn new(sdk_config: SdkConfig, table_name: String) -> Self {
+        Self {
+            sdk_config,
+            table_name,
+            interval: Some(DEFAULT_INTERVAL),
+            buffer: DEFAULT_BUFFER_SIZE,
+            shard_record_limit: None,
+        }
+    }
+
+    #[must_use]
+    pub fn interval(mut self, interval: Option<Duration>) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub fn buffer(mut self, buffer: NonZeroUsize) -> Self {
+        self.buffer = buffer.get();
+        self
+    }
+
+    #[must_use]
+    pub fn shard_record_limit(mut self, shard_record_limit: Option<i32>) -> Self {
+        self.shard_record_limit = shard_record_limit;
+        self
+    }
+
+    pub fn build(self) -> Client {
+        Client {
+            sdk_client: Arc::new(SDKClient::new(&self.sdk_config, self.shard_record_limit)),
+            table_name: self.table_name,
+            interval: self.interval,
+            buffer: self.buffer,
+        }
     }
 }
