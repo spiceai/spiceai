@@ -25,7 +25,7 @@ use datafusion::{
     common::tree_node::Transformed,
     datasource::DefaultTableSource,
     error::DataFusionError,
-    logical_expr::{Extension, LogicalPlan, Projection, TableScan, UserDefinedLogicalNode},
+    logical_expr::{Extension, LogicalPlan, Projection, TableScan},
     optimizer::{ApplyOrder, OptimizerRule},
     prelude::{Expr, col},
     scalar::ScalarValue,
@@ -34,7 +34,12 @@ use datafusion::{
 use runtime_datafusion_index::{Index, IndexedTableProvider, analyzer::IndexTableScanNode};
 use search::index::{VectorScanTableProvider, derived_columns_from_vector_index};
 
-/// An [`OptimizerRule`] that
+/// An [`OptimizerRule`] that, for any [`LogicalPlan`] with a [`IndexTableScanNode`] extension node, find all
+/// [`VectorIndex`] derived columns and remove them from the underlying [`VectorScanTableProvider`] projection.
+///
+/// This avoids redundant calls to the [`VectorIndex`] during indexing.
+///
+/// The derived columns are then re-added as NULL literal expressions in a projection on top of the modified [`TableScan`].
 pub struct AvoidDerivedVectorColumnOnIndexRule {}
 
 impl Debug for AvoidDerivedVectorColumnOnIndexRule {
@@ -45,6 +50,45 @@ impl Debug for AvoidDerivedVectorColumnOnIndexRule {
 }
 
 impl AvoidDerivedVectorColumnOnIndexRule {
+    /// Check if the given [`LogicalPlan`] is an [`IndexTableScanNode`] over a [`VectorScanTableProvider`].
+    ///
+    /// This will be nested like
+    /// ```
+    /// Extension(IndexTableScanNode)
+    ///   └── TableScan(DefaultTableSource)
+    ///       └── IndexedTableProvider
+    ///          └── VectorScanTableProvider
+    /// ```
+    fn is_indexing_with_derived_vector_columns(
+        plan: &LogicalPlan,
+    ) -> Option<(&IndexedTableProvider, &TableScan)> {
+        let LogicalPlan::Extension(ext) = plan else {
+            return None;
+        };
+        let index_scan = ext.node.as_any().downcast_ref::<IndexTableScanNode>()?;
+
+        let LogicalPlan::TableScan(table_scan) = index_scan.input() else {
+            return None;
+        };
+
+        let default_table_source = table_scan
+            .source
+            .as_any()
+            .downcast_ref::<DefaultTableSource>()?;
+
+        let indexed_table_provider = default_table_source
+            .table_provider
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()?;
+
+        let _vector_scan_table = indexed_table_provider
+            .get_underlying()
+            .as_any()
+            .downcast_ref::<VectorScanTableProvider>()?;
+
+        Some((indexed_table_provider, table_scan))
+    }
+
     /// For [`Index`] in [`IndexTableScanNode`], find all derived columns of [`VectorIndex`]s.
     fn derived_vector_index_columns(indexes: &[Arc<dyn Index + Send + Sync>]) -> Vec<String> {
         indexes
@@ -54,9 +98,12 @@ impl AvoidDerivedVectorColumnOnIndexRule {
             .collect()
     }
 
+    /// Rewrite the given [`TableScan`] to avoid projecting derived vector columns.
+    ///
+    /// The derived columns are removed from the projection, and then re-added as NULL literal expressions with matching Field types, relations and ordering.
     fn avoid_derived_vector_columns(
         derived: &[&String],
-        index_scan: &IndexTableScanNode,
+        index_scan: &IndexedTableProvider,
         table_scan: &TableScan,
     ) -> Result<LogicalPlan, DataFusionError> {
         let mut proj = match table_scan.projection.as_ref() {
@@ -96,7 +143,7 @@ impl AvoidDerivedVectorColumnOnIndexRule {
         let mut scan_col_iter = scan_schema.columns().into_iter();
         let mut projections: Vec<Expr> = Vec::new();
 
-        for i in 0..index_scan.schema().fields().len() {
+        for i in 0..index_scan.get_underlying_ref().schema().fields().len() {
             if let Some((table_ref, field)) = derived_cols.remove(&i) {
                 projections.push(
                     Expr::Literal(ScalarValue::try_from(field.data_type())?, None)
@@ -107,13 +154,14 @@ impl AvoidDerivedVectorColumnOnIndexRule {
             }
         }
 
-        let plan = LogicalPlan::Projection(Projection::try_new(
-            projections,
-            Arc::new(LogicalPlan::TableScan(tbl_scan)),
-        )?);
-
         Ok(LogicalPlan::Extension(Extension {
-            node: Arc::new(IndexTableScanNode::new(plan, index_scan.indexes().to_vec())),
+            node: Arc::new(IndexTableScanNode::new(
+                LogicalPlan::Projection(Projection::try_new(
+                    projections,
+                    Arc::new(LogicalPlan::TableScan(tbl_scan)),
+                )?),
+                index_scan.get_all_indexes(),
+            )),
         }))
     }
 }
@@ -131,47 +179,12 @@ impl OptimizerRule for AvoidDerivedVectorColumnOnIndexRule {
         plan: LogicalPlan,
         _config: &dyn datafusion::optimizer::OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
-        let LogicalPlan::Extension(ref ext) = plan else {
-            return Ok(Transformed::no(plan));
-        };
-        let Some(index_scan) = ext.node.as_any().downcast_ref::<IndexTableScanNode>() else {
-            return Ok(Transformed::no(plan));
-        };
-
-        let LogicalPlan::TableScan(table_scan) = index_scan.input() else {
-            return Ok(Transformed::no(plan));
-        };
-
-        // Check it is DefaultTableSource(VectorScanTableProvider)
-        let Some(default_table_source) = table_scan
-            .source
-            .as_any()
-            .downcast_ref::<DefaultTableSource>()
-        else {
-            return Ok(Transformed::no(plan));
-        };
-        let Some(indexed_table_provider) = default_table_source
-            .table_provider
-            .as_any()
-            .downcast_ref::<IndexedTableProvider>()
+        let Some((indexed, table_scan)) = Self::is_indexing_with_derived_vector_columns(&plan)
         else {
             return Ok(Transformed::no(plan));
         };
 
-        if indexed_table_provider
-            .get_underlying()
-            .as_any()
-            .downcast_ref::<VectorScanTableProvider>()
-            .is_none()
-        {
-            return Ok(Transformed::no(plan));
-        }
-
-        let derived_columns = Self::derived_vector_index_columns(index_scan.indexes());
-        if derived_columns.is_empty() {
-            return Ok(Transformed::no(plan));
-        }
-
+        let derived_columns = Self::derived_vector_index_columns(&indexed.indexes);
         let projected_derived_columns: Vec<&String> = derived_columns
             .iter()
             .filter(|&c| {
@@ -187,7 +200,7 @@ impl OptimizerRule for AvoidDerivedVectorColumnOnIndexRule {
 
         Ok(Transformed::yes(Self::avoid_derived_vector_columns(
             &projected_derived_columns,
-            index_scan,
+            indexed,
             table_scan,
         )?))
     }
