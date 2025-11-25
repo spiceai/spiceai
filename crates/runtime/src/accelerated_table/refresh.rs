@@ -1086,15 +1086,12 @@ mod tests {
         ) -> bool {
             for _attempt in 0..max_attempts {
                 let metrics = registry.gather();
-                if let Some(metric) = metrics
-                    .iter()
-                    .find(|m| m.get_name() == "dataset_load_state")
-                    && metric.get_field_type() == MetricType::GAUGE
+                if let Some(metric) = metrics.iter().find(|m| {
+                    m.name() == "dataset_load_state" && m.get_field_type() == MetricType::GAUGE
+                }) && let Some(gauge) = metric.get_metric()[0].get_gauge().as_ref()
+                    && gauge.value().is_eq(f64::from(desired as i32))
                 {
-                    let value = metric.get_metric()[0].get_gauge().get_value();
-                    if value.is_eq(f64::from(desired as i32)) {
-                        return true;
-                    }
+                    return true;
                 }
                 tokio::time::sleep(delay).await;
             }
@@ -1103,7 +1100,7 @@ mod tests {
 
         let registry = prometheus::Registry::new();
 
-        let resource = Resource::default();
+        let resource = Resource::builder().build();
 
         let prometheus_exporter = opentelemetry_prometheus::exporter()
             .with_registry(registry.clone())

@@ -30,7 +30,6 @@ use flightrepl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::runtime::Tokio;
 use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
 use runtime::config::ClusterMode;
@@ -373,7 +372,7 @@ fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resource = Resource::default();
+    let resource = Resource::builder().build();
 
     let prometheus_exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry)
@@ -386,9 +385,8 @@ fn init_metrics(
     let spice_metrics_exporter =
         OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
 
-    let periodic_reader = PeriodicReader::builder(spice_metrics_exporter, Tokio)
+    let periodic_reader = PeriodicReader::builder(spice_metrics_exporter)
         .with_interval(Duration::from_secs(30))
-        .with_timeout(Duration::from_secs(10))
         .build();
 
     let provider = SdkMeterProvider::builder()
