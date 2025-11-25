@@ -62,6 +62,8 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
+#[cfg(feature = "cluster")]
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -188,6 +190,29 @@ impl Query {
             .build()
             .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
+        let mut should_distribute = true;
+
+        let _ = plan.apply(|p| {
+            if let LogicalPlan::DescribeTable(_) = p {
+                should_distribute = false;
+            } else if let LogicalPlan::TableScan(scan) = p
+                && matches!(scan.table_name.schema(), Some(SPICE_RUNTIME_SCHEMA))
+            {
+                should_distribute = false;
+            }
+
+            if should_distribute {
+                Ok(TreeNodeRecursion::Continue)
+            } else {
+                Ok(TreeNodeRecursion::Stop)
+            }
+        })?;
+
+        Ok(should_distribute)
     }
 
     /// Run a query and return the result.
@@ -335,20 +360,18 @@ impl Query {
                 t
             });
 
-            // Special handling for DescribeTable in cluster mode - execute locally
+            // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
             #[cfg(feature = "cluster")]
-            let use_local_session = {
-                matches!(ctx.df.cluster_config.mode, Some(ClusterMode::Scheduler))
-                    && matches!(&*plan, LogicalPlan::DescribeTable { .. })
-            };
+            let should_distribute =
+                Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
 
             #[cfg(not(feature = "cluster"))]
-            let use_local_session = false;
+            let should_distribute = false;
 
-            let session_for_execution = if use_local_session {
-                ctx.df.ctx.state()
-            } else {
+            let session_for_execution = if should_distribute {
                 session
+            } else {
+                ctx.df.ctx.state()
             };
 
             let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
