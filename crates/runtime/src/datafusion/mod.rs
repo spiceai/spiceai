@@ -95,8 +95,6 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
-#[cfg(feature = "cluster")]
-pub mod cluster;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -106,6 +104,7 @@ pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
+pub mod secrets_context_extension;
 mod sql_validator;
 pub mod udf;
 
@@ -343,6 +342,7 @@ pub struct DataFusion {
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     io_runtime: Handle,
     metrics: Option<Metrics>,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
     pub temp_directory: Option<String>,
     #[cfg(feature = "cluster")]
@@ -1146,6 +1146,10 @@ impl DataFusion {
 
         if let Some(semaphore) = &self.acceleration_refresh_semaphore {
             accelerated_table_builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            accelerated_table_builder.with_resource_monitor(resource_monitor.clone());
         }
 
         if let Some(metrics) = &self.metrics {
@@ -1971,7 +1975,7 @@ mod tests {
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let df = Arc::new(
             DataFusion::builder(

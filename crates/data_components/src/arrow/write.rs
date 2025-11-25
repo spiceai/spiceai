@@ -25,9 +25,11 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use futures::stream;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
@@ -50,6 +52,38 @@ use tokio::sync::RwLock;
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
+/// A wrapper around `XxHash3_64` that uses a fixed seed (0) for deterministic hashing.
+/// This is necessary because `XxHash3_64::default()` may use a random seed for DOS protection,
+/// which would make `HashSets` with different hasher instances incompatible for lookups.
+#[derive(Clone)]
+struct XxHash3_64WithFixedSeed {
+    hasher: twox_hash::XxHash3_64,
+}
+
+impl Default for XxHash3_64WithFixedSeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XxHash3_64WithFixedSeed {
+    fn new() -> Self {
+        Self {
+            hasher: twox_hash::XxHash3_64::with_seed(7),
+        }
+    }
+}
+
+impl std::hash::Hasher for XxHash3_64WithFixedSeed {
+    fn finish(&self) -> u64 {
+        self.hasher.clone().finish()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.hasher.write(bytes);
+    }
+}
+
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
 
@@ -68,6 +102,11 @@ pub struct MemTable {
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
 
     pub on_conflict: Option<OnConflict>,
+
+    /// Optional columns to sort by during insert operations.
+    /// When specified, data is sorted before being written to improve
+    /// zone map efficiency for range queries.
+    sort_columns: Vec<String>,
 }
 
 impl MemTable {
@@ -101,7 +140,14 @@ impl MemTable {
             column_defaults: HashMap::new(),
             sort_order: Arc::new(Mutex::new(vec![])),
             on_conflict: None,
+            sort_columns: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
+        self.sort_columns = sort_columns;
+        self
     }
 
     #[must_use]
@@ -129,7 +175,9 @@ impl MemTable {
             return Ok(());
         }
         // Keep track of uniquness of rows per constraint.
-        let mut constraint_keys: Vec<HashSet<_>> = Vec::with_capacity(constraints.iter().len());
+        let mut constraint_keys: Vec<
+            HashSet<String, std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>>,
+        > = Vec::with_capacity(constraints.iter().len());
         for b in &self.batches {
             let p = &*b.read().await;
             let p: Vec<_> = p.iter().collect();
@@ -138,16 +186,15 @@ impl MemTable {
                     Constraint::PrimaryKey(pk) => {
                         let pks = primary_key_identifier(&p, pk)?;
                         check_and_filter_non_null_unique_primary_keys::<
-                            std::collections::hash_map::RandomState,
+                            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                         >(&pks, constraint_keys.get(i))?
                     }
                     Constraint::Unique(u) => {
                         let ids = constraint_identifiers(&p, u)?;
                         let as_str: Vec<_> = ids.iter().map(String::as_str).collect();
-                        check_and_filter_unique_constraint::<std::collections::hash_map::RandomState>(
-                            &as_str,
-                            constraint_keys.get(i),
-                        )?
+                        check_and_filter_unique_constraint::<
+                            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+                        >(&as_str, constraint_keys.get(i))?
                     }
                 };
                 // Keep track of ids to ensure uniqueness across all partitions.
@@ -296,6 +343,7 @@ impl TableProvider for MemTable {
             primary_key,
             self.schema(),
             self.on_conflict.clone(),
+            self.sort_columns.clone(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
@@ -315,6 +363,9 @@ struct MemSink {
     primary_key: Option<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
+
+    /// Optional columns to sort by before writing
+    sort_columns: Vec<String>,
 }
 
 impl Debug for MemSink {
@@ -345,6 +396,7 @@ impl MemSink {
         primary_key: Option<Vec<usize>>,
         schema: SchemaRef,
         on_conflict: Option<OnConflict>,
+        sort_columns: Vec<String>,
     ) -> Self {
         Self {
             batches,
@@ -356,6 +408,7 @@ impl MemSink {
             }),
             schema,
             on_conflict,
+            sort_columns,
         }
     }
 }
@@ -879,16 +932,16 @@ impl DataSink for MemSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
 
-        // buffer up the data round robin style into num_partitions
-
+        // Collect data into partitions (round-robin distribution)
         let mut new_batches = vec![vec![]; num_partitions];
         let mut i = 0;
         let mut row_count = 0;
+        let mut data = data;
         while let Some(batch) = data
             .next()
             .await
@@ -902,12 +955,15 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
-        let mut new_key_set: HashSet<String> = HashSet::new();
+        let mut new_key_set: HashSet<
+            String,
+            std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+        > = HashSet::default();
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
             new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::collections::hash_map::RandomState,
+                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
             >(&new_primary_key_ids, None)?;
         }
 
@@ -929,7 +985,7 @@ impl DataSink for MemSink {
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
                             let _ = check_and_filter_non_null_unique_primary_keys::<
-                                std::collections::hash_map::RandomState,
+                                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
                             >(&batch_pks, Some(&new_key_set))?;
                         }
                     }
@@ -945,6 +1001,39 @@ impl DataSink for MemSink {
                     }
                 }
             }
+
+            // IMPORTANT: Sort happens AFTER deduplication/filtering to ensure we only sort
+            // the final data that will actually be written. This matches Cayenne's behavior
+            // where sorting happens after retention filters are applied.
+            if !self.sort_columns.is_empty() && !batches.is_empty() {
+                // Concatenate batches in this partition for sorting
+                let schema = batches[0].schema();
+                let combined_batch = if batches.len() == 1 {
+                    // SAFETY: We've just checked that batches.len() == 1, so pop() cannot fail
+                    match batches.pop() {
+                        Some(batch) => batch,
+                        None => unreachable!("batches.len() == 1 guarantees pop() succeeds"),
+                    }
+                } else {
+                    arrow::compute::concat_batches(&schema, &batches)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+                };
+
+                let sorted_stream = RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    stream::iter(vec![Ok(combined_batch)]),
+                );
+
+                let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+                    Box::pin(sorted_stream),
+                    &self.sort_columns,
+                    context,
+                )?;
+
+                // Collect sorted batches
+                batches = datafusion::physical_plan::common::collect(sorted_stream).await?;
+            }
+
             target.append(&mut batches);
         }
 

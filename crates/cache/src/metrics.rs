@@ -90,6 +90,32 @@ macro_rules! generate_cache_metrics {
                     .with_description("Number of cache evictions.")
                     .build()
             });
+
+            pub static STALE_WHILE_REVALIDATE_SKIPPED: LazyLock<Counter<u64>> =
+                LazyLock::new(|| {
+                    METER
+                        .u64_counter(concat!(
+                            $prefix,
+                            "_cache_stale_swr_count"
+                        ))
+                        .with_description(
+                            "Number of stale-while-revalidate background refreshes skipped due to existing in-flight revalidation.",
+                        )
+                        .build()
+                });
+
+            pub static STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES: LazyLock<Counter<u64>> =
+                LazyLock::new(|| {
+                    METER
+                        .u64_counter(concat!(
+                            $prefix,
+                            "_cache_swr_background_query_count"
+                        ))
+                        .with_description(
+                            "Number of background queries triggered for stale-while-revalidate cache refreshes.",
+                        )
+                        .build()
+                });
         }
     };
 }

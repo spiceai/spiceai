@@ -46,6 +46,7 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 - **Use `unreachable!()`**: Only for provably impossible cases
 - **Use `ensure!` macro**: Preferred over `if` + `return Err`
 - **Define `Result` type alias**: `pub type Result<T, E = Error> = std::result::Result<T, E>;`
+- **Don't use `assert!()` (or related) macros in non-test code**: Prefer proper error handling, or marking with `unreachable!()` if the assertion is truly unreachable. Alternatively, make the assertion a `debug_assert!()` assertion to only fire in debug builds instead of release builds. `assert!()` macros can have case-by-case exceptions, for example for compile-time assertions that would prevent a build from being released to begin with.
 
 ```rust
 // GOOD
@@ -471,6 +472,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 5. testoperator is the test harness
 6. Workspace uses Rust edition 2024
 7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
+8. New files should include copyright header. The current year is 2025. Required file types: `.rs`, `.go`
 
 ## Adding Features Checklist
 

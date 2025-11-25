@@ -22,10 +22,10 @@ use std::{
     time::Instant,
 };
 
+use arrow_schema::{Schema, SchemaRef};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::StreamExt;
 use object_store::{
     ClientOptions, ObjectStore, PutMode, PutPayload, UpdateVersion, aws::AmazonS3Builder,

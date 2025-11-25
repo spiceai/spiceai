@@ -66,6 +66,7 @@ rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
+runtime-datafusion = { path = "../runtime-datafusion" }
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
@@ -87,7 +88,7 @@ tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
-twox-hash = { workspace = true, optional = true }
+twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
@@ -125,7 +126,6 @@ postgres = [
 s3_vectors = [
     "dep:s3_vectors",
     "dep:s3_vectors_metadata_filter",
-    "dep:twox-hash",
 ]
 sharepoint = ["dep:graph-rs-sdk"]
 snowflake = ["dep:snowflake-api"]

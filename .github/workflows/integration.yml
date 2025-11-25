@@ -48,7 +48,7 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -78,7 +78,7 @@ jobs:
     needs: check_changes
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
 
       # Cache Cargo dependencies
@@ -214,7 +214,7 @@ jobs:
           - label: 3
             partition: 'count:3/3'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -349,7 +349,7 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -394,7 +394,7 @@ jobs:
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -437,7 +437,7 @@ jobs:
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -484,7 +484,7 @@ jobs:
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -515,10 +515,9 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
       - name: Set up Rust
@@ -549,5 +548,19 @@ jobs:
         run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Run partition table integration test
+        env:
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
+      
+      - name: Configure Git
+        if: github.event.inputs.update_snapshots == 'always'
+        run: |
+          git config --global user.name 'Spice Snapshot Update Bot'
+          git config --global user.email 'spiceaibot@spice.ai'
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
