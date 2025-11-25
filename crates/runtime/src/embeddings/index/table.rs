@@ -15,29 +15,29 @@ limitations under the License.
 */
 #![allow(clippy::too_many_arguments)]
 
-use crate::embeddings::construct_chunker;
-use crate::embeddings::index::VectorScanTableProvider;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
-use chunking::ChunkingConfig;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-use runtime_datafusion_index::Index;
-use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::util::get_primary_keys;
-use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
 use search::metadata::MetadataColumn;
 use tokio::sync::RwLock;
 
-use datafusion::common::ToDFSchema as _;
-use runtime_table_partition::expression::partition_by_expressions;
 use spicepod::semantic::Column;
 
 #[cfg(feature = "s3_vectors")]
 use {
-    search::index::s3_vectors::S3Vector, snafu::ResultExt,
+    crate::embeddings::construct_chunker,
+    crate::embeddings::index::VectorScanTableProvider,
+    chunking::ChunkingConfig,
+    datafusion::common::ToDFSchema as _,
+    runtime_datafusion_index::{Index, IndexedTableProvider},
+    runtime_table_partition::expression::partition_by_expressions,
+    search::generation::util::get_primary_keys,
+    search::index::s3_vectors::S3Vector,
+    search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex},
+    snafu::ResultExt,
     spicepod::component::embeddings::EmbeddingChunkConfig,
 };
 
@@ -45,6 +45,7 @@ use spicepod::semantic::MetadataType;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 
+#[allow(unused_variables)]
 pub async fn wrap_table_as_index(
     ctx: &Arc<SessionContext>,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
@@ -195,6 +196,7 @@ async fn construct_s3_chunked_vector_index(
 }
 
 /// Provide updated columns and underlying [`SchemaRef`] for a [`SearchIndex`] to use based off the index being chunked.
+#[cfg(feature = "s3_vectors")]
 fn updated_chunked_search_index_format(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],

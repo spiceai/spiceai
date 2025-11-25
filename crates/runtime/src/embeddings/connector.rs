@@ -328,6 +328,7 @@ impl DataConnector for EmbeddingConnector {
     }
 }
 
+#[allow(unused_variables)]
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Option<Arc<FederatedTable>> {

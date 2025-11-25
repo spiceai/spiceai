@@ -133,6 +133,7 @@ pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
     }
 }
 
+#[cfg(feature = "models")]
 #[allow(clippy::cast_precision_loss)]
 fn mean(values: &[f32]) -> f32 {
     let n = values.len();
@@ -143,6 +144,7 @@ fn mean(values: &[f32]) -> f32 {
     values.iter().sum::<f32>() / n as f32
 }
 
+#[cfg(feature = "models")]
 fn extract_text(output: &DatasetOutput) -> String {
     match output {
         DatasetOutput::AssistantResponse(text) => text.clone(),

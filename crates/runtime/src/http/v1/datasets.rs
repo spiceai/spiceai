@@ -434,6 +434,7 @@ pub(crate) async fn acceleration(
     }
 }
 
+#[allow(unused_variables, unused_mut)]
 fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
     let mut properties = HashMap::new();
 
