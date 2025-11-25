@@ -51,8 +51,9 @@ use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 #[cfg(feature = "duckdb")]
 use {
     datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
+    datafusion_optimizer_rules::logical_plan::duckdb::full_query_pushdown::DuckDBFullQueryPushdown,
     datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
-    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
+    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBLogicalPlanPushdownPhysicalRewriter,
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
@@ -266,8 +267,9 @@ impl DataFusionBuilder {
         #[cfg(feature = "duckdb")]
         {
             state = state
+                .with_optimizer_rule(DuckDBFullQueryPushdown::new())
                 .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
+                .with_physical_optimizer_rule(DuckDBLogicalPlanPushdownPhysicalRewriter::new())
                 .with_physical_optimizer_rule(
                     DuckDBIntermediateIndexMaterializationOptimizer::new(),
                 );

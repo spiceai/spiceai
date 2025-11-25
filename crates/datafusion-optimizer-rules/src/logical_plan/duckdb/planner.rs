@@ -1,5 +1,5 @@
-use crate::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownNode;
-use crate::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownMarkerExec;
+use crate::logical_plan::duckdb::logical_pushdown_node::DuckDBLogicalPlanPushdownNode;
+use crate::physical_plan::duckdb::aggregate_pushdown::DuckDBLogicalPlanPushdownMarkerExec;
 use async_trait::async_trait;
 use datafusion::common::{Result, plan_err};
 use datafusion::execution::SessionState;
@@ -27,11 +27,14 @@ impl ExtensionPlanner for DuckDBLogicalExtensionPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(logical_marker) = node.as_any().downcast_ref::<DuckDBAggregatePushdownNode>() {
+        if let Some(logical_marker) = node
+            .as_any()
+            .downcast_ref::<DuckDBLogicalPlanPushdownNode>()
+        {
             if physical_inputs.len() != 1 {
-                return plan_err!("DuckDBAggregatePushdownNode expects exactly one input");
+                return plan_err!("DuckDBLogicalPlanPushdownNode expects exactly one input");
             }
-            Ok(Some(DuckDBAggregatePushdownMarkerExec::new(
+            Ok(Some(DuckDBLogicalPlanPushdownMarkerExec::new(
                 logical_marker.input_plan.clone(),
                 Arc::clone(&physical_inputs[0]),
             )))

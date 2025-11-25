@@ -21,18 +21,21 @@ use datafusion_expr::LogicalPlan;
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
+use datafusion_federation::sql::MultiPartTableReference::TableReference;
+use datafusion_table_providers::duckdb::sql_table::SimpleDuckSqlExec;
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlExec;
 
-/// Physical planning counterpart to `DuckDBAggregateLogicalPushdown`.
+/// Physical planning counterpart to logical_plan::duckdb planners.
 /// Looks for physical plan marker nodes and rewrites them with a `DuckSqlExec` that satisfies the whole plan subtree.
 #[derive(Debug)]
-pub struct DuckDBAggregatePushdownMarkerExec {
+pub struct DuckDBLogicalPlanPushdownMarkerExec {
     logical_plan: LogicalPlan,
     input: Arc<dyn ExecutionPlan>,
 }
 
-impl DuckDBAggregatePushdownMarkerExec {
+impl DuckDBLogicalPlanPushdownMarkerExec {
     pub fn new(logical_plan: LogicalPlan, input: Arc<dyn ExecutionPlan>) -> Arc<Self> {
-        Arc::new(DuckDBAggregatePushdownMarkerExec {
+        Arc::new(DuckDBLogicalPlanPushdownMarkerExec {
             logical_plan,
             input,
         })
@@ -44,7 +47,7 @@ impl DuckDBAggregatePushdownMarkerExec {
 }
 
 #[deny(clippy::missing_trait_methods)]
-impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
+impl ExecutionPlan for DuckDBLogicalPlanPushdownMarkerExec {
     fn name(&self) -> &'static str {
         Self::name()
     }
@@ -199,23 +202,23 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 }
 
-impl DisplayAs for DuckDBAggregatePushdownMarkerExec {
+impl DisplayAs for DuckDBLogicalPlanPushdownMarkerExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "DuckDBAggregatePushdownMarkerExec")
     }
 }
 
 #[derive(Debug)]
-pub struct DuckDBAggregatePushdownRewriter {}
+pub struct DuckDBLogicalPlanPushdownPhysicalRewriter {}
 
-impl DuckDBAggregatePushdownRewriter {
+impl DuckDBLogicalPlanPushdownPhysicalRewriter {
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(DuckDBAggregatePushdownRewriter {})
+        Arc::new(DuckDBLogicalPlanPushdownPhysicalRewriter {})
     }
 }
 
-impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
+impl PhysicalOptimizerRule for DuckDBLogicalPlanPushdownPhysicalRewriter {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -224,13 +227,15 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
         let dialect = DuckDBDialect::new();
         let unparser = Unparser::new(&dialect);
 
-        let maybe_new_plan = plan.transform_down(|p| {
-            let Some(marker) = concrete!(p, DuckDBAggregatePushdownMarkerExec) else {
+        let maybe_new_plan = plan.clone().transform_down(|p| {
+            let Some(marker) = concrete!(p, DuckDBLogicalPlanPushdownMarkerExec) else {
                 return Ok(Transformed::no(p));
             };
 
+            println!("found marker");
+
             let Some(maybe_duck_exec) =
-                SearchVisitor::first_concrete_down::<ConcreteDuckSqlExec>(&p)?
+                SearchVisitor::first_concrete_down::<ConcreteDuckSqlExec>(&marker.input)?
             else {
                 return exec_err!("DuckDBAggregatePushdownMarkerExec was found with no DuckSqlExec child. This is a bug.")
             };
@@ -239,20 +244,31 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
                 return exec_err!("Cannot cast DuckSqlExec for rewriting. This is a bug.")
             };
 
+            println!("attempt unparse {}", marker.logical_plan.display_indent());
             let optimized_sql = unparser.plan_to_sql(&marker.logical_plan)?;
             let logical_plan_schema = Arc::clone(marker.logical_plan.schema().inner());
-            let rewritten = duck_exec
-                .clone()
-                .with_optimized_sql(optimized_sql.to_string(), Some(logical_plan_schema));
+
+            println!("unparse ok");
+
+            let new_exec = SimpleDuckSqlExec::new(
+                duck_exec.get_pool(),
+                optimized_sql.to_string(),
+                logical_plan_schema,
+                duck_exec.properties().clone(),
+            );
 
             Ok(Transformed::new(
-                Arc::new(rewritten),
+                Arc::new(new_exec),
                 true,
                 TreeNodeRecursion::Jump,
             ))
-        });
+        })?;
 
-        maybe_new_plan.map(|t| t.data)
+        if maybe_new_plan.transformed {
+            Ok(maybe_new_plan.data)
+        } else {
+            Ok(plan)
+        }
     }
 
     fn name(&self) -> &'static str {
