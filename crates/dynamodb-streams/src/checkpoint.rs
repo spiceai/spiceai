@@ -47,7 +47,7 @@ pub enum CheckpointPosition {
 ///
 /// Captures the state of multiple shards at a point in time, allowing
 /// resumption from this position. Can be persisted and used to restart
-/// streaming within the 24-hour DynamoDB Streams retention window.
+/// streaming within the 24-hour `DynamoDB` Streams retention window.
 #[derive(Clone, Debug)]
 pub struct GlobalCheckpoint {
     pub shards: HashMap<String, ShardCheckpoint>,
