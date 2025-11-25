@@ -33,8 +33,8 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableType, dml::InsertOp},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        metrics::MetricsSet, stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, metrics::MetricsSet,
+        stream::RecordBatchStreamAdapter,
     },
 };
 use datafusion_table_providers::util::constraints::UpsertOptions;
@@ -189,7 +189,9 @@ impl UpsertDedupExec {
 impl DisplayAs for UpsertDedupExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "UpsertDedupExec: remove_duplicates={}, last_write_wins={}",
@@ -287,7 +289,9 @@ impl ExecutionPlan for UpsertDedupExec {
 
 /// Extracts `UpsertOptions` from the command options.
 #[must_use]
-pub fn extract_upsert_options(options: &std::collections::HashMap<String, String>) -> UpsertOptions {
+pub fn extract_upsert_options(
+    options: &std::collections::HashMap<String, String>,
+) -> UpsertOptions {
     let remove_duplicates = options
         .get("upsert_remove_duplicates")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
