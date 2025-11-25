@@ -1,7 +1,7 @@
 {
   "version": "2.2.0",
   "summary": {
-    "title": "Spice.ai OSS v1.10",
+    "title": "Spice.ai OSS v1.9.1",
     "owner": "Phillip LeBlanc",
     "description": "Spice is a portable, open-source runtime for fast, last-mile SQL query, search, and AI inference.",
     "id": 0
