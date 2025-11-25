@@ -314,22 +314,26 @@ impl CayenneAccelerator {
                     .unwrap_or(default)
             };
 
-            // Parse encoding options
-            config.enable_alp = get_enabled("cayenne_alp", true);
-            config.enable_fsst = get_enabled("cayenne_fsst", true);
-            config.enable_bitpacking = get_enabled("cayenne_bitpacking", true);
-            config.enable_delta = get_enabled("cayenne_delta", true);
-            config.enable_rle = get_enabled("cayenne_rle", true);
-            config.enable_dict = get_enabled("cayenne_dict", true);
-            config.enable_for = get_enabled("cayenne_for", true);
-            config.enable_zigzag = get_enabled("cayenne_zigzag", true);
+            // Parse encoding options - use VortexConfig defaults if not specified
+            config.enable_alp = get_enabled("cayenne_alp", config.enable_alp);
+            config.enable_fsst = get_enabled("cayenne_fsst", config.enable_fsst);
+            config.enable_bitpacking = get_enabled("cayenne_bitpacking", config.enable_bitpacking);
+            config.enable_delta = get_enabled("cayenne_delta", config.enable_delta);
+            config.enable_rle = get_enabled("cayenne_rle", config.enable_rle);
+            config.enable_dict = get_enabled("cayenne_dict", config.enable_dict);
+            config.enable_for = get_enabled("cayenne_for", config.enable_for);
+            config.enable_zigzag = get_enabled("cayenne_zigzag", config.enable_zigzag);
 
-            // Parse cache options
-            config.footer_cache_mb = parse_usize("cayenne_footer_cache_mb", 64);
-            config.segment_cache_mb = parse_usize("cayenne_segment_cache_mb", 0);
+            // Parse cache options - use VortexConfig defaults if not specified
+            config.footer_cache_mb = parse_usize("cayenne_footer_cache_mb", config.footer_cache_mb);
+            config.segment_cache_mb =
+                parse_usize("cayenne_segment_cache_mb", config.segment_cache_mb);
 
             // Parse file size options
-            config.target_vortex_file_size_mb = parse_usize("cayenne_target_file_size_mb", 256);
+            config.target_vortex_file_size_mb = parse_usize(
+                "cayenne_target_file_size_mb",
+                config.target_vortex_file_size_mb,
+            );
 
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
