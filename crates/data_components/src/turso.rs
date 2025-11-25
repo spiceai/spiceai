@@ -111,7 +111,7 @@ use std::ops::ControlFlow;
 
 use datafusion::{
     catalog::Session,
-    common::SchemaExt,
+    common::{SchemaExt, utils::quote_identifier},
     datasource::{
         TableProvider,
         sink::{DataSink, DataSinkExec},
@@ -1371,8 +1371,8 @@ impl SQLExecutor for TursoTableProvider {
                 DataFusionError::Execution(format!("Failed to connect to Turso: {e}"))
             })?;
 
-        // Query the table schema using SQLite's pragma
-        let query = format!("PRAGMA table_info({table_name})");
+        // Query the table schema using SQLite's pragma with quoted identifier
+        let query = format!("PRAGMA table_info({})", quote_identifier(table_name));
         let mut rows = conn
             .query(&query, ())
             .await
@@ -1473,12 +1473,12 @@ impl TursoExec {
     /// Note: Projection pushdown is handled by the schema parameter,
     /// which is already the projected schema from `scan()`.
     fn sql(&self) -> datafusion::error::Result<String> {
-        // Build column list from projected schema
+        // Build column list from projected schema, quoting identifiers to prevent injection and handle special characters.
         let columns = self
             .schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()).into_owned())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1502,7 +1502,10 @@ impl TursoExec {
 
         Ok(format!(
             "SELECT {} FROM {}{}{}",
-            columns, self.table_name, where_expr, limit_expr
+            columns,
+            quote_identifier(&self.table_name),
+            where_expr,
+            limit_expr
         ))
     }
 }
@@ -1512,7 +1515,7 @@ impl DisplayAs for TursoExec {
         let table_name = &self.table_name;
         let sql = self
             .sql()
-            .unwrap_or_else(|_| format!("SELECT * FROM {table_name}"));
+            .unwrap_or_else(|_| format!("SELECT * FROM {}", quote_identifier(table_name)));
         write!(f, "TursoExec sql={sql}")
     }
 }
@@ -1641,7 +1644,11 @@ impl DeletionSink for TursoDeletionSink {
             format!(" WHERE {}", filter_sqls.join(" AND "))
         };
 
-        let delete_sql = format!("DELETE FROM {}{}", self.table_name, where_clause);
+        let delete_sql = format!(
+            "DELETE FROM {}{}",
+            quote_identifier(&self.table_name),
+            where_clause
+        );
 
         let conn = self.pool.connect().await?;
         let rows_affected = conn
@@ -1694,7 +1701,7 @@ impl TursoDataSink {
             .schema
             .fields()
             .iter()
-            .map(|f| f.name().clone())
+            .map(|f| quote_identifier(f.name()).into_owned())
             .collect();
 
         let placeholders = (1..=columns.len())
@@ -1704,7 +1711,7 @@ impl TursoDataSink {
 
         let insert_sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
-            self.table_name,
+            quote_identifier(&self.table_name),
             columns.join(", "),
             placeholders
         );
