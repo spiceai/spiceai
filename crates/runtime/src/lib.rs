@@ -50,7 +50,7 @@ use app::App;
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode};
 
 use builder::RuntimeBuilder;
-use cancellable_task::CancellableTaskHandle;
+use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -72,7 +72,7 @@ use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 
-use tokio::sync::{RwLock, oneshot, oneshot::error::RecvError};
+use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
@@ -1091,55 +1091,23 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    ///
-    /// This function is a regular `fn` returning `impl Future` rather than an `async fn`
-    /// to ensure that task registration is non-blocking and does not hold async locks
-    /// across `.await` points. This pattern is used to avoid blocking the async runtime
-    /// during task registration, in line with Spice.ai's architectural principle that
-    /// async code must reach `.await` within 10-100 microseconds and never block the runtime.
-    /// See: `docs/PRINCIPLES.md` and `docs/dev/style_guide.md` for details.
-    fn start_runtime_task<F>(
+    async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
         task_fn: F,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> Result<(), Error>
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let tasks = Arc::clone(&self.tasks);
-        let component_name = component_name.to_string();
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
-        async move {
-            let (notify_abort_task, on_abort_task) = oneshot::channel();
-            let (notify_task_completed, on_task_completed) = oneshot::channel();
+        self.tasks
+            .write()
+            .await
+            .insert(component_name.to_string(), handle);
 
-            {
-                let handle = CancellableTaskHandle::new(
-                    notify_abort_task,
-                    cancellation_token,
-                    on_task_completed,
-                );
-                tasks.write().await.insert(component_name.clone(), handle);
-            }
-
-            let handle: JoinHandle<Result<(), Error>> = tokio::task::spawn(async move {
-                let result = tokio::select! {
-                    res = task_fn => res,
-                    _ = on_abort_task => Ok(()),
-                };
-
-                notify_task_completed.send(()).ok();
-
-                result
-            });
-
-            match handle.await {
-                Ok(result) => result,
-                Err(err) if err.is_cancelled() => Ok(()),
-                Err(err) => Err(err).context(FailedToExecuteTaskSnafu),
-            }
-        }
+        future.await
     }
 
     /// List all tools available in the runtime, either within a catalog or standalone.
