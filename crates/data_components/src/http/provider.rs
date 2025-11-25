@@ -22,7 +22,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints, project_schema},
+    common::{Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -248,8 +248,10 @@ impl HttpTableProvider {
             client,
             file_format,
             schema: Arc::new(Self::base_table_schema()),
-            // Mark `request_path`, `request_query`, and `request_body` as primary key components
-            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1, 2])]),
+            // No primary key constraints - HTTP responses can contain multiple rows
+            // with the same (request_path, request_query, request_body) but different content
+            // (e.g., search API results). Caching mode uses filter values as cache keys instead.
+            constraints: Constraints::new_unverified(vec![]),
             cache: Arc::new(RwLock::new(HashMap::new())),
             acceleration_enabled,
             retry_strategy: RetryBackoffBuilder::new()

@@ -21,25 +21,25 @@ limitations under the License.
 //!
 //! ## Implementation
 //!
-//! Caching mode uses `InsertOp::Append` with primary key constraints on metadata
-//! columns (`request_path`, `request_query`, `request_body`). This enables automatic upsert
-//! behavior: when data with the same metadata is inserted, it replaces the existing
-//! cached data. Different filter combinations are cached simultaneously.
+//! Caching mode uses `InsertOp::Overwrite` to replace cached data when the same
+//! query filters are used. The HTTP connector does not use primary key constraints
+//! because HTTP responses can contain multiple rows with the same filter values
+//! (e.g., search API results returning multiple items).
+//!
+//! Cache keys are determined by the filter values (`request_path`, `request_query`,
+//! `request_body`), not by database constraints. Each unique filter combination
+//! produces a separate cache entry.
 //!
 //! ## Accelerator Support
 //!
-//! **`DuckDB` and Cayenne**: Full multi-filter caching support with upsert behavior.
-//!
-//! **Arrow/MemTable**: Limited to single-query caching due to a datafusion-table-providers
-//! limitation where `ColumnReference::new()` sorts column names alphabetically, causing
-//! primary key validation to fail. This is acceptable since Arrow/MemTable is typically
-//! used for testing, while production deployments use `DuckDB` or Cayenne.
+//! All accelerators (DuckDB, Cayenne, Arrow/MemTable) support caching mode with
+//! the same behavior - data is cached per unique filter combination.
 //!
 //! ## Tests
 //!
 //! - `test_caching_mode_filter_propagation`: Basic cache miss and hit workflow
 //! - `test_caching_mode_multi_filter_limitation`: Verifies overwrite behavior (for Arrow)
-//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `DuckDB` (currently ignored due to issues)
+//! - `test_caching_mode_multi_filter_ideal`: Multi-filter caching with `DuckDB`
 //! - `test_caching_mode_multi_filter_cayenne`: Multi-filter caching with Cayenne (SQLite+Vortex)
 //! - `test_caching_mode_background_refresh_on_miss`: Background refresh triggered on cache miss
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
