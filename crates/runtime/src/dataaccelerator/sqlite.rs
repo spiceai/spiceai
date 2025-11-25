@@ -19,9 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
-    catalog::TableProviderFactory,
-    datasource::TableProvider,
-    execution::context::SessionContext,
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
