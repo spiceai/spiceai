@@ -1,3 +1,18 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 use crate::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
 use crate::client_sdk::{ApiShard, SDKClient};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
@@ -6,7 +21,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 #[derive(Debug)]
-pub struct RecordBatch {
+pub struct DynamoDBStreamBatch {
     pub shard_id: String,
     pub records: Vec<Record>,
     pub checkpoint: ShardCheckpoint,
@@ -67,7 +82,7 @@ impl StreamState {
         shard_id: &str,
         new_iterator: Option<String>,
         records: Vec<Record>,
-    ) -> Option<RecordBatch> {
+    ) -> Option<DynamoDBStreamBatch> {
         tracing::debug!(
             "Processing shard poll: shard_id={:?}, new_iterator={:?}, records_num={:?}",
             shard_id,
@@ -99,7 +114,7 @@ impl StreamState {
         }
         let last_seq = last_seq_opt?;
 
-        Some(RecordBatch {
+        Some(DynamoDBStreamBatch {
             shard_id: shard_id.to_string(),
             records,
             checkpoint: ShardCheckpoint {
@@ -130,6 +145,8 @@ impl StreamState {
         for shard in shards {
             let shard_id = shard.shard_id.clone();
 
+            // At each iteration we will get all currently non-expired shards
+            // Only subset of them we haven't seen before
             if self.active.contains_key(&shard_id)
                 || self.pending.contains_key(&shard_id)
                 || self.initializing.contains_key(&shard_id)
@@ -137,6 +154,10 @@ impl StreamState {
                 continue;
             }
 
+            // Shards in DynamoDB Streams have a parent-child relationship.
+            // Until we exhausted the parent shard, we don't want to read from its children.
+            // As long as the parent of the discovered shard is either active/pending/initializing,
+            // we add it to the pending state.
             let blocked = shard.parent_shard_id.clone().is_some_and(|p| {
                 self.active.contains_key(&p)
                     || self.pending.contains_key(&p)
@@ -328,1636 +349,1638 @@ mod tests {
         }
     }
 
-    // ========================================
-    // Tests for handle_poll_result()
-    // ========================================
+    mod handle_poll_result {
+        use super::*;
 
-    #[test]
-    fn test_handle_poll_result_shard_not_found() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        let result = state.handle_poll_result(
-            "nonexistent-shard",
-            Some("new-iter".to_string()),
-            vec![create_record("123")],
-        );
+        #[test]
+        fn test_handle_poll_result_shard_not_found() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let result = state.handle_poll_result(
+                "nonexistent-shard",
+                Some("new-iter".to_string()),
+                vec![create_record("123")],
+            );
 
-        assert!(result.is_none());
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-    }
+            assert!(result.is_none());
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+        }
 
-    #[test]
-    fn test_handle_poll_result_updates_iterator() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "old-iter".to_string(),
-            },
-        );
+        #[test]
+        fn test_handle_poll_result_updates_iterator() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "old-iter".to_string(),
+                },
+            );
 
-        let result = state.handle_poll_result(
-            "shard-1",
-            Some("new-iter".to_string()),
-            vec![create_record("123")],
-        );
+            let result = state.handle_poll_result(
+                "shard-1",
+                Some("new-iter".to_string()),
+                vec![create_record("123")],
+            );
 
-        assert!(result.is_some());
-        let batch = result.expect("Expected batch to be Some");
-        assert_eq!(batch.shard_id, "shard-1");
-        assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.checkpoint.sequence_number, "123");
-        assert_eq!(batch.checkpoint.parent_id, None);
-        assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
+            assert!(result.is_some());
+            let batch = result.expect("Expected batch to be Some");
+            assert_eq!(batch.shard_id, "shard-1");
+            assert_eq!(batch.records.len(), 1);
+            assert_eq!(batch.checkpoint.sequence_number, "123");
+            assert_eq!(batch.checkpoint.parent_id, None);
+            assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
 
-        // Check complete state
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
+            // Check complete state
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
 
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "new-iter".to_string(),
-            }
-        );
-    }
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "new-iter".to_string(),
+                }
+            );
+        }
 
-    #[test]
-    fn test_handle_poll_result_removes_exhausted_shard() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            },
-        );
+        #[test]
+        fn test_handle_poll_result_removes_exhausted_shard() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                },
+            );
 
-        let result = state.handle_poll_result("shard-1", None, vec![create_record("123")]);
+            let result = state.handle_poll_result("shard-1", None, vec![create_record("123")]);
 
-        assert!(result.is_some());
-        let batch = result.expect("Expected batch to be Some");
-        assert_eq!(batch.shard_id, "shard-1");
-        assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.checkpoint.sequence_number, "123");
+            assert!(result.is_some());
+            let batch = result.expect("Expected batch to be Some");
+            assert_eq!(batch.shard_id, "shard-1");
+            assert_eq!(batch.records.len(), 1);
+            assert_eq!(batch.checkpoint.sequence_number, "123");
 
-        // Check complete state - shard should be removed
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(!state.active.contains_key("shard-1"));
-    }
+            // Check complete state - shard should be removed
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(!state.active.contains_key("shard-1"));
+        }
 
-    #[test]
-    fn test_handle_poll_result_empty_records_returns_none() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            },
-        );
+        #[test]
+        fn test_handle_poll_result_empty_records_returns_none() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                },
+            );
 
-        let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), vec![]);
+            let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), vec![]);
 
-        assert!(result.is_none());
+            assert!(result.is_none());
 
-        // Iterator should still be updated even though no records
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
+            // Iterator should still be updated even though no records
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
 
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "new-iter".to_string(),
-            }
-        );
-    }
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "new-iter".to_string(),
+                }
+            );
+        }
 
-    #[test]
-    fn test_handle_poll_result_missing_sequence_number_returns_none() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            },
-        );
+        #[test]
+        fn test_handle_poll_result_missing_sequence_number_returns_none() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                },
+            );
 
-        let result = state.handle_poll_result(
-            "shard-1",
-            Some("new-iter".to_string()),
-            vec![create_record_without_seq()],
-        );
+            let result = state.handle_poll_result(
+                "shard-1",
+                Some("new-iter".to_string()),
+                vec![create_record_without_seq()],
+            );
 
-        assert!(result.is_none());
+            assert!(result.is_none());
 
-        // State should be updated even though result is None
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
+            // State should be updated even though result is None
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
 
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "new-iter".to_string(),
-            }
-        );
-    }
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "new-iter".to_string(),
+                }
+            );
+        }
 
-    #[test]
-    fn test_handle_poll_result_missing_dynamodb_returns_none() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            },
-        );
+        #[test]
+        fn test_handle_poll_result_missing_dynamodb_returns_none() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                },
+            );
 
-        let result = state.handle_poll_result(
-            "shard-1",
-            Some("new-iter".to_string()),
-            vec![create_record_without_dynamodb()],
-        );
+            let result = state.handle_poll_result(
+                "shard-1",
+                Some("new-iter".to_string()),
+                vec![create_record_without_dynamodb()],
+            );
 
-        assert!(result.is_none());
+            assert!(result.is_none());
 
-        // State should be updated
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-    }
+            // State should be updated
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+        }
 
-    #[test]
-    fn test_handle_poll_result_creates_correct_batch() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: Some("parent-1".to_string()),
-                iterator: "iter-1".to_string(),
-            },
-        );
+        #[test]
+        fn test_handle_poll_result_creates_correct_batch() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent-1".to_string()),
+                    iterator: "iter-1".to_string(),
+                },
+            );
 
-        let records = vec![
-            create_record("100"),
-            create_record("101"),
-            create_record("102"),
-        ];
+            let records = vec![
+                create_record("100"),
+                create_record("101"),
+                create_record("102"),
+            ];
 
-        let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
+            let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
-        assert!(result.is_some());
-        let batch = result.expect("Expected batch to be Some");
-        assert_eq!(batch.shard_id, "shard-1");
-        assert_eq!(batch.records.len(), 3);
-        assert_eq!(batch.checkpoint.sequence_number, "102");
-        assert_eq!(batch.checkpoint.parent_id, Some("parent-1".to_string()));
-        assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
+            assert!(result.is_some());
+            let batch = result.expect("Expected batch to be Some");
+            assert_eq!(batch.shard_id, "shard-1");
+            assert_eq!(batch.records.len(), 3);
+            assert_eq!(batch.checkpoint.sequence_number, "102");
+            assert_eq!(batch.checkpoint.parent_id, Some("parent-1".to_string()));
+            assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
 
-        // Verify complete state
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
+            // Verify complete state
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
 
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: Some("parent-1".to_string()),
-                iterator: "new-iter".to_string(),
-            }
-        );
-    }
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent-1".to_string()),
+                    iterator: "new-iter".to_string(),
+                }
+            );
+        }
 
-    #[test]
-    fn test_handle_poll_result_promotes_children_on_exhaustion() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
+        #[test]
+        fn test_handle_poll_result_promotes_children_on_exhaustion() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
-        // Setup parent shard
-        state.active.insert(
-            "parent".to_string(),
-            ActiveShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-parent".to_string(),
-            },
-        );
+            // Setup parent shard
+            state.active.insert(
+                "parent".to_string(),
+                ActiveShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-parent".to_string(),
+                },
+            );
 
-        // Setup child shard in pending
-        state.pending.insert(
-            "child".to_string(),
-            PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            },
-        );
+            // Setup child shard in pending
+            state.pending.insert(
+                "child".to_string(),
+                PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                },
+            );
 
-        // Exhaust parent shard
-        let result = state.handle_poll_result("parent", None, vec![create_record("100")]);
+            // Exhaust parent shard
+            let result = state.handle_poll_result("parent", None, vec![create_record("100")]);
 
-        assert!(result.is_some());
-        let batch = result.expect("Expected batch to be Some");
-        assert_eq!(batch.shard_id, "parent");
-        assert_eq!(batch.checkpoint.sequence_number, "100");
+            assert!(result.is_some());
+            let batch = result.expect("Expected batch to be Some");
+            assert_eq!(batch.shard_id, "parent");
+            assert_eq!(batch.checkpoint.sequence_number, "100");
 
-        // Verify complete state after exhaustion
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
+            // Verify complete state after exhaustion
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
 
-        assert!(!state.active.contains_key("parent"));
-        assert!(!state.pending.contains_key("child"));
-        assert!(state.initializing.contains_key("child"));
+            assert!(!state.active.contains_key("parent"));
+            assert!(!state.pending.contains_key("child"));
+            assert!(state.initializing.contains_key("child"));
 
-        assert_eq!(
-            state
-                .initializing
-                .get("child")
-                .expect("child should be in initializing"),
-            &PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
+            assert_eq!(
+                state
+                    .initializing
+                    .get("child")
+                    .expect("child should be in initializing"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
     }
 
     // ========================================
     // Tests for add_discovered()
     // ========================================
+    mod add_discovered {
+        use super::*;
+        #[test]
+        fn test_add_discovered_empty_list() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.add_discovered(vec![]);
 
-    #[test]
-    fn test_add_discovered_empty_list() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        state.add_discovered(vec![]);
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.active.is_empty());
+            assert!(state.pending.is_empty());
+            assert!(state.initializing.is_empty());
+        }
 
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.active.is_empty());
-        assert!(state.pending.is_empty());
-        assert!(state.initializing.is_empty());
+        #[test]
+        fn test_add_discovered_open_shard_without_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let shards = vec![create_api_shard("shard-1", None, None)];
+
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(!state.pending.contains_key("shard-1"));
+            assert!(state.initializing.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("shard-1")
+                    .expect("shard-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_closed_shard_without_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let shards = vec![create_api_shard("shard-1", None, Some("999"))];
+
+            state.add_discovered(shards);
+
+            // Closed shards are ignored
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(!state.initializing.contains_key("shard-1"));
+            assert!(!state.pending.contains_key("shard-1"));
+            assert!(!state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_add_discovered_child_with_active_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Add parent to active
+            state.active.insert(
+                "parent".to_string(),
+                ActiveShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter".to_string(),
+                },
+            );
+
+            let shards = vec![create_api_shard("child", Some("parent"), None)];
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(state.active.contains_key("parent"));
+            assert!(state.pending.contains_key("child"));
+            assert!(!state.initializing.contains_key("child"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_child_with_pending_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Add parent to pending
+            state.pending.insert(
+                "parent".to_string(),
+                PendingShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            let shards = vec![create_api_shard("child", Some("parent"), None)];
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(state.pending.contains_key("parent"));
+            assert!(state.pending.contains_key("child"));
+            assert!(!state.initializing.contains_key("child"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_child_with_initializing_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Add parent to initializing
+            state.initializing.insert(
+                "parent".to_string(),
+                PendingShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            let shards = vec![create_api_shard("child", Some("parent"), None)];
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 1);
+
+            assert!(state.initializing.contains_key("parent"));
+            assert!(state.pending.contains_key("child"));
+            assert!(!state.initializing.contains_key("child"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_ignores_existing_active_shard() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "original-iter".to_string(),
+                },
+            );
+
+            let shards = vec![create_api_shard("shard-1", None, None)];
+            state.add_discovered(shards);
+
+            // Should not change existing active shard
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(state.active.contains_key("shard-1"));
+            assert!(!state.pending.contains_key("shard-1"));
+            assert!(!state.initializing.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "original-iter".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_ignores_existing_pending_shard() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.pending.insert(
+                "shard-1".to_string(),
+                PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            let shards = vec![create_api_shard("shard-1", None, None)];
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(state.pending.contains_key("shard-1"));
+            assert!(!state.initializing.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("shard-1")
+                    .expect("shard-1 should be in pending"),
+                &PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_ignores_existing_initializing_shard() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.initializing.insert(
+                "shard-1".to_string(),
+                PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            let shards = vec![create_api_shard("shard-1", None, None)];
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(!state.pending.contains_key("shard-1"));
+            assert!(state.initializing.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("shard-1")
+                    .expect("shard-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
+
+        #[test]
+        fn test_add_discovered_multiple_shards_mixed_states() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "parent-1".to_string(),
+                ActiveShard {
+                    shard_id: "parent-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter".to_string(),
+                },
+            );
+
+            let shards = vec![
+                create_api_shard("root-1", None, None), // Should go to initializing
+                create_api_shard("root-2", None, Some("999")), // Should be ignored (closed)
+                create_api_shard("child-1", Some("parent-1"), None), // Should go to pending
+                create_api_shard("child-2", Some("nonexistent"), None), // Should go to initializing
+            ];
+
+            state.add_discovered(shards);
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 2);
+
+            // root-1: open shard without parent
+            assert!(state.initializing.contains_key("root-1"));
+            assert_eq!(
+                state
+                    .initializing
+                    .get("root-1")
+                    .expect("root-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "root-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+
+            // root-2: closed shard, should not exist anywhere
+            assert!(!state.active.contains_key("root-2"));
+            assert!(!state.pending.contains_key("root-2"));
+            assert!(!state.initializing.contains_key("root-2"));
+
+            // child-1: blocked by active parent
+            assert!(state.pending.contains_key("child-1"));
+            assert_eq!(
+                state
+                    .pending
+                    .get("child-1")
+                    .expect("child-1 should be in pending"),
+                &PendingShard {
+                    shard_id: "child-1".to_string(),
+                    parent_shard_id: Some("parent-1".to_string()),
+                }
+            );
+
+            // child-2: parent doesn't exist, not blocked
+            assert!(state.initializing.contains_key("child-2"));
+            assert_eq!(
+                state
+                    .initializing
+                    .get("child-2")
+                    .expect("child-2 should be in initializing"),
+                &PendingShard {
+                    shard_id: "child-2".to_string(),
+                    parent_shard_id: Some("nonexistent".to_string()),
+                }
+            );
+
+            // parent-1 should still be active
+            assert!(state.active.contains_key("parent-1"));
+        }
     }
 
-    #[test]
-    fn test_add_discovered_open_shard_without_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        let shards = vec![create_api_shard("shard-1", None, None)];
+    mod mark_active {
+        use super::*;
 
-        state.add_discovered(shards);
+        #[test]
+        fn test_mark_active_moves_from_initializing_to_active() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
+            state.initializing.insert(
+                "shard-1".to_string(),
+                PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                },
+            );
 
-        assert!(!state.active.contains_key("shard-1"));
-        assert!(!state.pending.contains_key("shard-1"));
-        assert!(state.initializing.contains_key("shard-1"));
+            state.mark_active("shard-1".to_string(), "iterator-1".to_string());
 
-        assert_eq!(
-            state
-                .initializing
-                .get("shard-1")
-                .expect("shard-1 should be in initializing"),
-            &PendingShard {
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(!state.initializing.contains_key("shard-1"));
+            assert!(!state.pending.contains_key("shard-1"));
+            assert!(state.active.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iterator-1".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_mark_active_without_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.initializing.insert(
+                "shard-1".to_string(),
+                PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            state.mark_active("shard-1".to_string(), "iterator-1".to_string());
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(state.active.contains_key("shard-1"));
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iterator-1".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_mark_active_nonexistent_shard_does_nothing() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.mark_active("nonexistent".to_string(), "iterator-1".to_string());
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(!state.active.contains_key("nonexistent"));
+            assert!(!state.pending.contains_key("nonexistent"));
+            assert!(!state.initializing.contains_key("nonexistent"));
+        }
+
+        #[test]
+        fn test_mark_active_from_pending_does_nothing() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.pending.insert(
+                "shard-1".to_string(),
+                PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            state.mark_active("shard-1".to_string(), "iterator-1".to_string());
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(state.pending.contains_key("shard-1"));
+            assert!(!state.initializing.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("shard-1")
+                    .expect("shard-1 should be in pending"),
+                &PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
+
+        #[test]
+        fn test_mark_active_multiple_shards() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.initializing.insert(
+                "shard-1".to_string(),
+                PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+            state.initializing.insert(
+                "shard-2".to_string(),
+                PendingShard {
+                    shard_id: "shard-2".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                },
+            );
+
+            state.mark_active("shard-1".to_string(), "iter-1".to_string());
+            state.mark_active("shard-2".to_string(), "iter-2".to_string());
+
+            assert_eq!(state.active.len(), 2);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-2")
+                    .expect("shard-2 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-2".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iter-2".to_string(),
+                }
+            );
+        }
+    }
+
+    mod promote_children {
+        use super::*;
+
+        #[test]
+        fn test_promote_children_single_child() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.pending.insert(
+                "child".to_string(),
+                PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                },
+            );
+
+            state.promote_children("parent");
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+
+            assert!(!state.pending.contains_key("child"));
+            assert!(state.initializing.contains_key("child"));
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("child")
+                    .expect("child should be in initializing"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
+
+        #[test]
+        fn test_promote_children_multiple_children() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.pending.insert(
+                "child-1".to_string(),
+                PendingShard {
+                    shard_id: "child-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                },
+            );
+            state.pending.insert(
+                "child-2".to_string(),
+                PendingShard {
+                    shard_id: "child-2".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                },
+            );
+            state.pending.insert(
+                "other-child".to_string(),
+                PendingShard {
+                    shard_id: "other-child".to_string(),
+                    parent_shard_id: Some("other-parent".to_string()),
+                },
+            );
+
+            state.promote_children("parent");
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 2);
+
+            assert!(!state.pending.contains_key("child-1"));
+            assert!(!state.pending.contains_key("child-2"));
+            assert!(state.initializing.contains_key("child-1"));
+            assert!(state.initializing.contains_key("child-2"));
+
+            // Other child should remain pending
+            assert!(state.pending.contains_key("other-child"));
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("child-1")
+                    .expect("child-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "child-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("child-2")
+                    .expect("child-2 should be in initializing"),
+                &PendingShard {
+                    shard_id: "child-2".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("other-child")
+                    .expect("other-child should be in pending"),
+                &PendingShard {
+                    shard_id: "other-child".to_string(),
+                    parent_shard_id: Some("other-parent".to_string()),
+                }
+            );
+        }
+
+        #[test]
+        fn test_promote_children_no_children() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.pending.insert(
+                "unrelated".to_string(),
+                PendingShard {
+                    shard_id: "unrelated".to_string(),
+                    parent_shard_id: Some("other-parent".to_string()),
+                },
+            );
+
+            state.promote_children("parent");
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert!(state.pending.contains_key("unrelated"));
+            assert!(!state.initializing.contains_key("unrelated"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("unrelated")
+                    .expect("unrelated should be in pending"),
+                &PendingShard {
+                    shard_id: "unrelated".to_string(),
+                    parent_shard_id: Some("other-parent".to_string()),
+                }
+            );
+        }
+
+        #[test]
+        fn test_promote_children_with_grandparent_blocking() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Grandparent is still active
+            state.active.insert(
+                "grandparent".to_string(),
+                ActiveShard {
+                    shard_id: "grandparent".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter".to_string(),
+                },
+            );
+
+            // Child pending on grandparent (not on parent that we're promoting from)
+            state.pending.insert(
+                "child".to_string(),
+                PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("grandparent".to_string()),
+                },
+            );
+
+            // Try to promote children of "parent" - but child belongs to grandparent
+            state.promote_children("parent");
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+
+            // Child should remain pending because it doesn't belong to "parent"
+            assert!(state.pending.contains_key("child"));
+            assert!(!state.initializing.contains_key("child"));
+            assert!(state.active.contains_key("grandparent"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("grandparent".to_string()),
+                }
+            );
+        }
+    }
+
+    mod try_move_to_initializing {
+        use super::*;
+
+        #[test]
+        fn test_try_move_to_initializing_not_blocked() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            let shard = PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
-            }
-        );
-    }
+            };
 
-    #[test]
-    fn test_add_discovered_closed_shard_without_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-        let shards = vec![create_api_shard("shard-1", None, Some("999"))];
+            state.try_move_to_initializing("shard-1", shard);
 
-        state.add_discovered(shards);
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
 
-        // Closed shards are ignored
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
+            assert!(state.initializing.contains_key("shard-1"));
+            assert!(!state.pending.contains_key("shard-1"));
+            assert!(!state.active.contains_key("shard-1"));
 
-        assert!(!state.initializing.contains_key("shard-1"));
-        assert!(!state.pending.contains_key("shard-1"));
-        assert!(!state.active.contains_key("shard-1"));
-    }
+            assert_eq!(
+                state
+                    .initializing
+                    .get("shard-1")
+                    .expect("shard-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
 
-    #[test]
-    fn test_add_discovered_child_with_active_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
+        #[test]
+        fn test_try_move_to_initializing_blocked_by_active_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
-        // Add parent to active
-        state.active.insert(
-            "parent".to_string(),
-            ActiveShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-                iterator: "iter".to_string(),
-            },
-        );
+            state.active.insert(
+                "parent".to_string(),
+                ActiveShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter".to_string(),
+                },
+            );
 
-        let shards = vec![create_api_shard("child", Some("parent"), None)];
-        state.add_discovered(shards);
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(state.active.contains_key("parent"));
-        assert!(state.pending.contains_key("child"));
-        assert!(!state.initializing.contains_key("child"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
+            let shard = PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
-            }
-        );
-    }
+            };
 
-    #[test]
-    fn test_add_discovered_child_with_pending_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.try_move_to_initializing("child", shard);
 
-        // Add parent to pending
-        state.pending.insert(
-            "parent".to_string(),
-            PendingShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-            },
-        );
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
 
-        let shards = vec![create_api_shard("child", Some("parent"), None)];
-        state.add_discovered(shards);
+            assert!(!state.initializing.contains_key("child"));
+            assert!(state.pending.contains_key("child"));
+            assert!(state.active.contains_key("parent"));
 
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 0);
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
 
-        assert!(state.pending.contains_key("parent"));
-        assert!(state.pending.contains_key("child"));
-        assert!(!state.initializing.contains_key("child"));
+        #[test]
+        fn test_try_move_to_initializing_blocked_by_pending_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
+            state.pending.insert(
+                "parent".to_string(),
+                PendingShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            let shard = PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
-            }
-        );
-    }
+            };
 
-    #[test]
-    fn test_add_discovered_child_with_initializing_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.try_move_to_initializing("child", shard);
 
-        // Add parent to initializing
-        state.initializing.insert(
-            "parent".to_string(),
-            PendingShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-            },
-        );
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 0);
 
-        let shards = vec![create_api_shard("child", Some("parent"), None)];
-        state.add_discovered(shards);
+            assert!(!state.initializing.contains_key("child"));
+            assert!(state.pending.contains_key("child"));
+            assert!(state.pending.contains_key("parent"));
 
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 1);
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+        }
 
-        assert!(state.initializing.contains_key("parent"));
-        assert!(state.pending.contains_key("child"));
-        assert!(!state.initializing.contains_key("child"));
+        #[test]
+        fn test_try_move_to_initializing_blocked_by_initializing_parent() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
+            state.initializing.insert(
+                "parent".to_string(),
+                PendingShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                },
+            );
+
+            let shard = PendingShard {
                 shard_id: "child".to_string(),
                 parent_shard_id: Some("parent".to_string()),
-            }
-        );
+            };
+
+            state.try_move_to_initializing("child", shard);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 1);
+
+            assert!(!state.initializing.contains_key("child"));
+            assert!(state.pending.contains_key("child"));
+            assert!(state.initializing.contains_key("parent"));
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("child")
+                    .expect("child should be in pending"),
+                &PendingShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("parent")
+                    .expect("parent should be in initializing"),
+                &PendingShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
     }
 
-    #[test]
-    fn test_add_discovered_ignores_existing_active_shard() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
+    mod complex_scenarios {
+        use super::*;
 
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
+        #[test]
+        fn test_integration_full_shard_lifecycle() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Discover initial shard
+            state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(state.initializing.contains_key("shard-1"));
+
+            // Mark it active
+            state.mark_active("shard-1".to_string(), "iter-1".to_string());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.active.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                }
+            );
+
+            // Poll with records
+            let batch = state.handle_poll_result(
+                "shard-1",
+                Some("iter-2".to_string()),
+                vec![create_record("100")],
+            );
+            assert!(batch.is_some());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-2".to_string(),
+                }
+            );
+
+            // Exhaust shard
+            let batch = state.handle_poll_result("shard-1", None, vec![create_record("101")]);
+            assert!(batch.is_some());
+            let batch = batch.expect("Expected batch to be Some");
+            assert_eq!(batch.shard_id, "shard-1");
+            assert_eq!(batch.checkpoint.sequence_number, "101");
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(!state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_integration_parent_child_promotion() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Discover parent and child
+            state.add_discovered(vec![
+                create_api_shard("parent", None, None),
+                create_api_shard("child", Some("parent"), None),
+            ]);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(state.initializing.contains_key("parent"));
+            assert!(state.pending.contains_key("child"));
+
+            // Activate parent
+            state.mark_active("parent".to_string(), "parent-iter".to_string());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.active.contains_key("parent"));
+            assert!(state.pending.contains_key("child"));
+
+            assert_eq!(
+                state
+                    .active
+                    .get("parent")
+                    .expect("parent should be in active"),
+                &ActiveShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                    iterator: "parent-iter".to_string(),
+                }
+            );
+
+            // Exhaust parent
+            let batch = state.handle_poll_result("parent", None, vec![create_record("100")]);
+            assert!(batch.is_some());
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(!state.active.contains_key("parent"));
+            assert!(!state.pending.contains_key("child"));
+            assert!(state.initializing.contains_key("child"));
+
+            // Activate child
+            state.mark_active("child".to_string(), "child-iter".to_string());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.active.contains_key("child"));
+
+            assert_eq!(
+                state
+                    .active
+                    .get("child")
+                    .expect("child should be in active"),
+                &ActiveShard {
+                    shard_id: "child".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "child-iter".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_integration_multiple_generations() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Add three generations
+            state.add_discovered(vec![
+                create_api_shard("gen1", None, None),
+                create_api_shard("gen2", Some("gen1"), None),
+                create_api_shard("gen3", Some("gen2"), None),
+            ]);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(state.initializing.contains_key("gen1"));
+            assert!(state.pending.contains_key("gen2"));
+            assert!(state.pending.contains_key("gen3"));
+
+            // Activate gen1
+            state.mark_active("gen1".to_string(), "iter1".to_string());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 0);
+
+            // Exhaust gen1
+            state.handle_poll_result("gen1", None, vec![create_record("100")]);
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(state.initializing.contains_key("gen2"));
+            assert!(state.pending.contains_key("gen3"));
+
+            // Activate gen2
+            state.mark_active("gen2".to_string(), "iter2".to_string());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 0);
+
+            // Exhaust gen2
+            state.handle_poll_result("gen2", None, vec![create_record("200")]);
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(state.initializing.contains_key("gen3"));
+
+            // Activate gen3
+            state.mark_active("gen3".to_string(), "iter3".to_string());
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.active.contains_key("gen3"));
+
+            assert_eq!(
+                state.active.get("gen3").expect("gen3 should be in active"),
+                &ActiveShard {
+                    shard_id: "gen3".to_string(),
+                    parent_shard_id: Some("gen2".to_string()),
+                    iterator: "iter3".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_integration_shard_split_two_children() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Parent splits into two children
+            state.add_discovered(vec![
+                create_api_shard("parent", None, None),
+                create_api_shard("child-a", Some("parent"), None),
+                create_api_shard("child-b", Some("parent"), None),
+            ]);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 1);
+
+            state.mark_active("parent".to_string(), "parent-iter".to_string());
+
+            // Both children should be pending
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.pending.contains_key("child-a"));
+            assert!(state.pending.contains_key("child-b"));
+
+            // Exhaust parent
+            state.handle_poll_result("parent", None, vec![create_record("100")]);
+
+            // Both children should now be initializing
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 2);
+            assert!(state.initializing.contains_key("child-a"));
+            assert!(state.initializing.contains_key("child-b"));
+
+            // Activate both
+            state.mark_active("child-a".to_string(), "iter-a".to_string());
+            state.mark_active("child-b".to_string(), "iter-b".to_string());
+
+            assert_eq!(state.active.len(), 2);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+            assert!(state.active.contains_key("child-a"));
+            assert!(state.active.contains_key("child-b"));
+
+            assert_eq!(
+                state
+                    .active
+                    .get("child-a")
+                    .expect("child-a should be in active"),
+                &ActiveShard {
+                    shard_id: "child-a".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iter-a".to_string(),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .active
+                    .get("child-b")
+                    .expect("child-b should be in active"),
+                &ActiveShard {
+                    shard_id: "child-b".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iter-b".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_integration_rediscovery_of_existing_shards() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Add initial shard
+            state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
+            state.mark_active("shard-1".to_string(), "iter-1".to_string());
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            // Rediscover same shard - should be ignored
+            state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_integration_handle_poll_with_multiple_records() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iter-1".to_string(),
+                },
+            );
+
+            let records = vec![
+                create_record("100"),
+                create_record("101"),
+                create_record("102"),
+                create_record("103"),
+                create_record("104"),
+            ];
+
+            let batch =
+                state.handle_poll_result("shard-1", Some("iter-2".to_string()), records.clone());
+
+            assert!(batch.is_some());
+            let batch = batch.expect("Expected batch to be Some");
+            assert_eq!(batch.shard_id, "shard-1");
+            assert_eq!(batch.records.len(), 5);
+            assert_eq!(batch.checkpoint.sequence_number, "104");
+            assert_eq!(batch.checkpoint.parent_id, Some("parent".to_string()));
+            assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
+
+            // Verify state
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+
+            assert_eq!(
+                state
+                    .active
+                    .get("shard-1")
+                    .expect("shard-1 should be in active"),
+                &ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iter-2".to_string(),
+                }
+            );
+        }
+
+        #[test]
+        fn test_edge_case_empty_parent_id() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            let shard = PendingShard {
                 shard_id: "shard-1".to_string(),
                 parent_shard_id: None,
-                iterator: "original-iter".to_string(),
-            },
-        );
-
-        let shards = vec![create_api_shard("shard-1", None, None)];
-        state.add_discovered(shards);
-
-        // Should not change existing active shard
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(state.active.contains_key("shard-1"));
-        assert!(!state.pending.contains_key("shard-1"));
-        assert!(!state.initializing.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "original-iter".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_add_discovered_ignores_existing_pending_shard() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.pending.insert(
-            "shard-1".to_string(),
-            PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            },
-        );
-
-        let shards = vec![create_api_shard("shard-1", None, None)];
-        state.add_discovered(shards);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(!state.active.contains_key("shard-1"));
-        assert!(state.pending.contains_key("shard-1"));
-        assert!(!state.initializing.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("shard-1")
-                .expect("shard-1 should be in pending"),
-            &PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_add_discovered_ignores_existing_initializing_shard() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.initializing.insert(
-            "shard-1".to_string(),
-            PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            },
-        );
-
-        let shards = vec![create_api_shard("shard-1", None, None)];
-        state.add_discovered(shards);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-
-        assert!(!state.active.contains_key("shard-1"));
-        assert!(!state.pending.contains_key("shard-1"));
-        assert!(state.initializing.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .initializing
-                .get("shard-1")
-                .expect("shard-1 should be in initializing"),
-            &PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_add_discovered_multiple_shards_mixed_states() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.active.insert(
-            "parent-1".to_string(),
-            ActiveShard {
-                shard_id: "parent-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter".to_string(),
-            },
-        );
-
-        let shards = vec![
-            create_api_shard("root-1", None, None), // Should go to initializing
-            create_api_shard("root-2", None, Some("999")), // Should be ignored (closed)
-            create_api_shard("child-1", Some("parent-1"), None), // Should go to pending
-            create_api_shard("child-2", Some("nonexistent"), None), // Should go to initializing
-        ];
-
-        state.add_discovered(shards);
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 2);
-
-        // root-1: open shard without parent
-        assert!(state.initializing.contains_key("root-1"));
-        assert_eq!(
-            state
-                .initializing
-                .get("root-1")
-                .expect("root-1 should be in initializing"),
-            &PendingShard {
-                shard_id: "root-1".to_string(),
-                parent_shard_id: None,
-            }
-        );
-
-        // root-2: closed shard, should not exist anywhere
-        assert!(!state.active.contains_key("root-2"));
-        assert!(!state.pending.contains_key("root-2"));
-        assert!(!state.initializing.contains_key("root-2"));
-
-        // child-1: blocked by active parent
-        assert!(state.pending.contains_key("child-1"));
-        assert_eq!(
-            state
-                .pending
-                .get("child-1")
-                .expect("child-1 should be in pending"),
-            &PendingShard {
-                shard_id: "child-1".to_string(),
-                parent_shard_id: Some("parent-1".to_string()),
-            }
-        );
-
-        // child-2: parent doesn't exist, not blocked
-        assert!(state.initializing.contains_key("child-2"));
-        assert_eq!(
-            state
-                .initializing
-                .get("child-2")
-                .expect("child-2 should be in initializing"),
-            &PendingShard {
-                shard_id: "child-2".to_string(),
-                parent_shard_id: Some("nonexistent".to_string()),
-            }
-        );
-
-        // parent-1 should still be active
-        assert!(state.active.contains_key("parent-1"));
-    }
-
-    // ========================================
-    // Tests for mark_active()
-    // ========================================
-
-    #[test]
-    fn test_mark_active_moves_from_initializing_to_active() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.initializing.insert(
-            "shard-1".to_string(),
-            PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            },
-        );
-
-        state.mark_active("shard-1".to_string(), "iterator-1".to_string());
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(!state.initializing.contains_key("shard-1"));
-        assert!(!state.pending.contains_key("shard-1"));
-        assert!(state.active.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "iterator-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_mark_active_without_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.initializing.insert(
-            "shard-1".to_string(),
-            PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            },
-        );
-
-        state.mark_active("shard-1".to_string(), "iterator-1".to_string());
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(state.active.contains_key("shard-1"));
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iterator-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_mark_active_nonexistent_shard_does_nothing() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.mark_active("nonexistent".to_string(), "iterator-1".to_string());
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(!state.active.contains_key("nonexistent"));
-        assert!(!state.pending.contains_key("nonexistent"));
-        assert!(!state.initializing.contains_key("nonexistent"));
-    }
-
-    #[test]
-    fn test_mark_active_from_pending_does_nothing() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.pending.insert(
-            "shard-1".to_string(),
-            PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            },
-        );
-
-        state.mark_active("shard-1".to_string(), "iterator-1".to_string());
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(!state.active.contains_key("shard-1"));
-        assert!(state.pending.contains_key("shard-1"));
-        assert!(!state.initializing.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("shard-1")
-                .expect("shard-1 should be in pending"),
-            &PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_mark_active_multiple_shards() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.initializing.insert(
-            "shard-1".to_string(),
-            PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            },
-        );
-        state.initializing.insert(
-            "shard-2".to_string(),
-            PendingShard {
-                shard_id: "shard-2".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            },
-        );
-
-        state.mark_active("shard-1".to_string(), "iter-1".to_string());
-        state.mark_active("shard-2".to_string(), "iter-2".to_string());
-
-        assert_eq!(state.active.len(), 2);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            }
-        );
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-2")
-                .expect("shard-2 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-2".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "iter-2".to_string(),
-            }
-        );
-    }
-
-    // ========================================
-    // Tests for promote_children()
-    // ========================================
-
-    #[test]
-    fn test_promote_children_single_child() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.pending.insert(
-            "child".to_string(),
-            PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            },
-        );
-
-        state.promote_children("parent");
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-
-        assert!(!state.pending.contains_key("child"));
-        assert!(state.initializing.contains_key("child"));
-
-        assert_eq!(
-            state
-                .initializing
-                .get("child")
-                .expect("child should be in initializing"),
-            &PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn test_promote_children_multiple_children() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.pending.insert(
-            "child-1".to_string(),
-            PendingShard {
-                shard_id: "child-1".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            },
-        );
-        state.pending.insert(
-            "child-2".to_string(),
-            PendingShard {
-                shard_id: "child-2".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            },
-        );
-        state.pending.insert(
-            "other-child".to_string(),
-            PendingShard {
-                shard_id: "other-child".to_string(),
-                parent_shard_id: Some("other-parent".to_string()),
-            },
-        );
-
-        state.promote_children("parent");
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 2);
-
-        assert!(!state.pending.contains_key("child-1"));
-        assert!(!state.pending.contains_key("child-2"));
-        assert!(state.initializing.contains_key("child-1"));
-        assert!(state.initializing.contains_key("child-2"));
-
-        // Other child should remain pending
-        assert!(state.pending.contains_key("other-child"));
-
-        assert_eq!(
-            state
-                .initializing
-                .get("child-1")
-                .expect("child-1 should be in initializing"),
-            &PendingShard {
-                shard_id: "child-1".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
-
-        assert_eq!(
-            state
-                .initializing
-                .get("child-2")
-                .expect("child-2 should be in initializing"),
-            &PendingShard {
-                shard_id: "child-2".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
-
-        assert_eq!(
-            state
-                .pending
-                .get("other-child")
-                .expect("other-child should be in pending"),
-            &PendingShard {
-                shard_id: "other-child".to_string(),
-                parent_shard_id: Some("other-parent".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn test_promote_children_no_children() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.pending.insert(
-            "unrelated".to_string(),
-            PendingShard {
-                shard_id: "unrelated".to_string(),
-                parent_shard_id: Some("other-parent".to_string()),
-            },
-        );
-
-        state.promote_children("parent");
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(state.pending.contains_key("unrelated"));
-        assert!(!state.initializing.contains_key("unrelated"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("unrelated")
-                .expect("unrelated should be in pending"),
-            &PendingShard {
-                shard_id: "unrelated".to_string(),
-                parent_shard_id: Some("other-parent".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn test_promote_children_with_grandparent_blocking() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Grandparent is still active
-        state.active.insert(
-            "grandparent".to_string(),
-            ActiveShard {
-                shard_id: "grandparent".to_string(),
-                parent_shard_id: None,
-                iterator: "iter".to_string(),
-            },
-        );
-
-        // Child pending on grandparent (not on parent that we're promoting from)
-        state.pending.insert(
-            "child".to_string(),
-            PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("grandparent".to_string()),
-            },
-        );
-
-        // Try to promote children of "parent" - but child belongs to grandparent
-        state.promote_children("parent");
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        // Child should remain pending because it doesn't belong to "parent"
-        assert!(state.pending.contains_key("child"));
-        assert!(!state.initializing.contains_key("child"));
-        assert!(state.active.contains_key("grandparent"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("grandparent".to_string()),
-            }
-        );
-    }
-
-    // ========================================
-    // Tests for try_move_to_initializing()
-    // ========================================
-
-    #[test]
-    fn test_try_move_to_initializing_not_blocked() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        let shard = PendingShard {
-            shard_id: "shard-1".to_string(),
-            parent_shard_id: None,
-        };
-
-        state.try_move_to_initializing("shard-1", shard);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-
-        assert!(state.initializing.contains_key("shard-1"));
-        assert!(!state.pending.contains_key("shard-1"));
-        assert!(!state.active.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .initializing
-                .get("shard-1")
-                .expect("shard-1 should be in initializing"),
-            &PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_try_move_to_initializing_blocked_by_active_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.active.insert(
-            "parent".to_string(),
-            ActiveShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-                iterator: "iter".to_string(),
-            },
-        );
-
-        let shard = PendingShard {
-            shard_id: "child".to_string(),
-            parent_shard_id: Some("parent".to_string()),
-        };
-
-        state.try_move_to_initializing("child", shard);
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(!state.initializing.contains_key("child"));
-        assert!(state.pending.contains_key("child"));
-        assert!(state.active.contains_key("parent"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn test_try_move_to_initializing_blocked_by_pending_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.pending.insert(
-            "parent".to_string(),
-            PendingShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-            },
-        );
-
-        let shard = PendingShard {
-            shard_id: "child".to_string(),
-            parent_shard_id: Some("parent".to_string()),
-        };
-
-        state.try_move_to_initializing("child", shard);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert!(!state.initializing.contains_key("child"));
-        assert!(state.pending.contains_key("child"));
-        assert!(state.pending.contains_key("parent"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn test_try_move_to_initializing_blocked_by_initializing_parent() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.initializing.insert(
-            "parent".to_string(),
-            PendingShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-            },
-        );
-
-        let shard = PendingShard {
-            shard_id: "child".to_string(),
-            parent_shard_id: Some("parent".to_string()),
-        };
-
-        state.try_move_to_initializing("child", shard);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 1);
-
-        assert!(!state.initializing.contains_key("child"));
-        assert!(state.pending.contains_key("child"));
-        assert!(state.initializing.contains_key("parent"));
-
-        assert_eq!(
-            state
-                .pending
-                .get("child")
-                .expect("child should be in pending"),
-            &PendingShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-            }
-        );
-
-        assert_eq!(
-            state
-                .initializing
-                .get("parent")
-                .expect("parent should be in initializing"),
-            &PendingShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-            }
-        );
-    }
-
-    // ========================================
-    // Integration tests - Complex scenarios
-    // ========================================
-
-    #[test]
-    fn test_integration_full_shard_lifecycle() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Discover initial shard
-        state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(state.initializing.contains_key("shard-1"));
-
-        // Mark it active
-        state.mark_active("shard-1".to_string(), "iter-1".to_string());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.active.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            }
-        );
-
-        // Poll with records
-        let batch = state.handle_poll_result(
-            "shard-1",
-            Some("iter-2".to_string()),
-            vec![create_record("100")],
-        );
-        assert!(batch.is_some());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-2".to_string(),
-            }
-        );
-
-        // Exhaust shard
-        let batch = state.handle_poll_result("shard-1", None, vec![create_record("101")]);
-        assert!(batch.is_some());
-        let batch = batch.expect("Expected batch to be Some");
-        assert_eq!(batch.shard_id, "shard-1");
-        assert_eq!(batch.checkpoint.sequence_number, "101");
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(!state.active.contains_key("shard-1"));
-    }
-
-    #[test]
-    fn test_integration_parent_child_promotion() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Discover parent and child
-        state.add_discovered(vec![
-            create_api_shard("parent", None, None),
-            create_api_shard("child", Some("parent"), None),
-        ]);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(state.initializing.contains_key("parent"));
-        assert!(state.pending.contains_key("child"));
-
-        // Activate parent
-        state.mark_active("parent".to_string(), "parent-iter".to_string());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.active.contains_key("parent"));
-        assert!(state.pending.contains_key("child"));
-
-        assert_eq!(
-            state
-                .active
-                .get("parent")
-                .expect("parent should be in active"),
-            &ActiveShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-                iterator: "parent-iter".to_string(),
-            }
-        );
-
-        // Exhaust parent
-        let batch = state.handle_poll_result("parent", None, vec![create_record("100")]);
-        assert!(batch.is_some());
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(!state.active.contains_key("parent"));
-        assert!(!state.pending.contains_key("child"));
-        assert!(state.initializing.contains_key("child"));
-
-        // Activate child
-        state.mark_active("child".to_string(), "child-iter".to_string());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.active.contains_key("child"));
-
-        assert_eq!(
-            state
-                .active
-                .get("child")
-                .expect("child should be in active"),
-            &ActiveShard {
-                shard_id: "child".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "child-iter".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_integration_multiple_generations() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Add three generations
-        state.add_discovered(vec![
-            create_api_shard("gen1", None, None),
-            create_api_shard("gen2", Some("gen1"), None),
-            create_api_shard("gen3", Some("gen2"), None),
-        ]);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(state.initializing.contains_key("gen1"));
-        assert!(state.pending.contains_key("gen2"));
-        assert!(state.pending.contains_key("gen3"));
-
-        // Activate gen1
-        state.mark_active("gen1".to_string(), "iter1".to_string());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 0);
-
-        // Exhaust gen1
-        state.handle_poll_result("gen1", None, vec![create_record("100")]);
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(state.initializing.contains_key("gen2"));
-        assert!(state.pending.contains_key("gen3"));
-
-        // Activate gen2
-        state.mark_active("gen2".to_string(), "iter2".to_string());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 0);
-
-        // Exhaust gen2
-        state.handle_poll_result("gen2", None, vec![create_record("200")]);
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(state.initializing.contains_key("gen3"));
-
-        // Activate gen3
-        state.mark_active("gen3".to_string(), "iter3".to_string());
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.active.contains_key("gen3"));
-
-        assert_eq!(
-            state.active.get("gen3").expect("gen3 should be in active"),
-            &ActiveShard {
-                shard_id: "gen3".to_string(),
-                parent_shard_id: Some("gen2".to_string()),
-                iterator: "iter3".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_integration_shard_split_two_children() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Parent splits into two children
-        state.add_discovered(vec![
-            create_api_shard("parent", None, None),
-            create_api_shard("child-a", Some("parent"), None),
-            create_api_shard("child-b", Some("parent"), None),
-        ]);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 1);
-
-        state.mark_active("parent".to_string(), "parent-iter".to_string());
-
-        // Both children should be pending
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.pending.contains_key("child-a"));
-        assert!(state.pending.contains_key("child-b"));
-
-        // Exhaust parent
-        state.handle_poll_result("parent", None, vec![create_record("100")]);
-
-        // Both children should now be initializing
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 2);
-        assert!(state.initializing.contains_key("child-a"));
-        assert!(state.initializing.contains_key("child-b"));
-
-        // Activate both
-        state.mark_active("child-a".to_string(), "iter-a".to_string());
-        state.mark_active("child-b".to_string(), "iter-b".to_string());
-
-        assert_eq!(state.active.len(), 2);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-        assert!(state.active.contains_key("child-a"));
-        assert!(state.active.contains_key("child-b"));
-
-        assert_eq!(
-            state
-                .active
-                .get("child-a")
-                .expect("child-a should be in active"),
-            &ActiveShard {
-                shard_id: "child-a".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "iter-a".to_string(),
-            }
-        );
-
-        assert_eq!(
-            state
-                .active
-                .get("child-b")
-                .expect("child-b should be in active"),
-            &ActiveShard {
-                shard_id: "child-b".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "iter-b".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_integration_rediscovery_of_existing_shards() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Add initial shard
-        state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
-        state.mark_active("shard-1".to_string(), "iter-1".to_string());
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        // Rediscover same shard - should be ignored
-        state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                iterator: "iter-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_integration_handle_poll_with_multiple_records() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.active.insert(
-            "shard-1".to_string(),
-            ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "iter-1".to_string(),
-            },
-        );
-
-        let records = vec![
-            create_record("100"),
-            create_record("101"),
-            create_record("102"),
-            create_record("103"),
-            create_record("104"),
-        ];
-
-        let batch =
-            state.handle_poll_result("shard-1", Some("iter-2".to_string()), records.clone());
-
-        assert!(batch.is_some());
-        let batch = batch.expect("Expected batch to be Some");
-        assert_eq!(batch.shard_id, "shard-1");
-        assert_eq!(batch.records.len(), 5);
-        assert_eq!(batch.checkpoint.sequence_number, "104");
-        assert_eq!(batch.checkpoint.parent_id, Some("parent".to_string()));
-        assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
-
-        // Verify state
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-
-        assert_eq!(
-            state
-                .active
-                .get("shard-1")
-                .expect("shard-1 should be in active"),
-            &ActiveShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: Some("parent".to_string()),
-                iterator: "iter-2".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_edge_case_empty_parent_id() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        let shard = PendingShard {
-            shard_id: "shard-1".to_string(),
-            parent_shard_id: None,
-        };
-
-        state.try_move_to_initializing("shard-1", shard);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 1);
-        assert!(state.initializing.contains_key("shard-1"));
-
-        assert_eq!(
-            state
-                .initializing
-                .get("shard-1")
-                .expect("shard-1 should be in initializing"),
-            &PendingShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn test_edge_case_promote_with_no_pending_children() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        state.active.insert(
-            "parent".to_string(),
-            ActiveShard {
-                shard_id: "parent".to_string(),
-                parent_shard_id: None,
-                iterator: "iter".to_string(),
-            },
-        );
-
-        // Should not panic
-        state.promote_children("parent");
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 0);
-        assert_eq!(state.initializing.len(), 0);
-    }
-
-    #[test]
-    fn test_concurrent_children_from_different_parents() {
-        let mut state = StreamState::new("arn:aws:stream:test".to_string());
-
-        // Two independent parent-child chains
-        state.add_discovered(vec![
-            create_api_shard("parent-1", None, None),
-            create_api_shard("parent-2", None, None),
-            create_api_shard("child-1", Some("parent-1"), None),
-            create_api_shard("child-2", Some("parent-2"), None),
-        ]);
-
-        assert_eq!(state.active.len(), 0);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 2);
-
-        state.mark_active("parent-1".to_string(), "iter1".to_string());
-        state.mark_active("parent-2".to_string(), "iter2".to_string());
-
-        assert_eq!(state.active.len(), 2);
-        assert_eq!(state.pending.len(), 2);
-        assert_eq!(state.initializing.len(), 0);
-
-        // Exhaust parent-1
-        state.handle_poll_result("parent-1", None, vec![create_record("100")]);
-
-        assert_eq!(state.active.len(), 1);
-        assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.initializing.len(), 1);
-
-        assert!(state.initializing.contains_key("child-1"));
-        assert!(state.pending.contains_key("child-2"));
-        assert!(state.active.contains_key("parent-2"));
-        assert!(!state.active.contains_key("parent-1"));
-
-        assert_eq!(
-            state
-                .initializing
-                .get("child-1")
-                .expect("child-1 should be in initializing"),
-            &PendingShard {
-                shard_id: "child-1".to_string(),
-                parent_shard_id: Some("parent-1".to_string()),
-            }
-        );
-
-        assert_eq!(
-            state
-                .pending
-                .get("child-2")
-                .expect("child-2 should be in pending"),
-            &PendingShard {
-                shard_id: "child-2".to_string(),
-                parent_shard_id: Some("parent-2".to_string()),
-            }
-        );
-
-        assert_eq!(
-            state
-                .active
-                .get("parent-2")
-                .expect("parent-2 should be in active"),
-            &ActiveShard {
-                shard_id: "parent-2".to_string(),
-                parent_shard_id: None,
-                iterator: "iter2".to_string(),
-            }
-        );
+            };
+
+            state.try_move_to_initializing("shard-1", shard);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
+            assert!(state.initializing.contains_key("shard-1"));
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("shard-1")
+                    .expect("shard-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                }
+            );
+        }
+
+        #[test]
+        fn test_edge_case_promote_with_no_pending_children() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "parent".to_string(),
+                ActiveShard {
+                    shard_id: "parent".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter".to_string(),
+                },
+            );
+
+            // Should not panic
+            state.promote_children("parent");
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 0);
+            assert_eq!(state.initializing.len(), 0);
+        }
+
+        #[test]
+        fn test_concurrent_children_from_different_parents() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            // Two independent parent-child chains
+            state.add_discovered(vec![
+                create_api_shard("parent-1", None, None),
+                create_api_shard("parent-2", None, None),
+                create_api_shard("child-1", Some("parent-1"), None),
+                create_api_shard("child-2", Some("parent-2"), None),
+            ]);
+
+            assert_eq!(state.active.len(), 0);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 2);
+
+            state.mark_active("parent-1".to_string(), "iter1".to_string());
+            state.mark_active("parent-2".to_string(), "iter2".to_string());
+
+            assert_eq!(state.active.len(), 2);
+            assert_eq!(state.pending.len(), 2);
+            assert_eq!(state.initializing.len(), 0);
+
+            // Exhaust parent-1
+            state.handle_poll_result("parent-1", None, vec![create_record("100")]);
+
+            assert_eq!(state.active.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.initializing.len(), 1);
+
+            assert!(state.initializing.contains_key("child-1"));
+            assert!(state.pending.contains_key("child-2"));
+            assert!(state.active.contains_key("parent-2"));
+            assert!(!state.active.contains_key("parent-1"));
+
+            assert_eq!(
+                state
+                    .initializing
+                    .get("child-1")
+                    .expect("child-1 should be in initializing"),
+                &PendingShard {
+                    shard_id: "child-1".to_string(),
+                    parent_shard_id: Some("parent-1".to_string()),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .pending
+                    .get("child-2")
+                    .expect("child-2 should be in pending"),
+                &PendingShard {
+                    shard_id: "child-2".to_string(),
+                    parent_shard_id: Some("parent-2".to_string()),
+                }
+            );
+
+            assert_eq!(
+                state
+                    .active
+                    .get("parent-2")
+                    .expect("parent-2 should be in active"),
+                &ActiveShard {
+                    shard_id: "parent-2".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter2".to_string(),
+                }
+            );
+        }
     }
 }

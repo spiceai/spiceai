@@ -1,5 +1,20 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{RecordBatch, StreamState};
+use crate::stream_state::{DynamoDBStreamBatch, StreamState};
 use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::ShardIteratorType;
 use futures::{Stream, future::join_all};
@@ -23,10 +38,13 @@ pub struct DynamodbStreamProducer {
 }
 
 impl DynamodbStreamProducer {
-    async fn iterate(&mut self) -> Result<Vec<RecordBatch>> {
+    async fn iterate(&mut self) -> Result<Vec<DynamoDBStreamBatch>> {
         let mut batches = Vec::new();
 
-        // 1. Poll active shards
+        // 1. Initialize shards that require iterators
+        self.initialize_shards_iterators().await;
+
+        // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
             tracing::debug!(
@@ -44,7 +62,7 @@ impl DynamodbStreamProducer {
 
         let results = join_all(futures).await;
 
-        // 2. Process poll results
+        // 3. Process poll results
         for (shard_id, result) in results {
             match result {
                 Ok((next_iter, records)) => {
@@ -61,19 +79,16 @@ impl DynamodbStreamProducer {
             }
         }
 
-        // 3. Discover new shards
+        // 4. Discover new shards
         if let Ok(shards) = self.client.get_all_shards(&self.stream_arn).await {
             self.state.add_discovered(shards);
         }
-
-        // 4. Initialize shards that require iterators
-        self.initialize_shards_iterators().await;
 
         Ok(batches)
     }
 
     fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
-        // TODO: Finalize logic
+        // TODO: Finalize logic - https://github.com/spiceai/spiceai/issues/8074
         let is_expired_iterator = error.to_string().contains("ExpiredIterator")
             || error.to_string().contains("TrimmedDataAccess");
 
@@ -110,7 +125,7 @@ impl DynamodbStreamProducer {
         }
     }
 
-    async fn perform_iterate_with_retry(&mut self) -> Result<Vec<RecordBatch>> {
+    async fn perform_iterate_with_retry(&mut self) -> Result<Vec<DynamoDBStreamBatch>> {
         let mut backoff = self.retry_strategy.clone();
 
         loop {
