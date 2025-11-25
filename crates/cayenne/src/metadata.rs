@@ -171,7 +171,7 @@ impl Default for VortexConfig {
             enable_zigzag: true,
             // Cache configuration
             footer_cache_mb: 128,
-            segment_cache_mb: 512,
+            segment_cache_mb: 256,
             // Target file size: 256 MB
             target_vortex_file_size_mb: 256,
         }
