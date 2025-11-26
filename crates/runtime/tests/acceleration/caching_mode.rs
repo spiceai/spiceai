@@ -199,6 +199,7 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 ///
 /// For production use with `DuckDB` or Cayenne accelerators, multi-filter caching
 /// works correctly with upsert behavior.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -412,6 +413,7 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
 /// Uses `DuckDB` accelerator which supports upsert-based multi-filter caching.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -628,6 +630,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 ///
 /// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
 /// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "sqlite")]
 async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
@@ -1248,6 +1251,7 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
 /// Test background refresh triggered on cache miss.
 /// Verifies that when data is not in the cache, a background refresh is triggered
 /// to populate the cache asynchronously after returning the federated data.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
