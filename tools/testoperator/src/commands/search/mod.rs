@@ -35,6 +35,7 @@ use test_framework::{
 };
 use tokio::time::sleep;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
@@ -119,20 +120,22 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or(git::get_commit_sha());
 
     // Record benchmark results
-    let benchmark_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "search"),
-        KeyValue::new("name", app.name.clone()),
-        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
-        KeyValue::new("branch_name", git::get_branch_name()),
-        KeyValue::new("config_name", app.name), // use app name as search configuration
-        KeyValue::new(
-            "benchmark_dataset",
-            args.benchmark_dataset.clone().unwrap_or_default(),
-        ),
-    ]);
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "search"),
+            KeyValue::new("name", app.name.clone()),
+            KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+            KeyValue::new("branch_name", git::get_branch_name()),
+            KeyValue::new("config_name", app.name), // use app name as search configuration
+            KeyValue::new(
+                "benchmark_dataset",
+                args.benchmark_dataset.clone().unwrap_or_default(),
+            ),
+        ])
+        .build();
 
     let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
