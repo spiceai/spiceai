@@ -247,8 +247,6 @@ impl DataConnector for DynamoDB {
 
                 let checkpoint = dynamodb.latest_global_checkpoint().await.ok()?;
 
-                // TODO: Add table bootstrapping and proper error handling
-
                 dynamodb.stream_from_checkpoint(checkpoint).await.ok()
             })
             .filter_map(|opt| async move { opt })
