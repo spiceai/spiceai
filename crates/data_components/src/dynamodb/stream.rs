@@ -240,11 +240,12 @@ mod tests {
             .build()
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn create_stream_result(records: Vec<Record>) -> StreamResult {
         Ok(DynamoDBStreamBatch {
             records,
             checkpoint: GlobalCheckpoint {
-                shards: Default::default(),
+                shards: HashMap::default(),
             },
         })
     }
