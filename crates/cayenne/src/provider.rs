@@ -36,6 +36,7 @@ use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::metadata::{CreateTableOptions, TableMetadata};
 use arrow::record_batch::RecordBatch;
+use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
@@ -58,16 +59,24 @@ use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::PlanProperties;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 
 const DEFAULT_DATA_FILE_ID: i64 = 0;
+
+#[derive(Debug, Clone, Copy)]
+struct RowLocation {
+    data_file_id: i64,
+    row_id: i64,
+}
 
 /// Error message for poisoned `RwLock` on the listing table.
 ///
@@ -768,8 +777,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the data cannot be inserted.
-    #[allow(clippy::items_after_statements)]
-    #[allow(clippy::too_many_lines)]
     pub async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
         // Acquire write lock to serialize inserts and prevent concurrent write races.
         // This ensures listing table refresh happens after all parallel chunk writes complete
@@ -778,10 +785,41 @@ impl CayenneTableProvider {
 
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
+        // If primary key is configured, enforce uniqueness and on_conflict handling.
+        let (prepared_stream, delete_specs) =
+            if let Some(pk_indices) = self.primary_key_indices()? {
+                let converter = self.build_pk_converter(&pk_indices)?;
+                let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
+                let (validated_batches, delete_specs) = self
+                    .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
+                    .await?;
+
+                let schema = if let Some(batch) = validated_batches.first() {
+                    batch.schema()
+                } else {
+                    Arc::clone(&self.table_metadata.schema)
+                };
+
+                let validated_stream = RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    futures::stream::iter(validated_batches.into_iter().map(Ok)),
+                );
+
+                (
+                    Box::pin(validated_stream) as SendableRecordBatchStream,
+                    delete_specs,
+                )
+            } else {
+                (stream, HashMap::new())
+            };
+
         // Process stream in chunks and write them in parallel with bounded concurrency
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(stream, target_size_bytes)
+            .chunk_and_write_parallel(prepared_stream, target_size_bytes)
             .await?;
+
+        // Apply any deletion vectors required by on_conflict upserts.
+        self.apply_on_conflict_deletions(delete_specs).await?;
 
         tracing::debug!(
             "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
@@ -957,6 +995,196 @@ impl CayenneTableProvider {
         Ok((total_rows, chunk_count))
     }
 
+    /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
+    ///
+    /// Returns filtered batches (with dropped rows removed) and a map of deletion vector specs
+    /// keyed by `data_file_id`.
+    #[allow(clippy::too_many_lines)]
+    async fn validate_on_conflict(
+        &self,
+        mut stream: SendableRecordBatchStream,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        existing_keys: &mut HashMap<OwnedRow, RowLocation>,
+    ) -> CatalogResult<(Vec<RecordBatch>, HashMap<i64, Vec<i64>>)> {
+        // Track keys seen in this incoming stream to detect intra-stream conflicts.
+        let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
+        let mut filtered_batches = Vec::new();
+        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
+
+        // Resolve on_conflict configuration.
+        let on_conflict = self.table_metadata.on_conflict.clone().ok_or_else(|| {
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Primary key requires on_conflict configuration for table {}",
+                    self.table_metadata.table_name
+                ),
+            }
+        })?;
+
+        let upsert_options = on_conflict.get_upsert_options();
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to read batch for on_conflict validation: {e}"),
+            })?;
+
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let pk_columns: Vec<_> = pk_indices
+                .iter()
+                .map(|idx| Arc::clone(batch.column(*idx)))
+                .collect();
+
+            let rows = converter.convert_columns(&pk_columns).map_err(|err| {
+                CatalogError::InvalidOperation {
+                    message: format!("Failed to convert primary key columns: {err}"),
+                }
+            })?;
+
+            let mut keep_mask = Vec::with_capacity(batch.num_rows());
+            for row_idx in 0..batch.num_rows() {
+                // Enforce non-null primary keys on incoming data.
+                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+                if has_null {
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Primary key values must be non-null for table {}",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+
+                let key = rows.row(row_idx).owned();
+
+                // Intra-stream duplicate detection: if we've already seen this key in a previous batch,
+                // we cannot generate a deletion vector because the earlier row has not been written yet.
+                if incoming_keys.contains(&key) {
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Incoming data for table {} contains duplicate primary key in stream",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+
+                if let Some(existing) = existing_keys.get(&key) {
+                    match on_conflict {
+                        OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
+                            // Drop incoming row.
+                            keep_mask.push(false);
+                        }
+                        OnConflict::Upsert(_, _) => {
+                            delete_specs
+                                .entry(existing.data_file_id)
+                                .or_default()
+                                .push(existing.row_id);
+                            // Replace existing key location with placeholder for the new row.
+                            existing_keys.insert(
+                                key.clone(),
+                                RowLocation {
+                                    data_file_id: DEFAULT_DATA_FILE_ID,
+                                    row_id: -1,
+                                },
+                            );
+                            incoming_keys.insert(key);
+                            keep_mask.push(true);
+                        }
+                    }
+                } else {
+                    incoming_keys.insert(key);
+                    keep_mask.push(true);
+                }
+            }
+
+            // If all rows were dropped, skip the batch.
+            if keep_mask.iter().all(|v| !*v) {
+                continue;
+            }
+
+            let filtered_batch = if keep_mask.iter().all(|v| *v) {
+                batch
+            } else {
+                let filter_array = arrow::array::BooleanArray::from(keep_mask);
+                arrow::compute::filter_record_batch(&batch, &filter_array).map_err(|err| {
+                    CatalogError::InvalidOperation {
+                        message: format!("Failed to filter batch for on_conflict handling: {err}"),
+                    }
+                })?
+            };
+
+            filtered_batches.push(filtered_batch);
+        }
+
+        // Handle intra-batch duplicates when upsert options request deduplication.
+        if !upsert_options.is_default() {
+            // Upsert options in this context apply only to duplicates within the same batch.
+            // Cross-batch duplicates already error above.
+            for batch in &mut filtered_batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                if !upsert_options.remove_duplicates && !upsert_options.last_write_wins {
+                    continue;
+                }
+
+                // Build a map for per-batch deduplication.
+                let pk_columns: Vec<_> = pk_indices
+                    .iter()
+                    .map(|idx| Arc::clone(batch.column(*idx)))
+                    .collect();
+
+                let rows = converter.convert_columns(&pk_columns).map_err(|err| {
+                    CatalogError::InvalidOperation {
+                        message: format!(
+                            "Failed to convert primary key columns during batch dedup: {err}"
+                        ),
+                    }
+                })?;
+
+                let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
+                let mut keep_mask = vec![true; batch.num_rows()];
+
+                for row_idx in 0..batch.num_rows() {
+                    let key = rows.row(row_idx).owned();
+                    if let Some(existing_idx) = seen.get(&key) {
+                        if upsert_options.last_write_wins {
+                            keep_mask[*existing_idx] = false;
+                            seen.insert(key, row_idx);
+                        } else if upsert_options.remove_duplicates {
+                            keep_mask[row_idx] = false;
+                        } else {
+                            return Err(CatalogError::InvalidOperation {
+                                message: format!(
+                                    "Duplicate primary key found in batch for table {}",
+                                    self.table_metadata.table_name
+                                ),
+                            });
+                        }
+                    } else {
+                        seen.insert(key, row_idx);
+                    }
+                }
+
+                if !keep_mask.iter().all(|v| *v) {
+                    let filter_array = arrow::array::BooleanArray::from(keep_mask);
+                    *batch = arrow::compute::filter_record_batch(batch, &filter_array).map_err(
+                        |err| CatalogError::InvalidOperation {
+                            message: format!(
+                                "Failed to filter batch for batch-level deduplication: {err}"
+                            ),
+                        },
+                    )?;
+                }
+            }
+        }
+
+        Ok((filtered_batches, delete_specs))
+    }
+
     /// Create a clone of necessary fields for parallel write tasks.
     ///
     /// This method clones only the Arc references needed for writing,
@@ -987,6 +1215,148 @@ impl CayenneTableProvider {
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
         }
+    }
+
+    /// Returns the column indices for the configured primary key, if any.
+    fn primary_key_indices(&self) -> CatalogResult<Option<Vec<usize>>> {
+        if self.table_metadata.primary_key.is_empty() {
+            return Ok(None);
+        }
+
+        let mut indices = Vec::with_capacity(self.table_metadata.primary_key.len());
+        for pk_col in &self.table_metadata.primary_key {
+            let idx = self.table_metadata.schema.index_of(pk_col).map_err(|_| {
+                CatalogError::InvalidOperation {
+                    message: format!(
+                        "Primary key column '{pk_col}' not found in schema for table {}",
+                        self.table_metadata.table_name
+                    ),
+                }
+            })?;
+            indices.push(idx);
+        }
+
+        Ok(Some(indices))
+    }
+
+    /// Builds a `RowConverter` for the primary key columns.
+    fn build_pk_converter(&self, pk_indices: &[usize]) -> CatalogResult<RowConverter> {
+        let mut sort_fields = Vec::with_capacity(pk_indices.len());
+        for idx in pk_indices {
+            let field = self.table_metadata.schema.field(*idx);
+            sort_fields.push(SortField::new(field.data_type().clone()));
+        }
+
+        RowConverter::new(sort_fields).map_err(|err| CatalogError::InvalidOperation {
+            message: format!(
+                "Failed to create row converter for primary key on table {}: {err}",
+                self.table_metadata.table_name
+            ),
+        })
+    }
+
+    /// Build the existing keyset (primary key bytes -> row location) for append-mode inserts.
+    async fn load_existing_keyset(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+    ) -> CatalogResult<HashMap<OwnedRow, RowLocation>> {
+        // Clone listing table to avoid holding locks across await points
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                super::catalog::CatalogError::LockPoisoned {
+                    operation: "load_existing_keyset (read listing table)".to_string(),
+                }
+            })?;
+            Arc::clone(&guard)
+        };
+
+        let ctx = SessionContext::new();
+        let scan_plan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: format!("Failed to scan listing table for primary keys: {err}"),
+            })?;
+
+        let batches = collect(scan_plan, ctx.task_ctx()).await.map_err(|err| {
+            CatalogError::InvalidOperation {
+                message: format!("Failed to collect primary key scan: {err}"),
+            }
+        })?;
+
+        // Use cached deletion vectors to skip already-deleted rows.
+        let deleted_rows = {
+            let guard =
+                self.cached_deleted_row_ids
+                    .read()
+                    .map_err(|_| CatalogError::InvalidOperation {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    })?;
+            Arc::clone(&guard)
+        };
+
+        let mut keyset = HashMap::with_capacity(1024);
+        let mut row_id_base: i64 = 0;
+
+        for batch in batches {
+            let pk_columns: Vec<_> = pk_indices
+                .iter()
+                .map(|idx| Arc::clone(batch.column(*idx)))
+                .collect();
+
+            let rows = converter.convert_columns(&pk_columns).map_err(|err| {
+                CatalogError::InvalidOperation {
+                    message: format!("Failed to convert primary key columns: {err}"),
+                }
+            })?;
+
+            for row_idx in 0..batch.num_rows() {
+                let row_id = row_id_base + i64::try_from(row_idx).unwrap_or(0);
+
+                // Skip rows already marked as deleted
+                if let Ok(row_id_u32) = u32::try_from(row_id) {
+                    if deleted_rows.contains(row_id_u32) {
+                        continue;
+                    }
+                }
+
+                // Enforce non-null primary key values
+                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+                if has_null {
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Null primary key encountered in existing data for table {}",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+
+                let key = rows.row(row_idx).owned();
+
+                if keyset
+                    .insert(
+                        key,
+                        RowLocation {
+                            data_file_id: DEFAULT_DATA_FILE_ID,
+                            row_id,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(CatalogError::InvalidOperation {
+                        message: format!(
+                            "Existing data for table {} violates primary key uniqueness",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+            }
+
+            row_id_base += i64::try_from(batch.num_rows()).unwrap_or(0);
+        }
+
+        Ok(keyset)
     }
 
     /// Sort a record batch stream using `DataFusion`'s `SortExec` for optimal performance.
@@ -1350,6 +1720,117 @@ impl CayenneTableProvider {
         }
 
         Ok(deleted_count)
+    }
+
+    /// Apply deletion vectors generated by on-conflict handling.
+    async fn apply_on_conflict_deletions(
+        &self,
+        delete_specs: HashMap<i64, Vec<i64>>,
+    ) -> CatalogResult<()> {
+        if delete_specs.is_empty() {
+            return Ok(());
+        }
+
+        // Capture existing delete files so we can replace them atomically.
+        let existing_delete_files = self
+            .catalog
+            .get_table_delete_files(self.table_metadata.table_id)
+            .await
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: format!("Failed to load existing delete files: {err}"),
+            })?;
+
+        let existing_ids: Vec<i64> = existing_delete_files
+            .iter()
+            .map(|f| f.delete_file_id)
+            .collect();
+        let existing_paths: Vec<std::path::PathBuf> = existing_delete_files
+            .iter()
+            .map(|f| f.path.clone().into())
+            .collect();
+
+        // Merge new deletions with cached deletions to avoid losing prior tombstones.
+        let cached_deleted = {
+            let guard =
+                self.cached_deleted_row_ids
+                    .read()
+                    .map_err(|_| CatalogError::InvalidOperation {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    })?;
+            Arc::clone(&guard)
+        };
+
+        let mut specs = Vec::new();
+        for (data_file_id, mut rows) in delete_specs {
+            if !cached_deleted.is_empty() && data_file_id == DEFAULT_DATA_FILE_ID {
+                rows.extend(
+                    cached_deleted
+                        .iter()
+                        .map(i64::from)
+                        .filter(|row_id| *row_id >= 0),
+                );
+            }
+            specs.push(DeletionVectorWriteSpec::new(data_file_id, rows));
+        }
+
+        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        let results = writer.write(specs).await?;
+
+        if results.is_empty() {
+            return Ok(());
+        }
+
+        let mut new_deleted_rows = RoaringBitmap::new();
+        // Register new delete files
+        for result in &results {
+            self.catalog
+                .add_delete_file(result.delete_file.clone())
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: format!("Failed to register delete file: {err}"),
+                })?;
+
+            for &row_id in &result.row_ids {
+                if let Ok(row_id_u32) = u32::try_from(row_id) {
+                    new_deleted_rows.insert(row_id_u32);
+                }
+            }
+        }
+
+        // Remove old delete files after new ones are registered.
+        if !existing_ids.is_empty() {
+            self.catalog
+                .remove_delete_files(self.table_metadata.table_id, &existing_ids)
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: format!("Failed to remove old delete files: {err}"),
+                })?;
+
+            // Best-effort cleanup of old files on disk.
+            for path in existing_paths {
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    tracing::debug!(
+                        "Failed to delete obsolete deletion vector file {:?}: {err}",
+                        path
+                    );
+                }
+            }
+        }
+
+        // Refresh deletion cache with new rows (union with existing cache).
+        {
+            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
+                CatalogError::InvalidOperation {
+                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                }
+            })?;
+
+            let mut merged = (**guard).clone();
+            merged |= new_deleted_rows;
+            *guard = Arc::new(merged);
+        }
+
+        Ok(())
     }
 
     /// Refresh the cached deletion vectors by reloading from the catalog.
@@ -2382,6 +2863,7 @@ mod tests {
                 table_name: table_name.to_string(),
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
+                on_conflict: None,
                 base_path: temp_dir.path().to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
@@ -2823,6 +3305,7 @@ mod tests {
             table_name: "sorted_test".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec![],
+            on_conflict: None,
             base_path: data_path.to_string_lossy().to_string(),
             partition_column: None,
             vortex_config,

@@ -119,6 +119,7 @@ impl SqliteMetastore {
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
+            on_conflict_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
             partition_column TEXT,
             vortex_config_json TEXT
@@ -301,6 +302,13 @@ impl MetastoreBackend for SqliteMetastore {
                 "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_partition_id', 1)",
                 [],
             )?;
+
+            // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
+            // Ignore errors when the column already exists to keep init idempotent.
+            let _ = conn.execute(
+                "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
+                [],
+            );
 
             Ok::<(), CatalogError>(())
         })

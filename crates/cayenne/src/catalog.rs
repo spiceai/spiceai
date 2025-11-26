@@ -159,6 +159,13 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: i64) -> CatalogResult<Vec<DeleteFile>>;
 
+    /// Remove delete files (deletion vectors) by ID for a table.
+    async fn remove_delete_files(
+        &self,
+        table_id: i64,
+        delete_file_ids: &[i64],
+    ) -> CatalogResult<()>;
+
     /// Get statistics for a table.
     async fn get_table_stats(&self, table_id: i64) -> CatalogResult<TableStats>;
 
