@@ -23,6 +23,7 @@ use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResul
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
+use crate::embeddings::index::VectorScanTableProvider;
 use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
@@ -34,6 +35,7 @@ use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
+use search::generation::text_search::index::FullTextDatabaseIndex;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 
 use std::any::Any;
@@ -246,14 +248,24 @@ impl DataConnector for EmbeddingConnector {
             .downcast_ref::<IndexedTableProvider>()
             .cloned()
         {
-            let indexed_table = Arc::new(indexed_table);
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
                 return self.inner_connector.changes_stream(federated_table);
             };
 
-            let indexes = Indexes::new(indexed_table.get_all_indexes());
+            // Avoid reindexing full-text indexes.
+            let indexes = Indexes::new(
+                indexed_table
+                    .get_all_indexes()
+                    .into_iter()
+                    .filter(|idx| {
+                        idx.as_any()
+                            .downcast_ref::<FullTextDatabaseIndex>()
+                            .is_none()
+                    })
+                    .collect(),
+            );
 
             let stream = self
                 .inner_connector

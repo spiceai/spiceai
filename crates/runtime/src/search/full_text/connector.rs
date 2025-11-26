@@ -16,7 +16,8 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::{Index, IndexedTableProvider};
+use search::generation::text_search::index::FullTextDatabaseIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -30,10 +31,8 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
-use crate::search::util::find_index_in_table_provider;
+use crate::search::util::{find_concrete_table_provider, find_index_in_table_provider};
 use futures::StreamExt;
-
-use search::generation::text_search::index::FullTextDatabaseIndex;
 
 /// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
@@ -56,8 +55,7 @@ impl FullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
-
-        let Some((indexed, underlying)) =
+        let Some((indexes, _)) =
             find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
         else {
             tracing::debug!(
@@ -65,15 +63,16 @@ impl FullTextConnector {
             );
             return None;
         };
+        let indexed = Indexes::new(
+            indexes
+                .into_iter()
+                .cloned()
+                .map(|i| Arc::new(i) as Arc<dyn Index + Send + Sync>)
+                .collect(),
+        );
 
-        let indexed = indexed
-            .into_iter()
-            .cloned()
-            .map(|i| Arc::new(i) as Arc<dyn Index + Send + Sync>)
-            .collect();
-
-        let indexed = Indexes::new(indexed);
-        let ft = Arc::new(FederatedTable::Immediate(underlying));
+        // Use `table_provider` to preserve IndexedTableProvider for `self.inner_connector` whom may need it.
+        let ft = Arc::new(FederatedTable::Immediate(Arc::clone(&table_provider)));
 
         let stream = f(&self.inner_connector, ft)?;
         Some(
