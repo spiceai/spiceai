@@ -86,9 +86,8 @@ impl ColumnBounds for ExactColumnBounds {
             .sum::<usize>();
 
         if total_memory_size > MAXIMUM_INLIST_MEMORY_BYTES {
-            tracing::warn!(
-                "ExactLeftAccumulator exceeded maximum in-list memory size ({} bytes > {} bytes). \
-                Consider using a different accumulator with approximation or range merging to reduce memory usage.",
+            tracing::debug!(
+                "ExactLeftAccumulator exceeded maximum in-list memory size ({} bytes > {} bytes).",
                 total_memory_size,
                 MAXIMUM_INLIST_MEMORY_BYTES
             );
