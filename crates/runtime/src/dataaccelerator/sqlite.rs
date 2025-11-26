@@ -341,12 +341,7 @@ impl DataAccelerator for SqliteAccelerator {
     }
 }
 
-register_data_accelerator!(
-    new_sqlite_accelerator,
-    SQLITE_ACCELERATOR_REGISTRATION,
-    crate::component::dataset::acceleration::Engine::Sqlite,
-    crate::dataaccelerator::sqlite::SqliteAccelerator
-);
+register_data_accelerator!(Engine::Sqlite, SqliteAccelerator);
 
 #[cfg(test)]
 mod tests {

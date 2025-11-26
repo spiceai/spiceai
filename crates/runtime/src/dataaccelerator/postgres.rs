@@ -28,8 +28,8 @@ use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
 use crate::{
-    datafusion::udf::deny_spice_specific_functions, parameters::ParameterSpec,
-    register_data_accelerator,
+    component::dataset::acceleration::Engine, datafusion::udf::deny_spice_specific_functions,
+    parameters::ParameterSpec, register_data_accelerator,
 };
 
 use super::{AccelerationSource, DataAccelerator};
@@ -191,9 +191,4 @@ impl DataAccelerator for PostgresAccelerator {
     }
 }
 
-register_data_accelerator!(
-    new_postgres_accelerator,
-    POSTGRES_ACCELERATOR_REGISTRATION,
-    crate::component::dataset::acceleration::Engine::PostgreSQL,
-    crate::dataaccelerator::postgres::PostgresAccelerator
-);
+register_data_accelerator!(Engine::PostgreSQL, PostgresAccelerator);

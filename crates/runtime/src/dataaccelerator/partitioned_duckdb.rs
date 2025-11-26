@@ -56,7 +56,7 @@ use super::{
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
-    component::dataset::acceleration::Mode,
+    component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::FilePathError,
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     parameters::ParameterSpec,
@@ -494,9 +494,4 @@ async fn get_pool(
     ))
 }
 
-register_data_accelerator!(
-    new_partitioned_duckdb_accelerator,
-    PARTITIONED_DUCKDB_ACCELERATOR_REGISTRATION,
-    crate::component::dataset::acceleration::Engine::PartitionedDuckDB,
-    crate::dataaccelerator::partitioned_duckdb::PartitionedDuckDBAccelerator
-);
+register_data_accelerator!(Engine::PartitionedDuckDB, PartitionedDuckDBAccelerator);

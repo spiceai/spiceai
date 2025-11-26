@@ -1093,12 +1093,7 @@ impl PartitionCreator for CayennePartitionCreator {
     }
 }
 
-register_data_accelerator!(
-    new_cayenne_accelerator,
-    CAYENNE_ACCELERATOR_REGISTRATION,
-    crate::component::dataset::acceleration::Engine::Cayenne,
-    crate::dataaccelerator::cayenne::CayenneAccelerator
-);
+register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {

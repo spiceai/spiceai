@@ -88,6 +88,17 @@ macro_rules! register_data_accelerator {
         pub static $static_name: $crate::dataaccelerator::AcceleratorRegistration =
             $crate::dataaccelerator::AcceleratorRegistration::new($engine, $fn_name);
     };
+
+    ($engine:expr, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $accelerator
+            );
+        }
+    };
 }
 
 #[derive(Debug, Snafu)]
