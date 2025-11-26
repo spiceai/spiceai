@@ -19,6 +19,7 @@ use {
     crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
     ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
+    std::net::ToSocketAddrs,
 };
 
 use crate::auth::EndpointAuth;
@@ -527,23 +528,19 @@ pub async fn start(
 
     // If running an executor, we may have resolved another port to bind if 50051 is taken
     #[cfg(feature = "cluster")]
-    let bind_address: SocketAddr = if let Some((host, port)) =
-        rt.df.executor.read().ok().and_then(|maybe_executor| {
+    let bind_address = rt
+        .df
+        .executor
+        .read()
+        .ok()
+        .and_then(|maybe_executor| {
             maybe_executor
                 .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
-        }) {
-        if let Ok(addr) = format!("{host}:{port}").parse() {
-            addr
-        } else {
-            tracing::warn!(
-                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
-            );
-            bind_address
-        }
-    } else {
-        bind_address
-    };
+                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
+        })
+        .and_then(|spec| spec.to_socket_addrs().ok())
+        .and_then(|mut addrs| addrs.next())
+        .unwrap_or_else(|| bind_address);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
