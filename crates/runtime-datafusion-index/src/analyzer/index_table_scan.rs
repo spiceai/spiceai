@@ -154,11 +154,11 @@ impl IndexTableScanNode {
         Self { input, indexes }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn indexes(&self) -> &[Arc<dyn Index + Send + Sync>] {
         &self.indexes
     }
-    #[must_use] 
+    #[must_use]
     pub fn input(&self) -> &LogicalPlan {
         &self.input
     }

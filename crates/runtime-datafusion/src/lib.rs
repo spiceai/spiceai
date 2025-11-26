@@ -19,7 +19,6 @@ pub mod execution_plan;
 pub mod extension;
 pub mod optimizer_rule;
 pub mod schema_provider;
-pub mod stream_utils;
 
 use snafu::prelude::*;
 

@@ -1044,7 +1044,7 @@ impl DataSink for MemSink {
                     stream::iter(vec![Ok(combined_batch)]),
                 );
 
-                let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+                let sorted_stream = util::stream_utils::sort_stream(
                     Box::pin(sorted_stream),
                     &self.sort_columns,
                     context,
