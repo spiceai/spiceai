@@ -152,7 +152,7 @@ impl DataConnector for DynamoDB {
 
         let stream_poll_interval_ms = self
             .params
-            .get("stream_poll_interval_ms_str")
+            .get("stream_poll_interval_ms")
             .expose()
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -240,10 +240,16 @@ impl DataConnector for DynamoDB {
         Some(Box::pin(
             stream::once(async move {
                 let table_provider = federated_table.table_provider().await;
-                table_provider
+
+                let dynamodb = table_provider
                     .as_any()
-                    .downcast_ref::<DynamoDBTableProvider>()
-                    .map(DynamoDBTableProvider::changes_stream_from_trim_horizon)
+                    .downcast_ref::<DynamoDBTableProvider>()?;
+
+                let checkpoint = dynamodb.latest_global_checkpoint().await.ok()?;
+
+                // TODO: Add table bootstrapping and proper error handling
+
+                dynamodb.stream_from_checkpoint(checkpoint).await.ok()
             })
             .filter_map(|opt| async move { opt })
             .flatten(),

@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::stream_state::DynamoDBStreamBatch;
 use snafu::Snafu;
 
 pub mod checkpoint;
@@ -21,6 +20,10 @@ pub mod client;
 mod client_sdk;
 mod stream;
 mod stream_state;
+
+pub use crate::stream_state::DynamoDBStreamBatch;
+pub use client::Client;
+pub use stream::DynamodbStream;
 
 pub type StreamResult = Result<DynamoDBStreamBatch, Error>;
 

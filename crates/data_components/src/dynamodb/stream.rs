@@ -25,24 +25,22 @@ use arrow::datatypes::Schema;
 use arrow_array::RecordBatch;
 use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder};
 use aws_sdk_dynamodb::types::AttributeValue as DynamoDbAttributeValue;
-use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
 use aws_sdk_dynamodbstreams::types::OperationType;
-use dynamo_subscriber::error::StreamResult;
+use aws_sdk_dynamodbstreams::types::{AttributeValue as StreamsAttributeValue, Record};
+use dynamodb_streams::{DynamoDBStreamBatch, StreamResult};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 pub fn process_batch(
-    batch: StreamResult,
+    batch: Vec<Record>,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
 ) -> Result<ChangeEnvelope, StreamError> {
     let changes_schema = changes_schema(table_schema).clone();
-
-    let batch = batch.map_err(|e| StreamError::FailedToReceiveMessage { source: e })?;
 
     let mut changes_struct_builder =
         StructBuilder::from_fields(changes_schema.fields().clone(), batch.len());
@@ -192,6 +190,7 @@ mod tests {
     use aws_sdk_dynamodbstreams::types::{
         AttributeValue as StreamsAttributeValue, OperationType, Record, StreamRecord,
     };
+    use dynamodb_streams::DynamoDBStreamBatch;
     use std::collections::HashMap;
 
     const TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
@@ -239,7 +238,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -270,7 +269,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -297,7 +296,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -317,7 +316,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -354,7 +353,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -395,13 +394,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(
-            Ok(batch),
-            &table_schema,
-            &primary_keys,
-            Some(2),
-            TIME_FORMAT,
-        );
+        let result = process_batch(batch, &table_schema, &primary_keys, Some(2), TIME_FORMAT);
 
         assert!(result.is_ok());
     }
@@ -424,7 +417,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec![]; // Empty primary keys
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -442,7 +435,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -463,7 +456,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -484,7 +477,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -511,7 +504,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string(), "sort_key".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -543,7 +536,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");
@@ -571,7 +564,7 @@ mod tests {
         let primary_keys = vec!["id".to_string()];
 
         let result = process_batch(
-            Ok(batch),
+            batch,
             &table_schema,
             &primary_keys.clone(),
             None,
@@ -604,7 +597,7 @@ mod tests {
         let table_schema = create_test_table_schema();
         let primary_keys = vec!["id".to_string()];
 
-        let result = process_batch(Ok(batch), &table_schema, &primary_keys, None, TIME_FORMAT);
+        let result = process_batch(batch, &table_schema, &primary_keys, None, TIME_FORMAT);
 
         assert!(result.is_ok());
         let envelope = result.expect("change envelope");

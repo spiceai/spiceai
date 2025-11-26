@@ -47,7 +47,7 @@ duckdb = { workspace = true, features = [
     "vtab-arrow",
     "appender-arrow",
 ], optional = true }
-dynamo-subscriber = { workspace = true, optional = true}
+dynamodb-streams = { path="../dynamodb-streams", optional = true}
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 git2 = { workspace = true }
@@ -117,7 +117,7 @@ dynamodb = [
     "dep:aws-sdk-dynamodb",
     "dep:aws-sdk-dynamodbstreams",
     "dep:aws-smithy-async",
-    "dep:dynamo-subscriber",
+    "dep:dynamodb-streams",
 ]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]

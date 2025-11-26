@@ -68,14 +68,18 @@ pub enum Error {
 
     #[snafu(display("Table has no partition key"))]
     MissingPartitionKey,
+
+    #[snafu(display("Failed to initialize DynamoDB Stream checkpoint: {source}"))]
+    FailedToInitializeCheckpoint { source: dynamodb_streams::Error },
+
+    #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
+    FailedToInitializeStream { source: dynamodb_streams::Error },
 }
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
     #[snafu(display("Failed to receive DynamoDB Stream record: {source}"))]
-    FailedToReceiveMessage {
-        source: dynamo_subscriber::error::Error,
-    },
+    FailedToReceiveMessage { source: dynamodb_streams::Error },
 
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,

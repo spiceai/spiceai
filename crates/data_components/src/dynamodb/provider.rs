@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
-    TableStatusIsNotActiveSnafu,
+    DescribeTableSnafu, Error, FailedToInitializeCheckpointSnafu, FailedToInitializeStreamSnafu,
+    Result, ScanSnafu, StreamError, TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangesStream;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
@@ -51,11 +51,12 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use dynamo_subscriber::error::StreamResult;
-use dynamo_subscriber::{Client as StreamsClient, SDKClient};
+use dynamodb_streams::checkpoint::GlobalCheckpoint;
+use dynamodb_streams::{Client as StreamsClient, DynamodbStream, StreamResult};
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
+use logos::internal::CallbackResult;
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -65,7 +66,7 @@ use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
     db_client: Arc<DbClient>,
-    streams_client: Arc<StreamsClient<SDKClient>>,
+    streams_client: Arc<StreamsClient>,
     table_schema: DynamoDBTableSchema,
     constraints: Option<Constraints>,
     request_plan_builder: DynamoDBRequestPlanBuilder,
@@ -253,37 +254,45 @@ impl DynamoDBTableProvider {
         }
     }
 
-    fn wrap_changes_stream<S>(&self, stream: S) -> ChangesStream
-    where
-        S: Stream<Item = StreamResult> + Send + 'static,
-    {
+    pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
+        self.streams_client
+            .latest_global_checkpoint()
+            .await
+            .context(FailedToInitializeStreamSnafu)
+    }
+
+    pub async fn stream_from_checkpoint(
+        &self,
+        checkpoint: GlobalCheckpoint,
+    ) -> Result<ChangesStream> {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
         let time_format = Arc::clone(&self.table_schema.time_format());
 
-        let stream = stream.map(move |batch| {
-            process_batch(
-                batch,
-                &table_schema,
-                &primary_keys,
-                unnest_depth,
-                &time_format,
-            )
-            .map_err(crate::cdc::StreamError::DynamoDB)
-        });
+        let stream = self
+            .streams_client
+            .stream_from_checkpoint(checkpoint)
+            .await
+            .context(FailedToInitializeCheckpointSnafu)?
+            .map(move |batch| {
+                let batch = batch.map_err(|e| {
+                    crate::cdc::StreamError::DynamoDB(StreamError::FailedToReceiveMessage {
+                        source: e,
+                    })
+                })?;
 
-        Box::pin(stream)
-    }
+                process_batch(
+                    batch.records,
+                    &table_schema,
+                    &primary_keys,
+                    unnest_depth,
+                    &time_format,
+                )
+                .map_err(crate::cdc::StreamError::DynamoDB)
+            });
 
-    #[must_use]
-    pub fn changes_stream_from_latest(&self) -> ChangesStream {
-        self.wrap_changes_stream(self.streams_client.stream_from_latest())
-    }
-
-    #[must_use]
-    pub fn changes_stream_from_trim_horizon(&self) -> ChangesStream {
-        self.wrap_changes_stream(self.streams_client.stream_from_trim_horizon())
+        Ok(Box::pin(stream))
     }
 }
 
