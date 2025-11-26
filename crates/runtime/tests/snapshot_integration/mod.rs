@@ -54,15 +54,6 @@ use spicepod::{
     },
     param::Params,
 };
-use std::{
-    collections::HashMap,
-    env,
-    io::Cursor,
-    path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
-    time::{Duration, Instant},
-};
-use tar::Archive;
 use tar::Archive;
 use tempfile::TempDir;
 use tokio::{

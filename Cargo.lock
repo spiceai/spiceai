@@ -13197,6 +13197,7 @@ dependencies = [
  "spicepod",
  "strsim 0.11.1",
  "sysinfo 0.35.2",
+ "tar",
  "telemetry",
  "tempfile",
  "tera",
