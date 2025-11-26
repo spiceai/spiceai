@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::index::VectorScanTableProvider;
 use crate::accelerated_table::AcceleratedTable;
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
@@ -36,6 +35,7 @@ use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
+use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::any::Any;
 use std::sync::Arc;
