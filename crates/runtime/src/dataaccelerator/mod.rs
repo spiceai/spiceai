@@ -246,16 +246,13 @@ impl AcceleratorEngineRegistry {
         .indexes(acceleration_settings.indexes.clone());
 
         // If there are constraints from the federated table, then add them to the accelerated table
-        // and automatically configure upsert behavior for them. This can be overridden by the user.
+        // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
         if let Some(constraints) = constraints
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
-            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                ColumnReference::new(primary_keys),
-                UpsertOptions::default(),
-            ));
+            let _primary_keys: Vec<String> =
+                get_primary_keys_from_constraints(constraints, &schema);
         }
 
         if let Some(on_conflict) =
@@ -496,7 +493,12 @@ impl AcceleratorExternalTableBuilder {
         }
 
         if let Some(on_conflict) = self.on_conflict {
-            options.insert("on_conflict".to_string(), on_conflict.to_string());
+            let on_conflict_str = on_conflict.to_string();
+            tracing::info!(
+                "[UPSERT DEBUG] Adding on_conflict to options: {}",
+                on_conflict_str
+            );
+            options.insert("on_conflict".to_string(), on_conflict_str);
         }
 
         let constraints = match self.constraints {
@@ -1876,7 +1878,10 @@ mod accelerator_compat_tests {
             assert_eq!(total_rows, 100, "{:?}: should have {} rows", engine, 100);
 
             // Test 2: Filter with WHERE clause (id > 50)
-            // Note: Arrow and Vortex engines don't support filter pushdown, so they return all rows
+            // Note: Arrow and Vortex engines don't support filter pushdown at the TableProvider
+            // level (via scan() method). Vortex supports filter pushdown at the physical plan
+            // level via DataFusion's FilterPushdown optimizer rule, but that only applies when
+            // running SQL queries, not when calling scan() directly.
             let filter = col("id").gt(lit(50_i64));
             let scan = table
                 .scan(&ctx.state(), None, &[filter], None)
@@ -1910,7 +1915,8 @@ mod accelerator_compat_tests {
             );
 
             // Test 4: LIMIT clause
-            // Note: Arrow and Vortex engines don't support limit pushdown
+            // Note: Arrow doesn't support limit pushdown. Vortex supports limit pushdown via
+            // FileScanConfig.limit at the TableProvider level when scan() is called with a limit.
             let limit = Some(10);
             let scan = table
                 .scan(&ctx.state(), None, &[], limit)
@@ -1930,7 +1936,9 @@ mod accelerator_compat_tests {
             }
 
             // Test 5: Combined filter + projection + limit
-            // Note: Arrow and Vortex engines don't support filter/limit pushdown
+            // Note: Arrow doesn't support filter/limit pushdown at the TableProvider level.
+            // Vortex supports limit pushdown via FileScanConfig.limit but filter pushdown
+            // only works via DataFusion's physical optimizer (when running SQL queries).
             let filter = col("id").lt(lit(30_i64));
             let projection = Some(vec![1_usize]); // name only
             let limit = Some(5);
@@ -2378,7 +2386,9 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            // (when calling scan() directly). Filter pushdown for Vortex only works via
+            // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
@@ -2404,7 +2414,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2428,7 +2438,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2454,7 +2464,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2602,9 +2612,10 @@ mod accelerator_compat_tests {
                 .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow doesn't support filter or limit pushdown, so it returns all rows
-            // Vortex doesn't support filter pushdown but does support limit pushdown
-            // DuckDB supports both filter and limit pushdown
+            // Arrow doesn't support filter or limit pushdown at the TableProvider level
+            // Vortex doesn't support filter pushdown at TableProvider level (only via physical
+            // optimizer when running SQL), but does support limit pushdown via FileScanConfig.limit
+            // DuckDB supports both filter and limit pushdown at TableProvider level
             if engine == Engine::Arrow {
                 // No pushdown - returns all 10 rows
                 assert_eq!(

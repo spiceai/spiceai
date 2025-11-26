@@ -100,6 +100,7 @@ opentelemetry-proto = { version = "0.30", features = [
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
+parking_lot.workspace = true
 percent-encoding.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
@@ -149,6 +150,7 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 strsim = { version = "0.11.1", optional = true }
+sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
@@ -179,6 +181,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+gethostname.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

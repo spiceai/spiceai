@@ -24,7 +24,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{TableReference, project_schema},
+    common::{TableReference, project_schema, utils::quote_identifier},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -415,7 +415,7 @@ impl FlightExec {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 

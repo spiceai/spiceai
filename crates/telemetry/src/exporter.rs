@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
-use opentelemetry_sdk::metrics::MetricError;
+use opentelemetry_sdk::error::OTelSdkResult;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -99,7 +99,7 @@ pub struct TelemetryExporter {
 
 #[async_trait]
 impl otel_arrow::ArrowExporter for TelemetryExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
+    async fn export(&self, metrics: RecordBatch) -> OTelSdkResult {
         let Some(mut flight_client) = self.flight_client.clone() else {
             return Ok(());
         };
@@ -114,11 +114,11 @@ impl otel_arrow::ArrowExporter for TelemetryExporter {
         Ok(())
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
+    fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricError> {
+    fn shutdown(&self) -> OTelSdkResult {
         Ok(())
     }
 }

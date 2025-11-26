@@ -25,9 +25,11 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use futures::stream;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
@@ -100,6 +102,11 @@ pub struct MemTable {
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
 
     pub on_conflict: Option<OnConflict>,
+
+    /// Optional columns to sort by during insert operations.
+    /// When specified, data is sorted before being written to improve
+    /// zone map efficiency for range queries.
+    sort_columns: Vec<String>,
 }
 
 impl MemTable {
@@ -133,7 +140,14 @@ impl MemTable {
             column_defaults: HashMap::new(),
             sort_order: Arc::new(Mutex::new(vec![])),
             on_conflict: None,
+            sort_columns: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_sort_columns(mut self, sort_columns: Vec<String>) -> Self {
+        self.sort_columns = sort_columns;
+        self
     }
 
     #[must_use]
@@ -219,6 +233,7 @@ impl MemTable {
         on_conflict: &ColumnReference,
     ) -> Result<()> {
         let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
+        let schema = self.schema();
 
         if on_conflict_cols.len() != pk.len() {
             return Err(DataFusionError::Execution(
@@ -226,16 +241,13 @@ impl MemTable {
             ));
         }
 
-        let schema = self.schema();
-
-        if on_conflict_cols
-            .iter()
-            .zip(pk.iter())
-            .any(|(c, pk)| c != schema.field(*pk).name())
-        {
-            return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
-            ));
+        for (c, pk_idx) in on_conflict_cols.iter().zip(pk.iter()) {
+            let pk_name = schema.field(*pk_idx).name();
+            if c != pk_name {
+                return Err(DataFusionError::Execution(
+                    "Primary key must match the on_conflict definition".to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -329,6 +341,7 @@ impl TableProvider for MemTable {
             primary_key,
             self.schema(),
             self.on_conflict.clone(),
+            self.sort_columns.clone(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
@@ -348,6 +361,9 @@ struct MemSink {
     primary_key: Option<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
+
+    /// Optional columns to sort by before writing
+    sort_columns: Vec<String>,
 }
 
 impl Debug for MemSink {
@@ -378,6 +394,7 @@ impl MemSink {
         primary_key: Option<Vec<usize>>,
         schema: SchemaRef,
         on_conflict: Option<OnConflict>,
+        sort_columns: Vec<String>,
     ) -> Self {
         Self {
             batches,
@@ -389,6 +406,7 @@ impl MemSink {
             }),
             schema,
             on_conflict,
+            sort_columns,
         }
     }
 }
@@ -912,16 +930,16 @@ impl DataSink for MemSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
 
-        // buffer up the data round robin style into num_partitions
-
+        // Collect data into partitions (round-robin distribution)
         let mut new_batches = vec![vec![]; num_partitions];
         let mut i = 0;
         let mut row_count = 0;
+        let mut data = data;
         while let Some(batch) = data
             .next()
             .await
@@ -935,6 +953,11 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
+        //
+        // For InsertOp::Replace, we allow duplicate primary keys in new data because the operation will:
+        // 1. Remove all existing rows matching ANY of the new primary keys
+        // 2. Insert all new rows (even if they share primary keys)
+        // This is essential for caching scenarios where multiple result rows share the same request metadata.
         let mut new_key_set: HashSet<
             String,
             std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
@@ -942,9 +965,26 @@ impl DataSink for MemSink {
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
-            new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
-            >(&new_primary_key_ids, None)?;
+
+            // For InsertOp::Replace, we don't require unique primary keys in new data
+            // because we'll remove all existing rows with these keys before inserting
+            if matches!(self.overwrite, InsertOp::Replace) {
+                // Just collect unique keys and check for nulls, don't enforce uniqueness
+                for id in &new_primary_key_ids {
+                    if let Some(key) = id {
+                        new_key_set.insert(key.to_string());
+                    } else {
+                        return Err(DataFusionError::Execution(
+                            "Primary key values cannot be null".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                // For Append/Overwrite, require unique primary keys
+                new_key_set = check_and_filter_non_null_unique_primary_keys::<
+                    std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+                >(&new_primary_key_ids, None)?;
+            }
         }
 
         let mut writable_targets: Vec<_> =
@@ -981,6 +1021,39 @@ impl DataSink for MemSink {
                     }
                 }
             }
+
+            // IMPORTANT: Sort happens AFTER deduplication/filtering to ensure we only sort
+            // the final data that will actually be written. This matches Cayenne's behavior
+            // where sorting happens after retention filters are applied.
+            if !self.sort_columns.is_empty() && !batches.is_empty() {
+                // Concatenate batches in this partition for sorting
+                let schema = batches[0].schema();
+                let combined_batch = if batches.len() == 1 {
+                    // SAFETY: We've just checked that batches.len() == 1, so pop() cannot fail
+                    match batches.pop() {
+                        Some(batch) => batch,
+                        None => unreachable!("batches.len() == 1 guarantees pop() succeeds"),
+                    }
+                } else {
+                    arrow::compute::concat_batches(&schema, &batches)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+                };
+
+                let sorted_stream = RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    stream::iter(vec![Ok(combined_batch)]),
+                );
+
+                let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+                    Box::pin(sorted_stream),
+                    &self.sort_columns,
+                    context,
+                )?;
+
+                // Collect sorted batches
+                batches = datafusion::physical_plan::common::collect(sorted_stream).await?;
+            }
+
             target.append(&mut batches);
         }
 

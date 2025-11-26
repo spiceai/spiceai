@@ -41,7 +41,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::Value;
@@ -974,7 +974,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
 #[allow(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
+    trace_provider: &SdkTracerProvider,
 ) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;

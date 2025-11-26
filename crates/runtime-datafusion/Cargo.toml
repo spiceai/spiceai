@@ -18,6 +18,7 @@ datafusion.workspace = true
 datafusion-federation = { workspace = true }
 futures.workspace = true
 opentelemetry.workspace = true
+parking_lot.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
 snafu.workspace = true
 tracing.workspace = true
