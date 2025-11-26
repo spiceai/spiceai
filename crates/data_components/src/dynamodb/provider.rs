@@ -51,8 +51,8 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use dynamodb_streams::checkpoint::GlobalCheckpoint;
 use dynamodb_streams::Client as StreamsClient;
+use dynamodb_streams::checkpoint::GlobalCheckpoint;
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
