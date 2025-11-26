@@ -245,8 +245,12 @@ impl DataConnector for DynamoDB {
                     .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
+                // Error handling will be added in the next PR
                 let checkpoint = dynamodb.latest_global_checkpoint().await.ok()?;
 
+                // Table bootstrapping will be added in the next PR
+
+                // Error handling will be added in the next PR
                 dynamodb.stream_from_checkpoint(checkpoint).await.ok()
             })
             .filter_map(|opt| async move { opt })
