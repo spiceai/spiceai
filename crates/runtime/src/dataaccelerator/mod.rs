@@ -32,11 +32,8 @@ use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-<<<<<<< HEAD
-use runtime_acceleration::snapshot::SnapshotAdapter;
-=======
 use linkme::distributed_slice;
->>>>>>> origin/trunk
+use runtime_acceleration::snapshot::SnapshotAdapter;
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
