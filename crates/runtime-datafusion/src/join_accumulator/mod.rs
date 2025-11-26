@@ -109,7 +109,7 @@ impl ColumnBounds for ExactColumnBounds {
             .into_iter()
             .collect();
 
-        if unique_values.len() == 0 {
+        if unique_values.is_empty() {
             // No values collected - return a no-op filter (always true)
             return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))));
         }
