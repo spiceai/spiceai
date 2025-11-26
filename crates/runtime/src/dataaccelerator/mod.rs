@@ -246,16 +246,13 @@ impl AcceleratorEngineRegistry {
         .indexes(acceleration_settings.indexes.clone());
 
         // If there are constraints from the federated table, then add them to the accelerated table
-        // and automatically configure upsert behavior for them. This can be overridden by the user.
+        // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
         if let Some(constraints) = constraints
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
-            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                ColumnReference::new(primary_keys),
-                UpsertOptions::default(),
-            ));
+            let _primary_keys: Vec<String> =
+                get_primary_keys_from_constraints(constraints, &schema);
         }
 
         if let Some(on_conflict) =
@@ -496,7 +493,12 @@ impl AcceleratorExternalTableBuilder {
         }
 
         if let Some(on_conflict) = self.on_conflict {
-            options.insert("on_conflict".to_string(), on_conflict.to_string());
+            let on_conflict_str = on_conflict.to_string();
+            tracing::info!(
+                "[UPSERT DEBUG] Adding on_conflict to options: {}",
+                on_conflict_str
+            );
+            options.insert("on_conflict".to_string(), on_conflict_str);
         }
 
         let constraints = match self.constraints {

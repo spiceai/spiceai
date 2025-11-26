@@ -17,14 +17,14 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, common::Constraints, datasource::TableProvider,
+    execution::context::SessionContext, logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::parameters::ParameterSpec;
+use crate::{component::dataset::acceleration::RefreshMode, parameters::ParameterSpec};
 
 use super::{AccelerationSource, DataAccelerator};
 
@@ -76,6 +76,18 @@ impl DataAccelerator for ArrowAccelerator {
                 msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
+
+        // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
+        // which overwrites the entire table. Primary key constraints cause uniqueness validation
+        // errors during inserts because Arrow doesn't support upsert operations.
+        let is_caching_mode = source
+            .and_then(|s| s.acceleration())
+            .and_then(|a| a.refresh_mode.as_ref())
+            .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
+
+        if is_caching_mode {
+            cmd.constraints = Constraints::new_unverified(vec![]);
+        }
 
         // Extract sort_columns from acceleration params if provided
         if let Some(source) = source

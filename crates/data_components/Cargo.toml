@@ -52,6 +52,7 @@ globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 http.workspace = true
+httpdate.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
