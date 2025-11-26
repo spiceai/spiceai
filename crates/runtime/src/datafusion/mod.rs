@@ -1190,8 +1190,7 @@ impl DataFusion {
             && dataset.time_column.is_none()
             && acceleration_settings.engine != Engine::Cayenne
         {
-            let append_stream = source.append_stream(source_table_provider);
-            if let Some(append_stream) = append_stream {
+            if let Some(append_stream) = source.append_stream(source_table_provider) {
                 accelerated_table_builder.append_stream(append_stream);
             } else {
                 return Err(Error::AppendRequiresTimeColumn {
