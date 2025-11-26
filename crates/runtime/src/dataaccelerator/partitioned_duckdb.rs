@@ -493,3 +493,10 @@ async fn get_pool(
             .await?,
     ))
 }
+
+register_data_accelerator!(
+    new_partitioned_duckdb_accelerator,
+    PARTITIONED_DUCKDB_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::PartitionedDuckDB,
+    crate::dataaccelerator::partitioned_duckdb::PartitionedDuckDBAccelerator
+);

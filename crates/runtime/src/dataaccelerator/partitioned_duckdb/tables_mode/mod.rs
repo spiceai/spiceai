@@ -439,6 +439,13 @@ async fn get_pool(
     ))
 }
 
+register_data_accelerator!(
+    new_tables_mode_duckdb_accelerator,
+    TABLES_MODE_DUCKDB_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::TableModePartitionedDuckDB,
+    crate::dataaccelerator::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -187,3 +187,10 @@ impl DataAccelerator for PostgresAccelerator {
         PARAMETERS
     }
 }
+
+register_data_accelerator!(
+    new_postgres_accelerator,
+    POSTGRES_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::PostgreSQL,
+    crate::dataaccelerator::postgres::PostgresAccelerator
+);

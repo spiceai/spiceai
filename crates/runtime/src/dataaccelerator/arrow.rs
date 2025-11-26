@@ -114,3 +114,10 @@ impl DataAccelerator for ArrowAccelerator {
         PARAMETERS
     }
 }
+
+register_data_accelerator!(
+    new_arrow_accelerator,
+    ARROW_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::Arrow,
+    crate::dataaccelerator::arrow::ArrowAccelerator
+);

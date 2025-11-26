@@ -623,6 +623,13 @@ fn make_retention_write_handler(
     })
 }
 
+register_data_accelerator!(
+    new_duckdb_accelerator,
+    DUCKDB_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::DuckDB,
+    crate::dataaccelerator::duckdb::DuckDBAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};

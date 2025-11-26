@@ -341,6 +341,13 @@ impl DataAccelerator for SqliteAccelerator {
     }
 }
 
+register_data_accelerator!(
+    new_sqlite_accelerator,
+    SQLITE_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::Sqlite,
+    crate::dataaccelerator::sqlite::SqliteAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};

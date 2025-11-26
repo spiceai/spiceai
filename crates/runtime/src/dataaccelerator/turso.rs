@@ -700,6 +700,13 @@ impl DataAccelerator for TursoAccelerator {
     }
 }
 
+register_data_accelerator!(
+    new_turso_accelerator,
+    TURSO_ACCELERATOR_REGISTRATION,
+    crate::component::dataset::acceleration::Engine::Turso,
+    crate::dataaccelerator::turso::TursoAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
