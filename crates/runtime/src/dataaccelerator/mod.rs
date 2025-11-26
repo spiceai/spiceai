@@ -32,6 +32,7 @@ use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use runtime_acceleration::snapshot::SnapshotAdapter;
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -338,6 +339,11 @@ pub trait DataAccelerator: Send + Sync {
 
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
+
+    /// Provides snapshot handling configuration for this accelerator.
+    fn snapshot_adapter(&self) -> SnapshotAdapter {
+        SnapshotAdapter::default()
+    }
 
     /// Initialize the accelerator for a component
     async fn init(

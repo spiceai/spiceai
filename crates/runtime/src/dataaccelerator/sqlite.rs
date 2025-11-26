@@ -245,7 +245,13 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                PathBuf::from(path),
+                self.snapshot_adapter(),
+            )
+            .await;
 
             self.get_shared_pool(source).await?;
         }

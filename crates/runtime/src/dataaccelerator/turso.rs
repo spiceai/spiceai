@@ -483,7 +483,13 @@ impl DataAccelerator for TursoAccelerator {
                 .into());
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                PathBuf::from(path),
+                self.snapshot_adapter(),
+            )
+            .await;
 
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;

@@ -38,7 +38,7 @@ use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{
-    SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics,
+    SnapshotAdapter, SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics,
 };
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -459,6 +459,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    snapshot_adapter: SnapshotAdapter,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -511,6 +512,7 @@ impl Refresher {
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            snapshot_adapter: SnapshotAdapter::default(),
             metrics: None,
             cpu_runtime,
             io_runtime,
@@ -570,6 +572,11 @@ impl Refresher {
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
+        self
+    }
+
+    pub fn with_snapshot_adapter(&mut self, snapshot_adapter: SnapshotAdapter) -> &mut Self {
+        self.snapshot_adapter = snapshot_adapter;
         self
     }
 
@@ -706,17 +713,15 @@ impl Refresher {
             self.snapshot_behavior.create_enabled(),
             self.snapshot_local_path.clone(),
         ) {
-            (true, Some(snapshot_local_path)) => Some(
-                SnapshotManager::try_new(
-                    self.dataset_name.to_string(),
-                    self.snapshot_behavior.clone(),
-                    snapshot_local_path,
-                )
-                .await,
-            ),
+            (true, Some(snapshot_local_path)) => SnapshotManager::try_new(
+                self.dataset_name.to_string(),
+                self.snapshot_behavior.clone(),
+                snapshot_local_path,
+            )
+            .await
+            .map(|manager| manager.with_snapshot_adapter(self.snapshot_adapter)),
             _ => None,
-        }
-        .flatten();
+        };
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both

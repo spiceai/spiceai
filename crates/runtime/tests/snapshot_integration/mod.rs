@@ -40,7 +40,7 @@ use object_store::{
 };
 use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
-    SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+    SnapshotAdapter, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
 use spicepod::{
@@ -253,6 +253,14 @@ impl SnapshotFixture {
 
     async fn cleanup(self) -> Result<()> {
         self.context.cleanup().await
+    }
+}
+
+fn snapshot_adapter_for_engine(engine: &str) -> SnapshotAdapter {
+    if engine.eq_ignore_ascii_case("cayenne") {
+        SnapshotAdapter::directory_archive()
+    } else {
+        SnapshotAdapter::identity()
     }
 }
 
@@ -1053,6 +1061,9 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 fixture.local_db_path.clone(),
             )
             .await
+            .map(|manager| {
+                manager.with_snapshot_adapter(snapshot_adapter_for_engine(fixture.engine))
+            })
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?;
 
             let snapshot_results = try_join_all((0..10).map(|_| {
@@ -1134,6 +1145,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 fixture.local_db_path.clone(),
             )
             .await
+            .map(|manager| manager.with_snapshot_adapter(snapshot_adapter_for_engine(fixture.engine)))
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
 
             let conn = Connection::open(&fixture.local_db_path)

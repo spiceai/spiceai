@@ -44,7 +44,7 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{SnapshotAdapter, SnapshotBehavior};
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
@@ -281,6 +281,7 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    snapshot_adapter: SnapshotAdapter,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -319,6 +320,7 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            snapshot_adapter: SnapshotAdapter::default(),
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -456,6 +458,11 @@ impl Builder {
         self
     }
 
+    pub fn snapshot_adapter(&mut self, snapshot_adapter: SnapshotAdapter) -> &mut Self {
+        self.snapshot_adapter = snapshot_adapter;
+        self
+    }
+
     /// Set the TTL for cache mode
     pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
         self.caching_ttl = ttl;
@@ -582,6 +589,7 @@ impl Builder {
             refresher.semaphore(semaphore);
         }
         refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
+        refresher.with_snapshot_adapter(self.snapshot_adapter);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());

@@ -44,6 +44,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use runtime_acceleration::snapshot::SnapshotAdapter;
 
 #[cfg(feature = "cluster")]
 use {
@@ -1084,6 +1085,13 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
+        let snapshot_adapter: SnapshotAdapter = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .map(|accelerator| accelerator.snapshot_adapter())
+            .unwrap_or_default();
+
         let mut accelerated_table_builder = AcceleratedTable::builder(
             Arc::clone(&self.runtime_status),
             dataset.name.clone(),
@@ -1094,6 +1102,7 @@ impl DataFusion {
             self.io_runtime.clone(),
         );
         accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
+        accelerated_table_builder.snapshot_adapter(snapshot_adapter);
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {

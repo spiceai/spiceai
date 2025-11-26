@@ -16,7 +16,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     fmt::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock},
     time::Instant,
@@ -40,7 +40,7 @@ use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     runtime::Handle,
     sync::RwLock,
 };
@@ -60,6 +60,194 @@ const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
+
+/// Represents a prepared snapshot artifact ready for upload.
+///
+/// When a snapshot requires temporary transformation (e.g., Cayenne archives a directory),
+/// the cleanup handle ensures the temporary file is removed once the upload completes.
+#[derive(Debug)]
+pub struct SnapshotUpload {
+    path: PathBuf,
+    _cleanup: Option<tempfile::TempPath>,
+}
+
+impl SnapshotUpload {
+    #[must_use]
+    pub fn from_path(path: PathBuf) -> Self {
+        Self {
+            path,
+            _cleanup: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_temp_file(file: tempfile::NamedTempFile) -> Self {
+        let path = file.path().to_path_buf();
+        Self {
+            path,
+            _cleanup: Some(file.into_temp_path()),
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SnapshotAdapter {
+    #[default]
+    Identity,
+    DirectoryArchive,
+}
+
+#[derive(Debug, Snafu)]
+pub enum SnapshotAdapterError {
+    #[snafu(display("Failed to create snapshot archive from {}: {source}", path.display()))]
+    CreateArchive { path: PathBuf, source: ArchiveError },
+
+    #[snafu(display("Failed to prepare snapshot file at {}: {source}", path.display()))]
+    PrepareFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to reopen snapshot file at {}: {source}", path.display()))]
+    ReopenTempFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to finalize downloaded snapshot at {}: {source}", path.display()))]
+    FinalizeDownloadArchive { path: PathBuf, source: ArchiveError },
+}
+
+impl SnapshotAdapter {
+    #[must_use]
+    pub fn identity() -> Self {
+        Self::Identity
+    }
+
+    #[must_use]
+    pub fn directory_archive() -> Self {
+        Self::DirectoryArchive
+    }
+
+    /// Prepare the snapshot artifact for upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot file cannot be prepared or archived.
+    pub async fn prepare_upload(
+        &self,
+        source_path: &Path,
+    ) -> Result<SnapshotUpload, SnapshotAdapterError> {
+        match self {
+            SnapshotAdapter::Identity => Ok(SnapshotUpload::from_path(source_path.to_path_buf())),
+            SnapshotAdapter::DirectoryArchive => {
+                let temp_file = tempfile::NamedTempFile::new().map_err(|source| {
+                    SnapshotAdapterError::PrepareFile {
+                        path: source_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+
+                let temp_path = temp_file.path().to_path_buf();
+                let file =
+                    temp_file
+                        .reopen()
+                        .map_err(|source| SnapshotAdapterError::ReopenTempFile {
+                            path: temp_path.clone(),
+                            source,
+                        })?;
+                let tokio_file = fs::File::from_std(file);
+                let mut writer = BufWriter::new(tokio_file);
+
+                let metadata_dir = source_path.join("metadata");
+                let data_dir = source_path.to_path_buf();
+                let dirs = vec![
+                    (metadata_dir, "metadata/".to_string()),
+                    (data_dir, "data/".to_string()),
+                ];
+
+                archive_directories(&dirs, &mut writer)
+                    .await
+                    .map_err(|source| SnapshotAdapterError::CreateArchive {
+                        path: source_path.to_path_buf(),
+                        source,
+                    })?;
+
+                writer
+                    .flush()
+                    .await
+                    .map_err(|source| SnapshotAdapterError::PrepareFile {
+                        path: temp_path.clone(),
+                        source,
+                    })?;
+
+                Ok(SnapshotUpload::from_temp_file(temp_file))
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn download_artifact_path(&self, destination: &Path) -> PathBuf {
+        match self {
+            SnapshotAdapter::Identity => destination.to_path_buf(),
+            SnapshotAdapter::DirectoryArchive => destination.with_extension("tar"),
+        }
+    }
+
+    /// Finalize a downloaded snapshot artifact by moving or extracting it to the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if extraction or file moves fail.
+    pub async fn finalize_download(
+        &self,
+        artifact_path: &Path,
+        destination: &Path,
+    ) -> Result<(), SnapshotAdapterError> {
+        match self {
+            SnapshotAdapter::Identity => {
+                if artifact_path != destination {
+                    fs::rename(artifact_path, destination)
+                        .await
+                        .map_err(|source| SnapshotAdapterError::PrepareFile {
+                            path: destination.to_path_buf(),
+                            source,
+                        })?;
+                }
+                Ok(())
+            }
+            SnapshotAdapter::DirectoryArchive => {
+                let file = fs::File::open(artifact_path).await.map_err(|source| {
+                    SnapshotAdapterError::PrepareFile {
+                        path: artifact_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+
+                extract_archive(BufReader::new(file), destination)
+                    .await
+                    .map_err(|source| SnapshotAdapterError::FinalizeDownloadArchive {
+                        path: destination.to_path_buf(),
+                        source,
+                    })?;
+
+                fs::remove_file(artifact_path).await.map_err(|source| {
+                    SnapshotAdapterError::PrepareFile {
+                        path: artifact_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+
+                Ok(())
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -241,6 +429,11 @@ pub enum SnapshotDownloadError {
         expected: u64,
         actual: u64,
     },
+    #[snafu(display("Failed to finalize downloaded snapshot {}: {source}", path.display()))]
+    FinalizeDownload {
+        path: PathBuf,
+        source: SnapshotAdapterError,
+    },
     #[snafu(display("Failed to initialize dataset checkpointer: {source}"))]
     CheckpointerInit {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -343,6 +536,11 @@ pub enum SnapshotUploadError {
     },
     #[snafu(display("Snapshot metadata at {path} has unsupported format version {version}"))]
     UploadUnsupportedMetadataVersion { path: String, version: u32 },
+    #[snafu(display("Failed to prepare snapshot artifact from {}: {source}", path.display()))]
+    PrepareSnapshot {
+        path: PathBuf,
+        source: SnapshotAdapterError,
+    },
     #[snafu(display("Failed to write snapshot metadata to {path}: {source}"))]
     UploadWriteMetadata {
         path: String,
@@ -407,6 +605,7 @@ pub struct SnapshotManager {
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
+    snapshot_adapter: SnapshotAdapter,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -421,6 +620,7 @@ impl std::fmt::Debug for SnapshotManager {
                 &self.bootstrap_failure_behavior,
             )
             .field("object_store", &self.object_store)
+            .field("snapshot_adapter", &self.snapshot_adapter)
             .finish_non_exhaustive()
     }
 }
@@ -569,6 +769,7 @@ impl SnapshotManager {
             object_store: store.into(),
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
+            snapshot_adapter: SnapshotAdapter::default(),
         })
     }
 
@@ -576,6 +777,12 @@ impl SnapshotManager {
     #[must_use]
     pub fn with_checkpointer_factory(mut self, factory: DatasetCheckpointerFactory) -> Self {
         self.checkpointer_factory = Some(factory);
+        self
+    }
+
+    #[must_use]
+    pub fn with_snapshot_adapter(mut self, adapter: SnapshotAdapter) -> Self {
+        self.snapshot_adapter = adapter;
         self
     }
 
@@ -605,74 +812,14 @@ impl SnapshotManager {
             self.dataset_name
         );
 
-        // For directory-based snapshots (Cayenne), create a temporary tar archive
-        let (upload_path, _temp_file) = if local_path.is_dir() {
-            let temp_tar = tempfile::NamedTempFile::new().map_err(|source| {
-                SnapshotUploadError::OpenLocal {
-                    path: local_path.clone(),
-                    source,
-                }
+        let prepared_snapshot = self
+            .snapshot_adapter
+            .prepare_upload(&local_path)
+            .await
+            .context(PrepareSnapshotSnafu {
+                path: local_path.clone(),
             })?;
-
-            let temp_path = temp_tar.path().to_path_buf();
-
-            // Archive the directory to the temp file
-            tracing::debug!(
-                "Creating tar archive for directory snapshot. dataset={} dir={}",
-                self.dataset_name,
-                local_path.display()
-            );
-
-            // Cayenne directories have metadata/ and data/ subdirectories
-            let metadata_dir = local_path.join("metadata");
-            let data_dir = local_path.clone(); // data files are in the main directory
-
-            let dirs = vec![
-                (metadata_dir, "metadata/".to_string()),
-                (data_dir, "data/".to_string()),
-            ];
-
-            let tar_file = std::fs::File::create(&temp_path).map_err(|source| {
-                SnapshotUploadError::OpenLocal {
-                    path: temp_path.clone(),
-                    source,
-                }
-            })?;
-
-            let mut archive = tar::Builder::new(tar_file);
-            for (dir, prefix) in dirs {
-                if dir.exists() && dir.is_dir() {
-                    let append_dir_all = |builder: &mut tar::Builder<std::fs::File>,
-                                          path: &std::path::Path,
-                                          prefix: &str|
-                     -> std::io::Result<()> {
-                        builder.append_dir_all(prefix, path)
-                    };
-                    append_dir_all(&mut archive, &dir, &prefix).map_err(|source| {
-                        SnapshotUploadError::ReadLocal {
-                            path: dir.clone(),
-                            source,
-                        }
-                    })?;
-                }
-            }
-            archive
-                .finish()
-                .map_err(|source| SnapshotUploadError::ReadLocal {
-                    path: temp_path.clone(),
-                    source,
-                })?;
-
-            tracing::debug!(
-                "Tar archive created. dataset={} size={} bytes",
-                self.dataset_name,
-                temp_path.metadata().map(|m| m.len()).unwrap_or(0)
-            );
-
-            (temp_path, Some(temp_tar))
-        } else {
-            (local_path.clone(), None)
-        };
+        let upload_path = prepared_snapshot.path().clone();
 
         let file = fs::File::open(&upload_path).await.context(OpenLocalSnafu {
             path: upload_path.clone(),
@@ -1088,7 +1235,11 @@ impl SnapshotManager {
             sha = entry.snapshot_checksum.as_str(),
         );
 
-        if let Some(parent) = self.local_path.parent() {
+        let download_path = self
+            .snapshot_adapter
+            .download_artifact_path(&self.local_path);
+
+        if let Some(parent) = download_path.parent() {
             fs::create_dir_all(parent).await.map_err(|source| {
                 SnapshotDownloadError::CreateLocalDir {
                     path: parent.to_path_buf(),
@@ -1098,9 +1249,9 @@ impl SnapshotManager {
         }
 
         let mut stream = get_result.into_stream();
-        let mut file = fs::File::create(&self.local_path).await.map_err(|source| {
+        let mut file = fs::File::create(&download_path).await.map_err(|source| {
             SnapshotDownloadError::WriteLocal {
-                path: self.local_path.clone(),
+                path: download_path.clone(),
                 source,
             }
         })?;
@@ -1112,7 +1263,7 @@ impl SnapshotManager {
             let chunk = match chunk_result {
                 Ok(chunk) => chunk,
                 Err(source) => {
-                    let _ = fs::remove_file(&self.local_path).await;
+                    let _ = fs::remove_file(&download_path).await;
                     return Err(SnapshotDownloadError::DownloadBytes {
                         path: path_display.clone(),
                         source,
@@ -1124,25 +1275,25 @@ impl SnapshotManager {
             hasher.update(&chunk);
 
             if let Err(source) = file.write_all(&chunk).await {
-                let _ = fs::remove_file(&self.local_path).await;
+                let _ = fs::remove_file(&download_path).await;
                 return Err(SnapshotDownloadError::WriteLocal {
-                    path: self.local_path.clone(),
+                    path: download_path.clone(),
                     source,
                 });
             }
         }
 
         if let Err(source) = file.flush().await {
-            let _ = fs::remove_file(&self.local_path).await;
+            let _ = fs::remove_file(&download_path).await;
             return Err(SnapshotDownloadError::WriteLocal {
-                path: self.local_path.clone(),
+                path: download_path.clone(),
                 source,
             });
         }
         drop(file);
 
         if entry.snapshot_size != actual_size {
-            let _ = fs::remove_file(&self.local_path).await;
+            let _ = fs::remove_file(&download_path).await;
             return Err(SnapshotDownloadError::SizeMismatch {
                 path: path_display.clone(),
                 expected: entry.snapshot_size,
@@ -1154,7 +1305,7 @@ impl SnapshotManager {
             .snapshot_checksum_algorithm
             .eq_ignore_ascii_case(SNAPSHOT_CHECKSUM_ALGORITHM)
         {
-            let _ = fs::remove_file(&self.local_path).await;
+            let _ = fs::remove_file(&download_path).await;
             return Err(SnapshotDownloadError::UnsupportedChecksumAlgorithm {
                 path: path_display.clone(),
                 algorithm: entry.snapshot_checksum_algorithm.clone(),
@@ -1165,7 +1316,7 @@ impl SnapshotManager {
         let actual_checksum = encode_hex_lower(checksum_bytes.as_ref());
         let expected_checksum = entry.snapshot_checksum.to_lowercase();
         if expected_checksum != actual_checksum {
-            let _ = fs::remove_file(&self.local_path).await;
+            let _ = fs::remove_file(&download_path).await;
             return Err(SnapshotDownloadError::ChecksumMismatch {
                 path: path_display.clone(),
                 expected: entry.snapshot_checksum.clone(),
@@ -1173,55 +1324,12 @@ impl SnapshotManager {
             });
         }
 
-        // For directory-based snapshots (Cayenne), we need to extract the tar archive
-        // We can detect this by checking if the local_path has no file extension
-        // (Cayenne uses directories without extensions, while DuckDB/SQLite use .db/.sqlite extensions)
-        let should_extract = self.local_path.extension().is_none();
-
-        if should_extract {
-            use tokio::task::spawn_blocking;
-
-            tracing::debug!(
-                "Extracting tar archive for directory snapshot. dataset={}",
-                self.dataset_name
-            );
-
-            // Extract the tar archive
-            let tar_path = self.local_path.clone();
-            let extract_to = self
-                .local_path
-                .parent()
-                .ok_or_else(|| SnapshotDownloadError::WriteLocal {
-                    path: self.local_path.clone(),
-                    source: std::io::Error::other("No parent directory for extraction"),
-                })?
-                .to_path_buf();
-            let extract_to_display = extract_to.clone();
-
-            spawn_blocking(move || {
-                let tar_file = std::fs::File::open(&tar_path)?;
-                let mut archive = tar::Archive::new(tar_file);
-                archive.unpack(&extract_to)?;
-                // Clean up the temporary tar file
-                std::fs::remove_file(&tar_path)?;
-                Ok::<(), std::io::Error>(())
-            })
+        self.snapshot_adapter
+            .finalize_download(&download_path, &self.local_path)
             .await
-            .map_err(|e| SnapshotDownloadError::WriteLocal {
-                path: self.local_path.clone(),
-                source: std::io::Error::other(e.to_string()),
-            })?
-            .map_err(|source| SnapshotDownloadError::WriteLocal {
-                path: self.local_path.clone(),
-                source,
+            .context(FinalizeDownloadSnafu {
+                path: download_path.clone(),
             })?;
-
-            tracing::debug!(
-                "Tar archive extracted. dataset={} extracted_to={}",
-                self.dataset_name,
-                extract_to_display.display()
-            );
-        }
 
         let checkpointer = (checkpointer_factory)()
             .await
@@ -1646,6 +1754,7 @@ mod tests {
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),
+            snapshot_adapter: SnapshotAdapter::default(),
         }
     }
 

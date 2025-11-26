@@ -18,7 +18,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
-    snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
+    snapshot::{SnapshotAdapter, SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
 };
 use snafu::ResultExt;
 
@@ -34,6 +34,7 @@ pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     path: PathBuf,
+    snapshot_adapter: SnapshotAdapter,
 ) {
     if !acceleration.snapshots.bootstrap_enabled() {
         return;
@@ -67,7 +68,9 @@ pub(super) async fn download_snapshot_if_needed(
     if let Some(manager) =
         SnapshotManager::try_new(dataset_name.clone(), acceleration.snapshots.clone(), path).await
     {
-        let manager = manager.with_checkpointer_factory(checkpoint_factory);
+        let manager = manager
+            .with_checkpointer_factory(checkpoint_factory)
+            .with_snapshot_adapter(snapshot_adapter);
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
             Ok(Some(SnapshotDownloadInfo {

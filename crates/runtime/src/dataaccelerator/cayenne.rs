@@ -40,7 +40,9 @@ use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
+use crate::dataaccelerator::{
+    FilePathError, SnapshotAdapter, snapshots::download_snapshot_if_needed,
+};
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 
@@ -549,6 +551,10 @@ impl DataAccelerator for CayenneAccelerator {
         vec!["cayenne"]
     }
 
+    fn snapshot_adapter(&self) -> SnapshotAdapter {
+        SnapshotAdapter::directory_archive()
+    }
+
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {
         self.cayenne_data_dir(source)
             .map_err(|err| FilePathError::External {
@@ -622,7 +628,8 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(acceleration, source, path_buf).await;
+            download_snapshot_if_needed(acceleration, source, path_buf, self.snapshot_adapter())
+                .await;
         }
 
         Ok(())
