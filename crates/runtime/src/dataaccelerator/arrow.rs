@@ -24,6 +24,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::register_data_accelerator;
 use crate::{component::dataset::acceleration::RefreshMode, parameters::ParameterSpec};
 
 use super::{AccelerationSource, DataAccelerator};

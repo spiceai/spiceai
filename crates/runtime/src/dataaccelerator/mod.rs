@@ -40,23 +40,6 @@ use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
-use self::arrow::ArrowAccelerator;
-
-#[cfg(not(windows))]
-use self::cayenne::CayenneAccelerator;
-#[cfg(feature = "duckdb")]
-use self::duckdb::DuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(feature = "postgres")]
-use self::postgres::PostgresAccelerator;
-#[cfg(feature = "sqlite")]
-use self::sqlite::SqliteAccelerator;
-#[cfg(feature = "turso")]
-use self::turso::TursoAccelerator;
-
 pub mod arrow;
 #[cfg(not(windows))]
 pub mod cayenne;
