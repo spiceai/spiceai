@@ -34,7 +34,7 @@ const MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: usize = 128 * 1024 * 1024; // 1
 // bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION
 // similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
 
-/// A simple implementation of a CollectLeftAccumulator that collects exact values for dynamic filtering.
+/// A simple implementation of a `CollectLeftAccumulator` that collects exact values for dynamic filtering.
 /// Performs no approximation or range merging, simply storing all values seen.
 ///
 /// Tradeoff: potentially higher memory usage on the build-side of the join, but more precise filtering on the probe-side.
@@ -77,7 +77,7 @@ pub struct ExactColumnBounds {
 }
 
 impl ColumnBounds for ExactColumnBounds {
-    /// Converts the collected arrays into an InListExpr for use in dynamic filtering.
+    /// Converts the collected arrays into an `InListExpr` for use in dynamic filtering.
     /// This builds an IN expression with all collected values.
     fn physical_expr(
         &self,
@@ -86,7 +86,7 @@ impl ColumnBounds for ExactColumnBounds {
         let total_memory_size = self
             .arrays
             .iter()
-            .map(|array| array.get_array_memory_size())
+            .map(arrow::array::Array::get_array_memory_size)
             .sum::<usize>();
 
         if total_memory_size > MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION {
