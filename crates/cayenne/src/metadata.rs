@@ -153,7 +153,7 @@ pub struct VortexConfig {
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 256 MB.
+    /// Defaults to 128 MB.
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
@@ -162,20 +162,28 @@ pub struct VortexConfig {
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Enable all SIMD-optimized encodings by default
+            // Enable encodings optimized for read performance
+            // ALP: Excellent for floating-point queries (SIMD-friendly decompression)
             enable_alp: true,
+            // FSST: Fast string decompression, good for string-heavy workloads
             enable_fsst: true,
+            // BitPacking: Very fast SIMD decompression for integers
             enable_bitpacking: true,
-            enable_delta: true,
+            // Delta: Disable for reads - requires sequential decompression
+            enable_delta: false,
+            // RLE: Enable for low-cardinality/repeated values (very fast scans)
             enable_rle: true,
+            // Dictionary: Enable for low-cardinality columns (fast lookups)
             enable_dict: true,
+            // FOR: Fast integer decompression, SIMD-friendly
             enable_for: true,
+            // ZigZag: Minimal overhead, keep enabled for signed integers
             enable_zigzag: true,
-            // Cache configuration
+            // Larger caches improve read performance
             footer_cache_mb: 128,
-            segment_cache_mb: 32,
-            // Target file size: 256 MB
-            target_vortex_file_size_mb: 256,
+            segment_cache_mb: 256,
+            // Smaller files = better parallelism and predicate pushdown
+            target_vortex_file_size_mb: 128,
             // No sort columns by default
             sort_columns: Vec::new(),
         }

@@ -482,9 +482,9 @@ impl OtelToArrowConverter {
     ) {
         for data_point in &sum.data_points {
             self.time_unix_nano_builder
-                .append_option(data_point.time.map(system_time_to_nanos));
+                .append_value(system_time_to_nanos(sum.time));
             self.start_time_unix_nano_builder
-                .append_option(data_point.start_time.map(system_time_to_nanos));
+                .append_option(Some(system_time_to_nanos(sum.start_time)));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -518,9 +518,9 @@ impl OtelToArrowConverter {
     ) {
         for data_point in &gauge.data_points {
             self.time_unix_nano_builder
-                .append_option(data_point.time.map(system_time_to_nanos));
+                .append_value(system_time_to_nanos(gauge.time));
             self.start_time_unix_nano_builder
-                .append_option(data_point.start_time.map(system_time_to_nanos));
+                .append_option(gauge.start_time.map(system_time_to_nanos));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -553,9 +553,9 @@ impl OtelToArrowConverter {
     ) {
         for data_point in &histogram.data_points {
             self.time_unix_nano_builder
-                .append_value(system_time_to_nanos(data_point.time));
+                .append_value(system_time_to_nanos(histogram.time));
             self.start_time_unix_nano_builder
-                .append_value(system_time_to_nanos(data_point.start_time));
+                .append_option(Some(system_time_to_nanos(histogram.start_time)));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
