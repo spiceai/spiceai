@@ -40,7 +40,7 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
 
     fn update_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
         // eagerly evaluate the expression and store the resulting array
-        // this avoids storing the entire record batch in memory, only storing the evaluated column(s?)
+        // this avoids storing the entire record batch in memory, only storing the evaluated column
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
         self.arrays.push(array);
         Ok(())
@@ -59,6 +59,8 @@ pub struct ExactColumnBounds {
 }
 
 impl ColumnBounds for ExactColumnBounds {
+    /// Converts the collected arrays into an InListExpr for use in dynamic filtering.
+     /// This builds an IN expression with all collected values.
     fn physical_expr(
             &self,
             left_expr: Arc<dyn PhysicalExpr>,
@@ -74,8 +76,8 @@ impl ColumnBounds for ExactColumnBounds {
         let in_expr = Arc::new(InListExpr::new(
              left_expr,
             expr_values,
-             false,
-             None
+            false, // not negated (IN, not NOT IN)
+             None   // no static filter optimization
         ));
 
         Ok(in_expr)
