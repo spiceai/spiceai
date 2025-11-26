@@ -452,7 +452,9 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![1]);
+        // Expect 2 rows deleted: "1970-01-01" (epoch=0) and "2012-12-01T11:11:11Z" (1354360271000ms)
+        // both are < 1354360272000ms
+        let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
@@ -471,7 +473,9 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
+        // Only 1 row remains after the first delete (time_int=1354360272),
+        // which matches time_int < 1354360273
+        let expected = UInt64Array::from(vec![1]);
         assert_eq!(actual, &expected);
     }
 
