@@ -74,7 +74,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -124,17 +124,19 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let app_name = app.name.clone();
-    let benchmark_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "benchmark_query"),
-        KeyValue::new("name", app_name.clone()),
-        KeyValue::new("spiced_version", spiced_version.clone()),
-        KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("branch_name", metrics.branch_name.clone()),
-        KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
-    ]);
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "benchmark_query"),
+            KeyValue::new("name", app_name.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", metrics.branch_name.clone()),
+            KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
+        ])
+        .build();
 
     let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
@@ -173,7 +175,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path())?;
+    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path()?)?;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;

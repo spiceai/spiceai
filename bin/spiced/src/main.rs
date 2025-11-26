@@ -87,7 +87,6 @@ fn main() {
         });
     }
 
-    global::shutdown_tracer_provider();
     // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");

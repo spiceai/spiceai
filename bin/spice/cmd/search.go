@@ -232,6 +232,9 @@ spice search --cloud
 			}
 
 			if strings.ToLower(message) == ".clear history" {
+				// Clear session history (in-memory)
+				line.ClearHistory()
+				// Clear persistent history
 				if historyMgr != nil {
 					historyMgr.Clear()
 					if err := historyMgr.Save(); err != nil {
@@ -517,6 +520,9 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 		}
 
 		if strings.ToLower(message) == ".clear history" {
+			// Clear session history (in-memory)
+			line.ClearHistory()
+			// Clear persistent history
 			if historyMgr != nil {
 				historyMgr.Clear()
 				if err := historyMgr.Save(); err != nil {

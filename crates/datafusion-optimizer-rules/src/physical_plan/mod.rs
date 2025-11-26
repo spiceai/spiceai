@@ -17,7 +17,7 @@ limitations under the License.
 //! General [`datafusion::physical_optimizer::PhysicalOptimizerRule`] not in [`datafusion`] by default.
 
 #[cfg(feature = "duckdb")]
-pub mod duckdb_intermediate_index;
+pub mod duckdb;
 pub mod hash_join_optimization;
 
 #[cfg(feature = "cluster")]

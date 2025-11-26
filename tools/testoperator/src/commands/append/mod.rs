@@ -63,7 +63,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))

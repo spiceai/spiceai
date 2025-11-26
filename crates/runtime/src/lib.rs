@@ -104,6 +104,7 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
 
@@ -480,6 +481,8 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     #[allow(dead_code)] // used in "cluster" feature
     config: Arc<Config>,
 }
@@ -545,6 +548,11 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
     }
 
     #[must_use]
@@ -713,13 +721,7 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let (auth, has_auth) = match endpoint_auth.http_auth.clone() {
-            Some(auth) => (auth, true),
-            None => (
-                Arc::new(auth::no_auth::NoAuth) as Arc<dyn runtime_auth::HttpAuth + Send + Sync>,
-                false,
-            ),
-        };
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -733,7 +735,6 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
-                    has_auth,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -860,9 +861,9 @@ impl Runtime {
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
     }
 
@@ -1201,13 +1202,6 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
 
 impl From<http::Error> for Error {
     fn from(err: http::Error) -> Self {
-        match err {
-            http::Error::UnableToBindServerToPort { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToBindServerToPort { source },
-            },
-            http::Error::UnableToStartHttpServer { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToStartHttpServer { source },
-            },
-        }
+        Error::UnableToStartHttpServer { source: err }
     }
 }

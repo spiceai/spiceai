@@ -51,6 +51,7 @@ pub struct RefreshTaskRunnerBuilder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -76,6 +77,7 @@ impl RefreshTaskRunnerBuilder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -105,6 +107,15 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -122,6 +133,10 @@ impl RefreshTaskRunnerBuilder {
         }
 
         refresh_task_builder = refresh_task_builder.with_cpu_runtime(self.cpu_runtime);
+
+        if let Some(resource_monitor) = self.resource_monitor {
+            refresh_task_builder = refresh_task_builder.with_resource_monitor(resource_monitor);
+        }
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 

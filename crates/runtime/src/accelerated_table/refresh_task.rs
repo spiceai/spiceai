@@ -112,6 +112,7 @@ pub struct RefreshTaskBuilder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTaskBuilder {
@@ -135,6 +136,7 @@ impl RefreshTaskBuilder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -160,6 +162,15 @@ impl RefreshTaskBuilder {
     #[must_use]
     pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> RefreshTaskBuilder {
+        self.resource_monitor = Some(monitor);
         self
     }
 
@@ -208,6 +219,7 @@ impl RefreshTaskBuilder {
                 .collect(),
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
+            resource_monitor: self.resource_monitor,
         }
     }
 }
@@ -226,6 +238,7 @@ pub struct RefreshTask {
     enabled_metrics: HashSet<String>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl RefreshTask {
@@ -380,18 +393,21 @@ impl RefreshTask {
 
         // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
+            #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
             match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
+                RefreshMode::Caching => &metrics::REFRESH_DURATION_MS,
             },
             &dataset_metrics_label_sets,
         );
 
         let start_time = SystemTime::now();
 
+        #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
         let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -402,6 +418,10 @@ impl RefreshTask {
             }
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Caching => {
+                // For caching mode, identify and refresh stale rows based on fetched_at and TTL
+                self.refresh_stale_cached_rows(refresh).await
+            }
         };
 
         let streaming_data_update = match get_data_update_result {
@@ -573,6 +593,7 @@ impl RefreshTask {
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
 
+        let resource_monitor = self.resource_monitor.clone();
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
@@ -582,6 +603,7 @@ impl RefreshTask {
                     dataset_name.to_string(),
                     notify_written_data_stat_available,
                     DataLoadTracing::new(&self.dataset_name),
+                    resource_monitor,
                 ),
                 move |(
                     mut stream,
@@ -589,6 +611,7 @@ impl RefreshTask {
                     ds_name,
                     notify_refresh_stat_available,
                     mut tracing,
+                    resource_monitor,
                 )| async move {
                     if let Some(batch) = stream.next().await {
                         match batch {
@@ -596,6 +619,12 @@ impl RefreshTask {
                                 tracing.on_new_batch_received(&batch);
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
+
+                                // Check memory usage after processing each batch
+                                if let Some(ref monitor) = resource_monitor {
+                                    monitor.check_memory_usage(&ds_name);
+                                }
+
                                 Some((
                                     Ok(batch),
                                     (
@@ -604,6 +633,7 @@ impl RefreshTask {
                                         ds_name,
                                         notify_refresh_stat_available,
                                         tracing,
+                                        resource_monitor,
                                     ),
                                 ))
                             }
@@ -615,6 +645,7 @@ impl RefreshTask {
                                     ds_name,
                                     notify_refresh_stat_available,
                                     tracing,
+                                    resource_monitor,
                                 ),
                             )),
                         }
@@ -733,6 +764,53 @@ impl RefreshTask {
         }
     }
 
+    async fn refresh_stale_cached_rows(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        use crate::accelerated_table::caching::CacheRefreshHelper;
+
+        // Get the TTL from refresh settings - default to 30 seconds if not specified
+        let ttl = refresh.check_interval.unwrap_or(Duration::from_secs(30));
+
+        eprintln!(
+            "!!!!! refresh_stale_cached_rows called for dataset {} with TTL {:?} !!!!!",
+            self.dataset_name, ttl
+        );
+
+        tracing::info!(
+            "Cache: Starting stale row refresh for dataset {} with TTL {:?}",
+            self.dataset_name,
+            ttl
+        );
+
+        // Use the CacheRefreshHelper to identify and refresh stale rows
+        let federated_provider = self.federated.table_provider().await;
+        let refreshed_count = CacheRefreshHelper::refresh_stale_rows(
+            federated_provider,
+            Arc::clone(&self.accelerator),
+            self.dataset_name.to_string().as_str(),
+            ttl,
+        )
+        .await
+        .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
+
+        tracing::info!(
+            "Cache: Completed stale row refresh for dataset {} - refreshed {} rows",
+            self.dataset_name,
+            refreshed_count
+        );
+
+        // Return an empty streaming update since the refresh was handled internally
+        // by CacheRefreshHelper
+        let schema = self.accelerator.schema();
+        let empty_stream = RecordBatchStreamAdapter::new(schema, futures::stream::empty());
+        Ok(StreamingDataUpdate {
+            data: Box::pin(empty_stream),
+            update_type: UpdateType::Overwrite,
+        })
+    }
+
     async fn trace_load_completed(
         &self,
         start_time: SystemTime,
@@ -776,6 +854,7 @@ impl RefreshTask {
         let federated_provider = self.federated.table_provider().await;
 
         let dataset_name = self.dataset_name.clone();
+        #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -783,6 +862,7 @@ impl RefreshTask {
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Caching => UpdateType::Overwrite,
         };
 
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
@@ -1254,36 +1334,65 @@ impl RefreshTask {
 struct DataLoadTracing {
     dataset: TableReference,
     num_records_received: usize,
+    bytes_received: usize,
+    start_time: Instant,
     last_updated_time: Instant,
     log_interval: Duration,
 }
 
 impl DataLoadTracing {
     fn new(dataset: &TableReference) -> Self {
+        let now = Instant::now();
         Self {
             dataset: dataset.clone(),
             num_records_received: 0,
-            last_updated_time: Instant::now(),
+            bytes_received: 0,
+            start_time: now,
+            last_updated_time: now,
             log_interval: Duration::from_secs(10),
         }
     }
 
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
+        let batch_size = batch.get_array_memory_size();
+
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
+        self.bytes_received += batch_size;
 
-        // trace num loaded records and reset every 10 seconds
+        // Log progress every 10 seconds showing cumulative stats
         if self.last_updated_time.elapsed() > self.log_interval {
             let pretty_records = util::pretty_print_number(self.num_records_received);
+            let elapsed = self.start_time.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+
+            // Calculate throughput
+            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_possible_truncation)]
+            #[allow(clippy::cast_sign_loss)]
+            let throughput = if elapsed_secs > 0.0 {
+                let bytes_per_sec = (self.bytes_received as f64 / elapsed_secs) as usize;
+                format!("{}/s", util::human_readable_bytes(bytes_per_sec))
+            } else {
+                "calculating...".to_string()
+            };
+
+            let size = util::human_readable_bytes(self.bytes_received);
+            let elapsed_str = format!("{}s", elapsed.as_secs());
 
             if is_spice_internal_dataset(&self.dataset) {
-                tracing::debug!("Dataset {} received {pretty_records} records", self.dataset);
+                tracing::debug!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             } else {
-                tracing::info!("Dataset {} received {pretty_records} records", self.dataset);
+                tracing::info!(
+                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             }
 
-            self.num_records_received = 0;
             self.last_updated_time = Instant::now();
         }
     }
@@ -1443,5 +1552,40 @@ fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_data_load_tracing_tracks_bytes_and_rows() {
+        let dataset = TableReference::bare("test_dataset");
+        let mut tracing = DataLoadTracing::new(&dataset);
+
+        // Create a test batch
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
+
+        let batch_size = batch.get_array_memory_size();
+        let num_rows = batch.num_rows();
+
+        // Process the batch
+        tracing.on_new_batch_received(&batch);
+
+        // Verify state
+        assert_eq!(tracing.num_records_received, num_rows);
+        assert_eq!(tracing.bytes_received, batch_size);
+        assert!(tracing.bytes_received > 0);
     }
 }
