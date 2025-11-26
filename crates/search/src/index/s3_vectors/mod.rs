@@ -194,8 +194,7 @@ impl SearchIndex for S3Vector {
                 }
                 let schema = data
                     .first()
-                    .map(|rb| rb.schema())
-                    .unwrap_or_else(|| Arc::clone(&input_schema));
+                    .map_or_else(|| Arc::clone(&input_schema), RecordBatch::schema);
                 concat_batches(&schema, data.iter()).boxed()
             }
             None => write::write(self, &self.table, record, self.batch_write_rows)
