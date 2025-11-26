@@ -74,9 +74,36 @@ impl AcceleratorRegistration {
     }
 }
 
+/// Distributed slice that automatically collects all data accelerator registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_accelerator!`] macro.
 #[distributed_slice]
 pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
 
+/// Registers a data accelerator for a given engine.
+///
+/// This macro creates a constructor function for the specified accelerator type and
+/// registers it in the global distributed slice of data accelerators. This allows
+/// the runtime to discover and instantiate accelerators for supported engines.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_accelerator!(Engine::Foo, FooAccelerator);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_accelerator!(
+///     my_accel_fn,
+///     MY_ACCEL_STATIC,
+///     Engine::Bar,
+///     BarAccelerator
+/// );
+/// ```
+///
+/// Using this macro automatically adds the accelerator to the distributed slice,
+/// making it available for discovery by the runtime.
 #[macro_export]
 macro_rules! register_data_accelerator {
     ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
