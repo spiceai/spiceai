@@ -272,7 +272,7 @@ impl DataConnector for EmbeddingConnector {
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
-            return Some(stream);
+            Some(stream)
 
         // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
         } else if let Some(vector_scan) = table_provider

@@ -16,8 +16,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
-use search::generation::text_search::index::FullTextDatabaseIndex;
+use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
