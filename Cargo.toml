@@ -80,7 +80,7 @@ arrow-csv = "56.0.0"
 arrow-flight = "56.0.0"
 arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
-arrow-odbc = "18"
+arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13ac969eea8bef7b496a2ba334ebd4e6e06" }
 arrow-schema = "56.0.0"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "afaaba87a10e48853e59c809bf296aefbb08c9bd", features = [
     "byot",
@@ -184,7 +184,7 @@ object_store = { version = "0.12.4", features = [
     "azure",
     "http",
 ] }
-odbc-api = { version = "14" }
+odbc-api = { version = "20" }
 opentelemetry = { version = "0.29", default-features = false, features = [
     "metrics",
     "trace",
