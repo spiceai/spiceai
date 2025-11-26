@@ -228,8 +228,8 @@ impl DistributeFileScanOptimizer {
         // expensive to clone for large scans
         let new_scan = FileScanConfigBuilder::new(
             original_file_scan.object_store_url.clone(),
-            original_file_scan.file_schema.clone(),
-            original_file_scan.file_source.clone(),
+            Arc::clone(&original_file_scan.file_schema),
+            Arc::clone(&original_file_scan.file_source),
         )
         .with_batch_size(original_file_scan.batch_size)
         .with_constraints(original_file_scan.constraints.clone())
