@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     env,
+    io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -53,6 +54,16 @@ use spicepod::{
     },
     param::Params,
 };
+use std::{
+    collections::HashMap,
+    env,
+    io::Cursor,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant},
+};
+use tar::Archive;
+use tar::Archive;
 use tempfile::TempDir;
 use tokio::{
     fs,
@@ -1387,4 +1398,72 @@ async fn snapshot_unified_test_bootstrap_from_s3() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn snapshot_cayenne_archive_contains_expected_layout() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+
+    test_request_context()
+        .scope(async {
+            let fixture = prepare_cayenne_fixture("snapshot_cayenne_archive_layout").await?;
+
+            let snapshot_objects = fixture
+                .context
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .await
+                .context("Waiting for Cayenne snapshot upload")?;
+
+            let snapshot_meta = snapshot_objects
+                .first()
+                .ok_or_else(|| anyhow!("No Cayenne snapshots found in object store"))?;
+
+            let snapshot_bytes = fixture
+                .context
+                .store
+                .get(&snapshot_meta.location)
+                .await
+                .context("Downloading Cayenne snapshot object")?
+                .bytes()
+                .await
+                .context("Reading Cayenne snapshot bytes")?;
+
+            let mut archive = Archive::new(Cursor::new(snapshot_bytes));
+            let mut has_metadata = false;
+            let mut has_data = false;
+
+            for entry_result in archive
+                .entries()
+                .context("Iterating Cayenne snapshot tar entries")?
+            {
+                let entry = entry_result.context("Reading Cayenne snapshot tar entry")?;
+                if let Ok(path) = entry.path() {
+                    let path_str = path.to_string_lossy();
+                    if path_str.starts_with("metadata/") {
+                        has_metadata = true;
+                    }
+                    if path_str.starts_with("data/") {
+                        has_data = true;
+                    }
+                }
+
+                if has_metadata && has_data {
+                    break;
+                }
+            }
+
+            assert!(
+                has_metadata,
+                "Cayenne snapshot archive should contain metadata/ entries"
+            );
+            assert!(
+                has_data,
+                "Cayenne snapshot archive should contain data/ entries"
+            );
+
+            fixture.cleanup().await
+        })
+        .await
 }
