@@ -102,6 +102,8 @@ otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
 parking_lot.workspace = true
 percent-encoding.workspace = true
+linkme.workspace = true
+paste.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true

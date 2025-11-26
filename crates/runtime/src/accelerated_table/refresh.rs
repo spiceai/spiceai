@@ -258,6 +258,11 @@ impl Refresh {
         refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> NextRefresh {
+        tracing::info!(
+            "startup_next_refresh called with mode: {:?}, check_interval: {:?}",
+            self.mode,
+            self.check_interval
+        );
         let previous_checkpoint = match self.mode {
             RefreshMode::Full => {
                 // If there is no checkpoint, we need to start a refresh.
@@ -269,6 +274,24 @@ impl Refresh {
             // Append and Changes modes are always refreshed since they stream changes from the source table.
             RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
+            }
+            // Caching mode handles refreshes in two ways:
+            // 1. On-demand through cache misses (primary)
+            // 2. Periodic background refresh of stale data (if refresh_check_interval is set)
+            RefreshMode::Caching => {
+                // If refresh_check_interval is set, enable periodic refresh for stale data
+                if let Some(check_interval) = self.check_interval {
+                    tracing::info!(
+                        "Caching mode with refresh_check_interval={:?} - enabling periodic stale data refresh",
+                        check_interval
+                    );
+                    // Start the periodic timer - the first refresh will happen after check_interval
+                    return NextRefresh::WaitFor(check_interval);
+                }
+                tracing::debug!(
+                    "Caching mode without refresh_check_interval - on-demand refresh only"
+                );
+                return NextRefresh::Disabled;
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
@@ -417,6 +440,7 @@ pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
+    Caching(Receiver<Option<RefreshOverrides>>),
 }
 
 pub struct Refresher {
@@ -625,7 +649,9 @@ impl Refresher {
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
             (
-                AccelerationRefreshMode::Append(receiver) | AccelerationRefreshMode::Full(receiver),
+                AccelerationRefreshMode::Append(receiver)
+                | AccelerationRefreshMode::Full(receiver)
+                | AccelerationRefreshMode::Caching(receiver),
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
@@ -707,9 +733,10 @@ impl Refresher {
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
-                    match next_scheduled_refresh_timer.take() {
-                        Some(timer) => Box::pin(timer),
-                        None => Box::pin(std::future::pending()),
+                    if let Some(timer) = next_scheduled_refresh_timer.take() {
+                        Box::pin(timer)
+                    } else {
+                        Box::pin(std::future::pending())
                     };
 
                 select! {

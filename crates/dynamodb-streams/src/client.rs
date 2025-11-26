@@ -127,7 +127,6 @@ impl Client {
         };
 
         tokio::spawn(async move {
-            // TODO - double check the behavior if the producer panics or stops streaming early
             // https://github.com/spiceai/spiceai/issues/8074
             producer.streaming().await;
         });
