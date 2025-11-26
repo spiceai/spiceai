@@ -181,6 +181,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+gethostname.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
