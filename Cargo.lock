@@ -1329,9 +1329,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodbstreams"
-version = "1.91.0"
+version = "1.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e6b903d5f274f9acec025a56f0239b02fba49f58a09c80a231e772dc1100ef9"
+checksum = "4e03b9e9ac22a1d956aee07873316b715ff1fb9d7282aa48f0b9d30ac367f999"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -4098,9 +4098,11 @@ dependencies = [
  "arrow_tools",
  "async-stream",
  "async-trait",
+ "aws-config",
  "aws-credential-types",
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
+ "aws-sdk-dynamodbstreams",
  "aws-smithy-async",
  "base64 0.22.1",
  "bb8 0.9.1",
@@ -4121,6 +4123,7 @@ dependencies = [
  "delta_kernel",
  "document_parse",
  "duckdb",
+ "dynamodb-streams",
  "flight_client",
  "futures",
  "git2",
