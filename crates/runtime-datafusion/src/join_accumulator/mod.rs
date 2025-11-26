@@ -30,6 +30,10 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
+const MAXIMUM_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - approx 128 million i32 keys per partition calculated
+// bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES
+// similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
+
 /// A simple implementation of a CollectLeftAccumulator that collects exact values for dynamic filtering.
 /// Performs no approximation or range merging, simply storing all values seen.
 ///
@@ -75,6 +79,23 @@ impl ColumnBounds for ExactColumnBounds {
         &self,
         left_expr: Arc<dyn PhysicalExpr>,
     ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        let total_memory_size = self
+            .arrays
+            .iter()
+            .map(|array| array.get_array_memory_size())
+            .sum::<usize>();
+
+        if total_memory_size > MAXIMUM_INLIST_MEMORY_BYTES {
+            tracing::warn!(
+                "ExactLeftAccumulator exceeded maximum in-list memory size ({} bytes > {} bytes). \
+                Consider using a different accumulator with approximation or range merging to reduce memory usage.",
+                total_memory_size,
+                MAXIMUM_INLIST_MEMORY_BYTES
+            );
+
+            return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))); // Fallback to a no-op filter (always true) - the default dynamic filter behaviour
+        }
+
         let scalar_values = self
             .arrays
             .iter()
