@@ -102,6 +102,8 @@ otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
 parking_lot.workspace = true
 percent-encoding.workspace = true
+linkme.workspace = true
+paste.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
@@ -181,6 +183,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+gethostname.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
