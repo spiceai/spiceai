@@ -541,10 +541,11 @@ pub async fn start(
                 .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
         })
         .and_then(|spec| {
+            let (host, port) = &spec;
             tokio::task::block_in_place(|| match spec.to_socket_addrs() {
                 Ok(sa) => Some(sa),
                 Err(e) => {
-                    tracing::error!("Unable to resolve bound executor host {e}");
+                    tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
                     None
                 }
             })
