@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use super::index::VectorScanTableProvider;
 use crate::accelerated_table::AcceleratedTable;
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
@@ -36,7 +37,6 @@ use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
-
 use std::any::Any;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -273,24 +273,34 @@ impl DataConnector for EmbeddingConnector {
                 .boxed();
 
             return Some(stream);
+
+        // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
+        } else if let Some(vector_scan) = table_provider
+            .as_any()
+            .downcast_ref::<VectorScanTableProvider>()
+        {
+            self.inner_connector
+                .changes_stream(Arc::new(FederatedTable::Immediate(Arc::clone(
+                    &vector_scan.table_provider,
+                ))))
+        } else if let Some(embedding_table) =
+            table_provider.as_any().downcast_ref::<EmbeddingTable>()
+        {
+            let embedding_table = Arc::new(embedding_table.clone());
+            let underlying_table = Arc::clone(&embedding_table.base_table);
+            let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+
+            Some(
+                self.inner_connector
+                    .changes_stream(underlying_federated_table)?
+                    .then(move |item| {
+                        Self::embed_change_envelope(item, Arc::clone(&embedding_table))
+                    })
+                    .boxed(),
+            )
+        } else {
+            None
         }
-
-        let embedding_table = Arc::new(
-            table_provider
-                .as_any()
-                .downcast_ref::<EmbeddingTable>()?
-                .clone(),
-        );
-        let underlying_table = Arc::clone(&embedding_table.base_table);
-        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
-
-        let stream = self
-            .inner_connector
-            .changes_stream(underlying_federated_table)?
-            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
-            .boxed();
-
-        Some(stream)
     }
 
     fn supports_append_stream(&self) -> bool {
