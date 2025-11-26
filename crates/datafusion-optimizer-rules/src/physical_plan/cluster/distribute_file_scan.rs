@@ -231,7 +231,7 @@ impl DistributeFileScanOptimizer {
             original_file_scan.file_schema.clone(),
             original_file_scan.file_source.clone(),
         )
-        .with_batch_size(original_file_scan.batch_size.clone())
+        .with_batch_size(original_file_scan.batch_size)
         .with_constraints(original_file_scan.constraints.clone())
         .with_expr_adapter(original_file_scan.expr_adapter_factory.clone())
         .with_file_compression_type(original_file_scan.file_compression_type.clone())
