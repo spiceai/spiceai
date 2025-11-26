@@ -25,6 +25,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::Cursor;
+use std::path::Path;
 use std::string::ToString;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ use regex::Regex;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
+    #[allow(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
@@ -95,10 +97,17 @@ impl ModelSource for SpiceAI {
             _ => caps["version"].to_string(),
         };
 
-        match version.as_str() {
+        // Sanitize version to prevent path traversal (e.g., "../../etc")
+        let sanitized_version = util::security::sanitize_filename(&version).map_err(|reason| {
+            super::Error::UnableToLoadConfig {
+                reason: format!("Invalid version in path: {reason}"),
+            }
+        })?;
+
+        match sanitized_version.as_str() {
             "latest" => {}
             _ => {
-                let _ = write!(url, "?training_run_id={version}");
+                let _ = write!(url, "?training_run_id={sanitized_version}");
             }
         }
 
@@ -134,12 +143,22 @@ impl ModelSource for SpiceAI {
             .clone()
             .context(super::UnableToParseMetadataSnafu {})?;
 
-        let versioned_path = format!("{local_path}/{version}");
-        let file_name = format!("{versioned_path}/model.onnx");
+        let versioned_path = Path::new(&local_path).join(&sanitized_version);
+        let file_path = versioned_path.join("model.onnx");
 
-        if std::fs::metadata(file_name.clone()).is_ok() {
-            tracing::debug!("File already exists: {file_name}, skipping download");
-            return Ok(file_name);
+        let file_exists = tokio::task::spawn_blocking({
+            let file_path = file_path.clone();
+            move || std::fs::metadata(&file_path).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+
+        if file_exists {
+            tracing::debug!(
+                "File already exists: {}, skipping download",
+                file_path.display()
+            );
+            return Ok(file_path.to_string_lossy().into_owned());
         }
 
         let response = client
@@ -148,13 +167,47 @@ impl ModelSource for SpiceAI {
             .await
             .context(super::UnableToFetchModelSnafu {})?;
 
-        std::fs::create_dir_all(versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
-        let mut file = std::fs::File::create(file_name.clone())
-            .context(super::UnableToCreateModelPathSnafu {})?;
-        let mut content = Cursor::new(response.bytes().await.unwrap_or_default());
-        std::io::copy(&mut content, &mut file).context(super::UnableToCreateModelPathSnafu {})?;
+        let bytes = response
+            .bytes()
+            .await
+            .context(super::UnableToFetchModelSnafu)?;
 
-        Ok(file_name)
+        util::security::validate_non_empty_bytes(&bytes, "model.onnx")
+            .map_err(|reason| super::Error::UnableToLoadConfig { reason })?;
+
+        let versioned_path_clone = versioned_path.clone();
+        let file_path_clone = file_path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&versioned_path_clone)
+                .context(super::UnableToCreateModelPathSnafu {})?;
+            let mut file = std::fs::File::create(&file_path_clone).map_err(|e| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!(
+                        "Failed to create model file {}: {e}",
+                        file_path_clone.display()
+                    ),
+                }
+            })?;
+            let mut content = Cursor::new(bytes);
+            std::io::copy(&mut content, &mut file).map_err(|e| {
+                super::Error::UnableToLoadConfig {
+                    reason: format!(
+                        "Failed to write model file {}: {e}",
+                        file_path_clone.display()
+                    ),
+                }
+            })?;
+            Ok::<(), super::Error>(())
+        })
+        .await
+        .map_err(|e| super::Error::UnableToLoadConfig {
+            reason: format!("Task panicked while writing model file: {e}"),
+        })?
+        .map_err(|e| super::Error::UnableToLoadConfig {
+            reason: format!("Failed to write model file: {e}"),
+        })?;
+
+        Ok(file_path.to_string_lossy().into_owned())
     }
 }
 

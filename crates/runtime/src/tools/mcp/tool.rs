@@ -80,7 +80,7 @@ impl SpiceModelTool for McpToolWrapper {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        // Security: Validate input size to prevent DoS attacks
+        // Security: Validate input size to prevent excessive memory consumption or processing overhead
         const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1 MB
         if arg.len() > MAX_INPUT_SIZE {
             return Err(format!(
@@ -101,6 +101,7 @@ impl SpiceModelTool for McpToolWrapper {
             let input: Value = if arg.is_empty() {
                 Value::Null
             } else {
+                // Security: Use controlled JSON parsing to prevent resource exhaustion
                 serde_json::from_str(arg).map_err(|e| {
                     tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
                     e

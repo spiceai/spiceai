@@ -59,8 +59,7 @@ pub(crate) async fn start<A>(
     rt: Arc<Runtime>,
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
-    auth_provider: Arc<dyn HttpAuth + Send + Sync>,
-    has_auth: bool,
+    auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -75,11 +74,7 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    let auth_layer = if has_auth {
-        Some(AuthLayer::new(auth_provider))
-    } else {
-        None
-    };
+    let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
     drop(app);
 
