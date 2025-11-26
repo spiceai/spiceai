@@ -32,7 +32,7 @@ limitations under the License.
 //!
 //! ## Accelerator Support
 //!
-//! All accelerators (DuckDB, Cayenne, Arrow/MemTable) support caching mode with
+//! All accelerators (`DuckDB`, Cayenne, Arrow/MemTable) support caching mode with
 //! the same behavior - data is cached per unique filter combination.
 //!
 //! ## Tests
@@ -66,6 +66,7 @@ use crate::{
 ///
 /// Also verifies:
 /// - Cache hit: subsequent queries with same filters are served from cache
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -101,7 +102,8 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 
             // Disable SQL results caching to prevent interference with acceleration caching test
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -232,7 +234,8 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 
             // Disable SQL results caching to prevent interference with acceleration caching test
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -445,7 +448,8 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 
             // Disable SQL results caching
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -661,7 +665,8 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
 
             // Disable SQL results caching
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -811,7 +816,8 @@ async fn test_caching_mode_with_sql_results_cache() -> Result<(), anyhow::Error>
 
             // Enable SQL results caching (default behavior when not explicitly disabled)
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = true;
@@ -879,7 +885,8 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 .build();
 
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -948,7 +955,8 @@ async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
                 .build();
 
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -1023,7 +1031,8 @@ async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> 
                 .build();
 
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -1109,7 +1118,8 @@ async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> 
 
             // Explicitly enable SQL results caching
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = true;
@@ -1181,7 +1191,8 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
                 .build();
 
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -1271,7 +1282,7 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
 
             // Disable SQL results caching
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results = Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -1382,11 +1393,12 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
 /// refresh is triggered to update the cache asynchronously.
 ///
 /// NOTE: This test is currently ignored because the caching implementation uses
-/// InsertOp::Overwrite for all inserts (including background refresh), which replaces
+/// `InsertOp::Overwrite` for all inserts (including background refresh), which replaces
 /// all data in the accelerator table. When the background refresh timer fires before
 /// the test can query stale data, it overwrites with fresh data. The proper fix would
 /// be to implement "delete-where + insert" for background refresh to only update
 /// specific rows.
+#[allow(clippy::too_many_lines)]
 #[ignore = "Background refresh uses InsertOp::Overwrite which replaces all data - needs delete-where + insert for row-level updates"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::Error> {
@@ -1422,7 +1434,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 
             // Disable SQL results caching
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results = Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
@@ -1579,6 +1591,7 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 /// 2. Data becomes stale after TTL
 /// 3. Periodic refresh task (based on `refresh_check_interval`) updates stale data automatically
 /// 4. Old data beyond `retention_period` is evicted from cache
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1617,7 +1630,7 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
 
             // Disable SQL results caching to prevent interference
             if app.runtime.caching.sql_results.is_none() {
-                app.runtime.caching.sql_results = Some(Default::default());
+                app.runtime.caching.sql_results = Some(spicepod::component::caching::SQLResultsCacheConfig::default());
             }
             if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
                 sql_cache.enabled = false;
