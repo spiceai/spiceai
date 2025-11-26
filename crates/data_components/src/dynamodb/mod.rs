@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::cdc::ChangeBatchError;
 use snafu::Snafu;
 use std::sync::Arc;
 
@@ -22,7 +21,7 @@ pub mod provider;
 mod request_builder;
 mod request_plan;
 mod schema;
-mod stream;
+pub mod stream;
 mod table_schema;
 mod unnest;
 mod utils;
@@ -74,22 +73,4 @@ pub enum Error {
 
     #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
     FailedToInitializeStream { source: dynamodb_streams::Error },
-}
-
-#[derive(Debug, Snafu)]
-pub enum StreamError {
-    #[snafu(display("Failed to receive DynamoDB Stream record: {source}"))]
-    FailedToReceiveMessage { source: dynamodb_streams::Error },
-
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
-    DowncastBuilder,
-
-    #[snafu(display("Failed to unnest DynamoDB Stream record: {source}"))]
-    FailedToUnnest { source: Error },
-
-    #[snafu(display("Failed to deserialize DynamoDB Stream record: {source}"))]
-    FailedToCreateChangeBatch { source: ChangeBatchError },
-
-    #[snafu(display("Failed to add item to struct: {source}"))]
-    FailedToAddItemToStruct { source: Error },
 }

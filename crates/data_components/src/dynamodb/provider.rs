@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::{
     DescribeTableSnafu, Error, FailedToInitializeCheckpointSnafu, FailedToInitializeStreamSnafu,
-    Result, ScanSnafu, StreamError, TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
+    Result, ScanSnafu, TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangesStream;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
@@ -52,11 +52,10 @@ use datafusion::{
     prelude::Expr,
 };
 use dynamodb_streams::checkpoint::GlobalCheckpoint;
-use dynamodb_streams::{Client as StreamsClient, DynamodbStream, StreamResult};
+use dynamodb_streams::Client as StreamsClient;
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
-use logos::internal::CallbackResult;
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -276,14 +275,8 @@ impl DynamoDBTableProvider {
             .await
             .context(FailedToInitializeCheckpointSnafu)?
             .map(move |batch| {
-                let batch = batch.map_err(|e| {
-                    crate::cdc::StreamError::DynamoDB(StreamError::FailedToReceiveMessage {
-                        source: e,
-                    })
-                })?;
-
                 process_batch(
-                    batch.records,
+                    batch,
                     &table_schema,
                     &primary_keys,
                     unnest_depth,

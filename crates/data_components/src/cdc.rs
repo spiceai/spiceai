@@ -58,7 +58,7 @@ pub enum StreamError {
     External(String),
     #[cfg(feature = "dynamodb")]
     /// Error from `DynamoDB`, such as failure during streaming or subscription.
-    DynamoDB(crate::dynamodb::StreamError),
+    DynamoDB(crate::dynamodb::stream::StreamError),
 }
 
 impl std::error::Error for StreamError {}
