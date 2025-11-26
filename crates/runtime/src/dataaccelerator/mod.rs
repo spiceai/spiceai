@@ -32,29 +32,13 @@ use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
+use linkme::distributed_slice;
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-
-use self::arrow::ArrowAccelerator;
-
-#[cfg(not(windows))]
-use self::cayenne::CayenneAccelerator;
-#[cfg(feature = "duckdb")]
-use self::duckdb::DuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(feature = "postgres")]
-use self::postgres::PostgresAccelerator;
-#[cfg(feature = "sqlite")]
-use self::sqlite::SqliteAccelerator;
-#[cfg(feature = "turso")]
-use self::turso::TursoAccelerator;
 
 pub mod arrow;
 #[cfg(not(windows))]
@@ -74,6 +58,75 @@ mod snapshots;
 pub mod spice_sys;
 
 pub(crate) use snapshots::validate_snapshot_paths;
+
+#[derive(Clone, Copy)]
+pub struct AcceleratorRegistration {
+    pub engine: Engine,
+    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+}
+
+impl AcceleratorRegistration {
+    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+        Self {
+            engine,
+            constructor,
+        }
+    }
+}
+
+/// Distributed slice that automatically collects all data accelerator registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_accelerator!`] macro.
+#[distributed_slice]
+pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
+
+/// Registers a data accelerator for a given engine.
+///
+/// This macro creates a constructor function for the specified accelerator type and
+/// registers it in the global distributed slice of data accelerators. This allows
+/// the runtime to discover and instantiate accelerators for supported engines.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_accelerator!(Engine::Foo, FooAccelerator);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_accelerator!(
+///     my_accel_fn,
+///     MY_ACCEL_STATIC,
+///     Engine::Bar,
+///     BarAccelerator
+/// );
+/// ```
+///
+/// Using this macro automatically adds the accelerator to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_accelerator {
+    ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataaccelerator::DataAccelerator> {
+            ::std::sync::Arc::new(<$accelerator>::new())
+        }
+
+        #[linkme::distributed_slice($crate::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataaccelerator::AcceleratorRegistration =
+            $crate::dataaccelerator::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    ($engine:expr, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $accelerator
+            );
+        }
+    };
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -141,35 +194,10 @@ impl AcceleratorEngineRegistry {
     }
 
     pub(crate) async fn register_all(&self) {
-        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::PartitionedDuckDB,
-            Arc::new(PartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::TableModePartitionedDuckDB,
-            Arc::new(TablesModePartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "postgres")]
-        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
-            .await;
-        #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
-            .await;
-        #[cfg(feature = "turso")]
-        self.register_accelerator_engine(Engine::Turso, Arc::new(TursoAccelerator::new()))
-            .await;
-        #[cfg(not(windows))]
-        self.register_accelerator_engine(Engine::Cayenne, Arc::new(CayenneAccelerator::new()))
-            .await;
+        for registration in DATA_ACCELERATOR_REGISTRATIONS {
+            self.register_accelerator_engine(registration.engine, (registration.constructor)())
+                .await;
+        }
     }
 
     pub async fn unregister_all(&self) {

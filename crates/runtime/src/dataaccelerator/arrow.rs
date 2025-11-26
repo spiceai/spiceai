@@ -24,7 +24,9 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::{component::dataset::acceleration::RefreshMode, parameters::ParameterSpec};
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::parameters::ParameterSpec;
+use crate::register_data_accelerator;
 
 use super::{AccelerationSource, DataAccelerator};
 
@@ -114,3 +116,5 @@ impl DataAccelerator for ArrowAccelerator {
         PARAMETERS
     }
 }
+
+register_data_accelerator!(Engine::Arrow, ArrowAccelerator);
