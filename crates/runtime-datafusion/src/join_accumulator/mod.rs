@@ -30,7 +30,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-const MAXIMUM_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - approx 128 million i32 keys per partition calculated
+const MAXIMUM_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 128 million i32 keys per partition calculated
 // bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES
 // similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
 
@@ -53,6 +53,10 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
     }
 
     fn update_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
         // eagerly evaluate the expression and store the resulting array
         // this avoids storing the entire record batch in memory, only storing the evaluated column
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
@@ -104,6 +108,11 @@ impl ColumnBounds for ExactColumnBounds {
             .collect::<DataFusionResult<Vec<ScalarValue>>>()?
             .into_iter()
             .collect();
+
+        if unique_values.len() == 0 {
+            // No values collected - return a no-op filter (always true)
+            return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))));
+        }
 
         let expr_values = unique_values
             .into_iter()
@@ -173,5 +182,36 @@ mod tests {
             })
             .collect();
         assert_eq!(expected_values, actual_values);
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_empty_batch() {
+        // Test that updating with an empty batch does not cause errors and results in an always-true filter
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let empty_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(
+            Vec::<i32>::new(),
+        ))])
+        .expect("Should create empty record batch");
+
+        let left_expr = col("a", &empty_batch.schema()).expect("Should create column expr");
+
+        let mut accumulator =
+            ExactLeftAccumulator::try_new(Arc::clone(&left_expr), &empty_batch.schema())
+                .expect("Should create accumulator");
+
+        accumulator
+            .update_batch(&empty_batch)
+            .expect("Should update with empty batch");
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let physical_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        // Validate the expression is a Literal true (no-op filter)
+        let literal_expr = physical_expr.as_any().downcast_ref::<Literal>();
+        let literal_expr = literal_expr.expect("Should downcast to Literal");
+        let expected_value = ScalarValue::Boolean(Some(true));
+        assert_eq!(literal_expr.value(), &expected_value);
     }
 }
