@@ -99,7 +99,7 @@ impl ColumnBounds for ExactColumnBounds {
             return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))); // Fallback to a no-op filter (always true) - the default dynamic filter behaviour
         }
 
-        let unique_values= self
+        let unique_values = self
             .arrays
             .iter()
             .flat_map(|array| {
@@ -251,7 +251,8 @@ mod tests {
         // Test that duplicate values are correctly handled and only unique values are included in the InListExpr
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 2, 3, 3, 3]));
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![a]).expect("Should create record batch");
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![a]).expect("Should create record batch");
 
         let left_expr = col("a", &batch.schema()).expect("Should create column expr");
 
@@ -271,8 +272,10 @@ mod tests {
         // Validate the expression is an InListExpr with the expected unique values
         let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
         let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
-        let expected_values: Vec<ScalarValue> =
-            vec![1, 2, 3].into_iter().map(|i| ScalarValue::Int32(Some(i))).collect();
+        let expected_values: Vec<ScalarValue> = vec![1, 2, 3]
+            .into_iter()
+            .map(|i| ScalarValue::Int32(Some(i)))
+            .collect();
         let mut actual_values: Vec<ScalarValue> = in_list_expr
             .list()
             .iter()
