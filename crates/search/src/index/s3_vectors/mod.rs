@@ -187,7 +187,6 @@ impl SearchIndex for S3Vector {
                         )
                     })?;
 
-                    // This is the bug. We don't return the augmented RecordBatch (that has the vectors).
                     let rb = write::write(self, &table, partition_record, self.batch_write_rows)
                         .await
                         .boxed()?;
