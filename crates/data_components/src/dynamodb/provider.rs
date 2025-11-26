@@ -15,24 +15,27 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, Error, Result, ScanSnafu, TableDoesNotExistSnafu,
-    TableStatusIsNotActiveSnafu,
+    DescribeTableSnafu, Error, FailedToInitializeCheckpointSnafu, FailedToInitializeStreamSnafu,
+    Result, ScanSnafu, TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
 };
+use crate::cdc::ChangesStream;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
+use crate::dynamodb::stream::process_batch;
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use aws_sdk_dynamodb::types::KeyType;
+use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
-    Client,
+    Client as DbClient,
     error::SdkError,
-    types::{AttributeValue, TableStatus},
+    types::{AttributeValue, KeyType, TableStatus},
 };
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
+use datafusion::common::{Constraint, Constraints, DFSchema};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -48,18 +51,23 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use dynamodb_streams::Client as StreamsClient;
+use dynamodb_streams::checkpoint::GlobalCheckpoint;
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::time::Duration;
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug)]
 pub struct DynamoDBTableProvider {
-    client: Arc<Client>,
+    db_client: Arc<DbClient>,
+    streams_client: Arc<StreamsClient>,
     table_schema: DynamoDBTableSchema,
+    constraints: Option<Constraints>,
     request_plan_builder: DynamoDBRequestPlanBuilder,
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
@@ -73,16 +81,24 @@ const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
     pub async fn try_new(
-        client: Arc<Client>,
+        sdk_config: SdkConfig,
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
+        stream_poll_interval_ms: u64,
         time_format: String,
     ) -> Result<Self, Error> {
+        let db_client = Arc::new(DbClient::new(&sdk_config));
+        let streams_client = Arc::new(
+            StreamsClient::builder(sdk_config, table_name.to_string())
+                .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
+                .build(),
+        );
+
         let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
             Self::fetch_table_metadata(
-                Arc::clone(&client),
+                Arc::clone(&db_client),
                 &table_name,
                 unnest_depth,
                 schema_infer_max_records,
@@ -98,9 +114,31 @@ impl DynamoDBTableProvider {
             flattened_fields,
             &time_format,
         );
+
+        // Create constraints with the primary key indices
+        let Ok(df_schema) = DFSchema::try_from(Arc::clone(table_schema.schema())) else {
+            unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
+        };
+
+        let pk_indices: Vec<usize> = table_schema
+            .primary_keys()
+            .iter()
+            .filter_map(|pk| df_schema.index_of_column_by_name(None, pk))
+            .collect();
+
+        let constraints = if pk_indices.is_empty() {
+            None
+        } else {
+            Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                pk_indices,
+            )]))
+        };
+
         Ok(Self {
-            client,
+            db_client,
+            streams_client,
             table_schema: table_schema.clone(),
+            constraints,
             request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
             unnest_depth,
             config_partitions,
@@ -109,7 +147,7 @@ impl DynamoDBTableProvider {
     }
 
     async fn fetch_table_metadata(
-        client: Arc<Client>,
+        db_client: Arc<DbClient>,
         table_name: &str,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
@@ -121,7 +159,7 @@ impl DynamoDBTableProvider {
         HashSet<String>,
         Option<i64>,
     )> {
-        let response = client
+        let response = db_client
             .describe_table()
             .table_name(table_name)
             .send()
@@ -161,7 +199,7 @@ impl DynamoDBTableProvider {
             return Err(Error::MissingPartitionKey);
         };
 
-        let mut request = client.scan().table_name(table_name);
+        let mut request = db_client.scan().table_name(table_name);
 
         request = request.limit(schema_infer_max_records);
 
@@ -214,6 +252,41 @@ impl DynamoDBTableProvider {
             },
         }
     }
+
+    pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
+        self.streams_client
+            .latest_global_checkpoint()
+            .await
+            .context(FailedToInitializeStreamSnafu)
+    }
+
+    pub async fn stream_from_checkpoint(
+        &self,
+        checkpoint: GlobalCheckpoint,
+    ) -> Result<ChangesStream> {
+        let table_schema = Arc::clone(self.table_schema.schema());
+        let primary_keys = self.table_schema.primary_keys().clone();
+        let unnest_depth = self.unnest_depth;
+        let time_format = Arc::clone(&self.table_schema.time_format());
+
+        let stream = self
+            .streams_client
+            .stream_from_checkpoint(checkpoint)
+            .await
+            .context(FailedToInitializeCheckpointSnafu)?
+            .map(move |batch| {
+                process_batch(
+                    batch,
+                    &table_schema,
+                    &primary_keys,
+                    unnest_depth,
+                    &time_format,
+                )
+                .map_err(crate::cdc::StreamError::DynamoDB)
+            });
+
+        Ok(Box::pin(stream))
+    }
 }
 
 #[async_trait]
@@ -224,6 +297,10 @@ impl TableProvider for DynamoDBTableProvider {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.table_schema.schema())
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.constraints.as_ref()
     }
 
     fn table_type(&self) -> TableType {
@@ -278,7 +355,7 @@ impl TableProvider for DynamoDBTableProvider {
         );
 
         Ok(Arc::new(DynamoDBTableProviderExec::new(
-            Arc::clone(&self.client),
+            Arc::clone(&self.db_client),
             request_plan,
             self.unnest_depth,
             projected_schema,
@@ -305,7 +382,7 @@ impl TableProvider for DynamoDBTableProvider {
 }
 
 pub struct DynamoDBTableProviderExec {
-    client: Arc<Client>,
+    client: Arc<DbClient>,
     request_plan: DynamoDBRequestPlan,
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
@@ -316,7 +393,7 @@ pub struct DynamoDBTableProviderExec {
 impl DynamoDBTableProviderExec {
     #[must_use]
     pub fn new(
-        client: Arc<Client>,
+        client: Arc<DbClient>,
         request_plan: DynamoDBRequestPlan,
         unnest_depth: Option<usize>,
         projected_schema: SchemaRef,
@@ -447,7 +524,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
 
 #[deny(unused_variables)]
 fn build_stream_from_plan(
-    client: &Arc<Client>,
+    client: &Arc<DbClient>,
     request: DynamoDBRequestPlan,
     segment: i32,
     total_segments: i32,
