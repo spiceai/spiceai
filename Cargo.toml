@@ -11,6 +11,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
     "crates/flightrepl",
@@ -94,6 +95,7 @@ aws-sdk-bedrockruntime = "1.117.0"
 aws-sdk-cognitoidentity = "1.91.0"
 aws-sdk-cognitoidentityprovider = "1.104.0"
 aws-sdk-dynamodb = "1.100.0"
+aws-sdk-dynamodbstreams = "1.87.0"
 aws-sdk-glue = "1.131.0"
 aws-sdk-s3 = "1.115.0"
 aws-sdk-s3vectors = "1.11"
