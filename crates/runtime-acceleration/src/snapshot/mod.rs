@@ -95,11 +95,30 @@ impl SnapshotUpload {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+type ArchiveLayoutFn =
+    Arc<dyn Fn(&Path) -> Result<Vec<(PathBuf, String)>, SnapshotAdapterError> + Send + Sync>;
+
+#[derive(Clone)]
 pub enum SnapshotAdapter {
-    #[default]
     Identity,
-    DirectoryArchive,
+    DirectoryArchive { layout: ArchiveLayoutFn },
+}
+
+impl std::fmt::Debug for SnapshotAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotAdapter::Identity => f.write_str("SnapshotAdapter::Identity"),
+            SnapshotAdapter::DirectoryArchive { .. } => {
+                f.write_str("SnapshotAdapter::DirectoryArchive")
+            }
+        }
+    }
+}
+
+impl Default for SnapshotAdapter {
+    fn default() -> Self {
+        Self::Identity
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -130,8 +149,18 @@ impl SnapshotAdapter {
     }
 
     #[must_use]
-    pub fn directory_archive() -> Self {
-        Self::DirectoryArchive
+    pub fn directory_archive_with(layout: ArchiveLayoutFn) -> Self {
+        Self::DirectoryArchive { layout }
+    }
+
+    fn archive_entries(
+        &self,
+        base_path: &Path,
+    ) -> Result<Vec<(PathBuf, String)>, SnapshotAdapterError> {
+        match self {
+            SnapshotAdapter::Identity => Ok(vec![]),
+            SnapshotAdapter::DirectoryArchive { layout } => layout(base_path),
+        }
     }
 
     /// Prepare the snapshot artifact for upload.
@@ -145,7 +174,7 @@ impl SnapshotAdapter {
     ) -> Result<SnapshotUpload, SnapshotAdapterError> {
         match self {
             SnapshotAdapter::Identity => Ok(SnapshotUpload::from_path(source_path.to_path_buf())),
-            SnapshotAdapter::DirectoryArchive => {
+            SnapshotAdapter::DirectoryArchive { .. } => {
                 let temp_file = tempfile::NamedTempFile::new().map_err(|source| {
                     SnapshotAdapterError::PrepareFile {
                         path: source_path.to_path_buf(),
@@ -164,12 +193,7 @@ impl SnapshotAdapter {
                 let tokio_file = fs::File::from_std(file);
                 let mut writer = BufWriter::new(tokio_file);
 
-                let metadata_dir = source_path.join("metadata");
-                let data_dir = source_path.to_path_buf();
-                let dirs = vec![
-                    (metadata_dir, "metadata/".to_string()),
-                    (data_dir, "data/".to_string()),
-                ];
+                let dirs = self.archive_entries(source_path)?;
 
                 archive_directories(&dirs, &mut writer)
                     .await
@@ -195,7 +219,7 @@ impl SnapshotAdapter {
     pub fn download_artifact_path(&self, destination: &Path) -> PathBuf {
         match self {
             SnapshotAdapter::Identity => destination.to_path_buf(),
-            SnapshotAdapter::DirectoryArchive => destination.with_extension("tar"),
+            SnapshotAdapter::DirectoryArchive { .. } => destination.with_extension("tar"),
         }
     }
 
@@ -221,7 +245,7 @@ impl SnapshotAdapter {
                 }
                 Ok(())
             }
-            SnapshotAdapter::DirectoryArchive => {
+            SnapshotAdapter::DirectoryArchive { .. } => {
                 let file = fs::File::open(artifact_path).await.map_err(|source| {
                     SnapshotAdapterError::PrepareFile {
                         path: artifact_path.to_path_buf(),

@@ -552,7 +552,14 @@ impl DataAccelerator for CayenneAccelerator {
     }
 
     fn snapshot_adapter(&self) -> SnapshotAdapter {
-        SnapshotAdapter::directory_archive()
+        SnapshotAdapter::directory_archive_with(Arc::new(|base| {
+            let metadata_dir = base.join("metadata");
+            let data_dir = base.to_path_buf();
+            Ok(vec![
+                (metadata_dir, "metadata/".to_string()),
+                (data_dir, "data/".to_string()),
+            ])
+        }))
     }
 
     fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, FilePathError> {

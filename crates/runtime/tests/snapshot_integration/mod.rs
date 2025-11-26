@@ -258,7 +258,12 @@ impl SnapshotFixture {
 
 fn snapshot_adapter_for_engine(engine: &str) -> SnapshotAdapter {
     if engine.eq_ignore_ascii_case("cayenne") {
-        SnapshotAdapter::directory_archive()
+        SnapshotAdapter::directory_archive_with(Arc::new(|base| {
+            Ok(vec![
+                (base.join("metadata"), "metadata/".to_string()),
+                (base.to_path_buf(), "data/".to_string()),
+            ])
+        }))
     } else {
         SnapshotAdapter::identity()
     }

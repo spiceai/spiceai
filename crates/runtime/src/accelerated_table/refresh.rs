@@ -719,7 +719,7 @@ impl Refresher {
                 snapshot_local_path,
             )
             .await
-            .map(|manager| manager.with_snapshot_adapter(self.snapshot_adapter)),
+            .map(|manager| manager.with_snapshot_adapter(self.snapshot_adapter.clone())),
             _ => None,
         };
 
