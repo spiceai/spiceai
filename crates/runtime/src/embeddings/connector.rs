@@ -23,7 +23,6 @@ use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResul
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
-use crate::embeddings::index::VectorScanTableProvider;
 use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
