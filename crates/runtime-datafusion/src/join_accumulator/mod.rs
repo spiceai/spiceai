@@ -30,8 +30,8 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
-const MAXIMUM_INLIST_MEMORY_BYTES: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 128 million i32 keys per partition calculated
-// bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES
+const MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION: usize = 128 * 1024 * 1024; // 128Mb - can store approximately 128 million i32 keys per partition calculated
+// bounds are calculated per-partition, so total memory usage for bounds calculation is potentially num_partitions * MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION
 // similarly, because rows are distributed across partitions the rows per partition is total_rows / num_partitions
 
 /// A simple implementation of a CollectLeftAccumulator that collects exact values for dynamic filtering.
@@ -89,11 +89,11 @@ impl ColumnBounds for ExactColumnBounds {
             .map(|array| array.get_array_memory_size())
             .sum::<usize>();
 
-        if total_memory_size > MAXIMUM_INLIST_MEMORY_BYTES {
+        if total_memory_size > MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION {
             tracing::debug!(
                 "ExactLeftAccumulator exceeded maximum in-list memory size ({} bytes > {} bytes).",
                 total_memory_size,
-                MAXIMUM_INLIST_MEMORY_BYTES
+                MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION
             );
 
             return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))); // Fallback to a no-op filter (always true) - the default dynamic filter behaviour
@@ -168,7 +168,7 @@ mod tests {
         let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
         let expected_values: Vec<ScalarValue> =
             (0..10).map(|i| ScalarValue::Int32(Some(i))).collect();
-        let actual_values: Vec<ScalarValue> = in_list_expr
+        let mut actual_values: Vec<ScalarValue> = in_list_expr
             .list()
             .iter()
             .map(|expr| {
@@ -179,6 +179,7 @@ mod tests {
                 literal.value().clone()
             })
             .collect();
+        actual_values.sort_by(|a, b| a.partial_cmp(b).expect("Should be comparable"));
         assert_eq!(expected_values, actual_values);
     }
 
@@ -219,7 +220,7 @@ mod tests {
         // Test that when the accumulated arrays exceed the maximum in-list memory size, we fallback to a no-op filter
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let large_array: ArrayRef = Arc::new(Int32Array::from(
-            (0..(MAXIMUM_INLIST_MEMORY_BYTES + 1) as i32).collect::<Vec<i32>>(),
+            (0..(MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION + 1) as i32).collect::<Vec<i32>>(),
         ));
         let batch = RecordBatch::try_new(Arc::new(schema), vec![large_array])
             .expect("Should create large record batch");
@@ -289,6 +290,62 @@ mod tests {
             .collect();
         actual_values.sort_by(|a, b| a.partial_cmp(b).expect("Should be comparable"));
 
+        assert_eq!(expected_values, actual_values);
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_multiple_batches() {
+        // Test that multiple batches can be accumulated correctly
+        let batch1 = {
+            let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+            let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+            RecordBatch::try_new(Arc::new(schema), vec![a]).expect("Should create record batch")
+        };
+
+        let batch2 = {
+            let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+            let a: ArrayRef = Arc::new(Int32Array::from(vec![4, 5, 6]));
+            RecordBatch::try_new(Arc::new(schema), vec![a]).expect("Should create record batch")
+        };
+
+        let left_expr = col("a", &batch1.schema()).expect("Should create column expr");
+
+        let mut accumulator =
+            ExactLeftAccumulator::try_new(Arc::clone(&left_expr), &batch1.schema())
+                .expect("Should create accumulator");
+
+        accumulator
+            .update_batch(&batch1)
+            .expect("Should update with batch 1");
+        accumulator
+            .update_batch(&batch2)
+            .expect("Should update with batch 2");
+        accumulator
+            .update_batch(&batch1)
+            .expect("Should update with batch 1 a second time");
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let in_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        // Validate the expression is an InListExpr with the expected values
+        let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
+        let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
+        let expected_values: Vec<ScalarValue> =
+            (1..=6).map(|i| ScalarValue::Int32(Some(i))).collect();
+        let mut actual_values: Vec<ScalarValue> = in_list_expr
+            .list()
+            .iter()
+            .map(|expr| {
+                let literal = expr
+                    .as_any()
+                    .downcast_ref::<Literal>()
+                    .expect("Should be a literal");
+                literal.value().clone()
+            })
+            .collect();
+        actual_values.sort_by(|a, b| a.partial_cmp(b).expect("Should be comparable"));
         assert_eq!(expected_values, actual_values);
     }
 }
