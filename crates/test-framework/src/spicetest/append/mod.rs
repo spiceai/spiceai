@@ -215,8 +215,7 @@ impl SpiceTest<AppendStarted> {
                 .with_flight_client(spice_client.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
                 .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate_row_counts(false)
-                .with_silent(!self.use_progress_bars);
+                .with_validate_row_counts(false);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
