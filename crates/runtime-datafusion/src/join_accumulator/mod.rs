@@ -99,15 +99,13 @@ impl ColumnBounds for ExactColumnBounds {
             return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))); // Fallback to a no-op filter (always true) - the default dynamic filter behaviour
         }
 
-        let unique_values: HashSet<_> = self
+        let unique_values= self
             .arrays
             .iter()
             .flat_map(|array| {
                 (0..array.len()).map(move |i| ScalarValue::try_from_array(array.as_ref(), i))
             })
-            .collect::<DataFusionResult<Vec<ScalarValue>>>()?
-            .into_iter()
-            .collect();
+            .collect::<DataFusionResult<HashSet<ScalarValue>>>()?;
 
         if unique_values.is_empty() {
             // No values collected - return a no-op filter (always true)
@@ -214,5 +212,80 @@ mod tests {
         let literal_expr = literal_expr.expect("Should downcast to Literal");
         let expected_value = ScalarValue::Boolean(Some(true));
         assert_eq!(literal_expr.value(), &expected_value);
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_exceeds_memory() {
+        // Test that when the accumulated arrays exceed the maximum in-list memory size, we fallback to a no-op filter
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let large_array: ArrayRef = Arc::new(Int32Array::from(
+            (0..(MAXIMUM_INLIST_MEMORY_BYTES + 1) as i32).collect::<Vec<i32>>(),
+        ));
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![large_array])
+            .expect("Should create large record batch");
+
+        let left_expr = col("a", &batch.schema()).expect("Should create column expr");
+
+        let mut accumulator =
+            ExactLeftAccumulator::try_new(Arc::clone(&left_expr), &batch.schema())
+                .expect("Should create accumulator");
+
+        accumulator
+            .update_batch(&batch)
+            .expect("Should update with large batch");
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let physical_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        // Validate the expression is a Literal true (no-op filter)
+        let literal_expr = physical_expr.as_any().downcast_ref::<Literal>();
+        let literal_expr = literal_expr.expect("Should downcast to Literal");
+        let expected_value = ScalarValue::Boolean(Some(true));
+        assert_eq!(literal_expr.value(), &expected_value);
+    }
+
+    #[test]
+    fn test_exact_left_accumulator_duplicate_values() {
+        // Test that duplicate values are correctly handled and only unique values are included in the InListExpr
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 2, 3, 3, 3]));
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![a]).expect("Should create record batch");
+
+        let left_expr = col("a", &batch.schema()).expect("Should create column expr");
+
+        let mut accumulator =
+            ExactLeftAccumulator::try_new(Arc::clone(&left_expr), &batch.schema())
+                .expect("Should create accumulator");
+
+        accumulator
+            .update_batch(&batch)
+            .expect("Should update with batch");
+
+        let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
+        let in_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
+
+        // Validate the expression is an InListExpr with the expected unique values
+        let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
+        let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
+        let expected_values: Vec<ScalarValue> =
+            vec![1, 2, 3].into_iter().map(|i| ScalarValue::Int32(Some(i))).collect();
+        let mut actual_values: Vec<ScalarValue> = in_list_expr
+            .list()
+            .iter()
+            .map(|expr| {
+                let literal = expr
+                    .as_any()
+                    .downcast_ref::<Literal>()
+                    .expect("Should be a literal");
+                literal.value().clone()
+            })
+            .collect();
+        actual_values.sort_by(|a, b| a.partial_cmp(b).expect("Should be comparable"));
+
+        assert_eq!(expected_values, actual_values);
     }
 }
