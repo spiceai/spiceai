@@ -238,7 +238,7 @@ impl DistributeFileScanOptimizer {
         .with_file_groups(stage)
         .with_limit(original_file_scan.limit)
         .with_metadata_cols(original_file_scan.metadata_cols.clone())
-        .with_object_versioning_type(original_file_scan.object_versioning_type)
+        .with_object_versioning_type(original_file_scan.object_versioning_type.clone())
         .with_output_ordering(original_file_scan.output_ordering.clone())
         .with_projection(original_file_scan.projection.clone())
         .with_statistics(original_file_scan.statistics()?)
