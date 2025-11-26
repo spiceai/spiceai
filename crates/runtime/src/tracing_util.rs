@@ -98,6 +98,9 @@ fn acceleration_info(
         RefreshMode::Changes => {
             info.push_str(", changes");
         }
+        RefreshMode::Caching => {
+            info.push_str(", caching");
+        }
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {

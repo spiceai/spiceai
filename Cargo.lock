@@ -543,9 +543,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-odbc"
-version = "18.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f58735896cd5ea1a19170cdee39635d04807148e502372b03c54e7dfe78ce32f"
+version = "21.0.0"
+source = "git+https://github.com/pacman82/arrow-odbc?rev=7316b13ac969eea8bef7b496a2ba334ebd4e6e06#7316b13ac969eea8bef7b496a2ba334ebd4e6e06"
 dependencies = [
  "arrow",
  "atoi",
@@ -2479,9 +2478,9 @@ dependencies = [
 
 [[package]]
 name = "borsh"
-version = "1.5.7"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad8646f98db542e39fc66e68a20b2144f6a732636df7c2354e74645faaa433ce"
+checksum = "d1da5ab77c1437701eeff7c88d968729e7766172279eab0676857b3d63af7a6f"
 dependencies = [
  "borsh-derive",
  "cfg_aliases",
@@ -2489,9 +2488,9 @@ dependencies = [
 
 [[package]]
 name = "borsh-derive"
-version = "1.5.7"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd1d3c0c2f5833f22386f252fe8ed005c7f59fdcddeef025c01b4c3b9fd9ac3"
+checksum = "0686c856aa6aac0c4498f936d7d6a02df690f614c03e4d906d1018062b5c5e2c"
 dependencies = [
  "once_cell",
  "proc-macro-crate",
@@ -4131,6 +4130,7 @@ dependencies = [
  "graph-rs-sdk",
  "graphql-parser",
  "http 1.4.0",
+ "httpdate",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
@@ -8593,6 +8593,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkme"
+version = "0.3.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e3283ed2d0e50c06dd8602e0ab319bb048b6325d0bba739db64ed8205179898"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5cec0ec4228b4853bb129c84dbf093a27e6c7a20526da046defc334a1b017f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "linux-keyutils"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8980,9 +9000,9 @@ checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 
 [[package]]
 name = "mailparse"
-version = "0.15.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3da03d5980411a724e8aaf7b61a7b5e386ec55a7fb49ee3d0ff79efc7e5e7c7e"
+checksum = "60819a97ddcb831a5614eb3b0174f3620e793e97e09195a395bfa948fd68ed2f"
 dependencies = [
  "charset",
  "data-encoding",
@@ -10516,9 +10536,9 @@ dependencies = [
 
 [[package]]
 name = "odbc-api"
-version = "14.3.0"
+version = "20.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0566d76c87be8dac51dbba245287afdbf8d5fe3c7ffb9cf5c73786ee4427f15"
+checksum = "783bf33566037e27f47dbb0ca9c0a0562e80e35ee2a8cf35b86048905c36076a"
 dependencies = [
  "atoi",
  "log",
@@ -10530,9 +10550,9 @@ dependencies = [
 
 [[package]]
 name = "odbc-sys"
-version = "0.25.1"
+version = "0.27.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ecdb20f7c165083ad1bc9f55122f677725e257716a5bc83e5413d5654b7d6f1"
+checksum = "1896e52e97c2f0cf997cc627380f1af1ecb3f6c29ce6175047cd38adaadb46f5"
 
 [[package]]
 name = "odpic-sys"
@@ -13065,6 +13085,7 @@ dependencies = [
  "itertools 0.14.0",
  "jsonpath-rust",
  "jsonwebtoken",
+ "linkme",
  "llms",
  "mediatype",
  "model_components",

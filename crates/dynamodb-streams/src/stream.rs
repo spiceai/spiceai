@@ -90,7 +90,6 @@ impl DynamodbStreamProducer {
     }
 
     fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
-        // TODO: Finalize logic - https://github.com/spiceai/spiceai/issues/8074
         let is_expired_iterator = error.to_string().contains("ExpiredIterator")
             || error.to_string().contains("TrimmedDataAccess");
 
@@ -121,7 +120,6 @@ impl DynamodbStreamProducer {
                     }
                 }
                 Err(e) => {
-                    // TODO: Handle failures - https://github.com/spiceai/spiceai/issues/8074
                     tracing::warn!("Failed to initialize shard {}: {}", shard_id, e);
                 }
             }
