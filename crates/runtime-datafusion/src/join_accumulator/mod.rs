@@ -188,9 +188,10 @@ mod tests {
     fn test_exact_left_accumulator_empty_batch() {
         // Test that updating with an empty batch does not cause errors and results in an always-true filter
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-        let empty_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int32Array::from(
-            Vec::<i32>::new(),
-        ))])
+        let empty_batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        )
         .expect("Should create empty record batch");
 
         let left_expr = col("a", &empty_batch.schema()).expect("Should create column expr");
