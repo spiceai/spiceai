@@ -118,17 +118,22 @@ impl Embed {
         let embedding = model
             .embed_sync(EmbeddingInput::String(sentence.to_owned()))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let vector_size = match embedding.first() {
-            Some(embedding) => embedding.len(),
-            _ => unreachable!("Should have at least one embedding"),
-        };
+
+        let first_embedding = embedding.first().ok_or_else(|| {
+            DataFusionError::Execution(
+                "Embedding model returned empty result for input text (contract violation)"
+                    .to_string(),
+            )
+        })?;
+
+        let vector_size = first_embedding.len();
 
         let mut builder = ListBuilder::with_capacity(
             PrimitiveBuilder::<Float32Type>::with_capacity(vector_size),
             1,
         );
 
-        builder.values().append_slice(&embedding[0]);
+        builder.values().append_slice(first_embedding);
         builder.append(true);
 
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
@@ -218,11 +223,16 @@ impl ScalarUDFImpl for Embed {
                 let ColumnarValue::Array(embeddings) =
                     Self::embed_multiple(&**model, string_array_iter!(arr))?
                 else {
-                    unreachable!("Should retrieve embedding list")
+                    unreachable!(
+                        "{EMBED_UDF_NAME}: embed_multiple must return ColumnarValue::Array by contract"
+                    );
                 };
 
                 // Unpack the inner list (i.e. as used for single row, multiple input below)
                 let list_array = as_list_array(&*embeddings)?;
+                if list_array.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: embedding result array is empty");
+                }
                 Ok(ColumnarValue::Array(Arc::new(list_array.value(0))))
             }
             // A single text value
@@ -231,14 +241,23 @@ impl ScalarUDFImpl for Embed {
             ) => Self::embed_single(&**model, text),
             // Various combinations of single row/multiple input
             ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
                 let inner_array = arr.value(0);
                 Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::List(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
                 let inner_array = arr.value(0);
                 Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }
             ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
                 let inner_array = arr.value(0);
                 Self::embed_multiple(&**model, string_array_iter!(&inner_array))
             }

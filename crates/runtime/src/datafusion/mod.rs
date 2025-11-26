@@ -986,10 +986,16 @@ impl DataFusion {
             source_schema
         };
 
-        // Only pass constraints from the source table if we're not using refresh_sql
-        // When refresh_sql is used, the schema might have different column ordering,
-        // which would make the constraint indices invalid
-        let constraints = if refresh_sql.is_none() {
+        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+
+        // Determine if we should pass constraints to the accelerator
+        // Only pass constraints if not using refresh_sql (schema might have different column ordering)
+        //
+        // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
+        // For caching mode with Arrow: constraints are required for InsertOp::Replace to work correctly
+        let use_constraints = refresh_sql.is_none();
+
+        let constraints = if use_constraints {
             match &*source_table_provider {
                 FederatedTable::Immediate(table_provider) => table_provider.constraints(),
                 FederatedTable::Deferred(_) => None,
@@ -1012,13 +1018,17 @@ impl DataFusion {
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
 
-        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
-
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
-        let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+        // For caching mode, we always start ready since it fetches data on-demand.
+        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        if initial_load_complete {
+            // Caching mode datasets are always ready immediately
+            self.runtime_status
+                .update_dataset(&dataset.name, status::ComponentStatus::Ready);
+        } else if let Ok(checkpoint) =
+            DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
             && checkpoint.exists().await
         {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
@@ -1120,6 +1130,13 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
+        // For caching mode, set the TTL from refresh_check_interval
+        if refresh_mode == RefreshMode::Caching
+            && let Some(check_interval) = acceleration_settings.refresh_check_interval
+        {
+            accelerated_table_builder.caching_ttl(Some(check_interval));
+        }
+
         if acceleration_settings.snapshots.create_enabled()
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
         {
@@ -1140,7 +1157,10 @@ impl DataFusion {
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
-        if acceleration_settings.disable_federation {
+        // Caching mode requires federation to be disabled so that queries go through
+        // AcceleratedTable::scan to trigger the cache miss/hit logic
+        if acceleration_settings.disable_federation || matches!(refresh_mode, RefreshMode::Caching)
+        {
             accelerated_table_builder.disable_federation();
         }
 

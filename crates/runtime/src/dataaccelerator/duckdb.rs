@@ -28,7 +28,7 @@ use crate::{
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path,
+    register_data_accelerator, spice_data_base_path,
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
@@ -622,6 +622,8 @@ fn make_retention_write_handler(
         }
     })
 }
+
+register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
 
 #[cfg(test)]
 mod tests {
