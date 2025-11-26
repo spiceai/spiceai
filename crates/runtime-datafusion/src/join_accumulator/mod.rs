@@ -16,13 +16,23 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::{array::{Array, RecordBatch}, datatypes::SchemaRef};
-use datafusion::{physical_plan::{expressions::{InListExpr, Literal}, joins::{CollectLeftAccumulator, ColumnBounds}, PhysicalExpr}, scalar::ScalarValue};
+use arrow::{
+    array::{Array, RecordBatch},
+    datatypes::SchemaRef,
+};
 use datafusion::error::Result as DataFusionResult;
+use datafusion::{
+    physical_plan::{
+        PhysicalExpr,
+        expressions::{InListExpr, Literal},
+        joins::{CollectLeftAccumulator, ColumnBounds},
+    },
+    scalar::ScalarValue,
+};
 
 /// A simple implementation of a CollectLeftAccumulator that collects exact values for dynamic filtering.
 /// Performs no approximation or range merging, simply storing all values seen.
-/// 
+///
 /// Tradeoff: potentially higher memory usage on the build-side of the join, but more precise filtering on the probe-side.
 /// If `JoinSelection` has correctly re-ordered the plan so the larger scan is on the probe-side, this can be beneficial.
 pub struct ExactLeftAccumulator {
@@ -60,24 +70,34 @@ pub struct ExactColumnBounds {
 
 impl ColumnBounds for ExactColumnBounds {
     /// Converts the collected arrays into an InListExpr for use in dynamic filtering.
-     /// This builds an IN expression with all collected values.
+    /// This builds an IN expression with all collected values.
     fn physical_expr(
-            &self,
-            left_expr: Arc<dyn PhysicalExpr>,
-        ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
-        let scalar_values = self.arrays.iter().map(|array| {
-            (0..array.len()).map(|i| ScalarValue::try_from_array(array.as_ref(), i)).collect::<DataFusionResult<Vec<ScalarValue>>>()
-        }).collect::<DataFusionResult<Vec<Vec<ScalarValue>>>>()?.into_iter().flatten().collect::<Vec<ScalarValue>>();
-        
-        let expr_values = scalar_values.into_iter().map(|sv| {
-            Arc::new(Literal::new(sv)) as Arc<dyn PhysicalExpr>
-        }).collect::<Vec<_>>();
+        &self,
+        left_expr: Arc<dyn PhysicalExpr>,
+    ) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        let scalar_values = self
+            .arrays
+            .iter()
+            .map(|array| {
+                (0..array.len())
+                    .map(|i| ScalarValue::try_from_array(array.as_ref(), i))
+                    .collect::<DataFusionResult<Vec<ScalarValue>>>()
+            })
+            .collect::<DataFusionResult<Vec<Vec<ScalarValue>>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<ScalarValue>>();
+
+        let expr_values = scalar_values
+            .into_iter()
+            .map(|sv| Arc::new(Literal::new(sv)) as Arc<dyn PhysicalExpr>)
+            .collect::<Vec<_>>();
 
         let in_expr = Arc::new(InListExpr::new(
-             left_expr,
+            left_expr,
             expr_values,
             false, // not negated (IN, not NOT IN)
-             None   // no static filter optimization
+            None,  // no static filter optimization
         ));
 
         Ok(in_expr)
@@ -86,15 +106,13 @@ impl ColumnBounds for ExactColumnBounds {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::physical_plan::expressions::col;
     use super::*;
-    use arrow::array::{Int32Array, ArrayRef};
+    use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::expressions::col;
 
     fn create_test_batch() -> RecordBatch {
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-        ]);
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let a: ArrayRef = Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>()));
         RecordBatch::try_new(Arc::new(schema), vec![a]).expect("Should create record batch")
     }
@@ -108,23 +126,34 @@ mod tests {
 
         let left_expr = col("a", &schema).expect("Should create column expr");
 
-        let mut accumulator = ExactLeftAccumulator::try_new(Arc::clone(&left_expr), &batch.schema()).expect("Should create accumulator");
+        let mut accumulator =
+            ExactLeftAccumulator::try_new(Arc::clone(&left_expr), &batch.schema())
+                .expect("Should create accumulator");
 
-        accumulator.update_batch(&batch).expect("Should update batches");
+        accumulator
+            .update_batch(&batch)
+            .expect("Should update batches");
 
         let column_bounds = accumulator.evaluate().expect("Should evaluate bounds");
-        let in_expr = column_bounds.physical_expr(left_expr).expect("Should create physical expr");
+        let in_expr = column_bounds
+            .physical_expr(left_expr)
+            .expect("Should create physical expr");
 
         // Validate the expression is an InListExpr with the expected values
         if let Some(in_list_expr) = in_expr.as_any().downcast_ref::<InListExpr>() {
-            let expected_values: Vec<ScalarValue> = (0..10).map(|i| ScalarValue::Int32(Some(i))).collect();
-            let actual_values: Vec<ScalarValue> = in_list_expr.list().iter().map(|expr| {
-                if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
-                    literal.value().clone()
-                } else {
-                    panic!("Expected Literal expression");
-                }
-            }).collect();
+            let expected_values: Vec<ScalarValue> =
+                (0..10).map(|i| ScalarValue::Int32(Some(i))).collect();
+            let actual_values: Vec<ScalarValue> = in_list_expr
+                .list()
+                .iter()
+                .map(|expr| {
+                    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+                        literal.value().clone()
+                    } else {
+                        panic!("Expected Literal expression");
+                    }
+                })
+                .collect();
 
             assert_eq!(expected_values, actual_values);
         } else {

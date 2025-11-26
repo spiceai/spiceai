@@ -17,9 +17,9 @@ limitations under the License.
 pub mod config;
 pub mod execution_plan;
 pub mod extension;
+pub mod join_accumulator;
 pub mod schema_provider;
 pub mod stream_utils;
-pub mod join_accumulator;
 
 use snafu::prelude::*;
 
