@@ -21,6 +21,7 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Component, Path};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -63,6 +64,16 @@ pub enum Error {
         "Unable to create model path. {source} Verify you have the necessary permissions to access the model path."
     ))]
     UnableToCreateModelPath { source: std::io::Error },
+
+    #[snafu(display(
+        "Invalid model name '{name}'. Model names must not be absolute paths or contain parent directory segments."
+    ))]
+    InvalidModelName { name: String },
+
+    #[snafu(display(
+        "Invalid model file path '{path}'. File paths must stay within the model directory."
+    ))]
+    InvalidModelFilePath { path: String },
 
     #[snafu(display(
         "Unable to load the configuration. {reason} Verify the configuration is valid, and try again."
@@ -141,9 +152,27 @@ impl FromStr for ModelSourceType {
 }
 
 pub fn ensure_model_path(name: &str) -> Result<String> {
-    let mut model_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
-    model_path.push(".spice/models");
-    model_path.push(name);
+    let mut base_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
+    base_path.push(".spice/models");
+
+    let candidate = Path::new(name);
+    ensure!(
+        !candidate.is_absolute()
+            && candidate
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        InvalidModelNameSnafu {
+            name: name.to_string(),
+        }
+    );
+
+    let model_path = base_path.join(candidate);
+    ensure!(
+        model_path.starts_with(&base_path),
+        InvalidModelNameSnafu {
+            name: name.to_string(),
+        }
+    );
 
     if !model_path.exists() {
         std::fs::create_dir_all(&model_path).context(UnableToCreateModelPathSnafu)?;
