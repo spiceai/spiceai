@@ -526,6 +526,9 @@ pub async fn start(
     };
 
     // If running an executor, we may have resolved another port to bind if 50051 is taken
+    // Cast truncation for port is OK: was originally widened from u32 because it's a u32 in
+    // Ballista `ExecutorRegistration`
+    #[allow(clippy::cast_possible_truncation)]
     #[cfg(feature = "cluster")]
     let bind_address = rt
         .df
@@ -547,7 +550,7 @@ pub async fn start(
             })
         })
         .and_then(|mut addrs| addrs.next())
-        .unwrap_or_else(|| bind_address);
+        .unwrap_or(bind_address);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
