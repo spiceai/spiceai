@@ -18,8 +18,7 @@ limitations under the License.
 use {
     crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
-    std::net::ToSocketAddrs,
+    ballista_executor::flight_service::BallistaFlightService, std::net::ToSocketAddrs,
 };
 
 use crate::auth::EndpointAuth;
@@ -538,7 +537,15 @@ pub async fn start(
                 .as_ref()
                 .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
         })
-        .and_then(|spec| spec.to_socket_addrs().ok())
+        .and_then(|spec| {
+            tokio::task::block_in_place(|| match spec.to_socket_addrs() {
+                Ok(sa) => Some(sa),
+                Err(e) => {
+                    tracing::error!("Unable to resolve bound executor host {e}");
+                    None
+                }
+            })
+        })
         .and_then(|mut addrs| addrs.next())
         .unwrap_or_else(|| bind_address);
 
