@@ -131,7 +131,7 @@ impl ColumnBounds for ExactColumnBounds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::array::{ArrayRef, Int32Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::expressions::col;
 
@@ -218,9 +218,9 @@ mod tests {
     #[test]
     fn test_exact_left_accumulator_exceeds_memory() {
         // Test that when the accumulated arrays exceed the maximum in-list memory size, we fallback to a no-op filter
-        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-        let large_array: ArrayRef = Arc::new(Int32Array::from(
-            (0..(MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION + 1) as i32).collect::<Vec<i32>>(),
+        let schema = Schema::new(vec![Field::new("a", DataType::UInt64, false)]);
+        let large_array: ArrayRef = Arc::new(UInt64Array::from(
+            (0..(MAXIMUM_INLIST_MEMORY_BYTES_PER_PARTITION + 1) as u64).collect::<Vec<u64>>(),
         ));
         let batch = RecordBatch::try_new(Arc::new(schema), vec![large_array])
             .expect("Should create large record batch");
