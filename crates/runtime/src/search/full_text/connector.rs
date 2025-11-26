@@ -16,7 +16,7 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::datasource::TableProvider;
-use runtime_datafusion_index::Index;
+use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -30,10 +30,8 @@ use crate::component::{
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
-use crate::search::util::find_index_in_table_provider;
+use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
-
-use search::generation::text_search::index::FullTextDatabaseIndex;
 
 /// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
@@ -56,29 +54,18 @@ impl FullTextConnector {
         F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
     {
         let table_provider = federated_table.try_table_provider_sync()?;
+        let indexed_table = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)?;
 
-        let Some((indexed, underlying)) =
-            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
-        else {
-            tracing::debug!(
-                "FullTextConnector didn't wrap underlying table with index - this is unexpected"
-            );
-            return None;
-        };
-
-        let indexed = indexed
-            .into_iter()
-            .cloned()
-            .map(|i| Arc::new(i) as Arc<dyn Index + Send + Sync>)
-            .collect();
-
-        let indexed = Indexes::new(indexed);
-        let ft = Arc::new(FederatedTable::Immediate(underlying));
+        // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
+        // This is required so that [`IndexedTableProvider`] can be unwrapped (i.e. [`IndexedTableProvider::get_underlying`])
+        //  in both cases there is and isn't a `EmbeddingConnector` underneath.
+        let indexes = Indexes::new(indexed_table.get_all_indexes());
+        let ft = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
 
         let stream = f(&self.inner_connector, ft)?;
         Some(
             stream
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexed)))
+                .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed(),
         )
     }
