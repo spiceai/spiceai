@@ -543,9 +543,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-odbc"
-version = "18.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f58735896cd5ea1a19170cdee39635d04807148e502372b03c54e7dfe78ce32f"
+version = "21.0.0"
+source = "git+https://github.com/pacman82/arrow-odbc?rev=7316b13ac969eea8bef7b496a2ba334ebd4e6e06#7316b13ac969eea8bef7b496a2ba334ebd4e6e06"
 dependencies = [
  "arrow",
  "atoi",
@@ -10580,9 +10579,9 @@ dependencies = [
 
 [[package]]
 name = "odbc-api"
-version = "14.3.0"
+version = "20.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0566d76c87be8dac51dbba245287afdbf8d5fe3c7ffb9cf5c73786ee4427f15"
+checksum = "783bf33566037e27f47dbb0ca9c0a0562e80e35ee2a8cf35b86048905c36076a"
 dependencies = [
  "atoi",
  "log",
@@ -10594,9 +10593,9 @@ dependencies = [
 
 [[package]]
 name = "odbc-sys"
-version = "0.25.1"
+version = "0.27.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ecdb20f7c165083ad1bc9f55122f677725e257716a5bc83e5413d5654b7d6f1"
+checksum = "1896e52e97c2f0cf997cc627380f1af1ecb3f6c29ce6175047cd38adaadb46f5"
 
 [[package]]
 name = "odpic-sys"
