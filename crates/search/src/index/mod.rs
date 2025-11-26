@@ -27,9 +27,11 @@ pub mod chunking;
 pub mod s3_vectors;
 
 pub mod vector_table;
+use crate::index::chunking::ChunkedVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
-use crate::index::{chunking::ChunkedVectorIndex, s3_vectors::S3Vector};
+#[cfg(feature = "s3_vectors")]
+use crate::index::s3_vectors::S3Vector;
 
 /// A [`SearchIndex`] is a table index that can provide search results for arbitrary queries (see [`SearchIndex::query_table_provider`]).
 /// This trait supports both vector similarity search and full-text search implementations.
