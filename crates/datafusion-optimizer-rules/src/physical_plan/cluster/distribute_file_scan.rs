@@ -145,7 +145,7 @@ impl DistributeFileScanOptimizer {
         let partitioned_files = file_scan_config
             .file_groups
             .iter()
-            .flat_map(|fg| fg.clone().into_inner())
+            .flat_map(|fg| fg.iter().cloned())
             .collect::<Vec<_>>();
 
         let read_size: u64 = partitioned_files.iter().map(Self::read_size).sum();
@@ -218,6 +218,46 @@ impl DistributeFileScanOptimizer {
 
         Ok(new_exec)
     }
+
+    fn stage_to_new_file_scan(
+        original_file_scan: &FileScanConfig,
+        stage: Vec<FileGroup>,
+        task_partitions: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Copy all existing attributes including projection, excluding file groups as they are potentially
+        // expensive to clone for large scans
+        let new_scan = FileScanConfigBuilder::new(
+            original_file_scan.object_store_url.clone(),
+            Arc::clone(&original_file_scan.file_schema),
+            Arc::clone(&original_file_scan.file_source),
+        )
+        .with_batch_size(original_file_scan.batch_size)
+        .with_constraints(original_file_scan.constraints.clone())
+        .with_expr_adapter(original_file_scan.expr_adapter_factory.clone())
+        .with_file_compression_type(original_file_scan.file_compression_type)
+        .with_file_groups(stage)
+        .with_limit(original_file_scan.limit)
+        .with_metadata_cols(original_file_scan.metadata_cols.clone())
+        .with_object_versioning_type(original_file_scan.object_versioning_type.clone())
+        .with_output_ordering(original_file_scan.output_ordering.clone())
+        .with_projection(original_file_scan.projection.clone())
+        .with_statistics(original_file_scan.statistics()?)
+        .with_table_partition_cols(
+            original_file_scan
+                .table_partition_cols
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+        )
+        .build();
+
+        // Propagate source partitioning
+        let new_scan_partitioning = new_scan.output_partitioning();
+        let new_data_source_exec =
+            DataSourceExec::new(Arc::new(new_scan)).with_partitioning(new_scan_partitioning);
+
+        Self::with_stage_repartition(Arc::new(new_data_source_exec), task_partitions)
+    }
 }
 
 impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
@@ -262,18 +302,9 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
             let exploded_scans = new_stages
                 .into_iter()
                 .map(|stage| {
-                    // Copy all existing attributes including projection, but override file groups
-                    let new_scan = FileScanConfigBuilder::from(file_scan_config.clone())
-                        .with_file_groups(stage)
-                        .build();
-
-                    // Propagate source partitioning
-                    let new_scan_partitioning = new_scan.output_partitioning();
-                    let new_data_source_exec = DataSourceExec::new(Arc::new(new_scan))
-                        .with_partitioning(new_scan_partitioning);
-
-                    Self::with_stage_repartition(
-                        Arc::new(new_data_source_exec),
+                    Self::stage_to_new_file_scan(
+                        file_scan_config,
+                        stage,
                         config.execution.target_partitions,
                     )
                 })
