@@ -44,6 +44,7 @@ use crate::dataaccelerator::{
     FilePathError, SnapshotAdapter, snapshots::download_snapshot_if_needed,
 };
 use crate::parameters::ParameterSpec;
+use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 
 #[derive(Debug, Snafu)]
@@ -1095,6 +1096,8 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect())
     }
 }
+
+register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {
