@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
     array::{Array, RecordBatch},
@@ -95,20 +95,17 @@ impl ColumnBounds for ExactColumnBounds {
             return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))); // Fallback to a no-op filter (always true) - the default dynamic filter behaviour
         }
 
-        let scalar_values = self
+        let unique_values: HashSet<_> = self
             .arrays
             .iter()
-            .map(|array| {
-                (0..array.len())
-                    .map(|i| ScalarValue::try_from_array(array.as_ref(), i))
-                    .collect::<DataFusionResult<Vec<ScalarValue>>>()
+            .flat_map(|array| {
+                (0..array.len()).map(move |i| ScalarValue::try_from_array(array.as_ref(), i))
             })
-            .collect::<DataFusionResult<Vec<Vec<ScalarValue>>>>()?
+            .collect::<DataFusionResult<Vec<ScalarValue>>>()?
             .into_iter()
-            .flatten()
-            .collect::<Vec<ScalarValue>>();
+            .collect();
 
-        let expr_values = scalar_values
+        let expr_values = unique_values
             .into_iter()
             .map(|sv| Arc::new(Literal::new(sv)) as Arc<dyn PhysicalExpr>)
             .collect::<Vec<_>>();
@@ -160,24 +157,21 @@ mod tests {
             .expect("Should create physical expr");
 
         // Validate the expression is an InListExpr with the expected values
-        if let Some(in_list_expr) = in_expr.as_any().downcast_ref::<InListExpr>() {
-            let expected_values: Vec<ScalarValue> =
-                (0..10).map(|i| ScalarValue::Int32(Some(i))).collect();
-            let actual_values: Vec<ScalarValue> = in_list_expr
-                .list()
-                .iter()
-                .map(|expr| {
-                    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
-                        literal.value().clone()
-                    } else {
-                        panic!("Expected Literal expression");
-                    }
-                })
-                .collect();
-
-            assert_eq!(expected_values, actual_values);
-        } else {
-            panic!("Expected InListExpr");
-        }
+        let in_list_expr = in_expr.as_any().downcast_ref::<InListExpr>();
+        let in_list_expr = in_list_expr.expect("Should downcast to InListExpr");
+        let expected_values: Vec<ScalarValue> =
+            (0..10).map(|i| ScalarValue::Int32(Some(i))).collect();
+        let actual_values: Vec<ScalarValue> = in_list_expr
+            .list()
+            .iter()
+            .map(|expr| {
+                let literal = expr
+                    .as_any()
+                    .downcast_ref::<Literal>()
+                    .expect("Should be a literal");
+                literal.value().clone()
+            })
+            .collect();
+        assert_eq!(expected_values, actual_values);
     }
 }
