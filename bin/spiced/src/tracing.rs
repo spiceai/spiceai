@@ -89,6 +89,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off";
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
@@ -102,11 +103,11 @@ impl From<LogVerbosity> for EnvFilter {
 
         match v {
             LogVerbosity::Default => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},WARN",
+                "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},WARN",
                 internal_components("INFO")
             )),
             LogVerbosity::Verbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},INFO",
+                "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},INFO",
                 internal_components("DEBUG")
             )),
             LogVerbosity::VeryVerbose => EnvFilter::new(format!(

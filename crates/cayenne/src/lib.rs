@@ -58,6 +58,7 @@ pub mod cayenne_catalog;
 pub mod deletion;
 pub mod metadata;
 pub mod metastore;
+pub mod optimizer_rules;
 pub mod provider;
 
 pub use catalog::MetadataCatalog;

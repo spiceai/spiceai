@@ -15,6 +15,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 dashmap = "6.1.0"
 datafusion.workspace = true
+datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
 futures.workspace = true
 opentelemetry.workspace = true
@@ -24,7 +25,6 @@ snafu.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-datafusion-datasource.workspace = true
 tokio.workspace = true
 
 [features]
