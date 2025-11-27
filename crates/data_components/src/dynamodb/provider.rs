@@ -319,7 +319,11 @@ impl DynamoDBTableProvider {
         let stream =
             record_batch_stream.map(move |record_batch_result| match record_batch_result {
                 Ok(record_batch) => {
-                    // tracing::debug!("DynamoDB bootstrapping records: table_name={}, records={}", table_name, record_batch.num_rows());
+                    tracing::debug!(
+                        "DynamoDB bootstrapping records: table_name={}, records={}",
+                        self.table_schema.table_name(),
+                        record_batch.num_rows()
+                    );
                     record_batch_to_change_envelope(record_batch, &schema, &primary_keys)
                         .map_err(crate::cdc::StreamError::DynamoDB)
                 }

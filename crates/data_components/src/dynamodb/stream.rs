@@ -802,18 +802,10 @@ mod tests {
 
         fn create_test_batch(schema: Arc<Schema>, row_count: usize) -> RecordBatch {
             let ids: Int32Array = (0..row_count as i32).collect();
-            let names: Vec<String> = (0..row_count)
-                .map(|i| format!("name_{}", i))
-                .collect();
-            let names_array: StringArray = names.iter()
-                .map(|s| Some(s.as_str()))
-                .collect();
+            let names: Vec<String> = (0..row_count).map(|i| format!("name_{}", i)).collect();
+            let names_array: StringArray = names.iter().map(|s| Some(s.as_str())).collect();
 
-            RecordBatch::try_new(
-                schema,
-                vec![Arc::new(ids), Arc::new(names_array)],
-            )
-                .unwrap()
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names_array)]).unwrap()
         }
 
         #[test]
