@@ -485,6 +485,13 @@ impl std::fmt::Debug for ChunkedVectorIndex {
 
 #[async_trait]
 impl VectorIndex for ChunkedVectorIndex {
+    fn derived_columns(&self) -> Vec<String> {
+        vec![
+            embedding_col(self.search_column().as_str()),
+            ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
+        ]
+    }
+
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         let base_index_table = self.inner.list_table_provider()?;
         let primary_key_names: Vec<_> = self

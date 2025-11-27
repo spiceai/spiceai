@@ -21,7 +21,6 @@ datafusion-datasource = { optional = true, workspace = true }
 datafusion-expr.workspace = true
 datafusion-table-providers.workspace = true
 tokio.workspace = true
-runtime-datafusion = { path = '../runtime-datafusion', optional = true }
 r2d2 = { optional = true, workspace = true }
 duckdb = { optional = true, workspace = true }
 futures.workspace = true
@@ -37,5 +36,4 @@ duckdb = [
     "dep:duckdb",
     "dep:r2d2"
 ]
-cluster = ["dep:arrow", "dep:chrono", "dep:itertools", "dep:datafusion-datasource", "dep:object_store", "dep:runtime-datafusion", "dep:url"]
-
+cluster = ["dep:arrow", "dep:chrono", "dep:itertools", "dep:datafusion-datasource", "dep:object_store", "dep:url"]
