@@ -293,7 +293,7 @@ impl DynamoDBTableProvider {
     }
 
     pub async fn bootstrap_stream(self: Arc<Self>) -> Result<ChangesStream> {
-        let schema = Arc::clone(&self.table_schema.schema());
+        let schema = Arc::clone(self.table_schema.schema());
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();
 
