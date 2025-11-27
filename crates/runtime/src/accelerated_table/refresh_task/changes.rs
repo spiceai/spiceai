@@ -196,8 +196,9 @@ impl RefreshTask {
                         tracing::trace!("Inserting data row for {dataset_name}",);
                     } else {
                         tracing::trace!(
-                            "Upserting data row for {dataset_name} with {}",
-                            Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
+                            "Upserting data row for {dataset_name} with {}, version={:?}",
+                            Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?,
+                            Self::get_primary_key_value(&inner_data, "version")?
                         );
                     }
 

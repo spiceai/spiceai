@@ -14,26 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! CREATE TABLE `spice_sys_dynamodb_streams` (
-//!     `dataset_name` TEXT PRIMARY KEY,
-//!     `checkpoint_data` TEXT,
-//!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
-//!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
-//! );
-
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
-use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
+use crate::{
+    component::dataset::Dataset,
+    dataaccelerator::spice_sys::OpenOption,
+};
 use serde::{Deserialize, Serialize};
 
 const DYNAMODB_STREAMS_TABLE_NAME: &str = "spice_sys_dynamodb_streams";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "postgres")]
+mod postgres;
+#[cfg(feature = "sqlite")]
+mod sqlite;
+#[cfg(feature = "turso")]
+mod turso;
 
-/// Serializable checkpoint metadata for DynamoDB Streams
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DynamoDBCheckpointMetadata {
-    pub checkpoint_data: String, // JSON-encoded Checkpoint
+    pub checkpoint_data: String,
 }
 
 pub struct DynamoDBSys {
@@ -49,18 +50,42 @@ impl DynamoDBSys {
         })
     }
 
-    pub(crate) async fn get(&self) -> Option<DynamoDBCheckpointMetadata> {
+    pub async fn get(&self) -> Option<DynamoDBCheckpointMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            #[cfg(feature = "postgres")]
+            AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => None,
         }
     }
 
-    pub(crate) async fn upsert(&self, metadata: &DynamoDBCheckpointMetadata) -> Result<()> {
+    pub async fn upsert(&self, metadata: &DynamoDBCheckpointMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            #[cfg(feature = "postgres")]
+            AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres",
+                feature = "turso"
+            )))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }

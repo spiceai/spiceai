@@ -313,7 +313,8 @@ impl DynamoDBTableProvider {
             .context(FailedToBootstrapTableSnafu)?;
 
         let ctx = SessionContext::new();
-        let df = DataFrame::new(ctx.state(), logical_plan);
+        let df = DataFrame::new(ctx.state(), logical_plan)
+            .limit(0, Some(100)).unwrap();
 
         let record_batch_stream = df
             .execute_stream()

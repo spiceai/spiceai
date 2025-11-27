@@ -262,14 +262,14 @@ impl DataConnector for DynamoDB {
 
                 if should_bootstrap {
                     // Initialize bootstrap stream
-                    let bootstrap_stream = dynamodb.bootstrap_stream().await.ok()?.map(|msg| {
+                    let bootstrap_stream = Arc::clone(&dynamodb).bootstrap_stream().await.ok()?.map(|msg| {
                         msg.map(|change_batch| {
                             // Bootstrap stream doesn't commit changes
                             ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch)
                         })
                     });
 
-                    // Attach changes stream to bootstrap stream
+                    // Attach changes stream from initial checkpoint to bootstrap stream
                     Some(
                         bootstrap_stream
                             .chain(
