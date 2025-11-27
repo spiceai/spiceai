@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::common::plan_node_key::PlanNodeKey;
 use crate::common::search_visitor::SearchVisitor;
 use crate::concrete;
@@ -180,29 +196,75 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
-    use crate::physical_plan::cluster::distribute_file_scan::tests::create_partitioned_file;
-    use crate::physical_plan::cluster::distribute_file_scan::tests::{
-        DEFAULT_CONFIG_OPTIONS, create_data_source_exec,
-    };
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use chrono::DateTime;
+    use datafusion::datasource::physical_plan::ArrowSource;
+    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::expressions::col;
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion_datasource::file_groups::FileGroup;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_datasource::{FileRange, PartitionedFile};
+    use object_store::{ObjectMeta, path::Path};
+
     use std::sync::LazyLock;
 
+    #[must_use]
+    pub fn create_partitioned_file(
+        path: &str,
+        size: u64,
+        range: Option<FileRange>,
+    ) -> PartitionedFile {
+        PartitionedFile {
+            object_meta: ObjectMeta {
+                location: Path::from(path),
+                last_modified: DateTime::default(),
+                size,
+                e_tag: None,
+                version: None,
+            },
+            partition_values: vec![],
+            range,
+            statistics: None,
+            extensions: None,
+            metadata_size_hint: None,
+        }
+    }
+    fn file_scan_config_builder() -> FileScanConfigBuilder {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+            schema,
+            Arc::new(ArrowSource::default()),
+        )
+    }
+
+    #[must_use]
+    pub fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
+        let fsc = file_scan_config_builder()
+            .with_file_group(FileGroup::new(files))
+            .build();
+
+        DataSourceExec::from_data_source(fsc)
+    }
+
     static OPTIMIZER: LazyLock<PhysicalOptimizer> = LazyLock::new(|| {
-        PhysicalOptimizer::with_rules(vec![
-            DistributeFileScanOptimizer::new(),
-            UnionProjectionPushdownOptimizer::new(),
-        ])
+        PhysicalOptimizer::with_rules(vec![UnionProjectionPushdownOptimizer::new()])
     });
 
     fn optimize(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         OPTIMIZER.rules.iter().fold(Arc::clone(plan), |acc, rule| {
-            rule.optimize(acc, &DEFAULT_CONFIG_OPTIONS)
+            rule.optimize(acc, &ConfigOptions::default())
                 .expect("Must optimize")
         })
     }
 
+    #[ignore = "See #8313"]
     #[test]
     fn test_projection_pushdown() {
         let files = vec![

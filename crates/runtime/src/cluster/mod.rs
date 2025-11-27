@@ -1,4 +1,5 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
+use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
@@ -28,7 +29,6 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
-use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;

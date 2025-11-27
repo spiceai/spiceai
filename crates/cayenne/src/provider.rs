@@ -1038,14 +1038,11 @@ impl CayenneTableProvider {
         );
 
         // Use the common stream sorting utility
-        let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
-            stream,
-            &self.vortex_config.sort_columns,
-            &task_ctx,
-        )
-        .map_err(|e| CatalogError::InvalidOperation {
-            message: format!("Failed to execute sort: {e}"),
-        })?;
+        let sorted_stream =
+            util::stream_utils::sort_stream(stream, &self.vortex_config.sort_columns, &task_ctx)
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Failed to execute sort: {e}"),
+                })?;
 
         Ok(sorted_stream)
     }
