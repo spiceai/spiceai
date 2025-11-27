@@ -1,0 +1,47 @@
+[package]
+name = "datafusion-table-providers-python"
+version = { workspace = true }
+readme = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+description = { workspace = true }
+publish = false
+
+[lib]
+name = "datafusion_table_providers"
+crate-type = ["cdylib"]
+doc = false
+
+[dependencies]
+arrow = { workspace = true }
+arrow-flight = { workspace = true, optional = true }
+datafusion = { workspace = true, features = ["pyarrow"] }
+datafusion-ffi = { workspace = true }
+datafusion-table-providers = { workspace = true }
+pyo3 = { version = "0.25" }
+tokio = { version = "1.46", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+] }
+duckdb = { workspace = true, optional = true }
+
+[features]
+default = [
+    "duckdb",
+    "clickhouse",
+    "sqlite",
+    "mysql",
+    "postgres",
+    "odbc",
+    "flight",    
+]
+clickhouse = ["datafusion-table-providers/clickhouse-federation"]
+duckdb = ["dep:duckdb", "datafusion-table-providers/duckdb-federation"]
+sqlite = ["datafusion-table-providers/sqlite-federation"]
+mysql = ["datafusion-table-providers/mysql-federation"]
+postgres = ["datafusion-table-providers/postgres-federation"]
+odbc = ["datafusion-table-providers/odbc-federation"]
+flight = ["dep:arrow-flight", "datafusion-table-providers/flight"]

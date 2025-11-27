@@ -1,0 +1,116 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[workspace]
+members = ["core", "python"]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.2"
+readme = "README.md"
+edition = "2021"
+repository = "https://github.com/datafusion-contrib/datafusion-table-providers"
+license = "Apache-2.0"
+description = "Extend the capabilities of DataFusion to support additional data sources via implementations of the `TableProvider` trait."
+
+[workspace.dependencies]
+arrow = "56"
+arrow-array = { version = "56" }
+arrow-flight = { version = "56", features = [
+    "flight-sql-experimental",
+    "tls-ring",
+    "tls-native-roots",
+] }
+arrow-ipc = { version = "56" }
+arrow-schema = { version = "56", features = ["serde"] }
+arrow-json = "56"
+arrow-odbc = { version = "20.0.0" }
+datafusion = { version = "50.3", default-features = false }
+datafusion-expr = { version = "50.3" }
+datafusion-federation = { version = "0.4.2", features = ["sql"] }
+datafusion-ffi = { version = "50.3" }
+datafusion-proto = { version = "50.3" }
+datafusion-physical-expr = { version = "50.3" }
+datafusion-physical-plan = { version = "50.3" }
+datafusion-table-providers = { path = "core" }
+duckdb = "1.3.2" # Forked to add support for duckdb_scan_arrow, pending: https://github.com/duckdb/duckdb-rs/pull/488
+adbc_core = { version = "0.20.0" }
+adbc_driver_manager = { version = "0.20.0" }
+parquet = "56"
+rusqlite = "0.37"
+tokio-rusqlite = "0.7.0"
+async-stream = "0.3.5"
+async-trait = "0.1.80"
+bigdecimal = "0.4.5"
+byteorder = "1.5.0"
+chrono = "0.4"
+futures = "0.3.30"
+itertools = "0.14.0"
+num-bigint = "0.4"
+secrecy = "0.10.3"
+serde = { version = "1.0.209", features = ["derive"] }
+serde_json = "1.0.124"
+snafu = "0.8.3"
+time = "0.3.36"
+tokio = { version = "1.46", features = ["macros", "fs"] }
+tracing = "0.1.40"
+url = "2.5.1"
+rand = "0.9"
+regex = "1"
+uuid = "1.9.1"
+prost = "0.14.1"
+tonic = { version = "0.13", features = ["tls-native-roots", "tls-webpki-roots"] }
+bytes = "1.7.1"
+base64 = "0.22.1"
+dashmap = "6.1.0"
+fallible-iterator = "0.3.0"
+fundu = "2.0.1"
+geo-types = "0.7.13"
+sha2 = "0.10"
+hickory-resolver = "0.25.2"
+sea-query = { version = "0.32", features = [
+    "backend-sqlite",
+    "backend-postgres",
+    "postgres-array",
+    "with-rust_decimal",
+    "with-bigdecimal",
+    "with-time",
+    "with-chrono",
+] }
+
+[patch.crates-io]
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai-50
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "dd02045c3aa77895723e873222cbe30f5c8f77a9" }                            # spiceai-1.3.2
+
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }               # spiceai-50
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }          # spiceai-50
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" } # spiceai-50
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" } # spiceai-50
+datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "41d08054e37e9cdca9b760c16fc2b97a21893af2" }         # spiceai-50
+
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }        # spiceai-56
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }  # spiceai-56
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }   # spiceai-56
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }   # spiceai-56
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }      # spiceai-56
+
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" } # spiceai-v0.37.0

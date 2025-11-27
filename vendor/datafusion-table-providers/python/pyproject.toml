@@ -1,0 +1,71 @@
+[build-system]
+requires = ["maturin>=1.5.1,<1.6.0"]
+build-backend = "maturin"
+
+[project]
+name = "datafusion_table_providers"
+version = "0.1.0"
+description = "Build and run queries against data"
+readme = "../README.md"
+license = { file = "../LICENSE" }
+requires-python = ">=3.9"
+keywords = ["datafusion", "dataframe", "rust", "query-engine"]
+classifier = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python",
+    "Programming Language :: Rust",
+]
+dependencies = ["datafusion>=45.0.0"]
+
+[project.urls]
+repository = "https://github.com/datafusion-contrib/datafusion-table-providers"
+
+[tool.isort]
+profile = "black"
+
+[tool.maturin]
+python-source = "python"
+module-name = "datafusion_table_providers._internal"
+include = [{ path = "../Cargo.lock", format = "sdist" }]
+exclude = [".github/**", "ci/**", ".asf.yaml"]
+# Require Cargo.lock is up to date
+locked = true
+
+# Enable docstring linting using the google style guide
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "D", "W"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 88
+
+# Disable docstring checking for these directories
+[tool.ruff.lint.per-file-ignores]
+"python/tests/*" = ["D"]
+"examples/*" = ["D", "W505"]
+"dev/*" = ["D"]
+"benchmarks/*" = ["D", "F"]
+"docs/*" = ["D"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.8.1",
+    "numpy>1.25.0",
+    "pytest>=7.4.4",
+    "pytest-asyncio>=0.23.3",
+    "ruff>=0.9.1",
+    "toml>=0.10.2",
+    "pygithub==2.5.0",
+    "pyarrow>=19.0.1"
+]

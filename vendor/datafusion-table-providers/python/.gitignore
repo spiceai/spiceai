@@ -1,0 +1,26 @@
+/venv
+.idea
+.DS_Store
+.vscode
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python dist ignore
+dist
+
+# C extensions
+*.so
+
+# Python dist
+dist
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+.python-version
+venv
+.venv
+

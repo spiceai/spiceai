@@ -1,0 +1,218 @@
+[package]
+name = "datafusion-table-providers"
+version = "0.1.0"
+readme = "README.md"
+edition = "2021"
+repository = "https://github.com/datafusion-contrib/datafusion-table-providers"
+license = "Apache-2.0"
+
+[dependencies]
+arrow = { workspace = true, features = ["ffi"] }
+arrow-ipc = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true, features = [
+  "flight-sql-experimental",
+  "tls-ring",
+  "tls-native-roots",
+] }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true, optional = true, features = ["serde"] }
+arrow-json = { workspace = true }
+arrow-odbc = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+async-trait = { workspace = true }
+base64 = { workspace = true, optional = true }
+bb8 = { version = "0.9.0", optional = true }
+bb8-postgres = { version = "0.9.0", optional = true }
+bigdecimal = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true, optional = true }
+byte-unit = { version = "5.1.4", optional = true }
+chrono = { workspace = true }
+clickhouse = { version = "0.13.3", optional = true }
+dashmap = { workspace = true }
+datafusion = { workspace = true, default-features = false }
+datafusion-expr = { workspace = true, optional = true }
+datafusion-federation = { workspace = true, features = ["sql"], optional = true }
+datafusion-physical-expr = { workspace = true, optional = true }
+datafusion-physical-plan = { workspace = true, optional = true }
+datafusion-proto = { workspace = true, optional = true }
+duckdb = { workspace = true, features = [
+  "bundled",
+  "r2d2",
+  "vtab",
+  "vtab-arrow",
+  "appender-arrow",
+], optional = true }
+libduckdb-sys = { version = "=1.3.0", optional = true }
+dyn-clone = { version = "1.0.17", optional = true }
+fallible-iterator = { workspace = true }
+fundu = { workspace = true }
+futures = { workspace = true }
+geo-types = { workspace = true }
+itertools = { workspace = true }
+mongodb = { version = "3.2.2", features = ["openssl-tls"], optional = true }
+mysql_async = { version = "0.36", features = [
+  "native-tls-tls",
+  "chrono",
+  "time",
+  "bigdecimal",
+], optional = true }
+native-tls = { version = "0.2.11", optional = true }
+num-bigint = { workspace = true }
+num-traits = { version = "0.2", optional = true }
+odbc-api = { version = "19.0", optional = true }
+pem = { version = "3.0.4", optional = true }
+postgres-native-tls = { version = "0.5.0", optional = true }
+prost = { workspace = true, optional = true }
+rand = { workspace = true }
+regex = { workspace = true }
+r2d2 = { version = "0.8", optional = true }
+r2d2_adbc = { version = "0.1.0", optional = true }
+rusqlite = { workspace = true, optional = true }
+rust_decimal = { version = "1.38.0", features = ["db-postgres"], optional = true }
+sea-query = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+snafu = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7.10", features = [
+  "with-chrono-0_4",
+  "with-uuid-1",
+  "with-serde_json-1",
+  "with-geo-types-0_7",
+], optional = true }
+tokio-rusqlite = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tracing = { workspace = true }
+uuid = { workspace = true, optional = true }
+hickory-resolver = { workspace = true }
+url = { workspace = true }
+adbc_driver_manager = { workspace = true, optional = true }
+adbc_core = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow = "1.0"
+bollard = "0.19"
+geozero = { version = "0.14.0", features = ["with-wkb"] }
+insta = { version = "1.43.2", features = ["filters"] }
+parquet = { workspace = true }
+prost = { version = "=0.13.5" }
+rand = { workspace = true }
+reqwest = "0.12"
+rstest = "0.26.1"
+test-log = { version = "0.2", features = ["trace"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.20.0"
+
+[features]
+clickhouse = ["dep:clickhouse", "arrow-ipc/lz4", "dep:async-stream"]
+clickhouse-federation = ["clickhouse", "federation"]
+duckdb = [
+  "dep:duckdb",
+  "dep:r2d2",
+  "dep:uuid",
+  "dep:dyn-clone",
+  "dep:async-stream",
+  "dep:arrow-schema",
+  "dep:byte-unit",
+]
+duckdb-federation = ["duckdb", "federation"]
+federation = ["dep:datafusion-federation"]
+flight = [
+  "dep:arrow-array",
+  "dep:arrow-flight",
+  "dep:arrow-schema",
+  "dep:base64",
+  "dep:bytes",
+  "dep:datafusion-expr",
+  "dep:datafusion-physical-expr",
+  "dep:datafusion-physical-plan",
+  "dep:datafusion-proto",
+  "dep:prost",
+  "dep:tonic",
+  "datafusion/serde",
+]
+mongodb = [
+  "dep:mongodb",
+  "dep:async-stream",
+  "dep:arrow-schema",
+  "dep:num-traits",
+  "dep:rust_decimal",
+]
+mysql = ["dep:mysql_async", "dep:async-stream"]
+mysql-federation = ["mysql", "federation"]
+odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:async-stream", "dep:dyn-clone"]
+odbc-federation = ["odbc", "federation"]
+postgres = [
+  "dep:tokio-postgres",
+  "dep:rust_decimal",
+  "dep:uuid",
+  "dep:postgres-native-tls",
+  "dep:bb8",
+  "dep:bb8-postgres",
+  "dep:native-tls",
+  "dep:pem",
+  "dep:async-stream",
+  "dep:arrow-schema",
+]
+postgres-federation = ["postgres", "federation"]
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "dep:arrow-schema"]
+sqlite-federation = ["sqlite", "federation"]
+sqlite-bundled = ["sqlite", "rusqlite/bundled"]
+sqlite-bundled-decimal = ["sqlite", "rusqlite/bundled-decimal"]
+adbc = [
+  "dep:adbc_driver_manager",
+  "dep:adbc_core",
+  "dep:r2d2_adbc",
+  "dep:async-stream",
+  "dep:arrow-schema",
+  "dep:r2d2",
+]
+adbc-federation = ["adbc", "federation"]
+
+# docs.rs-specific configuration
+[package.metadata.docs.rs]
+# document all features
+all-features = true
+# defines the configuration attribute `docsrs`
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "odbc_sqlite"
+path = "examples/odbc_sqlite.rs"
+required-features = ["sqlite", "odbc"]
+
+[[example]]
+name = "flight-sql"
+path = "examples/flight-sql.rs"
+required-features = ["flight"]
+
+[[example]]
+name = "sqlite"
+path = "examples/sqlite.rs"
+required-features = ["sqlite"]
+
+[[example]]
+name = "clickhouse"
+path = "examples/clickhouse.rs"
+required-features = ["clickhouse"]
+
+[[example]]
+name = "mongodb"
+path = "examples/mongodb.rs"
+required-features = ["mongodb"]
+
+[[bin]]
+name = "sqlite_insert_benchmark"
+path = "../benches/sqlite_insert_benchmark.rs"
+required-features = ["sqlite"]
+
+[[example]]
+name = "adbc"
+path = "examples/adbc_duckdb.rs"
+required-features = ["adbc"]
