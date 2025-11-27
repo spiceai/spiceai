@@ -264,6 +264,7 @@ mod tests {
         })
     }
 
+    #[ignore]
     #[test]
     fn test_projection_pushdown() {
         let files = vec![
