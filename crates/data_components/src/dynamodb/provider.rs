@@ -28,6 +28,7 @@ use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
@@ -65,7 +66,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-use arrow_array::RecordBatch;
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
@@ -83,10 +83,6 @@ type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
 
 const DEFAULT_PARTITIONS: usize = 8;
-
-// pub type DynamoDBMessage = Result<(ChangeBatch, Option<GlobalCheckpoint>), StreamError>;
-//
-// pub type DynamoDBStream = BoxStream<'static, DynamoDBMessage>;
 
 impl DynamoDBTableProvider {
     pub async fn try_new(
@@ -273,7 +269,12 @@ impl DynamoDBTableProvider {
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: GlobalCheckpoint,
-    ) -> Result<BoxStream<'static, Result<(ChangeBatch, Option<GlobalCheckpoint>), crate::cdc::StreamError>>> {
+    ) -> Result<
+        BoxStream<
+            'static,
+            Result<(ChangeBatch, Option<GlobalCheckpoint>), crate::cdc::StreamError>,
+        >,
+    > {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
@@ -298,7 +299,9 @@ impl DynamoDBTableProvider {
         Ok(Box::pin(stream))
     }
 
-    pub async fn bootstrap_stream(self: Arc<Self>) -> Result<BoxStream<'static, Result<(ChangeBatch, Option<GlobalCheckpoint>), crate::cdc::StreamError>>> {
+    pub async fn bootstrap_stream(
+        self: Arc<Self>,
+    ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
         let schema = self.table_schema.schema().clone();
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();

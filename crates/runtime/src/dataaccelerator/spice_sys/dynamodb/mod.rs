@@ -57,7 +57,6 @@ impl DynamoDBSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
-            #[cfg(not(feature = "duckdb"))]
             _ => None,
         }
     }
@@ -66,7 +65,6 @@ impl DynamoDBSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
-            #[cfg(not(feature = "duckdb"))]
             _ => Err(Error::NoAccelerationConnection),
         }
     }

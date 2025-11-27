@@ -154,7 +154,10 @@ impl RefreshTask {
         let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
             .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
 
-        tracing::debug!("Processing streaming batch: {:#?}", change_batch.record.num_rows());
+        tracing::debug!(
+            "Processing streaming batch: {:#?}",
+            change_batch.record.num_rows()
+        );
 
         for row in 0..change_batch.record.num_rows() {
             let op = change_batch.op(row);

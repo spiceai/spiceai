@@ -24,12 +24,15 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use dynamodb_streams::checkpoint::GlobalCheckpoint;
 use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use util::time_format::is_valid_format;
+use crate::dataaccelerator::spice_sys::dynamodb::DynamoDBSys;
+use crate::dataaccelerator::spice_sys::OpenOption;
 
 #[derive(Debug)]
 pub struct DynamoDB {
@@ -247,6 +250,18 @@ impl DataConnector for DynamoDB {
 
                 let dynamodb = Arc::new(dynamodb_ref.clone());
 
+                // How do I get dataset here?
+                let dynamodb_sys = match DynamoDBSys::try_new(&dataset, OpenOption::OpenExisting).await {
+                    Ok(sys) => Arc::new(sys),
+                    Err(err) => {
+                        tracing::error!(
+                        "Failed to initialize DynamoDBSys for checkpoint persistence: {:?}",
+                        err
+                    );
+                        return None;
+                    }
+                };
+
                 let checkpoint = match dynamodb.latest_global_checkpoint().await {
                     Ok(checkpoint) => checkpoint,
                     Err(err) => {
@@ -267,13 +282,12 @@ impl DataConnector for DynamoDB {
                         );
                         return None;
                     }
-                };
+                }.map(|msg| {
+                    msg.map(|change_batch| ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch))
+                });
 
                 Some(
                     bootstrap_stream
-                        .map(|msg| {
-                            msg.map(|(change_batch, _)| ChangeEnvelope::new(Box::new(DynamoDBStreamCommitter::new()), change_batch))
-                        })
                         .chain(
                             stream::once(async move {
                                 tracing::debug!(
@@ -290,31 +304,62 @@ impl DataConnector for DynamoDB {
                                         );
                                         None
                                     }
-                                }.map(|msg| {
+                                }
+                            })
+                                .filter_map(|opt| async move { opt })
+                                .flatten()
+                                .map(|msg| {
                                     msg.map(|(change_batch, _)| ChangeEnvelope::new(Box::new(DynamoDBStreamCommitter::new()), change_batch))
                                 })
-                            })
-                            .filter_map(|opt| async move { opt })
-                            .flatten()
                         )
                         .boxed(),
                 )
             })
-            .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
+                .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
     }
 }
 
-struct DynamoDBStreamCommitter;
+struct NoOpCommitter;
+impl CommitChange for NoOpCommitter {
+    fn commit(&self) -> Result<(), CommitError> {
+        Ok(())
+    }
+}
+
+pub struct DynamoDBStreamCommitter {
+    dynamodb_sys: Arc<DynamoDBSys>,
+    checkpoint: GlobalCheckpoint,
+}
 
 impl DynamoDBStreamCommitter {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(dynamodb_sys: Arc<DynamoDBSys>, checkpoint: GlobalCheckpoint) -> Self {
+        Self {
+            dynamodb_sys,
+            checkpoint,
+        }
     }
 }
 
 impl CommitChange for DynamoDBStreamCommitter {
     fn commit(&self) -> std::result::Result<(), CommitError> {
         Ok(())
+        // Serialize the checkpoint
+        // let checkpoint_json = serde_json::to_string(&self.checkpoint)
+        //     .map_err(|e| CommitError::Other(format!("Failed to serialize checkpoint: {}", e)))?;
+        //
+        // let metadata = DynamoDBCheckpointMetadata {
+        //     checkpoint_data: checkpoint_json,
+        // };
+        //
+        // // Use tokio::task::block_in_place to handle async upsert in sync context
+        // tokio::task::block_in_place(|| {
+        //     tokio::runtime::Handle::current().block_on(async {
+        //         self.dynamodb_sys
+        //             .upsert(&metadata)
+        //             .await
+        //             .map_err(|e| CommitError::Other(format!("Failed to upsert checkpoint: {}", e)))
+        //     })
+        // })
     }
 }

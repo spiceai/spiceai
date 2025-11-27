@@ -29,11 +29,11 @@ use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
 use aws_sdk_dynamodbstreams::types::OperationType;
 use datafusion::error::DataFusionError;
 use dynamodb_streams::StreamResult;
+use dynamodb_streams::checkpoint::GlobalCheckpoint;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use dynamodb_streams::checkpoint::GlobalCheckpoint;
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
@@ -63,7 +63,7 @@ pub fn record_batch_to_change_envelope(
     batch: RecordBatch,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
-) -> Result<(ChangeBatch, Option<GlobalCheckpoint>), StreamError> {
+) -> Result<ChangeBatch, StreamError> {
     let row_count = batch.num_rows();
 
     // "c" stands for ChangeOperation::Create
@@ -87,7 +87,7 @@ pub fn record_batch_to_change_envelope(
     let change_batch =
         ChangeBatch::try_new(new_record_batch).context(FailedToCreateChangeBatchSnafu)?;
 
-    Ok((change_batch, None))
+    Ok(change_batch)
 }
 
 fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArray {
@@ -247,7 +247,6 @@ fn streams_to_dynamodb_attribute(value: &StreamsAttributeValue) -> DynamoDbAttri
 fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Option<&mut T> {
     builder.as_any_mut().downcast_mut::<T>()
 }
-
 
 // #[cfg(test)]
 // mod tests {

@@ -13059,6 +13059,7 @@ dependencies = [
  "dirs",
  "document_parse",
  "duckdb",
+ "dynamodb-streams",
  "event_stream",
  "flight_client",
  "flightrepl",

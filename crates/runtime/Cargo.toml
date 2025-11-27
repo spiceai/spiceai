@@ -52,6 +52,7 @@ datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true, optional = true }
 datafusion-spark.workspace = true
 datafusion-table-providers = { workspace = true }
+dynamodb-streams = { path="../dynamodb-streams", optional = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -248,7 +249,7 @@ delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb", "datafusion-optimizer-rules/duckdb"]
-dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
+dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
