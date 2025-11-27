@@ -66,6 +66,7 @@ use crate::{
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
+    register_data_accelerator,
 };
 
 type Result<T, E = super::Error> = std::result::Result<T, E>;
@@ -438,6 +439,11 @@ async fn get_pool(
             .await?,
     ))
 }
+
+register_data_accelerator!(
+    Engine::TableModePartitionedDuckDB,
+    TablesModePartitionedDuckDBAccelerator
+);
 
 #[cfg(test)]
 mod tests {
