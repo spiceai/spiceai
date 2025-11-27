@@ -4212,7 +4212,8 @@
           "disabled",
           "full",
           "append",
-          "changes"
+          "changes",
+          "caching"
         ]
       },
       "RefreshOverrides": {

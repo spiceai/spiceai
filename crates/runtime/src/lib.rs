@@ -721,13 +721,7 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let (auth, has_auth) = match endpoint_auth.http_auth.clone() {
-            Some(auth) => (auth, true),
-            None => (
-                Arc::new(auth::no_auth::NoAuth) as Arc<dyn runtime_auth::HttpAuth + Send + Sync>,
-                false,
-            ),
-        };
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -741,7 +735,6 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
-                    has_auth,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -1209,13 +1202,6 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
 
 impl From<http::Error> for Error {
     fn from(err: http::Error) -> Self {
-        match err {
-            http::Error::UnableToBindServerToPort { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToBindServerToPort { source },
-            },
-            http::Error::UnableToStartHttpServer { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToStartHttpServer { source },
-            },
-        }
+        Error::UnableToStartHttpServer { source: err }
     }
 }

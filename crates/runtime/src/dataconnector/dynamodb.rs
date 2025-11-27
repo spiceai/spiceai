@@ -19,10 +19,12 @@ use super::{
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
 use crate::component::dataset::Dataset;
+use crate::federated_table::FederatedTable;
 use async_trait::async_trait;
-use aws_sdk_dynamodb::Client;
+use data_components::cdc::ChangesStream;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
@@ -51,6 +53,7 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
+const DEFAULT_STREAM_POLL_INTERVAL_MS_STR: &str = "200";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -76,6 +79,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("scan_segments")
         .description("Number of segments. 'auto' by default.")
         .default(SEGMENTS_AUTO_STR),
+    ParameterSpec::runtime("stream_poll_interval_ms")
+        .description("Interval in milliseconds between polling for new records in a DynamoDB stream.")
+        .default(DEFAULT_STREAM_POLL_INTERVAL_MS_STR),
     ParameterSpec::runtime("time_format")
         .description("Go-style time format used for parsing/formatting timestamps")
         .default(DEFAULT_TIME_FORMAT),
@@ -136,20 +142,21 @@ impl DataConnector for DynamoDB {
         .load()
         .await;
 
-        let client = Client::new(&config);
+        let schema_infer_max_records = self
+            .params
+            .get("schema_infer_max_records")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(10);
 
-        let schema_infer_max_records_str =
-            match self.params.get("schema_infer_max_records").expose() {
-                ExposedParamLookup::Present(infer_max_rec_str) => infer_max_rec_str,
-                ExposedParamLookup::Absent(_) => DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR,
-            };
-
-        let schema_infer_max_records = i32::from_str(schema_infer_max_records_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
-            dataconnector: "dynamodb".to_string(),
-            message: format!(
-                "DynamoDB parameter 'schema_infer_max_records' must be an integer, not {schema_infer_max_records_str}"),
-            connector_component: ConnectorComponent::from(dataset)
-        })?;
+        let stream_poll_interval_ms = self
+            .params
+            .get("stream_poll_interval_ms")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200);
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
@@ -208,11 +215,12 @@ impl DataConnector for DynamoDB {
         }
 
         let provider = DynamoDBTableProvider::try_new(
-            Arc::new(client),
+            config,
             Arc::from(table_name),
             unnest_depth,
             schema_infer_max_records,
             config_segments,
+            stream_poll_interval_ms,
             time_format.to_string(),
         )
         .await
@@ -222,5 +230,31 @@ impl DataConnector for DynamoDB {
             source: Box::new(e),
         })?;
         Ok(Arc::new(provider))
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        Some(Box::pin(
+            stream::once(async move {
+                let table_provider = federated_table.table_provider().await;
+
+                let dynamodb = table_provider
+                    .as_any()
+                    .downcast_ref::<DynamoDBTableProvider>()?;
+
+                // Error handling will be added in the next PR
+                let checkpoint = dynamodb.latest_global_checkpoint().await.ok()?;
+
+                // Table bootstrapping will be added in the next PR
+
+                // Error handling will be added in the next PR
+                dynamodb.stream_from_checkpoint(checkpoint).await.ok()
+            })
+            .filter_map(|opt| async move { opt })
+            .flatten(),
+        ))
     }
 }

@@ -18,7 +18,7 @@ limitations under the License.
 use {
     crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
+    ballista_executor::flight_service::BallistaFlightService, std::net::ToSocketAddrs,
 };
 
 use crate::auth::EndpointAuth;
@@ -445,6 +445,7 @@ fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
 /// # Panics
 /// If running in clustered mode, will panic unless TLS is configured or user manually overrides
 /// this safety check, as RPC will transmit sensitive information to executors.
+#[allow(clippy::too_many_lines)]
 pub async fn start(
     bind_address: std::net::SocketAddr,
     app: Option<Arc<App>>,
@@ -526,24 +527,32 @@ pub async fn start(
     };
 
     // If running an executor, we may have resolved another port to bind if 50051 is taken
+    // Cast truncation for port is OK: was originally widened to u32 because it's a u32 in
+    // Ballista `ExecutorRegistration`
+    #[allow(clippy::cast_possible_truncation)]
     #[cfg(feature = "cluster")]
-    let bind_address: SocketAddr = if let Some((host, port)) =
-        rt.df.executor.read().ok().and_then(|maybe_executor| {
+    let bind_address = rt
+        .df
+        .executor
+        .read()
+        .ok()
+        .and_then(|maybe_executor| {
             maybe_executor
                 .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
-        }) {
-        if let Ok(addr) = format!("{host}:{port}").parse() {
-            addr
-        } else {
-            tracing::warn!(
-                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
-            );
-            bind_address
-        }
-    } else {
-        bind_address
-    };
+                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
+        })
+        .and_then(|spec| {
+            let (host, port) = &spec;
+            tokio::task::block_in_place(|| match spec.to_socket_addrs() {
+                Ok(sa) => Some(sa),
+                Err(e) => {
+                    tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
+                    None
+                }
+            })
+        })
+        .and_then(|mut addrs| addrs.next())
+        .unwrap_or(bind_address);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);

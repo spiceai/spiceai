@@ -42,6 +42,7 @@ use super::{AccelerationSource, DataAccelerator};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
+use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 
@@ -108,9 +109,14 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::LargeBinary
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::List(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
     )
 }
 
@@ -1091,6 +1097,8 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect())
     }
 }
+
+register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {

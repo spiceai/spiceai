@@ -212,7 +212,7 @@ where
             let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
-            let mut statement = prepared.into_statement();
+            let mut statement = prepared.into_handle();
 
             bind_parameters(&mut statement, &params)?;
 
@@ -281,7 +281,7 @@ where
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
-        let mut statement = prepared.into_statement();
+        let mut statement = prepared.into_handle();
 
         bind_parameters(&mut statement, params)?;
 
@@ -403,7 +403,7 @@ mod tests {
         let mut statement = driver_cxn
             .prepare("select * from (select 'hopper' as name, 100 as age) as cats where name = ? and age = ?")
             .expect("Must prepare")
-            .into_statement();
+            .into_handle();
 
         let params: Vec<Box<dyn ODBCSyncParameter>> = vec![
             Box::new("hopper".into_parameter()),

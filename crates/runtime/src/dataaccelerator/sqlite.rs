@@ -37,7 +37,7 @@ use crate::{
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path,
+    register_data_accelerator, spice_data_base_path,
 };
 
 use super::{AccelerationSource, DataAccelerator, upsert_dedup};
@@ -352,6 +352,8 @@ impl DataAccelerator for SqliteAccelerator {
         PARAMETERS
     }
 }
+
+register_data_accelerator!(Engine::Sqlite, SqliteAccelerator);
 
 #[cfg(test)]
 mod tests {

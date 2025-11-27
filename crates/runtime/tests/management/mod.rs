@@ -28,6 +28,8 @@ use runtime::{Runtime, datafusion::query::QueryBuilder};
 use runtime::{auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::{management::Management, runtime::ApiKey};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     init_tracing,
@@ -49,12 +51,14 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
 
-            let (data_endpoint_rt, data_endpoint) = create_data_export_endpoint().await?;
+            let data_endpoint = create_data_export_endpoint().await?;
+            let data_endpoint_rt = Arc::clone(data_endpoint.runtime());
+            let data_endpoint_url = data_endpoint.endpoint().to_string();
 
             let management = Management {
                 enabled: true,
                 api_key: "auth_key_1".to_string(), // Must match the one used in the data export endpoint
-                params: vec![("data_endpoint".to_string(), data_endpoint)]
+                params: vec![("data_endpoint".to_string(), data_endpoint_url)]
                     .into_iter()
                     .collect(),
             };
@@ -99,12 +103,54 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             let exported_events = execute_query(&data_endpoint_rt, "SELECT input, captured_output, error_message FROM runtime.task_history where input like '%test_event%' order by input ").await?;
             insta::assert_snapshot!("shutdown_export", pretty_format_batches(&exported_events)?);
 
+            drop(data_endpoint_rt);
+            data_endpoint.shutdown().await;
+
             Ok(())
         })
         .await
 }
 
-async fn create_data_export_endpoint() -> Result<(Arc<Runtime>, String), anyhow::Error> {
+struct DataExportEndpoint {
+    runtime: Arc<Runtime>,
+    endpoint: String,
+    shutdown: CancellationToken,
+    server_handle: JoinHandle<Result<(), runtime::Error>>,
+}
+
+impl DataExportEndpoint {
+    fn runtime(&self) -> &Arc<Runtime> {
+        &self.runtime
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    async fn shutdown(self) {
+        self.shutdown.cancel();
+        // Protect against hangs in CI by bounding shutdown waits.
+        if let Err(elapsed) =
+            tokio::time::timeout(Duration::from_secs(15), self.runtime.shutdown()).await
+        {
+            tracing::error!("Runtime shutdown timed out after {elapsed:?}");
+        }
+
+        match tokio::time::timeout(Duration::from_secs(15), self.server_handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => {
+                tracing::debug!("Data export endpoint stopped with error: {err}");
+            }
+            Ok(Err(join_err)) if join_err.is_cancelled() => {}
+            Ok(Err(join_err)) => {
+                tracing::debug!("Data export endpoint join error: {join_err}");
+            }
+            Err(elapsed) => tracing::error!("Server task shutdown timed out after {elapsed:?}"),
+        }
+    }
+}
+
+async fn create_data_export_endpoint() -> Result<DataExportEndpoint, anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
@@ -131,15 +177,22 @@ async fn create_data_export_endpoint() -> Result<(Arc<Runtime>, String), anyhow:
     let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("auth_key_1:rw")]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-    let cloned_rt = Arc::clone(&rt);
-
-    tokio::spawn(async move {
-        Box::pin(Arc::clone(&cloned_rt).start_servers(
-            api_config,
-            None,
-            EndpointAuth::default().with_flight_basic_auth(api_key_auth),
-        ))
-        .await
+    let server_shutdown = CancellationToken::new();
+    let shutdown_token = server_shutdown.clone();
+    let server_rt = Arc::clone(&rt);
+    let server_handle = tokio::spawn(async move {
+        tokio::select! {
+            result = Box::pin(Arc::clone(&server_rt).start_servers(
+                api_config,
+                None,
+                EndpointAuth::default().with_flight_basic_auth(api_key_auth),
+            )) => result,
+            () = shutdown_token.cancelled() => {
+                // Ensure runtime shutdown completes even if servers were still starting.
+                server_rt.shutdown().await;
+                Ok(())
+            },
+        }
     });
 
     tracing::info!("Waiting for servers to start...");
@@ -150,7 +203,12 @@ async fn create_data_export_endpoint() -> Result<(Arc<Runtime>, String), anyhow:
     })
     .await;
 
-    Ok((Arc::clone(&rt), format!("http://localhost:{flight_port}")))
+    Ok(DataExportEndpoint {
+        runtime: Arc::clone(&rt),
+        endpoint: format!("http://localhost:{flight_port}"),
+        shutdown: server_shutdown,
+        server_handle,
+    })
 }
 
 async fn execute_query(rt: &Runtime, query: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
