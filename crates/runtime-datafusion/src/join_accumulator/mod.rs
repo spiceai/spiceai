@@ -45,7 +45,7 @@ pub struct ExactLeftAccumulator {
 }
 
 impl CollectLeftAccumulator for ExactLeftAccumulator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ExactLeftAccumulator"
     }
 
