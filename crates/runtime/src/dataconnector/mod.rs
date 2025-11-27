@@ -503,7 +503,11 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+    ) -> Option<ChangesStream> {
         None
     }
 

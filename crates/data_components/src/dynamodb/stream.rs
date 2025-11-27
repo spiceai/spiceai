@@ -15,9 +15,7 @@ limitations under the License.
 */
 use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
-use crate::cdc::{
-    ChangeBatch, ChangeBatchError, ChangeEnvelope, CommitChange, CommitError, changes_schema,
-};
+use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
 use crate::dynamodb::unnest::unnest_dynamodb_item;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -119,7 +117,7 @@ pub fn process_batch(
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
-) -> Result<(ChangeBatch, Option<GlobalCheckpoint>), StreamError> {
+) -> Result<(ChangeBatch, GlobalCheckpoint), StreamError> {
     let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
 
@@ -211,7 +209,7 @@ pub fn process_batch(
     let change_batch =
         ChangeBatch::try_new(record_batch).context(FailedToCreateChangeBatchSnafu)?;
 
-    Ok((change_batch, Some(batch.checkpoint)))
+    Ok((change_batch, batch.checkpoint))
 }
 
 fn streams_to_dynamodb_item(

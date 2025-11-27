@@ -19,7 +19,7 @@ use super::{
     FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::cdc::{ChangeBatch, ChangeEnvelope, ChangesStream};
+use crate::cdc::ChangeBatch;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
@@ -28,7 +28,6 @@ use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_sdk_dynamodb::{
@@ -269,12 +268,8 @@ impl DynamoDBTableProvider {
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: GlobalCheckpoint,
-    ) -> Result<
-        BoxStream<
-            'static,
-            Result<(ChangeBatch, Option<GlobalCheckpoint>), crate::cdc::StreamError>,
-        >,
-    > {
+    ) -> Result<BoxStream<'static, Result<(ChangeBatch, GlobalCheckpoint), crate::cdc::StreamError>>>
+    {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;

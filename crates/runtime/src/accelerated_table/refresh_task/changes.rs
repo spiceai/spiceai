@@ -155,7 +155,7 @@ impl RefreshTask {
             .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
 
         tracing::debug!(
-            "Processing streaming batch: {:#?}",
+            "Processing append/change stream batch: {:#?}",
             change_batch.record.num_rows()
         );
 
@@ -193,9 +193,9 @@ impl RefreshTask {
                     let session_state = ctx.state();
 
                     if primary_keys.is_empty() {
-                        tracing::debug!("Inserting data row for {dataset_name}",);
+                        tracing::trace!("Inserting data row for {dataset_name}",);
                     } else {
-                        tracing::debug!(
+                        tracing::trace!(
                             "Upserting data row for {dataset_name} with {}",
                             Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
                         );

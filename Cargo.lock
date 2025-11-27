@@ -5492,6 +5492,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-dynamodbstreams",
  "futures",
+ "serde",
  "snafu",
  "tokio",
  "tracing",

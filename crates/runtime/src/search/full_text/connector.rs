@@ -148,8 +148,14 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_changes_stream()
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        self.with_indexed_stream(federated_table, |inner, ft| inner.changes_stream(ft))
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        dataset: &Dataset,
+    ) -> Option<ChangesStream> {
+        self.with_indexed_stream(federated_table, |inner, ft| {
+            inner.changes_stream(ft, dataset)
+        })
     }
 
     fn supports_append_stream(&self) -> bool {

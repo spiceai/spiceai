@@ -50,10 +50,7 @@ impl DynamoDBSys {
         );
 
         duckdb_conn
-            .execute(
-                &upsert,
-                [&self.dataset_name, &metadata.checkpoint_data],
-            )
+            .execute(&upsert, [&self.dataset_name, &metadata.checkpoint_data])
             .map_err(Error::external)?;
 
         Ok(())
