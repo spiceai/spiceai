@@ -15,12 +15,18 @@ limitations under the License.
 */
 #![allow(clippy::too_many_arguments)]
 
+use crate::embeddings::construct_chunker;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
+use runtime_datafusion_index::Index;
+use runtime_datafusion_index::IndexedTableProvider;
+use search::generation::util::get_primary_keys;
+use search::index::VectorScanTableProvider;
+use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
 use search::metadata::MetadataColumn;
 use tokio::sync::RwLock;
 

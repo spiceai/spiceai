@@ -57,6 +57,8 @@ pub(crate) struct SpiceTestQueryWorker {
     reference_schema: Option<String>,
     /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
     skip_row_count_validation: HashSet<String>,
+    /// Whether to validate row counts between HTTP and Flight endpoints, and check for zero rows
+    validate_row_counts: bool,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -117,6 +119,7 @@ impl SpiceTestQueryWorker {
             validation_data: None,
             reference_schema: None,
             skip_row_count_validation: default_row_count_validation_skip_queries(),
+            validate_row_counts: true,
         }
     }
 
@@ -168,6 +171,11 @@ impl SpiceTestQueryWorker {
 
     pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
         self.reference_schema = reference_schema;
+        self
+    }
+
+    pub fn with_validate_row_counts(mut self, validate_row_counts: bool) -> Self {
+        self.validate_row_counts = validate_row_counts;
         self
     }
 
@@ -772,10 +780,11 @@ impl SpiceTestQueryWorker {
         )
         .await?;
 
-        // skip row count validation for specific queries that legitimately return 0 rows
-        if self
-            .skip_row_count_validation
-            .contains(&query.name.to_string())
+        // Skip row count validation if disabled or for specific queries that legitimately return 0 rows
+        if !self.validate_row_counts
+            || self
+                .skip_row_count_validation
+                .contains(&query.name.to_string())
         {
             return Ok(());
         }

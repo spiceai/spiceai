@@ -17,15 +17,21 @@ dashmap = "6.1.0"
 datafusion.workspace = true
 datafusion-federation = { workspace = true }
 futures.workspace = true
+itertools.workspace = true
 opentelemetry.workspace = true
 parking_lot.workspace = true
 runtime-request-context = { path = "../runtime-request-context" }
 snafu.workspace = true
 tracing.workspace = true
+search = { path = "../search",  default-features = false }
+runtime-datafusion-index = {path = "../runtime-datafusion-index" }
+datafusion-datasource.workspace = true
 
 [dev-dependencies]
-datafusion-datasource.workspace = true
+datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules" }
 tokio.workspace = true
+object_store.workspace = true
+chrono.workspace = true
 
 [features]
 cluster = []
