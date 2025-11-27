@@ -1,4 +1,20 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 use crate::concrete;
+use crate::config::cluster_config::SpiceClusterConfig;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -14,7 +30,6 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use itertools::Itertools;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use std::cmp::max;
 use std::sync::Arc;
 
@@ -328,13 +343,14 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::common::plan_node_key::PlanNodeKey;
-    use crate::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
+    use datafusion_optimizer_rules::common::{
+        plan_node_key::PlanNodeKey, search_visitor::SearchVisitor,
+    };
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;

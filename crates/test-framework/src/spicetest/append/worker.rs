@@ -32,6 +32,7 @@ pub(crate) struct AppendConfig {
     pub(crate) load_steps: u16,
     pub(crate) load_interval: Duration,
     pub(crate) temp_directory: PathBuf,
+    pub(crate) with_conflict_data: bool,
 }
 
 impl AppendConfig {
@@ -42,7 +43,23 @@ impl AppendConfig {
             load_steps: 10,
             load_interval: Duration::from_secs(60 * 4),
             temp_directory,
+            with_conflict_data: false,
         }
+    }
+
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = load_interval;
+        self
+    }
+
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = load_steps;
+        self
+    }
+
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
+        self
     }
 }
 

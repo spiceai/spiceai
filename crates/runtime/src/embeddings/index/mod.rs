@@ -16,9 +16,7 @@ limitations under the License.
 
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
-pub(crate) mod scan_table;
 pub mod table;
-pub use scan_table::VectorScanTableProvider;
 
 #[cfg(test)]
 pub mod tests {
