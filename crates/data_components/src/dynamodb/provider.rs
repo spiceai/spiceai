@@ -97,6 +97,7 @@ impl DynamoDBTableProvider {
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
+                .shard_record_limit(Some(10))
                 .build(),
         );
 
