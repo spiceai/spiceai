@@ -293,7 +293,7 @@ impl DynamoDBTableProvider {
     }
 
     pub async fn bootstrap_stream(self: Arc<Self>) -> Result<ChangesStream> {
-        let schema = self.table_schema.schema().clone();
+        let schema = Arc::clone(&self.table_schema.schema());
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();
 
@@ -305,7 +305,7 @@ impl DynamoDBTableProvider {
 
         let logical_plan = LogicalPlanBuilder::scan(table_name, table_source, None)
             .and_then(|b| b.project(columns))
-            .and_then(|b| b.build())
+            .and_then(LogicalPlanBuilder::build)
             .context(FailedToBootstrapTableSnafu)?;
 
         let ctx = SessionContext::new();
