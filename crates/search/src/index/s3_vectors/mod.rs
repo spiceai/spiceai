@@ -17,6 +17,7 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
+use arrow::compute::concat_batches;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
@@ -120,14 +121,16 @@ impl SearchIndex for S3Vector {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+        let input_schema = record.schema();
         match self.partition_by.first() {
             Some(partition_by) => {
-                let input_dfschema = DFSchema::try_from(record.schema())?;
+                let input_dfschema = DFSchema::try_from(Arc::clone(&input_schema))?;
                 let execution_props = ExecutionProps::new();
                 let physical_expr =
                     create_physical_expr(partition_by, &input_dfschema, &execution_props)?;
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
+                let mut data = vec![];
                 for (partition_value, partition_record) in partitions.into_values() {
                     let id = self.table.current_index();
                     // change the index name to a partition name
@@ -136,9 +139,17 @@ impl SearchIndex for S3Vector {
                             tracing::warn!(
                                 "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
                             );
-                            return write::write(self, &self.table, record, self.batch_write_rows)
+                            data.push(
+                                write::write(
+                                    self,
+                                    &self.table,
+                                    partition_record,
+                                    self.batch_write_rows,
+                                )
                                 .await
-                                .boxed();
+                                .boxed()?,
+                            );
+                            continue;
                         }
                         S3VectorIdentifier::Index {
                             bucket_name,
@@ -176,19 +187,20 @@ impl SearchIndex for S3Vector {
                         )
                     })?;
 
-                    write::write(self, &table, partition_record, self.batch_write_rows)
+                    let rb = write::write(self, &table, partition_record, self.batch_write_rows)
                         .await
                         .boxed()?;
+                    data.push(rb);
                 }
+                let schema = data
+                    .first()
+                    .map_or_else(|| Arc::clone(&input_schema), RecordBatch::schema);
+                concat_batches(&schema, data.iter()).boxed()
             }
-            None => {
-                return write::write(self, &self.table, record, self.batch_write_rows)
-                    .await
-                    .boxed();
-            }
+            None => write::write(self, &self.table, record, self.batch_write_rows)
+                .await
+                .boxed(),
         }
-
-        Ok(record)
     }
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
