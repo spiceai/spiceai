@@ -19,7 +19,7 @@ use super::{
     FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::cdc::ChangesStream;
+use crate::cdc::{ChangeBatch, ChangeEnvelope, ChangesStream};
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
@@ -59,12 +59,13 @@ use dynamodb_streams::Client as StreamsClient;
 use dynamodb_streams::checkpoint::GlobalCheckpoint;
 use futures::Stream;
 use futures::pin_mut;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use arrow_array::RecordBatch;
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
@@ -82,6 +83,10 @@ type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
 
 const DEFAULT_PARTITIONS: usize = 8;
+
+// pub type DynamoDBMessage = Result<(ChangeBatch, Option<GlobalCheckpoint>), StreamError>;
+//
+// pub type DynamoDBStream = BoxStream<'static, DynamoDBMessage>;
 
 impl DynamoDBTableProvider {
     pub async fn try_new(
@@ -268,7 +273,7 @@ impl DynamoDBTableProvider {
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: GlobalCheckpoint,
-    ) -> Result<ChangesStream> {
+    ) -> Result<BoxStream<'static, Result<(ChangeBatch, Option<GlobalCheckpoint>), crate::cdc::StreamError>>> {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
@@ -293,7 +298,7 @@ impl DynamoDBTableProvider {
         Ok(Box::pin(stream))
     }
 
-    pub async fn bootstrap_stream(self: Arc<Self>) -> Result<ChangesStream> {
+    pub async fn bootstrap_stream(self: Arc<Self>) -> Result<BoxStream<'static, Result<(ChangeBatch, Option<GlobalCheckpoint>), crate::cdc::StreamError>>> {
         let schema = self.table_schema.schema().clone();
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();

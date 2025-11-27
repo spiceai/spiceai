@@ -21,7 +21,7 @@ use super::{
 use crate::component::dataset::Dataset;
 use crate::federated_table::FederatedTable;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use futures::stream::{self, StreamExt};
@@ -271,6 +271,9 @@ impl DataConnector for DynamoDB {
 
                 Some(
                     bootstrap_stream
+                        .map(|msg| {
+                            msg.map(|(change_batch, _)| ChangeEnvelope::new(Box::new(DynamoDBStreamCommitter::new()), change_batch))
+                        })
                         .chain(
                             stream::once(async move {
                                 tracing::debug!(
@@ -287,7 +290,9 @@ impl DataConnector for DynamoDB {
                                         );
                                         None
                                     }
-                                }
+                                }.map(|msg| {
+                                    msg.map(|(change_batch, _)| ChangeEnvelope::new(Box::new(DynamoDBStreamCommitter::new()), change_batch))
+                                })
                             })
                             .filter_map(|opt| async move { opt })
                             .flatten()
@@ -297,5 +302,19 @@ impl DataConnector for DynamoDB {
             })
             .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
+    }
+}
+
+struct DynamoDBStreamCommitter;
+
+impl DynamoDBStreamCommitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl CommitChange for DynamoDBStreamCommitter {
+    fn commit(&self) -> std::result::Result<(), CommitError> {
+        Ok(())
     }
 }
