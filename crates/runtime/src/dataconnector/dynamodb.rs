@@ -241,20 +241,61 @@ impl DataConnector for DynamoDB {
             stream::once(async move {
                 let table_provider = federated_table.table_provider().await;
 
-                let dynamodb = table_provider
+                let dynamodb_ref = table_provider
                     .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
-                // Error handling will be added in the next PR
-                let checkpoint = dynamodb.latest_global_checkpoint().await.ok()?;
+                let dynamodb = Arc::new(dynamodb_ref.clone());
 
-                // Table bootstrapping will be added in the next PR
+                let checkpoint = match dynamodb.latest_global_checkpoint().await {
+                    Ok(checkpoint) => checkpoint,
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to get latest global checkpoint for DynamoDB Stream: {:?}",
+                            err
+                        );
+                        return None;
+                    }
+                };
 
-                // Error handling will be added in the next PR
-                dynamodb.stream_from_checkpoint(checkpoint).await.ok()
+                let bootstrap_stream = match Arc::clone(&dynamodb).bootstrap_stream().await {
+                    Ok(bootstrap_stream) => bootstrap_stream,
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to get bootstrap stream for DynamoDB Table: {:?}",
+                            err
+                        );
+                        return None;
+                    }
+                };
+
+                Some(
+                    bootstrap_stream
+                        .chain(
+                            stream::once(async move {
+                                tracing::debug!(
+                                    "Starting DynamoDB stream from checkpoint: {:?}",
+                                    checkpoint
+                                );
+
+                                match dynamodb.stream_from_checkpoint(checkpoint).await {
+                                    Ok(stream) => Some(stream),
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "Failed to get bootstrap stream from checkpoint for DynamoDB Table: {:?}",
+                                            err
+                                        );
+                                        None
+                                    }
+                                }
+                            })
+                            .filter_map(|opt| async move { opt })
+                            .flatten()
+                        )
+                        .boxed(),
+                )
             })
-            .filter_map(|opt| async move { opt })
-            .flatten(),
+            .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
     }
 }
