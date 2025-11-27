@@ -801,11 +801,13 @@ mod tests {
         }
 
         fn create_test_batch(schema: Arc<Schema>, row_count: usize) -> RecordBatch {
-            let ids: Int32Array = (0..row_count as i32).collect();
-            let names: Vec<String> = (0..row_count).map(|i| format!("name_{}", i)).collect();
+            let ids: Int32Array =
+                (0..i32::try_from(row_count).expect("row_count fits in i32")).collect();
+            let names: Vec<String> = (0..row_count).map(|i| format!("name_{i}")).collect();
             let names_array: StringArray = names.iter().map(|s| Some(s.as_str())).collect();
 
-            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names_array)]).unwrap()
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names_array)])
+                .expect("valid record batch")
         }
 
         #[test]
@@ -817,7 +819,7 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             let change_batch = envelope.change_batch.record;
             assert_eq!(change_batch.num_rows(), 1);
         }
@@ -831,7 +833,7 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             assert_eq!(envelope.change_batch.record.num_rows(), 100);
         }
 
@@ -844,7 +846,7 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             assert_eq!(envelope.change_batch.record.num_rows(), 0);
         }
 
@@ -857,12 +859,15 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             let change_batch = envelope.change_batch.record;
 
             // Verify the primary keys column is a list array
             let pk_column = change_batch.column(1);
-            let pk_list = pk_column.as_any().downcast_ref::<ListArray>().unwrap();
+            let pk_list = pk_column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("pk_column is ListArray");
 
             // Each row should have 2 primary keys
             for i in 0..change_batch.num_rows() {
@@ -880,11 +885,14 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             let change_batch = envelope.change_batch.record;
 
             let pk_column = change_batch.column(1);
-            let pk_list = pk_column.as_any().downcast_ref::<ListArray>().unwrap();
+            let pk_list = pk_column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("pk_column is ListArray");
 
             // Each row should have an empty list
             for i in 0..change_batch.num_rows() {
@@ -902,12 +910,15 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             let change_batch = envelope.change_batch.record;
 
             // First column should be the operation column
             let op_column = change_batch.column(0);
-            let op_array = op_column.as_any().downcast_ref::<StringArray>().unwrap();
+            let op_array = op_column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("op_column is StringArray");
 
             // All operations should be "c" (Create)
             for i in 0..change_batch.num_rows() {
@@ -924,12 +935,15 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             let change_batch = envelope.change_batch.record;
 
             // Third column should be the data as a struct
             let data_column = change_batch.column(2);
-            let struct_array = data_column.as_any().downcast_ref::<StructArray>().unwrap();
+            let struct_array = data_column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("data_column is StructArray");
 
             assert_eq!(struct_array.len(), 5);
             assert_eq!(struct_array.num_columns(), 2); // id and name
@@ -947,7 +961,10 @@ mod tests {
             // Verify all rows have the same primary keys
             for i in 0..row_count {
                 let list_value = pk_array.value(i);
-                let string_array = list_value.as_any().downcast_ref::<StringArray>().unwrap();
+                let string_array = list_value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("list_value is StringArray");
 
                 assert_eq!(string_array.len(), 2);
                 assert_eq!(string_array.value(0), "id");
@@ -964,7 +981,10 @@ mod tests {
 
             for i in 0..row_count {
                 let list_value = pk_array.value(i);
-                let string_array = list_value.as_any().downcast_ref::<StringArray>().unwrap();
+                let string_array = list_value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("list_value is StringArray");
 
                 assert_eq!(string_array.len(), 1);
                 assert_eq!(string_array.value(0), "id");
@@ -990,7 +1010,7 @@ mod tests {
             let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let envelope = result.unwrap();
+            let envelope = result.expect("valid envelope");
             assert_eq!(envelope.change_batch.record.num_rows(), 10000);
         }
 
@@ -1018,7 +1038,7 @@ mod tests {
                     Arc::new(optional_ints),
                 ],
             )
-            .unwrap();
+            .expect("valid record batch");
 
             let primary_keys = vec!["id".to_string()];
 
