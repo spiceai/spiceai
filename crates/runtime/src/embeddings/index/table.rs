@@ -15,19 +15,12 @@ limitations under the License.
 */
 #![allow(clippy::too_many_arguments)]
 
-use crate::embeddings::construct_chunker;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
-use arrow_schema::Schema;
-use arrow_schema::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-use runtime_datafusion_index::Index;
-use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::util::get_primary_keys;
-use search::index::VectorScanTableProvider;
-use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
-use search::metadata::MetadataColumn;
+use spicepod::vector::VectorStore;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use spicepod::semantic::Column;
@@ -35,21 +28,21 @@ use spicepod::semantic::Column;
 #[cfg(feature = "s3_vectors")]
 use {
     crate::embeddings::construct_chunker,
-    crate::embeddings::index::VectorScanTableProvider,
+    arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
     datafusion::common::ToDFSchema as _,
     runtime_datafusion_index::{Index, IndexedTableProvider},
     runtime_table_partition::expression::partition_by_expressions,
     search::generation::util::get_primary_keys,
     search::index::s3_vectors::S3Vector,
-    search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex},
+    search::index::{
+        SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
+    },
+    search::metadata::MetadataColumn,
     snafu::ResultExt,
     spicepod::component::embeddings::EmbeddingChunkConfig,
+    spicepod::semantic::MetadataType,
 };
-
-use spicepod::semantic::MetadataType;
-use spicepod::vector::VectorStore;
-use std::sync::Arc;
 
 #[allow(unused_variables)]
 pub async fn wrap_table_as_index(

@@ -29,7 +29,7 @@ use datafusion_table_providers::{
 use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, path::PathBuf, time::Duration};
+use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
@@ -95,13 +95,24 @@ impl Default for SqliteAccelerator {
 }
 
 impl SqliteAccelerator {
+    /// Wrapper to align the decimal extension signature with `sqlite3_auto_extension`.
+    ///
+    /// SAFETY: The wrapper only casts the error message pointer to match the expected mutability.
+    unsafe extern "C" fn sqlite3_decimal_init_wrapper(
+        db: *mut rusqlite::ffi::sqlite3,
+        error_message: *mut *mut c_char,
+        api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int {
+        unsafe { sqlite3_decimal_init(db, error_message.cast(), api) }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
         unsafe {
-            sqlite3_auto_extension(Some(sqlite3_decimal_init));
+            sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
