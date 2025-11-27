@@ -264,7 +264,7 @@ mod tests {
         })
     }
 
-    #[ignore="See #8313"]
+    #[ignore = "See #8313"]
     #[test]
     fn test_projection_pushdown() {
         let files = vec![
