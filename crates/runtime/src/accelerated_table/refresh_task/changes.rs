@@ -76,6 +76,8 @@ impl RefreshTask {
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
+        println!("start_changes_stream");
+
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
 
