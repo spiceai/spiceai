@@ -82,10 +82,11 @@
         "--load-steps",
         "10",
         "--load-interval",
+        "20",
+        "--duration",
         "240",
-        "--disable-progress-bars",
         "-p",
-        "./test/spicepods/tpch/sf1/accelerated/append/file_duckdb_file.yaml"
+        "./test/spicepods/tpch/sf1/accelerated/append/file_duckdb_file_on_conflict_upsert.yaml"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",

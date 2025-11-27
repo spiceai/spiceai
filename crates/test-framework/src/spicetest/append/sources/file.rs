@@ -176,7 +176,7 @@ impl AppendableSource for FileAppendableSource {
                     let do_conflict = enable_conflict_testing && load_index < load_steps - 1;
                     if do_conflict {
                         let next_step = load_index + 1;
-                        write!(&mut sql, "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');\n").ok();
+                        writeln!(&mut sql, "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');").ok();
                     }
 
                     for TableWithTimeColumn { name, column } in &tables {
@@ -193,10 +193,10 @@ impl AppendableSource for FileAppendableSource {
                                              DROP TABLE {name}_conflict;\n").ok();
                         }
 
-                        write!(&mut sql, "COPY {name} TO '{}' (FORMAT 'parquet');\n", parquet_path.to_string_lossy()).ok();
+                        writeln!(&mut sql, "COPY {name} TO '{}' (FORMAT 'parquet');", parquet_path.to_string_lossy()).ok();
                     }
 
-                    sql += "COMMIT;";
+                    sql += "COMMIT";
 
                     dest_conn.execute_batch(&sql)?;
                 }
