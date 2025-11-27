@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer FROM vector_search(qs_view, 'second', answer) order by score desc, id LIMIT 4"
-snapshot_kind: text
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                           |
@@ -13,7 +12,7 @@ snapshot_kind: text
 | physical_plan | ProjectionExec: expr=[id@0 as id, answer@1 as answer]                                                                                                                          |
 |               |   SortExec: TopK(fetch=4), expr=[score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                             |
 |               |     ProjectionExec: expr=[id@0 as id, answer@2 as answer, score@1 as score]                                                                                                    |
-|               |       HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@1), (question@1, question@2)], projection=[id@0, score@2, answer@3]                                        |
+|               |       HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@1), (question@1, question@2)], projection=[id@0, score@2, answer@3]     |
 |               |         CoalescePartitionsExec                                                                                                                                                 |
 |               |           ProjectionExec: expr=[union_extract(json_get(key@0, id), int) as id, union_extract(json_get(key@0, question), str) as question, 1 - distance@1 as score]             |
 |               |             CooperativeExec                                                                                                                                                    |
