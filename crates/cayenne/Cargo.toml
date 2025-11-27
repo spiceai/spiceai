@@ -43,7 +43,6 @@ vortex-bytebool = { workspace = true }
 vortex-datafusion = { workspace = true }
 vortex-datetime-parts = { workspace = true }
 vortex-decimal-byte-parts = { workspace = true }
-vortex-dict = { workspace = true }
 vortex-fastlanes = { workspace = true }
 vortex-fsst = { workspace = true }
 vortex-runend = { workspace = true }
