@@ -109,9 +109,14 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::LargeBinary
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::List(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
     )
 }
 
