@@ -24,7 +24,9 @@ pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
 
+#[cfg(feature = "append")]
 mod append;
+#[cfg(feature = "append")]
 pub use append::AppendTestArgs;
 
 pub mod dispatch;

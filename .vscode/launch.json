@@ -75,7 +75,7 @@
       "args": [
         "run",
         "append",
-      "--ready-wait",
+        "--ready-wait",
         "300",
         "--query-set",
         "tpch",
@@ -85,6 +85,7 @@
         "20",
         "--duration",
         "240",
+        "--with-conflict-data",
         "-p",
         "./test/spicepods/tpch/sf1/accelerated/append/file_duckdb_file_on_conflict_upsert.yaml"
       ],

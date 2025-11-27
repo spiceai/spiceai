@@ -138,15 +138,13 @@ impl AppendableSource for FileAppendableSource {
     }
 
     async fn generate(&self, config: &AppendConfig, load_index: u16) -> Result<()> {
-        let conflict_suffix =
-            if config.enable_conflict_testing && load_index < config.load_steps - 1 {
-                " (with conflict data)"
-            } else {
-                ""
-            };
+        // If conflict testing is enabled and not the last step, also generate next step's data
+        // This creates conflicts that should be resolved by the next append operation
+        let generate_conflict_test_data =
+            config.with_conflict_data && load_index < config.load_steps - 1;
 
         println!(
-            "Loading append data for {query_set} benchmark suite - {load_index}/{load_steps}{conflict_suffix}",
+            "Loading append data (with conflict data: {generate_conflict_test_data})  {query_set} benchmark suite - {load_index}/{load_steps}",
             query_set = config.query_set,
             load_steps = config.load_steps,
             load_index = load_index + 1, // display index is 1-based
@@ -157,7 +155,6 @@ impl AppendableSource for FileAppendableSource {
         let load_steps = config.load_steps;
         let tables = self.tables.clone();
         let temp_directory = config.temp_directory.clone();
-        let enable_conflict_testing = config.enable_conflict_testing;
 
         tokio::task::spawn_blocking(move || {
             let dest_conn = Connection::open(&dest_db_file)?;
@@ -171,10 +168,7 @@ impl AppendableSource for FileAppendableSource {
                          CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n"
                     );
 
-                    // If conflict testing is enabled and not the last step, also generate next step's data
-                    // This creates conflicts that should be resolved by the next append operation
-                    let do_conflict = enable_conflict_testing && load_index < load_steps - 1;
-                    if do_conflict {
+                    if generate_conflict_test_data {
                         let next_step = load_index + 1;
                         writeln!(&mut sql, "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');").ok();
                     }
@@ -187,7 +181,7 @@ impl AppendableSource for FileAppendableSource {
                                          INSERT INTO {name} SELECT * FROM {name}_new;
                                          DROP TABLE {name}_new;\n").ok();
 
-                        if do_conflict {
+                        if generate_conflict_test_data {
                             write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                                              INSERT INTO {name} SELECT * FROM {name}_conflict;
                                              DROP TABLE {name}_conflict;\n").ok();
@@ -196,12 +190,16 @@ impl AppendableSource for FileAppendableSource {
                         writeln!(&mut sql, "COPY {name} TO '{}' (FORMAT 'parquet');", parquet_path.to_string_lossy()).ok();
                     }
 
-                    sql += "COMMIT";
+                    sql += "COMMIT;";
 
                     dest_conn.execute_batch(&sql)?;
                 }
                 QuerySet::Tpcds => {
                     let mut sql = "BEGIN;\n".to_string();
+
+                    if generate_conflict_test_data {
+                        anyhow::bail!("Generating data for on_conflict testing for TPCDS is not supported");
+                    }
 
                     for TableWithTimeColumn { name, column } in &tables {
                         write!(&mut sql, "INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}

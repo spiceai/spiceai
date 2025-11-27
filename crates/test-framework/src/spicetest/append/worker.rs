@@ -32,7 +32,7 @@ pub(crate) struct AppendConfig {
     pub(crate) load_steps: u16,
     pub(crate) load_interval: Duration,
     pub(crate) temp_directory: PathBuf,
-    pub(crate) enable_conflict_testing: bool,
+    pub(crate) with_conflict_data: bool,
 }
 
 impl AppendConfig {
@@ -43,7 +43,7 @@ impl AppendConfig {
             load_steps: 10,
             load_interval: Duration::from_secs(60 * 4),
             temp_directory,
-            enable_conflict_testing: false,
+            with_conflict_data: false,
         }
     }
 
@@ -57,8 +57,8 @@ impl AppendConfig {
         self
     }
 
-    pub fn with_conflict_testing(mut self, enable_conflict_testing: bool) -> Self {
-        self.enable_conflict_testing = enable_conflict_testing;
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
         self
     }
 }

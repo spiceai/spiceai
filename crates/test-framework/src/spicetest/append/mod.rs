@@ -51,7 +51,7 @@ pub struct NotStarted {
     tempdir_path: Option<PathBuf>,
     load_interval: Option<Duration>,
     load_steps: Option<u16>,
-    enable_conflict_testing: bool,
+    with_conflict_data: bool,
 }
 
 impl NotStarted {
@@ -103,8 +103,8 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_conflict_testing(mut self, enable_conflict_testing: bool) -> Self {
-        self.enable_conflict_testing = enable_conflict_testing;
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
         self
     }
 
@@ -154,7 +154,7 @@ impl SpiceTest<NotStarted> {
             self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
         )
-        .with_conflict_testing(self.state.enable_conflict_testing);
+        .with_conflict_data(self.state.with_conflict_data);
 
         if let Some(load_interval) = self.state.load_interval {
             append_config = append_config.with_load_interval(load_interval);

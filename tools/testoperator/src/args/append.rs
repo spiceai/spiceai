@@ -31,7 +31,7 @@ pub struct AppendTestArgs {
     #[arg(long, default_value_t = 10)]
     pub(crate) load_steps: u16,
 
-    /// Enable conflict resolution testing by generating additional data that will be resolved in subsequent steps
+    /// Include additional conflict data to test ON CONFLICT upsert behavior during append operations
     #[arg(long)]
-    pub(crate) enable_conflict_testing: bool,
+    pub(crate) with_conflict_data: bool,
 }
