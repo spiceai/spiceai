@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: model2vec[potion-multilingual-128M]-duckdb[file]
+name: model2vec[potion-multilingual-128M]-cayenne[file]
 datasets:
 
   # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
@@ -10,7 +10,7 @@ datasets:
     name: corpus
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
     columns:
       - name: text

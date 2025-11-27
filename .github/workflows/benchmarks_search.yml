@@ -26,6 +26,7 @@ on:
           - 'full_text_search-duckdb[file]'
           - 'hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]'
           - 'model2vec[potion-multilingual-128M]-duckdb[file]'
+          - 'model2vec[potion-multilingual-128M]-cayenne[file]'
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -58,6 +59,7 @@ jobs:
               { name: "full_text_search-cayenne[file]" },
               { name: "hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]" },
               { name: "model2vec[potion-multilingual-128M]-duckdb[file]" },
+              { name: "model2vec[potion-multilingual-128M]-cayenne[file]" },
             ];
 
             const configuration = context.payload.inputs?.configuration || 'all';
