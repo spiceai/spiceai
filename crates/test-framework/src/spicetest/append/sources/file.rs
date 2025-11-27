@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use duckdb::Connection;
+use std::fmt::Write;
 use tokio::fs;
 use tonic::async_trait;
 
@@ -79,7 +80,6 @@ impl AppendableSource for FileAppendableSource {
                     );
 
                     for TableWithTimeColumn { name, column } in &tables {
-                        use std::fmt::Write;
                         let parquet_path = temp_directory.join(format!("{name}.parquet"));
                         write!(&mut sql,
                                     "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
@@ -100,7 +100,6 @@ impl AppendableSource for FileAppendableSource {
                     for TableWithTimeColumn { name, column } in &tables {
                         // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
                         // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
-                        use std::fmt::Write;
                         write!(&mut setup_sql,
                             "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                              ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
@@ -139,8 +138,13 @@ impl AppendableSource for FileAppendableSource {
     }
 
     async fn generate(&self, config: &AppendConfig, load_index: u16) -> Result<()> {
+        // If conflict testing is enabled and not the last step, also generate next step's data
+        // This creates conflicts that should be resolved by the next append operation
+        let generate_conflict_test_data =
+            config.with_conflict_data && load_index < config.load_steps - 1;
+
         println!(
-            "Loading append data for {query_set} benchmark suite - {load_index}/{load_steps}",
+            "Loading append data (with conflict data: {generate_conflict_test_data})  {query_set} benchmark suite - {load_index}/{load_steps}",
             query_set = config.query_set,
             load_steps = config.load_steps,
             load_index = load_index + 1, // display index is 1-based
@@ -164,13 +168,26 @@ impl AppendableSource for FileAppendableSource {
                          CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n"
                     );
 
+                    if generate_conflict_test_data {
+                        let next_step = load_index + 1;
+                        writeln!(&mut sql, "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');").ok();
+                    }
+
                     for TableWithTimeColumn { name, column } in &tables {
-                        use std::fmt::Write;
                         let parquet_path = temp_directory.join(format!("{name}.parquet"));
+
+                        // Insert the current step's data
                         write!(&mut sql, "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                                          INSERT INTO {name} SELECT * FROM {name}_new;
-                                         DROP TABLE {name}_new;
-                                         COPY {name} TO '{}' (FORMAT 'parquet');\n", parquet_path.to_string_lossy()).ok();
+                                         DROP TABLE {name}_new;\n").ok();
+
+                        if generate_conflict_test_data {
+                            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                                             INSERT INTO {name} SELECT * FROM {name}_conflict;
+                                             DROP TABLE {name}_conflict;\n").ok();
+                        }
+
+                        writeln!(&mut sql, "COPY {name} TO '{}' (FORMAT 'parquet');", parquet_path.to_string_lossy()).ok();
                     }
 
                     sql += "COMMIT;";
@@ -180,8 +197,11 @@ impl AppendableSource for FileAppendableSource {
                 QuerySet::Tpcds => {
                     let mut sql = "BEGIN;\n".to_string();
 
+                    if generate_conflict_test_data {
+                        anyhow::bail!("Generating data for on_conflict testing for TPCDS is not supported");
+                    }
+
                     for TableWithTimeColumn { name, column } in &tables {
-                        use std::fmt::Write;
                         write!(&mut sql, "INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
                                          FROM {name}_gen
                                          LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
