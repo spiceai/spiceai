@@ -273,7 +273,7 @@ impl DataConnector for DynamoDB {
                     Some(
                         bootstrap_stream
                             .chain(
-                                stream::once(create_changes_stream(
+                                stream::once(changes_stream_from_checkpoint(
                                     Arc::clone(&dynamodb),
                                     Arc::clone(&dynamodb_sys),
                                     checkpoint,
@@ -287,7 +287,7 @@ impl DataConnector for DynamoDB {
                 } else {
                     // Resume reading from a checkpoint
                     Some(
-                        stream::once(create_changes_stream(
+                        stream::once(changes_stream_from_checkpoint(
                             Arc::clone(&dynamodb),
                             Arc::clone(&dynamodb_sys),
                             checkpoint,
@@ -362,12 +362,14 @@ async fn get_latest_checkpoint(dynamodb: &Arc<DynamoDBTableProvider>) -> Option<
     }
 }
 
-async fn create_changes_stream(
+async fn changes_stream_from_checkpoint(
     dynamodb: Arc<DynamoDBTableProvider>,
     dynamodb_sys: Arc<DynamoDBSys>,
     checkpoint: Checkpoint,
     from_bootstrap: bool,
 ) -> Option<ChangesStream> {
+    // If this is an initial checkpoint(from_bootstrap=true), commit it immediately.
+    // This checkpoint is inclusive and in case of failure stream will restart from the current position, not next.
     if from_bootstrap {
         tracing::debug!("Committing bootstrap checkpoint");
         let committer = DynamoDBStreamCommitter::new(Arc::clone(&dynamodb_sys), checkpoint.clone());

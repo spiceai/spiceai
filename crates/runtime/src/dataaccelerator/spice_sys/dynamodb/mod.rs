@@ -33,7 +33,7 @@ mod duckdb;
 /// Serializable checkpoint metadata for DynamoDB Streams
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DynamoDBCheckpointMetadata {
-    pub checkpoint_data: String, // JSON-encoded GlobalCheckpoint
+    pub checkpoint_data: String, // JSON-encoded Checkpoint
 }
 
 pub struct DynamoDBSys {
