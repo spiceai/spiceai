@@ -40,6 +40,7 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
+    Caching,
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -48,6 +49,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
             spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
             spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
+            spicepod_acceleration::RefreshMode::Caching => RefreshMode::Caching,
         }
     }
 }

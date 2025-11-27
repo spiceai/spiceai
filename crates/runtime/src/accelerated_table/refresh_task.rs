@@ -393,18 +393,21 @@ impl RefreshTask {
 
         // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
+            #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
             match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
+                RefreshMode::Caching => &metrics::REFRESH_DURATION_MS,
             },
             &dataset_metrics_label_sets,
         );
 
         let start_time = SystemTime::now();
 
+        #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
         let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -415,6 +418,10 @@ impl RefreshTask {
             }
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Caching => {
+                // For caching mode, identify and refresh stale rows based on fetched_at and TTL
+                self.refresh_stale_cached_rows(refresh).await
+            }
         };
 
         let streaming_data_update = match get_data_update_result {
@@ -757,6 +764,53 @@ impl RefreshTask {
         }
     }
 
+    async fn refresh_stale_cached_rows(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        use crate::accelerated_table::caching::CacheRefreshHelper;
+
+        // Get the TTL from refresh settings - default to 30 seconds if not specified
+        let ttl = refresh.check_interval.unwrap_or(Duration::from_secs(30));
+
+        eprintln!(
+            "!!!!! refresh_stale_cached_rows called for dataset {} with TTL {:?} !!!!!",
+            self.dataset_name, ttl
+        );
+
+        tracing::info!(
+            "Cache: Starting stale row refresh for dataset {} with TTL {:?}",
+            self.dataset_name,
+            ttl
+        );
+
+        // Use the CacheRefreshHelper to identify and refresh stale rows
+        let federated_provider = self.federated.table_provider().await;
+        let refreshed_count = CacheRefreshHelper::refresh_stale_rows(
+            federated_provider,
+            Arc::clone(&self.accelerator),
+            self.dataset_name.to_string().as_str(),
+            ttl,
+        )
+        .await
+        .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
+
+        tracing::info!(
+            "Cache: Completed stale row refresh for dataset {} - refreshed {} rows",
+            self.dataset_name,
+            refreshed_count
+        );
+
+        // Return an empty streaming update since the refresh was handled internally
+        // by CacheRefreshHelper
+        let schema = self.accelerator.schema();
+        let empty_stream = RecordBatchStreamAdapter::new(schema, futures::stream::empty());
+        Ok(StreamingDataUpdate {
+            data: Box::pin(empty_stream),
+            update_type: UpdateType::Overwrite,
+        })
+    }
+
     async fn trace_load_completed(
         &self,
         start_time: SystemTime,
@@ -800,6 +854,7 @@ impl RefreshTask {
         let federated_provider = self.federated.table_provider().await;
 
         let dataset_name = self.dataset_name.clone();
+        #[allow(clippy::match_same_arms)] // Caching will have different behavior in future
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -807,6 +862,7 @@ impl RefreshTask {
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Caching => UpdateType::Overwrite,
         };
 
         if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {

@@ -129,11 +129,17 @@ pub async fn initialize_cluster_executor(
         });
     };
 
+    let Ok(hostname) = gethostname::gethostname().into_string() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to determine executor hostname".to_string().into(),
+        });
+    };
+
     let executor_id = Uuid::new_v4().to_string();
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service
-        host: Some(bind_addr.ip().to_string()),
+        host: Some(hostname),
         port: u32::from(bind_addr.port()),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,

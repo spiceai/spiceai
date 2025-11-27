@@ -148,7 +148,7 @@ fn handle_http_request(
                 for metric in family.get_metric() {
                     let histogram = metric.get_histogram();
                     let summary =
-                        histogram_to_summary(family.get_name(), metric.get_label(), histogram);
+                        histogram_to_summary(family.name(), metric.get_label(), histogram);
                     histogram_summaries.push(summary);
                 }
             }
@@ -225,9 +225,9 @@ fn histogram_to_summary(
     let cumulative_counts: Vec<u64> = h
         .get_bucket()
         .iter()
-        .map(Bucket::get_cumulative_count)
+        .map(Bucket::cumulative_count)
         .collect();
-    let bounds: Vec<f64> = h.get_bucket().iter().map(Bucket::get_upper_bound).collect();
+    let bounds: Vec<f64> = h.get_bucket().iter().map(Bucket::upper_bound).collect();
 
     let mut summary_proto = prometheus::proto::Summary::new();
 
@@ -236,7 +236,7 @@ fn histogram_to_summary(
         let mut quantile = prometheus::proto::Quantile::new();
         quantile.set_quantile(p / 100.0);
         quantile.set_value(value);
-        summary_proto.mut_quantile().push(quantile);
+        summary_proto.quantile.push(quantile);
     }
 
     summary_proto.set_sample_count(total_count);
@@ -310,11 +310,11 @@ mod tests {
     #[test]
     fn test_histogram_to_summary() {
         let (family, metric, histogram) = create_test_histogram();
-        let summary = histogram_to_summary(family.get_name(), metric.get_label(), &histogram);
+        let summary = histogram_to_summary(family.name(), metric.get_label(), &histogram);
 
-        assert_eq!(summary.get_name(), "test_histogram_summary");
+        assert_eq!(summary.name(), "test_histogram_summary");
         assert_eq!(
-            summary.get_help(),
+            summary.help(),
             "Summary derived from histogram test_histogram"
         );
         assert_eq!(summary.get_field_type(), MetricType::SUMMARY);
@@ -322,13 +322,13 @@ mod tests {
         let metric = &summary.get_metric()[0];
         let summary_proto = metric.get_summary();
 
-        assert_eq!(summary_proto.get_sample_count(), 550);
-        assert_float_eq(summary_proto.get_sample_sum(), 35750.0);
+        assert_eq!(summary_proto.sample_count(), 550);
+        assert_float_eq(summary_proto.sample_sum(), 35750.0);
 
         let quantiles: Vec<(f64, f64)> = summary_proto
-            .get_quantile()
+            .quantile
             .iter()
-            .map(|q| (q.get_quantile(), q.get_value()))
+            .map(|q| (q.quantile(), q.value()))
             .collect();
 
         assert_eq!(quantiles.len(), 4);
@@ -363,7 +363,7 @@ mod tests {
             let mut bucket = Bucket::new();
             bucket.set_cumulative_count(cumulative_count);
             bucket.set_upper_bound(upper_bound);
-            histogram.mut_bucket().push(bucket);
+            histogram.bucket.push(bucket);
 
             // Calculate sample sum (approximate)
             let lower_bound = if i == 0 { 0.0 } else { buckets[i - 1] };

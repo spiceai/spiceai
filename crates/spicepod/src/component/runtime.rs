@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
+use subtle::ConstantTimeEq;
+
 use super::{
     caching::{Caching, ResultsCache},
     default_true, is_default, is_default_or_none,
@@ -355,11 +357,50 @@ pub struct ApiKeyAuth {
     pub keys: Vec<ApiKey>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// API key for authentication. Keys can be read-only or read-write.
+/// The key value is redacted in Debug output to prevent credential leakage.
+///
+/// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+/// constant-time comparison via the `subtle` crate to prevent timing attacks.
+#[derive(Clone)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+}
+
+/// Constant-time comparison for `ApiKey` to `ApiKey`.
+/// Both variants must match AND the key values must be equal using constant-time comparison.
+impl PartialEq for ApiKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ApiKey::ReadOnly { key: a }, ApiKey::ReadOnly { key: b })
+            | (ApiKey::ReadWrite { key: a }, ApiKey::ReadWrite { key: b }) => {
+                a.as_bytes().ct_eq(b.as_bytes()).into()
+            }
+            // Different variants are never equal
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ApiKey {}
+
+/// Custom Debug implementation that redacts the key value to prevent
+/// credential leakage in logs or error messages.
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiKey::ReadOnly { .. } => f
+                .debug_struct("ApiKey::ReadOnly")
+                .field("key", &"[REDACTED]")
+                .finish(),
+            ApiKey::ReadWrite { .. } => f
+                .debug_struct("ApiKey::ReadWrite")
+                .field("key", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -433,9 +474,17 @@ impl Serialize for ApiKey {
 }
 
 impl PartialEq<str> for ApiKey {
+    /// Compares the API key with another string using constant-time comparison
+    /// to prevent timing attacks that could leak key information.
+    ///
+    /// Uses the `subtle` crate which is specifically designed for cryptographic
+    /// constant-time operations and handles edge cases like length differences
+    /// correctly without leaking timing information.
     fn eq(&self, other: &str) -> bool {
         match self {
-            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key == other,
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => {
+                key.as_bytes().ct_eq(other.as_bytes()).into()
+            }
         }
     }
 }
@@ -660,6 +709,76 @@ mod tests {
             ApiKey::ReadOnly {
                 key: "api-key-1".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn test_api_key_constant_time_comparison() {
+        let key = ApiKey::ReadOnly {
+            key: "secret-api-key-12345".to_string(),
+        };
+
+        // Test exact match
+        assert!(key == *"secret-api-key-12345");
+
+        // Test mismatch at different positions
+        assert!(key != *"xecret-api-key-12345"); // First char different
+        assert!(key != *"secret-api-key-1234x"); // Last char different
+        assert!(key != *"secret-xpi-key-12345"); // Middle char different
+
+        // Test different lengths
+        assert!(key != *"secret-api-key-1234"); // Shorter
+        assert!(key != *"secret-api-key-123456"); // Longer
+        assert!(key != *""); // Empty string
+
+        // Test with ReadWrite variant
+        let rw_key = ApiKey::ReadWrite {
+            key: "rw-key".to_string(),
+        };
+        assert!(rw_key == *"rw-key");
+        assert!(rw_key != *"rw-key2");
+    }
+
+    #[test]
+    fn test_api_key_debug_redaction() {
+        let readonly_key = ApiKey::ReadOnly {
+            key: "super-secret-key".to_string(),
+        };
+        let readwrite_key = ApiKey::ReadWrite {
+            key: "another-secret".to_string(),
+        };
+
+        let readonly_debug = format!("{readonly_key:?}");
+        let readwrite_debug = format!("{readwrite_key:?}");
+
+        // Ensure the actual key values are NOT in the debug output
+        assert!(
+            !readonly_debug.contains("super-secret-key"),
+            "Debug output should not contain the actual key"
+        );
+        assert!(
+            !readwrite_debug.contains("another-secret"),
+            "Debug output should not contain the actual key"
+        );
+
+        // Ensure [REDACTED] is present
+        assert!(
+            readonly_debug.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+        assert!(
+            readwrite_debug.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+
+        // Ensure the variant name is present for debugging purposes
+        assert!(
+            readonly_debug.contains("ReadOnly"),
+            "Debug output should indicate the variant type"
+        );
+        assert!(
+            readwrite_debug.contains("ReadWrite"),
+            "Debug output should indicate the variant type"
         );
     }
 

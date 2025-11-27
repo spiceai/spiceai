@@ -19,7 +19,6 @@ limitations under the License.
 //! This module provides functions to prevent common security vulnerabilities:
 //! - Path traversal attacks (e.g., `../../etc/passwd`)
 //! - Empty file downloads that could cause runtime errors
-//! - Malicious filenames with special characters
 //! - SQL injection via unquoted table identifiers
 
 use datafusion::sql::TableReference;
@@ -43,6 +42,8 @@ pub const MAX_SAFE_JSON_DEPTH: usize = 32;
 /// - Prevents path traversal attacks by removing all directory components
 /// - Rejects invalid UTF-8 sequences in filenames
 /// - Returns only the filename component without any path separators
+/// - Does not sanitize special characters in the filename itself; callers should
+///   apply additional validation if they need to restrict allowed characters
 ///
 /// # Arguments
 ///

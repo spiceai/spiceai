@@ -24,10 +24,10 @@ use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
+use ::cache::Caching;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
@@ -57,6 +57,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+pub mod caching;
 pub mod federation;
 mod metrics;
 pub mod refresh;
@@ -220,6 +221,8 @@ pub struct AcceleratedTable {
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
+    cache_ttl: Option<Duration>,
+    io_runtime: Handle,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -281,6 +284,7 @@ pub struct Builder {
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    caching_ttl: Option<Duration>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
@@ -318,6 +322,7 @@ impl Builder {
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            caching_ttl: None,
             resource_monitor: None,
         }
     }
@@ -451,6 +456,12 @@ impl Builder {
         self
     }
 
+    /// Set the TTL for cache mode
+    pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
+        self.caching_ttl = ttl;
+        self
+    }
+
     /// Build the accelerated table
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
@@ -534,6 +545,15 @@ impl Builder {
                     None,
                 )
             }
+            RefreshMode::Caching => {
+                // Cache mode supports manual refresh triggers to force refresh of stale data
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Caching(on_start_refresh),
+                    Some(start_refresh),
+                )
+            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
@@ -604,6 +624,8 @@ impl Builder {
             refresher,
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
+            cache_ttl: self.caching_ttl,
+            io_runtime: self.io_runtime,
         })
     }
 }
@@ -729,6 +751,16 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // In caching mode, we handle filters ourselves (not pushed to accelerator)
+        // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
+        let is_caching_mode = futures::executor::block_on(async {
+            self.refresh_params.read().await.mode == RefreshMode::Caching
+        });
+
+        if is_caching_mode {
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+        }
+
         match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
             ZeroResultsAction::UseSource => {
@@ -744,8 +776,11 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Check if we're in caching mode
+        let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
-        if !self.refresher().initial_load_completed() {
+        if !self.refresher().initial_load_completed() && !is_caching_mode {
             match self.ready_state {
                 ReadyState::OnLoad => {
                     return Err(DataFusionError::External(
@@ -767,20 +802,36 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
+        // In caching mode, pass filters to accelerator so it can check for cached data.
+        // If accelerator returns 0 rows → cache miss → fetch from source.
         let input = self
             .accelerator
             .scan(state, projection, filters, limit)
             .await?;
-
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match &self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => input,
-            ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
+        let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
+            (true, _) => {
+                // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+                let federated_provider = self.federated.table_provider().await;
+                Arc::new(caching::CachingAccelerationScanExec::new(
+                    input,
+                    self.cache_ttl,
+                    federated_provider,
+                    Arc::clone(&self.accelerator),
+                    self.dataset_name.to_string(),
+                    self.io_runtime.clone(),
+                    filters.to_vec(),
+                    projection.cloned(),
+                    limit,
+                ))
+            }
+            (false, ZeroResultsAction::ReturnEmpty) => input,
+            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
                 fallback_fn,

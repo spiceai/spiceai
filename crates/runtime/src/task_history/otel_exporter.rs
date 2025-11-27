@@ -22,9 +22,11 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use tracing::Instrument;
 
-use futures::future::BoxFuture;
-use opentelemetry::trace::{SpanId, TraceError};
-use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+use opentelemetry::trace::SpanId;
+use opentelemetry_sdk::{
+    error::{OTelSdkError, OTelSdkResult},
+    trace::{SpanData, SpanExporter},
+};
 use spicepod::component::runtime::{TaskHistoryCapturedOutput, TaskHistoryCapturedPlan};
 
 use crate::datafusion::DataFusion;
@@ -281,7 +283,10 @@ impl TaskHistoryExporter {
 }
 
 impl SpanExporter for TaskHistoryExporter {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         let min_sql_duration_ms = self.min_sql_duration_ms;
         let captured_plan = self.captured_plan.clone();
         let min_plan_duration_ms = self.min_plan_duration_ms;
@@ -296,12 +301,12 @@ impl SpanExporter for TaskHistoryExporter {
             .filter(should_include)
             .collect();
 
-        Box::pin(async move {
+        async move {
             // Separate logic: if plan capture is disabled, write all spans directly
             if matches!(captured_plan, TaskHistoryCapturedPlan::None) {
                 return TaskSpan::write(Arc::clone(&df), spans)
                     .await
-                    .map_err(|e| TraceError::Other(Box::new(e)));
+                    .map_err(|e| OTelSdkError::InternalFailure(e.to_string()));
             }
 
             // Filter spans that need plan capture before cloning
@@ -333,7 +338,7 @@ impl SpanExporter for TaskHistoryExporter {
             // Write all spans first
             TaskSpan::write(Arc::clone(&df), spans)
                 .await
-                .map_err(|e| TraceError::Other(Box::new(e)))?;
+                .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?;
 
             // Spawn async task to capture plans for filtered spans
             // The task runs in the background without blocking the export operation
@@ -354,7 +359,7 @@ impl SpanExporter for TaskHistoryExporter {
             }
 
             Ok(())
-        })
+        }
     }
 }
 

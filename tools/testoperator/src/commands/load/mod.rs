@@ -189,33 +189,35 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let app_name = app.name.clone();
-    let load_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "load_test"),
-        KeyValue::new("name", app_name.clone()),
-        KeyValue::new("spiced_version", spiced_version.clone()),
-        KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("branch_name", metrics.branch_name.clone()),
-        KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
-        // If not specified, default to 1 meaning single fixed params set was used
-        KeyValue::new(
-            "param_set_variants",
-            args.test_args
-                .random_param_set_count
-                .unwrap_or(1)
-                .to_string(),
-        ),
-        KeyValue::new(
-            "protocol",
-            if args.test_args.http_clients {
-                "http"
-            } else {
-                "flight"
-            },
-        ),
-    ]);
+    let load_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "load_test"),
+            KeyValue::new("name", app_name.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", metrics.branch_name.clone()),
+            KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
+            // If not specified, default to 1 meaning single fixed params set was used
+            KeyValue::new(
+                "param_set_variants",
+                args.test_args
+                    .random_param_set_count
+                    .unwrap_or(1)
+                    .to_string(),
+            ),
+            KeyValue::new(
+                "protocol",
+                if args.test_args.http_clients {
+                    "http"
+                } else {
+                    "flight"
+                },
+            ),
+        ])
+        .build();
 
     let telemetry = Telemetry::new(&load_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
