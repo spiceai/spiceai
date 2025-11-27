@@ -223,7 +223,7 @@ mod xxhash_compat {
     }
 
     impl Hasher for XxHash3_128Wrapper {
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         fn finish(&self) -> u64 {
             let hasher_copy = self.hasher.clone();
             let hash128 = hasher_copy.finish_128();

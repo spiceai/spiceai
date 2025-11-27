@@ -127,7 +127,6 @@ impl McpToolCatalog {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {

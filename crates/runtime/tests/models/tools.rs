@@ -14,14 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[allow(clippy::expect_used)]
 mod mcp {
-
-    use crate::models::{http_get, sort_json_keys};
-
     use crate::models::create_api_bindings_config;
+    use crate::models::{http_get, sort_json_keys};
     use crate::utils::init_tracing_with_task_history;
-
     use crate::utils::runtime_ready_check;
     use app::AppBuilder;
     use http::{
@@ -29,9 +25,8 @@ mod mcp {
         header::{ACCEPT, CONTENT_TYPE},
     };
     use insta::{assert_json_snapshot, assert_snapshot};
-    use runtime::auth::EndpointAuth;
-
     use runtime::Runtime;
+    use runtime::auth::EndpointAuth;
     use serde_json::Value;
     use spicepod::component::tool::Tool;
     use std::sync::Arc;

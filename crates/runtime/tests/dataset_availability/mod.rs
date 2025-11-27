@@ -91,7 +91,7 @@ async fn dataset_check_availability_register_skipped_when_disabled() -> Result<(
 
     // Try to register the dataset - should be skipped
     let result = monitor.register_dataset(&dataset).await;
-    assert!(result.is_ok());
+    result.expect("Should register dataset without error");
 
     // Check that monitored_datasets is empty
     let monitored_datasets = monitor.monitored_datasets.lock().await;
@@ -115,7 +115,7 @@ async fn dataset_check_availability_register_skipped_when_accelerated() -> Resul
 
     // Try to register the dataset - should be skipped due to acceleration
     let result = monitor.register_dataset(&dataset).await;
-    assert!(result.is_ok());
+    result.expect("Should register dataset without error");
 
     // Check that monitored_datasets is empty
     let monitored_datasets = monitor.monitored_datasets.lock().await;

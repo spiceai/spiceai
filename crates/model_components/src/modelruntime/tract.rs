@@ -130,7 +130,7 @@ impl Runnable for Model {
                         let col = float_col.into_iter().flatten().collect_vec();
                         let end_idx: usize =
                             std::cmp::min(lookback_size - data[i].len(), col.len());
-                        data[i].append(&mut col[..end_idx].to_vec().clone());
+                        data[i].append(&mut col[..end_idx].to_vec());
                     });
             }
             let inp: Vec<Vec<f64>> = data

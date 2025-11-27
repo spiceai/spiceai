@@ -68,7 +68,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
     }
 
     // Custom healthcheck for OpenAI because Azure dosn't support `max_completion_tokens`.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn health(&self) -> Result<(), crate::chat::Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 

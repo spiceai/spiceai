@@ -104,7 +104,7 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let store_url = self.get_object_store_url(dataset, None)?;
-        let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
+        let listing_store_url = ListingTableUrl::parse(store_url).boxed().context(
             crate::dataconnector::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
@@ -506,7 +506,7 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_listing_table(
         &self,
         dataset: &Dataset,
@@ -816,7 +816,7 @@ async fn get_last_modified(
         file_count += 1;
         total_size += file.size;
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         if file_count % 1_000_000 == 0 {
             tracing::debug!(
                 "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
@@ -1393,7 +1393,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        result.expect_err("should error on no matching extension");
     }
 
     #[tokio::test]
@@ -1428,7 +1428,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        result.expect("should succeed with matching files");
     }
 
     #[tokio::test]
@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     async fn test_verify_schema_source_path_file_limit() {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");

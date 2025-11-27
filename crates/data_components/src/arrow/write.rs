@@ -400,7 +400,7 @@ impl MemSink {
             batches,
             overwrite,
             primary_key: primary_key.map(|pks| {
-                let mut z = pks.clone();
+                let mut z = pks;
                 z.sort_unstable();
                 z
             }),
@@ -533,7 +533,7 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
@@ -858,7 +858,7 @@ pub mod bench_wrappers {
     };
 
     /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn check_and_filter_non_null_unique_primary_keys(
         pks: &[Option<String>],
         existing_pks: Option<&HashSet<String>>,
@@ -867,7 +867,7 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn check_and_filter_unique_constraint(
         ids: &[&str],
         existing_ids: Option<&HashSet<String>>,
@@ -884,7 +884,7 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `filter_existing`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn filter_existing(
         existing_batches: &mut Vec<RecordBatch>,
         overwriting_primary_keys: &HashSet<String>,
@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_delete_from() {
         let (rb, schema) = create_batch_with_string_columns(&[(
             "time_in_string",

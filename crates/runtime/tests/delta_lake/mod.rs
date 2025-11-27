@@ -45,7 +45,7 @@ impl Drop for FileCleanup {
     }
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn setup_test_data(zip_url: &str, dir_name: &str) -> Result<String, String> {
     let tmp_dir = std::env::temp_dir();
     let path = format!("{}/{}", tmp_dir.display(), dir_name);

@@ -93,14 +93,7 @@ impl VectorScanTableProvider {
             input
         };
 
-        filtered.project(
-            projection
-                .iter()
-                .sorted_unstable()
-                .cloned()
-                .map(ident)
-                .collect::<Vec<Expr>>(),
-        )
+        filtered.project(projection.iter().sorted_unstable().cloned().map(ident))
     }
 
     fn columns_projected(
@@ -210,7 +203,6 @@ impl TableProvider for VectorScanTableProvider {
         self.table_provider.table_type()
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -305,13 +297,7 @@ impl TableProvider for VectorScanTableProvider {
         }
 
         join = join
-            .project(
-                columns_requested
-                    .into_iter()
-                    .sorted_unstable()
-                    .map(ident)
-                    .collect::<Vec<Expr>>(),
-            )?
+            .project(columns_requested.into_iter().sorted_unstable().map(ident))?
             .limit(0, limit)?;
 
         match with_join_optimization(state) {

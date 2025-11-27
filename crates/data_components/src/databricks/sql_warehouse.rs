@@ -511,7 +511,7 @@ impl SqlWarehouseApi {
 #[derive(Debug, Deserialize, Serialize)]
 struct ExternalLink {
     chunk_index: u64,
-    #[allow(clippy::struct_field_names)]
+    #[expect(clippy::struct_field_names)]
     external_link: String,
     next_chunk_internal_link: Option<String>,
 }

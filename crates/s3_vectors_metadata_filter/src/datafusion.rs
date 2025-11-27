@@ -593,7 +593,7 @@ mod tests {
     use datafusion::sql::unparser::{Unparser, dialect::DefaultDialect};
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn test_valid_datafusion_expressions() {
         let columns = vec![
             "genre".to_string(),
@@ -704,7 +704,7 @@ mod tests {
             let result = convert_datafusion_filters_to_s3_vectors(&[expr])
                 .expect("Failed to convert DataFusion filters to S3 Vectors filters");
             if let Some(filter) = result {
-                assert!(filter.validate().is_ok());
+                filter.validate().expect("Should be a valid filter");
 
                 let json_result = filter.to_json().expect("Failed to convert filter to JSON");
                 let parsed_value: serde_json::Value =

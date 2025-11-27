@@ -62,7 +62,7 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
@@ -234,7 +234,7 @@ async fn create_scheduler_server(
                 .with_option_extension(SpiceClusterConfig::default());
 
             Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
+                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env(io_runtime.clone()))
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())

@@ -126,7 +126,7 @@ async fn test_schema_evolution() -> Result<(), anyhow::Error> {
         .await
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn run_and_verify_query(rt: &Arc<Runtime>, sql: &str, snapshot_name: &str) {
     let record_batch = run_query(rt, sql).await.expect("query should succeed");
     insta::assert_snapshot!(
@@ -149,7 +149,7 @@ async fn reset_pg_table(db_conn: &PostgresConnection) {
     .await;
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn execute_pg_statement(db_conn: &PostgresConnection, sql: &str) {
     db_conn
         .conn

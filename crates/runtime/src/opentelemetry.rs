@@ -252,7 +252,7 @@ macro_rules! append_value {
     };
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
@@ -410,7 +410,7 @@ macro_rules! append_attribute {
     }};
 }
 
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn attributes_to_fields_and_columns(
     metric: &str,
     attributes: &[&[KeyValue]],

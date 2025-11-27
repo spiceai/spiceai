@@ -126,7 +126,6 @@ pub(crate) enum NextRefresh {
 }
 
 impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn new(mode: RefreshMode) -> Self {
         Self {
@@ -482,7 +481,7 @@ impl std::fmt::Debug for Refresher {
 }
 
 impl Refresher {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -611,7 +610,7 @@ impl Refresher {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -763,7 +762,7 @@ impl Refresher {
                     Some(res) = on_refresh_complete.recv() => {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
-                        if let Ok(()) = res {
+                        if matches!(res, Ok(())) {
                             notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
                             initial_load_completed.store(true, Ordering::Relaxed);
 
@@ -1189,7 +1188,7 @@ mod tests {
         );
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_iso8601() {
         async fn test(
@@ -1340,7 +1339,7 @@ mod tests {
         .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp() {
         async fn test(
@@ -1519,7 +1518,7 @@ mod tests {
         .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp_with_more_complicated_structs() {
         async fn test(
@@ -1749,11 +1748,9 @@ mod tests {
     fn test_validate_time_column_when_no_time_column() {
         let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1868,11 +1865,9 @@ mod tests {
             .time_format(TimeFormat::ISO8601);
 
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1887,11 +1882,9 @@ mod tests {
                 DataType::Int64,
                 false,
             )]));
-            assert!(
-                refresh
-                    .validate_time_format("dataset_name".to_string(), &schema)
-                    .is_ok()
-            );
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .expect("should validate successfully");
         }
     }
 
@@ -1906,11 +1899,9 @@ mod tests {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
             false,
         )]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1924,11 +1915,9 @@ mod tests {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
             false,
         )]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1942,11 +1931,9 @@ mod tests {
             DataType::Date32,
             false,
         )]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1975,7 +1962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_startup_next_refresh() {
         struct TestCase {
             description: &'static str,
@@ -2140,7 +2127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_startup_next_refresh_wait_time() {
         struct TestCase {
             description: &'static str,

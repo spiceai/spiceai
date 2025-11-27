@@ -197,7 +197,7 @@ pub static SPICED_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub static SPICED_QUERY_DURATION_AVG: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("spiced_query_duration_avg_ms")

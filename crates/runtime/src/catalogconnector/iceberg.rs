@@ -257,7 +257,6 @@ impl CatalogConnector for IcebergCatalog {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         _runtime: Arc<Runtime>,
@@ -771,11 +770,11 @@ mod tests {
         // should deny unknown schemes, or schemes from warehouses that don't match
         let url = "ftp://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("ftp://my-bucket/my-prefix/warehouse"));
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
 
         let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
@@ -830,28 +829,27 @@ mod tests {
     fn test_invalid_scheme() {
         let url = "ftp://my.iceberg.com/v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_no_host() {
         let url = "https:///v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_missing_namespace_segment() {
         let url = "https://my.iceberg.com/v1/";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_empty_namespace_segment() {
         let url = "https://my.iceberg.com/v1/namespaces";
         let result = parse_catalog_url(url);
-        assert!(result.is_ok());
         assert!(result.expect("Failed to parse catalog URL").2.is_none());
     }
 

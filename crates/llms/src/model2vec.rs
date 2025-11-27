@@ -238,12 +238,12 @@ mod tests {
 
         let embed_ints = model.embed(EmbeddingInput::IntegerArray(vec![1])).await;
 
-        assert!(embed_ints.is_err());
+        embed_ints.expect_err("Should fail for integer input");
 
         let embed_2d_int = model
             .embed(EmbeddingInput::ArrayOfIntegerArray(vec![vec![1]]))
             .await;
 
-        assert!(embed_2d_int.is_err());
+        embed_2d_int.expect_err("Should fail for 2D integer input");
     }
 }

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE functionality...");
 
@@ -178,7 +178,6 @@ async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_insert_overwrite_cleanup_old_snapshots() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE cleanup of old snapshots...");
 

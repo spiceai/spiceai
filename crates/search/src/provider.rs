@@ -251,8 +251,7 @@ impl SearchQueryProvider {
                         Expr::Column(Column::new(Some(table_ref.clone()), field_ref.name()))
                     }
                     None => Expr::Column(Column::new(None::<TableReference>, field_ref.name())),
-                })
-                .collect::<Vec<Expr>>(),
+                }),
         )?;
 
         // Apply all filters after JOIN. This is to ensure that if a filter is pushed onto RHS,
@@ -426,7 +425,6 @@ impl TableProvider for SearchQueryProvider {
         Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -458,7 +456,7 @@ impl TableProvider for SearchQueryProvider {
             if !proj.contains(&match_idx) {
                 return proj;
             }
-            let mut proj2 = proj.clone();
+            let mut proj2 = proj;
             if let Some(search_idx) = self
                 .schema()
                 .column_with_name(self.search_column.as_str())
@@ -514,8 +512,7 @@ impl TableProvider for SearchQueryProvider {
                 schema_proj
                     .fields()
                     .into_iter()
-                    .map(|f| ident(f.name().clone()))
-                    .collect::<Vec<_>>(),
+                    .map(|f| ident(f.name().clone())),
             )?
             .build()?;
 

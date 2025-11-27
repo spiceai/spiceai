@@ -146,7 +146,7 @@ struct TableMetadata {
         )))
     )
 ))]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
