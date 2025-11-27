@@ -15,15 +15,16 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, Error, FailedToInitializeCheckpointSnafu, FailedToInitializeStreamSnafu,
-    Result, ScanSnafu, TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
+    DescribeTableSnafu, Error, FailedToBootstrapTableSnafu, FailedToInitializeCheckpointSnafu,
+    FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
+    TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangesStream;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
-use crate::dynamodb::stream::process_batch;
+use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_envelope};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
@@ -36,7 +37,10 @@ use aws_sdk_dynamodb::{
 };
 use aws_smithy_async::future::pagination_stream::TryFlatMap;
 use datafusion::common::{Constraint, Constraints, DFSchema};
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::logical_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
+use datafusion::prelude::SessionContext;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::project_schema,
@@ -62,13 +66,13 @@ use std::pin::Pin;
 use std::time::Duration;
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
     db_client: Arc<DbClient>,
     streams_client: Arc<StreamsClient>,
     table_schema: DynamoDBTableSchema,
     constraints: Option<Constraints>,
-    request_plan_builder: DynamoDBRequestPlanBuilder,
+    request_plan_builder: Arc<DynamoDBRequestPlanBuilder>,
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
@@ -139,7 +143,7 @@ impl DynamoDBTableProvider {
             streams_client,
             table_schema: table_schema.clone(),
             constraints,
-            request_plan_builder: DynamoDBRequestPlanBuilder::new(table_schema),
+            request_plan_builder: Arc::new(DynamoDBRequestPlanBuilder::new(table_schema)),
             unnest_depth,
             config_partitions,
             table_total_item_count,
@@ -286,6 +290,49 @@ impl DynamoDBTableProvider {
             });
 
         Ok(Box::pin(stream))
+    }
+
+    pub async fn bootstrap_stream(self: Arc<Self>) -> Result<ChangesStream> {
+        let schema = Arc::clone(self.table_schema.schema());
+        let table_name = self.table_schema.table_name();
+        let primary_keys = self.table_schema.primary_keys();
+
+        let table_source = Arc::new(DefaultTableSource::new(
+            Arc::clone(&self) as Arc<dyn TableProvider>
+        ));
+
+        let columns: Vec<Expr> = schema.fields().iter().map(|f| ident(f.name())).collect();
+
+        let logical_plan = LogicalPlanBuilder::scan(table_name, table_source, None)
+            .and_then(|b| b.project(columns))
+            .and_then(LogicalPlanBuilder::build)
+            .context(FailedToBootstrapTableSnafu)?;
+
+        let ctx = SessionContext::new();
+        let df = DataFrame::new(ctx.state(), logical_plan);
+
+        let record_batch_stream = df
+            .execute_stream()
+            .await
+            .context(FailedToBootstrapTableSnafu)?;
+
+        let stream =
+            record_batch_stream.map(move |record_batch_result| match record_batch_result {
+                Ok(record_batch) => {
+                    tracing::debug!(
+                        "DynamoDB bootstrapping records: table_name={}, records={}",
+                        self.table_schema.table_name(),
+                        record_batch.num_rows()
+                    );
+                    record_batch_to_change_envelope(record_batch, &schema, &primary_keys)
+                        .map_err(crate::cdc::StreamError::DynamoDB)
+                }
+                Err(e) => Err(crate::cdc::StreamError::DynamoDB(
+                    StreamError::FailedToReadRecordBatch { source: e },
+                )),
+            });
+
+        Ok(stream.boxed())
     }
 }
 
