@@ -153,7 +153,8 @@ impl SpiceTest<NotStarted> {
             self.state.end_duration,
             self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
-        ).with_conflict_testing(self.state.enable_conflict_testing);
+        )
+        .with_conflict_testing(self.state.enable_conflict_testing);
 
         if let Some(load_interval) = self.state.load_interval {
             append_config = append_config.with_load_interval(load_interval);
