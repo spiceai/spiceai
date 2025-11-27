@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: file_duckdb_file_append_on_conflict
 
-refresh_check_interval: &refresh_check_interval 10s
+refresh_check_interval: &refresh_check_interval 30s
 
 datasets:
   - from: file:customer.parquet

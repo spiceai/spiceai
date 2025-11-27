@@ -1,0 +1,145 @@
+name: append tests
+run-name: append - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      duration:
+        description: 'The test duration in seconds'
+        required: true
+        default: '720'
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      query_set:
+        description: 'Query set'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+      query_overrides:
+        description: 'Query overrides'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'duckdb'
+          - 'sqlite'
+          - 'postgresql'
+          - 'mysql'
+          - 'dremio'
+          - 'odbc-athena'
+          - 'odbc-databricks'
+          - 'oracle'
+          - 'duckdb-zero-results'
+          - 'snowflake'
+          - 'spark'
+          - 'iceberg-sf1'
+          - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
+          - 'spicecloud'
+          - 'iceberg-hadoop'
+          - 'dynamodb'
+      load_interval:
+        description: 'Interval in seconds between append operations'
+        required: true
+        default: '60'
+        type: string
+      load_steps:
+        description: 'Number of append steps/loads'
+        required: true
+        default: '10'
+        type: string
+      with_conflict_data:
+        description: 'Include additional conflict data to test ON CONFLICT upsert behavior'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run-append:
+    name: Run append test
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${query_set%%\[*\]*}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/accelerated/append/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup Testoperator
+        uses: ./.github/actions/setup-testoperator-data
+        with:
+          query_set: ${{ github.event.inputs.query_set }}
+
+      - name: Run the append test - ${{ github.event.inputs.spicepod_path }}
+        run: |
+          rm -rf .spice/data
+          testoperator run append \
+            -s /usr/local/bin/spiced \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            --ready-wait 300 \
+            --disable-progress-bars \
+            --duration ${{ github.event.inputs.duration }} \
+            --load-interval ${{ github.event.inputs.load_interval }} \
+            --load-steps ${{ github.event.inputs.load_steps }} \
+            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
+            ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }}
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
