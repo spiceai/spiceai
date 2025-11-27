@@ -56,7 +56,7 @@ use datafusion::{
     prelude::Expr,
 };
 use dynamodb_streams::Client as StreamsClient;
-use dynamodb_streams::checkpoint::GlobalCheckpoint;
+use dynamodb_streams::checkpoint::Checkpoint;
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -258,7 +258,7 @@ impl DynamoDBTableProvider {
         }
     }
 
-    pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
+    pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         self.streams_client
             .latest_global_checkpoint()
             .await
@@ -267,8 +267,8 @@ impl DynamoDBTableProvider {
 
     pub async fn stream_from_checkpoint(
         &self,
-        checkpoint: GlobalCheckpoint,
-    ) -> Result<BoxStream<'static, Result<(ChangeBatch, GlobalCheckpoint), crate::cdc::StreamError>>>
+        checkpoint: Checkpoint,
+    ) -> Result<BoxStream<'static, Result<(ChangeBatch, Checkpoint), crate::cdc::StreamError>>>
     {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();

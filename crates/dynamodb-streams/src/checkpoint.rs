@@ -50,11 +50,11 @@ pub enum CheckpointPosition {
 /// resumption from this position. Can be persisted and used to restart
 /// streaming within the 24-hour `DynamoDB` Streams retention window.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GlobalCheckpoint {
+pub struct Checkpoint {
     pub shards: HashMap<String, ShardCheckpoint>,
 }
 
-impl GlobalCheckpoint {
+impl Checkpoint {
     /// Returns shards that have no children in this checkpoint (leaf nodes in the lineage tree).
     /// These are the active shards to resume from, as their parents are already exhausted.
     #[must_use]

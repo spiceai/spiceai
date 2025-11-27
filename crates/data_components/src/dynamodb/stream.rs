@@ -27,7 +27,7 @@ use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
 use aws_sdk_dynamodbstreams::types::OperationType;
 use datafusion::error::DataFusionError;
 use dynamodb_streams::StreamResult;
-use dynamodb_streams::checkpoint::GlobalCheckpoint;
+use dynamodb_streams::checkpoint::Checkpoint;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -117,7 +117,7 @@ pub fn process_batch(
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
-) -> Result<(ChangeBatch, GlobalCheckpoint), StreamError> {
+) -> Result<(ChangeBatch, Checkpoint), StreamError> {
     let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
 

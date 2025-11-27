@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::GlobalCheckpoint;
+use crate::checkpoint::Checkpoint;
 use crate::client_sdk::SDKClient;
 use crate::stream_state::{DynamoDBStreamBatch, ShardPollResult, StreamState};
 use crate::{Error, Result, StreamResult};
@@ -174,7 +174,7 @@ fn combine_shard_batches(batches: Vec<ShardPollResult>) -> DynamoDBStreamBatch {
 
     DynamoDBStreamBatch {
         records,
-        checkpoint: GlobalCheckpoint {
+        checkpoint: Checkpoint {
             shards: shards_checkpoints,
         },
     }
