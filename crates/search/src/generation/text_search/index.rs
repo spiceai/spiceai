@@ -29,7 +29,6 @@ use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::{DocParsingError, SchemaBuilder};
 use tantivy::{TantivyDocument, TantivyError};
-use tokio::sync::RwLock;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
@@ -50,7 +49,9 @@ pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
-    pub index: Arc<RwLock<tantivy::Index>>,
+
+    // Read queries will be blocking during index writes.
+    pub index: Arc<std::sync::RwLock<tantivy::Index>>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -124,7 +125,7 @@ impl FullTextDatabaseIndex {
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(RwLock::new(index)),
+            index: Arc::new(std::sync::RwLock::new(index)),
             primary_key: pks,
         })
     }
@@ -158,7 +159,7 @@ impl FullTextDatabaseIndex {
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
         let index_read = self
             .index
-            .try_read()
+            .read()
             .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
 
         let mut search_index = FullTextSearchFieldIndex::try_new(
@@ -232,29 +233,47 @@ impl FullTextDatabaseIndex {
             rb.to_vec()
         };
 
-        let index_writable = self.index.write().await;
         // Updates in tantivy are a deletion then insertion.
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
-
-        // Deletion.
-        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
-            index_writer.delete_term(t);
-        }
-
-        // Insertion.
+        // Prepare documents to insert/delete with read lock.
+        let index_read =
+            self.index
+                .read()
+                .map_err(|_| super::Error::FailedToInsertDataIntoIndex {
+                    source: TantivyError::Poisoned,
+                })?;
+        let index_schema = index_read.schema();
+        drop(index_read);
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
-        let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
+        let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+
+        // Write to index with write lock.
+        let index_writable =
+            self.index
+                .write()
+                .map_err(|_| super::Error::FailedToInsertDataIntoIndex {
+                    source: TantivyError::Poisoned,
+                })?;
+        {
+            let mut index_writer: tantivy::IndexWriter = index_writable
+                .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
+                .context(IndexCreationSnafu)?;
+            // Deletion.
+            for t in terms_to_delete {
+                index_writer.delete_term(t);
+            }
+            // Insertion.
+            for doc in docs {
+                index_writer.add_document(doc).context(IndexCreationSnafu)?;
+            }
+            index_writer
+                .commit()
+                .context(FailedToInsertDataIntoIndexSnafu)?;
         }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
+        drop(index_writable);
         Ok(())
     }
 
@@ -561,7 +580,7 @@ mod tests {
 
         // Initial table as expected
         {
-            let index_read = index.index.read().await;
+            let index_read = index.index.read().expect("Failed to read index");
             let search_index = FullTextSearchFieldIndex::try_new(
                 &index_read,
                 "content".to_string(),
@@ -593,7 +612,7 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
-            let index_read = index.index.read().await;
+            let index_read = index.index.read().expect("Failed to read index");
             let search_index = FullTextSearchFieldIndex::try_new(
                 &index_read,
                 "content".to_string(),
@@ -655,7 +674,7 @@ mod tests {
 
         // Initial table as expected
         {
-            let index_read = index.index.read().await;
+            let index_read = index.index.read().expect("Failed to read index");
             let search_index = FullTextSearchFieldIndex::try_new(
                 &index_read,
                 "content".to_string(),
@@ -688,7 +707,7 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
-            let index_read = index.index.read().await;
+            let index_read = index.index.read().expect("Failed to read index");
             let search_index = FullTextSearchFieldIndex::try_new(
                 &index_read,
                 "content".to_string(),
