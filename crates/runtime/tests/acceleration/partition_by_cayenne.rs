@@ -383,7 +383,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 /// 4. Data with NULL partition values can be queried correctly
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -536,7 +536,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
 /// This test verifies NULL handling specifically for numeric partition columns
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 

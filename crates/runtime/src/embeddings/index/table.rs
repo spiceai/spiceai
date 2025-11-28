@@ -16,7 +16,6 @@ limitations under the License.
 #![allow(clippy::too_many_arguments)]
 
 use crate::embeddings::construct_chunker;
-use crate::embeddings::index::VectorScanTableProvider;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use arrow_schema::Schema;
@@ -27,6 +26,7 @@ use datafusion::{prelude::SessionContext, sql::TableReference};
 use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::util::get_primary_keys;
+use search::index::VectorScanTableProvider;
 use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
 use search::metadata::MetadataColumn;
 use tokio::sync::RwLock;
@@ -104,7 +104,14 @@ async fn wrap_table_as_index_s3(
                 .map(|embed| (c.name.clone(), embed.clone()))
         })
         .collect();
-    let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
+    let mut provider = if let Some(indexed) = inner_table_provider
+        .as_any()
+        .downcast_ref::<IndexedTableProvider>()
+    {
+        indexed.clone()
+    } else {
+        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
     for (column, config) in embedding_columns {
         let (columns, index_schema) = if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
             updated_chunked_search_index_format(&inner_table_provider, columns, &column)

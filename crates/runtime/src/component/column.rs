@@ -20,7 +20,7 @@ use spicepod::semantic::{Column, FullTextSearchConfig, IndexStore};
 
 use crate::component::dataset::FullTextSearchDatasetConfig;
 
-#[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
+#[expect(clippy::type_complexity)] // From a two-part `.unzip()`.
 #[must_use]
 pub fn full_text_search_config(
     columns: &[Column],

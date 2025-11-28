@@ -139,12 +139,12 @@ pub enum SnapshotBehavior {
     CreateOnly,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::Disabled
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -244,7 +244,7 @@ pub struct Acceleration {
     pub snapshots: SnapshotBehavior,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -254,7 +254,7 @@ const fn default_true() -> bool {
 }
 
 impl Default for Acceleration {
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     fn default() -> Self {
         Self {
             enabled: true,

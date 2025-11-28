@@ -368,7 +368,7 @@ mod tests {
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_sqlite() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -495,7 +495,6 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());

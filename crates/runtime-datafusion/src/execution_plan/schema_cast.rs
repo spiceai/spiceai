@@ -208,7 +208,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         self.input.statistics()
     }
 

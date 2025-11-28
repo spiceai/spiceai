@@ -205,7 +205,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -279,8 +279,11 @@ impl AcceleratorEngineRegistry {
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
-            let _primary_keys: Vec<String> =
-                get_primary_keys_from_constraints(constraints, &schema);
+            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
+            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
+                ColumnReference::new(primary_keys),
+                UpsertOptions::default(),
+            ));
         }
 
         if let Some(on_conflict) =
@@ -522,10 +525,7 @@ impl AcceleratorExternalTableBuilder {
 
         if let Some(on_conflict) = self.on_conflict {
             let on_conflict_str = on_conflict.to_string();
-            tracing::info!(
-                "[UPSERT DEBUG] Adding on_conflict to options: {}",
-                on_conflict_str
-            );
+            tracing::debug!("Adding on_conflict to options: {}", on_conflict_str);
             options.insert("on_conflict".to_string(), on_conflict_str);
         }
 
@@ -759,7 +759,7 @@ mod test {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::redundant_closure_for_method_calls,
     clippy::uninlined_format_args,
     clippy::bool_assert_comparison,
@@ -1884,7 +1884,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
@@ -2014,7 +2014,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
@@ -2806,7 +2806,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_overwrite_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Turso/SQLite doesn't support INSERT OVERWRITE in the same way - it appends instead

@@ -138,7 +138,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     // Deprecated, but need to allow because `missing_trait_methods` complains otherwise
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     fn statistics(&self) -> Result<Statistics> {
         self.input.statistics()
     }

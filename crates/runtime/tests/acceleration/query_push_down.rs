@@ -25,7 +25,7 @@ use spicepod::{component::dataset::Dataset, param::Params};
 use crate::{init_tracing, utils::test_request_context};
 
 #[cfg(feature = "postgres")]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::configure_test_datafusion;

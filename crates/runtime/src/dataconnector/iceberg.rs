@@ -113,7 +113,7 @@ impl IcebergDataConnector {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_iceberg_table_provider(
         &self,
         dataset: &Dataset,

@@ -318,7 +318,7 @@ where
                 .into_iter()
                 .enumerate()
                 .map(|(i, emb)| Embedding {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     index: i as u32,
                     object: "embedding".to_string(),
                     embedding: EmbeddingVector::Float(emb),

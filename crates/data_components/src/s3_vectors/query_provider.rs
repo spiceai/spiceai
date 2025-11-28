@@ -74,7 +74,7 @@ pub struct S3VectorsQueryTable {
     partition_by: Vec<Expr>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn create_spill_plan_query(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -150,7 +150,7 @@ fn create_spill_plan_query(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn create_partition_plan_query(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -632,7 +632,6 @@ async fn query_vectors_call(
     Ok(output.vectors)
 }
 
-#[allow(clippy::too_many_lines)]
 async fn query_vector_stream(
     client: Arc<dyn S3Vectors + Send + Sync>,
     idx: S3VectorIdentifier,
@@ -1022,7 +1021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn scan_plan_with_partitioned_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
         let bucket_name = "test-bucket";

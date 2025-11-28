@@ -57,6 +57,8 @@ pub(crate) struct SpiceTestQueryWorker {
     reference_schema: Option<String>,
     /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
     skip_row_count_validation: HashSet<String>,
+    /// Whether to validate row counts between HTTP and Flight endpoints, and check for zero rows
+    validate_row_counts: bool,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -117,6 +119,7 @@ impl SpiceTestQueryWorker {
             validation_data: None,
             reference_schema: None,
             skip_row_count_validation: default_row_count_validation_skip_queries(),
+            validate_row_counts: true,
         }
     }
 
@@ -171,6 +174,11 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_validate_row_counts(mut self, validate_row_counts: bool) -> Self {
+        self.validate_row_counts = validate_row_counts;
+        self
+    }
+
     /// Validate query results against expected data
     /// Uses TPCH validation for TPCH queries, custom validation data for scenario queries
     fn validate_query_results(
@@ -193,7 +201,7 @@ impl SpiceTestQueryWorker {
         validation::validate_tpch_query(query, actual_batches)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             // Load test queries may be generated with multiple parameter sets, resulting in a large
@@ -480,7 +488,7 @@ impl SpiceTestQueryWorker {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn execute_flight(
         &self,
         query: &Query,
@@ -733,7 +741,7 @@ impl SpiceTestQueryWorker {
                     .get("row_count")
                     .and_then(serde_json::Value::as_u64)
                 {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let row_count_usize = row_count as usize;
                     http_row_counts
                         .entry(Arc::clone(&query.name))
@@ -783,10 +791,11 @@ impl SpiceTestQueryWorker {
         )
         .await?;
 
-        // skip row count validation for specific queries that legitimately return 0 rows
-        if self
-            .skip_row_count_validation
-            .contains(&query.name.to_string())
+        // Skip row count validation if disabled or for specific queries that legitimately return 0 rows
+        if !self.validate_row_counts
+            || self
+                .skip_row_count_validation
+                .contains(&query.name.to_string())
         {
             return Ok(());
         }

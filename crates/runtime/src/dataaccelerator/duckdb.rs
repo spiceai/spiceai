@@ -265,7 +265,7 @@ pub fn duckdb_file_path(
                     );
                 });
             }
-            params.insert("duckdb_open".to_string(), duckdb_file.to_string());
+            params.insert("duckdb_open".to_string(), duckdb_file);
         }
 
         duckdb_factory
@@ -380,8 +380,7 @@ impl DataAccelerator for DuckDBAccelerator {
         _partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
-            cmd.options
-                .insert("open".to_string(), duckdb_file.to_string());
+            cmd.options.insert("open".to_string(), duckdb_file);
         }
 
         if let Some(recompute_statistics_on_write) =
@@ -390,7 +389,7 @@ impl DataAccelerator for DuckDBAccelerator {
             // Translate Spice parameter to DuckDB write setting
             cmd.options.insert(
                 "recompute_statistics_on_write".to_string(),
-                recompute_statistics_on_write.to_string(),
+                recompute_statistics_on_write,
             );
         }
 
@@ -403,10 +402,9 @@ impl DataAccelerator for DuckDBAccelerator {
                 .clone()
                 .unwrap_or_default()
                 .temp_directory
-                .clone()
             {
                 cmd.options
-                    .insert("temp_directory".to_string(), temp_directory.to_string());
+                    .insert("temp_directory".to_string(), temp_directory);
             }
 
             if source.is_file_accelerated() {
@@ -739,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn retention_sql_fails_with_internal_tables() {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -901,8 +899,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -1136,7 +1134,6 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
@@ -1146,7 +1143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_retention_sql_with_duckdb_accelerator() {
         use tempfile::TempDir;
 

@@ -656,7 +656,6 @@ impl FlightClient {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     if is_connection_reset_error(&e) {
         return Error::ConnectionReset {

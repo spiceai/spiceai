@@ -123,7 +123,7 @@ mod tests {
         let task_fn = async { Ok::<(), Error>(()) };
         let (task_future, _handle) = spawn_cancellable_task(None, task_fn);
         let result = task_future.await;
-        assert!(result.is_ok());
+        result.expect("should complete successfully");
     }
 
     #[tokio::test]
@@ -162,8 +162,8 @@ mod tests {
         });
 
         let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
-        assert!(task_result.is_ok());
-        assert!(cancel_result.is_ok());
+        task_result.expect("should complete successfully");
+        cancel_result.expect("should complete successfully");
     }
 
     #[tokio::test]
@@ -187,8 +187,8 @@ mod tests {
         });
 
         let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
-        assert!(task_result.is_ok());
-        assert!(cancel_result.is_ok());
+        task_result.expect("should complete successfully");
+        cancel_result.expect("should complete successfully");
     }
 
     #[tokio::test]
@@ -214,8 +214,8 @@ mod tests {
         });
 
         let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
-        assert!(task_result.is_ok());
-        assert!(cancel_result.is_ok());
+        task_result.expect("should complete successfully");
+        cancel_result.expect("should complete successfully");
     }
 
     #[tokio::test]
@@ -226,7 +226,7 @@ mod tests {
             Ok::<(), Error>(())
         });
 
-        assert!(task_future.await.is_ok());
+        task_future.await.expect("should complete successfully");
 
         // attempt to cancel already completed task after 100 ms
         let cancel_result = tokio::spawn(async move {
@@ -241,7 +241,7 @@ mod tests {
         })
         .await;
 
-        assert!(cancel_result.is_ok());
+        cancel_result.expect("should complete successfully");
     }
 
     #[tokio::test]

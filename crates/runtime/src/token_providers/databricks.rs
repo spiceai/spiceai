@@ -77,12 +77,12 @@ impl DatabricksM2MTokenProvider {
             .map_err(|e| Error::UnableToGetToken { source: e })?;
 
         // create watch channel
-        let (tx, rx) = watch::channel(access_token.clone());
+        let (tx, rx) = watch::channel(access_token);
 
         // spawn background refresh loop
         let cloned_client_id = client_id.clone();
         let cloned_endpoint = endpoint.clone();
-        let cloned_tx = tx.clone();
+        let cloned_tx = tx;
 
         let secret = client_secret.clone();
 
@@ -275,7 +275,6 @@ impl TokenProvider for DatabricksU2MTokenProvider {
 }
 
 impl DatabricksU2MTokenProvider {
-    #[allow(clippy::needless_pass_by_value)]
     pub fn new(endpoint: String, client_id: String) -> Self {
         Self {
             endpoint,

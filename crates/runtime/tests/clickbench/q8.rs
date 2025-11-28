@@ -17,7 +17,7 @@ limitations under the License.
 const Q8_QUERY: &str = r#"SELECT "AdvEngineID", COUNT(*) FROM hits WHERE "AdvEngineID" <> 0 GROUP BY "AdvEngineID" ORDER BY COUNT(*) DESC;"#;
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_clickbench_q8() -> Result<(), anyhow::Error> {
     super::test_clickbench_query(Q8_QUERY).await
 }

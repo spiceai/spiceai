@@ -75,7 +75,7 @@ impl Spark {
             .await
             .context(UnableToConstructSparkConnectSnafu)?;
         Ok(Self {
-            read_provider: Arc::new(spark.clone()),
+            read_provider: Arc::new(spark),
         })
     }
 }

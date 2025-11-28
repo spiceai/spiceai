@@ -157,7 +157,7 @@ macro_rules! handle_error {
 
 impl Query {
     #[cfg(not(feature = "cluster"))]
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn get_session_state(&self) -> Result<SessionState> {
         Ok(self.df.ctx.state())
     }
@@ -266,7 +266,7 @@ impl Query {
         Ok(QueryResult::new(stream, cache_status))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
@@ -1083,13 +1083,13 @@ mod tests {
 
     impl Debug for TestExecutionPlan {
         fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-            todo!()
+            unimplemented!("Not used in tests")
         }
     }
 
     impl DisplayAs for TestExecutionPlan {
         fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> std::fmt::Result {
-            todo!()
+            unimplemented!("Not used in tests")
         }
     }
 
@@ -1126,7 +1126,7 @@ mod tests {
             _partition: usize,
             _context: Arc<TaskContext>,
         ) -> datafusion::common::Result<SendableRecordBatchStream> {
-            todo!()
+            unimplemented!("Not used in tests")
         }
     }
 

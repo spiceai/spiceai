@@ -141,8 +141,8 @@ where
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::ref_option)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::ref_option)]
 fn serialize_scale_factor<S>(x: &Option<f64>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,

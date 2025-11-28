@@ -23,7 +23,6 @@ use crate::{
     partitioning::{PartitionedBy, deserialize_partition_by},
 };
 
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
