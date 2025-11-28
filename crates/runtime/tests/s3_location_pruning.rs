@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use app::AppBuilder;
+use arrow::array::{Array, StringArray};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion_datasource::metadata::MetadataColumn;
 use futures::StreamExt;
@@ -208,14 +209,39 @@ async fn s3_location_pruning_avoids_list() -> Result<(), anyhow::Error> {
         counting_store.reset();
 
         let mut filtered = runtime
-                .datafusion()
-                .query_builder("SELECT * FROM met_location_only WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet'")
-                .build()
-                .run()
-                .await?;
+            .datafusion()
+            .query_builder("SELECT * FROM met_location_only WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet'")
+            .build()
+            .run()
+            .await?;
 
-        // Consume the results to drive execution.
-        while filtered.data.next().await.transpose()?.is_some() {}
+        let mut filtered_batches = Vec::new();
+        while let Some(batch) = filtered.data.next().await.transpose()? {
+            filtered_batches.push(batch);
+        }
+
+        let target_location = "s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet";
+        let mut rows = 0usize;
+        for batch in &filtered_batches {
+            let (idx, _) = batch
+                .schema()
+                .column_with_name("location")
+                .expect("location column");
+            let array = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("location string array");
+            for i in 0..array.len() {
+                let value = array.value(i);
+                assert_eq!(value, target_location);
+                rows += 1;
+            }
+        }
+        assert!(
+            rows > 0,
+            "Expected filtered query to return at least one row"
+        );
 
         assert_eq!(
             counting_store.list_count(),
