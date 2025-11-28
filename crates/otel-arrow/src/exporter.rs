@@ -60,7 +60,7 @@ impl<E: ArrowExporter> OtelArrowExporter<E> {
 
 #[async_trait]
 impl<E: ArrowExporter> PushMetricExporter for OtelArrowExporter<E> {
-    #[allow(clippy::manual_async_fn)]
+    #[expect(clippy::manual_async_fn)]
     fn export(
         &self,
         metrics: &mut ResourceMetrics,

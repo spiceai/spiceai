@@ -96,7 +96,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
         .await
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn stack_qa_json() -> Vec<serde_json::Value> {
     include_str!("./test_data/stack_qa.json")
         .lines()

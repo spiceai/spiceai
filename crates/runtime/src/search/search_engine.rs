@@ -507,12 +507,7 @@ fn wrap_cache_to_result(
         if results.is_empty() {
             tracing::trace!("No results to cache for tables: {expected_keys:?}");
             return;
-        } else if !expected_keys
-            .iter()
-            .filter(|key| !results.contains_key(key))
-            .collect::<Vec<_>>()
-            .is_empty()
-        {
+        } else if expected_keys.iter().any(|key| !results.contains_key(key)) {
             tracing::trace!(
                 "Not all expected keys were found in the cached results: {expected_keys:?}"
             );

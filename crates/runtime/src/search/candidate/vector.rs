@@ -68,7 +68,6 @@ impl ChunkedNonIndexVectorGeneration {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn score_expr(&self, query: String) -> LogicalExpr {
         binary_expr(
             lit(1.0),
@@ -176,14 +175,13 @@ impl ChunkedNonIndexVectorGeneration {
         let lp_cols: Vec<_> = lp
             .schema()
             .columns()
-            .clone()
             .into_iter()
             .map(LogicalExpr::Column)
             .collect();
 
         // Then apply the window function separately
         let window_expr = row_number().alias(VSS_TEMP_GEN_ID_COLUMN);
-        let lp = lp.project(lp_cols.clone())?.window(vec![window_expr])?;
+        let lp = lp.project(lp_cols)?.window(vec![window_expr])?;
 
         // This is just the table with all the additional columns we may want to join on
         let additional_lp = lp.clone().alias("additional")?.build()?;

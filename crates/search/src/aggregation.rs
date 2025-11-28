@@ -131,10 +131,7 @@ fn from_single_input(
     // Results from [`super::generation::CandidateGeneration::search`] outputs the matches as the
     // `SEARCH_VALUE_COLUMN_NAME` column, so we directly know the mapping.
     let mut matches = HashMap::new();
-    matches.insert(
-        derived_column.to_string(),
-        vec![SEARCH_VALUE_COLUMN_NAME.to_string()],
-    );
+    matches.insert(derived_column, vec![SEARCH_VALUE_COLUMN_NAME.to_string()]);
 
     // All remaining columns in the data are considered additional columns.
     let data_columns: Vec<_> = data

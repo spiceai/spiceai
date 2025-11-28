@@ -564,7 +564,7 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
     let data = rt
         .datafusion()

@@ -120,7 +120,7 @@ pub(crate) async fn get(
     let mut format = Format::Json;
     if let Some(accept) = accept
         && let Some(media_type) = accept.negotiate(ACCEPT_LIST.iter())
-        && let ("text", "csv") = (media_type.ty.as_str(), media_type.subty.as_str())
+        && (media_type.ty.as_str(), media_type.subty.as_str()) == ("text", "csv")
     {
         format = Format::Csv;
     }

@@ -57,7 +57,6 @@ impl From<Error> for DataFusionError {
 /// # Errors
 ///
 /// This function will return an error if the record batch cannot be cast.
-#[allow(clippy::needless_pass_by_value)]
 pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let existing_schema = record_batch.schema();
 

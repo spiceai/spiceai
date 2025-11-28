@@ -32,7 +32,7 @@ use std::sync::Arc;
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_basic_workflow_impl);
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_cayenne_basic_workflow_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -659,7 +659,7 @@ async fn test_cayenne_statistics_impl(
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_core_data_types_impl);
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_cayenne_core_data_types_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -933,7 +933,7 @@ test_with_backends!(test_cayenne_sorted_insert_impl);
 /// 1. Data is sorted after retention filters and before listing table refresh
 /// 2. Sorting operates on the complete corpus after retention
 /// 3. Zone maps have optimal (non-overlapping) min/max ranges
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_cayenne_sorted_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -36,7 +36,6 @@ use tokio_rustls::TlsAcceptor;
 
 const PERCENTILES: [f64; 4] = [50.0, 90.0, 95.0, 99.0];
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to bind to address: {source}"))]
@@ -170,7 +169,7 @@ fn handle_http_request(
     response
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn calculate_percentile(
     cumulative_counts: &[u64],
     bounds: &[f64],
@@ -343,7 +342,7 @@ mod tests {
         assert!(quantiles[3].1 > 99.4 && quantiles[3].1 < 99.5);
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn create_test_histogram() -> (MetricFamily, Metric, Histogram) {
         let mut family = MetricFamily::new();
         family.set_name("test_histogram".to_string());

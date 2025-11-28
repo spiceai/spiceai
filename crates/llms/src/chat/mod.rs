@@ -276,8 +276,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                     .collect();
                 x.join("\n")
             }
-        }
-        .clone(),
+        },
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
@@ -297,7 +296,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         .collect();
                 x.join("\n")
             }
-            None => todo!(),
+            None => unimplemented!("Assistant message with no content is not supported"),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -318,7 +317,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
@@ -337,7 +336,7 @@ pub fn message_to_mistral(
                     either::Either::Left(text.clone())
                 }
                 ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let v = array.iter().map(|p| {
+                    let index_map = array.iter().map(|p| {
                         match p {
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                                 ("content".to_string(), Value::String(t.text.clone()))
@@ -350,8 +349,7 @@ pub fn message_to_mistral(
                             }
                         }
 
-                    }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
+                    }).collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -518,7 +516,7 @@ pub fn message_to_mistral(
             (String::from("role"), Either::Left(String::from("function"))),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default().clone()),
+                Either::Left(content.clone().unwrap_or_default()),
             ),
             ("name".to_string(), Either::Left(name.clone())),
         ]),
@@ -595,7 +593,6 @@ pub trait Chat: Sync + Send {
         Ok(Box::pin(stream! { yield resp }))
     }
 
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -626,7 +623,7 @@ pub trait Chat: Sync + Send {
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
@@ -696,7 +693,6 @@ pub async fn create_hf_model(
         .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
-#[allow(unused_variables)]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,

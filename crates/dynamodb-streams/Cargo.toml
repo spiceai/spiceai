@@ -1,0 +1,19 @@
+[package]
+name = "dynamodb-streams"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aws-config.workspace = true
+aws-sdk-dynamodb.workspace = true
+aws-sdk-dynamodbstreams.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+util = { path = "../util" }

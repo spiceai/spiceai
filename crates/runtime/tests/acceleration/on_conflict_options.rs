@@ -42,7 +42,7 @@ pub struct TestCsvDataBuilder {
 }
 
 impl TestCsvDataBuilder {
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
         Self {
@@ -63,7 +63,7 @@ impl TestCsvDataBuilder {
         Self::new(schema)
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     #[must_use]
     pub fn add_batch(self, data: &[Vec<Option<&str>>]) -> Self {
         let columns: Vec<ArrayRef> = (0..self.schema.fields().len())
@@ -89,7 +89,7 @@ impl TestCsvDataBuilder {
         Dataset::new(from, name)
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     pub fn flush_to_file(&mut self) {
         let file = self.temp_file.as_file_mut();
         file.set_len(0).expect("Failed to truncate temp file");
@@ -318,7 +318,7 @@ async fn test_acceleration_on_conflict_same_batch_upsert_with_dedup_by_row_id_no
     Ok::<(), anyhow::Error>(())
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn get_query_result(rt: &Runtime, sql: &str) -> Vec<RecordBatch> {
     rt.datafusion()
         .query_builder(sql)
@@ -332,7 +332,7 @@ async fn get_query_result(rt: &Runtime, sql: &str) -> Vec<RecordBatch> {
         .expect("Failed to collect query results")
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn assert_value(
     batches: Vec<RecordBatch>,
     key_name: &str,
@@ -360,7 +360,7 @@ async fn assert_value(
     assert_eq!(value, target_col_expected_value);
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn set_duckdb_acceleration(mut dataset: Dataset) -> Dataset {
     let yaml = r"
                 enabled: true
@@ -373,7 +373,7 @@ fn set_duckdb_acceleration(mut dataset: Dataset) -> Dataset {
     dataset
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn set_primary_key(mut dataset: Dataset, primary_key: &str) -> Dataset {
     let mut acceleration = dataset
         .acceleration
@@ -384,7 +384,7 @@ fn set_primary_key(mut dataset: Dataset, primary_key: &str) -> Dataset {
     dataset
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn set_on_conflict_behavior(
     mut dataset: Dataset,
     on_conflict_behavior: OnConflictBehavior,

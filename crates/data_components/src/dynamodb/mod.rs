@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use datafusion::error::DataFusionError;
 use snafu::Snafu;
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ pub mod provider;
 mod request_builder;
 mod request_plan;
 mod schema;
+pub mod stream;
 mod table_schema;
 mod unnest;
 mod utils;
@@ -66,4 +68,13 @@ pub enum Error {
 
     #[snafu(display("Table has no partition key"))]
     MissingPartitionKey,
+
+    #[snafu(display("Failed to initialize DynamoDB Stream checkpoint: {source}"))]
+    FailedToInitializeCheckpoint { source: dynamodb_streams::Error },
+
+    #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
+    FailedToInitializeStream { source: dynamodb_streams::Error },
+
+    #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
+    FailedToBootstrapTable { source: DataFusionError },
 }

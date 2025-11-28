@@ -768,8 +768,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the data cannot be inserted.
-    #[allow(clippy::items_after_statements)]
-    #[allow(clippy::too_many_lines)]
     pub async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
         // Acquire write lock to serialize inserts and prevent concurrent write races.
         // This ensures listing table refresh happens after all parallel chunk writes complete
@@ -1038,14 +1036,11 @@ impl CayenneTableProvider {
         );
 
         // Use the common stream sorting utility
-        let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
-            stream,
-            &self.vortex_config.sort_columns,
-            &task_ctx,
-        )
-        .map_err(|e| CatalogError::InvalidOperation {
-            message: format!("Failed to execute sort: {e}"),
-        })?;
+        let sorted_stream =
+            util::stream_utils::sort_stream(stream, &self.vortex_config.sort_columns, &task_ctx)
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Failed to execute sort: {e}"),
+                })?;
 
         Ok(sorted_stream)
     }
@@ -1170,8 +1165,8 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the chunk cannot be written.
-    #[allow(clippy::items_after_statements)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::items_after_statements)]
+    #[expect(clippy::too_many_lines)]
     async fn write_chunk(&self, chunk: Vec<RecordBatch>) -> CatalogResult<u64> {
         if chunk.is_empty() {
             return Ok(0);
@@ -2597,7 +2592,7 @@ mod tests {
                         .expect("Failed to downcast count column to Int64Array")
                         .value(0);
 
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let count_usize = count as usize;
                     assert_eq!(
                         count_usize, *expected_count,

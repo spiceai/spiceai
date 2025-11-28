@@ -87,6 +87,7 @@ mod results_cache;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
+mod s3_location_pruning;
 #[cfg(feature = "postgres")]
 mod schema_evolution;
 #[cfg(feature = "snapshots")]

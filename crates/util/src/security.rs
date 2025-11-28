@@ -383,10 +383,11 @@ mod tests {
     #[test]
     fn test_validate_non_empty_bytes_valid() {
         let data = b"some model data";
-        assert!(validate_non_empty_bytes(data, "model.onnx").is_ok());
+        validate_non_empty_bytes(data, "model.onnx").expect("Should validate non-empty bytes");
 
         let single_byte = b"x";
-        assert!(validate_non_empty_bytes(single_byte, "config.json").is_ok());
+        validate_non_empty_bytes(single_byte, "config.json")
+            .expect("Should validate non-empty bytes");
     }
 
     #[test]
