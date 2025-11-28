@@ -308,16 +308,12 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Vec<String>
                     let right_is_location =
                         matches!(*binary.right, Expr::Column(ref c) if c.name == "location");
 
-                    if left_is_location {
-                        if let Some(value) = literal_str(&binary.right) {
-                            values.push(value);
-                        }
+                    if left_is_location && let Some(value) = literal_str(&binary.right) {
+                        values.push(value);
                     }
 
-                    if right_is_location {
-                        if let Some(value) = literal_str(&binary.left) {
-                            values.push(value);
-                        }
+                    if right_is_location && let Some(value) = literal_str(&binary.left) {
+                        values.push(value);
                     }
                 }
                 Expr::InList(in_list)
