@@ -525,7 +525,7 @@ impl AcceleratorExternalTableBuilder {
 
         if let Some(on_conflict) = self.on_conflict {
             let on_conflict_str = on_conflict.to_string();
-            tracing::debug!("Adding on_conflict to options: {}", on_conflict_str);
+            tracing::trace!("Adding on_conflict to options: {}", on_conflict_str);
             options.insert("on_conflict".to_string(), on_conflict_str);
         }
 
