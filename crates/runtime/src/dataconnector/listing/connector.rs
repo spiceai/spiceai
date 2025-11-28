@@ -227,7 +227,13 @@ impl TableProvider for LocationPruningListingTable {
                 }
             };
 
-            let partition_values = self.collect_partition_values(&meta).unwrap_or_default();
+            let Some(partition_values) = self.collect_partition_values(&meta) else {
+                tracing::warn!(
+                    location = loc,
+                    "Unable to parse partition values for location predicate; skipping file"
+                );
+                continue;
+            };
 
             files.push(PartitionedFile {
                 object_meta: meta,
@@ -945,13 +951,19 @@ pub trait ListingTableConnector: DataConnector {
             return Ok(Arc::new(cached_table));
         }
 
-        let table_arc = Arc::new(LocationPruningListingTable::new(
-            table_arc,
-            Arc::clone(&object_store),
-            table_path,
-        ));
+        let has_location_metadata = table_arc
+            .options()
+            .metadata_cols
+            .iter()
+            .any(|c| matches!(c, MetadataColumn::Location(_)));
 
-        Ok(table_arc)
+        if has_location_metadata {
+            let wrapped =
+                LocationPruningListingTable::new(table_arc, Arc::clone(&object_store), table_path);
+            Ok(Arc::new(wrapped))
+        } else {
+            Ok(table_arc)
+        }
     }
 }
 
