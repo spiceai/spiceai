@@ -169,107 +169,106 @@ fn get_s3_hive_dataset(name: &str, metadata_columns: Vec<MetadataColumn>) -> Dat
 
 #[tokio::test]
 async fn s3_location_pruning_avoids_list() -> Result<(), anyhow::Error> {
-    {
-        let store_url = Url::parse("s3://spiceai-public-datasets")?;
-        let listing_url =
-            ListingTableUrl::parse("s3://spiceai-public-datasets/hive_partitioned_data/")?;
+    let store_url = Url::parse("s3://spiceai-public-datasets")?;
+    let listing_url =
+        ListingTableUrl::parse("s3://spiceai-public-datasets/hive_partitioned_data/")?;
 
-        let runtime = Arc::new(
-            Runtime::builder()
-                .with_app_opt(Some(Arc::new(
-                    AppBuilder::new("s3_location_pruning")
-                        .with_dataset(get_s3_hive_dataset(
-                            "met_location_only",
-                            vec![MetadataColumn::Location(None)],
-                        ))
-                        .build(),
-                )))
-                .build()
-                .await,
+    let runtime = Arc::new(
+        Runtime::builder()
+            .with_app_opt(Some(Arc::new(
+                AppBuilder::new("s3_location_pruning")
+                    .with_dataset(get_s3_hive_dataset(
+                        "met_location_only",
+                        vec![MetadataColumn::Location(None)],
+                    ))
+                    .build(),
+            )))
+            .build()
+            .await,
+    );
+
+    let base_store = runtime
+        .datafusion()
+        .ctx
+        .runtime_env()
+        .object_store(&listing_url)
+        .expect("base S3 object store");
+    let counting_store = Arc::new(CountingObjectStore::new(base_store));
+    runtime
+        .datafusion()
+        .ctx
+        .runtime_env()
+        .register_object_store(
+            &store_url,
+            Arc::clone(&counting_store) as Arc<dyn ObjectStore>,
         );
 
-        let base_store = runtime
-            .datafusion()
-            .ctx
-            .runtime_env()
-            .object_store(&listing_url)
-            .expect("base S3 object store");
-        let counting_store = Arc::new(CountingObjectStore::new(base_store));
-        runtime
-            .datafusion()
-            .ctx
-            .runtime_env()
-            .register_object_store(
-                &store_url,
-                Arc::clone(&counting_store) as Arc<dyn ObjectStore>,
-            );
+    Arc::clone(&runtime).load_components().await;
 
-        Arc::clone(&runtime).load_components().await;
+    counting_store.reset();
 
-        counting_store.reset();
-
-        let mut filtered = runtime
+    let mut filtered = runtime
             .datafusion()
             .query_builder("SELECT * FROM met_location_only WHERE location = 's3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet'")
             .build()
             .run()
             .await?;
 
-        let mut filtered_batches = Vec::new();
-        while let Some(batch) = filtered.data.next().await.transpose()? {
-            filtered_batches.push(batch);
-        }
-
-        let target_location = "s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet";
-        let mut rows = 0usize;
-        for batch in &filtered_batches {
-            let (idx, _) = batch
-                .schema()
-                .column_with_name("location")
-                .expect("location column");
-            let array = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("location string array");
-            for i in 0..array.len() {
-                let value = array.value(i);
-                assert_eq!(value, target_location);
-                rows += 1;
-            }
-        }
-        assert!(
-            rows > 0,
-            "Expected filtered query to return at least one row"
-        );
-
-        assert_eq!(
-            counting_store.list_count(),
-            0,
-            "location equality should avoid list()"
-        );
-        assert_eq!(
-            counting_store.list_delimiter_count(),
-            0,
-            "location equality should avoid list_with_delimiter()"
-        );
-
-        counting_store.reset();
-
-        let mut unfiltered = runtime
-            .datafusion()
-            .query_builder("SELECT * FROM met_location_only LIMIT 1")
-            .build()
-            .run()
-            .await?;
-
-        while unfiltered.data.next().await.transpose()?.is_some() {}
-
-        assert!(
-            counting_store.list_count() > 0 || counting_store.list_delimiter_count() > 0,
-            "Queries without location predicates should list to discover files"
-        );
-
-        Ok(())
+    let mut filtered_batches = Vec::new();
+    while let Some(batch) = filtered.data.next().await.transpose()? {
+        filtered_batches.push(batch);
     }
+
+    let target_location =
+        "s3://spiceai-public-datasets/hive_partitioned_data/year=2023/month=2/day=2/data_1.parquet";
+    let mut rows = 0usize;
+    for batch in &filtered_batches {
+        let (idx, _) = batch
+            .schema()
+            .column_with_name("location")
+            .expect("location column");
+        let array = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("location string array");
+        for i in 0..array.len() {
+            let value = array.value(i);
+            assert_eq!(value, target_location);
+            rows += 1;
+        }
+    }
+    assert!(
+        rows > 0,
+        "Expected filtered query to return at least one row"
+    );
+
+    assert_eq!(
+        counting_store.list_count(),
+        0,
+        "location equality should avoid list()"
+    );
+    assert_eq!(
+        counting_store.list_delimiter_count(),
+        0,
+        "location equality should avoid list_with_delimiter()"
+    );
+
+    counting_store.reset();
+
+    let mut unfiltered = runtime
+        .datafusion()
+        .query_builder("SELECT * FROM met_location_only LIMIT 1")
+        .build()
+        .run()
+        .await?;
+
+    while unfiltered.data.next().await.transpose()?.is_some() {}
+
+    assert!(
+        counting_store.list_count() > 0 || counting_store.list_delimiter_count() > 0,
+        "Queries without location predicates should list to discover files"
+    );
+
+    Ok(())
 }

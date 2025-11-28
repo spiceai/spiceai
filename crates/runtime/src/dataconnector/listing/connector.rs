@@ -66,6 +66,10 @@ use runtime_object_store::registry::default_runtime_env;
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
+/// Wraps a `ListingTable` to short-circuit broad object-store listings when
+/// queries include `location` predicates. Instead of listing a large prefix, it
+/// directly fetches the specific objects referenced in the predicate, which
+/// significantly reduces LIST calls on large buckets.
 struct LocationPruningListingTable {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
@@ -148,6 +152,9 @@ fn parse_partition_values(
     file_path: &Path,
     table_partition_cols: &[(String, datafusion::arrow::datatypes::DataType)],
 ) -> Option<Vec<String>> {
+    // Extract hive-style partition values (e.g., year=2023/month=2) from the
+    // file path relative to the table path, validating the expected partition
+    // column names.
     let subpath = table_path.strip_prefix(file_path)?;
 
     let mut part_values = Vec::with_capacity(table_partition_cols.len());
@@ -215,7 +222,7 @@ impl TableProvider for LocationPruningListingTable {
             let meta = match self.object_store.head(&path).await {
                 Ok(m) => m,
                 Err(err) => {
-                    tracing::warn!(%err, location = loc, "Failed to head S3 object for location predicate");
+                    tracing::warn!(%err, location = loc, "Failed to head object for location predicate");
                     continue;
                 }
             };
@@ -272,6 +279,10 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Vec<String>
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion_expr::{Expr, Operator};
 
+    // Recursively walks filter expressions to collect string literals from:
+    // - location = 'literal' and 'literal' = location
+    // - location IN ('a', 'b', ...)
+    // Traversal covers nested AND/OR/NOT by leveraging `TreeNode::apply`.
     fn literal_str(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => {
@@ -2034,6 +2045,63 @@ mod tests {
                 "s3://bucket/a.parquet".to_string(),
                 "s3://bucket/b.parquet".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_reversed_equality() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("location"))];
+        let values = extract_location_predicates(&filters);
+        assert_eq!(values, vec!["s3://bucket/reversed.parquet".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_location_predicates_nested_and_or() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![
+            col("location")
+                .eq(lit("s3://bucket/a.parquet"))
+                .and(col("id").gt(lit(1)))
+                .or(col("location").eq(lit("s3://bucket/b.parquet"))),
+        ];
+        let mut values = extract_location_predicates(&filters);
+        values.sort();
+        assert_eq!(
+            values,
+            vec![
+                "s3://bucket/a.parquet".to_string(),
+                "s3://bucket/b.parquet".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_not_wrapped() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![datafusion_expr::not(
+            col("location").eq(lit("s3://bucket/negated.parquet")),
+        )];
+        let values = extract_location_predicates(&filters);
+        assert_eq!(values, vec!["s3://bucket/negated.parquet".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_location_predicates_ignores_non_location() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![
+            col("id")
+                .eq(lit(5))
+                .and(col("location").eq(lit("s3://bucket/only_location.parquet"))),
+        ];
+        let values = extract_location_predicates(&filters);
+        assert_eq!(
+            values,
+            vec!["s3://bucket/only_location.parquet".to_string()]
         );
     }
 
