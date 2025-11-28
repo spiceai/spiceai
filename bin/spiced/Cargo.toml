@@ -55,6 +55,7 @@ databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "duckdb",
+    "gcs",
     "postgres",
     "sqlite",
     "mysql",
@@ -89,6 +90,7 @@ duckdb = ["runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
+gcs = ["runtime/gcs"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["runtime/imap"]
 kafka = ["runtime/kafka"]

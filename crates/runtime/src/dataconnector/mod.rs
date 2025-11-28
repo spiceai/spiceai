@@ -77,6 +77,8 @@ pub mod file;
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
+#[cfg(feature = "gcs")]
+pub mod gcs;
 pub mod git;
 pub mod github;
 pub mod graphql;
@@ -388,6 +390,8 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
     register_connector_factory("s3", s3::S3Factory::new_arc()).await;
+    #[cfg(feature = "gcs")]
+    register_connector_factory("gs", gcs::GcsFactory::new_arc()).await;
     register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
