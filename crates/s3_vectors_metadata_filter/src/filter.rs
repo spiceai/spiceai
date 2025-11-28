@@ -754,12 +754,12 @@ pub fn aws_number_to_json_number(num: aws_smithy_types::Number) -> Option<serde_
 }
 
 #[must_use]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn json_number_to_aws_number(num: serde_json::Number) -> Option<aws_smithy_types::Number> {
     if num.is_i64() {
         let i = num.as_i64()?;
         if i >= 0 {
-            #[allow(clippy::cast_sign_loss)]
+            #[expect(clippy::cast_sign_loss)]
             Some(aws_smithy_types::Number::PosInt(i as u64))
         } else {
             Some(aws_smithy_types::Number::NegInt(i))
@@ -817,12 +817,10 @@ mod tests {
             r#"{"$or": [{"genre": {"$eq": "drama"}}, {"year": {"$gte": 2020}}]}"#,
         ];
         for expr in valid_expressions {
-            assert!(
-                MetadataFilter::from_json(expr)
-                    .expect("should parse metadata filter from JSON")
-                    .validate()
-                    .is_ok()
-            );
+            MetadataFilter::from_json(expr)
+                .expect("should parse metadata filter from JSON")
+                .validate()
+                .expect("Should be a valid filter");
         }
     }
 

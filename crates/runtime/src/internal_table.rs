@@ -115,7 +115,7 @@ async fn get_local_table_provider(
     Ok(source_table_provider)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,

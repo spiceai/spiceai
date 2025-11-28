@@ -233,8 +233,8 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::missing_errors_doc)]
+#[expect(clippy::too_many_lines)]
+#[expect(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();

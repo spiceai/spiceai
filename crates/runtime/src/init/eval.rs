@@ -38,7 +38,6 @@ use crate::{
 };
 
 impl Runtime {
-    #[allow(clippy::implicit_hasher)]
     pub(crate) async fn load_eval_scorer(&self) {
         for (name, scorer) in builtin_scorer() {
             let mut reg = self.eval_scorers.write().await;

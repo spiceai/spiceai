@@ -427,7 +427,7 @@ impl Stream for CustomResponseStream {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn make_responses_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -436,7 +436,7 @@ fn make_responses_stream(
     mut s: ResponseStream,
 ) -> ResponseStream {
     let (sender, receiver) = mpsc::channel(100);
-    let sender_clone = sender.clone();
+    let sender_clone = sender;
 
     tokio::spawn(
         request_context

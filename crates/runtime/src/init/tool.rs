@@ -29,7 +29,6 @@ use spicepod::component::tool::Tool;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
-    #[allow(clippy::implicit_hasher)]
     pub(crate) async fn load_tools(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {

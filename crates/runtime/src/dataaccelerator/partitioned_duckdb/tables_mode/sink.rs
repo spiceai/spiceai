@@ -109,7 +109,7 @@ impl DataSink for DuckDBPartitionedDataSink {
         &self.schema
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
@@ -323,7 +323,6 @@ impl DisplayAs for DuckDBPartitionedDataSink {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn insert_overwrite(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
@@ -583,7 +582,7 @@ fn write_to_tables(
             .context(UnableToGetElapsedTimeSnafu)
             .map_err(to_datafusion_error)?;
         let secs = elapsed.as_secs_f64();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let rps = if secs > 0.0 {
             (rows_written as f64) / secs
         } else {
@@ -1172,7 +1171,6 @@ mod test {
             let pool = Arc::clone(&pool);
             let table_definition = Arc::clone(&table_definition);
             let schema = Arc::clone(&schema);
-            let write_settings = write_settings.clone();
 
             move || {
                 insert_overwrite(
@@ -1224,7 +1222,6 @@ mod test {
             let pool = Arc::clone(&pool);
             let table_definition = Arc::clone(&table_definition);
             let schema = Arc::clone(&schema);
-            let write_settings = write_settings.clone();
 
             move || {
                 insert_append(

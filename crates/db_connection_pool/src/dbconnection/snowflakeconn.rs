@@ -254,7 +254,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 }
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 /// Converts `Snowflake` specific types to standard Arrow types.
@@ -444,7 +444,7 @@ where
     ))
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
         serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
@@ -648,11 +648,11 @@ mod tests {
             false,
         );
 
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing fraction field");
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn test_cast_sf_fixed_point_number_to_decimal_i32() {
         let scale = 4i8;
         let data = vec![
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn test_cast_sf_fixed_point_number_to_decimal_i64() {
         let scale = 9i8;
         let data = vec![
@@ -798,7 +798,7 @@ mod tests {
         ];
 
         let mut builder = StructBuilder::new(
-            fields.clone(),
+            fields,
             vec![
                 Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
                 Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
@@ -844,7 +844,7 @@ mod tests {
         ];
 
         let mut builder = StructBuilder::new(
-            fields.clone(),
+            fields,
             vec![
                 Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
                 Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,

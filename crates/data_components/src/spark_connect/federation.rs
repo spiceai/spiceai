@@ -106,7 +106,7 @@ impl SQLExecutor for SparkConnectTableProvider {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn spark_query_to_stream(
     session: Arc<spark_connect_rs::SparkSession>,
     query: String,

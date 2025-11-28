@@ -34,7 +34,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,

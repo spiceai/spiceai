@@ -37,7 +37,7 @@ use crate::chat::Result;
 ///
 /// Returns an error if the system time cannot be determined or if the timestamp
 /// conversion fails.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub fn create_stream_response(
     id: &str,
     model: &str,
@@ -67,7 +67,6 @@ pub fn create_stream_response(
 ///
 /// This function is currently infallible and wrapped in `Ok()`, but returns a `Result`
 /// for API consistency with other streaming utility functions.
-#[allow(clippy::cast_possible_truncation)]
 pub fn create_stream_response_with_timestamp(
     id: &str,
     model: &str,
@@ -100,7 +99,7 @@ pub fn create_stream_choice(
         delta: ChatCompletionStreamResponseDelta {
             content,
             role,
-            #[allow(deprecated)]
+            #[expect(deprecated)]
             function_call: None,
             tool_calls: None,
             refusal: None,
@@ -176,7 +175,7 @@ pub fn create_mock_streaming_response(
     Box::pin(stream! {
         let num_chunks = content_chunks.len();
         for (index, chunk) in content_chunks.into_iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let choice = create_stream_choice(
                 index as u32,
                 Some(chunk),
@@ -196,7 +195,7 @@ pub fn create_mock_streaming_response(
         }
 
         // Final chunk with finish reason and optional usage
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let final_choice = create_stream_choice(
             num_chunks as u32,
             Some(String::new()),

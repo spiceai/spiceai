@@ -69,7 +69,7 @@ pub fn append_item_to_struct_builder(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn append_value_to_builder(
     builder: &mut dyn ArrayBuilder,
     value: Option<&AttributeValue>,

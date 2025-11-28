@@ -121,7 +121,7 @@ pub fn sort_stream(
 ///
 /// This is a simple wrapper that allows integrating an existing stream
 /// into `DataFusion`'s `ExecutionPlan` framework for operations like sorting.
-#[allow(dead_code)] // schema is used indirectly via PlanProperties
+#[expect(dead_code)] // schema is used indirectly via PlanProperties
 struct StreamingExec {
     schema: SchemaRef,
     stream: Mutex<Option<SendableRecordBatchStream>>,

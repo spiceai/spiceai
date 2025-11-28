@@ -80,7 +80,7 @@ impl PostgresDeletionSink {
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 async fn delete_from(
     table_name: &str,
     transaction: &Transaction<'_>,

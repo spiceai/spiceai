@@ -243,7 +243,7 @@ async fn handle_streaming(
     )
 }
 
-#[allow(clippy::cast_possible_truncation, deprecated)]
+#[expect(deprecated)]
 pub(crate) fn create_working_stream_payload(
     content: String,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {

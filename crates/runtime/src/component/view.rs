@@ -73,7 +73,7 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
@@ -197,21 +197,21 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                 && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
             {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "Only 'refresh_mode: full' is supported".to_string(),
                 });
             }
 
             if acc.refresh_sql.is_some() {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "'refresh_sql' is not supported".to_string(),
                 });
             }
 
             if acc.on_zero_results == acceleration::ZeroResultsAction::UseSource {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "Only 'on_zero_results: return_empty' is supported".to_string(),
                 });
             }
