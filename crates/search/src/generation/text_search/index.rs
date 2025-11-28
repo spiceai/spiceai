@@ -86,7 +86,7 @@ impl Index for FullTextDatabaseIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if let Err(e) = self.update_index(batches.as_slice()).await {
+        if let Err(e) = self.update_index(batches.as_slice()) {
             tracing::error!("Failed to update full text search index: {e}");
             return Err(DataFusionError::External(Box::new(e)));
         }
@@ -220,7 +220,7 @@ impl FullTextDatabaseIndex {
     /// columns present will be ignored.
     ///
     /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
-    async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
+    fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if self.primary_key.len() > 1 {
             rb.iter()
@@ -433,7 +433,7 @@ impl SearchIndex for FullTextDatabaseIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        self.update_index(slice::from_ref(&record)).await.boxed()?;
+        self.update_index(slice::from_ref(&record)).boxed()?;
         Ok(record)
     }
 
