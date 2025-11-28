@@ -104,6 +104,8 @@ impl CatalogProvider for UnityCatalogProvider {
 impl RefreshableCatalogProvider for UnityCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let max_concurrent = 5;
+        // without a clone, the lifetime of the trait implementation does not match the expected async block signature
+        #[expect(clippy::redundant_clone)]
         let futures = self
             .schemas
             .values()

@@ -90,7 +90,6 @@ impl OracleExecPlan {
             .build()
     }
 
-    #[allow(clippy::unnecessary_wraps)]
     pub fn sql(&self) -> DataFusionResult<String> {
         let columns = self
             .projected_schema
@@ -247,11 +246,10 @@ fn project_schema_safe(
     Ok(schema)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 fn to_datafusion_err(e: super::Error) -> datafusion::error::DataFusionError {

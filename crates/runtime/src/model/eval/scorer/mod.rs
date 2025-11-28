@@ -133,8 +133,7 @@ pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
     }
 }
 
-#[cfg(feature = "models")]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn mean(values: &[f32]) -> f32 {
     let n = values.len();
     if n == 0 {

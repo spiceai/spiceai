@@ -303,7 +303,7 @@ impl Runtime {
         .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn register_loaded_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -480,10 +480,12 @@ impl Runtime {
                 // File accelerated datasets don't support hot reload.
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
-                    if let Ok(()) = Arc::clone(&self)
-                        .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
-                        .await
-                    {
+                    if matches!(
+                        Arc::clone(&self)
+                            .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
+                            .await,
+                        Ok(())
+                    ) {
                         self.status
                             .update_dataset(&ds.name, status::ComponentStatus::Ready);
                         return;
@@ -905,7 +907,7 @@ pub struct RegisterDatasetContext {
     accelerated_table: Option<Arc<AcceleratedTable>>,
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
         return Err(FullTextSearchRequiresAccelerationSnafu {

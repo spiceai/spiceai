@@ -210,7 +210,6 @@ pub async fn handle_eval_run(
     Ok(id)
 }
 
-#[allow(clippy::implicit_hasher)]
 async fn run_eval(
     id: &EvalRunId,
     llm_store: Arc<RwLock<LLMChatCompletionsModelStore>>,

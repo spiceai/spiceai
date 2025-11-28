@@ -68,6 +68,6 @@ impl SampleFrom for RandomSampleParams {
 
         let schema = Arc::new(df.get_arrow_schema(self.tbl.as_str()).await.boxed()?);
 
-        concat_batches(&schema, batches.iter().collect::<Vec<&RecordBatch>>()).boxed()
+        concat_batches(&schema, batches.iter()).boxed()
     }
 }

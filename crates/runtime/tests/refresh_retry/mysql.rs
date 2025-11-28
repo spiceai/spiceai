@@ -143,7 +143,7 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn mysql_refresh_retries() -> Result<(), String> {
     test_request_context()
         .scope(async {
@@ -209,16 +209,14 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 // restore connectivity after few seconds
                 time::sleep(Duration::from_secs(2)).await;
                 tracing::debug!("Restoring connectivity...");
-                assert!(
-                    running_container_reference_copy
-                        .start()
-                        .await
-                        .map_err(|e| {
-                            tracing::error!("running_container.start: {e}");
-                            e.to_string()
-                        })
-                        .is_ok()
-                );
+                running_container_reference_copy
+                    .start()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("running_container.start: {e}");
+                        e.to_string()
+                    })
+                    .expect("should start container");
             });
 
             // set custom refresh sql to check number of items loaded later

@@ -436,7 +436,6 @@ impl DataFusion {
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
     ///
     /// This method is generally used for tables that are created by the Spice runtime.
-    #[allow(clippy::result_large_err)]
     pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
@@ -938,7 +937,7 @@ impl DataFusion {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -1485,7 +1484,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     pub(crate) fn register_view(
         self: &Arc<Self>,
         view: Arc<View>,
@@ -1504,8 +1502,7 @@ impl DataFusion {
                 reason: format!(
                     "Expected 1 statement to create view from, received {}",
                     statements.len()
-                )
-                .to_string(),
+                ),
             }
             .fail();
         }
@@ -1775,7 +1772,6 @@ impl DataFusion {
             .collect_vec()
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn get_public_table_names(&self) -> Result<Vec<String>> {
         Ok(self
             .ctx

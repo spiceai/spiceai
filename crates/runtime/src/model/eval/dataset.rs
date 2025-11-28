@@ -170,7 +170,7 @@ impl DatasetInput {
 
     pub fn try_from_value(v: Value) -> Result<Option<Self>, serde_json::Error> {
         match v {
-            Value::String(s) => Ok(Some(Self::UserInput(s.to_string()))),
+            Value::String(s) => Ok(Some(Self::UserInput(s))),
             Value::Array(values) => {
                 let messages = values
                     .into_iter()
@@ -277,7 +277,7 @@ impl DatasetOutput {
 
     pub fn try_from_value(v: Value) -> Result<Option<Self>, serde_json::Error> {
         match v {
-            Value::String(s) => Ok(Some(Self::AssistantResponse(s.to_string()))),
+            Value::String(s) => Ok(Some(Self::AssistantResponse(s))),
             Value::Array(values) => {
                 let choices = values
                     .into_iter()

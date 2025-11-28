@@ -69,7 +69,8 @@ impl UnionProjectionPushdownOptimizer {
 
         // All `UnionExec` inputs must also be unary chains that end with `DataSourceExec` leaves
         // that have the same schema, without any intermediate projections
-        let data_source_exec_leaves = union_exec
+        // The union inputs should represent the same number of DataSourceExec instances
+        if union_exec
             .inputs()
             .iter()
             .filter_map(|p_child| {
@@ -87,10 +88,9 @@ impl UnionProjectionPushdownOptimizer {
                     .ok()
                     .and_then(|nodes| nodes.into_iter().last())
             })
-            .collect::<Vec<_>>();
-
-        // The union inputs should represent the same number of DataSourceExec instances
-        if data_source_exec_leaves.len() != union_exec.inputs().len() {
+            .count()
+            != union_exec.inputs().len()
+        {
             return Ok(None);
         }
 

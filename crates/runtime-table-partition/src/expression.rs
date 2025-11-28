@@ -297,23 +297,30 @@ mod tests {
             )
             .otherwise(lit("other"))
             .expect("expression created");
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Valid: date_trunc('month', date)
         let expr = Expr::ScalarFunction(ScalarFunction {
             func: date_trunc(),
             args: vec![lit("month"), col("date")],
         });
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Invalid: Two columns (a + region)
         let expr = col("a") + col("region");
-        assert!(criterion.validate(&expr, &schema).is_err());
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Literal (no column)
         let expr = lit(42);
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         // Invalid: Alias
         let expr = Expr::Alias(Alias {
             expr: Box::new(col("region")),
@@ -321,15 +328,15 @@ mod tests {
             relation: None,
             metadata: None,
         });
-        assert!(
-            criterion.validate(&expr, &schema).is_err(),
-            "forbidden expression"
-        );
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Non-existent column
         let expr = col("missing");
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         Ok(())
     }
 }

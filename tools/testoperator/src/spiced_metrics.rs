@@ -28,7 +28,7 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone)]
 pub struct MetricSample {
     pub name: String,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub labels: HashMap<String, String>,
     pub value: f64,
     pub metric_type: MetricType,
@@ -79,7 +79,7 @@ impl SpicedMetrics {
     }
 
     /// Get the average value for a gauge metric
-    #[allow(dead_code, clippy::cast_precision_loss)]
+    #[expect(dead_code, clippy::cast_precision_loss)]
     pub fn get_gauge_avg(&self, name: &str) -> Option<f64> {
         let samples: Vec<f64> = self
             .samples
@@ -98,13 +98,13 @@ impl SpicedMetrics {
     }
 
     /// Get all samples for a specific metric name
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn get_samples(&self, name: &str) -> Option<&Vec<MetricSample>> {
         self.samples.get(name)
     }
 
     /// Get all unique metric names
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn metric_names(&self) -> Vec<&String> {
         self.samples.keys().collect()
     }

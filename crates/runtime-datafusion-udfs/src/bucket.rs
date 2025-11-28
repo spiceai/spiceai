@@ -34,7 +34,8 @@ use snafu::{ResultExt as _, Snafu};
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
 
 /// Compile-time assertion that `MAX_NUM_BUCKETS` does not exceed `i32::MAX`
-#[allow(clippy::disallowed_macros)]
+#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
+#[allow(unfulfilled_lint_expectations)]
 const _: () = assert!(
     MAX_NUM_BUCKETS <= i32::MAX as i64,
     "MAX_NUM_BUCKETS exceeds i32::MAX"
@@ -168,7 +169,6 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue,
     )))
 }
 
-#[allow(clippy::missing_panics_doc)]
 fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
@@ -344,7 +344,7 @@ mod tests {
             config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
-        assert!(result.is_err());
+        result.expect_err("Should fail for invalid num_buckets");
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
             config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
-        assert!(result.is_err());
+        result.expect_err("Should fail for invalid num_buckets");
     }
 
     #[test]

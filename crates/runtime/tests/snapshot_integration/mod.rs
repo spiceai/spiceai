@@ -309,7 +309,7 @@ fn build_snapshots_config(
     }
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn build_metadata_document(
     context: &SnapshotS3Context,
     dataset_name: &str,
@@ -995,7 +995,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .await
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {
