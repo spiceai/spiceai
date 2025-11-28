@@ -203,11 +203,9 @@ impl TableProvider for LocationPruningListingTable {
         filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let locations = extract_location_predicates(filters);
-
-        if locations.is_empty() {
+        let Some(locations) = extract_location_predicates(filters) else {
             return self.inner.scan(state, projection, filters, limit).await;
-        }
+        };
 
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
@@ -281,14 +279,17 @@ impl TableProvider for LocationPruningListingTable {
     }
 }
 
-fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Vec<String> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+/// Extracts literal locations from `location = 'literal'` and `location IN (...)`
+/// predicates when they appear in a purely conjunctive context. If a location
+/// predicate appears under `NOT` or `OR`, return `None` to force the caller to
+/// fall back to full listing (to avoid incorrect pruning).
+fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<String>> {
     use datafusion_expr::{Expr, Operator};
 
     // Recursively walks filter expressions to collect string literals from:
     // - location = 'literal' and 'literal' = location
     // - location IN ('a', 'b', ...)
-    // Traversal covers nested AND/OR/NOT by leveraging `TreeNode::apply`.
+    // Only safe when predicates are in a purely conjunctive form (no OR/NOT).
     fn literal_str(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Literal(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)), _) => {
@@ -298,40 +299,80 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Vec<String>
         }
     }
 
-    let mut values = Vec::new();
-    for filter in filters {
-        let _ = filter.apply(|expr| {
-            match expr {
-                Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+    fn collect_locations(expr: &Expr) -> (Vec<String>, bool) {
+        match expr {
+            Expr::BinaryExpr(binary) => match binary.op {
+                Operator::Eq => {
                     let left_is_location =
                         matches!(*binary.left, Expr::Column(ref c) if c.name == "location");
                     let right_is_location =
                         matches!(*binary.right, Expr::Column(ref c) if c.name == "location");
 
+                    let mut values = Vec::new();
                     if left_is_location && let Some(value) = literal_str(&binary.right) {
                         values.push(value);
                     }
-
                     if right_is_location && let Some(value) = literal_str(&binary.left) {
                         values.push(value);
                     }
+                    (values, true)
                 }
-                Expr::InList(in_list)
-                    if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") =>
-                {
-                    for v in &in_list.list {
-                        if let Some(s) = literal_str(v) {
-                            values.push(s);
-                        }
+                Operator::And => {
+                    let (mut lvals, lsafe) = collect_locations(&binary.left);
+                    let (rvals, rsafe) = collect_locations(&binary.right);
+                    lvals.extend(rvals);
+                    (lvals, lsafe && rsafe)
+                }
+                Operator::Or => {
+                    let (lvals, lsafe) = collect_locations(&binary.left);
+                    let (rvals, rsafe) = collect_locations(&binary.right);
+                    if !lvals.is_empty() || !rvals.is_empty() {
+                        (Vec::new(), false)
+                    } else {
+                        (Vec::new(), lsafe && rsafe)
                     }
                 }
-                _ => {}
+                _ => (Vec::new(), true),
+            },
+            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") =>
+            {
+                let mut values = Vec::new();
+                for v in &in_list.list {
+                    if let Some(s) = literal_str(v) {
+                        values.push(s);
+                    }
+                }
+                (values, true)
             }
-
-            Ok(TreeNodeRecursion::Continue)
-        });
+            Expr::Not(inner) => {
+                let (vals, _safe_inner) = collect_locations(inner);
+                if vals.is_empty() {
+                    (Vec::new(), true)
+                } else {
+                    (Vec::new(), false)
+                }
+            }
+            _ => (Vec::new(), true),
+        }
     }
-    values
+
+    let mut values = Vec::new();
+    let mut safe = true;
+    for filter in filters {
+        let (vals, is_safe) = collect_locations(filter);
+        values.extend(vals);
+        safe &= is_safe;
+    }
+
+    if !safe {
+        return None;
+    }
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 #[async_trait]
@@ -2034,7 +2075,10 @@ mod tests {
 
         let filters = vec![col("location").eq(lit("s3://bucket/path/file.parquet"))];
         let values = extract_location_predicates(&filters);
-        assert_eq!(values, vec!["s3://bucket/path/file.parquet".to_string()]);
+        assert_eq!(
+            values,
+            Some(vec!["s3://bucket/path/file.parquet".to_string()])
+        );
     }
 
     #[test]
@@ -2045,14 +2089,14 @@ mod tests {
             vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
             false,
         )];
-        let mut values = extract_location_predicates(&filters);
+        let mut values = extract_location_predicates(&filters).expect("some values");
         values.sort();
         assert_eq!(
-            values,
-            vec![
+            Some(vec![
                 "s3://bucket/a.parquet".to_string(),
                 "s3://bucket/b.parquet".to_string()
-            ]
+            ]),
+            Some(values)
         );
     }
 
@@ -2062,7 +2106,10 @@ mod tests {
 
         let filters = vec![lit("s3://bucket/reversed.parquet").eq(col("location"))];
         let values = extract_location_predicates(&filters);
-        assert_eq!(values, vec!["s3://bucket/reversed.parquet".to_string()]);
+        assert_eq!(
+            values,
+            Some(vec!["s3://bucket/reversed.parquet".to_string()])
+        );
     }
 
     #[test]
@@ -2075,15 +2122,8 @@ mod tests {
                 .and(col("id").gt(lit(1)))
                 .or(col("location").eq(lit("s3://bucket/b.parquet"))),
         ];
-        let mut values = extract_location_predicates(&filters);
-        values.sort();
-        assert_eq!(
-            values,
-            vec![
-                "s3://bucket/a.parquet".to_string(),
-                "s3://bucket/b.parquet".to_string()
-            ]
-        );
+        let values = extract_location_predicates(&filters);
+        assert!(values.is_none(), "Location under OR should disable pruning");
     }
 
     #[test]
@@ -2094,7 +2134,10 @@ mod tests {
             col("location").eq(lit("s3://bucket/negated.parquet")),
         )];
         let values = extract_location_predicates(&filters);
-        assert_eq!(values, vec!["s3://bucket/negated.parquet".to_string()]);
+        assert!(
+            values.is_none(),
+            "Location under NOT should disable pruning"
+        );
     }
 
     #[test]
@@ -2109,7 +2152,7 @@ mod tests {
         let values = extract_location_predicates(&filters);
         assert_eq!(
             values,
-            vec!["s3://bucket/only_location.parquet".to_string()]
+            Some(vec!["s3://bucket/only_location.parquet".to_string()])
         );
     }
 
