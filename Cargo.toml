@@ -329,7 +329,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "d4649aaba84e02a452cbcad9e11e16b57f934cb6" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "d4649aaba84e02a452cbcad9e11e16b57f934cb6" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "f03cf4502e9095bbfafb47d27645e77b7a6e82f5" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "2ba81dda853c766dd9b7b73cad0fc73fa783c901" } # phillip/251128-properly-handle-decimal
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai:spiceai-50
 
