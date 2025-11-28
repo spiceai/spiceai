@@ -42,7 +42,7 @@ impl CayenneJoinRewriter {
     /// Create a new `CayenneJoinRewriter` optimizer rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 

@@ -580,6 +580,10 @@ impl DeletionSink for CayenneDeletionSink {
 /// - SIMD-optimized contains operations (used in hot read path)
 /// - 50-90% memory savings vs `HashSet` for sparse deletions
 /// - Efficient bulk insertion using Arrow's contiguous arrays
+///
+/// # Errors
+///
+/// Returns an error if any deletion vector file cannot be read or parsed.
 pub fn read_deletion_vectors(
     delete_files: Vec<crate::metadata::DeleteFile>,
 ) -> datafusion_common::Result<RoaringBitmap> {
