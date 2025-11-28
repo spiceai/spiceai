@@ -215,6 +215,24 @@ impl TableProvider for LocationPruningListingTable {
                 continue;
             };
 
+            // Enforce that the requested location stays within the configured object store/prefix.
+            let location_listing = match ListingTableUrl::parse(&loc) {
+                Ok(l) => l,
+                Err(err) => {
+                    tracing::warn!(%err, location = loc, "Ignoring location predicate outside table prefix");
+                    continue;
+                }
+            };
+            if location_listing.object_store() != self.object_store_url()
+                || !self.table_path.contains(location_listing.prefix(), false)
+            {
+                tracing::warn!(
+                    location = loc,
+                    "Ignoring location predicate outside table prefix/object store"
+                );
+                continue;
+            }
+
             let path = Path::from(url.path().trim_start_matches('/'));
 
             let meta = match self.object_store.head(&path).await {
