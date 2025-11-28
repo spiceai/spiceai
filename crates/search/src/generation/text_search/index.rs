@@ -580,13 +580,9 @@ mod tests {
 
         // Initial table as expected
         {
-            let index_read = index.index.read().expect("Failed to read index");
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
             +----------------+----+---------------------+----------------+
@@ -612,13 +608,9 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
-            let index_read = index.index.read().expect("Failed to read index");
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             // First, ensure old data is no longer existent.
             insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
@@ -674,13 +666,9 @@ mod tests {
 
         // Initial table as expected
         {
-            let index_read = index.index.read().expect("Failed to read index");
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id1".to_string(), "id2".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
             +----------------+-----+-----+---------------------+----------------+
@@ -707,13 +695,9 @@ mod tests {
                 .await
                 .expect("failed to compute_index");
 
-            let index_read = index.index.read().expect("Failed to read index");
-            let search_index = FullTextSearchFieldIndex::try_new(
-                &index_read,
-                "content".to_string(),
-                vec!["id1".to_string(), "id2".to_string()],
-            )
-            .expect("Failed to create FullTextSearchFieldIndex");
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
 
             // First, ensure old data is no longer existent.
             insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
