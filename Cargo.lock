@@ -5494,7 +5494,7 @@ dependencies = [
 
 [[package]]
 name = "dynamodb-streams"
-version = "1.10.0-unstable"
+version = "1.10.0-enterprise-beta"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
