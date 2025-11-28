@@ -2,14 +2,14 @@
 
 This roadmap details the planned features and priorities for Spice.ai Open Source, aligning with the mission to empower developers to build decision-making, data-driven AI applications. It is regularly refined based on community feedback, customer needs, and strategic goals.
 
-To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Discord](https://github.com/spiceai/spiceai#-connect-with-us). Your input drives our direction.
+To propose features or report issues, please [file an issue](https://github.com/spiceai/spiceai/issues/new/choose) or connect with us on [Slack](https://spiceai.org/slack). Your input drives our direction.
 
 ---
 
 ## Known Issues
 
 - Track active bugs on [GitHub](https://github.com/spiceai/spiceai/labels/bug).
-- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Discord for faster resolution.
+- Report new bugs via [this issue template](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) and share details on Slack for faster resolution.
 
 ---
 
