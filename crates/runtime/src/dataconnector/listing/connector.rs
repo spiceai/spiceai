@@ -269,6 +269,7 @@ impl TableProvider for LocationPruningListingTable {
 }
 
 fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Vec<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion_expr::{Expr, Operator};
 
     fn literal_str(expr: &Expr) -> Option<String> {
@@ -280,53 +281,42 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Vec<String>
         }
     }
 
-    fn collect(expr: &Expr, out: &mut Vec<String>) {
-        match expr {
-            Expr::BinaryExpr(binary) => {
-                let left_is_location =
-                    matches!(*binary.left, Expr::Column(ref c) if c.name == "location");
-                let right_literal = literal_str(&binary.right);
-
-                let right_is_location =
-                    matches!(*binary.right, Expr::Column(ref c) if c.name == "location");
-                let left_literal = literal_str(&binary.left);
-
-                if binary.op == Operator::Eq {
-                    if left_is_location && let Some(value) = right_literal {
-                        out.push(value);
-                        return;
-                    }
-                    if right_is_location && let Some(value) = left_literal {
-                        out.push(value);
-                        return;
-                    }
-                }
-
-                collect(&binary.left, out);
-                collect(&binary.right, out);
-            }
-            Expr::InList(in_list) => {
-                if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") {
-                    for v in &in_list.list {
-                        if let Some(s) = literal_str(v) {
-                            out.push(s);
-                        }
-                    }
-                } else {
-                    collect(&in_list.expr, out);
-                    for v in &in_list.list {
-                        collect(v, out);
-                    }
-                }
-            }
-            Expr::Not(inner) => collect(inner, out),
-            _ => {}
-        }
-    }
-
     let mut values = Vec::new();
     for filter in filters {
-        collect(filter, &mut values);
+        let _ = filter.apply(|expr| {
+            match expr {
+                Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                    let left_is_location =
+                        matches!(*binary.left, Expr::Column(ref c) if c.name == "location");
+                    let right_is_location =
+                        matches!(*binary.right, Expr::Column(ref c) if c.name == "location");
+
+                    if left_is_location {
+                        if let Some(value) = literal_str(&binary.right) {
+                            values.push(value);
+                        }
+                    }
+
+                    if right_is_location {
+                        if let Some(value) = literal_str(&binary.left) {
+                            values.push(value);
+                        }
+                    }
+                }
+                Expr::InList(in_list)
+                    if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") =>
+                {
+                    for v in &in_list.list {
+                        if let Some(s) = literal_str(v) {
+                            values.push(s);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            Ok(TreeNodeRecursion::Continue)
+        });
     }
     values
 }
