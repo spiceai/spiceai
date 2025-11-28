@@ -44,7 +44,6 @@ use {
     spicepod::semantic::MetadataType,
 };
 
-#[allow(unused_variables)]
 pub async fn wrap_table_as_index(
     ctx: &Arc<SessionContext>,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
@@ -55,6 +54,17 @@ pub async fn wrap_table_as_index(
     inner_table_provider: Arc<dyn TableProvider>,
     vector_store: &VectorStore,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(feature = "s3_vectors"))]
+    let _ = (
+        ctx,
+        embedding_models,
+        secrets,
+        tbl,
+        columns,
+        file_format,
+        inner_table_provider.as_ref(),
+    );
+
     match vector_store.engine.as_deref() {
         #[cfg(feature = "s3_vectors")]
         Some("s3" | "s3_vectors") => {

@@ -257,7 +257,7 @@ impl Refresh {
         refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> NextRefresh {
-        tracing::info!(
+        tracing::debug!(
             "startup_next_refresh called with mode: {:?}, check_interval: {:?}",
             self.mode,
             self.check_interval

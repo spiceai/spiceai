@@ -218,6 +218,7 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
     ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
+    refresh_mode: RefreshMode,
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
@@ -557,6 +558,7 @@ impl Builder {
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
+        let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
@@ -621,6 +623,7 @@ impl Builder {
             zero_results_action: self.zero_results_action,
             ready_state: self.ready_state,
             refresh_params,
+            refresh_mode,
             refresher,
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
@@ -753,11 +756,7 @@ impl TableProvider for AcceleratedTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         // In caching mode, we handle filters ourselves (not pushed to accelerator)
         // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
-        let is_caching_mode = futures::executor::block_on(async {
-            self.refresh_params.read().await.mode == RefreshMode::Caching
-        });
-
-        if is_caching_mode {
+        if self.refresh_mode == RefreshMode::Caching {
             return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
         }
 

@@ -434,9 +434,11 @@ pub(crate) async fn acceleration(
     }
 }
 
-#[allow(unused_variables, unused_mut)]
 fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
     let mut properties = HashMap::new();
+
+    #[cfg(not(feature = "models"))]
+    let _ = ds;
 
     #[cfg(feature = "models")]
     properties.insert(

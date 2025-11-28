@@ -349,10 +349,12 @@ impl DataConnector for EmbeddingConnector {
     }
 }
 
-#[allow(unused_variables)]
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Option<Arc<FederatedTable>> {
+    #[cfg(not(feature = "s3_vectors"))]
+    let _ = src_table_provider;
+
     #[cfg(feature = "s3_vectors")]
     {
         if let Some(vector_scan) = src_table_provider
