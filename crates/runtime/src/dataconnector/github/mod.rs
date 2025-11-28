@@ -65,11 +65,11 @@ use super::{
 };
 
 mod commits;
-mod issues;
+pub mod issues;
 mod members;
-mod projects;
-mod pull_requests;
-mod rate_limit;
+pub mod projects;
+pub mod pull_requests;
+pub mod rate_limit;
 mod stargazers;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
@@ -92,6 +92,24 @@ impl std::fmt::Debug for Github {
             .field("rate_limiter", &self.rate_limiter)
             .field("semaphore", &"<Semaphore>")
             .finish()
+    }
+}
+
+impl Github {
+    /// Creates a new GitHub connector with the provided parameters
+    #[must_use]
+    pub fn new(
+        params: Parameters,
+        token: Option<Arc<dyn TokenProvider>>,
+        rate_limiter: Arc<GitHubRateLimiter>,
+        semaphore: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            params,
+            token,
+            rate_limiter,
+            semaphore,
+        }
     }
 }
 
@@ -136,7 +154,9 @@ impl Github {
         target: &str,
         resource_type: &str,
         installation_id: &str,
+        client_id: Option<&str>,
     ) -> Result<(), String> {
+        let client_id_info = client_id.map_or(String::new(), |id| format!(" (client_id: '{id}')"));
         match response {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!(
@@ -155,10 +175,10 @@ impl Github {
                     .await
                     .unwrap_or_else(|_| "Unable to read response body".to_string());
                 tracing::error!(
-                    "GitHub App installation does not have access to '{target}' (HTTP {status}). Response: {body}"
+                    "GitHub App installation does not have access to '{target}' (HTTP {status}){client_id_info}. Response: {body}"
                 );
                 Err(format!(
-                    "GitHub App installation ID '{installation_id}' does not have permission to access '{resource_type}' for '{target}' (HTTP {status}). Verify the GitHub App has the required permissions and is correctly installed into {target}."
+                    "GitHub App installation ID '{installation_id}'{client_id_info} does not have permission to access '{resource_type}' for '{target}' (HTTP {status}). Verify the GitHub App has the required permissions and is correctly installed into {target}."
                 ))
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
@@ -167,10 +187,10 @@ impl Github {
                     .await
                     .unwrap_or_else(|_| "Unable to read response body".to_string());
                 tracing::error!(
-                    "Target '{target}' not found or GitHub App installation does not have access (HTTP 404). Response: {body}"
+                    "Target '{target}' not found or GitHub App installation does not have access (HTTP 404){client_id_info}. Response: {body}"
                 );
                 Err(format!(
-                    "Resource '{target}' not found or GitHub App installation ID '{installation_id}' does not have access to it."
+                    "Resource '{target}' not found or GitHub App installation ID '{installation_id}'{client_id_info} does not have access to it."
                 ))
             }
             Ok(resp) => {
@@ -180,18 +200,18 @@ impl Github {
                     .await
                     .unwrap_or_else(|_| "Unable to read response body".to_string());
                 tracing::error!(
-                    "GitHub App installation validation failed for '{target}' (HTTP {status}). Response: {body}"
+                    "GitHub App installation validation failed for '{target}' (HTTP {status}){client_id_info}. Response: {body}"
                 );
                 Err(format!(
-                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}' (HTTP {status})."
+                    "Failed to validate GitHub App installation ID '{installation_id}'{client_id_info} access to '{target}' (HTTP {status})."
                 ))
             }
             Err(e) => {
                 tracing::error!(
-                    "GitHub App installation validation request failed for '{target}': {e}"
+                    "GitHub App installation validation request failed for '{target}'{client_id_info}: {e}"
                 );
                 Err(format!(
-                    "Failed to validate GitHub App installation ID '{installation_id}' access to '{target}': {e}"
+                    "Failed to validate GitHub App installation ID '{installation_id}'{client_id_info} access to '{target}': {e}"
                 ))
             }
         }
@@ -233,6 +253,8 @@ impl Github {
                     "Failed to authenticate with GitHub App installation ID '{installation_id}'. The installation ID may be invalid or the app may not be installed."
                 ));
             }
+
+            tracing::info!(installation_id = %installation_id, token = token, "Successfully retrieved GitHub App token");
 
             // Validate that the installation has access to the target repository or organization
             let Some(endpoint) = self.params.get("endpoint").expose().ok() else {
@@ -285,8 +307,15 @@ impl Github {
                 .send()
                 .await;
 
-            Self::handle_validation_response(response, &target, resource_type, installation_id)
-                .await
+            let client_id = self.params.get("client_id").expose().ok();
+            Self::handle_validation_response(
+                response,
+                &target,
+                resource_type,
+                installation_id,
+                client_id.as_deref(),
+            )
+            .await
         } else {
             // No token provider but installation_id was provided - this is a configuration error
             Err(format!(
@@ -325,7 +354,7 @@ impl Github {
         .boxed()
     }
 
-    fn get_health_check_for_owner_and_repo(owner: &str, repo: &str) -> String {
+    pub fn get_health_check_for_owner_and_repo(owner: &str, repo: &str) -> String {
         format!(
             r#"{{
             githubHealthCheck: repository(owner: "{owner}", name: "{repo}") {{
@@ -336,7 +365,7 @@ impl Github {
         )
     }
 
-    fn get_health_check_for_org(org: &str) -> String {
+    pub fn get_health_check_for_org(org: &str) -> String {
         format!(
             r#"{{
             githubHealthCheck: organization(login: "{org}") {{
@@ -347,7 +376,7 @@ impl Github {
         )
     }
 
-    async fn create_gql_table_provider(
+    pub async fn create_gql_table_provider(
         &self,
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
@@ -694,8 +723,8 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
-pub(crate) enum GitHubQueryMode {
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum GitHubQueryMode {
     Auto,
     Search,
 }

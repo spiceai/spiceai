@@ -88,6 +88,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
+pub mod github;
 pub mod glue;
 pub mod iceberg;
 pub mod spice_cloud;
@@ -163,6 +164,15 @@ pub async fn register_all() {
             spice_cloud::SpiceCloudPlatformCatalog::new_connector,
             "spiceai",
             spice_cloud::PARAMETERS,
+        ),
+    );
+
+    registry.insert(
+        github::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            github::GitHubCatalog::new_connector,
+            github::PREFIX,
+            github::PARAMETERS,
         ),
     );
 }
