@@ -50,7 +50,7 @@ on:
   workflow_dispatch:
     inputs:
       use_macos_15:
-        description: 'Use macos-15 hosted runners instead of self-hosted spiceai-macos'
+        description: 'Official build? (uses macOS hosted runners)'
         required: false
         type: boolean
         default: false
