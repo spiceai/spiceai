@@ -352,15 +352,18 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
                 }
                 _ => (Vec::new(), true),
             },
-            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") =>
-            {
-                let mut values = Vec::new();
-                for v in &in_list.list {
-                    if let Some(s) = literal_str(v) {
-                        values.push(s);
+            Expr::InList(in_list) if matches!(*in_list.expr, Expr::Column(ref c) if c.name == "location") => {
+                if in_list.negated {
+                    (Vec::new(), false)
+                } else {
+                    let mut values = Vec::new();
+                    for v in &in_list.list {
+                        if let Some(s) = literal_str(v) {
+                            values.push(s);
+                        }
                     }
+                    (values, true)
                 }
-                (values, true)
             }
             Expr::Not(inner) => {
                 let (vals, _safe_inner) = collect_locations(inner);
@@ -2171,6 +2174,21 @@ mod tests {
         assert_eq!(
             values,
             Some(vec!["s3://bucket/only_location.parquet".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_extract_location_predicates_not_in_list() {
+        use datafusion_expr::{col, lit};
+
+        let filters = vec![col("location").in_list(
+            vec![lit("s3://bucket/a.parquet"), lit("s3://bucket/b.parquet")],
+            true,
+        )];
+        let values = extract_location_predicates(&filters);
+        assert!(
+            values.is_none(),
+            "Negated IN should disable location pruning"
         );
     }
 
