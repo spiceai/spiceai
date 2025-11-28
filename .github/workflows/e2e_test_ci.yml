@@ -48,6 +48,12 @@ on:
       - 'Dockerfile*'
 
   workflow_dispatch:
+    inputs:
+      use_macos_15:
+        description: 'Use macos-15 hosted runners instead of self-hosted spiceai-macos'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -67,6 +73,18 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            // Check if this is a tagged release
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+
+            // Check if use_macos_15 input is set in workflow_dispatch
+            const useMacos15Input = context.eventName === 'workflow_dispatch' &&
+                                    context.payload.inputs?.use_macos_15 === 'true';
+
+            // Use hosted macOS runners only for tagged releases or when specified in dispatch
+            const useMacos15 = isTaggedRelease || useMacos15Input;
+            const macosBuilder = useMacos15 ? "macos-15" : "spiceai-macos";
+            const macosRunner = useMacos15 ? "macos-15" : "spiceai-macos";
+
             const matrix = [
               {
                 name: "Linux x64",
@@ -77,8 +95,8 @@ jobs:
                 target_arch_go: "amd64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                builder: "spiceai-macos",
-                runner: "macos-15",
+                builder: macosBuilder,
+                runner: macosRunner,
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64"
@@ -262,6 +280,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -338,6 +357,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -404,6 +424,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         acceleration: [{}, { engine: arrow, mode: memory }]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -496,6 +517,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         acceleration:
           [
@@ -680,6 +702,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         acceleration:
@@ -894,6 +917,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -996,6 +1020,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -1079,6 +1104,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         acceleration: [
@@ -1228,6 +1254,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -1379,6 +1406,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         # run only on "Linux x64"
@@ -1523,6 +1551,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         # run only on "Linux x64"
@@ -1639,6 +1668,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      max-parallel: 1
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -1730,6 +1760,7 @@ jobs:
     timeout-minutes: 10
 
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
@@ -1890,6 +1921,7 @@ jobs:
     timeout-minutes: 10
 
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
