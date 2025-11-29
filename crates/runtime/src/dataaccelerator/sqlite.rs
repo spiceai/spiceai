@@ -156,7 +156,9 @@ impl SqliteAccelerator {
         })?;
 
         let mode = match acceleration.mode {
-            Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
+            Mode::File | Mode::FileCreate => {
+                datafusion_table_providers::sql::db_connection_pool::Mode::File
+            }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();

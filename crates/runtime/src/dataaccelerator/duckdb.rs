@@ -144,7 +144,7 @@ impl DuckDBAccelerator {
         })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => {
+            (Ok(duckdb_file), Mode::File | Mode::FileCreate) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
@@ -175,7 +175,7 @@ impl DuckDBAccelerator {
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
-            (Err(e), Mode::File) => {
+            (Err(e), Mode::File | Mode::FileCreate) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
                 });
