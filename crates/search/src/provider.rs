@@ -193,8 +193,7 @@ impl SearchQueryProvider {
         scan.project(
             base_table_cols
                 .iter()
-                .map(|c| SelectExpr::Expression(col(c)))
-                .collect::<Vec<_>>(),
+                .map(|c| SelectExpr::Expression(col(c))),
         )?
         .build()
     }
