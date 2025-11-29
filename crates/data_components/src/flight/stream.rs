@@ -216,7 +216,6 @@ impl ExecutionPlan for FlightStreamExec {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn subscribe_to_stream(
     mut client: FlightClient,
     table_reference: String,

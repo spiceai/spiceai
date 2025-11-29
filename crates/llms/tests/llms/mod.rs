@@ -65,7 +65,6 @@ type AsyncModelCreator = Box<
 /// A given model to test - cached after first creation
 type ModelDef = (&'static str, Mutex<Option<Arc<dyn Chat>>>);
 
-#[allow(clippy::expect_used)]
 static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = LazyLock::new(
     || {
         vec![
@@ -397,7 +396,7 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     Ok(model)
 }
 
-#[allow(clippy::expect_used, clippy::expect_fun_call)]
+#[expect(clippy::expect_used)]
 async fn run_single_test(
     test_name: &str,
     model_name: &str,

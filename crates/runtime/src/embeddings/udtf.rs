@@ -402,7 +402,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 

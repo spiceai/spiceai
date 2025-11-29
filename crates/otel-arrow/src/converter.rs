@@ -297,8 +297,8 @@ impl AttributesBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_truncation)]
     fn append(&mut self, is_valid: bool) {
         self.list_offsets_builder
             .append(self.key_builder.len() as i32);
@@ -594,23 +594,11 @@ impl OtelToArrowConverter {
 
             self.data_histogram_builder
                 .bucket_counts_builder
-                .append_value(
-                    data_point
-                        .bucket_counts
-                        .iter()
-                        .map(|bc| Some(*bc))
-                        .collect::<Vec<Option<u64>>>(),
-                );
+                .append_value(data_point.bucket_counts.iter().map(|bc| Some(*bc)));
 
             self.data_histogram_builder
                 .explicit_bounds_builder
-                .append_value(
-                    data_point
-                        .bounds
-                        .iter()
-                        .map(|b| Some(*b))
-                        .collect::<Vec<Option<f64>>>(),
-                );
+                .append_value(data_point.bounds.iter().map(|b| Some(*b)));
 
             self.data_histogram_builder.append(true);
         }
@@ -759,14 +747,14 @@ impl AppendFloat64 for f64 {
 }
 
 impl AppendFloat64 for i64 {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn append(&self, builder: &mut Float64Builder) {
         builder.append_value(*self as f64);
     }
 }
 
 impl AppendFloat64 for u64 {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn append(&self, builder: &mut Float64Builder) {
         builder.append_value(*self as f64);
     }
@@ -777,7 +765,7 @@ trait AppendDataNumber {
 }
 
 impl AppendDataNumber for u64 {
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     fn append(&self, builder: &mut DataNumberBuilder) {
         builder.int_builder.append_value(*self as i64);
         builder.double_builder.append_null();
@@ -804,7 +792,7 @@ impl AppendDataNumber for f64 {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn system_time_to_nanos(time: SystemTime) -> i64 {
     let Ok(duration) = time.duration_since(UNIX_EPOCH) else {
         panic!("SystemTime before UNIX EPOCH!");

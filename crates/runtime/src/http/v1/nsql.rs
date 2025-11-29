@@ -290,7 +290,7 @@ pub(crate) async fn post(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle_nsql_query(
     rt: Arc<Runtime>,
     context: Arc<RequestContext>,

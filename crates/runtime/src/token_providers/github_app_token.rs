@@ -133,7 +133,7 @@ impl GitHubAppTokenProvider {
         let cloned_app_client_id = Arc::clone(&app_client_id);
         let cloned_private_key = Arc::clone(&private_key);
         let cloned_installation_id = Arc::clone(&installation_id);
-        let cloned_tx = tx.clone();
+        let cloned_tx = tx;
 
         let handle = tokio::spawn(async move {
             let mut backoff = FibonacciBackoffBuilder::new()
@@ -197,7 +197,7 @@ impl fmt::Debug for GitHubToken {
     }
 }
 impl GitHubToken {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     #[must_use]
     pub fn next_wait(&self) -> Duration {
         Duration::from_secs(
@@ -257,7 +257,7 @@ async fn generate_token(
         .await
         .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
-    #[allow(clippy::items_after_statements)]
+    #[expect(clippy::items_after_statements)]
     #[derive(Deserialize, Debug)]
     struct TokenResponse {
         token: SecretString,

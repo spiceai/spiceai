@@ -18,8 +18,8 @@ pub mod config;
 pub mod execution_plan;
 pub mod extension;
 pub mod join_accumulator;
+pub mod optimizer_rule;
 pub mod schema_provider;
-pub mod stream_utils;
 
 use snafu::prelude::*;
 

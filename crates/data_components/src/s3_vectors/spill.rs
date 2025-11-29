@@ -196,7 +196,7 @@ mod tests {
         assert!(SpillIndex::parse("myindex.123").expect("success").is_none());
         assert!(SpillIndex::parse("myindex.abc").expect("success").is_none());
         let result = SpillIndex::parse("myindex-aa");
-        assert!(result.is_err());
+        result.expect_err("Should error on invalid spill index format");
     }
 
     #[test]

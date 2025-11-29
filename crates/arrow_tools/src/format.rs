@@ -37,7 +37,7 @@ pub enum FormatOperation {
     TruncateListLength(usize),
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn format_column_data(
     column: ArrayRef,
     field: &Arc<Field>,
@@ -182,7 +182,7 @@ fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap
@@ -216,11 +216,7 @@ fn truncate_fixed_size_list_array(
     )
 }
 
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(clippy::cast_sign_loss)]
 fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
@@ -339,7 +335,7 @@ fn hashmap_to_string(map: &HashMap<String, String>, separator: &str) -> String {
         .join(separator)
 }
 
-#[allow(clippy::doc_lazy_continuation)]
+#[expect(clippy::doc_lazy_continuation)]
 /// Creates a markdown representation of tables' schemas in the following format:
 ///
 /// **Table: users**
@@ -441,8 +437,7 @@ Cras venenatis euismod malesuada.",
             None,
             &["location".to_string(), "dist".to_string()],
         )
-        .expect("format record batch")
-        .to_string();
+        .expect("format record batch");
 
         insta::assert_snapshot!(formatted);
 
@@ -452,8 +447,7 @@ Cras venenatis euismod malesuada.",
             Some("content"),
             &["location".to_string(), "dist".to_string()],
         )
-        .expect("format record batch")
-        .to_string();
+        .expect("format record batch");
 
         insta::assert_snapshot!("with_alias", formatted);
 

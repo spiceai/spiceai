@@ -128,7 +128,7 @@ pub struct PartitionStats {
 
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct VortexConfig {
     /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
     pub enable_alp: bool,

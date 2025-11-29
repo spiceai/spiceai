@@ -108,7 +108,7 @@ impl StreamState {
             return None;
         }
 
-        let last_seq_opt = records.last()?.clone().dynamodb?.sequence_number.clone();
+        let last_seq_opt = records.last()?.clone().dynamodb?.sequence_number;
         tracing::debug!(
             "Shard latest sequence number: shard_id={:?}, seq_number={:?}",
             shard_id,
@@ -1840,8 +1840,7 @@ mod tests {
                 create_record("104"),
             ];
 
-            let batch =
-                state.handle_poll_result("shard-1", Some("iter-2".to_string()), records.clone());
+            let batch = state.handle_poll_result("shard-1", Some("iter-2".to_string()), records);
 
             assert!(batch.is_some());
             let batch = batch.expect("Expected batch to be Some");

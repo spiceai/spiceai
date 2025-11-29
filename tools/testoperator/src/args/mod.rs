@@ -24,6 +24,11 @@ pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
 
+#[cfg(feature = "append")]
+mod append;
+#[cfg(feature = "append")]
+pub use append::AppendTestArgs;
+
 pub mod dispatch;
 use dispatch::DispatchArgs;
 
@@ -62,8 +67,7 @@ pub enum TestCommands {
     /// Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
-    Append(DatasetTestArgs),
-    /// Run a vector search test
+    Append(AppendTestArgs),
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
     Query(QueryArgs),

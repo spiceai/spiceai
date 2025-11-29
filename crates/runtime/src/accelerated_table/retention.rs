@@ -39,9 +39,7 @@ use crate::{
 use runtime_object_store::registry::default_runtime_env;
 
 impl super::AcceleratedTable {
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn start_retention_check(
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
@@ -235,7 +233,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Create test data with different timestamps (some old, some recent)
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("to get current time")

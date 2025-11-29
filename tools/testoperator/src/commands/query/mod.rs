@@ -31,7 +31,6 @@ use test_framework::{
     },
 };
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
     let mut spiced_instance = SpicedInstance::empty();
 

@@ -345,7 +345,7 @@ struct DatasetDeserializer {
     check_availability: CheckAvailability,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
 
@@ -437,7 +437,6 @@ mod check_availability_tests {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_yaml;

@@ -125,7 +125,7 @@ pub fn process_batch(
     let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
 
-    let changes_schema = changes_schema(table_schema).clone();
+    let changes_schema = changes_schema(table_schema);
 
     let mut changes_struct_builder =
         StructBuilder::from_fields(changes_schema.fields().clone(), records.len());
@@ -289,7 +289,7 @@ mod tests {
             .build()
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn create_stream_result(records: Vec<Record>) -> StreamResult {
         Ok(DynamoDBStreamBatch {
             records,
@@ -328,8 +328,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -365,8 +365,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -398,8 +398,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -424,8 +424,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Empty batch should produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -467,17 +467,17 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should have 3 rows
             assert_eq!(change_batch.record.num_rows(), 3);
 
             // Verify operations
             assert!(matches!(change_batch.op(0), ChangeOperation::Create));
-            assert!(matches!(change_batch.op(1), ChangeOperation::Update));
-            assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
-        }
+                assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+                assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
+            }
 
         #[test]
         fn test_process_batch_with_unnest_depth() {
@@ -505,7 +505,7 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
+            result.expect("Should create change envelope with unnesting");
         }
 
         #[test]
@@ -534,8 +534,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify we can extract primary keys (should be empty)
             let pks = change_batch.primary_keys(0);
@@ -558,8 +558,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -585,8 +585,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -612,8 +612,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -645,8 +645,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify primary keys
             let pks = change_batch.primary_keys(0);
@@ -683,8 +683,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should only process the valid record
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -711,13 +711,13 @@ mod tests {
             let result = process_batch(
                 create_stream_result(batch),
                 &table_schema,
-                &primary_keys.clone(),
+                &primary_keys,
                 None,
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify primary keys can be extracted
             let extracted_pks = change_batch.primary_keys(0);
@@ -750,8 +750,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            assert!(result.is_ok());
-            let (change_batch, _checkpoint) = result.expect("change envelope");
+
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify data can be extracted
             let data_batch = change_batch.data(0);

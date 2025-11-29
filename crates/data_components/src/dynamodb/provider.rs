@@ -537,14 +537,16 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         };
 
         let segment: i32 = i32::try_from(partition).map_err(|_| {
-            DataFusionError::Execution(
-                format!("Partition number too large for DynamoDB segment: {partition}").to_string(),
-            )
+            DataFusionError::Execution(format!(
+                "Partition number too large for DynamoDB segment: {partition}"
+            ))
         })?;
 
-        let total_segments: i32 = i32::try_from(total_partitions).map_err(|_| DataFusionError::Execution(
-            format!("Total partitions number too large for DynamoDB total_segments: {total_partitions}").to_string()
-        ))?;
+        let total_segments: i32 = i32::try_from(total_partitions).map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Total partitions number too large for DynamoDB total_segments: {total_partitions}"
+            ))
+        })?;
 
         builder.spawn(async move {
             const CHUNK_SIZE: usize = 4_000;
@@ -654,11 +656,10 @@ fn build_stream_from_plan(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 fn map_sdk_error<E>(err: SdkError<E>) -> Box<dyn std::error::Error + Send + Sync>

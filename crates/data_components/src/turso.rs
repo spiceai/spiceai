@@ -441,7 +441,7 @@ impl TursoConnectionPool {
     /// This method is lightweight and can be called frequently. Each connection
     /// shares the underlying database instance, making it efficient for high-frequency
     /// operations.
-    #[allow(clippy::unused_async)]
+    #[expect(clippy::unused_async)]
     pub async fn connect(&self) -> Result<Connection> {
         self.database.connect().context(TursoDatabaseSnafu)
     }
@@ -533,7 +533,7 @@ impl TursoTableProvider {
     /// - Time: Time32, Time64
     /// - Duration, Interval, Decimal128, Decimal256
     /// - Complex types: List, Map (serialized as JSON)
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::match_same_arms,
         clippy::cast_precision_loss,
@@ -1004,7 +1004,7 @@ impl TursoTableProvider {
                                     for (key, value) in map {
                                         map_builder.keys().append_value(&key);
                                         if let Some(int_val) = value.as_i64() {
-                                            #[allow(clippy::cast_possible_truncation)]
+                                            #[expect(clippy::cast_possible_truncation)]
                                             let val = int_val as i32;
                                             map_builder.values().append_value(val);
                                         } else {
@@ -1046,14 +1046,14 @@ impl TursoTableProvider {
                     // Decimal128 stored as REAL in database
                     // Convert back to i128 scaled value
                     const DECIMAL_BASE: i128 = 10;
-                    #[allow(clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_sign_loss)]
                     let scale_factor = DECIMAL_BASE.pow(*scale as u32);
                     let values: Vec<Option<i128>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Real(f) => {
                                 // Convert float to scaled integer
-                                #[allow(
+                                #[expect(
                                     clippy::cast_possible_truncation,
                                     clippy::cast_precision_loss
                                 )]
@@ -1083,14 +1083,14 @@ impl TursoTableProvider {
                     // Decimal256 stored as REAL in database
                     // Convert back to i256 scaled value
                     const DECIMAL_BASE: i128 = 10;
-                    #[allow(clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_sign_loss)]
                     let scale_factor = DECIMAL_BASE.pow(*scale as u32);
                     let values: Vec<Option<i256>> = rows
                         .iter()
                         .map(|row| match &row[col_idx] {
                             TursoValue::Real(f) => {
                                 // Convert float to scaled integer
-                                #[allow(
+                                #[expect(
                                     clippy::cast_possible_truncation,
                                     clippy::cast_precision_loss
                                 )]
@@ -1825,7 +1825,7 @@ fn convert_timestamp_to_turso(
 
             // Split into seconds and subsecond nanos
             let secs = nanos / timestamp_conversion::NANOS_PER_SECOND;
-            #[allow(clippy::cast_sign_loss)]
+            #[expect(clippy::cast_sign_loss)]
             let nsecs = (nanos % timestamp_conversion::NANOS_PER_SECOND) as u32;
 
             // Create NaiveDateTime using the new DateTime::from_timestamp API
@@ -1898,7 +1898,7 @@ fn convert_timestamp_to_turso(
 /// - `Timestamp*(_, Some(_))` → ERROR
 ///
 /// Configure via spicepod.yaml: `acceleration.params.internal_timestamp_format: "rfc3339"` or `"integer_millis"`
-#[allow(clippy::too_many_lines, clippy::match_same_arms)]
+#[expect(clippy::too_many_lines, clippy::match_same_arms)]
 fn scalar_value_to_turso(
     value: ScalarValue,
     timestamp_format: TimestampFormat,
@@ -1971,15 +1971,15 @@ fn scalar_value_to_turso(
         }
         ScalarValue::Decimal128(Some(v), _, scale) => {
             // Convert decimal to float for storage as REAL
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let scale_factor = (DECIMAL_BASE as f64).powi(i32::from(scale));
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let v_f64 = v as f64;
             TursoValue::Real(v_f64 / scale_factor)
         }
         ScalarValue::Decimal256(Some(v), _, scale) => {
             // Convert decimal256 to float for storage as REAL
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let scale_factor = (DECIMAL_BASE as f64).powi(i32::from(scale));
             let v_str = format!("{v}");
             let v_f64 = v_str

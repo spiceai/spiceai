@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::get_app_and_start_request;
 use crate::{
-    args::{DatasetTestArgs, QuerySetLoader},
+    args::{AppendTestArgs, QuerySetLoader},
     health::HealthMonitor,
     wait_test_and_memory,
 };
@@ -36,11 +36,15 @@ use test_framework::{
     utils::observe_memory,
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    let query_set = args.load_query_set()?;
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
+    let query_set = args.test_args.load_query_set()?;
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(QueryOverrides::from);
 
-    let (app, start_request) = get_app_and_start_request(&args.common).await?;
+    let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
 
     check_app_is_appendable(&app)?;
 
@@ -51,10 +55,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_query_set(query_set.clone(), query_overrides)
             .with_parallel_count(1)
-            .with_end_duration(Duration::from_secs(60 * 60))
-            .with_tempdir_path(start_request.get_tempdir_path()),
+            .with_end_duration(Duration::from_secs(args.test_args.common.duration))
+            .with_tempdir_path(start_request.get_tempdir_path())
+            .with_load_interval(Duration::from_secs(args.load_interval))
+            .with_load_steps(args.load_steps)
+            .with_conflict_data(args.with_conflict_data),
     )
-    .with_progress_bars(false)
+    .with_progress_bars(!args.test_args.common.disable_progress_bars)
     .start_appending()
     .await?;
 
@@ -63,7 +70,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
+        .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -79,7 +86,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let table_count_result = check_table_counts(
         &spiced_instance,
         &query_set,
-        args.scale_factor.unwrap_or(1.0),
+        args.test_args.scale_factor.unwrap_or(1.0),
     )
     .await;
 

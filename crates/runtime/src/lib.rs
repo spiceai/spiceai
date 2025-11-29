@@ -448,7 +448,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
@@ -483,7 +483,6 @@ pub struct Runtime {
 
     resource_monitor: resource_monitor::ResourceMonitor,
 
-    #[allow(dead_code)] // used in "cluster" feature
     config: Arc<Config>,
 }
 
@@ -625,7 +624,7 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
@@ -871,7 +870,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         Arc::clone(&self).set_components_initializing().await;
 
@@ -1186,13 +1185,13 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     make_spice_data_sub_directory(&[])?;
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);

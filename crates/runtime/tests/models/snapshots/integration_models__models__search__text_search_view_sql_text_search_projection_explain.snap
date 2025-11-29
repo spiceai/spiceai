@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, question, subject, trunc(score, 3) as score FROM text_search(qs, 'second') order by score desc LIMIT 4"
+snapshot_kind: text
 ---
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                         |
@@ -12,8 +13,8 @@ description: "SELECT id, answer, question, subject, trunc(score, 3) as score FRO
 |               |   SortExec: TopK(fetch=4), expr=[score@4 DESC], preserve_partitioning=[true]                                                                                                                                                                 |
 |               |     ProjectionExec: expr=[id@1 as id, answer@0 as answer, question@2 as question, subject@4 as subject, trunc(score@3, 3) as score]                                                                                                          |
 |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                                                   |
-|               |         ProjectionExec: expr=[answer@3 as answer, id@0 as id, question@2 as question, score@1 as score, subject@4 as subject]                                                                                                                |
-|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@0)], projection=[id@0, score@1, question@3, answer@4, subject@5]                                                                                                     |
+|               |         ProjectionExec: expr=[answer@2 as answer, id@0 as id, question@3 as question, score@1 as score, subject@4 as subject]                                                                                                                |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@1)], projection=[id@0, score@1, answer@2, question@4, subject@5]                                                                                                     |
 |               |             CoalescePartitionsExec                                                                                                                                                                                                           |
 |               |               CooperativeExec                                                                                                                                                                                                                |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                                         |

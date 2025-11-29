@@ -28,7 +28,7 @@ use tokio::time::Duration;
 use util::retry_strategy::{BackoffMethod, RetryBackoffBuilder};
 
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Client {
     sdk_client: Arc<SDKClient>,
     table_name: String,
@@ -73,7 +73,7 @@ impl Client {
                     s.shard_id.clone(),
                     ShardCheckpoint {
                         sequence_number,
-                        parent_id: s.parent_shard_id.clone(),
+                        parent_id: s.parent_shard_id,
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::At,
                     },
