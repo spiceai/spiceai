@@ -154,6 +154,7 @@ impl SearchQueryProvider {
 
         base_table_cols.extend(self.primary_key.clone());
 
+        // Include columns for all filters.
         let before_final_filter: Vec<String> = filters
             .iter()
             .flat_map(|f| {
@@ -171,16 +172,41 @@ impl SearchQueryProvider {
             .sorted()
             .collect();
 
-        let before_final_filter =
-            projection_from_columns(&self.table_provider.schema(), &before_final_filter);
+        let mut scan = LogicalPlanBuilder::scan(
+            "base_table",
+            Arc::new(DefaultTableSource::new(
+                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
+            )),
+            Some(projection_from_columns(
+                &self.table_provider.schema(),
+                &before_final_filter,
+            )),
+        )?;
 
-        // Get filters that can be pushed down to the base table
+        if let Some(f) = self.base_table_filters(filters)? {
+            scan = scan.filter(f)?;
+        }
+
+        // Only return columns 1. asked for in projection or 2. Needed by filters but not in search schema.
+        // Previous projection `before_final_filter` included all columns needed by filters.
+        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
+        scan.project(
+            base_table_cols
+                .iter()
+                .map(|c| SelectExpr::Expression(col(c)))
+                .collect::<Vec<_>>(),
+        )?
+        .build()
+    }
+
+    // Get filters that can be pushed down to the base table
+    fn base_table_filters(&self, filters: &[Expr]) -> Result<Option<Expr>, DataFusionError> {
         let filter_refs: Vec<_> = filters.iter().collect();
         let supported_filters = self
             .table_provider
             .supports_filters_pushdown(filter_refs.as_slice())?;
 
-        let pushdown_filter: Option<Expr> = filters
+        Ok(filters
             .iter()
             .zip(supported_filters.iter())
             .filter_map(|(f, supp)| {
@@ -191,27 +217,7 @@ impl SearchQueryProvider {
                     Some(f.clone())
                 }
             })
-            .reduce(Expr::and);
-
-        let mut scan = LogicalPlanBuilder::scan(
-            "base_table",
-            Arc::new(DefaultTableSource::new(
-                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
-            )),
-            Some(before_final_filter),
-        )?;
-
-        if let Some(f) = pushdown_filter {
-            scan = scan.filter(f)?;
-        }
-        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
-        scan.project(
-            base_table_cols
-                .iter()
-                .map(|c| SelectExpr::Expression(col(c)))
-                .collect::<Vec<_>>(),
-        )?
-        .build()
+            .reduce(Expr::and))
     }
 
     fn join_with_base(
