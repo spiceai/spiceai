@@ -34,7 +34,9 @@ use datafusion::{
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
     sql::TableReference,
 };
+use datafusion_expr::select_expr::SelectExpr;
 use futures::future::BoxFuture;
+use itertools::Itertools;
 
 use crate::{
     SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
@@ -149,22 +151,62 @@ impl SearchQueryProvider {
         for f in search_index_schema.fields() {
             base_table_cols.remove(f.name());
         }
+
         base_table_cols.extend(self.primary_key.clone());
 
-        // Also include any columns needed for filters on base table.
-        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
-        let base_table_cols: Vec<_> = base_table_cols.into_iter().collect();
-        let mut base_proj =
-            projection_from_columns(&self.table_provider.schema(), &base_table_cols);
-        base_proj.sort_unstable(); // Deterministic LogicalPlans
+        // Include columns for all filters.
+        let before_final_filter: Vec<String> = filters
+            .iter()
+            .flat_map(|f| {
+                f.column_refs()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            // Sort for deterministic LogicalPlans
+            .collect::<HashSet<String>>()
+            .union(&base_table_cols)
+            .cloned()
+            .collect::<Vec<String>>()
+            .into_iter()
+            .sorted()
+            .collect();
 
-        // Get filters that can be pushed down to the base table
+        let mut scan = LogicalPlanBuilder::scan(
+            "base_table",
+            Arc::new(DefaultTableSource::new(
+                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
+            )),
+            Some(projection_from_columns(
+                &self.table_provider.schema(),
+                &before_final_filter,
+            )),
+        )?;
+
+        if let Some(f) = self.base_table_filters(filters)? {
+            scan = scan.filter(f)?;
+        }
+
+        // Only return columns 1. asked for in projection or 2. Needed by filters but not in search schema.
+        // Previous projection `before_final_filter` included all columns needed by filters.
+        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
+        scan.project(
+            base_table_cols
+                .iter()
+                .map(|c| SelectExpr::Expression(ident(c)))
+                .sorted_by_key(ToString::to_string), // Sort for deterministic LogicalPlans
+        )?
+        .build()
+    }
+
+    // Get filters that can be pushed down to the base table
+    fn base_table_filters(&self, filters: &[Expr]) -> Result<Option<Expr>, DataFusionError> {
         let filter_refs: Vec<_> = filters.iter().collect();
         let supported_filters = self
             .table_provider
             .supports_filters_pushdown(filter_refs.as_slice())?;
 
-        let underlying_filter: Option<Expr> = filters
+        Ok(filters
             .iter()
             .zip(supported_filters.iter())
             .filter_map(|(f, supp)| {
@@ -175,20 +217,7 @@ impl SearchQueryProvider {
                     Some(f.clone())
                 }
             })
-            .reduce(Expr::and);
-
-        let mut scan = LogicalPlanBuilder::scan(
-            "base_table",
-            Arc::new(DefaultTableSource::new(
-                Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
-            )),
-            Some(base_proj),
-        )?;
-
-        if let Some(f) = underlying_filter {
-            scan = scan.filter(f)?;
-        }
-        scan.build()
+            .reduce(Expr::and))
     }
 
     fn join_with_base(
