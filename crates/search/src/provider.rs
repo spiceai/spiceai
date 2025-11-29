@@ -34,7 +34,9 @@ use datafusion::{
     prelude::{Expr, array_element, binary_expr, cast, col, ident, lit, substring},
     sql::TableReference,
 };
+use datafusion_expr::select_expr::SelectExpr;
 use futures::future::BoxFuture;
+use itertools::Itertools;
 
 use crate::{
     SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
@@ -149,14 +151,28 @@ impl SearchQueryProvider {
         for f in search_index_schema.fields() {
             base_table_cols.remove(f.name());
         }
+
         base_table_cols.extend(self.primary_key.clone());
 
-        // Also include any columns needed for filters on base table.
-        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
-        let base_table_cols: Vec<_> = base_table_cols.into_iter().collect();
-        let mut base_proj =
-            projection_from_columns(&self.table_provider.schema(), &base_table_cols);
-        base_proj.sort_unstable(); // Deterministic LogicalPlans
+        let before_final_filter: Vec<String> = filters
+            .iter()
+            .flat_map(|f| {
+                f.column_refs()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            // Sort for deterministic LogicalPlans
+            .collect::<HashSet<String>>()
+            .union(&base_table_cols)
+            .cloned()
+            .collect::<Vec<String>>()
+            .into_iter()
+            .sorted()
+            .collect();
+
+        let before_final_filter =
+            projection_from_columns(&self.table_provider.schema(), &before_final_filter);
 
         // Get filters that can be pushed down to the base table
         let filter_refs: Vec<_> = filters.iter().collect();
@@ -164,7 +180,7 @@ impl SearchQueryProvider {
             .table_provider
             .supports_filters_pushdown(filter_refs.as_slice())?;
 
-        let underlying_filter: Option<Expr> = filters
+        let pushdown_filter: Option<Expr> = filters
             .iter()
             .zip(supported_filters.iter())
             .filter_map(|(f, supp)| {
@@ -182,13 +198,20 @@ impl SearchQueryProvider {
             Arc::new(DefaultTableSource::new(
                 Arc::clone(&self.table_provider) as Arc<dyn TableProvider>
             )),
-            Some(base_proj),
+            Some(before_final_filter),
         )?;
 
-        if let Some(f) = underlying_filter {
+        if let Some(f) = pushdown_filter {
             scan = scan.filter(f)?;
         }
-        scan.build()
+        base_table_cols.extend(columns_missing_from(filters, search_index_schema));
+        scan.project(
+            base_table_cols
+                .iter()
+                .map(|c| SelectExpr::Expression(col(c)))
+                .collect::<Vec<_>>(),
+        )?
+        .build()
     }
 
     fn join_with_base(
