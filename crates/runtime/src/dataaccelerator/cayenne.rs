@@ -39,7 +39,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -629,6 +629,22 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         let dir_path = self.file_path(source)?;
+
+        // If mode is FileCreate, delete the existing directory to start fresh
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.mode == Mode::FileCreate
+        {
+            let path_buf = PathBuf::from(&dir_path);
+            if path_buf.exists() {
+                tracing::warn!(
+                    "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
+                    dir_path
+                );
+                std::fs::remove_dir_all(&path_buf).map_err(|err| {
+                    Error::AccelerationInitializationFailed { source: err.into() }
+                })?;
+            }
+        }
 
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
