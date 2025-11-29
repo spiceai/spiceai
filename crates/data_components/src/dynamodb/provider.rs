@@ -24,7 +24,7 @@ use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
-use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_envelope};
+use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
@@ -329,7 +329,7 @@ impl DynamoDBTableProvider {
                         self.table_schema.table_name(),
                         record_batch.num_rows()
                     );
-                    record_batch_to_change_envelope(record_batch, &schema, &primary_keys)
+                    record_batch_to_change_batch(record_batch, &schema, &primary_keys)
                         .map_err(crate::cdc::StreamError::DynamoDB)
                 }
                 Err(e) => Err(crate::cdc::StreamError::DynamoDB(
