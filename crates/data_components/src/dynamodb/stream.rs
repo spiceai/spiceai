@@ -329,7 +329,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -366,7 +366,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -399,7 +399,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -425,7 +425,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Empty batch should produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -468,24 +468,15 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Should have 3 rows
             assert_eq!(change_batch.record.num_rows(), 3);
 
             // Verify operations
-            assert!(matches!(
-                change_batch.op(0),
-                ChangeOperation::Create
-            ));
-            assert!(matches!(
-                change_batch.op(1),
-                ChangeOperation::Update
-            ));
-            assert!(matches!(
-                change_batch.op(2),
-                ChangeOperation::Delete
-            ));
+            assert!(matches!(change_batch.op(0), ChangeOperation::Create));
+            assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+            assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
         }
 
         #[test]
@@ -544,7 +535,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify we can extract primary keys (should be empty)
             let pks = change_batch.primary_keys(0);
@@ -568,7 +559,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -595,7 +586,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -622,7 +613,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -655,7 +646,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify primary keys
             let pks = change_batch.primary_keys(0);
@@ -693,7 +684,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Should only process the valid record
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -726,7 +717,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify primary keys can be extracted
             let extracted_pks = change_batch.primary_keys(0);
@@ -760,7 +751,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let (change_batch, checkpoint) = result.expect("change envelope");
+            let (change_batch, _checkpoint) = result.expect("change envelope");
 
             // Verify data can be extracted
             let data_batch = change_batch.data(0);
@@ -785,11 +776,13 @@ mod tests {
         }
 
         fn create_test_batch(schema: Arc<Schema>, row_count: usize) -> RecordBatch {
-            let ids: Int32Array = (0..row_count as i32).collect();
-            let names: Vec<String> = (0..row_count).map(|i| format!("name_{}", i)).collect();
+            let ids: Int32Array =
+                (0..i32::try_from(row_count).expect("row_count fits in i32")).collect();
+            let names: Vec<String> = (0..row_count).map(|i| format!("name_{i}")).collect();
             let names_array: StringArray = names.iter().map(|s| Some(s.as_str())).collect();
 
-            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names_array)]).unwrap()
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names_array)])
+                .expect("valid record batch")
         }
 
         #[test]
@@ -801,7 +794,7 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
             assert_eq!(change_batch.num_rows(), 1);
         }
@@ -815,7 +808,7 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 100);
         }
 
@@ -828,7 +821,7 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 0);
         }
 
@@ -841,12 +834,15 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
             // Verify the primary keys column is a list array
             let pk_column = change_batch.column(1);
-            let pk_list = pk_column.as_any().downcast_ref::<ListArray>().unwrap();
+            let pk_list = pk_column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("pk_column is ListArray");
 
             // Each row should have 2 primary keys
             for i in 0..change_batch.num_rows() {
@@ -864,11 +860,14 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
             let pk_column = change_batch.column(1);
-            let pk_list = pk_column.as_any().downcast_ref::<ListArray>().unwrap();
+            let pk_list = pk_column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("pk_column is ListArray");
 
             // Each row should have an empty list
             for i in 0..change_batch.num_rows() {
@@ -886,12 +885,15 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
             // First column should be the operation column
             let op_column = change_batch.column(0);
-            let op_array = op_column.as_any().downcast_ref::<StringArray>().unwrap();
+            let op_array = op_column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column is StringArray");
 
             // All operations should be "c" (Create)
             for i in 0..change_batch.num_rows() {
@@ -908,12 +910,15 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
             // Third column should be the data as a struct
             let data_column = change_batch.column(2);
-            let struct_array = data_column.as_any().downcast_ref::<StructArray>().unwrap();
+            let struct_array = data_column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("data_column is StructArray");
 
             assert_eq!(struct_array.len(), 5);
             assert_eq!(struct_array.num_columns(), 2); // id and name
@@ -931,7 +936,10 @@ mod tests {
             // Verify all rows have the same primary keys
             for i in 0..row_count {
                 let list_value = pk_array.value(i);
-                let string_array = list_value.as_any().downcast_ref::<StringArray>().unwrap();
+                let string_array = list_value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("column is StringArray");
 
                 assert_eq!(string_array.len(), 2);
                 assert_eq!(string_array.value(0), "id");
@@ -948,7 +956,10 @@ mod tests {
 
             for i in 0..row_count {
                 let list_value = pk_array.value(i);
-                let string_array = list_value.as_any().downcast_ref::<StringArray>().unwrap();
+                let string_array = list_value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("column is StringArray");
 
                 assert_eq!(string_array.len(), 1);
                 assert_eq!(string_array.value(0), "id");
@@ -974,7 +985,7 @@ mod tests {
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
             assert!(result.is_ok());
-            let change_batch = result.unwrap();
+            let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 10000);
         }
 
@@ -1002,7 +1013,7 @@ mod tests {
                     Arc::new(optional_ints),
                 ],
             )
-                .unwrap();
+            .expect("valid record batch");
 
             let primary_keys = vec!["id".to_string()];
 

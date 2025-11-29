@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::{CheckpointPosition, Checkpoint, ShardCheckpoint};
+use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::{ApiShard, SDKClient};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::collections::HashMap;

@@ -97,7 +97,6 @@ impl DynamoDBTableProvider {
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
-                .shard_record_limit(Some(10))
                 .build(),
         );
 
@@ -294,10 +293,17 @@ impl DynamoDBTableProvider {
         Ok(Box::pin(stream))
     }
 
+    /// Creates a bootstrap stream for the `DynamoDB` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Logical plan construction fails
+    /// - Stream execution fails
     pub async fn bootstrap_stream(
         self: Arc<Self>,
     ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
-        let schema = self.table_schema.schema().clone();
+        let schema = Arc::clone(self.table_schema.schema());
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();
 
@@ -309,12 +315,11 @@ impl DynamoDBTableProvider {
 
         let logical_plan = LogicalPlanBuilder::scan(table_name, table_source, None)
             .and_then(|b| b.project(columns))
-            .and_then(|b| b.build())
+            .and_then(datafusion::logical_expr::LogicalPlanBuilder::build)
             .context(FailedToBootstrapTableSnafu)?;
 
         let ctx = SessionContext::new();
-        let df = DataFrame::new(ctx.state(), logical_plan)
-            .limit(0, Some(100)).unwrap();
+        let df = DataFrame::new(ctx.state(), logical_plan);
 
         let record_batch_stream = df
             .execute_stream()

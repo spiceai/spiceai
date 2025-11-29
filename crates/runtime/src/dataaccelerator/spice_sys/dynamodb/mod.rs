@@ -15,10 +15,7 @@ limitations under the License.
 */
 
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
-use crate::{
-    component::dataset::Dataset,
-    dataaccelerator::spice_sys::OpenOption,
-};
+use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 use serde::{Deserialize, Serialize};
 
 const DYNAMODB_STREAMS_TABLE_NAME: &str = "spice_sys_dynamodb_streams";

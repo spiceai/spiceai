@@ -262,12 +262,16 @@ impl DataConnector for DynamoDB {
 
                 if should_bootstrap {
                     // Initialize bootstrap stream
-                    let bootstrap_stream = Arc::clone(&dynamodb).bootstrap_stream().await.ok()?.map(|msg| {
-                        msg.map(|change_batch| {
-                            // Bootstrap stream doesn't commit changes
-                            ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch)
-                        })
-                    });
+                    let bootstrap_stream = Arc::clone(&dynamodb)
+                        .bootstrap_stream()
+                        .await
+                        .ok()?
+                        .map(|msg| {
+                            msg.map(|change_batch| {
+                                // Bootstrap stream doesn't commit changes
+                                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch)
+                            })
+                        });
 
                     // Attach changes stream from initial checkpoint to bootstrap stream
                     Some(
@@ -317,35 +321,32 @@ async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<Arc<DynamoDBSys>> 
     }
 }
 
-/// Loads checkpoint from DynamoDBSys, or initializes a new checkpoint if none exists.
+/// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: &Arc<DynamoDBSys>,
 ) -> Option<(bool, Checkpoint)> {
     let existing_checkpoint = dynamodb_sys.get().await;
 
-    match existing_checkpoint {
-        Some(metadata) => {
-            match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
-                Ok(checkpoint) => {
-                    tracing::info!(
-                        "Found existing checkpoint for DynamoDB Stream, resuming from checkpoint"
-                    );
-                    Some((false, checkpoint))
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to deserialize checkpoint, falling back to bootstrap: {:?}",
-                        err
-                    );
-                    get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
-                }
+    if let Some(metadata) = existing_checkpoint {
+        match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
+            Ok(checkpoint) => {
+                tracing::info!(
+                    "Found existing checkpoint for DynamoDB Stream, resuming from checkpoint"
+                );
+                Some((false, checkpoint))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to deserialize checkpoint, falling back to bootstrap: {:?}",
+                    err
+                );
+                get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
             }
         }
-        None => {
-            tracing::info!("No existing checkpoint found, starting from bootstrap");
-            get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
-        }
+    } else {
+        tracing::info!("No existing checkpoint found, starting from bootstrap");
+        get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
     }
 }
 
@@ -423,6 +424,7 @@ pub struct DynamoDBStreamCommitter {
 }
 
 impl DynamoDBStreamCommitter {
+    #[must_use]
     pub fn new(dynamodb_sys: Arc<DynamoDBSys>, checkpoint: Checkpoint) -> Self {
         Self {
             dynamodb_sys,
