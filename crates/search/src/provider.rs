@@ -194,7 +194,7 @@ impl SearchQueryProvider {
             base_table_cols
                 .iter()
                 .map(|c| SelectExpr::Expression(ident(c)))
-                .sorted_by_key(|c| c.to_string()), // Sort for deterministic LogicalPlans
+                .sorted_by_key(ToString::to_string), // Sort for deterministic LogicalPlans
         )?
         .build()
     }
