@@ -154,11 +154,6 @@ impl RefreshTask {
         let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
             .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
 
-        tracing::debug!(
-            "Processing append/change stream batch: {:#?}",
-            change_batch.record.num_rows()
-        );
-
         for row in 0..change_batch.record.num_rows() {
             let op = change_batch.op(row);
             match op {
@@ -193,12 +188,11 @@ impl RefreshTask {
                     let session_state = ctx.state();
 
                     if primary_keys.is_empty() {
-                        tracing::trace!("Inserting data row for {dataset_name}",);
+                        tracing::debug!("Inserting data row for {dataset_name}",);
                     } else {
                         tracing::trace!(
-                            "Upserting data row for {dataset_name} with {}, version={:?}",
-                            Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?,
-                            Self::get_primary_key_value(&inner_data, "version")?
+                            "Upserting data row for {dataset_name} with {}",
+                            Self::get_primary_key_log_fmt(&inner_data, &primary_keys)?
                         );
                     }
 
