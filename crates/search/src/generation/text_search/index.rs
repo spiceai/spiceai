@@ -29,6 +29,7 @@ use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::{DocParsingError, SchemaBuilder};
 use tantivy::{TantivyDocument, TantivyError};
+use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
@@ -50,8 +51,9 @@ pub struct FullTextDatabaseIndex {
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
 
-    // Read queries will be blocking during index writes.
-    pub index: Arc<std::sync::RwLock<tantivy::Index>>,
+    // `index` access should only be needed for write path. Query/reads should use [`self::reader`].
+    pub index: Arc<Mutex<tantivy::Index>>,
+    pub reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -86,7 +88,7 @@ impl Index for FullTextDatabaseIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if let Err(e) = self.update_index(batches.as_slice()) {
+        if let Err(e) = self.update_index(batches.as_slice()).await {
             tracing::error!("Failed to update full text search index: {e}");
             return Err(DataFusionError::External(Box::new(e)));
         }
@@ -121,12 +123,14 @@ impl FullTextDatabaseIndex {
         } else {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
+        let reader = index.reader().context(TextSearchIndexingSnafu)?;
 
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(std::sync::RwLock::new(index)),
+            index: Arc::new(Mutex::new(index)),
             primary_key: pks,
+            reader,
         })
     }
 
@@ -157,13 +161,8 @@ impl FullTextDatabaseIndex {
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self
-            .index
-            .read()
-            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
-
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            &index_read,
+            self.reader.searcher(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -220,7 +219,7 @@ impl FullTextDatabaseIndex {
     /// columns present will be ignored.
     ///
     /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
-    fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
+    async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if self.primary_key.len() > 1 {
             rb.iter()
@@ -235,14 +234,7 @@ impl FullTextDatabaseIndex {
 
         // Updates in tantivy are a deletion then insertion.
         // Prepare documents to insert/delete with read lock.
-        let index_read =
-            self.index
-                .read()
-                .map_err(|_| super::Error::FailedToInsertDataIntoIndex {
-                    source: TantivyError::Poisoned,
-                })?;
-        let index_schema = index_read.schema();
-        drop(index_read);
+        let index_schema = self.reader.searcher().schema().clone();
         let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
@@ -250,31 +242,26 @@ impl FullTextDatabaseIndex {
         let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
-        // Write to index with write lock.
-        let index_writable =
-            self.index
-                .write()
-                .map_err(|_| super::Error::FailedToInsertDataIntoIndex {
-                    source: TantivyError::Poisoned,
-                })?;
-        {
-            let mut index_writer: tantivy::IndexWriter = index_writable
-                .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-                .context(IndexCreationSnafu)?;
-            // Deletion.
-            for t in terms_to_delete {
-                index_writer.delete_term(t);
-            }
-            // Insertion.
-            for doc in docs {
-                index_writer.add_document(doc).context(IndexCreationSnafu)?;
-            }
-            index_writer
-                .commit()
-                .context(FailedToInsertDataIntoIndexSnafu)?;
+        let index_writable = self.index.lock().await;
+        let mut index_writer: tantivy::IndexWriter = index_writable
+            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
+            .context(IndexCreationSnafu)?;
+        // Deletion.
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
         }
+        // Insertion.
+        for doc in docs {
+            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        }
+        index_writer
+            .commit()
+            .context(FailedToInsertDataIntoIndexSnafu)?;
         drop(index_writable);
-        Ok(())
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+        })
     }
 
     #[must_use]
@@ -297,6 +284,7 @@ impl FullTextDatabaseIndex {
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
             base_table,
+            reader: self.reader.clone(),
         }
     }
 
@@ -433,7 +421,7 @@ impl SearchIndex for FullTextDatabaseIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        self.update_index(slice::from_ref(&record)).boxed()?;
+        self.update_index(slice::from_ref(&record)).await.boxed()?;
         Ok(record)
     }
 
