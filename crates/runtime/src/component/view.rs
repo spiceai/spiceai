@@ -239,7 +239,11 @@ impl AccelerationSource for View {
             if acceleration.engine == acceleration::Engine::PostgreSQL {
                 return false;
             }
-            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+            return acceleration.enabled
+                && matches!(
+                    acceleration.mode,
+                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                );
         }
         false
     }
