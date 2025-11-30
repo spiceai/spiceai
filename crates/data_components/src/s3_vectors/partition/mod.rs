@@ -45,6 +45,9 @@ const _: () = {
     );
 };
 
+mod list_provider;
+pub use list_provider::S3VectorsPartitionedListTable;
+
 static PARTS_SEPARATOR: &str = ".";
 
 #[derive(Debug, Snafu)]

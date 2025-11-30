@@ -293,7 +293,7 @@ impl std::fmt::Debug for S3VectorsListExec {
     }
 }
 
-struct S3VectorsListExec {
+pub(super) struct S3VectorsListExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
@@ -308,7 +308,7 @@ impl DisplayAs for S3VectorsListExec {
 
 impl S3VectorsListExec {
     pub fn new(
-        table: &S3VectorsListTable,
+        table: &S3VectorsTable,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Self {
@@ -321,7 +321,7 @@ impl S3VectorsListExec {
             Boundedness::Bounded,
         );
 
-        let idx = table.table.current_index();
+        let idx = table.current_index();
 
         Self {
             idx,
