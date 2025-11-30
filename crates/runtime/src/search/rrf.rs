@@ -361,7 +361,7 @@ impl ReciprocalRankFusion {
             // e^(-alpha * age units)
             RecencyDecay::Exponential => {
                 let decay_constant = args.decay_constant.unwrap_or(0.01);
-                #[allow(clippy::neg_multiply)]
+                #[expect(clippy::neg_multiply)]
                 exp(lit(-1.0f64 * decay_constant) * age_in_units)
             }
             // 1 - (age units / boost window)

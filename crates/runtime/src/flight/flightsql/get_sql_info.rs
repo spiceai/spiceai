@@ -463,7 +463,7 @@ pub(crate) static SQL_INFO_SUPPORTS_CONVERT: std::sync::LazyLock<HashMap<i32, Ve
         convert
     });
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| {
     // The following are not defined in the [`SqlInfo`], but are
     // documented at

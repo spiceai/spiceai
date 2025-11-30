@@ -236,7 +236,7 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
         if !std::path::Path::new(&f.path).exists() {
             return Err(Error::ReferencedPathDoesNotExist {
                 name: m.name.clone(),
-                path: f.path.clone(),
+                path: f.path,
             });
         }
     }

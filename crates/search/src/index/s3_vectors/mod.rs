@@ -76,11 +76,6 @@ pub struct S3Vector {
 }
 
 impl S3Vector {
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::too_many_arguments
-    )]
     #[must_use]
     pub fn new(
         table: S3VectorsTable,

@@ -86,7 +86,13 @@ lint-rust:
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
 	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
@@ -94,7 +100,14 @@ lint-rust:
 		-Aclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
 	cargo fmt --all
@@ -105,7 +118,13 @@ lint-rust-fix:
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
 
 lint-go:
 	go vet ./...

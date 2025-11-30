@@ -550,13 +550,13 @@ mod test {
 
     pub struct TestIndex {
         required_cols: Vec<String>,
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         compute_index_cb: Option<fn(Vec<RecordBatch>) -> Result<Vec<RecordBatch>, DataFusionError>>,
         calls: AtomicUsize,
     }
 
     impl TestIndex {
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         fn new(
             required_cols: Vec<String>,
             compute_index_cb: Option<
@@ -627,7 +627,6 @@ mod test {
         ]))
     }
 
-    #[allow(clippy::expect_used)]
     fn test_empty_batch() -> RecordBatch {
         let empty_columns: Vec<ArrayRef> = test_schema()
             .fields()
@@ -638,7 +637,6 @@ mod test {
         RecordBatch::try_new(test_schema(), empty_columns).expect("valid batch")
     }
 
-    #[allow(clippy::expect_used)]
     fn mem_table() -> Arc<dyn TableProvider> {
         let empty_batch = test_empty_batch();
         let mem_table = Arc::new(
@@ -654,7 +652,6 @@ mod test {
         Arc::new(IndexedTableProvider::new(table).add_index(index)) as Arc<dyn TableProvider>
     }
 
-    #[allow(clippy::expect_used)]
     fn test_one_row_batch() -> RecordBatch {
         use datafusion::arrow::array::{Int64Array, StringArray};
         let schema = test_schema();
@@ -664,14 +661,12 @@ mod test {
         RecordBatch::try_new(schema, vec![id, region, value]).expect("valid batch")
     }
 
-    #[allow(clippy::expect_used)]
     fn mem_table_from_batches(batches: Vec<RecordBatch>) -> Arc<dyn TableProvider> {
         let schema = batches[0].schema();
         Arc::new(MemTable::try_new(schema, vec![batches]).expect("valid table"))
             as Arc<dyn TableProvider>
     }
 
-    #[allow(clippy::expect_used)]
     fn one_row_batch() -> RecordBatch {
         let schema = test_schema();
         let id: ArrayRef = Arc::new(Int64Array::from(vec![1]));

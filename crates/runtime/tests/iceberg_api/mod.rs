@@ -38,7 +38,7 @@ pub fn get_s3_dictionary_dataset(name: &str) -> Dataset {
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

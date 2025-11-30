@@ -193,7 +193,7 @@ pub(crate) async fn post(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
 
-    let (sql, parameters) = if let Some("application/json") = content_type {
+    let (sql, parameters) = if content_type == Some("application/json") {
         match serde_json::from_slice::<ParameterizedQuery>(&body) {
             Ok(ParameterizedQuery { sql, parameters }) => {
                 let parameters = match param_utils::convert_json_to_param_values(parameters) {

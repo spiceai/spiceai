@@ -77,7 +77,7 @@ async fn test_aws_sdk_environment_resolution() -> Result<(), anyhow::Error> {
 ///
 /// If not, configure it by placing a `~/.aws/config` file with a `[default]` profile and add static
 /// test credentials for that profile to the `~/.aws/credentials` file.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn ensure_aws_profile() {
     let os_home = std::env::var("HOME").expect("HOME environment variable must be set");
     let config_file_str = format!("{os_home}/.aws/config");
@@ -117,7 +117,7 @@ aws_secret_access_key = {secret_access_key}
         .expect("Failed to write credentials file");
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn validate_one_row(results: Vec<RecordBatch>) {
     assert_eq!(results.len(), 1, "Expected one row in the result");
     let batch = &results[0];

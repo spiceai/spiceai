@@ -84,7 +84,7 @@ macro_rules! ensure_no_expr {
     };
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub fn validate_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,
@@ -208,7 +208,6 @@ pub fn validate_refresh_sql(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn validate_select_columns(
     select: &Vec<SelectItem>,
     source_schema: Arc<Schema>,

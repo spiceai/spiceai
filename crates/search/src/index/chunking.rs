@@ -226,7 +226,7 @@ impl SearchIndex for ChunkedSearchIndex {
     /// | 116 | Do planning and scheduling mean the                  | 0        | [0, 35]   | textbook_reasoning |
     /// | 116 | same thing? (Yes | No)                               | 0        | [35, 57]  | textbook_reasoning |
     /// +-----+------------------------------------------------------+----------|-----------|--------------------+
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn write(
         &self,
         record: RecordBatch,
@@ -437,8 +437,7 @@ impl SearchIndex for ChunkedSearchIndex {
             );
         }
 
-        let agg =
-            LogicalPlan::Aggregate(Aggregate::try_new(tbl, pk_expr.clone(), aggr_expr.clone())?);
+        let agg = LogicalPlan::Aggregate(Aggregate::try_new(tbl, pk_expr, aggr_expr.clone())?);
 
         let final_sort = LogicalPlan::Sort(Sort {
             expr: vec![SortExpr::new(col(SEARCH_SCORE_COLUMN_NAME), false, false)],
@@ -450,11 +449,7 @@ impl SearchIndex for ChunkedSearchIndex {
     }
 }
 
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn to_offset_array(x: &[Vec<(usize, usize)>], nullable: bool) -> FixedSizeListArray {
     let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 2)
         .with_field(Field::new_list_field(DataType::Int32, nullable));
@@ -532,31 +527,24 @@ impl VectorIndex for ChunkedVectorIndex {
                 embedding_col(self.search_column().as_str()),
             )),
         ];
-        aggr_expr.extend(
-            base_index_table
-                .schema()
-                .columns()
-                .iter()
-                .filter_map(|c| {
-                    if [
-                        ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
-                        embedding_col(self.search_column().as_str()),
-                        CHUNKED_INDEX_CHUNK_KEY.to_string(),
-                        self.search_column(),
-                    ]
-                    .contains(&c.name)
-                        || primary_key_names.contains(&c.name)
-                    {
-                        return None;
-                    }
-                    Some(Expr::Alias(Alias::new(
-                        first_value(Expr::Column(c.clone()), vec![]),
-                        None::<TableReference>,
-                        c.name.clone(),
-                    )))
-                })
-                .collect::<Vec<_>>(),
-        );
+        aggr_expr.extend(base_index_table.schema().columns().iter().filter_map(|c| {
+            if [
+                ChunkedSearchIndex::chunking_offset_col(self.search_column().as_str()),
+                embedding_col(self.search_column().as_str()),
+                CHUNKED_INDEX_CHUNK_KEY.to_string(),
+                self.search_column(),
+            ]
+            .contains(&c.name)
+                || primary_key_names.contains(&c.name)
+            {
+                return None;
+            }
+            Some(Expr::Alias(Alias::new(
+                first_value(Expr::Column(c.clone()), vec![]),
+                None::<TableReference>,
+                c.name.clone(),
+            )))
+        }));
 
         if base_index_table
             .schema()

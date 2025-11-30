@@ -39,7 +39,6 @@ test_with_backends!(test_delete_all_rows_impl);
 test_with_backends!(test_delete_then_insert_impl);
 test_with_backends!(test_delete_with_complex_filter_impl);
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_with_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -175,7 +174,6 @@ async fn test_delete_with_primary_key_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_without_primary_key_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -277,7 +275,6 @@ async fn test_delete_without_primary_key_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_all_rows_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -354,7 +351,6 @@ async fn test_delete_all_rows_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_then_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -458,7 +454,6 @@ async fn test_delete_then_insert_impl(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn test_delete_with_complex_filter_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {

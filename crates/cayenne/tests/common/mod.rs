@@ -29,7 +29,8 @@ pub enum BackendType {
 }
 
 impl BackendType {
-    #[allow(dead_code)]
+    #[expect(dead_code, clippy::allow_attributes)]
+    #[allow(unfulfilled_lint_expectations)]
     pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
@@ -41,11 +42,15 @@ impl BackendType {
 
 /// Test fixture that sets up a temporary directory and catalog
 pub struct TestFixture {
-    #[allow(dead_code)]
+    // this is only used in 1 of the tests, but is imported in all test files
+    // hence, it is dead everywhere else
+    #[expect(dead_code, clippy::allow_attributes)]
+    #[allow(unfulfilled_lint_expectations)]
     pub temp_dir: TempDir,
     pub catalog: Arc<CayenneCatalog>,
     pub data_path: std::path::PathBuf,
-    #[allow(dead_code)]
+    #[expect(dead_code, clippy::allow_attributes)]
+    #[allow(unfulfilled_lint_expectations)]
     pub backend_type: BackendType,
 }
 
@@ -80,7 +85,8 @@ impl TestFixture {
     }
 
     /// Get the database path for SQLite-specific verification
-    #[allow(dead_code)]
+    #[expect(dead_code, clippy::allow_attributes)]
+    #[allow(unfulfilled_lint_expectations)]
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")
     }

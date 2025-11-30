@@ -44,7 +44,7 @@ impl FullTextConnector {
         Self { inner_connector }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn with_indexed_stream<F>(
         &self,
         federated_table: Arc<FederatedTable>,

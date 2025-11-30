@@ -25,7 +25,7 @@ use object_store::CredentialProvider;
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn setup(file: &mut NamedTempFile) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let client_id = std::env::var("AWS_S3_CLIENT_ID").expect("AWS_S3_CLIENT_ID must be set");
     let identity_pool_id =

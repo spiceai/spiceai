@@ -126,7 +126,7 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Re
     } else {
         Repo::new(model_id.to_string(), RepoType::Model)
     };
-    let api_repo = api.repo(repo.clone());
+    let api_repo = api.repo(repo);
 
     Ok(api_repo)
 }
@@ -217,7 +217,7 @@ pub(crate) fn max_seq_length_from_st_config(
 ///
 /// ```
 ///
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()
