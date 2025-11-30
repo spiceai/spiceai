@@ -52,6 +52,7 @@ pub struct FullTextDatabaseIndex {
 
     // Read queries will be blocking during index writes.
     pub index: Arc<std::sync::RwLock<tantivy::Index>>,
+    pub reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -121,12 +122,14 @@ impl FullTextDatabaseIndex {
         } else {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
+        let reader = index.reader().context(TextSearchIndexingSnafu)?;
 
         Ok(Self {
             base_table: inner,
             search_fields,
             index: Arc::new(std::sync::RwLock::new(index)),
             primary_key: pks,
+            reader,
         })
     }
 
@@ -157,13 +160,8 @@ impl FullTextDatabaseIndex {
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self
-            .index
-            .read()
-            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
-
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            &index_read,
+            self.reader.searcher(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -274,7 +272,9 @@ impl FullTextDatabaseIndex {
                 .context(FailedToInsertDataIntoIndexSnafu)?;
         }
         drop(index_writable);
-        Ok(())
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Data successfully rewritten to full-text index, but failed to reload search path. Queries will be served from previous revision until the next update.".to_string(),
+        })
     }
 
     #[must_use]
@@ -297,6 +297,7 @@ impl FullTextDatabaseIndex {
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
             base_table,
+            reader: self.reader.clone(),
         }
     }
 

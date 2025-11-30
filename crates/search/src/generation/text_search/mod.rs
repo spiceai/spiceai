@@ -33,7 +33,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Index, ReloadPolicy, TantivyError,
+    Searcher, TantivyError,
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
@@ -183,16 +183,16 @@ pub struct FullTextSearchFieldIndex {
 }
 
 impl FullTextSearchFieldIndex {
-    pub fn try_new(index: &Index, field: String, primary_key: Vec<String>) -> Result<Self> {
+    pub fn try_new(
+        index_search: Searcher,
+        field: String,
+        primary_key: Vec<String>,
+    ) -> Result<Self> {
+        let tokenizer_manager = index_search.index().tokenizers().clone();
         let fts = Self {
-            search_schema: index.schema(),
-            reader: index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommitWithDelay)
-                .try_into()
-                .context(TextSearchSnafu)?
-                .searcher(),
-            tokenizer_manager: index.tokenizers().clone(),
+            search_schema: index_search.schema().clone(),
+            reader: index_search,
+            tokenizer_manager,
             field,
             primary_key,
             type_hints: HashMap::from([(
