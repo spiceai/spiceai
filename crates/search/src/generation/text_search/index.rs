@@ -259,7 +259,7 @@ impl FullTextDatabaseIndex {
             .context(FailedToInsertDataIntoIndexSnafu)?;
         drop(index_writable);
 
-        self.reader.reload().context(InvalidIndexingSnafu {
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
         })
     }
