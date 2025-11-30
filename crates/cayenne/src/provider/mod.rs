@@ -56,7 +56,7 @@ pub use delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec}
 
 use snafu::prelude::*;
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     /// Invalid number of children provided to execution plan

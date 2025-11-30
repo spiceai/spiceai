@@ -154,7 +154,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         self.inner.statistics()
     }
 
