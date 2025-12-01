@@ -51,6 +51,7 @@ pub enum Workflow {
     Bench,
     Throughput,
     Load,
+    Append,
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
@@ -62,6 +63,7 @@ impl From<Workflow> for TestType {
             Workflow::Bench => TestType::Benchmark,
             Workflow::Throughput => TestType::Throughput,
             Workflow::Load => TestType::Load,
+            Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
             Workflow::HttpConsistency => TestType::HttpConsistency,
             Workflow::HttpOverhead => TestType::HttpOverhead,
@@ -83,6 +85,7 @@ pub struct DispatchTests {
     pub bench: Option<BenchArgs>,
     pub throughput: Option<BenchArgs>,
     pub load: Option<LoadArgs>,
+    pub append: Option<AppendArgs>,
     pub http_consistency: Option<HttpConsistencyArgs>,
     pub http_overhead: Option<HttpOverheadArgs>,
 }
@@ -158,6 +161,23 @@ pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
     pub duration: Option<u64>,
+}
+
+/// Append workflow arguments, defined in the test files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendArgs {
+    pub spicepod_path: PathBuf,
+    pub query_set: QuerySetArg,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_overrides: Option<QueryOverridesArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_steps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_conflict_data: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for LoadArgs {
