@@ -33,7 +33,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, HashMap, exec_err, project_schema},
+    common::{Constraints, HashMap, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -132,7 +132,7 @@ fn create_spill_plan_query(
                 None => S3_VECTOR_MAX_TOPK,
             };
             let index_plan = Arc::new(S3VectorsQueryExec::new(
-                &query_table,
+                &query_table.table,
                 projection,
                 i64::from(limit_i32),
                 query_vector.to_owned(),
@@ -359,51 +359,24 @@ impl TableProvider for S3VectorsQueryTable {
             return Ok(plan);
         }
 
-        if self.partition_by.is_empty() {
-            let limit_i32: i32 = match limit {
-                Some(l) => {
-                    // Safe conversion: check against i32::MAX first, then compare with limit
-                    let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
-                    if l_i32 > S3_VECTOR_MAX_TOPK {
-                        tracing::warn!(
-                            "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                        );
-                        S3_VECTOR_MAX_TOPK
-                    } else {
-                        l_i32
-                    }
-                }
-                None => S3_VECTOR_MAX_TOPK,
-            };
-            return Ok(Arc::new(S3VectorsQueryExec::new(
-                self,
-                projection,
-                i64::from(limit_i32),
-                query_vector.clone(),
-                filters.to_vec(),
-            )));
-        }
-
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-        let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
-            return exec_err!("No bucket name or index name for bucket query");
+        let limit_i32: i32 = match limit.map(i32::try_from) {
+            Some(Ok(l)) if l > S3_VECTOR_MAX_TOPK => {
+                tracing::warn!(
+                    "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
+                );
+                S3_VECTOR_MAX_TOPK
+            }
+            Some(Ok(l)) => l,
+            // No limit, or failed conversion
+            None | Some(Err(_)) => S3_VECTOR_MAX_TOPK,
         };
-
-        let all_index_names = all_index_names.unwrap_or_default();
-
-        create_partition_plan_query(
-            &self.table.client,
-            &bucket_name,
-            &index_name,
-            self,
+        return Ok(Arc::new(S3VectorsQueryExec::new(
+            &self.table,
             projection,
-            filters,
-            limit,
-            state,
-            &all_index_names,
-        )
-        .await
+            i64::from(limit_i32),
+            query_vector.clone(),
+            filters.to_vec(),
+        )));
     }
 }
 
@@ -413,7 +386,7 @@ impl std::fmt::Debug for S3VectorsQueryExec {
     }
 }
 
-struct S3VectorsQueryExec {
+pub(super) struct S3VectorsQueryExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
@@ -435,27 +408,24 @@ impl DisplayAs for S3VectorsQueryExec {
 
 impl S3VectorsQueryExec {
     pub fn new(
-        table: &S3VectorsQueryTable,
+        table: &S3VectorsTable,
         projection: Option<&Vec<usize>>,
         limit: i64,
         query: Vec<f32>,
         filters: Vec<Expr>,
     ) -> Self {
         let projected_schema =
-            project_schema(&table.schema(), projection).unwrap_or_else(|_| table.schema());
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(projected_schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-
-        let idx = table.table.current_index();
+            project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
 
         Self {
-            idx,
-            client: Arc::clone(&table.table.client),
-            plan_properties: properties,
+            idx: table.current_index(),
+            client: Arc::clone(&table.client),
+            plan_properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ),
             query,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
             filters,

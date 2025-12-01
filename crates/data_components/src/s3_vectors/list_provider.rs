@@ -90,42 +90,39 @@ fn create_spill_plan(
     let virtual_index_names =
         SpillIndex::get_all_indexes_for_virtual_index(index_name, all_index_names);
 
-    if virtual_index_names.len() > 1 {
-        let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for spill_index_name in virtual_index_names {
-            let index_table_identifier = S3VectorIdentifier::Index {
-                bucket_name: bucket_name.to_string(),
-                index_name: spill_index_name.clone(),
-            };
-
-            let index_table = S3VectorsTable {
-                client: Arc::clone(client),
-                schema: Arc::clone(&table.table.schema),
-                constraints: table.table.constraints.clone(),
-                idx: Arc::new(index_table_identifier),
-                spill_index: Arc::new(AtomicU8::new(0)),
-                dimension: table.table.dimension,
-                columns: table.table.columns.clone(),
-                distance_metric: table.table.distance_metric.clone(),
-            };
-
-            let list_table =
-                S3VectorsListTable::new(index_table, table.column_name.clone(), vec![]);
-
-            let index_plan = Arc::new(S3VectorsListExec::new(&list_table, projection, limit));
-            index_plans.push(index_plan);
-        }
-
-        let union_plan = Arc::new(UnionExec::new(index_plans));
-        if let Some(limit) = limit {
-            let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, Some(limit)));
-            Some(limit_plan)
-        } else {
-            Some(union_plan)
-        }
-    } else {
-        None
+    if virtual_index_names.len() <= 1 {
+        return None;
     }
+    let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+    for spill_index_name in virtual_index_names {
+        let index_table_identifier = S3VectorIdentifier::Index {
+            bucket_name: bucket_name.to_string(),
+            index_name: spill_index_name.clone(),
+        };
+
+        let index_table = S3VectorsTable {
+            client: Arc::clone(client),
+            schema: Arc::clone(&table.table.schema),
+            constraints: table.table.constraints.clone(),
+            idx: Arc::new(index_table_identifier),
+            spill_index: Arc::new(AtomicU8::new(0)),
+            dimension: table.table.dimension,
+            columns: table.table.columns.clone(),
+            distance_metric: table.table.distance_metric.clone(),
+        };
+
+        index_plans.push(Arc::new(S3VectorsListExec::new(
+            &index_table,
+            projection,
+            limit,
+        )));
+    }
+
+    Some(Arc::new(GlobalLimitExec::new(
+        Arc::new(UnionExec::new(index_plans)),
+        0,
+        limit,
+    )))
 }
 
 /// Create an execution plan to scan across partitions.
@@ -233,6 +230,7 @@ impl TableProvider for S3VectorsListTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // This will be made with spill index suffexed
         let current_index = self.table.current_index();
         let (_, bucket_name, index_name) = current_index.index_identifier_variables();
 
@@ -260,7 +258,8 @@ impl TableProvider for S3VectorsListTable {
 
         if self.partition_by.is_empty() {
             return Ok(
-                Arc::new(S3VectorsListExec::new(self, projection, limit)) as Arc<dyn ExecutionPlan>
+                Arc::new(S3VectorsListExec::new(&self.table, projection, limit))
+                    as Arc<dyn ExecutionPlan>,
             );
         }
 
@@ -313,7 +312,7 @@ impl S3VectorsListExec {
         limit: Option<usize>,
     ) -> Self {
         let projected_schema =
-            project_schema(&table.schema(), projection).unwrap_or_else(|_| table.schema());
+            project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
@@ -325,7 +324,7 @@ impl S3VectorsListExec {
 
         Self {
             idx,
-            client: Arc::clone(&table.table.client),
+            client: Arc::clone(&table.client),
             plan_properties: properties,
             limit,
         }

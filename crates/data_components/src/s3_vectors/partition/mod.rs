@@ -48,6 +48,9 @@ const _: () = {
 mod list_provider;
 pub use list_provider::S3VectorsPartitionedListTable;
 
+mod query_provider;
+pub use query_provider::S3VectorsPartitionedQueryTable;
+
 static PARTS_SEPARATOR: &str = ".";
 
 #[derive(Debug, Snafu)]

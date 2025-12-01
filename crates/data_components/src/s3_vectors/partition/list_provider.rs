@@ -19,43 +19,23 @@ use std::{
 };
 
 use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, fetch_all_index_names,
+    S3VectorIdentifier, fetch_all_index_names,
     list_provider::{S3VectorsListExec, S3VectorsListTable},
     partition::{BelongsWith, PartitionedIndexName},
-    vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
+    vector_table::S3VectorsTable,
 };
 
-/// Num of segments to use for parallel `ListVectors` API calls.
-const LIST_S3_VECTORS_NUM_READ_SEGMENTS: usize = 10;
-
-use arrow::{array::RecordBatch, datatypes::SchemaRef, json::ReaderBuilder};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Constraints, exec_err, project_schema},
     datasource::TableType,
-    error::{DataFusionError, Result as DataFusionResult},
-    execution::{SendableRecordBatchStream, TaskContext},
+    error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
-    physical_expr::EquivalenceProperties,
-    physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        empty::EmptyExec,
-        execution_plan::{Boundedness, EmissionType},
-        limit::GlobalLimitExec,
-        stream::RecordBatchReceiverStream,
-        union::UnionExec,
-    },
+    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
 };
-use futures::{StreamExt, stream::FuturesUnordered};
-use s3_vectors::{
-    LIST_VECTORS_MAX_RESULTS, ListOutputVector, ListVectorsInput, ListVectorsOutput, S3Vectors,
-    VectorData,
-};
-use s3_vectors_metadata_filter::document_to_json_map;
-use snafu::ResultExt;
-use tokio::sync::mpsc::Sender;
 
 /// A [`TableProvider`] that performs a logical `/ListVectors` over a set of physical S3 Vector index.
 ///
@@ -160,7 +140,7 @@ impl TableProvider for S3VectorsPartitionedListTable {
                 };
 
                 let index_table = S3VectorsTable {
-                    client: Arc::clone(self.table.client),
+                    client: Arc::clone(&self.table.client),
                     schema: Arc::clone(&self.table.schema),
                     constraints: self.table.constraints.clone(),
                     idx: Arc::new(index_table_identifier),
@@ -179,7 +159,7 @@ impl TableProvider for S3VectorsPartitionedListTable {
 
         let scan_plan = match index_plans.len() {
             0 => Arc::new(EmptyExec::new(project_schema(
-                &self.table.schema(),
+                &self.table.schema,
                 projection,
             )?)),
             1 => Arc::clone(&index_plans[0]),
@@ -194,7 +174,9 @@ impl TableProvider for S3VectorsPartitionedListTable {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::s3_vectors::MetadataColumns;
+    use crate::s3_vectors::{
+        MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    };
 
     use super::*;
 
