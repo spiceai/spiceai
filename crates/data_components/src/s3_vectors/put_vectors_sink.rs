@@ -42,9 +42,6 @@ const ESTIMATED_OVERHEAD_PER_VECTOR: usize = 200;
 /// Maximum number of metadata keys per vector. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 const MAX_METADATA_KEYS_PER_VECTOR: usize = 50;
 
-/// Maximum total metadata size per vector in bytes (40 KB). <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
-const MAX_METADATA_SIZE_PER_VECTOR: usize = 40 * 1024;
-
 /// Maximum vector dimension. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 const MAX_VECTOR_DIMENSION: usize = 4096;
 
@@ -77,10 +74,6 @@ pub enum Error {
         count: usize,
         max: usize,
     },
-    #[snafu(display(
-        "Metadata size at row {row} exceeds maximum of {max} bytes (got {size} bytes)"
-    ))]
-    MetadataTooLarge { row: usize, size: usize, max: usize },
     #[snafu(display("Vector dimension {dimension} at row {row} exceeds maximum of {max}"))]
     VectorDimensionTooLarge {
         row: usize,
