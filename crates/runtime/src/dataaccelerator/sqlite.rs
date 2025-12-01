@@ -156,7 +156,9 @@ impl SqliteAccelerator {
         })?;
 
         let mode = match acceleration.mode {
-            Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
+            Mode::File | Mode::FileCreate => {
+                datafusion_table_providers::sql::db_connection_pool::Mode::File
+            }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();
@@ -245,6 +247,20 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "SQLite acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
             download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
 
             self.get_shared_pool(source).await?;
@@ -285,11 +301,10 @@ impl DataAccelerator for SqliteAccelerator {
             let attach_databases = datasets
                 .iter()
                 .filter_map(|other_dataset| {
-                    if other_dataset
-                        .acceleration
-                        .as_ref()
-                        .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
-                    {
+                    if other_dataset.acceleration.as_ref().is_some_and(|a| {
+                        a.engine == Engine::Sqlite
+                            && matches!(a.mode, Mode::File | Mode::FileCreate)
+                    }) {
                         if other_dataset.name() == source.name() {
                             None
                         } else {
