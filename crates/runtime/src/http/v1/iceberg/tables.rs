@@ -23,7 +23,7 @@ use super::{
 };
 use crate::datafusion::is_spice_internal_schema;
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use arrow::datatypes::Schema as ArrowSchema;
+use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
 use axum::{
     Json,
     extract::Path,
@@ -220,16 +220,242 @@ fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference>
     Some(TableReference::full(catalog, schema, table))
 }
 
-/// Iceberg requires field IDs to be set, and the iceberg-rust crate expects them to be set in the
-/// `PARQUET:field_id` metadata key.
+/// Iceberg requires field IDs to be set for all fields, including nested fields in Struct, List, and Map types.
+/// The iceberg-rust crate expects them to be set in the `PARQUET:field_id` metadata key.
 fn assign_field_ids(schema: &ArrowSchema) -> ArrowSchema {
-    let mut fields = vec![];
-    for (i, field) in schema.fields.iter().enumerate() {
-        let field = Arc::unwrap_or_clone(Arc::clone(field));
-        fields.push(field.with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            format!("{i}"),
-        )])));
-    }
+    let mut counter: i32 = 0;
+    let fields: Vec<Arc<Field>> = schema
+        .fields
+        .iter()
+        .map(|f| Arc::new(assign_field_id_recursive(f, &mut counter)))
+        .collect();
     ArrowSchema::new(fields)
+}
+
+fn assign_field_id_recursive(field: &Field, counter: &mut i32) -> Field {
+    let id = *counter;
+    *counter += 1;
+
+    let new_data_type = match field.data_type() {
+        DataType::Struct(fields) => {
+            let new_fields: Vec<Arc<Field>> = fields
+                .iter()
+                .map(|f| Arc::new(assign_field_id_recursive(f, counter)))
+                .collect();
+            DataType::Struct(Fields::from(new_fields))
+        }
+        DataType::List(element_field) => {
+            DataType::List(Arc::new(assign_field_id_recursive(element_field, counter)))
+        }
+        DataType::LargeList(element_field) => {
+            DataType::LargeList(Arc::new(assign_field_id_recursive(element_field, counter)))
+        }
+        DataType::FixedSizeList(element_field, size) => DataType::FixedSizeList(
+            Arc::new(assign_field_id_recursive(element_field, counter)),
+            *size,
+        ),
+        DataType::Map(struct_field, keys_sorted) => DataType::Map(
+            Arc::new(assign_field_id_recursive(struct_field, counter)),
+            *keys_sorted,
+        ),
+        other => other.clone(),
+    };
+
+    Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        id.to_string(),
+    )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::arrow::arrow_schema_to_schema;
+
+    fn get_field_id(field: &Field) -> Option<i32> {
+        field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|v| v.parse().ok())
+    }
+
+    #[test]
+    fn test_assign_field_ids_primitive_fields() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Float64, false),
+        ]);
+
+        let result = assign_field_ids(&schema);
+
+        assert_eq!(result.fields.len(), 3);
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+        assert_eq!(get_field_id(&result.fields[1]), Some(1));
+        assert_eq!(get_field_id(&result.fields[2]), Some(2));
+
+        // Verify iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
+
+    #[test]
+    fn test_assign_field_ids_nested_struct() {
+        let inner_fields = Fields::from(vec![
+            Field::new("inner_a", DataType::Int32, false),
+            Field::new("inner_b", DataType::Utf8, true),
+        ]);
+        let schema = ArrowSchema::new(vec![
+            Field::new("outer", DataType::Struct(inner_fields), false),
+            Field::new("other", DataType::Int64, false),
+        ]);
+
+        let result = assign_field_ids(&schema);
+
+        // outer gets id 0, inner_a gets id 1, inner_b gets id 2, other gets id 3
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+        if let DataType::Struct(inner) = result.fields[0].data_type() {
+            assert_eq!(get_field_id(&inner[0]), Some(1));
+            assert_eq!(get_field_id(&inner[1]), Some(2));
+        } else {
+            panic!("Expected struct type");
+        }
+        assert_eq!(get_field_id(&result.fields[1]), Some(3));
+
+        // Verify iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
+
+    #[test]
+    fn test_assign_field_ids_list() {
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "list_col",
+                DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+                true,
+            ),
+            Field::new("other", DataType::Utf8, false),
+        ]);
+
+        let result = assign_field_ids(&schema);
+
+        // list_col gets id 0, element gets id 1, other gets id 2
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+        if let DataType::List(element_field) = result.fields[0].data_type() {
+            assert_eq!(get_field_id(element_field), Some(1));
+        } else {
+            panic!("Expected list type");
+        }
+        assert_eq!(get_field_id(&result.fields[1]), Some(2));
+
+        // Verify iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
+
+    #[test]
+    fn test_assign_field_ids_map() {
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, true),
+            ])),
+            false,
+        );
+        let schema = ArrowSchema::new(vec![Field::new(
+            "map_col",
+            DataType::Map(Arc::new(map_field), false),
+            true,
+        )]);
+
+        let result = assign_field_ids(&schema);
+
+        // map_col gets id 0, entries (struct) gets id 1, key gets id 2, value gets id 3
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+        if let DataType::Map(struct_field, _) = result.fields[0].data_type() {
+            assert_eq!(get_field_id(struct_field), Some(1));
+            if let DataType::Struct(kv_fields) = struct_field.data_type() {
+                assert_eq!(get_field_id(&kv_fields[0]), Some(2));
+                assert_eq!(get_field_id(&kv_fields[1]), Some(3));
+            } else {
+                panic!("Expected struct type inside map");
+            }
+        } else {
+            panic!("Expected map type");
+        }
+
+        // Verify iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
+
+    #[test]
+    fn test_assign_field_ids_deeply_nested() {
+        // List of structs containing lists
+        let inner_list = Field::new(
+            "inner_list",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+            true,
+        );
+        let struct_fields =
+            Fields::from(vec![Field::new("name", DataType::Utf8, false), inner_list]);
+        let schema = ArrowSchema::new(vec![Field::new(
+            "outer_list",
+            DataType::List(Arc::new(Field::new(
+                "element",
+                DataType::Struct(struct_fields),
+                false,
+            ))),
+            true,
+        )]);
+
+        let result = assign_field_ids(&schema);
+
+        // Verify all fields have IDs assigned and iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert deeply nested schema to iceberg");
+    }
+
+    #[test]
+    fn test_assign_field_ids_large_list() {
+        let schema = ArrowSchema::new(vec![Field::new(
+            "large_list_col",
+            DataType::LargeList(Arc::new(Field::new("element", DataType::Utf8, false))),
+            true,
+        )]);
+
+        let result = assign_field_ids(&schema);
+
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+        if let DataType::LargeList(element_field) = result.fields[0].data_type() {
+            assert_eq!(get_field_id(element_field), Some(1));
+        } else {
+            panic!("Expected large list type");
+        }
+
+        // Verify iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
+
+    #[test]
+    fn test_assign_field_ids_fixed_size_list() {
+        let schema = ArrowSchema::new(vec![Field::new(
+            "fixed_list_col",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("element", DataType::Float32, false)),
+                10,
+            ),
+            true,
+        )]);
+
+        let result = assign_field_ids(&schema);
+
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+        if let DataType::FixedSizeList(element_field, size) = result.fields[0].data_type() {
+            assert_eq!(get_field_id(element_field), Some(1));
+            assert_eq!(*size, 10);
+        } else {
+            panic!("Expected fixed size list type");
+        }
+
+        // Verify iceberg conversion succeeds
+        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
 }
