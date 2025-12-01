@@ -328,7 +328,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
@@ -365,7 +364,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
@@ -398,7 +396,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
@@ -423,7 +420,6 @@ mod tests {
                 None,
                 TIME_FORMAT,
             );
-
 
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
@@ -467,7 +463,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should have 3 rows
@@ -475,9 +470,9 @@ mod tests {
 
             // Verify operations
             assert!(matches!(change_batch.op(0), ChangeOperation::Create));
-                assert!(matches!(change_batch.op(1), ChangeOperation::Update));
-                assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
-            }
+            assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+            assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
+        }
 
         #[test]
         fn test_process_batch_with_unnest_depth() {
@@ -534,7 +529,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify we can extract primary keys (should be empty)
@@ -557,7 +551,6 @@ mod tests {
                 None,
                 TIME_FORMAT,
             );
-
 
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
@@ -585,7 +578,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
@@ -611,7 +603,6 @@ mod tests {
                 None,
                 TIME_FORMAT,
             );
-
 
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
@@ -644,7 +635,6 @@ mod tests {
                 None,
                 TIME_FORMAT,
             );
-
 
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
@@ -683,7 +673,6 @@ mod tests {
                 TIME_FORMAT,
             );
 
-
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should only process the valid record
@@ -715,7 +704,6 @@ mod tests {
                 None,
                 TIME_FORMAT,
             );
-
 
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
@@ -749,7 +737,6 @@ mod tests {
                 None,
                 TIME_FORMAT,
             );
-
 
             let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
@@ -793,7 +780,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
             assert_eq!(change_batch.num_rows(), 1);
@@ -807,7 +793,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 100);
         }
@@ -820,7 +806,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 0);
         }
@@ -833,7 +819,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -859,7 +845,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -884,7 +870,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -909,7 +895,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -984,7 +970,7 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            assert!(result.is_ok());
+            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 10000);
         }
@@ -1018,7 +1004,7 @@ mod tests {
             let primary_keys = vec!["id".to_string()];
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
-            assert!(result.is_ok());
+            result.expect("valid change batch");
         }
     }
 }
