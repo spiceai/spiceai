@@ -43,6 +43,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
+use linkme::distributed_slice;
 use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
@@ -56,6 +57,81 @@ use tracing::Level;
 use std::future::Future;
 
 pub mod listing;
+
+#[derive(Clone, Copy)]
+pub struct DataConnectorRegistration {
+    pub name: &'static str,
+    pub constructor: fn() -> Arc<dyn DataConnectorFactory>,
+}
+
+impl DataConnectorRegistration {
+    pub const fn new(
+        name: &'static str,
+        constructor: fn() -> Arc<dyn DataConnectorFactory>,
+    ) -> Self {
+        Self { name, constructor }
+    }
+}
+
+/// Distributed slice that automatically collects all data connector registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_connector!`] macro.
+#[distributed_slice]
+pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
+
+/// Registers a data connector factory by name.
+///
+/// This macro creates a constructor function for the specified connector factory type and
+/// registers it in the global distributed slice of data connectors. This allows
+/// the runtime to discover and instantiate connectors without updating a central registry.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_connector!("file", FileFactory);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_connector!(
+///     register_file_connector,
+///     FILE_CONNECTOR_REGISTRATION,
+///     "file",
+///     FileFactory
+/// );
+/// ```
+///
+/// Using this macro automatically adds the connector to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_connector {
+    ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory> {
+            <$factory>::new_arc()
+        }
+
+        #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataconnector::DataConnectorRegistration =
+            $crate::dataconnector::DataConnectorRegistration::new($name, $fn_name);
+    };
+
+    ($name:expr, $factory:path) => {
+        ::paste::paste! {
+            fn [<__register_data_connector_fn_ line!()>]()
+                -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory>
+            {
+                <$factory>::new_arc()
+            }
+
+            #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
+            pub static [<__REGISTER_DATA_CONNECTOR_ line!()>]: $crate::dataconnector::DataConnectorRegistration =
+                $crate::dataconnector::DataConnectorRegistration::new(
+                    $name,
+                    [<__register_data_connector_fn_ line!()>],
+                );
+        }
+    };
+}
 
 pub mod abfs;
 #[cfg(feature = "clickhouse")]
@@ -115,6 +191,238 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
+
+register_data_connector!(
+    register_sink_connector,
+    REGISTER_SINK_CONNECTOR,
+    "sink",
+    sink::SinkConnectorFactory
+);
+#[cfg(feature = "databricks")]
+register_data_connector!(
+    register_databricks_connector,
+    REGISTER_DATABRICKS_CONNECTOR,
+    "databricks",
+    databricks::DatabricksFactory
+);
+#[cfg(feature = "delta_lake")]
+register_data_connector!(
+    register_delta_lake_connector,
+    REGISTER_DELTA_LAKE_CONNECTOR,
+    "delta_lake",
+    delta_lake::DeltaLakeFactory
+);
+#[cfg(feature = "dremio")]
+register_data_connector!(
+    register_dremio_connector,
+    REGISTER_DREMIO_CONNECTOR,
+    "dremio",
+    dremio::DremioFactory
+);
+register_data_connector!(
+    register_file_connector,
+    REGISTER_FILE_CONNECTOR,
+    "file",
+    file::FileFactory
+);
+#[cfg(feature = "flightsql")]
+register_data_connector!(
+    register_flightsql_connector,
+    REGISTER_FLIGHTSQL_CONNECTOR,
+    "flightsql",
+    flightsql::FlightSQLFactory
+);
+register_data_connector!(
+    register_s3_connector,
+    REGISTER_S3_CONNECTOR,
+    "s3",
+    s3::S3Factory
+);
+register_data_connector!(
+    register_abfs_connector,
+    REGISTER_ABFS_CONNECTOR,
+    "abfs",
+    abfs::AzureBlobFSFactory
+);
+#[cfg(feature = "ftp")]
+register_data_connector!(
+    register_ftp_connector,
+    REGISTER_FTP_CONNECTOR,
+    "ftp",
+    ftp::FTPFactory
+);
+#[cfg(feature = "imap")]
+register_data_connector!(
+    register_imap_connector,
+    REGISTER_IMAP_CONNECTOR,
+    "imap",
+    imap::ImapFactory
+);
+register_data_connector!(
+    register_http_connector,
+    REGISTER_HTTP_CONNECTOR,
+    "http",
+    https::HttpsFactory
+);
+register_data_connector!(
+    register_https_connector,
+    REGISTER_HTTPS_CONNECTOR,
+    "https",
+    https::HttpsFactory
+);
+register_data_connector!(
+    register_git_connector,
+    REGISTER_GIT_CONNECTOR,
+    "git",
+    git::GitFactory
+);
+register_data_connector!(
+    register_github_connector,
+    REGISTER_GITHUB_CONNECTOR,
+    "github",
+    github::GithubFactory
+);
+#[cfg(feature = "ftp")]
+register_data_connector!(
+    register_sftp_connector,
+    REGISTER_SFTP_CONNECTOR,
+    "sftp",
+    sftp::SFTPFactory
+);
+register_data_connector!(
+    register_spiceai_connector,
+    REGISTER_SPICEAI_CONNECTOR,
+    "spice.ai",
+    spiceai::SpiceAIFactory
+);
+register_data_connector!(
+    register_memory_connector,
+    REGISTER_MEMORY_CONNECTOR,
+    "memory",
+    memory::MemoryConnectorFactory
+);
+#[cfg(feature = "mongodb")]
+register_data_connector!(
+    register_mongodb_connector,
+    REGISTER_MONGODB_CONNECTOR,
+    "mongodb",
+    mongodb::MongoDBFactory
+);
+#[cfg(feature = "mssql")]
+register_data_connector!(
+    register_mssql_connector,
+    REGISTER_MSSQL_CONNECTOR,
+    "mssql",
+    mssql::SqlServerFactory
+);
+#[cfg(feature = "mysql")]
+register_data_connector!(
+    register_mysql_connector,
+    REGISTER_MYSQL_CONNECTOR,
+    "mysql",
+    mysql::MySQLFactory
+);
+#[cfg(feature = "postgres")]
+register_data_connector!(
+    register_postgres_connector,
+    REGISTER_POSTGRES_CONNECTOR,
+    "postgres",
+    postgres::PostgresFactory
+);
+#[cfg(feature = "duckdb")]
+register_data_connector!(
+    register_duckdb_connector,
+    REGISTER_DUCKDB_CONNECTOR,
+    "duckdb",
+    duckdb::DuckDBFactory
+);
+#[cfg(feature = "clickhouse")]
+register_data_connector!(
+    register_clickhouse_connector,
+    REGISTER_CLICKHOUSE_CONNECTOR,
+    "clickhouse",
+    clickhouse::ClickhouseFactory
+);
+register_data_connector!(
+    register_graphql_connector,
+    REGISTER_GRAPHQL_CONNECTOR,
+    "graphql",
+    graphql::GraphQLFactory
+);
+#[cfg(feature = "odbc")]
+register_data_connector!(
+    register_odbc_connector,
+    REGISTER_ODBC_CONNECTOR,
+    "odbc",
+    odbc::ODBCFactory
+);
+#[cfg(feature = "oracle")]
+register_data_connector!(
+    register_oracle_connector,
+    REGISTER_ORACLE_CONNECTOR,
+    "oracle",
+    oracle::OracleFactory
+);
+#[cfg(feature = "sharepoint")]
+register_data_connector!(
+    register_sharepoint_connector,
+    REGISTER_SHAREPOINT_CONNECTOR,
+    "sharepoint",
+    sharepoint::SharepointFactory
+);
+#[cfg(feature = "spark")]
+register_data_connector!(
+    register_spark_connector,
+    REGISTER_SPARK_CONNECTOR,
+    "spark",
+    spark::SparkFactory
+);
+#[cfg(feature = "snowflake")]
+register_data_connector!(
+    register_snowflake_connector,
+    REGISTER_SNOWFLAKE_CONNECTOR,
+    "snowflake",
+    snowflake::SnowflakeFactory
+);
+#[cfg(feature = "debezium")]
+register_data_connector!(
+    register_debezium_connector,
+    REGISTER_DEBEZIUM_CONNECTOR,
+    "debezium",
+    debezium::DebeziumFactory
+);
+#[cfg(feature = "kafka")]
+register_data_connector!(
+    register_kafka_connector,
+    REGISTER_KAFKA_CONNECTOR,
+    "kafka",
+    kafka::KafkaFactory
+);
+register_data_connector!(
+    register_localpod_connector,
+    REGISTER_LOCALPOD_CONNECTOR,
+    "localpod",
+    localpod::LocalPodFactory
+);
+#[cfg(feature = "dynamodb")]
+register_data_connector!(
+    register_dynamodb_connector,
+    REGISTER_DYNAMODB_CONNECTOR,
+    "dynamodb",
+    dynamodb::DynamoDBFactory
+);
+register_data_connector!(
+    register_iceberg_connector,
+    REGISTER_ICEBERG_CONNECTOR,
+    "iceberg",
+    iceberg::IcebergDataConnectorFactory
+);
+register_data_connector!(
+    register_glue_connector,
+    REGISTER_GLUE_CONNECTOR,
+    "glue",
+    glue::GlueDataConnectorFactory
+);
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
@@ -377,62 +685,9 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
-    #[cfg(feature = "databricks")]
-    register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory("delta_lake", delta_lake::DeltaLakeFactory::new_arc()).await;
-    #[cfg(feature = "dremio")]
-    register_connector_factory("dremio", dremio::DremioFactory::new_arc()).await;
-    register_connector_factory("file", file::FileFactory::new_arc()).await;
-    #[cfg(feature = "flightsql")]
-    register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
-    register_connector_factory("s3", s3::S3Factory::new_arc()).await;
-    register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
-    #[cfg(feature = "imap")]
-    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
-    register_connector_factory("http", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("https", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("git", git::GitFactory::new_arc()).await;
-    register_connector_factory("github", github::GithubFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
-    register_connector_factory("spice.ai", spiceai::SpiceAIFactory::new_arc()).await;
-    register_connector_factory("memory", memory::MemoryConnectorFactory::new_arc()).await;
-    #[cfg(feature = "mongodb")]
-    register_connector_factory("mongodb", mongodb::MongoDBFactory::new_arc()).await;
-    #[cfg(feature = "mssql")]
-    register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
-    #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
-    #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::PostgresFactory::new_arc()).await;
-    #[cfg(feature = "duckdb")]
-    register_connector_factory("duckdb", duckdb::DuckDBFactory::new_arc()).await;
-    #[cfg(feature = "clickhouse")]
-    register_connector_factory("clickhouse", clickhouse::ClickhouseFactory::new_arc()).await;
-    register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
-    #[cfg(feature = "odbc")]
-    register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
-    #[cfg(feature = "oracle")]
-    register_connector_factory("oracle", oracle::OracleFactory::new_arc()).await;
-    #[cfg(feature = "sharepoint")]
-    register_connector_factory("sharepoint", sharepoint::SharepointFactory::new_arc()).await;
-    #[cfg(feature = "spark")]
-    register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
-    #[cfg(feature = "snowflake")]
-    register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
-    #[cfg(feature = "debezium")]
-    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
-    #[cfg(feature = "kafka")]
-    register_connector_factory("kafka", kafka::KafkaFactory::new_arc()).await;
-    register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
-    #[cfg(feature = "dynamodb")]
-    register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
-    register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
-    register_connector_factory("glue", glue::GlueDataConnectorFactory::new_arc()).await;
+    for registration in DATA_CONNECTOR_REGISTRATIONS {
+        register_connector_factory(registration.name, (registration.constructor)()).await;
+    }
 }
 
 pub async fn unregister_all() {
