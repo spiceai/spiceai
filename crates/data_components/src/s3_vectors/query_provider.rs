@@ -1256,21 +1256,18 @@ mod tests {
         let bucket_name = "test-bucket";
         let index_name = "test-index";
 
-        mock_client
-            .data
-            .lock()
-            .expect("lock")
-            .indexes
-            .insert(
-                bucket_name.to_string(),
-                vec![IndexSummary::builder()
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
                     .set_index_arn(Some("arn".to_string()))
                     .creation_time(DateTime::from_secs(1))
                     .index_name(index_name.to_string())
                     .build()
-                    .expect("build")],
-            );
+                    .expect("build"),
+            ],
+        );
 
         mock_client
             .data
@@ -1337,21 +1334,18 @@ mod tests {
         let bucket_name = "test-bucket";
         let index_name = "test-index";
 
-        mock_client
-            .data
-            .lock()
-            .expect("lock")
-            .indexes
-            .insert(
-                bucket_name.to_string(),
-                vec![IndexSummary::builder()
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
                     .set_index_arn(Some("arn".to_string()))
                     .creation_time(DateTime::from_secs(1))
                     .index_name(index_name.to_string())
                     .build()
-                    .expect("build")],
-            );
+                    .expect("build"),
+            ],
+        );
 
         mock_client
             .data
@@ -1417,21 +1411,18 @@ mod tests {
         let bucket_name = "test-bucket";
         let index_name = "test-index";
 
-        mock_client
-            .data
-            .lock()
-            .expect("lock")
-            .indexes
-            .insert(
-                bucket_name.to_string(),
-                vec![IndexSummary::builder()
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
                     .vector_bucket_name(bucket_name)
                     .set_index_arn(Some("arn".to_string()))
                     .creation_time(DateTime::from_secs(1))
                     .index_name(index_name.to_string())
                     .build()
-                    .expect("build")],
-            );
+                    .expect("build"),
+            ],
+        );
 
         mock_client
             .data

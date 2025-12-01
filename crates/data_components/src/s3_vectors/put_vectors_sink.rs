@@ -77,12 +77,10 @@ pub enum Error {
         count: usize,
         max: usize,
     },
-    #[snafu(display("Metadata size at row {row} exceeds maximum of {max} bytes (got {size} bytes)"))]
-    MetadataTooLarge {
-        row: usize,
-        size: usize,
-        max: usize,
-    },
+    #[snafu(display(
+        "Metadata size at row {row} exceeds maximum of {max} bytes (got {size} bytes)"
+    ))]
+    MetadataTooLarge { row: usize, size: usize, max: usize },
     #[snafu(display("Vector dimension {dimension} at row {row} exceeds maximum of {max}"))]
     VectorDimensionTooLarge {
         row: usize,
