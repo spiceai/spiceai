@@ -185,7 +185,7 @@ impl KafkaMetrics {
 }
 
 impl rdkafka::ClientContext for KafkaConsumerContext {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn stats(&self, statistics: rdkafka::Statistics) {
         // Calculate total consumer lag from all topic partitions
         let mut total_lag = 0u64;

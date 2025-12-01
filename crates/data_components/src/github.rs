@@ -324,10 +324,10 @@ impl GithubRestClient {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::missing_panics_doc)]
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::missing_panics_doc)]
+    #[expect(clippy::expect_used)]
     pub async fn fetch_files(
         &self,
         owner: &str,
@@ -576,7 +576,6 @@ impl GithubRestClient {
             }
         })?;
 
-        #[allow(clippy::single_match_else)]
         match response_status {
             404 => {
                 let err_msg = format!(
@@ -780,7 +779,7 @@ pub fn error_checker(
     let rate_limited: Option<bool> = response["message"]
         .as_str()
         .map(|s| s.to_lowercase().contains("rate limit"));
-    if let Some(true) = rate_limited {
+    if rate_limited == Some(true) {
         // A secondary rate limit was exceeded
         return Err(graphql::Error::RateLimited {
             message: "GitHub API rate limit exceeded. Consider reducing 'github_max_concurrent_connections' in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),

@@ -162,7 +162,7 @@ pub enum OpenOption {
     OpenExisting,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,

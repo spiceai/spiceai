@@ -108,7 +108,7 @@ impl CayenneCatalog {
     ///
     /// Returns a relative path like `file_000001/` that will be combined with
     /// the table's base path to create the full `ListingTable` directory.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn generate_file_path(file_id: i64) -> String {
         format!("file_{file_id:06}/")
     }
@@ -227,7 +227,7 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<i64> {
         /// Result of attempting to create a table in the catalog
         enum CreateTableResult {

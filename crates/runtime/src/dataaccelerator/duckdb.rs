@@ -144,7 +144,7 @@ impl DuckDBAccelerator {
         })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => {
+            (Ok(duckdb_file), Mode::File | Mode::FileCreate) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
@@ -175,7 +175,7 @@ impl DuckDBAccelerator {
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
-            (Err(e), Mode::File) => {
+            (Err(e), Mode::File | Mode::FileCreate) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
                 });
@@ -202,7 +202,7 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if acceleration.mode == Mode::File
+                    if matches!(acceleration.mode, Mode::File | Mode::FileCreate)
                         && let Ok(file_path) = self.file_path(ds.as_ref())
                         && this_file_path == file_path
                     {
@@ -265,7 +265,7 @@ pub fn duckdb_file_path(
                     );
                 });
             }
-            params.insert("duckdb_open".to_string(), duckdb_file.to_string());
+            params.insert("duckdb_open".to_string(), duckdb_file);
         }
 
         duckdb_factory
@@ -364,6 +364,20 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "DuckDB acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
             download_snapshot_if_needed(
                 acceleration,
                 source,
@@ -386,8 +400,7 @@ impl DataAccelerator for DuckDBAccelerator {
         _partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(duckdb_file) = cmd.options.remove("file") {
-            cmd.options
-                .insert("open".to_string(), duckdb_file.to_string());
+            cmd.options.insert("open".to_string(), duckdb_file);
         }
 
         if let Some(recompute_statistics_on_write) =
@@ -396,7 +409,7 @@ impl DataAccelerator for DuckDBAccelerator {
             // Translate Spice parameter to DuckDB write setting
             cmd.options.insert(
                 "recompute_statistics_on_write".to_string(),
-                recompute_statistics_on_write.to_string(),
+                recompute_statistics_on_write,
             );
         }
 
@@ -409,10 +422,9 @@ impl DataAccelerator for DuckDBAccelerator {
                 .clone()
                 .unwrap_or_default()
                 .temp_directory
-                .clone()
             {
                 cmd.options
-                    .insert("temp_directory".to_string(), temp_directory.to_string());
+                    .insert("temp_directory".to_string(), temp_directory);
             }
 
             if source.is_file_accelerated() {
@@ -441,10 +453,10 @@ impl DataAccelerator for DuckDBAccelerator {
                             .map(|view| view as Arc<dyn AccelerationSource>),
                     )
                     .filter_map(|other_source| {
-                        if other_source
-                            .acceleration()
-                            .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
-                        {
+                        if other_source.acceleration().is_some_and(|a| {
+                            a.engine == Engine::DuckDB
+                                && matches!(a.mode, Mode::File | Mode::FileCreate)
+                        }) {
                             if other_source.name() == source.name() {
                                 None
                             } else {
@@ -745,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn retention_sql_fails_with_internal_tables() {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -907,8 +919,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -1142,7 +1154,6 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
@@ -1152,7 +1163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_retention_sql_with_duckdb_accelerator() {
         use tempfile::TempDir;
 

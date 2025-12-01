@@ -36,7 +36,7 @@ use crate::{TestType, git};
 
 const FLOAT_ERROR_MARGIN: f64 = 0.0001;
 
-#[allow(
+#[expect(
     clippy::must_use_candidate,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation
@@ -156,7 +156,7 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         sorted_durations.sort();
 
         // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
             let rank =
                 (percentile / 100.0) * (f64::from(u32::try_from(sorted_durations.len() - 1)?));
@@ -206,7 +206,6 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
 
         // calculate the inter-quartile range to remove statistical outliers
         // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
             let first_quartile_secs = sorted_durations.percentile(25.0)?.as_secs_f64();
             let third_quartile_secs = sorted_durations.percentile(75.0)?.as_secs_f64();
@@ -567,7 +566,6 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
     /// Builds record batches for the individual metrics of this test run
     /// For example, a record would be a single query execution
-    #[allow(clippy::cast_possible_wrap)]
     pub fn build_records(&self) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string(); self.metrics.len()];
         let spiced_version = vec![self.spiced_version.clone(); self.metrics.len()];
@@ -860,7 +858,6 @@ impl ThroughputMetrics {
     }
 }
 
-#[allow(clippy::missing_panics_doc)]
 pub fn system_time_to_unix_epoch_ms(time: SystemTime) -> Result<usize> {
     let duration = time
         .duration_since(UNIX_EPOCH)

@@ -238,7 +238,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
         .await
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

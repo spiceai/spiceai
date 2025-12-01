@@ -174,7 +174,7 @@ mod tests {
         let data_dir = TempDir::new().expect("Failed to create temp data dir");
 
         let result = DatasetCheckpoint::init_cayenne(metadata_dir.path(), data_dir.path());
-        assert!(result.is_ok());
+        result.expect("Cayenne dataset checkpoint should succeed");
         assert!(metadata_dir.path().exists());
         assert!(data_dir.path().exists());
     }

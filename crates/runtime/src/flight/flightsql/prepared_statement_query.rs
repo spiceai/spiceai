@@ -65,7 +65,7 @@ mod param_values_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::io::Cursor;
 
-    #[allow(clippy::ref_option)]
+    #[expect(clippy::ref_option)]
     pub fn serialize<S>(params: &Option<ParamValues>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_parameter_binding_with_plan_caching() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;

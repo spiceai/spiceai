@@ -39,14 +39,13 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{
     FilePathError, SnapshotAdapter, snapshots::download_snapshot_if_needed,
 };
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create table: {source}"))]
@@ -110,9 +109,14 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::LargeBinary
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::List(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
     )
 }
 
@@ -402,7 +406,7 @@ impl CayenneAccelerator {
 
         self.catalog
             .get_or_try_init(move || {
-                let connection_string = connection_string.clone();
+                let connection_string = connection_string;
                 async move {
                     let catalog = Arc::new(
                         cayenne::CayenneCatalog::new(connection_string).map_err(|e| {
@@ -628,6 +632,22 @@ impl DataAccelerator for CayenneAccelerator {
 
         let dir_path = self.file_path(source)?;
 
+        // If mode is FileCreate, delete the existing directory to start fresh
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.mode == Mode::FileCreate
+        {
+            let path_buf = PathBuf::from(&dir_path);
+            if path_buf.exists() {
+                tracing::warn!(
+                    "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
+                    dir_path
+                );
+                std::fs::remove_dir_all(&path_buf).map_err(|err| {
+                    Error::AccelerationInitializationFailed { source: err.into() }
+                })?;
+            }
+        }
+
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
         if !path_buf.exists() {
@@ -645,7 +665,7 @@ impl DataAccelerator for CayenneAccelerator {
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     /// Cayenne supports file mode and can optionally partition data.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -896,7 +916,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
 }
 
 impl CayennePartitionCreator {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         table_name: String,
         base_path: PathBuf,

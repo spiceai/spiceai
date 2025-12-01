@@ -83,7 +83,7 @@ impl Chat for Anthropic {
 impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
     type Error = OpenAIError;
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn try_from(value: MessageCreateResponse) -> Result<Self, Self::Error> {
         Ok(CreateChatCompletionResponse {
             id: value.id,

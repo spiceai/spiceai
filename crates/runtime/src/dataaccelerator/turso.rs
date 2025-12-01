@@ -54,7 +54,7 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
-    component::dataset::acceleration::Engine,
+    component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
@@ -483,6 +483,20 @@ impl DataAccelerator for TursoAccelerator {
                 .into());
             }
 
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "Turso acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
             download_snapshot_if_needed(
                 acceleration,
                 source,
@@ -500,7 +514,7 @@ impl DataAccelerator for TursoAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -554,7 +568,7 @@ impl DataAccelerator for TursoAccelerator {
         // Build CREATE TABLE statement from schema
         let mut columns = Vec::new();
         for field in cmd.schema.fields() {
-            #[allow(clippy::match_same_arms)]
+            #[expect(clippy::match_same_arms)]
             let col_type = match field.data_type() {
                 // Integer types map to SQLite INTEGER
                 DataType::Int64
@@ -759,7 +773,6 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
@@ -837,7 +850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_turso() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -1288,7 +1301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_timestamp_unit_conversion() {
         // Test that timestamps are correctly converted between different units
         // All timestamps are stored as milliseconds in Turso, but should be

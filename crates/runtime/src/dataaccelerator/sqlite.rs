@@ -31,7 +31,7 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    dataaccelerator::{FilePathError, SnapshotAdapter, snapshots::download_snapshot_if_needed},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -156,7 +156,9 @@ impl SqliteAccelerator {
         })?;
 
         let mode = match acceleration.mode {
-            Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
+            Mode::File | Mode::FileCreate => {
+                datafusion_table_providers::sql::db_connection_pool::Mode::File
+            }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();
@@ -245,11 +247,25 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "SQLite acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
             download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
-                self.snapshot_adapter(),
+                SnapshotAdapter::identity(),
             )
             .await;
 
@@ -291,11 +307,10 @@ impl DataAccelerator for SqliteAccelerator {
             let attach_databases = datasets
                 .iter()
                 .filter_map(|other_dataset| {
-                    if other_dataset
-                        .acceleration
-                        .as_ref()
-                        .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
-                    {
+                    if other_dataset.acceleration.as_ref().is_some_and(|a| {
+                        a.engine == Engine::Sqlite
+                            && matches!(a.mode, Mode::File | Mode::FileCreate)
+                    }) {
                         if other_dataset.name() == source.name() {
                             None
                         } else {
@@ -374,7 +389,7 @@ mod tests {
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_sqlite() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -501,7 +516,6 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());

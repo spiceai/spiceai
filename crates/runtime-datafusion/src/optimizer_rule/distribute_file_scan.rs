@@ -1,4 +1,20 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 use crate::concrete;
+use crate::config::cluster_config::SpiceClusterConfig;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -14,7 +30,6 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use itertools::Itertools;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use std::cmp::max;
 use std::sync::Arc;
 
@@ -56,7 +71,7 @@ impl DistributeFileScanOptimizer {
 impl DistributeFileScanOptimizer {
     /// Bytes read is either the whole file or some part of it
     // `cast_sign_loss` is OK because file offsets are always non-negative
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn read_size(pf: &PartitionedFile) -> u64 {
         if let Some(range) = pf.range.as_ref() {
             (range.end - range.start) as u64
@@ -145,7 +160,7 @@ impl DistributeFileScanOptimizer {
         let partitioned_files = file_scan_config
             .file_groups
             .iter()
-            .flat_map(|fg| fg.clone().into_inner())
+            .flat_map(|fg| fg.iter().cloned())
             .collect::<Vec<_>>();
 
         let read_size: u64 = partitioned_files.iter().map(Self::read_size).sum();
@@ -218,6 +233,46 @@ impl DistributeFileScanOptimizer {
 
         Ok(new_exec)
     }
+
+    fn stage_to_new_file_scan(
+        original_file_scan: &FileScanConfig,
+        stage: Vec<FileGroup>,
+        task_partitions: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Copy all existing attributes including projection, excluding file groups as they are potentially
+        // expensive to clone for large scans
+        let new_scan = FileScanConfigBuilder::new(
+            original_file_scan.object_store_url.clone(),
+            Arc::clone(&original_file_scan.file_schema),
+            Arc::clone(&original_file_scan.file_source),
+        )
+        .with_batch_size(original_file_scan.batch_size)
+        .with_constraints(original_file_scan.constraints.clone())
+        .with_expr_adapter(original_file_scan.expr_adapter_factory.clone())
+        .with_file_compression_type(original_file_scan.file_compression_type)
+        .with_file_groups(stage)
+        .with_limit(original_file_scan.limit)
+        .with_metadata_cols(original_file_scan.metadata_cols.clone())
+        .with_object_versioning_type(original_file_scan.object_versioning_type.clone())
+        .with_output_ordering(original_file_scan.output_ordering.clone())
+        .with_projection(original_file_scan.projection.clone())
+        .with_statistics(original_file_scan.statistics()?)
+        .with_table_partition_cols(
+            original_file_scan
+                .table_partition_cols
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+        )
+        .build();
+
+        // Propagate source partitioning
+        let new_scan_partitioning = new_scan.output_partitioning();
+        let new_data_source_exec =
+            DataSourceExec::new(Arc::new(new_scan)).with_partitioning(new_scan_partitioning);
+
+        Self::with_stage_repartition(Arc::new(new_data_source_exec), task_partitions)
+    }
 }
 
 impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
@@ -262,18 +317,9 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
             let exploded_scans = new_stages
                 .into_iter()
                 .map(|stage| {
-                    // Copy all existing attributes including projection, but override file groups
-                    let new_scan = FileScanConfigBuilder::from(file_scan_config.clone())
-                        .with_file_groups(stage)
-                        .build();
-
-                    // Propagate source partitioning
-                    let new_scan_partitioning = new_scan.output_partitioning();
-                    let new_data_source_exec = DataSourceExec::new(Arc::new(new_scan))
-                        .with_partitioning(new_scan_partitioning);
-
-                    Self::with_stage_repartition(
-                        Arc::new(new_data_source_exec),
+                    Self::stage_to_new_file_scan(
+                        file_scan_config,
+                        stage,
                         config.execution.target_partitions,
                     )
                 })
@@ -297,13 +343,14 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::common::plan_node_key::PlanNodeKey;
-    use crate::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
+    use datafusion_optimizer_rules::common::{
+        plan_node_key::PlanNodeKey, search_visitor::SearchVisitor,
+    };
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;

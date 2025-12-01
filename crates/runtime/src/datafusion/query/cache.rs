@@ -207,7 +207,7 @@ impl Query {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
@@ -605,7 +605,7 @@ impl Query {
                 })
                 .await;
 
-            if let Some(()) = result {
+            if result == Some(()) {
                 // This task was the one that ran the revalidation
             } else {
                 // Another task is already revalidating this key
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_complete_lifecycle() {
         // This test validates the complete stale-while-revalidate lifecycle:
         // 1. Initial cache population
@@ -1269,7 +1269,7 @@ mod tests {
                 })
                 .await;
 
-            if let Some(2) = value {
+            if value == Some(2) {
                 tracing::info!(
                     "Background revalidation completed successfully after {} attempts ({}ms)",
                     attempt,
@@ -1367,7 +1367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
         // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
@@ -1531,7 +1531,7 @@ mod tests {
             .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_single_in_flight_revalidation() {
         // This test validates that concurrent stale-while-revalidate requests

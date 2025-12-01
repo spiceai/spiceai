@@ -260,11 +260,9 @@ mod tests {
 
         // Verify that the shutdown does not fail if there are no active connections
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     #[tokio::test]
@@ -299,16 +297,12 @@ mod tests {
 
         // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(5), request_completion_handle)
-                .await
-                .is_ok()
-        );
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+            .await
+            .expect("should complete request after shutdown");
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     fn build_test_http_client() -> reqwest::Client {

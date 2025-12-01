@@ -116,7 +116,7 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
     Response::new(Box::pin(output) as <Service as FlightService>::ListActionsStream)
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn do_action(
     request: Request<Action>,
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {

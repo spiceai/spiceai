@@ -143,7 +143,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 /// check_threshold(10.0, 5.0, 1.1, "p50") // Ok
 /// check_threshold(12.0, 5.0, 1.1, "p50") // Err
 /// ```
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn check_threshold(
     spice_duration: u64,
     baseline_duration: u64,
@@ -185,7 +185,7 @@ fn construct_baseline_cfg(
     let baseline_component_name = args
         .base_component
         .clone()
-        .unwrap_or(spice_component.component_name().clone());
+        .unwrap_or(spice_component.component_name());
 
     let base_payloads: Option<Vec<_>> = args
         .base_payload()?

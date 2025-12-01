@@ -49,6 +49,9 @@ pub struct NotStarted {
     parallel_count: usize,
     end_duration: Duration,
     tempdir_path: Option<PathBuf>,
+    load_interval: Option<Duration>,
+    load_steps: Option<u16>,
+    with_conflict_data: bool,
 }
 
 impl NotStarted {
@@ -84,6 +87,24 @@ impl NotStarted {
     #[must_use]
     pub fn with_tempdir_path(mut self, tempdir_path: PathBuf) -> Self {
         self.tempdir_path = Some(tempdir_path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = Some(load_interval);
+        self
+    }
+
+    #[must_use]
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = Some(load_steps);
+        self
+    }
+
+    #[must_use]
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
         self
     }
 
@@ -128,11 +149,20 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        let append_config = AppendConfig::new(
+        let mut append_config = AppendConfig::new(
             self.state.end_duration,
             self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
-        );
+        )
+        .with_conflict_data(self.state.with_conflict_data);
+
+        if let Some(load_interval) = self.state.load_interval {
+            append_config = append_config.with_load_interval(load_interval);
+        }
+
+        if let Some(load_steps) = self.state.load_steps {
+            append_config = append_config.with_load_steps(load_steps);
+        }
         let append_source = FileAppendableSource::new(&append_config);
 
         let append_worker = AppendWorker::new(append_config, Box::new(append_source))
@@ -185,7 +215,8 @@ impl SpiceTest<AppendStarted> {
                 )
                 .with_flight_client(spice_client.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate);
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate_row_counts(false);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))

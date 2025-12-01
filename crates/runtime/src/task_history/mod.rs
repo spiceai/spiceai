@@ -258,7 +258,7 @@ impl TaskSpan {
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn to_record_batch(spans: Vec<TaskSpan>) -> Result<RecordBatch, Error> {
         let schema = Self::table_schema();
         let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), spans.len());

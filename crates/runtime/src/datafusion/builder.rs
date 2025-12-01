@@ -29,6 +29,7 @@ use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
+use cayenne::optimizer_rules::CayenneJoinRewriter;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -242,7 +243,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -275,9 +276,10 @@ impl DataFusionBuilder {
 
         state = state
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
-                Arc::new(Box::new(track_bytes_processed)),
-            )));
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
+            .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
 
         let mut state = state.build();
 
@@ -446,7 +448,7 @@ pub(crate) fn runtime_env(
     // If no memory limit is specified, default to 70% of total memory (container-aware)
     let effective_memory_limit = memory_limit.or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
@@ -456,7 +458,7 @@ pub(crate) fn runtime_env(
         tracing::debug!(
             "No memory limit specified, defaulting to 70% of total memory: {}",
             {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 util::human_readable_bytes(default_limit as usize)
             }
         );

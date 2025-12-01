@@ -67,7 +67,7 @@ pub struct Kafka {
 }
 
 impl Kafka {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters) -> Result<Self> {
         let kafka_config = KafkaConfig {
             brokers: params
