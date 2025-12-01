@@ -327,7 +327,7 @@ mod tests {
                         .expect("Failed to downcast count column to Int64Array")
                         .value(0);
 
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let count_usize = count as usize;
                     assert_eq!(
                         count_usize, *expected_count,
