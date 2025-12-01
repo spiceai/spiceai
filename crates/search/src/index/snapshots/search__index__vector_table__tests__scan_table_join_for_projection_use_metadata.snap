@@ -1,28 +1,27 @@
 ---
 source: crates/search/src/index/vector_table.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
-snapshot_kind: text
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                          |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                                          |
-|               |   Projection: my_vectored_table.pk, my_vectored_table.another_column, my_vectored_table.not_where, my_vectored_table.body_embedding           |
-|               |     TableScan: my_vectored_table projection=[another_column, body_embedding, not_where, pk]                                                   |
-| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                                 |
-|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                                     |
-|               |     CoalesceBatchesExec: target_batch_size=8192                                                                                               |
-|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                             |
-|               |         HashJoinExec: mode=Partitioned, join_type=Left, on=[(pk@0, pk@0)], projection=[pk@0, another_column@1, not_where@2, body_embedding@4] |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                         |
-|               |             RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=3                                                                 |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                            |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                   BaseTable: projection=["pk", "another_column", "not_where"] filter=[] limit=None                                            |
-|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                         |
-|               |             RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=3                                                                 |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                            |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                   PretendVectorIndex: projection=["pk", "body_embedding"] filter=[] limit=None                                                |
-|               |                                                                                                                                               |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                             |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: my_vectored_table.pk DESC NULLS FIRST, fetch=5                                                                                                                             |
+|               |   Projection: my_vectored_table.pk, my_vectored_table.another_column, my_vectored_table.not_where, my_vectored_table.body_embedding                                              |
+|               |     TableScan: my_vectored_table projection=[another_column, body_embedding, not_where, pk]                                                                                      |
+| physical_plan | SortPreservingMergeExec: [pk@0 DESC], fetch=5                                                                                                                                    |
+|               |   SortExec: TopK(fetch=5), expr=[pk@0 DESC], preserve_partitioning=[true]                                                                                                        |
+|               |     CoalesceBatchesExec: target_batch_size=8192                                                                                                                                  |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                                                |
+|               |         HashJoinExec: mode=Partitioned, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(pk@0, pk@0)], projection=[pk@0, another_column@1, not_where@2, body_embedding@4] |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                                            |
+|               |             RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=3                                                                                                    |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                               |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                      |
+|               |                   BaseTable: projection=["pk", "another_column", "not_where"] filter=[] limit=None                                                                               |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                                                                                                            |
+|               |             RepartitionExec: partitioning=Hash([pk@0], 3), input_partitions=3                                                                                                    |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                               |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                      |
+|               |                   PretendVectorIndex: projection=["pk", "body_embedding"] filter=[] limit=None                                                                                   |
+|               |                                                                                                                                                                                  |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
