@@ -54,7 +54,7 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
-    component::dataset::acceleration::Engine,
+    component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
@@ -481,6 +481,20 @@ impl DataAccelerator for TursoAccelerator {
                     extension: extension.to_string(),
                 }
                 .into());
+            }
+
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "Turso acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
             }
 
             download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
