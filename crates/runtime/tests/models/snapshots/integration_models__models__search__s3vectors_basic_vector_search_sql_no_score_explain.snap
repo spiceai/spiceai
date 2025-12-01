@@ -19,7 +19,7 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
 |               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                              |
 |               |                 BytesProcessedExec                                                                                                                              |
 |               |                   CooperativeExec                                                                                                                               |
-|               |                     S3VectorsQueryExec: limit=30                                                                                                                |
+|               |                     S3VectorsQueryExec: limit=100                                                                                                               |
 |               |         SchemaCastScanExec                                                                                                                                      |
 |               |           BytesProcessedExec                                                                                                                                    |
 |               |             DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                   |

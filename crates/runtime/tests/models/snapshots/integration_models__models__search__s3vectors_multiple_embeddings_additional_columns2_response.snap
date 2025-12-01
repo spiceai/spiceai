@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -17,20 +16,6 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 948
-      },
-      "score": 0.03
-    },
-    {
-      "data": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-      },
-      "dataset": "qs",
-      "matches": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
-        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
-      },
-      "primary_key": {
-        "id": 189
       },
       "score": 0.03
     },
@@ -61,6 +46,19 @@ snapshot_kind: text
         "id": 468
       },
       "score": 0.03
+    },
+    {
+      "data": {
+        "answer": "\\[\n20 - 2(-3)^2 = 20 - 2(9) = 20 - 18 = \\boxed{2}\n\\]"
+      },
+      "dataset": "qs",
+      "matches": {
+        "question": "Evaluate the expression \\( 20 - 2x^2 \\), where \\( x = -3 \\)."
+      },
+      "primary_key": {
+        "id": 191
+      },
+      "score": 0.01
     }
   ]
 }
