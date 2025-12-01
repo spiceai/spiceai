@@ -5,13 +5,18 @@ expression: sanitized_plan
 FilterExec: Use date_part(month, order_date@2) IN (SET) ([Literal { value: Int32(1), field: Field { name: "lit", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }, Literal { value: Int32(2), field: Field { name: "lit", data_type: Int32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }])
   SchemaCastScanExec
     PartitionedUnionExec
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
-      BytesProcessedExec
-        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
+      CayenneAccelerationExec
+        BytesProcessedExec
+          DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
+      CayenneAccelerationExec
+        BytesProcessedExec
+          DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
+      CayenneAccelerationExec
+        BytesProcessedExec
+          DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
+      CayenneAccelerationExec
+        BytesProcessedExec
+          DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
+      CayenneAccelerationExec
+        BytesProcessedExec
+          DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex
