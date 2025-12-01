@@ -261,10 +261,11 @@ fn assign_field_id_recursive(field: &Field, counter: &mut i32) -> Field {
         other => other.clone(),
     };
 
-    Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(HashMap::from([(
-        PARQUET_FIELD_ID_META_KEY.to_string(),
-        id.to_string(),
-    )]))
+    // Preserve existing metadata and add/update the field ID
+    let mut metadata = field.metadata().clone();
+    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+
+    Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(metadata)
 }
 
 #[cfg(test)]
@@ -457,5 +458,63 @@ mod tests {
 
         // Verify iceberg conversion succeeds
         arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
+    }
+
+    #[test]
+    fn test_assign_field_ids_preserves_existing_metadata() {
+        let mut existing_metadata = HashMap::new();
+        existing_metadata.insert("custom_key".to_string(), "custom_value".to_string());
+        existing_metadata.insert("another_key".to_string(), "another_value".to_string());
+
+        let field_with_metadata =
+            Field::new("a", DataType::Int32, false).with_metadata(existing_metadata);
+        let schema = ArrowSchema::new(vec![field_with_metadata]);
+
+        let result = assign_field_ids(&schema);
+
+        let result_field = &result.fields[0];
+        let metadata = result_field.metadata();
+
+        // Verify field ID was added
+        assert_eq!(get_field_id(result_field), Some(0));
+
+        // Verify existing metadata was preserved
+        assert_eq!(
+            metadata.get("custom_key"),
+            Some(&"custom_value".to_string())
+        );
+        assert_eq!(
+            metadata.get("another_key"),
+            Some(&"another_value".to_string())
+        );
+
+        // Verify we have all three keys
+        assert_eq!(metadata.len(), 3);
+    }
+
+    #[test]
+    fn test_assign_field_ids_preserves_nested_metadata() {
+        let mut inner_metadata = HashMap::new();
+        inner_metadata.insert("inner_key".to_string(), "inner_value".to_string());
+
+        let inner_field = Field::new("inner", DataType::Utf8, false).with_metadata(inner_metadata);
+        let schema = ArrowSchema::new(vec![Field::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![inner_field])),
+            false,
+        )]);
+
+        let result = assign_field_ids(&schema);
+
+        if let DataType::Struct(inner_fields) = result.fields[0].data_type() {
+            let inner_metadata = inner_fields[0].metadata();
+            assert_eq!(get_field_id(&inner_fields[0]), Some(1));
+            assert_eq!(
+                inner_metadata.get("inner_key"),
+                Some(&"inner_value".to_string())
+            );
+        } else {
+            panic!("Expected struct type");
+        }
     }
 }
