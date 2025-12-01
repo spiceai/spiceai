@@ -793,7 +793,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 100);
         }
@@ -806,7 +805,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 0);
         }
@@ -819,7 +817,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -845,7 +842,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -870,7 +866,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -895,7 +890,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             let change_batch = change_batch.record;
 
@@ -970,7 +964,6 @@ mod tests {
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            result.expect("valid change batch");
             let change_batch = result.expect("valid change batch");
             assert_eq!(change_batch.record.num_rows(), 10000);
         }
@@ -1004,7 +997,7 @@ mod tests {
             let primary_keys = vec!["id".to_string()];
 
             let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
-            result.expect("valid change batch");
+            let _change_batch = result.expect("valid change batch");
         }
     }
 }
