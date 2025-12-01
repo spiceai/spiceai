@@ -61,8 +61,11 @@ use tracing::{Instrument, info_span};
 /// The JSON key within a `QueryVector` response that contains the distance to the query vector.
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
-/// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
-pub static S3_VECTOR_MAX_TOPK: i32 = 30;
+/// Maximum topK results retrievable by a `QueryVector` operation. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
+pub static S3_VECTOR_MAX_TOPK: i32 = 100;
+
+/// Maximum number of keys per `GetVectors` API call. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
+pub static GET_VECTORS_MAX_KEYS: usize = 100;
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
@@ -524,48 +527,58 @@ impl ExecutionPlan for S3VectorsQueryExec {
 }
 
 /// Wraps a single [`S3Vectors::get_vectors`] for better input, output and error handling.
+/// Batches requests if there are more than `GET_VECTORS_MAX_KEYS` keys.
 async fn get_vectors_call(
     client: Arc<dyn S3Vectors + Send + Sync>,
     idx: &S3VectorIdentifier,
     keys: Vec<String>,
 ) -> DataFusionResult<HashMap<String, VectorData>> {
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let GetVectorsOutput {
-        vectors: output_vectors,
-        ..
-    } = client
-        .get_vectors(
-            GetVectorsInput::builder()
-                .set_keys(Some(keys))
-                .set_vector_bucket_name(bucket_name.clone())
-                .set_index_arn(arn.clone())
-                .set_index_name(index_name.clone())
-                .set_return_data(Some(true))
-                .build()
-                .boxed()
-                .map_err(DataFusionError::External)?,
-        )
-        .instrument(info_span!(
-            target: "task_history",
-            "s3_get_vectors",
-            bucket_name = bucket_name,
-            index_name = index_name,
-            arn = arn,
-        ))
-        .await
-        .map_err(|e| {
-            DataFusionError::External(
-                Error::S3VectorGetVectorsError {
-                    source: Box::new(e.into_service_error()),
-                }
-                .into(),
-            )
-        })?;
+    let mut result = HashMap::new();
 
-    Ok(output_vectors
-        .into_iter()
-        .filter_map(|v| Some((v.key, v.data?)))
-        .collect())
+    // Batch keys into chunks of GET_VECTORS_MAX_KEYS
+    for chunk in keys.chunks(GET_VECTORS_MAX_KEYS) {
+        let GetVectorsOutput {
+            vectors: output_vectors,
+            ..
+        } = client
+            .get_vectors(
+                GetVectorsInput::builder()
+                    .set_keys(Some(chunk.to_vec()))
+                    .set_vector_bucket_name(bucket_name.clone())
+                    .set_index_arn(arn.clone())
+                    .set_index_name(index_name.clone())
+                    .set_return_data(Some(true))
+                    .build()
+                    .boxed()
+                    .map_err(DataFusionError::External)?,
+            )
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_get_vectors",
+                bucket_name = bucket_name,
+                index_name = index_name,
+                arn = arn,
+                keys_count = chunk.len(),
+            ))
+            .await
+            .map_err(|e| {
+                DataFusionError::External(
+                    Error::S3VectorGetVectorsError {
+                        source: Box::new(e.into_service_error()),
+                    }
+                    .into(),
+                )
+            })?;
+
+        result.extend(
+            output_vectors
+                .into_iter()
+                .filter_map(|v| Some((v.key, v.data?))),
+        );
+    }
+
+    Ok(result)
 }
 
 /// Wraps a single [`S3Vectors::query_vectors`] for better input, output and error handling.
@@ -1223,5 +1236,249 @@ mod tests {
         assert!(plan.as_any().downcast_ref::<S3VectorsQueryExec>().is_some());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_s3_vector_max_topk_value() {
+        // Verify the constant is set to 100 as per updated S3 Vectors API limits
+        assert_eq!(S3_VECTOR_MAX_TOPK, 100);
+    }
+
+    #[test]
+    fn test_get_vectors_max_keys_value() {
+        // Verify the constant is set to 100 as per S3 Vectors API limits
+        assert_eq!(GET_VECTORS_MAX_KEYS, 100);
+    }
+
+    #[tokio::test]
+    async fn test_s3_vectors_query_exec_limit_clamped() {
+        let mock_client = Arc::new(MockClient::new());
+        let bucket_name = "test-bucket";
+        let index_name = "test-index";
+
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
+                    .vector_bucket_name(bucket_name)
+                    .set_index_arn(Some("arn".to_string()))
+                    .creation_time(DateTime::from_secs(1))
+                    .index_name(index_name.to_string())
+                    .build()
+                    .expect("build"),
+            ],
+        );
+
+        mock_client
+            .data
+            .lock()
+            .expect("lock")
+            .vectors
+            .insert(index_name.to_string(), vec![]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new(
+                S3_VECTOR_EMBEDDING_NAME,
+                DataType::new_list(DataType::Float32, true),
+                false,
+            ),
+            Field::new(S3_VECTOR_DISTANCE_NAME, DataType::Float64, false),
+        ]));
+
+        let s3_table = S3VectorsTable {
+            client: mock_client,
+            schema,
+            constraints: Constraints::default(),
+            idx: Arc::new(S3VectorIdentifier::Index {
+                bucket_name: bucket_name.to_string(),
+                index_name: index_name.to_string(),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
+            dimension: 3,
+            columns: MetadataColumns::none(),
+            distance_metric: DistanceMetric::Cosine,
+        };
+
+        let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
+        let query_table = S3VectorsQueryTable::new(
+            s3_table,
+            compute_vector,
+            "test query".to_string(),
+            "test_column".to_string(),
+            vec![],
+        );
+
+        let session_state = SessionContext::new().state();
+
+        // Test with limit exceeding S3_VECTOR_MAX_TOPK (100)
+        // The scan should clamp the limit to S3_VECTOR_MAX_TOPK
+        let plan = query_table
+            .scan(&session_state, None, &[], Some(200))
+            .await
+            .expect("scan should succeed");
+
+        // The plan should be S3VectorsQueryExec with clamped limit
+        let exec = plan
+            .as_any()
+            .downcast_ref::<S3VectorsQueryExec>()
+            .expect("should be S3VectorsQueryExec");
+
+        // The limit should be clamped to S3_VECTOR_MAX_TOPK (100)
+        assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
+    }
+
+    #[tokio::test]
+    async fn test_s3_vectors_query_exec_limit_within_bounds() {
+        let mock_client = Arc::new(MockClient::new());
+        let bucket_name = "test-bucket";
+        let index_name = "test-index";
+
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
+                    .vector_bucket_name(bucket_name)
+                    .set_index_arn(Some("arn".to_string()))
+                    .creation_time(DateTime::from_secs(1))
+                    .index_name(index_name.to_string())
+                    .build()
+                    .expect("build"),
+            ],
+        );
+
+        mock_client
+            .data
+            .lock()
+            .expect("lock")
+            .vectors
+            .insert(index_name.to_string(), vec![]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new(
+                S3_VECTOR_EMBEDDING_NAME,
+                DataType::new_list(DataType::Float32, true),
+                false,
+            ),
+            Field::new(S3_VECTOR_DISTANCE_NAME, DataType::Float64, false),
+        ]));
+
+        let s3_table = S3VectorsTable {
+            client: mock_client,
+            schema,
+            constraints: Constraints::default(),
+            idx: Arc::new(S3VectorIdentifier::Index {
+                bucket_name: bucket_name.to_string(),
+                index_name: index_name.to_string(),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
+            dimension: 3,
+            columns: MetadataColumns::none(),
+            distance_metric: DistanceMetric::Cosine,
+        };
+
+        let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
+        let query_table = S3VectorsQueryTable::new(
+            s3_table,
+            compute_vector,
+            "test query".to_string(),
+            "test_column".to_string(),
+            vec![],
+        );
+
+        let session_state = SessionContext::new().state();
+
+        // Test with limit within bounds
+        let plan = query_table
+            .scan(&session_state, None, &[], Some(50))
+            .await
+            .expect("scan should succeed");
+
+        // The plan should be S3VectorsQueryExec with the original limit
+        let exec = plan
+            .as_any()
+            .downcast_ref::<S3VectorsQueryExec>()
+            .expect("should be S3VectorsQueryExec");
+
+        // The limit should remain 50
+        assert_eq!(exec.limit, 50);
+    }
+
+    #[tokio::test]
+    async fn test_s3_vectors_query_exec_no_limit_uses_default() {
+        let mock_client = Arc::new(MockClient::new());
+        let bucket_name = "test-bucket";
+        let index_name = "test-index";
+
+        mock_client.data.lock().expect("lock").indexes.insert(
+            bucket_name.to_string(),
+            vec![
+                IndexSummary::builder()
+                    .vector_bucket_name(bucket_name)
+                    .set_index_arn(Some("arn".to_string()))
+                    .creation_time(DateTime::from_secs(1))
+                    .index_name(index_name.to_string())
+                    .build()
+                    .expect("build"),
+            ],
+        );
+
+        mock_client
+            .data
+            .lock()
+            .expect("lock")
+            .vectors
+            .insert(index_name.to_string(), vec![]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new(
+                S3_VECTOR_EMBEDDING_NAME,
+                DataType::new_list(DataType::Float32, true),
+                false,
+            ),
+            Field::new(S3_VECTOR_DISTANCE_NAME, DataType::Float64, false),
+        ]));
+
+        let s3_table = S3VectorsTable {
+            client: mock_client,
+            schema,
+            constraints: Constraints::default(),
+            idx: Arc::new(S3VectorIdentifier::Index {
+                bucket_name: bucket_name.to_string(),
+                index_name: index_name.to_string(),
+            }),
+            spill_index: Arc::new(AtomicU8::new(0)),
+            dimension: 3,
+            columns: MetadataColumns::none(),
+            distance_metric: DistanceMetric::Cosine,
+        };
+
+        let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
+        let query_table = S3VectorsQueryTable::new(
+            s3_table,
+            compute_vector,
+            "test query".to_string(),
+            "test_column".to_string(),
+            vec![],
+        );
+
+        let session_state = SessionContext::new().state();
+
+        // Test with no limit - should use S3_VECTOR_MAX_TOPK as default
+        let plan = query_table
+            .scan(&session_state, None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        // The plan should be S3VectorsQueryExec with the default limit
+        let exec = plan
+            .as_any()
+            .downcast_ref::<S3VectorsQueryExec>()
+            .expect("should be S3VectorsQueryExec");
+
+        // The limit should be S3_VECTOR_MAX_TOPK (100)
+        assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
     }
 }
