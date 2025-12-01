@@ -591,8 +591,8 @@ fn get_test_dataset(from: &str, name: &str) -> Dataset {
     dataset
 }
 
-#[allow(clippy::missing_panics_doc)]
-#[allow(clippy::missing_errors_doc)]
+#[expect(clippy::missing_panics_doc)]
+#[expect(clippy::missing_errors_doc)]
 pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::Error> {
     let Ok(dynamodb_access_key_id) = env::var("AWS_DYNAMODB_KEY") else {
         panic!("AWS_DYNAMODB_KEY not set")
@@ -621,8 +621,8 @@ pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::E
     Ok(client)
 }
 
-#[allow(clippy::too_many_lines)]
-#[allow(dead_code)]
+#[expect(clippy::too_many_lines)]
+#[expect(dead_code)]
 async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     let client = get_dynamodb_client().await?;
 

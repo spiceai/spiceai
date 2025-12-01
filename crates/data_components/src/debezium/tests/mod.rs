@@ -27,7 +27,7 @@ use crate::debezium::{arrow::convert_fields_to_arrow_schema, change_event::Chang
 use super::arrow::to_record_batch;
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn parse_arrow_schema() {
     let change_event_json = include_str!("./all_types.json");
 
@@ -194,7 +194,7 @@ fn parse_arrow_schema() {
 }
 
 #[test]
-#[allow(clippy::float_cmp)]
+#[expect(clippy::float_cmp)]
 fn parse_values() {
     let change_event_json = include_str!("./all_types.json");
 

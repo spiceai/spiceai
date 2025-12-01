@@ -344,7 +344,7 @@ impl MetricsProvider for MySQLMetricsProvider {
         METRICS
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn callback_to_observe_metric(
         &self,
         metric: &MetricSpec,

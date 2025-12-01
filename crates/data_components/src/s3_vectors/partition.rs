@@ -32,7 +32,8 @@ const _NUM_SEPARATORS: usize = 3; // 3 periods '.' separate the 4 parts
 const _S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
 
 // Check at compile time that we use the full amount allowed from S3
-#[allow(clippy::disallowed_macros)]
+#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
+#[allow(unfulfilled_lint_expectations)]
 const _: () = {
     assert!(
         INDEX_NAME_MAX_LENGTH
@@ -206,7 +207,7 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, Error> {
         .join(PARTS_SEPARATOR))
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
     Ok(match expr {
         Expr::Column(col) => {
@@ -382,10 +383,8 @@ mod tests {
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        assert!(
-            PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
-                .is_err()
-        );
+        PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
+            .expect_err("Should error on long index name");
     }
 
     #[test]
@@ -427,7 +426,7 @@ mod tests {
         let name = "test.index.col";
         let result = PartitionedIndexName::from_index_name(name);
 
-        assert!(result.is_err());
+        result.expect_err("Should error on invalid index name parts");
     }
 
     #[test]

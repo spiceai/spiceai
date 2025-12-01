@@ -66,6 +66,7 @@ use crate::{
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
+    register_data_accelerator,
 };
 
 type Result<T, E = super::Error> = std::result::Result<T, E>;
@@ -439,6 +440,11 @@ async fn get_pool(
     ))
 }
 
+register_data_accelerator!(
+    Engine::TableModePartitionedDuckDB,
+    TablesModePartitionedDuckDBAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,7 +467,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_tables_mode_partitioned_duckdb_accelerator() {
         // Ensure no previous database version exists
         let test_db_path = "./test_table.db";

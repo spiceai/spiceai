@@ -12,6 +12,7 @@ version.workspace = true
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 chrono.workspace = true
 ctrlc = "3.5"
+futures.workspace = true
 humantime = "2.1.0"
 rand.workspace = true
 serde_json.workspace = true
@@ -21,3 +22,4 @@ tracing-subscriber.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 datafusion.workspace = true
+parking_lot.workspace = true

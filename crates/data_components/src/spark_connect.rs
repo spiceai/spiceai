@@ -214,7 +214,7 @@ struct SparkConnectExecutionPlan {
 }
 
 impl SparkConnectExecutionPlan {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(
         dataframe: DataFrame,
         schema: SchemaRef,

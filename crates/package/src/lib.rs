@@ -81,7 +81,6 @@ enum PathReference {
 }
 
 impl std::fmt::Debug for PathReference {
-    #[allow(clippy::unnecessary_debug_formatting)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PathReference::Direct(path) => write!(f, "Direct({path})"),
@@ -310,7 +309,6 @@ async fn find_linked_files(
     Ok(linked_files)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 async fn add_linked_components<ComponentType>(
     store: &dyn ObjectStore,
     linked_files: &mut Vec<PathReference>,

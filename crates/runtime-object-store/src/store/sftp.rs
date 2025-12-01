@@ -140,7 +140,7 @@ impl ObjectStore for SFTPObjectStore {
         unimplemented!()
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn get_opts(
         &self,
         location: &Path,
@@ -167,7 +167,7 @@ impl ObjectStore for SFTPObjectStore {
                     }
                 })?,
 
-                #[allow(clippy::cast_possible_wrap)]
+                #[expect(clippy::cast_possible_wrap)]
                 last_modified: DateTime::from_timestamp(
                     file.stat().map_err(handle_error)?.mtime.ok_or(
                         object_store::Error::Generic {
@@ -332,7 +332,6 @@ impl ObjectStore for SFTPObjectStore {
                         store: "SFTP",
                         source: "No size found for file".into(),
                     })?,
-                    #[allow(clippy::cast_possible_wrap)]
                     last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
                             store: "SFTP",
                             source: "No modification time found for file".into(),

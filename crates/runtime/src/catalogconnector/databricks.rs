@@ -133,7 +133,7 @@ impl CatalogConnector for Databricks {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: Arc<Runtime>,
@@ -226,7 +226,7 @@ impl CatalogConnector for Databricks {
         })?;
 
         let mode = self.params.get("mode").expose().ok();
-        let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
+        let (table_creator, table_reference_creator) = if mode == Some("delta_lake") {
             (
                 Arc::new(DeltaTableFactory::new(
                     params.to_secret_map(),
@@ -283,7 +283,7 @@ impl CatalogConnector for Databricks {
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
     let table_reference = TableReference::Full {
         catalog: uc_table.catalog_name.clone().into(),

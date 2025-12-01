@@ -30,7 +30,7 @@ pub struct Levenshtein {}
 
 #[async_trait]
 impl Scorer for Levenshtein {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     async fn score(
         &self,
         _input: &DatasetInput,

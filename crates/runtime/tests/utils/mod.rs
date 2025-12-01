@@ -55,7 +55,7 @@ pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Dur
     assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) async fn runtime_ready_check_with_timeout_err(
     rt: &Runtime,
     duration: Duration,
@@ -87,7 +87,7 @@ where
 
 /// Returns the duration until the next occurrence of the nearest second.
 /// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
     assert!(
         nearest_second < 60,
@@ -104,7 +104,7 @@ pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Durati
     Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
     let mut secrets = runtime::secrets::Secrets::new();
     // Will automatically load `env` as the default
@@ -126,7 +126,7 @@ pub(crate) fn test_request_context() -> Arc<RequestContext> {
     Arc::clone(&TEST_REQUEST_CONTEXT)
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) async fn run_query(
     rt: &Arc<Runtime>,
     query: &str,
@@ -141,7 +141,7 @@ pub(crate) async fn run_query(
     Ok(results)
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display, anyhow::Error> {
     let pretty = arrow::util::pretty::pretty_format_batches(batches)
         .map_err(|e| anyhow::Error::msg(e.to_string()))?;
@@ -149,7 +149,7 @@ pub(crate) fn to_pretty_display(batches: &[RecordBatch]) -> Result<impl Display,
     Ok(pretty)
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,

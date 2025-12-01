@@ -411,7 +411,7 @@ impl ExecutionPlan for PartitionedUnionExec {
     }
 
     fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         self.inner_union.statistics()
     }
 

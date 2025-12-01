@@ -119,7 +119,6 @@ impl Embed for TaskEmbed {
         self.inner.embed_sync(input)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     async fn embed_request<'b>(
         &'b self,
         req: CreateEmbeddingRequest,

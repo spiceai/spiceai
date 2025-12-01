@@ -1,3 +1,2 @@
 allow-expect-in-tests = true
-# Large futures are in tests
-future-size-threshold = 45520
+future-size-threshold = 45520 # Large futures are in tests

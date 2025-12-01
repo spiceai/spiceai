@@ -21,6 +21,7 @@ test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 
 [features]
+default = ["append"]
 anonymous_telemetry = []
 aws-secrets-manager = []
 clickhouse = []

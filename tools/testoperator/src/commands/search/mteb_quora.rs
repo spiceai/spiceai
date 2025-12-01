@@ -139,7 +139,7 @@ fn to_search_requests(
                     let id = id_column.value(i).to_string();
                     let text = text_column.value(i).to_string();
 
-                    let mut search_request = SearchRequest::new(id.clone(), text.clone());
+                    let mut search_request = SearchRequest::new(id, text);
                     if let Some(limit) = search_limit {
                         search_request = search_request.with_limit(limit);
                     }

@@ -71,7 +71,6 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
-#[allow(clippy::needless_for_each)]
 #[derive(OpenApi)]
 #[openapi(
     servers(
@@ -109,7 +108,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 
     components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
-#[allow(clippy::needless_for_each)]
 pub(crate) struct ApiDoc;
 
 /// Returns the `OpenAPI` documentation for the HTTP API. Adds MCP endpoints if the feature is enabled.
@@ -199,7 +197,7 @@ const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,

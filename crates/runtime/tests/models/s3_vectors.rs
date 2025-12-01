@@ -83,7 +83,6 @@ mod search {
             .and_then(|v| v.params.as_ref())
             .and_then(|p| p.data.get("s3_vectors_bucket"))
             .map(ParamValue::as_string)
-            .clone()
             .ok_or(anyhow!("Dataset has no 's3_vectors_bucket'"))?;
 
         let idx = ds
@@ -92,7 +91,6 @@ mod search {
             .and_then(|v| v.params.as_ref())
             .and_then(|p| p.data.get("s3_vectors_index"))
             .map(ParamValue::as_string)
-            .clone()
             .ok_or(anyhow!("Dataset has no 's3_vectors_index'"))?;
 
         // Last is `view` we want to test upon
@@ -144,7 +142,7 @@ mod search {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
@@ -258,7 +256,6 @@ mod search {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn multiple_embeddings() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
@@ -544,7 +541,7 @@ mod search {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",

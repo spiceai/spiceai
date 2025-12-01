@@ -48,7 +48,7 @@ pub fn dynamodb_items_to_arrow(
     Ok(struct_builder.finish().into())
 }
 
-fn append_item_to_struct_builder(
+pub fn append_item_to_struct_builder(
     item: &HashMap<String, AttributeValue>,
     struct_builder: &mut StructBuilder,
     time_format: &str,
@@ -69,7 +69,7 @@ fn append_item_to_struct_builder(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn append_value_to_builder(
     builder: &mut dyn ArrayBuilder,
     value: Option<&AttributeValue>,

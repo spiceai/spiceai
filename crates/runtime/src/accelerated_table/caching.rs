@@ -39,7 +39,6 @@ use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
 
 /// Check if cached data is stale based on TTL
-#[allow(clippy::cast_possible_wrap)] // SystemTime cast to i64 is safe for reasonable timestamps
 fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<bool> {
     // Find the refreshed_at column
     let schema = batch.schema();
@@ -63,13 +62,13 @@ fn is_data_stale(batch: &RecordBatch, ttl: Duration) -> DataFusionResult<bool> {
         })?;
 
     // Check if any row has stale data
-    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
+    #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
         .as_nanos() as i64;
 
-    #[allow(clippy::cast_possible_truncation)] // Safe: Duration nanoseconds fit in i64
+    #[expect(clippy::cast_possible_truncation)] // Safe: Duration nanoseconds fit in i64
     let ttl_nanos = ttl.as_nanos() as i64;
 
     for i in 0..refreshed_at_array.len() {
@@ -105,12 +104,12 @@ impl CacheRefreshHelper {
         let state = ctx.state();
 
         // Calculate the staleness threshold
-        #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
+        #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
             .as_nanos() as i64;
-        #[allow(clippy::cast_possible_truncation)] // Safe: Duration nanoseconds fit in i64
+        #[expect(clippy::cast_possible_truncation)] // Safe: Duration nanoseconds fit in i64
         let ttl_nanos = ttl.as_nanos() as i64;
         let stale_threshold = now - ttl_nanos;
 
@@ -579,7 +578,7 @@ pub struct CachingAccelerationScanExec {
 }
 
 impl CachingAccelerationScanExec {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         ttl: Option<Duration>,
@@ -608,7 +607,7 @@ impl CachingAccelerationScanExec {
     }
 
     /// Check if we should trigger a background refresh
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn should_refresh(&self, batch: &RecordBatch) -> bool {
         let Some(ttl) = self.ttl else {
             return false; // No TTL configured, never refresh
@@ -618,7 +617,7 @@ impl CachingAccelerationScanExec {
     }
 
     /// Run the user's query on the source (federated table) to fetch fresh data
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     async fn fetch_from_source(
         federated: Arc<dyn TableProvider>,
         dataset_name: &str,
@@ -700,7 +699,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         )))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,
@@ -1011,7 +1010,7 @@ mod tests {
         let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
 
         // Create timestamps that are very recent (within TTL)
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1044,7 +1043,7 @@ mod tests {
         let id_array = Int32Array::from(vec![1, 2]);
         let name_array = StringArray::from(vec!["alice", "bob"]);
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1102,7 +1101,7 @@ mod tests {
         let id_array = Int32Array::from(vec![1, 2, 3]);
         let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1139,14 +1138,14 @@ mod tests {
         let id_array = Int32Array::from(vec![1, 2]);
         let name_array = StringArray::from(vec!["alice", "bob"]);
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
             .as_nanos() as i64;
 
         let ttl = Duration::from_secs(60);
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let ttl_nanos = ttl.as_nanos() as i64;
 
         // Well within TTL boundary - this should NOT be stale
@@ -1223,7 +1222,7 @@ mod tests {
         let query_array = StringArray::from(vec![Some("page=1"), Some("limit=10")]);
         let body_array = StringArray::from(vec![Some("{\"id\":1}"), Some("{\"id\":2}")]);
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1256,7 +1255,7 @@ mod tests {
         let query_array = StringArray::from(vec![None::<&str>]); // Null query
         let body_array = StringArray::from(vec![Some("{\"id\":1}")]);
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1290,7 +1289,7 @@ mod tests {
         let query_array = StringArray::from(vec![Some("page=1")]);
         let body_array = StringArray::from(vec![Some("")]); // Empty string
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1333,7 +1332,7 @@ mod tests {
 
         let id_array = Int32Array::from(vec![1]);
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("Time went backwards")

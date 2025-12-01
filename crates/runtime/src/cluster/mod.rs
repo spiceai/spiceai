@@ -1,4 +1,5 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
+use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
@@ -28,7 +29,6 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
-use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
@@ -62,7 +62,7 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
@@ -234,7 +234,7 @@ async fn create_scheduler_server(
                 .with_option_extension(SpiceClusterConfig::default());
 
             Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
+                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env(io_runtime.clone()))
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
