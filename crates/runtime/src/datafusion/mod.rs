@@ -269,6 +269,14 @@ pub enum Error {
     ))]
     AppendRequiresTimeColumn { from: String },
 
+    #[snafu(display(
+        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS data connector. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
+    ))]
+    InvalidCachingRefreshMode {
+        dataset_name: String,
+        connector: String,
+    },
+
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
 
@@ -986,6 +994,18 @@ impl DataFusion {
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+        if refresh_mode == RefreshMode::Caching {
+            let connector = dataset.source();
+            let is_http_connector =
+                connector.eq_ignore_ascii_case("http") || connector.eq_ignore_ascii_case("https");
+            ensure!(
+                is_http_connector,
+                InvalidCachingRefreshModeSnafu {
+                    dataset_name: dataset.name.to_string(),
+                    connector: connector.to_string(),
+                }
+            );
+        }
 
         // Determine if we should pass constraints to the accelerator
         // Only pass constraints if not using refresh_sql (schema might have different column ordering)
@@ -1072,6 +1092,9 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
+        if let Some(caching_ttl) = acceleration_settings.caching_ttl {
+            refresh = refresh.caching_ttl(caching_ttl);
+        }
 
         // we must not fetch data older than the explicitly set refresh data window or retention period
         let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
@@ -1129,11 +1152,12 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
-        // For caching mode, set the TTL from refresh_check_interval
-        if refresh_mode == RefreshMode::Caching
-            && let Some(check_interval) = acceleration_settings.refresh_check_interval
-        {
-            accelerated_table_builder.caching_ttl(Some(check_interval));
+        // For caching mode, set the TTL (max_age) and stale_while_revalidate from params
+        if refresh_mode == RefreshMode::Caching {
+            accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
+            accelerated_table_builder.caching_stale_while_revalidate_ttl(
+                acceleration_settings.caching_stale_while_revalidate_ttl,
+            );
         }
 
         if acceleration_settings.snapshots.create_enabled()

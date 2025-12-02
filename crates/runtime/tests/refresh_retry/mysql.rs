@@ -120,6 +120,7 @@ async fn create_refresh_task(
             None,
             accelerated_table.get_accelerator(),
             Handle::current(),
+            Arc::new(tokio::sync::Mutex::new(())),
         )
         .with_cpu_runtime(rt.datafusion().cpu_runtime().cloned())
         .build(),
