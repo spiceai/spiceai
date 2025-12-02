@@ -1,7 +1,7 @@
 {
   "version": "2.5.0",
   "summary": {
-    "title": "Spice.ai OSS v1.10.0",
+    "title": "Spice.ai OSS v1.9.2 Threat Model",
     "owner": "Phillip LeBlanc",
     "description": "Spice is a portable, open-source runtime for fast, last-mile SQL query, search, and AI inference with embedded model execution.",
     "id": 0
@@ -469,8 +469,8 @@
             "connector": "smooth",
             "data": {
               "type": "tm.Flow",
-              "name": "Accelerator I/O (DuckDB/SQLite/Vortex)",
-              "description": "File formats: .duckdb, .db, .vortex, Parquet, Arrow IPC",
+              "name": "Accelerator I/O (DuckDB)",
+              "description": "File formats: .duckdb, Parquet, Arrow IPC",
               "outOfScope": false,
               "isTrustBoundary": false,
               "reasonOutOfScope": "",
@@ -482,7 +482,7 @@
               "threats": []
             },
             "labels": [
-              "Accelerator I/O (DuckDB/SQLite/Vortex)"
+              "Accelerator I/O (DuckDB)"
             ],
             "id": "25b3a98a-0e28-4d2b-bf74-bede05ce95eb",
             "source": {
@@ -495,6 +495,55 @@
               {
                 "x": 300,
                 "y": 460
+              }
+            ]
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Accelerator I/O (SQLite)",
+              "description": "File formats: .sqlite, .db",
+              "outOfScope": false,
+              "isTrustBoundary": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "In-memory Arrow",
+              "threats": []
+            },
+            "labels": [
+              "Accelerator I/O (SQLite)"
+            ],
+            "id": "91f4a5b6-c7d8-49e0-a1b2-345c6de7890f",
+            "source": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "target": {
+              "cell": "81367a19-0ccf-4772-b2fe-55f1232cd67f"
+            },
+            "vertices": [
+              {
+                "x": 420,
+                "y": 500
               }
             ]
           },
@@ -644,6 +693,55 @@
             },
             "target": {
               "cell": "81367a19-0ccf-4772-b2fe-55f1232cd67f"
+            }
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "File I/O (SQLite persistence storage)",
+              "description": "Embedded SQLite accelerator reads/writes .sqlite/.db files on local filesystem",
+              "outOfScope": false,
+              "isTrustBoundary": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "labels": [
+              {
+                "attrs": {
+                  "label": {
+                    "text": "Data Flow"
+                  }
+                }
+              }
+            ],
+            "id": "b15fda1e-5c83-4dd7-bb59-1c31d91cb7a1",
+            "source": {
+              "cell": "81367a19-0ccf-4772-b2fe-55f1232cd67f"
+            },
+            "target": {
+              "cell": "03fb0ac1-ff87-46cc-8c51-f75357f8d350"
             }
           },
           {
@@ -1029,6 +1127,94 @@
             "connector": "smooth",
             "data": {
               "type": "tm.Flow",
+              "name": "Model Execution Control",
+              "description": "Runtime issues inference requests to embedded model runtimes and receives responses.",
+              "outOfScope": false,
+              "isTrustBoundary": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "In-process",
+              "threats": []
+            },
+            "labels": [
+              "Model Execution Control"
+            ],
+            "id": "7c4d5e6f-12ab-4cde-8f90-1234567890ab",
+            "source": {
+              "cell": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+            },
+            "target": {
+              "cell": "910108ef-e112-4d35-869a-55bae2e7e631"
+            },
+            "vertices": []
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Model File I/O",
+              "description": "Model Execution reads weights and writes cache metadata to Local Model Storage.",
+              "outOfScope": false,
+              "isTrustBoundary": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": true,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "File I/O",
+              "threats": []
+            },
+            "labels": [
+              "Model File I/O"
+            ],
+            "id": "5de6f7a8-b9c0-4d1e-8f2a-3b4c5d6e7f80",
+            "source": {
+              "cell": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"
+            },
+            "target": {
+              "cell": "f3a4b5c6-d7e8-9f0a-1b2c-3d4e5f6a7b8c"
+            },
+            "vertices": []
+          },
+          {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": "block"
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
               "name": "Ballista gRPC (Task Dispatch)",
               "description": "Scheduler sends task assignments to executors",
               "outOfScope": false,
@@ -1148,44 +1334,13 @@
             },
             "target": {
               "cell": "df26fc07-6901-4028-b816-f7fdc36bffb5"
-            }
-          },
-          {
-            "position": {
-              "x": 760,
-              "y": 250
             },
-            "size": {
-              "width": 180,
-              "height": 110
-            },
-            "attrs": {
-              "text": {
-                "text": "Federated Query & Catalog Orchestration"
-              },
-              "body": {
-                "stroke": "#333333",
-                "strokeWidth": 1.5,
-                "strokeDasharray": null
+            "vertices": [
+              {
+                "x": 450,
+                "y": 305
               }
-            },
-            "visible": true,
-            "shape": "process",
-            "zIndex": 21,
-            "id": "6e3f0d3b-04a1-4b2c-9f4c-1db0bd0e8c9c",
-            "data": {
-              "type": "tm.Process",
-              "name": "Federated Query & Catalog Orchestration",
-              "description": "DataFusion-based federation layer coordinating multi-source SQL, Unity Catalog/Glue metadata, and catalog-backed governance enforcement.",
-              "outOfScope": false,
-              "reasonOutOfScope": "",
-              "hasOpenThreats": false,
-              "handlesCardPayment": false,
-              "handlesGoodsOrServices": false,
-              "isWebApplication": false,
-              "privilegeLevel": "",
-              "threats": []
-            }
+            ]
           },
           {
             "shape": "flow",
@@ -1274,8 +1429,54 @@
             }
           },
           {
+            "shape": "flow",
+            "attrs": {
+              "line": {
+                "stroke": "#333333",
+                "targetMarker": {
+                  "name": "block"
+                },
+                "sourceMarker": {
+                  "name": ""
+                },
+                "strokeDasharray": null
+              }
+            },
+            "width": 200,
+            "height": 100,
+            "zIndex": 10,
+            "connector": "smooth",
+            "data": {
+              "type": "tm.Flow",
+              "name": "Data Flow",
+              "description": "",
+              "outOfScope": false,
+              "isTrustBoundary": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "isBidirectional": false,
+              "isEncrypted": false,
+              "isPublicNetwork": false,
+              "protocol": "",
+              "threats": []
+            },
+            "labels": [
+              "Data Flow"
+            ],
+            "id": "0d294445-6bfa-460f-b845-869e0c96db90",
+            "source": {
+              "x": 680,
+              "y": 720
+            },
+            "target": {
+              "x": 850,
+              "y": 700
+            },
+            "vertices": []
+          },
+          {
             "position": {
-              "x": 1120,
+              "x": 1250,
               "y": 80
             },
             "size": {
@@ -1284,7 +1485,7 @@
             },
             "attrs": {
               "text": {
-                "text": "Data Source(s)"
+                "text": "Data Sources"
               },
               "topLine": {
                 "strokeWidth": 1.5,
@@ -1383,7 +1584,7 @@
             "id": "b7b0e199-6a96-4240-b70e-5a349ec627bc",
             "data": {
               "type": "tm.Store",
-              "name": "Data Source(s)",
+              "name": "Data Sources",
               "description": "Any number of data sources (databases via ODBC FFI boundary, warehouses, cloud storage) serving CSV, JSON, Parquet, Delta, Iceberg formats. ODBC connections cross native/foreign function interface boundary.",
               "outOfScope": false,
               "reasonOutOfScope": "",
@@ -2061,7 +2262,7 @@
           },
           {
             "position": {
-              "x": 1120,
+              "x": 1250,
               "y": 230
             },
             "size": {
@@ -2184,7 +2385,7 @@
           },
           {
             "position": {
-              "x": 1120,
+              "x": 1250,
               "y": 380
             },
             "size": {
@@ -2559,7 +2760,126 @@
           },
           {
             "position": {
-              "x": 1120,
+              "x": 780,
+              "y": 200
+            },
+            "size": {
+              "width": 180,
+              "height": 110
+            },
+            "attrs": {
+              "text": {
+                "text": "Federated Query & Catalog Orchestration"
+              },
+              "body": {
+                "stroke": "#333333",
+                "strokeWidth": 1.5,
+                "strokeDasharray": null
+              }
+            },
+            "visible": true,
+            "shape": "process",
+            "zIndex": 21,
+            "ports": {
+              "groups": {
+                "top": {
+                  "position": "top",
+                  "attrs": {
+                    "circle": {
+                      "r": 4,
+                      "magnet": true,
+                      "stroke": "#5F95FF",
+                      "strokeWidth": 1,
+                      "fill": "#fff",
+                      "style": {
+                        "visibility": "hidden"
+                      }
+                    }
+                  }
+                },
+                "right": {
+                  "position": "right",
+                  "attrs": {
+                    "circle": {
+                      "r": 4,
+                      "magnet": true,
+                      "stroke": "#5F95FF",
+                      "strokeWidth": 1,
+                      "fill": "#fff",
+                      "style": {
+                        "visibility": "hidden"
+                      }
+                    }
+                  }
+                },
+                "bottom": {
+                  "position": "bottom",
+                  "attrs": {
+                    "circle": {
+                      "r": 4,
+                      "magnet": true,
+                      "stroke": "#5F95FF",
+                      "strokeWidth": 1,
+                      "fill": "#fff",
+                      "style": {
+                        "visibility": "hidden"
+                      }
+                    }
+                  }
+                },
+                "left": {
+                  "position": "left",
+                  "attrs": {
+                    "circle": {
+                      "r": 4,
+                      "magnet": true,
+                      "stroke": "#5F95FF",
+                      "strokeWidth": 1,
+                      "fill": "#fff",
+                      "style": {
+                        "visibility": "hidden"
+                      }
+                    }
+                  }
+                }
+              },
+              "items": [
+                {
+                  "group": "top",
+                  "id": "195e90b7-7a51-4fe5-b9f7-a5a0f52f1e52"
+                },
+                {
+                  "group": "right",
+                  "id": "5fb79512-aa43-43db-b2bb-f43b0d85e093"
+                },
+                {
+                  "group": "bottom",
+                  "id": "9b194ece-3062-4eb9-8769-0a45d86b1bc0"
+                },
+                {
+                  "group": "left",
+                  "id": "49637664-6f7f-458f-9d75-a10d2873bb0f"
+                }
+              ]
+            },
+            "id": "6e3f0d3b-04a1-4b2c-9f4c-1db0bd0e8c9c",
+            "data": {
+              "type": "tm.Process",
+              "name": "Federated Query & Catalog Orchestration",
+              "description": "DataFusion-based federation layer coordinating multi-source SQL, Unity Catalog/Glue metadata, and catalog-backed governance enforcement.",
+              "outOfScope": false,
+              "reasonOutOfScope": "",
+              "hasOpenThreats": false,
+              "handlesCardPayment": false,
+              "handlesGoodsOrServices": false,
+              "isWebApplication": false,
+              "privilegeLevel": "",
+              "threats": []
+            }
+          },
+          {
+            "position": {
+              "x": 1250,
               "y": 530
             },
             "size": {
@@ -2696,8 +3016,8 @@
           },
           {
             "position": {
-              "x": 720,
-              "y": 400
+              "x": 760,
+              "y": 420
             },
             "size": {
               "width": 170,
@@ -2815,8 +3135,8 @@
           },
           {
             "position": {
-              "x": 730,
-              "y": 600
+              "x": 760,
+              "y": 610
             },
             "size": {
               "width": 180,
