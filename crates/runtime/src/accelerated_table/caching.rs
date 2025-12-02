@@ -1498,9 +1498,10 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let freshness = check_cache_freshness(&[batch_stale], max_age, stale_while_revalidate)
-            .await
-            .expect("Should check freshness");
+        let freshness =
+            check_cache_freshness(&[batch_stale], max_age, Some(stale_while_revalidate))
+                .await
+                .expect("Should check freshness");
         assert_eq!(freshness, CacheFreshness::Stale, "Just past max_age");
 
         // Just past max_age + swr (91 seconds ago)
@@ -1518,9 +1519,10 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let freshness = check_cache_freshness(&[batch_rotten], max_age, stale_while_revalidate)
-            .await
-            .expect("Should check freshness");
+        let freshness =
+            check_cache_freshness(&[batch_rotten], max_age, Some(stale_while_revalidate))
+                .await
+                .expect("Should check freshness");
         assert_eq!(freshness, CacheFreshness::Rotten, "Just past max_age + swr");
     }
 
