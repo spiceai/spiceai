@@ -378,8 +378,8 @@ impl CacheRefreshHelper {
     /// Insert new data into the accelerator by combining with existing data and overwriting.
     /// This is used when there is no existing data in the cache for the given filters (cache miss).
     ///
-    /// Note: We use read-combine-overwrite instead of `InsertOp::Append` because the DuckDB
-    /// accelerator uses views with underlying data tables, and DuckDB views don't support
+    /// Note: We use read-combine-overwrite instead of `InsertOp::Append` because the `DuckDB`
+    /// accelerator uses views with underlying data tables, and `DuckDB` views don't support
     /// direct INSERT operations. The `InsertOp::Append` fails with "is not an table" error.
     async fn insert_into_accelerator(
         accelerator: &Arc<dyn TableProvider>,
