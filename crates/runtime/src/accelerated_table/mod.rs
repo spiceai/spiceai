@@ -54,7 +54,7 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
@@ -225,6 +225,8 @@ pub struct AcceleratedTable {
     cache_ttl: Option<Duration>,
     cache_stale_while_revalidate_ttl: Option<Duration>,
     io_runtime: Handle,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -642,6 +644,7 @@ impl Builder {
             cache_ttl: self.caching_ttl,
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             io_runtime: self.io_runtime,
+            cache_mutex: Arc::new(Mutex::new(())),
         })
     }
 }
@@ -841,6 +844,7 @@ impl TableProvider for AcceleratedTable {
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
+                    Arc::clone(&self.cache_mutex),
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,

@@ -765,8 +765,8 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<(), RetryError<super::Error>> {
-        // Get the TTL from refresh settings - default to 30 seconds if not specified
-        let ttl = refresh.check_interval.unwrap_or(Duration::from_secs(30));
+        // Get the caching TTL from refresh settings - default to 30 seconds if not specified
+        let ttl = refresh.caching_ttl.unwrap_or(Duration::from_secs(30));
 
         tracing::info!(
             "Starting stale row refresh for dataset {} with TTL {ttl:?}",

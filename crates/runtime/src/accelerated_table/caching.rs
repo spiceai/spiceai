@@ -26,7 +26,7 @@ use arrow_tools::format::SchemaDisplay;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, dml::InsertOp};
+use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::{
@@ -38,6 +38,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
 use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 
@@ -374,6 +375,162 @@ impl CacheRefreshHelper {
         Ok(())
     }
 
+    /// Insert new data into the accelerator by combining with existing data and overwriting.
+    /// This is used when there is no existing data in the cache for the given filters (cache miss).
+    ///
+    /// Note: We use read-combine-overwrite instead of `InsertOp::Append` because the DuckDB
+    /// accelerator uses views with underlying data tables, and DuckDB views don't support
+    /// direct INSERT operations. The `InsertOp::Append` fails with "is not an table" error.
+    async fn insert_into_accelerator(
+        accelerator: &Arc<dyn TableProvider>,
+        dataset_name: &str,
+        new_batches: Vec<RecordBatch>,
+    ) -> DataFusionResult<()> {
+        if new_batches.is_empty() {
+            tracing::debug!(
+                "insert_into_accelerator called with empty batches for dataset={dataset_name}"
+            );
+            return Ok(());
+        }
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let new_rows: usize = new_batches.iter().map(RecordBatch::num_rows).sum();
+
+        tracing::debug!(
+            "insert_into_accelerator - reading existing data from accelerator for dataset={}",
+            dataset_name
+        );
+
+        // Scan all existing data from the accelerator
+        let plan = accelerator.scan(&state, None, &[], None).await?;
+        let task_ctx = Arc::new(TaskContext::default());
+        let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+
+        let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
+        tracing::debug!(
+            "insert_into_accelerator - found {} existing rows, adding {} new rows for dataset={}",
+            existing_rows,
+            new_rows,
+            dataset_name
+        );
+
+        // Combine existing data with new data
+        let mut combined_batches = existing_batches;
+        combined_batches.extend(new_batches);
+
+        // Overwrite the accelerator with the combined data
+        Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, combined_batches).await
+    }
+
+    /// Upsert data into the accelerator by removing rows matching the filters and inserting new data.
+    /// This is used when cached data exists but is rotten (expired).
+    ///
+    /// The process:
+    /// 1. Scan all data from the accelerator
+    /// 2. Filter out rows that match the provided filters (these are the rotten rows to replace)
+    /// 3. Combine remaining rows with new data
+    /// 4. Overwrite the accelerator with the combined data
+    async fn upsert_into_accelerator(
+        accelerator: &Arc<dyn TableProvider>,
+        dataset_name: &str,
+        filters: &[Expr],
+        new_batches: Vec<RecordBatch>,
+    ) -> DataFusionResult<()> {
+        if new_batches.is_empty() {
+            tracing::debug!(
+                "upsert_into_accelerator called with empty batches for dataset={dataset_name}"
+            );
+            return Ok(());
+        }
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        tracing::debug!(
+            "upsert_into_accelerator - reading existing data from accelerator for dataset={}",
+            dataset_name
+        );
+
+        // Scan all data from the accelerator (no filters to get everything)
+        let plan = accelerator.scan(&state, None, &[], None).await?;
+        let task_ctx = Arc::new(TaskContext::default());
+        let existing_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+
+        let existing_rows: usize = existing_batches.iter().map(RecordBatch::num_rows).sum();
+        tracing::debug!(
+            "upsert_into_accelerator - found {} existing rows in accelerator for dataset={}",
+            existing_rows,
+            dataset_name
+        );
+
+        // If there's no existing data, just insert the new data
+        if existing_batches.is_empty() || existing_rows == 0 {
+            tracing::debug!(
+                "upsert_into_accelerator - no existing data, performing simple insert for dataset={}",
+                dataset_name
+            );
+            return Self::insert_into_accelerator(accelerator, dataset_name, new_batches).await;
+        }
+
+        // Build a filter to exclude rows that match the provided filters
+        // We need to keep rows that DON'T match the filters
+        let exclusion_filter = Self::build_exclusion_filter(filters);
+
+        tracing::debug!(
+            "upsert_into_accelerator - filtering out matching rows with {} filters for dataset={}",
+            filters.len(),
+            dataset_name
+        );
+
+        // Filter existing data to keep only non-matching rows
+        let df = ctx.read_batches(existing_batches)?;
+        let filtered_df = if let Some(filter) = exclusion_filter {
+            df.filter(filter)?
+        } else {
+            // No filters means replace everything
+            tracing::debug!(
+                "upsert_into_accelerator - no filters provided, will replace all data for dataset={}",
+                dataset_name
+            );
+            // Return early with just the new batches
+            return Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, new_batches)
+                .await;
+        };
+
+        let kept_batches = filtered_df.collect().await?;
+        let kept_rows: usize = kept_batches.iter().map(RecordBatch::num_rows).sum();
+        let new_rows: usize = new_batches.iter().map(RecordBatch::num_rows).sum();
+
+        tracing::debug!(
+            "upsert_into_accelerator - keeping {} rows, adding {} new rows for dataset={}",
+            kept_rows,
+            new_rows,
+            dataset_name
+        );
+
+        // Combine kept rows with new rows
+        let mut combined_batches = kept_batches;
+        combined_batches.extend(new_batches);
+
+        // Overwrite the accelerator with the combined data
+        Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, combined_batches).await
+    }
+
+    /// Build an exclusion filter that matches rows NOT matching the provided filters.
+    /// Returns `None` if no filters are provided.
+    ///
+    /// For example, if filters are [path = '/api/users', query = 'page=1'],
+    /// this returns: NOT (path = '/api/users' AND query = 'page=1')
+    fn build_exclusion_filter(filters: &[Expr]) -> Option<Expr> {
+        if filters.is_empty() {
+            return None;
+        }
+
+        // Combine all filters with AND, then negate
+        filters.iter().cloned().reduce(Expr::and).map(not)
+    }
+
     /// Fetch data from federated source for given filters
     async fn fetch_from_source(
         federated: &Arc<dyn TableProvider>,
@@ -415,6 +572,12 @@ impl CacheRefreshHelper {
 
     /// Handle a cache miss by fetching from source and returning a stream.
     /// Returns a `SendableRecordBatchStream` containing the fetched data, empty stream, or error stream.
+    ///
+    /// # Arguments
+    /// * `is_rotten` - If `true`, data exists in the cache but is expired (rotten), so we use upsert.
+    ///   If `false`, no data exists in the cache, so we use insert (append).
+    /// * `accelerator_mutex` - Mutex to protect concurrent access to the accelerator.
+    #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
@@ -422,6 +585,8 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
         fallback_schema: SchemaRef,
+        is_rotten: bool,
+        accelerator_mutex: Arc<Mutex<()>>,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
             Ok(batches) if !batches.is_empty() => {
@@ -433,10 +598,29 @@ impl CacheRefreshHelper {
                     dataset_name
                 );
 
+                // Acquire the mutex to protect accelerator operations
+                let lock_guard = accelerator_mutex.lock().await;
+
                 // Store in accelerator for future queries
-                if let Err(e) =
-                    Self::overwrite_accelerator(accelerator, dataset_name, batches.clone()).await
-                {
+                let store_result = if is_rotten {
+                    // Data exists but is expired - upsert (remove matching rows, add new)
+                    tracing::debug!("Upserting rotten cache entry for dataset={dataset_name}");
+                    Self::upsert_into_accelerator(
+                        &accelerator,
+                        dataset_name,
+                        filters,
+                        batches.clone(),
+                    )
+                    .await
+                } else {
+                    // No data exists - insert (append)
+                    tracing::debug!("Inserting new cache entry for dataset={dataset_name}");
+                    Self::insert_into_accelerator(&accelerator, dataset_name, batches.clone()).await
+                };
+
+                drop(lock_guard); // Release the mutex
+
+                if let Err(e) = store_result {
                     tracing::warn!(
                         "Failed to store fetched data in accelerator for dataset {}: {}",
                         dataset_name,
@@ -589,6 +773,8 @@ pub struct CachingAccelerationScanExec {
     filters: Vec<Expr>,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
+    /// Mutex to protect concurrent access to the accelerator during cache operations
+    accelerator_mutex: Arc<Mutex<()>>,
 }
 
 impl CachingAccelerationScanExec {
@@ -604,6 +790,7 @@ impl CachingAccelerationScanExec {
         filters: Vec<Expr>,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
+        accelerator_mutex: Arc<Mutex<()>>,
     ) -> Self {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
@@ -626,6 +813,7 @@ impl CachingAccelerationScanExec {
             filters,
             projection,
             limit,
+            accelerator_mutex,
         }
     }
 }
@@ -682,6 +870,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.filters.clone(),
             self.projection.clone(),
             self.limit,
+            Arc::clone(&self.accelerator_mutex),
         )))
     }
 
@@ -708,6 +897,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let max_age = self.max_age;
         let stale_while_revalidate = self.stale_while_revalidate;
         let io_runtime = self.io_runtime.clone();
+        let accelerator_mutex = Arc::clone(&self.accelerator_mutex);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -749,7 +939,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
             if total_cached_rows > 0 {
                 // Check if data is rotten (past max_age + stale_while_revalidate)
-                // If rotten, treat as cache miss
+                // If rotten, treat as cache miss with is_rotten=true (will upsert)
                 if let Some(max_age) = max_age {
                     let freshness =
                         check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
@@ -758,7 +948,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
                     if freshness == CacheFreshness::Rotten {
                         tracing::debug!(
-                            "Data is rotten for dataset={dataset_name}, treating as cache miss"
+                            "Data is rotten for dataset={dataset_name}, treating as cache miss (upsert)"
                         );
                         return CacheRefreshHelper::handle_cache_miss(
                             federated,
@@ -767,6 +957,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             &filters,
                             limit,
                             Arc::clone(&schema_clone),
+                            true, // is_rotten = true, will upsert
+                            accelerator_mutex,
                         )
                         .await;
                     }
@@ -786,6 +978,9 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 .await
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
+                tracing::debug!(
+                    "No cached data for dataset={dataset_name}, treating as cache miss (insert)"
+                );
                 CacheRefreshHelper::handle_cache_miss(
                     federated,
                     accelerator,
@@ -793,6 +988,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &filters,
                     limit,
                     Arc::clone(&schema_clone),
+                    false, // is_rotten = false, will insert (append)
+                    accelerator_mutex,
                 )
                 .await
             }

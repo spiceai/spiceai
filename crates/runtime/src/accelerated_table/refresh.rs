@@ -83,6 +83,8 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
+    /// TTL for cache entries. Data older than this is considered stale.
+    pub(crate) caching_ttl: Option<Duration>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -185,6 +187,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
+        self.caching_ttl = Some(caching_ttl);
         self
     }
 
@@ -430,6 +438,7 @@ impl Default for Refresh {
             append_overlap: None,
             retry_enabled: false,
             retry_max_attempts: None,
+            caching_ttl: None,
         }
     }
 }
