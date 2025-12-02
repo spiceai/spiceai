@@ -76,7 +76,7 @@ pub enum CacheFreshness {
 /// - `Fresh`: Data was fetched within `max_age` duration
 /// - `Stale`: Data was fetched more than `max_age` ago but within `max_age + stale_while_revalidate`
 /// - `Rotten`: Data was fetched more than `max_age + stale_while_revalidate` ago (or has no timestamp)
-async fn check_cache_freshness(
+fn check_cache_freshness(
     batches: &[RecordBatch],
     max_age: Duration,
     stale_while_revalidate: Option<Duration>,
@@ -113,34 +113,34 @@ async fn check_cache_freshness(
         fresh_threshold
     };
 
-    // Use DataFrame API to check freshness
-    let ctx = SessionContext::new();
-    let df = ctx.read_batches(batches.to_vec())?;
-
-    // Check for rotten rows first: fetched_at IS NULL OR fetched_at < rotten_threshold
-    let rotten_filter = col(CACHE_REFRESHED_AT_COLUMN)
-        .is_null()
-        .or(
-            col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(
-                Some(rotten_threshold),
-                None,
-            ))),
-        );
-
-    let rotten_count = df.clone().filter(rotten_filter)?.count().await?;
-    if rotten_count > 0 {
-        return Ok(CacheFreshness::Rotten);
-    }
-
-    // Check for stale rows: fetched_at < fresh_threshold (but not rotten, checked above)
-    let stale_filter = col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(
-        Some(fresh_threshold),
-        None,
-    )));
-
-    let stale_count = df.filter(stale_filter)?.count().await?;
-    if stale_count > 0 {
-        return Ok(CacheFreshness::Stale);
+    // Directly scan Arrow arrays for freshness (avoid DataFusion overhead)
+    for batch in batches {
+        let col_idx = batch
+            .schema()
+            .index_of(CACHE_REFRESHED_AT_COLUMN)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        let array = batch.column(col_idx);
+        let ts_array = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(
+                    "CACHE_REFRESHED_AT_COLUMN is not TimestampNanosecondArray".to_string(),
+                )
+            })?;
+        for i in 0..ts_array.len() {
+            if !ts_array.is_valid(i) {
+                // Null value = rotten
+                return Ok(CacheFreshness::Rotten);
+            }
+            let ts = ts_array.value(i);
+            if ts < rotten_threshold {
+                return Ok(CacheFreshness::Rotten);
+            }
+            if ts < fresh_threshold {
+                return Ok(CacheFreshness::Stale);
+            }
+        }
     }
 
     Ok(CacheFreshness::Fresh)
@@ -208,9 +208,12 @@ impl CacheRefreshHelper {
             return Ok(0);
         }
 
-        // Create futures for all refresh operations and run them with limited concurrency
+        // Create futures for all refresh operations and run them with limited concurrency.
+        // Each refresh fetches from the source and then upserts into the accelerator,
+        // which preserves data for other cache entries (different request paths/queries).
         let refresh_futures = filter_sets.into_iter().map(|row_filters| {
             let federated = Arc::clone(&federated);
+            let accelerator = Arc::clone(&accelerator);
             let dataset_name = dataset_name.to_string();
 
             async move {
@@ -220,18 +223,32 @@ impl CacheRefreshHelper {
                     row_filters.len()
                 );
 
-                Self::fetch_from_source(&federated, &dataset_name, &row_filters, None).await
+                let batches =
+                    Self::fetch_from_source(&federated, &dataset_name, &row_filters, None).await?;
+
+                if batches.is_empty() {
+                    return Ok::<usize, datafusion::error::DataFusionError>(0);
+                }
+
+                let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+                // Upsert this specific cache entry - removes rows matching the filters
+                // and adds the new data, preserving other cache entries.
+                Self::upsert_into_accelerator(&accelerator, &dataset_name, &row_filters, batches)
+                    .await?;
+
+                Ok(refreshed_rows)
             }
         });
 
         let mut refresh_stream =
             futures::stream::iter(refresh_futures).buffer_unordered(MAX_CONCURRENT_REFRESHES);
 
-        let mut all_refreshed_batches: Vec<RecordBatch> = Vec::new();
+        let mut total_refreshed: usize = 0;
         while let Some(result) = refresh_stream.next().await {
             match result {
-                Ok(batches) => {
-                    all_refreshed_batches.extend(batches);
+                Ok(rows) => {
+                    total_refreshed += rows;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -242,18 +259,6 @@ impl CacheRefreshHelper {
                 }
             }
         }
-
-        if all_refreshed_batches.is_empty() {
-            return Ok(0);
-        }
-
-        let total_refreshed: usize = all_refreshed_batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-
-        // Perform a single overwrite with all refreshed data
-        Self::overwrite_accelerator(accelerator, dataset_name, all_refreshed_batches).await?;
 
         Ok(total_refreshed)
     }
@@ -668,7 +673,7 @@ impl CacheRefreshHelper {
     /// - `Stale`: Return cached data immediately, trigger background refresh
     /// - `Rotten`: This should not be called for rotten data (handled as cache miss)
     #[expect(clippy::too_many_arguments)]
-    async fn handle_cache_hit(
+    fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
         accelerator: &Arc<dyn TableProvider>,
@@ -692,7 +697,6 @@ impl CacheRefreshHelper {
         // Check freshness and trigger background refresh if stale
         if let Some(max_age) = max_age {
             let freshness = check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
-                .await
                 .unwrap_or(CacheFreshness::Rotten);
 
             match freshness {
@@ -943,7 +947,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 if let Some(max_age) = max_age {
                     let freshness =
                         check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
-                            .await
                             .unwrap_or(CacheFreshness::Rotten);
 
                     if freshness == CacheFreshness::Rotten {
@@ -975,7 +978,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &io_runtime,
                     Arc::clone(&schema_clone),
                 )
-                .await
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
                 tracing::debug!(
@@ -1215,7 +1217,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1256,7 +1257,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1297,7 +1297,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1338,7 +1337,6 @@ mod tests {
         let stale_while_revalidate = None; // No stale-while-revalidate
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1369,7 +1367,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1394,7 +1391,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1436,7 +1432,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
@@ -1480,7 +1475,6 @@ mod tests {
 
         let freshness =
             check_cache_freshness(&[batch_fresh], max_age, Some(stale_while_revalidate))
-                .await
                 .expect("Should check freshness");
         assert_eq!(freshness, CacheFreshness::Fresh, "Just within max_age");
 
@@ -1500,7 +1494,6 @@ mod tests {
 
         let freshness =
             check_cache_freshness(&[batch_stale], max_age, Some(stale_while_revalidate))
-                .await
                 .expect("Should check freshness");
         assert_eq!(freshness, CacheFreshness::Stale, "Just past max_age");
 
@@ -1521,7 +1514,6 @@ mod tests {
 
         let freshness =
             check_cache_freshness(&[batch_rotten], max_age, Some(stale_while_revalidate))
-                .await
                 .expect("Should check freshness");
         assert_eq!(freshness, CacheFreshness::Rotten, "Just past max_age + swr");
     }
@@ -1533,7 +1525,6 @@ mod tests {
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&batches, max_age, stale_while_revalidate)
-            .await
             .expect("Should check freshness");
         assert_eq!(
             freshness,
