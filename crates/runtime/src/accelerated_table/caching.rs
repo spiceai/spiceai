@@ -114,6 +114,9 @@ fn check_cache_freshness(
     };
 
     // Directly scan Arrow arrays for freshness (avoid DataFusion overhead)
+    // Track the worst freshness status seen
+    let mut worst_freshness = CacheFreshness::Fresh;
+
     for batch in batches {
         let col_idx = batch
             .schema()
@@ -130,20 +133,22 @@ fn check_cache_freshness(
             })?;
         for i in 0..ts_array.len() {
             if !ts_array.is_valid(i) {
-                // Null value = rotten
+                // Null value = rotten, return immediately (can't get worse)
                 return Ok(CacheFreshness::Rotten);
             }
             let ts = ts_array.value(i);
             if ts < rotten_threshold {
+                // Rotten is the worst, return immediately
                 return Ok(CacheFreshness::Rotten);
             }
-            if ts < fresh_threshold {
-                return Ok(CacheFreshness::Stale);
+            if ts < fresh_threshold && worst_freshness == CacheFreshness::Fresh {
+                // Found a stale row - update worst status but continue checking for rotten
+                worst_freshness = CacheFreshness::Stale;
             }
         }
     }
 
-    Ok(CacheFreshness::Fresh)
+    Ok(worst_freshness)
 }
 
 /// Helper functions for cache refresh operations
