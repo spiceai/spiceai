@@ -308,7 +308,7 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
-  
+
       - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
@@ -1256,7 +1256,7 @@ jobs:
           echo "  caching:" >> spicepod.yaml
           echo "    sql_results:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      eviction_policy: lru" >> spicepod.yaml
+          echo "      caching_policy: lru" >> spicepod.yaml
           echo "      max_size: 128MiB" >> spicepod.yaml
           echo "      item_ttl: 300s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
