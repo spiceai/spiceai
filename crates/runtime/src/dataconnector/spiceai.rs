@@ -38,8 +38,9 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::Dataset;
-use crate::federated_table::FederatedTable;
+use crate::{
+    component::dataset::Dataset, federated_table::FederatedTable, register_data_connector,
+};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -351,6 +352,8 @@ impl DataConnector for SpiceAI {
         }))
     }
 }
+
+register_data_connector!("spice.ai", SpiceAIFactory);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {

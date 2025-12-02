@@ -45,7 +45,19 @@ pub struct ExactLeftAccumulator {
 }
 
 impl CollectLeftAccumulator for ExactLeftAccumulator {
+    fn name(&self) -> &'static str {
+        "ExactLeftAccumulator"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "ExactLeftAccumulator"
+    }
+
     fn try_new(expr: Arc<dyn PhysicalExpr>, _schema: &SchemaRef) -> DataFusionResult<Self> {
+        tracing::debug!("Trying to build ExactLeftAccumulator.");
         Ok(Self {
             arrays: Vec::new(),
             expr,
@@ -54,8 +66,14 @@ impl CollectLeftAccumulator for ExactLeftAccumulator {
 
     fn update_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
         if batch.num_rows() == 0 {
+            tracing::debug!("ExactLeftAccumulator received empty batch, skipping.");
             return Ok(());
         }
+
+        tracing::debug!(
+            "ExactLeftAccumulator updating batch with {} rows",
+            batch.num_rows()
+        );
 
         // eagerly evaluate the expression and store the resulting array
         // this avoids storing the entire record batch in memory, only storing the evaluated column
@@ -109,6 +127,7 @@ impl ColumnBounds for ExactColumnBounds {
 
         if unique_values.is_empty() {
             // No values collected - return a no-op filter (always true)
+            tracing::debug!("ExactLeftAccumulator collected no values, returning no-op filter.");
             return Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))));
         }
 
@@ -123,6 +142,12 @@ impl ColumnBounds for ExactColumnBounds {
             false, // not negated (IN, not NOT IN)
             None,  // no static filter optimization
         ));
+
+        tracing::debug!(
+            "ExactLeftAccumulator created InListExpr with {} values ({} bytes).",
+            in_expr.list().len(),
+            total_memory_size,
+        );
 
         Ok(in_expr)
     }

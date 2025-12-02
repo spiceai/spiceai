@@ -58,7 +58,12 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
 pub enum Mode {
     #[default]
     Memory,
+    /// Open an existing file if it exists, otherwise create a new one.
+    /// This is the default file behavior that preserves data across restarts.
     File,
+    /// Always create a new file, truncating/overwriting any existing file on startup.
+    /// Use this when you want a fresh acceleration on each startup.
+    FileCreate,
 }
 
 impl From<spicepod_acceleration::Mode> for Mode {
@@ -66,6 +71,7 @@ impl From<spicepod_acceleration::Mode> for Mode {
         match mode {
             spicepod_acceleration::Mode::Memory => Mode::Memory,
             spicepod_acceleration::Mode::File => Mode::File,
+            spicepod_acceleration::Mode::FileCreate => Mode::FileCreate,
         }
     }
 }
@@ -75,6 +81,7 @@ impl Display for Mode {
         match self {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
+            Mode::FileCreate => write!(f, "file_create"),
         }
     }
 }
