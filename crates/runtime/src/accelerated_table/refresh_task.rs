@@ -14,38 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::compute::{SortOptions, filter_record_batch};
-use arrow::{
-    array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
-    datatypes::DataType,
-};
-use arrow_schema::SchemaRef;
-use async_stream::stream;
-use datafusion::datasource::{DefaultTableSource, TableType};
-use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_planner::ExtensionPlanner;
-use datafusion_table_providers::util::retriable_error::{
-    check_and_mark_retriable_error, is_retriable_error,
-};
-use futures::{StreamExt, stream};
-use opentelemetry::KeyValue;
-use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
-use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
-use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
-use runtime_datafusion_index::analyzer::{
-    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
-};
-use snafu::{OptionExt, ResultExt};
-use tokio::{
-    runtime::Handle,
-    sync::{Mutex, RwLock, Semaphore, oneshot},
-    time::Instant,
-};
-use tracing::{Instrument, Span};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{RetryError, retry};
-
+use super::metrics;
+use super::refresh::Refresh;
+use super::refresh::get_timestamp;
+use super::sink::AccelerationSink;
+use super::synchronized_table::SynchronizedTable;
+use crate::accelerated_table::caching::CacheRefreshHelper;
+use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
+use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
 use crate::datafusion::is_spice_internal_dataset;
@@ -61,22 +37,19 @@ use crate::{
     dataupdate::{StreamingDataUpdate, UpdateType},
     status,
 };
-use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
-use runtime_object_store::registry::default_runtime_env;
-
-use super::metrics;
-use super::refresh::get_timestamp;
-use super::sink::AccelerationSink;
-use super::synchronized_table::SynchronizedTable;
-
-use crate::component::dataset::TimeFormat;
-use std::time::{Duration, UNIX_EPOCH};
-use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-
-use super::refresh::Refresh;
-use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
+use arrow::compute::{SortOptions, filter_record_batch};
+use arrow::{
+    array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    datatypes::DataType,
+};
+use arrow_schema::SchemaRef;
+use async_stream::stream;
 use data_components::poly::PolyTableProvider;
+use datafusion::datasource::{DefaultTableSource, TableType};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
     dataframe::DataFrame,
     datasource::TableProvider,
@@ -87,9 +60,33 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_table_providers::util::retriable_error::{
+    check_and_mark_retriable_error, is_retriable_error,
+};
+use futures::{StreamExt, stream};
+use opentelemetry::KeyValue;
+use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
+use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
+use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
+use runtime_datafusion_index::analyzer::{
+    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
+};
+use runtime_object_store::registry::default_runtime_env;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
+use std::time::{Duration, UNIX_EPOCH};
+use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, RwLock, Semaphore, oneshot},
+    time::Instant,
+};
+use tracing::{Instrument, Span};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 mod changes;
 
@@ -768,15 +765,12 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        use crate::accelerated_table::caching::CacheRefreshHelper;
-
         // Get the TTL from refresh settings - default to 30 seconds if not specified
         let ttl = refresh.check_interval.unwrap_or(Duration::from_secs(30));
 
         tracing::info!(
-            "Cache: Starting stale row refresh for dataset {} with TTL {:?}",
+            "Starting stale row refresh for dataset {} with TTL {ttl:?}",
             self.dataset_name,
-            ttl
         );
 
         // Use the CacheRefreshHelper to identify and refresh stale rows
@@ -791,9 +785,8 @@ impl RefreshTask {
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
 
         tracing::info!(
-            "Cache: Completed stale row refresh for dataset {} - refreshed {} rows",
+            "Completed stale row refresh for dataset {} - refreshed {refreshed_count} rows",
             self.dataset_name,
-            refreshed_count
         );
 
         // Return an empty streaming update since the refresh was handled internally
