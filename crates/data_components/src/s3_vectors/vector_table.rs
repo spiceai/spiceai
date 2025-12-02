@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    S3VectorBuildSnafu, spill::MAX_SPILL_SEQUENCE,
+    S3VectorBuildSnafu, query_provider::S3_VECTOR_DISTANCE_NAME, spill::MAX_SPILL_SEQUENCE,
 };
 use arrow_tools::record_batch::replace_column_in_record;
 use std::{
@@ -39,6 +39,8 @@ use aws_credential_types::provider::error::CredentialsError;
 use datafusion::{
     common::{Constraint, Constraints},
     error::DataFusionError,
+    logical_expr::TableProviderFilterPushDown,
+    prelude::Expr,
 };
 
 use s3_vectors::{
@@ -581,6 +583,43 @@ impl S3VectorsTable {
                 }
             }
         }
+    }
+
+    pub(super) fn query_provider_schema(&self) -> SchemaRef {
+        let mut base_fields = self.schema.fields().iter().cloned().collect::<Vec<_>>();
+
+        base_fields.push(Arc::new(Field::new(
+            S3_VECTOR_DISTANCE_NAME,
+            DataType::Float64,
+            false,
+        )));
+
+        Arc::new(Schema::new(base_fields))
+    }
+
+    pub(super) fn query_provider_supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        // Filters can only possibly be pushed down for columns in underlying metadata (i.e. not derived columns like `S3_VECTOR_DISTANCE_NAME`).
+        let columns: Vec<_> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|c| self.is_filterable_column(c.as_str()))
+            .collect();
+
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if s3_vectors_metadata_filter::supports_filter_expr(columns.as_slice(), f) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     fn is_capacity_exceeded_error(error: &PutVectorsError) -> bool {

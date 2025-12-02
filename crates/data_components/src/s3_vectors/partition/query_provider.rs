@@ -19,32 +19,25 @@ use std::{
 };
 
 use crate::s3_vectors::{
-    S3VectorIdentifier,
-    compute_query::ComputeQueryVector,
-    fetch_all_index_names,
-    partition::{BelongsWith, PartitionedIndexName},
-    query_provider::{S3VectorsQueryExec, S3VectorsQueryTable},
+    S3VectorIdentifier, compute_query::ComputeQueryVector, fetch_all_index_names,
+    partition::PartitionedIndexName, query_provider::S3VectorsQueryTable,
     vector_table::S3VectorsTable,
 };
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Constraints, exec_err, project_schema},
     datasource::TableType,
-    error::{DataFusionError, Result as DataFusionResult},
+    error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
     physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
 };
-use s3_vectors::S3Vectors;
 
 /// The JSON key within a `QueryVector` response that contains the distance to the query vector.
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
-
-/// Maximum topK results retrievable by a `QueryVector` operation. // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
-pub static S3_VECTOR_MAX_TOPK: i32 = 30;
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
@@ -82,21 +75,7 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        let mut base_fields = self
-            .table
-            .schema
-            .fields()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        base_fields.push(Arc::new(Field::new(
-            S3_VECTOR_DISTANCE_NAME,
-            DataType::Float64,
-            false,
-        )));
-
-        Arc::new(Schema::new(base_fields))
+        self.table.query_provider_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -111,26 +90,7 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // Filters can only possibly be pushed down for columns in underlying metadata (i.e. not derived columns like `S3_VECTOR_DISTANCE_NAME`).
-        let columns: Vec<_> = self
-            .table
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .filter(|c| self.table.is_filterable_column(c.as_str()))
-            .collect();
-
-        Ok(filters
-            .iter()
-            .map(|f| {
-                if s3_vectors_metadata_filter::supports_filter_expr(columns.as_slice(), f) {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+        self.table.query_provider_supports_filters_pushdown(filters)
     }
 
     async fn scan(
@@ -140,12 +100,6 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let query_vector = self
-            .compute_vector
-            .compute_vector(self.query.as_str())
-            .await
-            .map_err(DataFusionError::External)?;
-
         let current_index = self.table.current_index();
         let (_, bucket_name, index_name) = current_index.index_identifier_variables();
 
@@ -156,73 +110,26 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
         )
         .await?;
 
-        if self.partition_by.is_empty() {
-            let limit_i32: i32 = match limit {
-                Some(l) => {
-                    // Safe conversion: check against i32::MAX first, then compare with limit
-                    let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
-                    if l_i32 > S3_VECTOR_MAX_TOPK {
-                        tracing::warn!(
-                            "S3VectorsPartitionedQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                        );
-                        S3_VECTOR_MAX_TOPK
-                    } else {
-                        l_i32
-                    }
-                }
-                None => S3_VECTOR_MAX_TOPK,
-            };
-            // TODO: use `S3VectorsQueryTable` to offload above limit checking logic .
-            return Ok(Arc::new(S3VectorsQueryExec::new(
-                &self.table,
-                projection,
-                i64::from(limit_i32),
-                query_vector.clone(),
-                filters.to_vec(),
-            )));
-        }
-
         let current_index = self.table.current_index();
         let (_, bucket_name, index_name) = current_index.index_identifier_variables();
         let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
             return exec_err!("No bucket name or index name for bucket query");
         };
 
-        let all_index_names = all_index_names.unwrap_or_default();
-
+        // Filter out any index that has `index_name` as prefix, but is not apart of this partitioning.
         let index_names: Vec<_> = all_index_names
+            .unwrap_or_default()
             .iter()
             .filter_map(|idx_name| {
-                let Ok(partitioned_index_name) =
-                    PartitionedIndexName::from_index_name(idx_name)
-                else {
-                    return None;
-                };
-
-                if matches!(
-                    partitioned_index_name.belongs_with(
-                        &index_name,
-                        &self.column_name,
-                        &self.partition_by
-                    ),
-                    BelongsWith::ThisDataset
-                ) {
-                    Some(idx_name.clone())
-                } else {
-                    tracing::debug!(
-                        "S3 index {idx_name} returned but does not belong with this dataset: {index_name}",
-                    );
-                    None
-                }
+                PartitionedIndexName::from_and_check_index_name(
+                    idx_name,
+                    &index_name,
+                    &self.column_name,
+                    &self.partition_by,
+                )?;
+                Some(idx_name.clone())
             })
             .collect();
-
-        if index_names.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(project_schema(
-                &self.schema(),
-                projection,
-            )?)));
-        }
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         for index_name in index_names {
@@ -244,8 +151,6 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
                 index_table,
                 Arc::clone(&self.compute_vector),
                 self.query.clone(),
-                self.column_name.clone(),
-                vec![],
             );
 
             let index_plan = query_table.scan(state, projection, filters, limit).await?;
@@ -278,7 +183,7 @@ mod tests {
 
     use super::*;
 
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
         prelude::{SessionContext, col},
         scalar::ScalarValue,

@@ -21,12 +21,14 @@ use arrow::compute::concat_batches;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
+use data_components::s3_vectors::partition::S3VectorsPartitionedQueryTable;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
     list_provider::S3VectorsListTable, partition::PartitionedIndexName,
     query_provider::S3VectorsQueryTable,
 };
 
+use datafusion::catalog::TableProvider;
 use datafusion::common::DFSchema;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::functions::core::union_extract::UnionExtractFun;
@@ -203,35 +205,44 @@ impl SearchIndex for S3Vector {
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
-        Ok(LogicalPlanBuilder::scan(
-            "tbl",
-            Arc::new(DefaultTableSource::new(Arc::new(S3VectorsQueryTable::new(
+        // TODO: should be able to internalize the CachedQueryVector within S3VectorsQueryTable.
+        let compute_vector = Arc::new(CachedQueryVector::new(
+            Arc::new(EmbedQuery(Arc::clone(&self.compute_query))),
+            query.to_string(),
+        )) as Arc<dyn ComputeQueryVector>;
+        let table: Arc<dyn TableProvider> = match self.partition_by.len() {
+            0 => Arc::new(S3VectorsQueryTable::new(
                 self.table.clone(),
-                // TODO: should be able to internalize the CachedQueryVector within S3VectorsQueryTable.
-                Arc::new(CachedQueryVector::new(
-                    Arc::new(EmbedQuery(Arc::clone(&self.compute_query))),
-                    query.to_string(),
-                )) as Arc<dyn ComputeQueryVector>,
+                compute_vector,
+                query.to_string(),
+                self.embedded_column.clone(),
+            )),
+            _ => Arc::new(S3VectorsPartitionedQueryTable::new(
+                self.table.clone(),
+                compute_vector,
                 query.to_string(),
                 self.embedded_column.clone(),
                 self.partition_by.clone(),
-            )))),
-            None,
-        )?
-        .project(
-            [
-                s3_vectors_primary_key_cast(&self.primary_fields()),
-                metadata_columns_to_exprs(&self.metadata_columns),
-                vec![
-                    col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(&self.search_column())),
-                    binary_expr(lit(1.0), Operator::Minus, col("distance"))
-                        .alias(SEARCH_SCORE_COLUMN_NAME),
-                ],
-            ]
-            .concat(),
-        )?
-        .build()?
-        .into())
+            )),
+        };
+        Ok(
+            LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(table)), None)?
+                .project(
+                    [
+                        s3_vectors_primary_key_cast(&self.primary_fields()),
+                        metadata_columns_to_exprs(&self.metadata_columns),
+                        vec![
+                            col(S3_VECTOR_EMBEDDING_NAME)
+                                .alias(embedding_col(&self.search_column())),
+                            binary_expr(lit(1.0), Operator::Minus, col("distance"))
+                                .alias(SEARCH_SCORE_COLUMN_NAME),
+                        ],
+                    ]
+                    .concat(),
+                )?
+                .build()?
+                .into(),
+        )
     }
 }
 

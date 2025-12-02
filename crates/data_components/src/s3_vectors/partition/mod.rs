@@ -45,10 +45,10 @@ const _: () = {
     );
 };
 
-mod list_provider;
+pub mod list_provider;
 pub use list_provider::S3VectorsPartitionedListTable;
 
-mod query_provider;
+pub mod query_provider;
 pub use query_provider::S3VectorsPartitionedQueryTable;
 
 static PARTS_SEPARATOR: &str = ".";
@@ -148,6 +148,22 @@ impl PartitionedIndexName {
             partition_by_hash: parts[2].to_string(),
             partition_value_hash: parts[3].to_string(),
         })
+    }
+
+    // Checks if a given index name is valid and belongs to the partitioned index (base on the encoding scheme of the column and parition [`Expr`]).
+    //
+    // Does not delineate between an invalid `index_name` and one that is not apart of the partition.
+    pub fn from_and_check_index_name(
+        index_name: &str,
+        base_index_name: &str,
+        column_name: &str,
+        partition_by: &[Expr],
+    ) -> Option<Self> {
+        let partitioned_index = Self::from_index_name(index_name).ok()?;
+        match partitioned_index.belongs_with(base_index_name, column_name, partition_by) {
+            BelongsWith::ThisDataset => Some(partitioned_index),
+            _ => None,
+        }
     }
 
     /// Determines if the partitions come from the same dataset

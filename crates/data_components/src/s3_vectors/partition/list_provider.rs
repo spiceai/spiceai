@@ -21,7 +21,7 @@ use std::{
 use crate::s3_vectors::{
     S3VectorIdentifier, fetch_all_index_names,
     list_provider::{S3VectorsListExec, S3VectorsListTable},
-    partition::{BelongsWith, PartitionedIndexName},
+    partition::PartitionedIndexName,
     vector_table::S3VectorsTable,
 };
 
@@ -48,6 +48,9 @@ pub struct S3VectorsPartitionedListTable {
 }
 
 impl S3VectorsPartitionedListTable {
+    /// Create a new [`S3VectorsPartitionedListTable`].
+    ///
+    /// Expects `partition_by` to be non-empty.
     #[must_use]
     pub fn new(table: S3VectorsTable, column_name: String, partition_by: Vec<Expr>) -> Self {
         Self {
@@ -106,13 +109,6 @@ impl TableProvider for S3VectorsPartitionedListTable {
         )
         .await?;
 
-        if self.partition_by.is_empty() {
-            return Ok(
-                Arc::new(S3VectorsListExec::new(&self.table, projection, limit))
-                    as Arc<dyn ExecutionPlan>,
-            );
-        }
-
         let current_index = self.table.current_index();
         let (_, bucket_name, index_name) = current_index.index_identifier_variables();
         let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
@@ -121,19 +117,14 @@ impl TableProvider for S3VectorsPartitionedListTable {
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         for idx_name in all_index_names.unwrap_or_default() {
-            let Ok(partitioned_index_name) = PartitionedIndexName::from_index_name(&idx_name)
-            else {
-                continue;
-            };
-
-            if matches!(
-                partitioned_index_name.belongs_with(
-                    &index_name,
-                    &self.column_name,
-                    &self.partition_by
-                ),
-                BelongsWith::ThisDataset
-            ) {
+            if PartitionedIndexName::from_and_check_index_name(
+                &idx_name,
+                &index_name,
+                &self.column_name,
+                &self.partition_by,
+            )
+            .is_some()
+            {
                 let index_table_identifier = S3VectorIdentifier::Index {
                     bucket_name: bucket_name.to_string(),
                     index_name: idx_name.clone(),
@@ -150,7 +141,7 @@ impl TableProvider for S3VectorsPartitionedListTable {
                     distance_metric: self.table.distance_metric.clone(),
                 };
                 index_plans.push(
-                    S3VectorsListTable::new(index_table, self.column_name.clone(), vec![])
+                    S3VectorsListTable::new(index_table)
                         .scan(state, projection, filters, limit)
                         .await?,
                 );
