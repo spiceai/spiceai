@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_cayenne_file_append
+name: file[parquet]-cayenne[file]-append
 datasets:
   - from: file:customer.parquet
     name: customer
