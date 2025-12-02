@@ -417,7 +417,7 @@ impl RefreshTask {
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on fetched_at and TTL
-                self.refresh_stale_cached_rows(refresh).await
+                return self.refresh_stale_cached_rows(refresh).await;
             }
         };
 
@@ -764,7 +764,7 @@ impl RefreshTask {
     async fn refresh_stale_cached_rows(
         &self,
         refresh: &Refresh,
-    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+    ) -> Result<(), RetryError<super::Error>> {
         // Get the TTL from refresh settings - default to 30 seconds if not specified
         let ttl = refresh.check_interval.unwrap_or(Duration::from_secs(30));
 
@@ -789,14 +789,7 @@ impl RefreshTask {
             self.dataset_name,
         );
 
-        // Return an empty streaming update since the refresh was handled internally
-        // by CacheRefreshHelper
-        let schema = self.accelerator.schema();
-        let empty_stream = RecordBatchStreamAdapter::new(schema, futures::stream::empty());
-        Ok(StreamingDataUpdate {
-            data: Box::pin(empty_stream),
-            update_type: UpdateType::Overwrite,
-        })
+        Ok(())
     }
 
     async fn trace_load_completed(
