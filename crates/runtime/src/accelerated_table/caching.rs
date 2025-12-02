@@ -1458,13 +1458,11 @@ mod tests {
             .as_nanos() as i64;
 
         let max_age = Duration::from_secs(60);
-        let stale_while_revalidate = Some(Duration::from_secs(30));
+        let stale_while_revalidate = Duration::from_secs(30);
         #[expect(clippy::cast_possible_truncation)]
         let max_age_nanos = max_age.as_nanos() as i64;
         #[expect(clippy::cast_possible_truncation)]
-        let swr_nanos = stale_while_revalidate
-            .expect("swr should be Some")
-            .as_nanos() as i64;
+        let swr_nanos = stale_while_revalidate.as_nanos() as i64;
 
         // Just within max_age (59 seconds ago)
         let refresh_timestamps_fresh =
