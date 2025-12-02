@@ -1149,11 +1149,12 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
-        // For caching mode, set the TTL from refresh_check_interval
-        if refresh_mode == RefreshMode::Caching
-            && let Some(check_interval) = acceleration_settings.refresh_check_interval
-        {
-            accelerated_table_builder.caching_ttl(Some(check_interval));
+        // For caching mode, set the TTL (max_age) and stale_while_revalidate from params
+        if refresh_mode == RefreshMode::Caching {
+            accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
+            accelerated_table_builder.caching_stale_while_revalidate_ttl(
+                acceleration_settings.caching_stale_while_revalidate_ttl,
+            );
         }
 
         if acceleration_settings.snapshots.create_enabled()

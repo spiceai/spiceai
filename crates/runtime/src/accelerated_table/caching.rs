@@ -59,43 +59,90 @@ fn get_first_fetched_at_timestamp(batch: &RecordBatch) -> Option<i64> {
     Some(ts_array.value(0))
 }
 
-/// Check if cached data is stale based on TTL
-async fn is_data_stale(batches: Vec<RecordBatch>, ttl: Duration) -> DataFusionResult<bool> {
+/// Represents the freshness state of cached data
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheFreshness {
+    /// Data is within `max_age` TTL - can be served directly without refresh
+    Fresh,
+    /// Data is past `max_age` but within `stale_while_revalidate` - serve but trigger background refresh
+    Stale,
+    /// Data is past both TTLs - treat as cache miss
+    Rotten,
+}
+
+/// Check the freshness state of cached data based on `max_age` and `stale_while_revalidate` TTLs
+///
+/// - `Fresh`: Data was fetched within `max_age` duration
+/// - `Stale`: Data was fetched more than `max_age` ago but within `max_age + stale_while_revalidate`
+/// - `Rotten`: Data was fetched more than `max_age + stale_while_revalidate` ago (or has no timestamp)
+async fn check_cache_freshness(
+    batches: &[RecordBatch],
+    max_age: Duration,
+    stale_while_revalidate: Option<Duration>,
+) -> DataFusionResult<CacheFreshness> {
     if batches.is_empty() {
-        return Ok(false); // No data means not stale
+        return Ok(CacheFreshness::Fresh); // No data means nothing to check
     }
 
     // Check the first batch for schema information
     let schema = batches[0].schema();
     if schema.column_with_name(CACHE_REFRESHED_AT_COLUMN).is_none() {
-        // No metadata column means data was never refreshed in cache mode
-        return Ok(true);
+        // No metadata column means data was never refreshed in cache mode - treat as rotten
+        return Ok(CacheFreshness::Rotten);
     }
 
-    // Data fetched before this threshold is considered stale
     #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
-    let stale_threshold = (SystemTime::now() - ttl)
+    let now_nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
         .as_nanos() as i64;
 
-    // Use DataFrame API to check for stale rows
-    let ctx = SessionContext::new();
-    let df = ctx.read_batches(batches)?;
+    // Calculate thresholds
+    #[expect(clippy::cast_possible_truncation)]
+    let max_age_nanos = max_age.as_nanos() as i64;
+    let fresh_threshold = now_nanos - max_age_nanos;
 
-    // Filter for stale rows: fetched_at IS NULL OR fetched_at < stale_threshold
-    let stale_filter = col(CACHE_REFRESHED_AT_COLUMN)
+    // Calculate rotten threshold (max_age + stale_while_revalidate)
+    let rotten_threshold = if let Some(swr) = stale_while_revalidate {
+        #[expect(clippy::cast_possible_truncation)]
+        let swr_nanos = swr.as_nanos() as i64;
+        now_nanos - max_age_nanos - swr_nanos
+    } else {
+        // If no stale_while_revalidate, stale items become rotten immediately
+        fresh_threshold
+    };
+
+    // Use DataFrame API to check freshness
+    let ctx = SessionContext::new();
+    let df = ctx.read_batches(batches.to_vec())?;
+
+    // Check for rotten rows first: fetched_at IS NULL OR fetched_at < rotten_threshold
+    let rotten_filter = col(CACHE_REFRESHED_AT_COLUMN)
         .is_null()
         .or(
             col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(
-                Some(stale_threshold),
+                Some(rotten_threshold),
                 None,
             ))),
         );
 
-    let stale_count = df.filter(stale_filter)?.count().await?;
+    let rotten_count = df.clone().filter(rotten_filter)?.count().await?;
+    if rotten_count > 0 {
+        return Ok(CacheFreshness::Rotten);
+    }
 
-    Ok(stale_count > 0)
+    // Check for stale rows: fetched_at < fresh_threshold (but not rotten, checked above)
+    let stale_filter = col(CACHE_REFRESHED_AT_COLUMN).lt(lit(ScalarValue::TimestampNanosecond(
+        Some(fresh_threshold),
+        None,
+    )));
+
+    let stale_count = df.filter(stale_filter)?.count().await?;
+    if stale_count > 0 {
+        return Ok(CacheFreshness::Stale);
+    }
+
+    Ok(CacheFreshness::Fresh)
 }
 
 /// Helper functions for cache refresh operations
@@ -431,12 +478,19 @@ impl CacheRefreshHelper {
 
     /// Handle a cache hit by returning cached data and optionally triggering background refresh.
     /// Returns a `SendableRecordBatchStream` containing the cached data.
+    ///
+    /// Cache behavior based on freshness:
+    /// - `Fresh`: Return cached data immediately, no refresh needed
+    /// - `Stale`: Return cached data immediately, trigger background refresh
+    /// - `Rotten`: This should not be called for rotten data (handled as cache miss)
+    #[expect(clippy::too_many_arguments)]
     async fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
         accelerator: &Arc<dyn TableProvider>,
         dataset_name: &str,
-        ttl: Option<Duration>,
+        max_age: Option<Duration>,
+        stale_while_revalidate: Option<Duration>,
         io_runtime: &Handle,
         schema: SchemaRef,
     ) -> SendableRecordBatchStream {
@@ -451,48 +505,65 @@ impl CacheRefreshHelper {
             cached_batches.len()
         );
 
-        // Check if data is stale and trigger background refresh if needed
-        if let Some(ttl) = ttl
-            && is_data_stale(cached_batches.clone(), ttl)
+        // Check freshness and trigger background refresh if stale
+        if let Some(max_age) = max_age {
+            let freshness = check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
                 .await
-                .unwrap_or(false)
-        {
-            tracing::debug!(
-                "Data is stale for dataset={dataset_name}, triggering background refresh"
-            );
+                .unwrap_or(CacheFreshness::Rotten);
 
-            // Log current fetched_at for debugging
-            if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0]) {
-                tracing::debug!(
-                    "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
-                );
-            }
-
-            let federated_clone = Arc::clone(federated);
-            let accelerator_clone = Arc::clone(accelerator);
-            let dataset_name_clone = dataset_name.to_string();
-
-            io_runtime.spawn(async move {
-                tracing::debug!("Background refresh task started for dataset={dataset_name_clone}");
-                match Self::refresh_stale_rows(
-                    federated_clone,
-                    accelerator_clone,
-                    &dataset_name_clone,
-                    ttl,
-                )
-                .await
-                {
-                    Ok(rows) => {
-                        tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
-                    }
-                    Err(e) => {
-                        tracing::error!("Background refresh task failed for dataset={dataset_name_clone}: {e}");
-                    }
+            match freshness {
+                CacheFreshness::Fresh => {
+                    tracing::debug!(
+                        "Data is fresh for dataset={dataset_name}, no background refresh needed"
+                    );
                 }
-            });
+                CacheFreshness::Stale => {
+                    tracing::debug!(
+                        "Data is stale for dataset={dataset_name}, triggering background refresh"
+                    );
+
+                    // Log current fetched_at for debugging
+                    if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0]) {
+                        tracing::debug!(
+                            "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                        );
+                    }
+
+                    let federated_clone = Arc::clone(federated);
+                    let accelerator_clone = Arc::clone(accelerator);
+                    let dataset_name_clone = dataset_name.to_string();
+
+                    io_runtime.spawn(async move {
+                        tracing::debug!(
+                            "Background refresh task started for dataset={dataset_name_clone}"
+                        );
+                        match Self::refresh_stale_rows(
+                            federated_clone,
+                            accelerator_clone,
+                            &dataset_name_clone,
+                            max_age,
+                        )
+                        .await
+                        {
+                            Ok(rows) => {
+                                tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
+                            }
+                            Err(e) => {
+                                tracing::error!("Background refresh task failed for dataset={dataset_name_clone}: {e}");
+                            }
+                        }
+                    });
+                }
+                CacheFreshness::Rotten => {
+                    // This shouldn't happen as rotten data should be handled as cache miss
+                    tracing::warn!(
+                        "Unexpected rotten data in handle_cache_hit for dataset={dataset_name}"
+                    );
+                }
+            }
         } else {
             tracing::debug!(
-                "Data is fresh for dataset={dataset_name}, no background refresh needed"
+                "No caching_ttl configured for dataset={dataset_name}, serving cached data without refresh check"
             );
         }
 
@@ -507,7 +578,10 @@ impl CacheRefreshHelper {
 pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
     plan_properties: PlanProperties,
-    ttl: Option<Duration>,
+    /// Maximum time data is considered "fresh" - can be served without refresh
+    max_age: Option<Duration>,
+    /// Time window after `max_age` during which stale data can be served while revalidating
+    stale_while_revalidate: Option<Duration>,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
@@ -521,7 +595,8 @@ impl CachingAccelerationScanExec {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        ttl: Option<Duration>,
+        max_age: Option<Duration>,
+        stale_while_revalidate: Option<Duration>,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
@@ -530,8 +605,8 @@ impl CachingAccelerationScanExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
     ) -> Self {
-        // Default TTL to 30 seconds if not specified
-        let ttl = ttl.or(Some(Duration::from_secs(30)));
+        // Default max_age (TTL) to 30 seconds if not specified
+        let max_age = max_age.or(Some(Duration::from_secs(30)));
 
         let plan_properties = input
             .properties()
@@ -542,7 +617,8 @@ impl CachingAccelerationScanExec {
         Self {
             input,
             plan_properties,
-            ttl,
+            max_age,
+            stale_while_revalidate,
             federated,
             accelerator,
             dataset_name,
@@ -597,7 +673,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            self.ttl,
+            self.max_age,
+            self.stale_while_revalidate,
             Arc::clone(&self.federated),
             Arc::clone(&self.accelerator),
             self.dataset_name.clone(),
@@ -628,7 +705,8 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let dataset_name = self.dataset_name.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
-        let ttl = self.ttl;
+        let max_age = self.max_age;
+        let stale_while_revalidate = self.stale_while_revalidate;
         let io_runtime = self.io_runtime.clone();
 
         tracing::debug!(
@@ -670,12 +748,38 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
             if total_cached_rows > 0 {
+                // Check if data is rotten (past max_age + stale_while_revalidate)
+                // If rotten, treat as cache miss
+                if let Some(max_age) = max_age {
+                    let freshness =
+                        check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
+                            .await
+                            .unwrap_or(CacheFreshness::Rotten);
+
+                    if freshness == CacheFreshness::Rotten {
+                        tracing::debug!(
+                            "Data is rotten for dataset={dataset_name}, treating as cache miss"
+                        );
+                        return CacheRefreshHelper::handle_cache_miss(
+                            federated,
+                            accelerator,
+                            &dataset_name,
+                            &filters,
+                            limit,
+                            Arc::clone(&schema_clone),
+                        )
+                        .await;
+                    }
+                }
+
+                // Data is fresh or stale - serve from cache (stale triggers background refresh)
                 CacheRefreshHelper::handle_cache_hit(
                     cached_batches,
                     &federated,
                     &accelerator,
                     &dataset_name,
-                    ttl,
+                    max_age,
+                    stale_while_revalidate,
                     &io_runtime,
                     Arc::clone(&schema_clone),
                 )
@@ -739,352 +843,6 @@ mod tests {
                 true,
             ),
         ]))
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_no_refresh_column() {
-        let schema = create_test_schema_without_refresh_timestamp();
-        let id_array = Int32Array::from(vec![1, 2, 3]);
-        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(vec![batch], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(
-            result,
-            "Data without refresh column should be considered stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_fresh_data() {
-        let schema = create_test_schema_with_refresh_timestamp();
-        let id_array = Int32Array::from(vec![1, 2, 3]);
-        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
-
-        // Create timestamps that are very recent (within TTL)
-        #[expect(clippy::cast_possible_truncation)]
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos() as i64;
-
-        let refresh_timestamps = TimestampNanosecondArray::from(vec![
-            Some(now - 10_000_000_000), // 10 seconds ago
-            Some(now - 20_000_000_000), // 20 seconds ago
-            Some(now - 5_000_000_000),  // 5 seconds ago
-        ]);
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(refresh_timestamps),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60); // 60 second TTL
-        let result = is_data_stale(vec![batch], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(!result, "Data refreshed within TTL should not be stale");
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_stale_data() {
-        let schema = create_test_schema_with_refresh_timestamp();
-        let id_array = Int32Array::from(vec![1, 2]);
-        let name_array = StringArray::from(vec!["alice", "bob"]);
-
-        #[expect(clippy::cast_possible_truncation)]
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos() as i64;
-
-        let refresh_timestamps = TimestampNanosecondArray::from(vec![
-            Some(now - 90_000_000_000),  // 90 seconds ago (stale)
-            Some(now - 120_000_000_000), // 120 seconds ago (stale)
-        ]);
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(refresh_timestamps),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60); // 60 second TTL
-        let result = is_data_stale(vec![batch], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(result, "Data older than TTL should be stale");
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_null_timestamps() {
-        let schema = create_test_schema_with_refresh_timestamp();
-        let id_array = Int32Array::from(vec![1, 2]);
-        let name_array = StringArray::from(vec!["alice", "bob"]);
-
-        let refresh_timestamps = TimestampNanosecondArray::from(vec![None, None]);
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(refresh_timestamps),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(vec![batch], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(
-            result,
-            "Data with null timestamps should be considered stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_mixed_timestamps() {
-        let schema = create_test_schema_with_refresh_timestamp();
-        let id_array = Int32Array::from(vec![1, 2, 3]);
-        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
-
-        #[expect(clippy::cast_possible_truncation)]
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos() as i64;
-
-        // Mix of fresh and stale timestamps - if ANY is stale, the whole batch is stale
-        let refresh_timestamps = TimestampNanosecondArray::from(vec![
-            Some(now - 10_000_000_000), // 10 seconds ago (fresh)
-            Some(now - 90_000_000_000), // 90 seconds ago (stale)
-            Some(now - 5_000_000_000),  // 5 seconds ago (fresh)
-        ]);
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(refresh_timestamps),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(vec![batch], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(
-            result,
-            "Data with any stale timestamp should be considered stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_ttl_boundary() {
-        let schema = create_test_schema_with_refresh_timestamp();
-        let id_array = Int32Array::from(vec![1, 2]);
-        let name_array = StringArray::from(vec!["alice", "bob"]);
-
-        #[expect(clippy::cast_possible_truncation)]
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos() as i64;
-
-        let ttl = Duration::from_secs(60);
-        #[expect(clippy::cast_possible_truncation)]
-        let ttl_nanos = ttl.as_nanos() as i64;
-
-        // Well within TTL boundary - this should NOT be stale
-        let refresh_timestamps_fresh = TimestampNanosecondArray::from(vec![
-            Some(now - ttl_nanos + 1_000_000_000),
-            Some(now - ttl_nanos + 2_000_000_000),
-        ]); // 1-2 seconds within boundary
-
-        let batch_fresh = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array.clone()),
-                Arc::new(name_array.clone()),
-                Arc::new(refresh_timestamps_fresh),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let result_fresh = is_data_stale(vec![batch_fresh], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(
-            !result_fresh,
-            "Data well within TTL boundary should not be stale"
-        );
-
-        // Well past the TTL boundary - this SHOULD be stale
-        let refresh_timestamps_stale = TimestampNanosecondArray::from(vec![
-            Some(now - ttl_nanos - 1_000_000_000),
-            Some(now - ttl_nanos - 2_000_000_000),
-        ]); // 1-2 seconds past boundary
-
-        let batch_stale = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(refresh_timestamps_stale),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let result_stale = is_data_stale(vec![batch_stale], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(result_stale, "Data well past TTL boundary should be stale");
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_empty_slice() {
-        let batches: Vec<RecordBatch> = Vec::new();
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(batches, ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(!result, "Empty slice should not be considered stale");
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_empty_batch() {
-        let schema = create_test_schema_with_refresh_timestamp();
-        let id_array = Int32Array::from(Vec::<i32>::new());
-        let name_array = StringArray::from(Vec::<&str>::new());
-        let refresh_timestamps = TimestampNanosecondArray::from(Vec::<Option<i64>>::new());
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(id_array),
-                Arc::new(name_array),
-                Arc::new(refresh_timestamps),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(vec![batch], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(
-            !result,
-            "Batch with zero rows should not be considered stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_multiple_batches_all_fresh() {
-        let schema = create_test_schema_with_refresh_timestamp();
-
-        #[expect(clippy::cast_possible_truncation)]
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos() as i64;
-
-        let batch1 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["alice", "bob"])),
-                Arc::new(TimestampNanosecondArray::from(vec![
-                    Some(now - 10_000_000_000), // 10 seconds ago
-                    Some(now - 20_000_000_000), // 20 seconds ago
-                ])),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let batch2 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![3, 4])),
-                Arc::new(StringArray::from(vec!["charlie", "dave"])),
-                Arc::new(TimestampNanosecondArray::from(vec![
-                    Some(now - 15_000_000_000), // 15 seconds ago
-                    Some(now - 25_000_000_000), // 25 seconds ago
-                ])),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(vec![batch1, batch2], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(!result, "All fresh batches should not be stale");
-    }
-
-    #[tokio::test]
-    async fn test_is_data_stale_multiple_batches_one_stale() {
-        let schema = create_test_schema_with_refresh_timestamp();
-
-        #[expect(clippy::cast_possible_truncation)]
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos() as i64;
-
-        // First batch is fresh
-        let batch1 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["alice", "bob"])),
-                Arc::new(TimestampNanosecondArray::from(vec![
-                    Some(now - 10_000_000_000), // 10 seconds ago
-                    Some(now - 20_000_000_000), // 20 seconds ago
-                ])),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        // Second batch has stale data
-        let batch2 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![3, 4])),
-                Arc::new(StringArray::from(vec!["charlie", "dave"])),
-                Arc::new(TimestampNanosecondArray::from(vec![
-                    Some(now - 15_000_000_000),  // 15 seconds ago (fresh)
-                    Some(now - 120_000_000_000), // 120 seconds ago (stale)
-                ])),
-            ],
-        )
-        .expect("Failed to create batch");
-
-        let ttl = Duration::from_secs(60);
-        let result = is_data_stale(vec![batch1, batch2], ttl)
-            .await
-            .expect("Should successfully check staleness");
-        assert!(result, "Should be stale if any row in any batch is stale");
     }
 
     #[test]
@@ -1225,6 +983,364 @@ mod tests {
             filters.len(),
             0,
             "Should extract 0 filters when columns are missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_fresh_data() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Data fetched 10 seconds ago
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 10_000_000_000),
+            Some(now - 15_000_000_000),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Fresh,
+            "Data within max_age should be fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_stale_data_with_swr() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Data fetched 70 seconds ago (past max_age of 60s, but within max_age + swr of 90s)
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 70_000_000_000),
+            Some(now - 75_000_000_000),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Stale,
+            "Data past max_age but within swr should be stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_rotten_data() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Data fetched 100 seconds ago (past max_age + swr of 90s)
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 100_000_000_000),
+            Some(now - 110_000_000_000),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Rotten,
+            "Data past max_age + swr should be rotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_no_swr_stale_becomes_rotten() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Data fetched 70 seconds ago (past max_age of 60s)
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 70_000_000_000),
+            Some(now - 75_000_000_000),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = None; // No stale-while-revalidate
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Rotten,
+            "Without swr, data past max_age should be rotten (not stale)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_null_timestamps_are_rotten() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![None, None]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Rotten,
+            "Data with null timestamps should be rotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_no_refresh_column_is_rotten() {
+        let schema = create_test_schema_without_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec!["alice", "bob"]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Rotten,
+            "Data without refresh column should be rotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_mixed_timestamps_worst_case_wins() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec!["alice", "bob", "charlie"]);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Mix: fresh (10s), stale (70s), rotten (100s)
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![
+            Some(now - 10_000_000_000),  // Fresh
+            Some(now - 70_000_000_000),  // Stale (past 60s, within 90s)
+            Some(now - 100_000_000_000), // Rotten (past 90s)
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Rotten,
+            "If any row is rotten, the whole batch should be considered rotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_boundary_conditions() {
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1]);
+        let name_array = StringArray::from(vec!["alice"]);
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+        #[expect(clippy::cast_possible_truncation)]
+        let max_age_nanos = max_age.as_nanos() as i64;
+        #[expect(clippy::cast_possible_truncation)]
+        let swr_nanos = stale_while_revalidate
+            .expect("swr should be Some")
+            .as_nanos() as i64;
+
+        // Just within max_age (59 seconds ago)
+        let refresh_timestamps_fresh =
+            TimestampNanosecondArray::from(vec![Some(now - max_age_nanos + 1_000_000_000)]);
+
+        let batch_fresh = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array.clone()),
+                Arc::new(name_array.clone()),
+                Arc::new(refresh_timestamps_fresh),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let freshness = check_cache_freshness(&[batch_fresh], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(freshness, CacheFreshness::Fresh, "Just within max_age");
+
+        // Just past max_age but within swr (61 seconds ago)
+        let refresh_timestamps_stale =
+            TimestampNanosecondArray::from(vec![Some(now - max_age_nanos - 1_000_000_000)]);
+
+        let batch_stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array.clone()),
+                Arc::new(name_array.clone()),
+                Arc::new(refresh_timestamps_stale),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let freshness = check_cache_freshness(&[batch_stale], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(freshness, CacheFreshness::Stale, "Just past max_age");
+
+        // Just past max_age + swr (91 seconds ago)
+        let refresh_timestamps_rotten = TimestampNanosecondArray::from(vec![Some(
+            now - max_age_nanos - swr_nanos - 1_000_000_000,
+        )]);
+
+        let batch_rotten = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps_rotten),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let freshness = check_cache_freshness(&[batch_rotten], max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(freshness, CacheFreshness::Rotten, "Just past max_age + swr");
+    }
+
+    #[tokio::test]
+    async fn test_cache_freshness_empty_batches() {
+        let batches: Vec<RecordBatch> = Vec::new();
+        let max_age = Duration::from_secs(60);
+        let stale_while_revalidate = Some(Duration::from_secs(30));
+
+        let freshness = check_cache_freshness(&batches, max_age, stale_while_revalidate)
+            .await
+            .expect("Should check freshness");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Fresh,
+            "Empty batches should be considered fresh (nothing to check)"
         );
     }
 }

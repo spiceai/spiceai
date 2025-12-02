@@ -223,6 +223,7 @@ pub struct AcceleratedTable {
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
     cache_ttl: Option<Duration>,
+    cache_stale_while_revalidate_ttl: Option<Duration>,
     io_runtime: Handle,
 }
 
@@ -286,6 +287,7 @@ pub struct Builder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
+    caching_stale_while_revalidate_ttl: Option<Duration>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
@@ -324,6 +326,7 @@ impl Builder {
             cpu_runtime: None,
             io_runtime,
             caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
             resource_monitor: None,
         }
     }
@@ -460,6 +463,15 @@ impl Builder {
     /// Set the TTL for cache mode
     pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
         self.caching_ttl = ttl;
+        self
+    }
+
+    /// Set the stale-while-revalidate duration for cache mode
+    pub fn caching_stale_while_revalidate_ttl(
+        &mut self,
+        stale_while_revalidate: Option<Duration>,
+    ) -> &mut Self {
+        self.caching_stale_while_revalidate_ttl = stale_while_revalidate;
         self
     }
 
@@ -628,6 +640,7 @@ impl Builder {
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
             cache_ttl: self.caching_ttl,
+            cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             io_runtime: self.io_runtime,
         })
     }
@@ -820,6 +833,7 @@ impl TableProvider for AcceleratedTable {
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
                     federated_provider,
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
