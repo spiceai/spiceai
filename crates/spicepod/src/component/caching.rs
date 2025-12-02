@@ -66,7 +66,7 @@ pub enum CachingPolicy {
     /// Suitable for workloads with strong recency bias, such as streaming data processing.
     #[default]
     Lru,
-    /// TinyLFU caching policy.
+    /// `TinyLFU` caching policy.
     /// Combines LRU eviction with LFU-based admission policy.
     /// Suitable for most workloads including database, search, and analytics.
     TinyLfu,
