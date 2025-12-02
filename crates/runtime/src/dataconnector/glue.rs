@@ -37,6 +37,7 @@ use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 use crate::{
     component::dataset::Dataset,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 use super::{
@@ -288,6 +289,8 @@ impl DataConnector for GlueDataConnector {
         Some(self.create_table_provider(dataset).await)
     }
 }
+
+register_data_connector!("glue", GlueDataConnectorFactory);
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {

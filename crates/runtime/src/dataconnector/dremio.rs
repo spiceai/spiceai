@@ -21,6 +21,7 @@ use super::DataConnectorFactory;
 use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
+use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::ReadWrite;
 use data_components::flight::FlightFactory;
@@ -244,3 +245,5 @@ impl DataConnector for Dremio {
         Some(read_write_result)
     }
 }
+
+register_data_connector!("dremio", DremioFactory);
