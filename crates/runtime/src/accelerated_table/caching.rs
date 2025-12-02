@@ -1478,9 +1478,10 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let freshness = check_cache_freshness(&[batch_fresh], max_age, stale_while_revalidate)
-            .await
-            .expect("Should check freshness");
+        let freshness =
+            check_cache_freshness(&[batch_fresh], max_age, Some(stale_while_revalidate))
+                .await
+                .expect("Should check freshness");
         assert_eq!(freshness, CacheFreshness::Fresh, "Just within max_age");
 
         // Just past max_age but within swr (61 seconds ago)
