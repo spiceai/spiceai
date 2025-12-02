@@ -232,24 +232,20 @@ impl MemTable {
         pk: &[usize],
         on_conflict: &ColumnReference,
     ) -> Result<()> {
-        let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
         let schema = self.schema();
 
-        if on_conflict_cols.len() != pk.len() {
+        let pk_names: HashSet<&str> = pk
+            .iter()
+            .map(|&idx| schema.field(idx).name().as_str())
+            .collect();
+
+        let on_conflict_set: HashSet<&str> = on_conflict.iter().collect();
+
+        if pk_names != on_conflict_set {
             return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
+                "Primary key columns must match the on_conflict definition".to_string(),
             ));
         }
-
-        for (c, pk_idx) in on_conflict_cols.iter().zip(pk.iter()) {
-            let pk_name = schema.field(*pk_idx).name();
-            if c != pk_name {
-                return Err(DataFusionError::Execution(
-                    "Primary key must match the on_conflict definition".to_string(),
-                ));
-            }
-        }
-
         Ok(())
     }
 
