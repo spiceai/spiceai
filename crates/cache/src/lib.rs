@@ -382,7 +382,12 @@ impl QueryResultsCacheProvider {
         // Cache TTL should be the base TTL plus the stale-while-revalidate window
         // so entries aren't evicted before they can be served as stale
         let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
-        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
+        let cache = Arc::new(LruCache::new(
+            cache_max_size,
+            cache_ttl,
+            hash_builder,
+            config.caching_policy,
+        ));
 
         let encoder = encoding::get_encoder(config.encoding);
 
