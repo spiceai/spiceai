@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use data_components::Read;
 use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
@@ -164,3 +164,5 @@ impl DataConnector for Spark {
             })?)
     }
 }
+
+register_data_connector!("spark", SparkFactory);
