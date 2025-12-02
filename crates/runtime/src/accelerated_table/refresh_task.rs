@@ -111,6 +111,8 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent access to the accelerator during cache operations.
+    accelerator_mutex: Arc<Mutex<()>>,
 }
 
 impl RefreshTaskBuilder {
@@ -122,6 +124,7 @@ impl RefreshTaskBuilder {
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
+        accelerator_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -135,6 +138,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            accelerator_mutex,
         }
     }
 
@@ -218,6 +222,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
             resource_monitor: self.resource_monitor,
+            accelerator_mutex: self.accelerator_mutex,
         }
     }
 }
@@ -237,6 +242,8 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent access to the accelerator during cache operations.
+    accelerator_mutex: Arc<Mutex<()>>,
 }
 
 impl RefreshTask {
@@ -248,6 +255,7 @@ impl RefreshTask {
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
+        accelerator_mutex: Arc<Mutex<()>>,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -256,6 +264,7 @@ impl RefreshTask {
             federated_source,
             accelerator,
             io_runtime,
+            accelerator_mutex,
         )
     }
 
@@ -780,6 +789,7 @@ impl RefreshTask {
             Arc::clone(&self.accelerator),
             self.dataset_name.to_string().as_str(),
             ttl,
+            Arc::clone(&self.accelerator_mutex),
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;

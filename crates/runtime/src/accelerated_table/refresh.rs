@@ -45,6 +45,7 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
@@ -475,6 +476,9 @@ pub struct Refresher {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator.
+    /// Shared with `CachingAccelerationScanExec`.
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -500,6 +504,7 @@ impl Refresher {
         accelerator: Arc<dyn TableProvider>,
         cpu_runtime: Option<Handle>,
         io_runtime: Handle,
+        cache_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -523,6 +528,7 @@ impl Refresher {
             cpu_runtime,
             io_runtime,
             resource_monitor: None,
+            cache_mutex,
         }
     }
 
@@ -675,6 +681,7 @@ impl Refresher {
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
             self.io_runtime.clone(),
+            Arc::clone(&self.cache_mutex),
         )
         .with_disable_federation(self.disable_federation);
 
@@ -861,6 +868,7 @@ impl Refresher {
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
                 self.io_runtime.clone(),
+                Arc::clone(&self.cache_mutex),
             )
             .with_disable_federation(self.disable_federation)
             .with_cpu_runtime(self.cpu_runtime.clone())
@@ -1035,6 +1043,7 @@ mod tests {
             Arc::clone(&accelerator),
             None,
             Handle::current(),
+            Arc::new(Mutex::new(())),
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1245,6 +1254,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1404,6 +1414,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1613,6 +1624,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));

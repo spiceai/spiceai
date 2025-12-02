@@ -574,6 +574,8 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
+        // Create the cache mutex early so it can be shared between the Refresher and the AcceleratedTable.
+        let cache_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -583,6 +585,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&cache_mutex),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -644,7 +647,7 @@ impl Builder {
             cache_ttl: self.caching_ttl,
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             io_runtime: self.io_runtime,
-            cache_mutex: Arc::new(Mutex::new(())),
+            cache_mutex,
         })
     }
 }

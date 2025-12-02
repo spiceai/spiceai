@@ -158,6 +158,7 @@ impl CacheRefreshHelper {
         accelerator: Arc<dyn TableProvider>,
         dataset_name: &str,
         ttl: Duration,
+        accelerator_mutex: Arc<Mutex<()>>,
     ) -> DataFusionResult<usize> {
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -215,6 +216,7 @@ impl CacheRefreshHelper {
             let federated = Arc::clone(&federated);
             let accelerator = Arc::clone(&accelerator);
             let dataset_name = dataset_name.to_string();
+            let accelerator_mutex = Arc::clone(&accelerator_mutex);
 
             async move {
                 tracing::debug!(
@@ -232,10 +234,15 @@ impl CacheRefreshHelper {
 
                 let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
+                // Acquire the mutex to protect accelerator operations
+                let lock_guard = accelerator_mutex.lock().await;
+
                 // Upsert this specific cache entry - removes rows matching the filters
                 // and adds the new data, preserving other cache entries.
                 Self::upsert_into_accelerator(&accelerator, &dataset_name, &row_filters, batches)
                     .await?;
+
+                drop(lock_guard); // Release the mutex
 
                 Ok(refreshed_rows)
             }
@@ -682,6 +689,7 @@ impl CacheRefreshHelper {
         stale_while_revalidate: Option<Duration>,
         io_runtime: &Handle,
         schema: SchemaRef,
+        accelerator_mutex: &Arc<Mutex<()>>,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -720,6 +728,7 @@ impl CacheRefreshHelper {
                     let federated_clone = Arc::clone(federated);
                     let accelerator_clone = Arc::clone(accelerator);
                     let dataset_name_clone = dataset_name.to_string();
+                    let accelerator_mutex_clone = Arc::clone(accelerator_mutex);
 
                     io_runtime.spawn(async move {
                         tracing::debug!(
@@ -730,6 +739,7 @@ impl CacheRefreshHelper {
                             accelerator_clone,
                             &dataset_name_clone,
                             max_age,
+                            accelerator_mutex_clone,
                         )
                         .await
                         {
@@ -961,7 +971,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             limit,
                             Arc::clone(&schema_clone),
                             true, // is_rotten = true, will upsert
-                            accelerator_mutex,
+                            Arc::clone(&accelerator_mutex),
                         )
                         .await;
                     }
@@ -977,6 +987,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     stale_while_revalidate,
                     &io_runtime,
                     Arc::clone(&schema_clone),
+                    &accelerator_mutex,
                 )
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
