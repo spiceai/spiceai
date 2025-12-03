@@ -1,7 +1,7 @@
 ---
 name: Enterprise Milestone Endgame
 about: Ship a milestone release for Spice.ai Enterprise!
-title: 'v1.x.x Endgame'
+title: 'v1.x.x-enterprise Endgame'
 labels: 'kind/endgame'
 assignees: ''
 ---
@@ -82,10 +82,11 @@ assignees: ''
 
 - [ ] [Generate Spicepod JSON schema](https://github.com/spicehq/spiceai/actions/workflows/generate_json_schema.yml) and cherry-pick schema update PR onto the release branch.
 
-- [ ] Verify `version.txt` and version in `Cargo.toml` using [docs/RELEASE.md](https://github.com/spicehq/spiceai/blob/trunk/docs/RELEASE.md#version-update).
+- [ ] Verify `version.txt` and version in `Cargo.toml` using [docs/RELEASE.md](https://github.com/spicehq/spiceai/blob/trunk/docs/RELEASE.md#version-update). It should be updated to the release version (e.g. `1.9.0-enterprise` or `1.10.0-rc.1-enterprise`).
 
 - [ ] Verify or update the [Helm chart](https://github.com/spicehq/spiceai/blob/trunk/deploy/chart) (chart version & image.tag) in the release branch (not in trunk).
-  - [ ] If this is a **minor** release, replace the `ghcr.io/spicehq/spiceai-nightly` repository in `values.yaml` with `spicehq/spiceai` and change the tag to the release version (e.g. `1.0.0-enterprise`).
+  - [ ] Ensure that the `image.repository` in `values.yaml` is `ghcr.io/spicehq/spiceai-enterprise` and change the tag to the release version (e.g. `1.9.0-enterprise-models` or `1.10.0-rc.1-enterprise-models`).
+  - [ ] Ensure that the `version` in `Chart.yaml` is updated to the release version with `-helm` suffix (e.g. `1.9.0-enterprise-helm` or `1.10.0-rc.1-enterprise-helm`).
 
 - [ ] **QA DRI sign-off** and **Docs DRI sign-off** confirming readiness and completeness.
 
@@ -139,16 +140,42 @@ assignees: ''
     - https://spice.ai/spiceai/quickstart
     - https://spice.ai/spiceai/tailwindcss
 - [ ] Run [Publish to AWS Marketplace](https://github.com/spicehq/spiceai/actions/workflows/aws_marketplace_publish.yml) using the following configuration (BYOL):
-  - Docker image: `X.Y.Z-enterprise-models`
+  - Docker image: `X.Y.Z-enterprise-models` (i.e. `1.10.0-rc.1-enterprise-models`)
   - Target ECR repository: `spice-ai/spiceai-enterprise-byol`
   - Platforms to publish: `linux/amd64,linux/arm64`
-
 - [ ] Mark the [release](https://github.com/spicehq/spiceai/releases) as official once all binaries and Docker images finish building.
 
 - [ ] Perform a final test pass on the released binaries and Docker images.
 
 - [ ] Trigger [Platform OpenAPI Spec generation workflow](https://github.com/spicehq/ai-platform/actions/workflows/generate-openapi.yml) to include Spice OSS OpenAPI spec updates, if any exist.
   - [ ] Update HTTP API Reference in https://docs.spice.ai if needed.
+
+- [ ] Run [(production) Build AMI from Enterprise release](https://github.com/spicehq/spiceai-ami/actions/workflows/build-ami-enterprise-release-production.yml)
+  - Release tag: `vX.Y.Z-enterprise` (i.e. `v1.10.0-rc.1-enterprise`)
+  - Asset name to download: `spiced_models_linux_x86_64`
+
+- [ ] Update the AWS Marketplace listings to point to both the new AMI and Docker image.
+  - [ ] Activate `Marketplace Admins` JIT access in the [Azure PIM portal](https://portal.azure.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup)
+  - [ ] Log into the [AWS Console](https://spiceai.awsapps.com/start/#/) using the Marketplace Admins SSO role for the Production account (903332016402).
+  - [ ] Navigate to the [AWS Marketplace Management Portal](https://aws.amazon.com/marketplace/management/products/server?region=us-east-1)
+  - [ ] For the [Spice.ai Enterprise (BYOL)](https://aws.amazon.com/marketplace/management/products/prod-pkjfmapef2dlu/overview) listing, add a new version:
+    - Load the most recent request to "Add new version"
+    - In a separate window on the product page, click "Request changes" > "Update versions" > "Add new version".
+    - Fill in the Version title and Release notes - you may need to tweak the release notes to remove emojis and the changelog.
+    - Add the Helm and Container Deployment delivery options.
+    - Refer to the previous release for guidance on filling out the rest of the form.
+    - **IMPORTANT**: Copy the usage instructions from the previous version and update any reference to the release tag to the current version. By default when you create a new version, the usage instructions are reset to a super old version.
+    - Submit the changes for review.
+  - [ ] For the [Spice.ai Enterprise for AWS](https://aws.amazon.com/marketplace/management/products/prod-qfzcrwtpve3ho/overview) listing, add a new version:
+    - Load the most recent request to "Add new version"
+    - In a separate window on the product page, click "Request changes" > "Update versions" > "Add new version".
+    - Fill in the Version title and Release notes - use the same release notes as the BYOL listing.
+    - Add the AMI with CloudFormation delivery option.
+    - Use the AMI ID generated from running the [(production) Build AMI from Enterprise release](https://github.com/spicehq/spiceai-ami/actions/workflows/build-ami-enterprise-release-production.yml) workflow.
+    - Refer to the previous release for guidance on filling out the rest of the form.
+    - **IMPORTANT**: Copy the usage instructions from the previous version and update any reference to the AMI ID to the current version. By default when you create a new version, the usage instructions are reset to a super old version.
+    - Submit the changes for review.
+  - [ ] Validate that the AWS Marketplace listings are updated - they can take an hour to update.
 
 ## Post-Release Validation and Housekeeping
 
