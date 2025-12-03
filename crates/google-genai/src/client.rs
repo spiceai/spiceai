@@ -24,7 +24,7 @@ use snafu::ResultExt;
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const API_KEY_HEADER: &str = "x-goog-api-key";
 
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 #[derive(Debug, Clone)]
 pub struct Client {
     http_client: reqwest::Client,
