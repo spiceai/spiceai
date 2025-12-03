@@ -10,6 +10,7 @@ A Rust client library for the Google Generative AI (Gemini) REST API.
 - ✅ Text embeddings with configurable dimensions
 - ✅ Function calling (tools)
 - ✅ Tool configuration (function calling modes)
+- ✅ Thinking configuration for complex reasoning
 - ✅ Cached content support
 - ✅ Structured output (response schema)
 - ✅ Safety settings
@@ -249,6 +250,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Thinking Mode
+
+Enable internal reasoning for complex tasks (requires thinking-capable models):
+
+```rust
+use google_genai::{
+    Client,
+    generate::GenerateContentRequest,
+    types::{Content, GenerationConfig, ThinkingConfig},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new("your-api-key")?;
+    
+    let thinking_config = ThinkingConfig {
+        include_thoughts: Some(true),
+        thinking_budget: Some(5),
+    };
+    
+    let generation_config = GenerationConfig {
+        thinking_config: Some(thinking_config),
+        ..Default::default()
+    };
+    
+    let request = GenerateContentRequest::new(vec![
+        Content::user("Solve this complex problem step by step...")
+    ]).with_generation_config(generation_config);
+    
+    let response = client
+        .generate_content("gemini-2.0-flash-thinking-exp-1219", request)
+        .await?;
+    
+    Ok(())
+}
+```
+
 ### Structured Output
 
 ```rust
@@ -309,13 +347,15 @@ The `examples/` directory contains complete working examples:
 - **`streaming.rs`** - Streaming responses with Server-Sent Events
 - **`embeddings.rs`** - Generate text embeddings with multiple inputs
 - **`function_calling.rs`** - Function calling with weather API example
-- **`tool_config_modes.rs`** - Demonstrates different `ToolConfig` modes (AUTO, NONE, restricted functions)
+- **`tool_config_modes.rs`** - Demonstrates different `ToolConfig` modes (AUTO, NONE, ANY with restrictions)
+- **`thinking.rs`** - Using thinking mode for complex reasoning tasks
 - **`cached_content.rs`** - Using cached content for optimized queries
 
 Run examples with:
 ```bash
 cargo run --example simple_chat
 cargo run --example function_calling
+cargo run --example thinking
 ```
 
 ## Authentication
