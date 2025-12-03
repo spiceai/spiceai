@@ -899,7 +899,7 @@ impl Refresher {
 }
 
 type SnapshotCallback =
-Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+    Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
 fn create_snapshot_callback(
     snapshot_trigger: Option<SnapshotTrigger>,
