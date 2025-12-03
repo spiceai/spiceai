@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_duckdb_file_append_on_conflict
+name: file[parquet]-cayenne[file]-append_upsert
 
 refresh_check_interval: &refresh_check_interval 30s
 
@@ -10,7 +10,7 @@ datasets:
     time_column: c_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -23,7 +23,7 @@ datasets:
     time_column: l_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -36,7 +36,7 @@ datasets:
     time_column: n_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -49,7 +49,7 @@ datasets:
     time_column: o_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -62,7 +62,7 @@ datasets:
     time_column: p_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -75,7 +75,7 @@ datasets:
     time_column: ps_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -88,7 +88,7 @@ datasets:
     time_column: r_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
@@ -101,7 +101,7 @@ datasets:
     time_column: s_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval

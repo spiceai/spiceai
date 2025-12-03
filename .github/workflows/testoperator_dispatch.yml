@@ -20,6 +20,7 @@ on:
           - 'bench'
           - 'load'
           - 'throughput'
+          - 'append'
           - 'http-consistency'
       update_snapshots:
         description: 'Update snapshots?'
