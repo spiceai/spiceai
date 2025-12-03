@@ -136,7 +136,6 @@ pub struct ThinkingConfig {
     pub thinking_budget: Option<i32>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Schema {

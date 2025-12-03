@@ -16,7 +16,10 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-use google_genai::{generate::GenerateContentRequest, types::{CachedContent, Content}};
+use google_genai::{
+    generate::GenerateContentRequest,
+    types::{CachedContent, Content},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

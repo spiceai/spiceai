@@ -17,12 +17,12 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 
 use google_genai::{
+    Client,
     generate::GenerateContentRequest,
     types::{
         Content, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, FunctionResponse,
         Part, Schema, Tool, ToolConfig,
     },
-    Client,
 };
 use std::collections::HashMap;
 
@@ -115,7 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or("Unknown");
                     let unit = function_call.args.get("unit").and_then(|v| v.as_str());
 
-                    println!("Calling function: get_current_weather(\"{}\", {:?})", location, unit);
+                    println!(
+                        "Calling function: get_current_weather(\"{}\", {:?})",
+                        location, unit
+                    );
                     let function_result = get_current_weather(location, unit);
                     println!("Function result: {}\n", function_result);
 
