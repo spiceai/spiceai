@@ -44,7 +44,7 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotTrigger};
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
@@ -202,6 +202,11 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
+
+    #[snafu(display(
+        "{message}, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    InvalidSnapshotTrigger { message: String },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -285,6 +290,7 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    snapshot_trigger: Option<SnapshotTrigger>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -323,6 +329,7 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            snapshot_trigger: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -454,9 +461,11 @@ impl Builder {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
+        snapshot_trigger: Option<SnapshotTrigger>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
+        self.snapshot_trigger = snapshot_trigger;
         self
     }
 
@@ -560,6 +569,38 @@ impl Builder {
             }
         };
 
+        if self.snapshot_behavior.create_enabled() && self.snapshot_local_path.is_some() {
+            match acceleration_refresh_mode {
+                refresh::AccelerationRefreshMode::Append(_)
+                | refresh::AccelerationRefreshMode::Full(_)
+                | refresh::AccelerationRefreshMode::Caching(_) => {
+                    if let Some(trigger) = self.snapshot_trigger.clone() {
+                        if !matches!(trigger, SnapshotTrigger::Refresh) {
+                            return Err(
+                                AcceleratedTableBuilderError::InvalidSnapshotTrigger{
+                                    message: format!("Refresh mode '{:?}' only supports 'refresh' snapshot_trigger", self.refresh.mode)
+                                })
+                        }
+                    }
+                },
+                refresh::AccelerationRefreshMode::Changes(_) => {},
+                _ => {
+                    if let Some(trigger) = self.snapshot_trigger.clone() {
+                        match trigger {
+                            SnapshotTrigger::Interval(_) => {},
+                            _ => {
+                                return Err(
+                                    AcceleratedTableBuilderError::InvalidSnapshotTrigger{
+                                        message: format!("Refresh mode '{:?}' only supports 'interval' snapshot_trigger", self.refresh.mode)
+                                    });
+                            }
+
+                        }
+                    }
+                },
+            }
+        }
+
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
@@ -586,7 +627,8 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
+        refresher.with_snapshot_behavior(
+            self.snapshot_behavior, self.snapshot_local_path.clone(), self.snapshot_trigger);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());

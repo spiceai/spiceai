@@ -90,6 +90,7 @@ use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
+use std::pin::Pin;
 
 mod changes;
 
@@ -114,6 +115,7 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    on_stream_batch_process_callback: Option<Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>>,
 }
 
 impl RefreshTaskBuilder {
@@ -138,6 +140,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            on_stream_batch_process_callback: None,
         }
     }
 
@@ -172,6 +175,14 @@ impl RefreshTaskBuilder {
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> RefreshTaskBuilder {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    pub fn with_on_stream_batch_process_callback(
+        mut self,
+        callback: Option<Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>>
+    ) -> RefreshTaskBuilder {
+        self.on_stream_batch_process_callback = callback;
         self
     }
 
@@ -221,11 +232,11 @@ impl RefreshTaskBuilder {
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
             resource_monitor: self.resource_monitor,
+            on_stream_batch_process_callback: self.on_stream_batch_process_callback,
         }
     }
 }
 
-#[derive(Debug)]
 pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -240,6 +251,26 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    on_stream_batch_process_callback: Option<Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>>,
+}
+
+impl std::fmt::Debug for RefreshTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshTask")
+            .field("runtime_status", &self.runtime_status)
+            .field("dataset_name", &self.dataset_name)
+            .field("federated", &self.federated)
+            .field("federated_source", &self.federated_source)
+            .field("accelerator", &self.accelerator)
+            .field("sink", &self.sink)
+            .field("disable_federation", &self.disable_federation)
+            .field("semaphore", &self.semaphore)
+            .field("enabled_metrics", &self.enabled_metrics)
+            .field("cpu_runtime", &self.cpu_runtime)
+            .field("io_runtime", &self.io_runtime)
+            .field("resource_monitor", &self.resource_monitor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RefreshTask {

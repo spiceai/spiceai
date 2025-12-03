@@ -17,7 +17,7 @@ limitations under the License.
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotTrigger};
 use serde::{Deserialize, Serialize};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
@@ -25,7 +25,6 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
-
 #[cfg(feature = "duckdb")]
 use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
@@ -318,7 +317,9 @@ pub struct Acceleration {
 
     pub partition_by: Vec<PartitionedBy>,
 
-    pub snapshots: SnapshotBehavior,
+    pub snapshot_behavior: SnapshotBehavior,
+
+    pub snapshot_trigger: Option<SnapshotTrigger>,
 }
 
 impl Acceleration {
@@ -433,6 +434,21 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
 
+        let snapshot_trigger = match (acceleration.snapshots_trigger, acceleration.snapshots_interval) {
+            (None, _) => None,
+            (Some(spicepod_acceleration::SnapshotTrigger::AfterRefresh), _) => Some(SnapshotTrigger::Refresh),
+            (Some(spicepod_acceleration::SnapshotTrigger::Interval), None) => {
+                return Err(crate::Error::InvalidSpicepodDataset {source: super::Error::SnapshotTriggerIntervalRequiresInterval});
+            },
+            (Some(spicepod_acceleration::SnapshotTrigger::Interval), Some(interval)) => {
+                let Some(duration) = try_parse_duration("snapshots_interval", Some(interval))? else {
+                    return Err(crate::Error::InvalidSpicepodDataset {source: super::Error::SnapshotTriggerIntervalRequiresInterval});
+                };
+
+                Some(SnapshotTrigger::Interval(duration))
+            }
+        };
+
         // TODO: Add validation for other refresh mode params here if needed.
 
         Ok(Acceleration {
@@ -467,7 +483,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
-            snapshots: SnapshotBehavior::disabled(),
+            snapshot_behavior: SnapshotBehavior::disabled(),
+            snapshot_trigger,
         })
     }
 }
@@ -500,7 +517,8 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
-            snapshots: SnapshotBehavior::Disabled,
+            snapshot_behavior: SnapshotBehavior::Disabled,
+            snapshot_trigger: None,
         }
     }
 }

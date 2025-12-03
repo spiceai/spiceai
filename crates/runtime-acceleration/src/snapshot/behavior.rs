@@ -12,7 +12,7 @@ limitations under the License.
 */
 
 use std::sync::{Arc, Weak};
-
+use std::time::Duration;
 use runtime_secrets::Secrets;
 use spicepod::acceleration as spicepod_acceleration;
 use spicepod::component::snapshot::Snapshots;
@@ -194,4 +194,12 @@ impl SnapshotBehavior {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+// TODO: docs + rename to AfterRefresh
+pub enum SnapshotTrigger {
+    #[default]
+    Refresh,
+    Interval(Duration),
 }

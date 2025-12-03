@@ -619,7 +619,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             // Validate that snapshots are not enabled
-            if !matches!(acceleration.snapshots, SnapshotBehavior::Disabled) {
+            if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(
                         "Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: false' or remove the snapshots configuration",
