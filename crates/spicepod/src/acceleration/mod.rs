@@ -148,13 +148,12 @@ fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotTrigger {
-    /// Snapshots are created after each refresh (used by full/append modes).
     #[default]
+    /// Snapshots are created after each refresh (used by full/append modes).
     AfterRefresh,
     /// Snapshots are updated on an interval (used by append/changes modes).
     Interval,
 }
-
 
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -96,6 +96,10 @@ mod changes;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
+// Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
+type StreamBatchProcessCallback =
+    Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
     pub num_rows: usize,
@@ -115,7 +119,7 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    on_stream_batch_process_callback: Option<Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>>,
+    on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
 
 impl RefreshTaskBuilder {
@@ -178,9 +182,10 @@ impl RefreshTaskBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_on_stream_batch_process_callback(
         mut self,
-        callback: Option<Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>>
+        callback: Option<StreamBatchProcessCallback>,
     ) -> RefreshTaskBuilder {
         self.on_stream_batch_process_callback = callback;
         self
@@ -251,7 +256,7 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    on_stream_batch_process_callback: Option<Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>>,
+    on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
 
 impl std::fmt::Debug for RefreshTask {

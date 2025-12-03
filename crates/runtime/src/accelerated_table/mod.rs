@@ -574,30 +574,33 @@ impl Builder {
                 refresh::AccelerationRefreshMode::Append(_)
                 | refresh::AccelerationRefreshMode::Full(_)
                 | refresh::AccelerationRefreshMode::Caching(_) => {
-                    if let Some(trigger) = self.snapshot_trigger.clone() {
-                        if !matches!(trigger, SnapshotTrigger::Refresh) {
-                            return Err(
-                                AcceleratedTableBuilderError::InvalidSnapshotTrigger{
-                                    message: format!("Refresh mode '{:?}' only supports 'refresh' snapshot_trigger", self.refresh.mode)
-                                })
-                        }
+                    if let Some(trigger) = self.snapshot_trigger.clone()
+                        && !matches!(trigger, SnapshotTrigger::AfterRefresh)
+                    {
+                        return Err(AcceleratedTableBuilderError::InvalidSnapshotTrigger {
+                            message: format!(
+                                "Refresh mode '{:?}' only supports 'refresh' snapshot_trigger",
+                                self.refresh.mode
+                            ),
+                        });
                     }
-                },
-                refresh::AccelerationRefreshMode::Changes(_) => {},
-                _ => {
+                }
+                refresh::AccelerationRefreshMode::Changes(_) => {
                     if let Some(trigger) = self.snapshot_trigger.clone() {
                         match trigger {
-                            SnapshotTrigger::Interval(_) => {},
-                            _ => {
-                                return Err(
-                                    AcceleratedTableBuilderError::InvalidSnapshotTrigger{
-                                        message: format!("Refresh mode '{:?}' only supports 'interval' snapshot_trigger", self.refresh.mode)
-                                    });
+                            SnapshotTrigger::Interval(_) => {}
+                            SnapshotTrigger::AfterRefresh => {
+                                return Err(AcceleratedTableBuilderError::InvalidSnapshotTrigger {
+                                    message: format!(
+                                        "Refresh mode '{:?}' only supports 'interval' snapshot_trigger",
+                                        self.refresh.mode
+                                    ),
+                                });
                             }
-
                         }
                     }
-                },
+                }
+                refresh::AccelerationRefreshMode::Disabled => {}
             }
         }
 
@@ -628,7 +631,10 @@ impl Builder {
             refresher.semaphore(semaphore);
         }
         refresher.with_snapshot_behavior(
-            self.snapshot_behavior, self.snapshot_local_path.clone(), self.snapshot_trigger);
+            self.snapshot_behavior,
+            self.snapshot_local_path.clone(),
+            self.snapshot_trigger,
+        );
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());

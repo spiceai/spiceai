@@ -38,14 +38,16 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics, SnapshotTrigger};
+use runtime_acceleration::snapshot::{
+    SnapshotBehavior, SnapshotManager, SnapshotTrigger, metrics as snapshot_metrics,
+};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::select;
-use tokio::sync::{Mutex, Notify};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
 
@@ -658,7 +660,7 @@ impl Refresher {
                     self.snapshot_behavior.clone(),
                     snapshot_local_path,
                 )
-                    .await,
+                .await,
             ),
             _ => None,
         }
@@ -850,87 +852,13 @@ impl Refresher {
     ) -> tokio::task::JoinHandle<()> {
         let checkpointer = self.checkpointer.clone();
 
-        let on_batch_process_callback = if let Some(snapshot_trigger) =
-            self.snapshot_trigger.clone()
-        {
-            match snapshot_trigger {
-                SnapshotTrigger::Refresh => {
-                    // TODO: check if this warning is not handled above
-                    tracing::warn!("Append/changes streams only support 'snapshots_trigger: interval', but 'refresh' is set. No checkpoints will be created.");
-                    None
-                },
-                SnapshotTrigger::Interval(snapshot_interval) => {
-                    match (checkpointer, snapshot_manager) {
-                        (Some(checkpointer), Some(snapshot_manager)) => {
-                            let snapshot_manager = Arc::new(snapshot_manager);
-                            let dataset_name = self.dataset_name.clone();
-                            let federated_schema = self.federated.schema();
-
-                            // Track last snapshot time using Arc<RwLock<Instant>>
-                            let last_snapshot_time = Arc::new(RwLock::new(tokio::time::Instant::now()));
-
-                            let callback =
-                                Arc::new(Mutex::new(Box::new(move || {
-                                    let checkpointer = Arc::clone(&checkpointer);
-                                    let snapshot_manager = Arc::clone(&snapshot_manager);
-                                    let last_snapshot_time = Arc::clone(&last_snapshot_time);
-                                    let federated_schema = federated_schema.clone();
-                                    let dataset_name = dataset_name.clone();
-
-                                    Box::pin(async move {
-
-                                        println!("on_batch_process_callback");
-
-                                        let mut last_time = last_snapshot_time.write().await;
-                                        let elapsed = last_time.elapsed();
-
-                                        if elapsed >= snapshot_interval {
-                                            println!("Snapshotting dataset {dataset_name}");
-                                            tracing::debug!(
-                                                "Creating snapshot for changes stream: {} (elapsed: {:?})",
-                                                dataset_name,
-                                                elapsed
-                                            );
-
-                                            if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
-                                                tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
-                                                return;
-                                            }
-
-                                            if let Err(e) = snapshot_manager
-                                                .create_snapshot(&federated_schema)
-                                                .await
-                                            {
-                                                let dataset_label = dataset_name.to_string();
-                                                snapshot_metrics::record_snapshot_failure(&dataset_label);
-                                                tracing::warn!(
-                                                    "Failed to create snapshot for changes stream {}: {}",
-                                                    dataset_name,
-                                                    e
-                                                );
-                                            } else {
-                                                tracing::info!(
-                                                    "Successfully created snapshot for changes stream: {}",
-                                                    dataset_name
-                                                );
-                                            }
-
-                                            *last_time = tokio::time::Instant::now();
-                                        }
-                                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
-                                }) as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
-
-                            Some(callback)
-                        },
-                        _ => {
-                            None
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        let on_batch_process_callback = create_snapshot_callback(
+            self.snapshot_trigger.clone(),
+            checkpointer,
+            snapshot_manager,
+            &self.dataset_name,
+            self.federated.schema(),
+        );
 
         let refresh_task = Arc::new(
             RefreshTask::builder(
@@ -967,6 +895,93 @@ impl Refresher {
                 tracing::error!("Changes stream failed with error: {err}");
             }
         })
+    }
+}
+
+type SnapshotCallback =
+Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
+fn create_snapshot_callback(
+    snapshot_trigger: Option<SnapshotTrigger>,
+    checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
+    snapshot_manager: Option<SnapshotManager>,
+    dataset_name: &TableReference,
+    federated_schema: Arc<Schema>,
+) -> Option<SnapshotCallback> {
+    let snapshot_trigger = snapshot_trigger?;
+
+    match snapshot_trigger {
+        SnapshotTrigger::AfterRefresh => {
+            tracing::warn!(
+                "Append/changes streams only support 'snapshots_trigger: interval', but 'refresh' is set. No checkpoints will be created."
+            );
+            None
+        }
+        SnapshotTrigger::Interval(snapshot_interval) => {
+            match (checkpointer, snapshot_manager) {
+                (Some(checkpointer), Some(snapshot_manager)) => {
+                    let snapshot_manager = Arc::new(snapshot_manager);
+                    let dataset_name = dataset_name.clone();
+
+                    // Track last snapshot time using Arc<RwLock<Instant>>
+                    let last_snapshot_time = Arc::new(RwLock::new(tokio::time::Instant::now()));
+
+                    let callback = Arc::new(Mutex::new(Box::new(move || {
+                        let checkpointer = Arc::clone(&checkpointer);
+                        let snapshot_manager = Arc::clone(&snapshot_manager);
+                        let last_snapshot_time = Arc::clone(&last_snapshot_time);
+                        let federated_schema = Arc::<Schema>::clone(&federated_schema);
+                        let dataset_name = dataset_name.clone();
+
+                        Box::pin(async move {
+                            println!("on_batch_process_callback");
+
+                            let mut last_time = last_snapshot_time.write().await;
+                            let elapsed = last_time.elapsed();
+
+                            if elapsed >= snapshot_interval {
+                                println!("Snapshotting dataset {dataset_name}");
+                                tracing::debug!(
+                                    "Creating snapshot for changes stream: {} (elapsed: {:?})",
+                                    dataset_name,
+                                    elapsed
+                                );
+
+                                if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+                                    tracing::warn!(
+                                        "Failed to checkpoint dataset {dataset_name}: {e}"
+                                    );
+                                    return;
+                                }
+
+                                if let Err(e) =
+                                    snapshot_manager.create_snapshot(&federated_schema).await
+                                {
+                                    let dataset_label = dataset_name.to_string();
+                                    snapshot_metrics::record_snapshot_failure(&dataset_label);
+                                    tracing::warn!(
+                                        "Failed to create snapshot for changes stream {}: {}",
+                                        dataset_name,
+                                        e
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "Successfully created snapshot for changes stream: {}",
+                                        dataset_name
+                                    );
+                                }
+
+                                *last_time = tokio::time::Instant::now();
+                            }
+                        }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                    })
+                        as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
+
+                    Some(callback)
+                }
+                _ => None,
+            }
+        }
     }
 }
 

@@ -64,8 +64,12 @@ pub(super) async fn download_snapshot_if_needed(
                 })
         }
     });
-    if let Some(manager) =
-        SnapshotManager::try_new(dataset_name.clone(), acceleration.snapshot_behavior.clone(), path).await
+    if let Some(manager) = SnapshotManager::try_new(
+        dataset_name.clone(),
+        acceleration.snapshot_behavior.clone(),
+        path,
+    )
+    .await
     {
         let manager = manager.with_checkpointer_factory(checkpoint_factory);
         let start_time = Instant::now();

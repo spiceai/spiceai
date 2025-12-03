@@ -1139,11 +1139,11 @@ impl DataFusion {
         if acceleration_settings.snapshot_behavior.create_enabled()
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
         {
-            accelerated_table_builder
-                .snapshot_behavior(
-                    acceleration_settings.snapshot_behavior.clone(),
-                    Some(snapshot_path),
-                    acceleration_settings.snapshot_trigger.clone());
+            accelerated_table_builder.snapshot_behavior(
+                acceleration_settings.snapshot_behavior.clone(),
+                Some(snapshot_path),
+                acceleration_settings.snapshot_trigger.clone(),
+            );
         }
 
         accelerated_table_builder.checkpointer_opt(

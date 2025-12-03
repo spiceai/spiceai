@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "duckdb")]
+use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
@@ -25,8 +27,6 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
-#[cfg(feature = "duckdb")]
-use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -434,15 +434,25 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
 
-        let snapshot_trigger = match (acceleration.snapshots_trigger, acceleration.snapshots_interval) {
+        let snapshot_trigger = match (
+            acceleration.snapshots_trigger,
+            acceleration.snapshots_interval,
+        ) {
             (None, _) => None,
-            (Some(spicepod_acceleration::SnapshotTrigger::AfterRefresh), _) => Some(SnapshotTrigger::Refresh),
+            (Some(spicepod_acceleration::SnapshotTrigger::AfterRefresh), _) => {
+                Some(SnapshotTrigger::AfterRefresh)
+            }
             (Some(spicepod_acceleration::SnapshotTrigger::Interval), None) => {
-                return Err(crate::Error::InvalidSpicepodDataset {source: super::Error::SnapshotTriggerIntervalRequiresInterval});
-            },
+                return Err(crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::SnapshotTriggerIntervalRequiresInterval,
+                });
+            }
             (Some(spicepod_acceleration::SnapshotTrigger::Interval), Some(interval)) => {
-                let Some(duration) = try_parse_duration("snapshots_interval", Some(interval))? else {
-                    return Err(crate::Error::InvalidSpicepodDataset {source: super::Error::SnapshotTriggerIntervalRequiresInterval});
+                let Some(duration) = try_parse_duration("snapshots_interval", Some(interval))?
+                else {
+                    return Err(crate::Error::InvalidSpicepodDataset {
+                        source: super::Error::SnapshotTriggerIntervalRequiresInterval,
+                    });
                 };
 
                 Some(SnapshotTrigger::Interval(duration))
