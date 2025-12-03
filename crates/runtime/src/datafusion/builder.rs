@@ -255,10 +255,6 @@ impl DataFusionBuilder {
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
             ))
-            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         #[cfg(feature = "duckdb")]
