@@ -32,7 +32,9 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
-use runtime_proto::{ExecutorExpandSecretRequest, ExecutorExpandSecretResponse};
+use runtime_proto::{
+    ExecutorExpandSecretRequest, ExecutorExpandSecretResponse, GetAppDefinitionRequest,
+};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use secrecy::ExposeSecret;
 
@@ -116,7 +118,6 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
     Response::new(Box::pin(output) as <Service as FlightService>::ListActionsStream)
 }
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn do_action(
     request: Request<Action>,
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
@@ -148,6 +149,11 @@ pub(crate) async fn do_action(
         ActionType::GetAppDefinition => {
             tracing::trace!("do_action: GetAppDefinition");
             let context = RequestContext::current(AsyncMarker::new().await);
+            let request =
+                GetAppDefinitionRequest::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            check_executor_registration(&context, &request.executor_id).await?;
+
             let Some(app) = context
                 .extension::<AppContextExtension>()
                 .and_then(|a| a.app())
@@ -175,42 +181,7 @@ pub(crate) async fn do_action(
             let _guard = span.enter();
 
             let context = RequestContext::current(AsyncMarker::new().await);
-            let Some(df) = context
-                .extension::<DataFusionContextExtension>()
-                .map(|df| df.datafusion())
-            else {
-                return Err(Status::internal("DataFusion context not available"));
-            };
-
-            let scheduler = {
-                let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
-                    return Err(Status::internal("Cluster scheduler context cannot be read"));
-                };
-
-                let Some(ref scheduler) = *maybe_scheduler else {
-                    return Err(Status::internal("Cluster scheduler context not available"));
-                };
-
-                Arc::clone(scheduler)
-            };
-
-            let executor_state = scheduler
-                .state
-                .executor_manager
-                .get_executor_state()
-                .await
-                .map_err(to_tonic_err)?;
-            let executors = executor_state
-                .into_iter()
-                .map(|(e, _)| e.id)
-                .collect::<HashSet<_>>();
-
-            if !executors.contains(&request.executor_id) {
-                return Err(Status::invalid_argument(format!(
-                    "Executor {} is not a part of the cluster",
-                    request.executor_id
-                )));
-            }
+            check_executor_registration(&context, &request.executor_id).await?;
 
             tracing::debug!(
                 "ExpandSecret: expanding secret {} for executor {}",
@@ -254,4 +225,48 @@ pub(crate) async fn do_action(
         stream,
         move || start,
     ))))
+}
+
+/// Checks if executor is a part of the Ballista cluster
+async fn check_executor_registration(
+    request_context: &RequestContext,
+    executor_id: &str,
+) -> Result<(), Status> {
+    let Some(df) = request_context
+        .extension::<DataFusionContextExtension>()
+        .map(|df| df.datafusion())
+    else {
+        return Err(Status::internal("DataFusion context not available"));
+    };
+
+    let scheduler = {
+        let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
+            return Err(Status::internal("Cluster scheduler context cannot be read"));
+        };
+
+        let Some(ref scheduler) = *maybe_scheduler else {
+            return Err(Status::internal("Cluster scheduler context not available"));
+        };
+
+        Arc::clone(scheduler)
+    };
+
+    let executor_state = scheduler
+        .state
+        .executor_manager
+        .get_executor_state()
+        .await
+        .map_err(to_tonic_err)?;
+    let executors = executor_state
+        .into_iter()
+        .map(|(e, _)| e.id)
+        .collect::<HashSet<_>>();
+
+    if executors.contains(executor_id) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "Executor {executor_id} is not a part of the cluster"
+        )))
+    }
 }
