@@ -16,6 +16,8 @@ definitions:
     enabled: true
     engine: duckdb
     mode: memory
+    params:
+      connection_pool_size: 25
 
 datasets:
   - from: mysql:call_center

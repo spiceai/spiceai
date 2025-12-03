@@ -27,7 +27,7 @@ description: "Query: tpch_q13"
 |               |               ProjectionExec: expr=[count(ice.tpch_sf1.orders.o_orderkey)@1 as c_count]                                                                                               |
 |               |                 AggregateExec: mode=SinglePartitioned, gby=[c_custkey@0 as c_custkey], aggr=[count(ice.tpch_sf1.orders.o_orderkey)]                                                   |
 |               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                         |
-|               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]                                           |
+|               |                     HashJoinExec: mode=Partitioned, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1]        |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
 |               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 32), input_partitions=32                                                                                    |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                       |

@@ -4,13 +4,18 @@ expression: sanitized_plan
 ---
 SchemaCastScanExec
   PartitionedUnionExec
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, order_date, amount], file_type=vortex, predicate: order_date@2 >= 2024-03-01 AND order_date@2 < 2024-04-01

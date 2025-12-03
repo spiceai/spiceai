@@ -38,11 +38,16 @@ pub enum RefreshMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
     Memory,
+    /// Open an existing file if it exists, otherwise create a new one.
+    /// This is the default file behavior that preserves data across restarts.
     File,
+    /// Always create a new file, truncating/overwriting any existing file on startup.
+    /// Use this when you want a fresh acceleration on each startup.
+    FileCreate,
 }
 
 impl Display for Mode {
@@ -50,6 +55,7 @@ impl Display for Mode {
         match self {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
+            Mode::FileCreate => write!(f, "file_create"),
         }
     }
 }

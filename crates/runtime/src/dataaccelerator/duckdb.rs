@@ -144,7 +144,7 @@ impl DuckDBAccelerator {
         })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => {
+            (Ok(duckdb_file), Mode::File | Mode::FileCreate) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
@@ -175,7 +175,7 @@ impl DuckDBAccelerator {
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
-            (Err(e), Mode::File) => {
+            (Err(e), Mode::File | Mode::FileCreate) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
                 });
@@ -202,7 +202,7 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if acceleration.mode == Mode::File
+                    if matches!(acceleration.mode, Mode::File | Mode::FileCreate)
                         && let Ok(file_path) = self.file_path(ds.as_ref())
                         && this_file_path == file_path
                     {
@@ -364,6 +364,20 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "DuckDB acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
             download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
 
             self.get_shared_pool(source).await?;
@@ -433,10 +447,10 @@ impl DataAccelerator for DuckDBAccelerator {
                             .map(|view| view as Arc<dyn AccelerationSource>),
                     )
                     .filter_map(|other_source| {
-                        if other_source
-                            .acceleration()
-                            .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
-                        {
+                        if other_source.acceleration().is_some_and(|a| {
+                            a.engine == Engine::DuckDB
+                                && matches!(a.mode, Mode::File | Mode::FileCreate)
+                        }) {
                             if other_source.name() == source.name() {
                                 None
                             } else {

@@ -4,9 +4,12 @@ expression: sanitized_plan
 ---
 SchemaCastScanExec
   PartitionedUnionExec
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 > 85
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 > 85
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 > 85
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 > 85
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 > 85
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 > 85
