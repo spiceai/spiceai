@@ -18,7 +18,10 @@ limitations under the License.
 
 use crate::client::Client;
 use crate::error::{HttpSnafu, JsonSnafu, Result, StreamSnafu};
-use crate::types::{Candidate, Content, GenerationConfig, SafetySetting, Tool, UsageMetadata};
+use crate::types::{
+    CachedContent, Candidate, Content, GenerationConfig, SafetySetting, Tool, ToolConfig,
+    UsageMetadata,
+};
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::header::HeaderMap;
@@ -36,6 +39,9 @@ pub struct GenerateContentRequest {
     pub tools: Option<Vec<Tool>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<ToolConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_settings: Option<Vec<SafetySetting>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +49,9 @@ pub struct GenerateContentRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<Content>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<CachedContent>,
 }
 
 impl GenerateContentRequest {
@@ -51,9 +60,11 @@ impl GenerateContentRequest {
         Self {
             contents,
             tools: None,
+            tool_config: None,
             safety_settings: None,
             generation_config: None,
             system_instruction: None,
+            cached_content: None,
         }
     }
 
@@ -70,6 +81,12 @@ impl GenerateContentRequest {
     }
 
     #[must_use]
+    pub fn with_tool_config(mut self, config: ToolConfig) -> Self {
+        self.tool_config = Some(config);
+        self
+    }
+
+    #[must_use]
     pub fn with_safety_settings(mut self, settings: Vec<SafetySetting>) -> Self {
         self.safety_settings = Some(settings);
         self
@@ -78,6 +95,12 @@ impl GenerateContentRequest {
     #[must_use]
     pub fn with_system_instruction(mut self, instruction: Content) -> Self {
         self.system_instruction = Some(instruction);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cached_content(mut self, cached: CachedContent) -> Self {
+        self.cached_content = Some(cached);
         self
     }
 }
@@ -92,6 +115,12 @@ pub struct GenerateContentResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_feedback: Option<PromptFeedback>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

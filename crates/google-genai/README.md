@@ -9,6 +9,8 @@ A Rust client library for the Google Generative AI (Gemini) REST API.
 - ✅ Streaming responses (SSE)
 - ✅ Text embeddings with configurable dimensions
 - ✅ Function calling (tools)
+- ✅ Tool configuration (function calling modes)
+- ✅ Cached content support
 - ✅ Structured output (response schema)
 - ✅ Safety settings
 - ✅ Batch embeddings
@@ -137,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use google_genai::{
     Client,
     generate::GenerateContentRequest,
-    types::{Content, Tool, FunctionDeclaration, Schema, GenerationConfig},
+    types::{Content, Tool, FunctionDeclaration, Schema},
 };
 use std::collections::HashMap;
 
@@ -168,6 +170,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = GenerateContentRequest::new(vec![
         Content::user("What's the weather in San Francisco?")
     ]).with_tools(vec![tool]);
+    
+    let response = client.generate_content("gemini-2.0-flash", request).await?;
+    
+    Ok(())
+}
+```
+
+### Tool Configuration
+
+Control function calling behavior with `ToolConfig`:
+
+```rust
+use google_genai::{
+    Client,
+    generate::GenerateContentRequest,
+    types::{
+        Content, Tool, FunctionDeclaration, ToolConfig,
+        FunctionCallingConfig, FunctionCallingMode,
+    },
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new("your-api-key")?;
+    
+    // Define your tools
+    let tools = vec![/* ... */];
+    
+    // Configure function calling mode
+    // Note: allowed_function_names should only be used with ANY mode
+    let tool_config = ToolConfig {
+        function_calling_config: Some(FunctionCallingConfig {
+            mode: Some(FunctionCallingMode::Auto), // AUTO, ANY, or NONE
+            allowed_function_names: None, // Only use with ANY mode
+        }),
+    };
+    
+    let request = GenerateContentRequest::new(vec![
+        Content::user("What's the weather?")
+    ])
+    .with_tools(tools)
+    .with_tool_config(tool_config);
+    
+    let response = client.generate_content("gemini-2.0-flash", request).await?;
+    
+    Ok(())
+}
+```
+
+### Cached Content
+
+Use cached content for optimized repeated queries with large contexts:
+
+```rust
+use google_genai::{
+    Client,
+    generate::GenerateContentRequest,
+    types::{Content, CachedContent},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new("your-api-key")?;
+    
+    // Reference a previously created cache
+    let cached_content = CachedContent {
+        name: Some("cachedContents/your-cache-id".to_string()),
+    };
+    
+    let request = GenerateContentRequest::new(vec![
+        Content::user("Based on the cached context, summarize the key points.")
+    ]).with_cached_content(cached_content);
     
     let response = client.generate_content("gemini-2.0-flash", request).await?;
     
@@ -226,6 +300,23 @@ See the [Google AI documentation](https://ai.google.dev/api) for detailed API sp
 
 - **Chat/Text Generation**: `gemini-2.0-flash`, `gemini-1.5-pro`, `gemini-1.5-flash`
 - **Embeddings**: `text-embedding-004`
+
+## Examples
+
+The `examples/` directory contains complete working examples:
+
+- **`simple_chat.rs`** - Basic text generation with token usage
+- **`streaming.rs`** - Streaming responses with Server-Sent Events
+- **`embeddings.rs`** - Generate text embeddings with multiple inputs
+- **`function_calling.rs`** - Function calling with weather API example
+- **`tool_config_modes.rs`** - Demonstrates different `ToolConfig` modes (AUTO, NONE, restricted functions)
+- **`cached_content.rs`** - Using cached content for optimized queries
+
+Run examples with:
+```bash
+cargo run --example simple_chat
+cargo run --example function_calling
+```
 
 ## Authentication
 
