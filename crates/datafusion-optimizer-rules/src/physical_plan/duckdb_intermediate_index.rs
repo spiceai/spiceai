@@ -96,7 +96,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
     /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
     /// materialized CTE with filters _only_ on index columns
-    #[expect(clippy::too_many_lines)]
     fn build_cte(
         select: &Select,
         indexes: &[(ColumnReference, IndexType)],
