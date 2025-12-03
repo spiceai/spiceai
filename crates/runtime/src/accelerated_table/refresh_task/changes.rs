@@ -99,25 +99,23 @@ impl RefreshTask {
                             self.update_component_status(status::ComponentStatus::Ready)
                                 .await;
 
-                            if let Err(e) = change_envelope.commit() {
-                                if !self.runtime_status.is_shutdown() {
-                                    tracing::error!("Failed to commit CDC change envelope: {e}");
-                                }
+                            if let Err(e) = change_envelope.commit()
+                                && !self.runtime_status.is_shutdown()
+                            {
+                                tracing::error!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if let Some(cache_provider_ref) = caching.as_ref() {
+                            if let Some(cache_provider_ref) = caching.as_ref()
+                                && let Some(cache_provider) = cache_provider_ref.upgrade()
+                                && let Err(e) =
+                                    cache_provider.invalidate_for_table(dataset_name.clone())
+                                && !self.runtime_status.is_shutdown()
+                            {
                                 // No cache provider means runtime is shutting down and cache is already cleaned up
-                                if let Some(cache_provider) = cache_provider_ref.upgrade()
-                                    && let Err(e) =
-                                        cache_provider.invalidate_for_table(dataset_name.clone())
-                                {
-                                    if !self.runtime_status.is_shutdown() {
-                                        tracing::error!(
-                                            "Failed to invalidate cached results for dataset {}: {e}",
-                                            &dataset_name.to_string()
-                                        );
-                                    }
-                                }
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name.to_string()
+                                );
                             }
                         }
                         Err(e) => {
@@ -205,8 +203,17 @@ impl RefreshTask {
 
         let data_batch = change_batch.data_batch();
 
-        let indices_array =
-            UInt32Array::from(row_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let indices_array = UInt32Array::from(
+            row_indices
+                .iter()
+                .map(|&i| {
+                    u32::try_from(i).unwrap_or_else(|_| {
+                        tracing::error!("Index {i} doesn't fit in u32, using 0");
+                        0
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
 
         let selected_columns: Vec<ArrayRef> = data_batch
             .columns()
@@ -266,7 +273,7 @@ impl RefreshTask {
         for &row in row_indices {
             let inner_data = change_batch.data(row);
             let primary_keys = change_batch.primary_keys(row);
-            let primary_key_log_fmt = get_primary_key_log_fmt(&inner_data, &primary_keys).unwrap();
+            let primary_key_log_fmt = get_primary_key_log_fmt(&inner_data, &primary_keys)?;
             let delete_where_exprs = get_delete_where_expr(&inner_data, primary_keys)?;
 
             tracing::trace!("Deleting data for {dataset_name} where {primary_key_log_fmt}");
@@ -348,7 +355,7 @@ fn get_primary_key_value(
 }
 
 /// Groups rows into sub-batches based on operation type and primary key uniqueness
-/// Returns a vector of (operation_type, row_indices) tuples
+/// Returns a vector of (`operation_type`, `row_indices`) tuples
 #[must_use]
 fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
     if change_batch.record.num_rows() == 0 {
@@ -365,7 +372,13 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
         let primary_keys_columns = change_batch.primary_keys(row_id);
-        let primary_keys = get_primary_key_log_fmt(&row, &primary_keys_columns).unwrap();
+        let primary_keys = match get_primary_key_log_fmt(&row, &primary_keys_columns) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::error!("Failed to get primary key log format for row {row_id}: {e}");
+                continue;
+            }
+        };
 
         let should_split = if let Some(current_type) = current_op_type {
             current_type != op_type || (seen_primary_keys.contains(&primary_keys))
@@ -374,8 +387,10 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         };
 
         if should_split {
-            if !current_batch_indices.is_empty() {
-                sub_batches.push((current_op_type.unwrap(), current_batch_indices.clone()));
+            if !current_batch_indices.is_empty()
+                && let Some(op_type) = current_op_type
+            {
+                sub_batches.push((op_type, current_batch_indices.clone()));
             }
 
             current_batch_indices.clear();
@@ -389,8 +404,10 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         seen_primary_keys.insert(primary_keys);
     }
 
-    if !current_batch_indices.is_empty() {
-        sub_batches.push((current_op_type.unwrap(), current_batch_indices));
+    if !current_batch_indices.is_empty()
+        && let Some(op_type) = current_op_type
+    {
+        sub_batches.push((op_type, current_batch_indices));
     }
 
     sub_batches
@@ -491,7 +508,7 @@ mod tests {
 
     fn create_test_change_batch(
         ops: Vec<&str>,
-        primary_keys: Vec<Vec<&str>>,
+        primary_keys: &[Vec<&str>],
         ids: Vec<i32>,
         names: Vec<Option<&str>>,
     ) -> ChangeBatch {
@@ -517,12 +534,13 @@ mod tests {
         let mut pk_offsets = vec![0i32];
         let mut pk_values = Vec::new();
 
-        for pk_vec in &primary_keys {
+        for pk_vec in primary_keys {
             for &pk in pk_vec {
                 pk_values.push(pk);
             }
             pk_offsets.push(
-                pk_offsets.last().expect("offsets should not be empty") + pk_vec.len() as i32,
+                pk_offsets.last().expect("offsets should not be empty")
+                    + i32::try_from(pk_vec.len()).expect("pk_vec.len() fits in i32"),
             );
         }
 
@@ -559,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_empty_batch() {
-        let change_batch = create_test_change_batch(vec![], vec![], vec![], vec![]);
+        let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
 
         let result = group_into_sub_batches(&change_batch);
 
@@ -569,7 +587,7 @@ mod tests {
     #[test]
     fn test_single_row() {
         let change_batch =
-            create_test_change_batch(vec!["c"], vec![vec!["id"]], vec![1], vec![Some("Alice")]);
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
 
         let result = group_into_sub_batches(&change_batch);
 
@@ -582,7 +600,7 @@ mod tests {
     fn test_same_operation_different_primary_keys() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
-            vec![vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 2, 3],
             vec![Some("Alice"), Some("Bob"), Some("Charlie")],
         );
@@ -602,7 +620,7 @@ mod tests {
     fn test_different_operation_types_split() {
         let change_batch = create_test_change_batch(
             vec!["c", "d", "c"],
-            vec![vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 2, 3],
             vec![Some("Alice"), Some("Bob"), Some("Charlie")],
         );
@@ -629,7 +647,7 @@ mod tests {
     fn test_duplicate_primary_key_causes_split() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
-            vec![vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 1, 2], // First two rows have same id value
             vec![Some("Alice"), Some("Alice_v2"), Some("Bob")],
         );
@@ -655,7 +673,7 @@ mod tests {
         // create, update, and read should all map to Upsert
         let change_batch = create_test_change_batch(
             vec!["c", "u", "r"],
-            vec![vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 2, 3],
             vec![Some("A"), Some("B"), Some("C")],
         );
@@ -675,7 +693,7 @@ mod tests {
     fn test_all_operation_types() {
         let change_batch = create_test_change_batch(
             vec!["c", "u", "r", "d", "t"],
-            vec![vec!["id"], vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 2, 3, 4, 5],
             vec![Some("A"), Some("B"), Some("C"), Some("D"), Some("E")],
         );
@@ -702,7 +720,7 @@ mod tests {
     fn test_multiple_duplicate_keys_in_sequence() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c", "c"],
-            vec![vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 1, 2, 1],
             vec![Some("A"), Some("A2"), Some("B"), Some("A3")],
         );
@@ -728,7 +746,7 @@ mod tests {
     fn test_composite_primary_keys() {
         let change_batch = create_test_change_batch(
             vec!["c", "c", "c"],
-            vec![vec!["id", "name"], vec!["id", "name"], vec!["id", "name"]],
+            &[vec!["id", "name"], vec!["id", "name"], vec!["id", "name"]],
             vec![1, 2, 1],
             vec![Some("Alice"), Some("Bob"), Some("Alice")],
         );
@@ -751,7 +769,7 @@ mod tests {
     fn test_alternating_operations() {
         let change_batch = create_test_change_batch(
             vec!["c", "d", "c", "d"],
-            vec![vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
+            &[vec!["id"], vec!["id"], vec!["id"], vec!["id"]],
             vec![1, 2, 3, 4],
             vec![Some("A"), Some("B"), Some("C"), Some("D")],
         );
