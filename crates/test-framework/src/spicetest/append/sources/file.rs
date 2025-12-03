@@ -49,7 +49,6 @@ impl FileAppendableSource {
 
 #[async_trait]
 impl AppendableSource for FileAppendableSource {
-    #[allow(clippy::format_push_string)]
     async fn setup(&self, config: &AppendConfig) -> Result<()> {
         if fs::try_exists(&self.dest_db_file).await? {
             fs::remove_file(&self.dest_db_file).await?;
@@ -138,7 +137,6 @@ impl AppendableSource for FileAppendableSource {
         Ok(())
     }
 
-    #[allow(clippy::format_push_string)]
     async fn generate(&self, config: &AppendConfig, load_index: u16) -> Result<()> {
         // If conflict testing is enabled and not the last step, also generate next step's data
         // This creates conflicts that should be resolved by the next append operation

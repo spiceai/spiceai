@@ -15,11 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{
-    args::{AppendTestArgs, QuerySetLoader},
-    health::HealthMonitor,
-    wait_test_and_memory,
-};
+use crate::{args::AppendTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType,
@@ -43,6 +39,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         .query_overrides
         .clone()
         .map(QueryOverrides::from);
+
+    let queries = query_set.get_queries(query_overrides, None, None).await?;
 
     let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
 
