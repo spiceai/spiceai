@@ -15,6 +15,8 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
+      params:
+        connection_pool_size: 25
   - from: s3://benchmarks/tpcds_sf1/catalog_returns.parquet
     name: catalog_returns
     params: *s3_params
