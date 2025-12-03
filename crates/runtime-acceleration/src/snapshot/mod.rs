@@ -51,7 +51,7 @@ use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
 pub mod metrics;
-pub use behavior::SnapshotBehavior;
+pub use behavior::{SnapshotBehavior, SnapshotTrigger};
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;

@@ -108,6 +108,11 @@ pub enum Error {
 
     #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
     InvalidConfiguration { config_key: String, message: String },
+
+    #[snafu(display(
+        "'snapshots_interval' is required when setting 'snapshots_trigger: interval'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotTriggerIntervalRequiresInterval,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -53,7 +53,7 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
-    pub acceleration_snapshot: spicepod_acceleration::SnapshotBehavior,
+    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -80,7 +80,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let acceleration_snapshot = dataset
+        let acceleration_snapshot_behavior = dataset
             .acceleration
             .as_ref()
             .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
@@ -132,7 +132,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
-            acceleration_snapshot,
+            acceleration_snapshot_behavior,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -163,7 +163,7 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
-            acceleration_snapshot: spicepod_acceleration::SnapshotBehavior::Disabled,
+            acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -238,9 +238,9 @@ impl DatasetBuilder {
         })?;
 
         if let Some(acceleration) = self.acceleration.as_mut() {
-            acceleration.snapshots = SnapshotBehavior::from(
+            acceleration.snapshot_behavior = SnapshotBehavior::from(
                 app.snapshots.clone(),
-                self.acceleration_snapshot,
+                self.acceleration_snapshot_behavior,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
             );

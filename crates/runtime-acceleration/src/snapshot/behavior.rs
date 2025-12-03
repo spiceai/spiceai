@@ -11,11 +11,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, Weak};
-
 use runtime_secrets::Secrets;
 use spicepod::acceleration as spicepod_acceleration;
 use spicepod::component::snapshot::Snapshots;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
@@ -194,4 +194,13 @@ impl SnapshotBehavior {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SnapshotTrigger {
+    #[default]
+    /// Snapshots are created after each refresh (used by full/append modes).
+    AfterRefresh,
+    /// Snapshots are updated on an interval (used by append/changes modes).
+    Interval(Duration),
 }
