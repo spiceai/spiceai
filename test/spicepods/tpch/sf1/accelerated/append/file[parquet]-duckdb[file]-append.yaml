@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_duckdb_file_append
+name: file[parquet]-duckdb[file]-append
 datasets:
   - from: file:customer.parquet
     name: customer

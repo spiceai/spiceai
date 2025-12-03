@@ -45,7 +45,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
-            accel.mode == Mode::File
+            matches!(accel.mode, Mode::File | Mode::FileCreate)
                 && accel.enabled
                 && matches!(
                     accel.engine.as_deref(),

@@ -113,6 +113,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
+            (
+                TestType::Append,
+                DispatchTests {
+                    append: Some(append),
+                    ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: append.clone(),
+                    spiced_commit: args.spiced_commit.clone(),
+                })
+            }
             (TestType::Benchmark, _) => {
                 println!(
                     "Test file {} does not contain a benchmark test",
@@ -141,6 +153,13 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             (TestType::HttpOverhead, _) => {
                 println!(
                     "Test file {} does not contain an HTTP overhead test",
+                    path.display()
+                );
+                continue;
+            }
+            (TestType::Append, _) => {
+                println!(
+                    "Test file {} does not contain an append test",
                     path.display()
                 );
                 continue;

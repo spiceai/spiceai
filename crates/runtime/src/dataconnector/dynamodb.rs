@@ -22,6 +22,7 @@ use crate::component::dataset::Dataset;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
 use crate::federated_table::FederatedTable;
+use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
@@ -458,3 +459,5 @@ impl CommitChange for DynamoDBStreamCommitter {
         })
     }
 }
+
+register_data_connector!("dynamodb", DynamoDBFactory);
