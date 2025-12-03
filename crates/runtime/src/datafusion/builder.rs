@@ -48,15 +48,8 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
-
 #[cfg(feature = "duckdb")]
-use {
-    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
-    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
-    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
-    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
-};
-
+use datafusion_optimizer_rules::physical_plan::duckdb_intermediate_index::DuckDBIntermediateIndexMaterializationOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -266,12 +259,9 @@ impl DataFusionBuilder {
 
         #[cfg(feature = "duckdb")]
         {
-            state = state
-                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
-                .with_physical_optimizer_rule(
-                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
-                );
+            state = state.with_physical_optimizer_rule(
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            );
         }
 
         state = state
@@ -511,8 +501,6 @@ pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Sen
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
-        #[cfg(feature = "duckdb")]
-        DuckDBLogicalExtensionPlanner::new(),
     ]
 }
 
