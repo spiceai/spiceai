@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 //! Google Generative AI API client
+#![allow(clippy::missing_errors_doc)]
 
 use crate::error::{Error, HttpSnafu, Result};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
