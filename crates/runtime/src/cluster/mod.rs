@@ -34,7 +34,7 @@ use futures::TryFutureExt;
 use prost::Message;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
-use runtime_proto::{ExecutorExpandSecretRequest, GetAppDefinitionRequest};
+use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::env;
@@ -64,7 +64,6 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
-#[expect(clippy::too_many_lines)]
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
