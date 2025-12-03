@@ -17,14 +17,22 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 
 use google_genai::{
-    Client,
     generate::GenerateContentRequest,
     types::{
-        Content, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, Schema, Tool,
-        ToolConfig,
+        Content, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, FunctionResponse,
+        Part, Schema, Tool, ToolConfig,
     },
+    Client,
 };
 use std::collections::HashMap;
+
+fn get_current_weather(location: &str, unit: Option<&str>) -> String {
+    let unit = unit.unwrap_or("fahrenheit");
+    format!(
+        "{{\"location\": \"{}\", \"temperature\": \"72\", \"unit\": \"{}\", \"forecast\": \"sunny\"}}",
+        location, unit
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,36 +82,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     };
 
-    let request = GenerateContentRequest::new(vec![Content::user(
+    println!("=== Step 1: Initial request with function calling ===\n");
+
+    let initial_request = GenerateContentRequest::new(vec![Content::user(
         "What's the weather like in San Francisco?",
     )])
-    .with_tools(tools)
-    .with_tool_config(tool_config);
+    .with_tools(tools.clone())
+    .with_tool_config(tool_config.clone());
 
-    println!("Sending request with function calling to Gemini API...");
+    let initial_response = client
+        .generate_content("gemini-2.0-flash", initial_request)
+        .await?;
 
-    let response = client.generate_content("gemini-2.0-flash", request).await?;
+    let mut conversation_history = vec![Content::user(
+        "What's the weather like in San Francisco?".to_string(),
+    )];
 
-    if let Some(candidate) = response.candidates.first() {
+    if let Some(candidate) = initial_response.candidates.first() {
+        conversation_history.push(candidate.content.clone());
+
         for part in &candidate.content.parts {
             match part {
-                google_genai::types::Part::Text { text } => {
-                    println!("\nText response: {text}");
+                Part::FunctionCall { function_call } => {
+                    println!("Model requested function call:");
+                    println!("  Function: {}", function_call.name);
+                    println!("  Arguments: {:?}\n", function_call.args);
+
+                    let location = function_call
+                        .args
+                        .get("location")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    let unit = function_call.args.get("unit").and_then(|v| v.as_str());
+
+                    println!("Calling function: get_current_weather(\"{}\", {:?})", location, unit);
+                    let function_result = get_current_weather(location, unit);
+                    println!("Function result: {}\n", function_result);
+
+                    let mut response_map = HashMap::new();
+                    response_map.insert("result".to_string(), serde_json::json!(function_result));
+
+                    let function_response_part = Part::FunctionResponse {
+                        function_response: FunctionResponse {
+                            name: function_call.name.clone(),
+                            response: response_map,
+                        },
+                    };
+
+                    conversation_history.push(Content {
+                        role: Some("function".to_string()),
+                        parts: vec![function_response_part],
+                    });
                 }
-                google_genai::types::Part::FunctionCall { function_call } => {
-                    println!("\nFunction call requested:");
-                    println!("  Function name: {}", function_call.name);
-                    println!("  Arguments: {:?}", function_call.args);
+                Part::Text { text } => {
+                    println!("Model text response: {}\n", text);
                 }
-                _ => {
-                    println!("\nOther part type: {part:?}");
-                }
+                _ => {}
             }
         }
     }
 
-    if let Some(usage) = response.usage_metadata {
-        println!("\nToken usage:");
+    println!("=== Step 2: Send function response back to model ===\n");
+
+    let followup_request = GenerateContentRequest::new(conversation_history)
+        .with_tools(tools)
+        .with_tool_config(tool_config);
+
+    let final_response = client
+        .generate_content("gemini-2.0-flash", followup_request)
+        .await?;
+
+    if let Some(candidate) = final_response.candidates.first() {
+        for part in &candidate.content.parts {
+            if let Part::Text { text } = part {
+                println!("Final response from model:\n{}\n", text);
+            }
+        }
+    }
+
+    if let Some(usage) = final_response.usage_metadata {
+        println!("Total token usage:");
         println!("  Prompt tokens: {}", usage.prompt_token_count);
         if let Some(candidate_tokens) = usage.candidates_token_count {
             println!("  Candidate tokens: {candidate_tokens}");

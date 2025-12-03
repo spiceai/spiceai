@@ -136,11 +136,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Function Calling
 
+Complete example with function execution and response:
+
 ```rust
 use google_genai::{
     Client,
     generate::GenerateContentRequest,
-    types::{Content, Tool, FunctionDeclaration, Schema},
+    types::{Content, Tool, FunctionDeclaration, Schema, FunctionResponse, Part},
 };
 use std::collections::HashMap;
 
@@ -148,31 +150,64 @@ use std::collections::HashMap;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new("your-api-key")?;
     
-    let mut properties = HashMap::new();
-    properties.insert("city".to_string(), Schema {
-        schema_type: "string".to_string(),
-        description: Some("The city name".to_string()),
-        ..Default::default()
-    });
-    
+    // Step 1: Define the function
     let tool = Tool {
         function_declarations: Some(vec![FunctionDeclaration {
             name: "get_weather".to_string(),
             description: "Get the weather for a city".to_string(),
             parameters: Some(Schema {
                 schema_type: "object".to_string(),
-                properties: Some(properties),
+                properties: Some(HashMap::from([(
+                    "city".to_string(),
+                    Schema {
+                        schema_type: "string".to_string(),
+                        ..Default::default()
+                    }
+                )])),
                 required: Some(vec!["city".to_string()]),
                 ..Default::default()
             }),
         }])
     };
     
+    // Step 2: Initial request
     let request = GenerateContentRequest::new(vec![
         Content::user("What's the weather in San Francisco?")
-    ]).with_tools(vec![tool]);
+    ]).with_tools(vec![tool.clone()]);
     
     let response = client.generate_content("gemini-2.0-flash", request).await?;
+    
+    // Step 3: Execute function if requested
+    let mut conversation = vec![Content::user("What's the weather in San Francisco?".to_string())];
+    
+    if let Some(candidate) = response.candidates.first() {
+        conversation.push(candidate.content.clone());
+        
+        for part in &candidate.content.parts {
+            if let Part::FunctionCall { function_call } = part {
+                // Execute your function here
+                let weather_data = r#"{"temp": 72, "condition": "sunny"}"#;
+                
+                // Add function response
+                let mut response_map = HashMap::new();
+                response_map.insert("result".to_string(), serde_json::json!(weather_data));
+                
+                conversation.push(Content {
+                    role: Some("function".to_string()),
+                    parts: vec![Part::FunctionResponse {
+                        function_response: FunctionResponse {
+                            name: function_call.name.clone(),
+                            response: response_map,
+                        }
+                    }],
+                });
+            }
+        }
+    }
+    
+    // Step 4: Send function response back
+    let final_request = GenerateContentRequest::new(conversation).with_tools(vec![tool]);
+    let final_response = client.generate_content("gemini-2.0-flash", final_request).await?;
     
     Ok(())
 }
