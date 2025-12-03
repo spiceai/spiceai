@@ -59,12 +59,6 @@ use tokio::sync::mpsc::Sender;
 #[derive(Debug, Clone)]
 pub struct S3VectorsListTable(S3VectorsTable);
 
-impl From<S3VectorsTable> for S3VectorsListTable {
-    fn from(table: S3VectorsTable) -> Self {
-        Self::new(table)
-    }
-}
-
 impl S3VectorsListTable {
     #[must_use]
     pub fn new(table: S3VectorsTable) -> Self {
