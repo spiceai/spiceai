@@ -232,24 +232,20 @@ impl MemTable {
         pk: &[usize],
         on_conflict: &ColumnReference,
     ) -> Result<()> {
-        let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
         let schema = self.schema();
 
-        if on_conflict_cols.len() != pk.len() {
+        let pk_names: HashSet<&str> = pk
+            .iter()
+            .map(|&idx| schema.field(idx).name().as_str())
+            .collect();
+
+        let on_conflict_set: HashSet<&str> = on_conflict.iter().collect();
+
+        if pk_names != on_conflict_set {
             return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
+                "Primary key columns must match the on_conflict definition".to_string(),
             ));
         }
-
-        for (c, pk_idx) in on_conflict_cols.iter().zip(pk.iter()) {
-            let pk_name = schema.field(*pk_idx).name();
-            if c != pk_name {
-                return Err(DataFusionError::Execution(
-                    "Primary key must match the on_conflict definition".to_string(),
-                ));
-            }
-        }
-
         Ok(())
     }
 
@@ -2082,6 +2078,53 @@ mod tests {
         assert!(
             result.is_err(),
             "should fail when on_conflict columns don't match primary key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_validation_column_order() {
+        // Tests that composite primary key validation works correctly when
+        // primary key / on_conflict columns indices are not lexicographically ordered.
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "b"]),
+            ("pk2", vec!["1", "2"]),
+            ("value", vec!["v1", "v2"]),
+        ]);
+
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![1, 0]), // Composite key
+            ]))
+            .await
+            .expect("constraints should be satisfied")
+            .with_on_conflict(
+                OnConflict::try_from("upsert:(pk2,pk1)").expect("create on_conflict"),
+            );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Try to insert duplicate composite key
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "c"]),
+            ("pk2", vec!["1", "1"]),
+            ("value", vec!["v5", "v6"]),
+        ]);
+
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        assert!(
+            collect(insertion, ctx.task_ctx()).await.is_ok(),
+            "insertion should succeed"
         );
     }
 

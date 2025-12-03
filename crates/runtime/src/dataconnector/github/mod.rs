@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
+use crate::{
+    component::dataset::Dataset, dataconnector::github::members::MembersTableArgs,
+    register_data_connector,
+};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -690,6 +693,8 @@ impl DataConnectorFactory for GithubFactory {
         PARAMETERS
     }
 }
+
+register_data_connector!("github", GithubFactory);
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {

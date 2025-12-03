@@ -20,6 +20,7 @@ use super::{
 };
 use crate::component::dataset::Dataset;
 use crate::federated_table::FederatedTable;
+use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
@@ -299,3 +300,5 @@ impl DataConnector for DynamoDB {
         ))
     }
 }
+
+register_data_connector!("dynamodb", DynamoDBFactory);
