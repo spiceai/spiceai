@@ -19,7 +19,7 @@ limitations under the License.
 //! upstream to `datafusion` directly.
 
 #[cfg(feature = "duckdb")]
-pub mod duckdb;
+pub mod duckdb_intermediate_index;
 pub mod hash_join_optimization;
 
 #[cfg(feature = "cluster")]

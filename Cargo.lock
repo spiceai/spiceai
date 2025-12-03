@@ -4703,7 +4703,6 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
- "datafusion-federation",
  "datafusion-table-providers",
  "duckdb",
  "futures",
@@ -4711,7 +4710,6 @@ dependencies = [
  "object_store",
  "r2d2",
  "snafu",
- "tokio",
  "tracing",
  "url",
 ]
