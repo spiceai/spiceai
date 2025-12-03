@@ -4926,7 +4926,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=9fa10f280175667a54ca18b55aa1320e82737840#9fa10f280175667a54ca18b55aa1320e82737840"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=bfe12b5e9ea31950a724cecce04e543f4db02165#bfe12b5e9ea31950a724cecce04e543f4db02165"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4942,6 +4942,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-federation",
+ "datafusion-physical-expr",
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",

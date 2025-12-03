@@ -329,7 +329,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "97ea01e40c79e5aaf34a6126cef95721f8bef3cc" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "97ea01e40c79e5aaf34a6126cef95721f8bef3cc" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "9fa10f280175667a54ca18b55aa1320e82737840" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "bfe12b5e9ea31950a724cecce04e543f4db02165" } # spiceai
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai:spiceai-50
 
