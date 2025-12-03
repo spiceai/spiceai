@@ -269,6 +269,8 @@ fn assign_field_id_recursive(field: &Field, counter: &mut i32) -> Field {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use iceberg::arrow::arrow_schema_to_schema;
 
