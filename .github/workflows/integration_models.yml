@@ -125,6 +125,13 @@ jobs:
         run: |
           echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
 
+      # 🔽 PoC step: show that a secret is available in this job
+      - name: PoC – show dummy secret is set (fork only)
+        env:
+          DUMMY_SECRET: ${{ secrets.DUMMY_SECRET }}
+        run: |
+          echo "DUMMY_SECRET length: ${#DUMMY_SECRET}"
+
       - name: Run integration test
         env:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
