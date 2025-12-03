@@ -848,72 +848,83 @@ impl Refresher {
         changes_stream: ChangesStream,
         snapshot_manager: Option<SnapshotManager>,
     ) -> tokio::task::JoinHandle<()> {
+        let checkpointer = self.checkpointer.clone();
+
         let on_batch_process_callback = if let Some(snapshot_trigger) =
             self.snapshot_trigger.clone()
         {
             match snapshot_trigger {
                 SnapshotTrigger::Refresh => {
                     // TODO: check if this warning is not handled above
-                    tracing::warn!("Append/changes streams only support 'snapshots_trigger: interval', but 'refresh' is set.");
+                    tracing::warn!("Append/changes streams only support 'snapshots_trigger: interval', but 'refresh' is set. No checkpoints will be created.");
                     None
                 },
                 SnapshotTrigger::Interval(snapshot_interval) => {
-                    if let Some(snapshot_manager) = snapshot_manager {
-                        let snapshot_manager = Arc::new(snapshot_manager);
-                        let dataset_name = self.dataset_name.clone();
-                        let federated_schema = self.federated.schema();
+                    match (checkpointer, snapshot_manager) {
+                        (Some(checkpointer), Some(snapshot_manager)) => {
+                            let snapshot_manager = Arc::new(snapshot_manager);
+                            let dataset_name = self.dataset_name.clone();
+                            let federated_schema = self.federated.schema();
 
-                        // Track last snapshot time using Arc<RwLock<Instant>>
-                        let last_snapshot_time = Arc::new(RwLock::new(tokio::time::Instant::now()));
+                            // Track last snapshot time using Arc<RwLock<Instant>>
+                            let last_snapshot_time = Arc::new(RwLock::new(tokio::time::Instant::now()));
 
-                        let callback =
-                            Arc::new(Mutex::new(Box::new(move || {
-                                let snapshot_manager = Arc::clone(&snapshot_manager);
-                                let last_snapshot_time = Arc::clone(&last_snapshot_time);
-                                let federated_schema = federated_schema.clone();
-                                let dataset_name = dataset_name.clone();
+                            let callback =
+                                Arc::new(Mutex::new(Box::new(move || {
+                                    let checkpointer = Arc::clone(&checkpointer);
+                                    let snapshot_manager = Arc::clone(&snapshot_manager);
+                                    let last_snapshot_time = Arc::clone(&last_snapshot_time);
+                                    let federated_schema = federated_schema.clone();
+                                    let dataset_name = dataset_name.clone();
 
-                                Box::pin(async move {
+                                    Box::pin(async move {
 
-                                    println!("on_batch_process_callback");
+                                        println!("on_batch_process_callback");
 
-                                    let mut last_time = last_snapshot_time.write().await;
-                                    let elapsed = last_time.elapsed();
+                                        let mut last_time = last_snapshot_time.write().await;
+                                        let elapsed = last_time.elapsed();
 
-                                    if elapsed >= snapshot_interval {
-                                        println!("Snapshotting dataset {dataset_name}");
-                                        tracing::debug!(
-                                            "Creating snapshot for changes stream: {} (elapsed: {:?})",
-                                            dataset_name,
-                                            elapsed
-                                        );
-
-                                        if let Err(e) = snapshot_manager
-                                            .create_snapshot(&federated_schema)
-                                            .await
-                                        {
-                                            let dataset_label = dataset_name.to_string();
-                                            snapshot_metrics::record_snapshot_failure(&dataset_label);
-                                            tracing::warn!(
-                                                "Failed to create snapshot for changes stream {}: {}",
+                                        if elapsed >= snapshot_interval {
+                                            println!("Snapshotting dataset {dataset_name}");
+                                            tracing::debug!(
+                                                "Creating snapshot for changes stream: {} (elapsed: {:?})",
                                                 dataset_name,
-                                                e
+                                                elapsed
                                             );
-                                        } else {
-                                            tracing::info!(
-                                                "Successfully created snapshot for changes stream: {}",
-                                                dataset_name
-                                            );
+
+                                            if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+                                                tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+                                                return;
+                                            }
+
+                                            if let Err(e) = snapshot_manager
+                                                .create_snapshot(&federated_schema)
+                                                .await
+                                            {
+                                                let dataset_label = dataset_name.to_string();
+                                                snapshot_metrics::record_snapshot_failure(&dataset_label);
+                                                tracing::warn!(
+                                                    "Failed to create snapshot for changes stream {}: {}",
+                                                    dataset_name,
+                                                    e
+                                                );
+                                            } else {
+                                                tracing::info!(
+                                                    "Successfully created snapshot for changes stream: {}",
+                                                    dataset_name
+                                                );
+                                            }
+
+                                            *last_time = tokio::time::Instant::now();
                                         }
+                                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                                }) as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
 
-                                        *last_time = tokio::time::Instant::now();
-                                    }
-                                }) as Pin<Box<dyn Future<Output = ()> + Send>>
-                            }) as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
-
-                        Some(callback)
-                    } else {
-                        None
+                            Some(callback)
+                        },
+                        _ => {
+                            None
+                        }
                     }
                 }
             }
