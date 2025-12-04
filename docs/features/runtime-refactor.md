@@ -78,4 +78,5 @@
 ## Progress Log
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
 - [x] 2025-12-04: Phase 1 inventory started (downcasts cataloged; dependency minimization goals captured).
-- [ ] 2025-12-04: Draft `runtime-interfaces` dependency/feature matrix and façade trait plan.
+- [x] 2025-12-04: Draft `runtime-interfaces` dependency/feature matrix and façade trait plan.
+- [ ] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
