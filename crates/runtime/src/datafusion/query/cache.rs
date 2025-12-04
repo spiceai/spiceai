@@ -45,19 +45,35 @@ pub(super) enum PlanOrCached {
 
 pub(super) struct RequestCacheManager {
     pub(super) cache_status: CacheStatus,
-    pub(super) raw_cache_key: RawCacheKey,
+    cache_keys: Vec<RawCacheKey>,
 }
 
 impl RequestCacheManager {
-    pub(super) fn new(cache_status: CacheStatus, raw_cache_key: RawCacheKey) -> Self {
+    pub(super) fn new(
+        cache_status: CacheStatus,
+        primary_cache_key: RawCacheKey,
+        alternate_cache_keys: Vec<RawCacheKey>,
+    ) -> Self {
+        let mut cache_keys = Vec::with_capacity(1 + alternate_cache_keys.len());
+        cache_keys.push(primary_cache_key);
+        for key in alternate_cache_keys {
+            if !cache_keys.contains(&key) {
+                cache_keys.push(key);
+            }
+        }
+
         Self {
             cache_status,
-            raw_cache_key,
+            cache_keys,
         }
     }
 
     pub(super) fn should_cache_results(&self) -> bool {
         !matches!(self.cache_status, CacheStatus::CacheDisabled)
+    }
+
+    pub(super) fn cache_keys(&self) -> &[RawCacheKey] {
+        &self.cache_keys
     }
 }
 
@@ -189,13 +205,21 @@ impl Query {
         }
         .unwrap_or(sql_raw_cache_key);
 
+        let mut alternate_cache_keys = Vec::new();
+        if let Some(raw_key) = sql_or_client_raw_key {
+            alternate_cache_keys.push(raw_key);
+        }
+        if let Some(raw_key) = plan_raw_cache_key {
+            alternate_cache_keys.push(raw_key);
+        }
+
         let cache_status = Self::should_cache_results(df, &plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(
             Box::new(plan),
             tracker,
-            RequestCacheManager::new(cache_status, request_raw_cache_key),
+            RequestCacheManager::new(cache_status, request_raw_cache_key, alternate_cache_keys),
         ))
     }
 
@@ -223,6 +247,7 @@ impl Query {
         };
 
         let cache_control = request_context.cache_control();
+        let raw_key = key.as_raw_key(cache_provider.hasher());
 
         // Validate that the provided cache key is the correct type for this request
         match (cache_control, &key) {
@@ -231,14 +256,14 @@ impl Query {
                 | CacheControl::MaxStale(CacheKeyType::Default, _)
                 | CacheControl::MinFresh(CacheKeyType::Default, _)
                 | CacheControl::OnlyIfCached(CacheKeyType::Default),
-                CacheKey::LogicalPlan(_),
+                CacheKey::LogicalPlan(_) | CacheKey::Query(_, _),
             )
             | (
                 CacheControl::Cache(CacheKeyType::Raw)
                 | CacheControl::MaxStale(CacheKeyType::Raw, _)
                 | CacheControl::MinFresh(CacheKeyType::Raw, _)
                 | CacheControl::OnlyIfCached(CacheKeyType::Raw),
-                CacheKey::Query(_, _),
+                CacheKey::LogicalPlan(_),
             )
             | (
                 CacheControl::Cache(CacheKeyType::ClientSupplied)
@@ -252,18 +277,18 @@ impl Query {
                     CacheResult::MissOrSkipped,
                     CacheStatus::CacheBypass,
                 )
-                .with_query_tracker(tracker));
+                .with_query_tracker(tracker)
+                .with_raw_key(Some(raw_key)));
             }
             _ => {
                 return Ok(CacheResponse::from(
                     CacheResult::WrongCacheKeyType,
                     CacheStatus::CacheMiss,
                 )
-                .with_query_tracker(tracker));
+                .with_query_tracker(tracker)
+                .with_raw_key(Some(raw_key)));
             }
         }
-
-        let raw_key = key.as_raw_key(cache_provider.hasher());
 
         let cached_result = match cache_provider.get_raw_key(&raw_key).await {
             Ok(Some(result)) => result,
@@ -621,11 +646,11 @@ impl Query {
     pub(super) fn wrap_stream_with_cache(
         df: &DataFusion,
         stream: SendableRecordBatchStream,
-        plan_cache_key: RawCacheKey,
+        cache_keys: &[RawCacheKey],
         datasets: Arc<HashSet<TableReference>>,
     ) -> SendableRecordBatchStream {
         if let Some(cache_provider) = df.results_cache_provider() {
-            to_cached_record_batch_stream(cache_provider, stream, plan_cache_key, datasets)
+            to_cached_record_batch_stream(cache_provider, stream, cache_keys.to_vec(), datasets)
         } else {
             stream
         }
@@ -638,13 +663,17 @@ mod tests {
 
     use std::{sync::Arc, time::Duration};
 
-    use arrow::array::Int64Array;
+    use arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
 
     use futures::TryStreamExt;
 
     use cache::{
         Caching, QueryResultsCacheProvider, SimpleCache, key::CacheKey, result::CacheStatus,
     };
+    use datafusion::datasource::MemTable;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use tokio::runtime::Handle;
 
@@ -709,7 +738,7 @@ mod tests {
         let raw_cache_key =
             CacheKey::Query("test-key", None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
 
-        let manager = RequestCacheManager::new(cache_status, raw_cache_key);
+        let manager = RequestCacheManager::new(cache_status, raw_cache_key, Vec::new());
         assert!(manager.should_cache_results());
     }
 
@@ -1527,6 +1556,85 @@ mod tests {
                         .value(0),
                     3
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_results_cache_serves_stale_when_table_unavailable() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("50ms".to_string()),
+            stale_while_revalidate_ttl: Some("5s".to_string()),
+            ..Default::default()
+        }))
+        .await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("create record batch");
+        let mem_table =
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("create mem table");
+        df.ctx
+            .register_table("swr_table", Arc::new(mem_table))
+            .expect("register mem table");
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
+
+        let query_builder = QueryBuilder::new("SELECT value FROM swr_table", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("collect results");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                let value_array = records[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("must read i64 array");
+                assert_eq!(value_array.value(0), 1);
+            })
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        df.ctx
+            .deregister_table("swr_table")
+            .expect("deregister table to simulate source outage");
+
+        let query_builder = QueryBuilder::new("SELECT value FROM swr_table", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should use stale cache");
+                assert_eq!(result.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("collect cached results");
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].num_rows(), 1);
+                let value_array = records[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("must read i64 array");
+                assert_eq!(value_array.value(0), 1);
             })
             .await;
     }

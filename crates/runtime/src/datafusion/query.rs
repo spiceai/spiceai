@@ -312,6 +312,7 @@ impl Query {
                     let cache_manager = RequestCacheManager::new(
                         CacheStatus::CacheMiss,
                         CacheKey::LogicalPlan(logical_plan).as_raw_key(Query::plan_hasher(&ctx.df)),
+                        Vec::new(),
                     );
                     (logical_plan.clone(), None, cache_manager)
                 }
@@ -423,7 +424,7 @@ impl Query {
                 Self::wrap_stream_with_cache(
                     &ctx.df,
                     res_stream,
-                    cache_manager.raw_cache_key,
+                    cache_manager.cache_keys(),
                     datasets,
                 )
             } else {

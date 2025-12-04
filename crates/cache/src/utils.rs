@@ -33,7 +33,7 @@ use futures::StreamExt;
 pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
-    raw_cache_key: RawCacheKey,
+    raw_cache_keys: Vec<RawCacheKey>,
     input_tables: Arc<HashSet<TableReference>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
@@ -66,8 +66,17 @@ pub fn to_cached_record_batch_stream(
             .await
             {
                 Ok(cached_result) => {
-                    if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                        tracing::error!("Failed to cache query results: {e}");
+                    let mut unique_keys: Vec<RawCacheKey> = Vec::new();
+                    for key in raw_cache_keys {
+                        if !unique_keys.contains(&key) {
+                            unique_keys.push(key);
+                        }
+                    }
+
+                    for raw_cache_key in unique_keys {
+                        if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result.clone()).await {
+                            tracing::error!("Failed to cache query results: {e}");
+                        }
                     }
                 }
                 Err(e) => {
