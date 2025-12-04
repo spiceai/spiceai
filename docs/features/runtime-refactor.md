@@ -102,6 +102,8 @@
 ### Phase 2 Progress
 - [x] Scaffolding created (`crates/runtime-interfaces` added to workspace, placeholder lib with 2025 header).
 - [x] Began wiring shared types: `runtime-interfaces` re-exports `ParameterSpec`/`Parameters` from `runtime-parameters`.
+- [x] Added minimal metrics trait shard (`MetricsProvider`, `MetricSpec`, `MetricType`) to `runtime-interfaces`.
+- [x] Added dataset/accelerated/federated info façade traits in `runtime-interfaces`.
 - [ ] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
 - [ ] Wire `runtime` to use/re-export interfaces.
 - [ ] Add distributed-slice smoke test to validate cross-crate registration.

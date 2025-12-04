@@ -19,6 +19,7 @@ limitations under the License.
 //! This crate will host traits, macros, and types that allow the runtime to
 //! depend only on shared interfaces rather than concrete implementations.
 
+pub mod datasets;
 pub mod metrics;
 
 pub use runtime_parameters::{ParameterSpec, Parameters};
