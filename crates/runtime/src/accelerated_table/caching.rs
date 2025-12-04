@@ -604,6 +604,7 @@ impl CacheRefreshHelper {
         fallback_schema: SchemaRef,
         is_rotten: bool,
         accelerator_mutex: Arc<Mutex<()>>,
+        cached_batches: Option<Vec<RecordBatch>>,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
             Ok(batches) if !batches.is_empty() => {
@@ -668,11 +669,27 @@ impl CacheRefreshHelper {
                     dataset_name,
                     e
                 );
-                let error_stream = RecordBatchStreamAdapter::new(
-                    fallback_schema,
-                    futures::stream::once(async move { Err(e) }),
-                );
-                Box::pin(error_stream)
+
+                match cached_batches {
+                    Some(rotten_batches) if is_rotten && !rotten_batches.is_empty() => {
+                        tracing::warn!(
+                            "Serving rotten data for dataset {dataset_name}, errored during refresh: {e}"
+                        );
+                        let schema = rotten_batches[0].schema();
+                        let adapter = RecordBatchStreamAdapter::new(
+                            schema,
+                            futures::stream::iter(rotten_batches.into_iter().map(Ok)),
+                        );
+                        Box::pin(adapter)
+                    }
+                    _ => {
+                        let error_stream = RecordBatchStreamAdapter::new(
+                            fallback_schema,
+                            futures::stream::once(async move { Err(e) }),
+                        );
+                        Box::pin(error_stream)
+                    }
+                }
             }
         }
     }
@@ -977,6 +994,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             Arc::clone(&schema_clone),
                             true, // is_rotten = true, will upsert
                             Arc::clone(&accelerator_mutex),
+                            Some(cached_batches),
                         )
                         .await;
                     }
@@ -1008,6 +1026,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     Arc::clone(&schema_clone),
                     false, // is_rotten = false, will insert (append)
                     accelerator_mutex,
+                    None
                 )
                 .await
             }
