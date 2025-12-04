@@ -16,8 +16,8 @@ limitations under the License.
 
 use std::any::Any;
 
-use arrow_schema::SchemaRef;
-use datafusion::sql::TableReference;
+pub use arrow_schema::SchemaRef;
+pub use datafusion::sql::TableReference;
 
 /// Minimal dataset view for connector/accelerator interfaces.
 pub trait DatasetInfo: Send + Sync {
