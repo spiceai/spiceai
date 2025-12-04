@@ -104,6 +104,13 @@
 - [ ] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
 - [ ] Wire `runtime` to use/re-export interfaces.
 - [ ] Add distributed-slice smoke test to validate cross-crate registration.
+- [ ] Define façade traits/structs needed to avoid pulling runtime types (`Dataset`, `AcceleratedTable`, `FederatedTable`, `MetricsProvider`, `AccelerationSource`).
+
+### Next extraction tasks
+- Draft dataset/acceleration/metrics façade traits with minimal methods used by interfaces; map each to existing runtime types to ensure compatibility.
+- Decide whether to re-export `runtime-parameters` types (`ParameterSpec`, `Parameters`) directly vs. wrap them to reduce dependency churn.
+- Prototype `dataconnector` and `dataaccelerator` modules in `runtime-interfaces` containing registration structs/macros referencing façade traits.
+- Plan runtime re-exports: introduce a shim module in `runtime` that re-exports `runtime-interfaces` types/macros to minimize callsite churn during transition.
 
 ### Interface Dependency Breakdown (for extraction)
 - **DataConnector interface** needs: `ParameterSpec`/`Parameters` (runtime-parameters), `Dataset` (runtime component), `FederatedTable`/`AcceleratedTable` (runtime), `RefreshMode`, `MetricsProvider` (runtime component metrics), `ChangesStream` (data_components), `TableProvider`/`SchemaRef`/DataFusion types, `Parameters::try_new` for metadata provider hooks. Likely requires façade traits for dataset/table abstractions or moving small structs alongside the interface.
