@@ -51,7 +51,10 @@
 - High-risk / likely to defer (runtime downcasts or tight coupling): accelerators using path helpers (`duckdb`, `sqlite`, `turso`), snapshot logic, or any connector/accelerator with runtime-specific types in signatures.
 
 ## Phase 1 Inventory (working list)
-- **Traits/macros to extract**: `DataConnectorFactory`, `DataConnector`, `DataAccelerator`, registration macros (`register_data_connector!`, `register_data_accelerator!`), distributed slice statics, `ParameterSpec`/`Parameters` structs used in connector/accelerator signatures, `AccelerationSource` interfaces, metrics hooks used by connectors.
+- **Traits/macros to extract**:
+  - Connectors: `DataConnectorFactory`, `DataConnector`, `register_data_connector!`, distributed slice static.
+  - Accelerators: `DataAccelerator`, `register_data_accelerator!`, distributed slice static, `AccelerationSource` (or a slimmer subset).
+  - Shared config: `ParameterSpec`, `Parameters` (public-facing parts only), any metrics/provider traits consumed by connectors/accelerators.
 - **Dependencies to minimize**: `datafusion`/`arrow` types exposed in trait signatures; `secrecy` wrappers; `linkme`; `async_trait`; `snafu` for error types; parameter parsing utilities; `runtime`-specific helpers (secrets, base paths, metrics).
 - **Known runtime downcasts (likely blockers)**:
   - Connectors: `dynamodb` (downcasts to `DynamoDBTableProvider`), `debezium` (downcasts to `DebeziumKafka`), `kafka` (downcasts to `data_components::kafka::Kafka`), `listing` (downcasts to `dataconnector::s3::S3`), `spiceai` (downcasts to `FederatedTableProviderAdaptor`/`FlightTable` and error types), `github` (downcasts to `StructArray`), `postgres`/`mysql` (error downcasts to `dbconnection::Error`).
@@ -63,6 +66,10 @@
   - Map connector parameter plumbing: `ConnectorParams`/builder rely on `runtime`-local registries, secrets, app/runtime handles, and `Parameters`; likely keep builder/validation in `runtime` and expose only the consumable `Parameters`/`ParameterSpec` types from `runtime-interfaces`.
   - Catalog which helper modules (e.g., `runtime_secrets`, base path helpers, metrics providers) are referenced directly by connectors/accelerators and may need small façade traits to avoid pulling full crates into `runtime-interfaces`.
   - Document interface dependencies to lift: `AccelerationSource` depends on `app::App` and `Runtime` for `app()`/`runtime()`—may need to expose thin traits (e.g., `HasApp`, `HasRuntimeHandles`) or keep `AccelerationSource` in runtime and add a connector-facing subset for file path resolution.
+  - Sketch `runtime-interfaces` dependency/feature matrix:
+    - Hard deps: `async_trait`, `linkme`, `snafu`, `tracing`? (if kept in signatures), minimal `datafusion`/`arrow` types used in trait methods, `secrecy` for secrets in parameters.
+    - Optional features mirroring connectors/accelerators: `duckdb`, `sqlite`, `postgres`, `turso`, `kafka`, `debezium`, `dynamodb`, `odbc`, etc., only when trait signatures or enums need them.
+    - Avoid pulling `app`, `runtime`, `runtime_secrets` into the new crate; provide trait abstractions instead.
 
 ## Progress Log
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
