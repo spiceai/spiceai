@@ -81,6 +81,7 @@
   - Proposed shims:
     - Re-export only the minimal `datafusion` types needed in signatures from `runtime-interfaces` to avoid a broad dependency surface.
     - Define lightweight newtypes/traits for `TableProvider`/`CreateExternalTable` if we want to decouple future signatures (optional; defer if too invasive for initial extraction).
+    - Consider a tiny `interfaces-metrics` submodule/crate if metrics types become noisy; otherwise keep a small traits module in `runtime-interfaces`.
 
 ## Progress Log
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
