@@ -101,14 +101,15 @@ jobs:
         run: |
           update_mode="${{ github.event.inputs.update_snapshots }}"
           if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
-            if [[ "${GITHUB_REF_NAME}" == release/* ]]; then
+            branch_name="${{ github.ref_name }}"
+            if [[ "${branch_name}" == "release/"* ]]; then
               update_mode="no"
             else
               update_mode="always"
             fi
           fi
 
-          echo "Using update_snapshots=${update_mode}"
+          echo "Using update_snapshots=${update_mode}" >&2
           echo "update_snapshots=${update_mode}" >> "${GITHUB_OUTPUT}"
 
       - name: Set spicepod path
