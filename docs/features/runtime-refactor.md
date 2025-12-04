@@ -104,6 +104,12 @@
 - [ ] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
 - [ ] Wire `runtime` to use/re-export interfaces.
 - [ ] Add distributed-slice smoke test to validate cross-crate registration.
+
+### Interface Dependency Breakdown (for extraction)
+- **DataConnector interface** needs: `ParameterSpec`/`Parameters` (runtime-parameters), `Dataset` (runtime component), `FederatedTable`/`AcceleratedTable` (runtime), `RefreshMode`, `MetricsProvider` (runtime component metrics), `ChangesStream` (data_components), `TableProvider`/`SchemaRef`/DataFusion types, `Parameters::try_new` for metadata provider hooks. Likely requires façade traits for dataset/table abstractions or moving small structs alongside the interface.
+- **DataAccelerator interface** needs: `Acceleration`/`Engine`/`Mode`/`IndexType`/`OnConflict`/`Constraints` (runtime dataaccelerator + DataFusion), `AccelerationSource` (currently tied to `app::App`/`Runtime`), `Parameters`/`ParameterSpec`, `TableProvider`, `PartitionedBy` (runtime-table-partition), `CreateExternalTable`.
+- **Registration macros**: `linkme`, `paste`, `macro_export` adjustments to point at `runtime-interfaces`.
+- **Support crates to factor**: small metrics trait shard, lightweight `AccelerationSource` core, dataset/file-path helpers, and any secret/parameter builder facades to avoid depending on `runtime` or `runtime_secrets` from interfaces.
 - **Initial `runtime-interfaces` crate sketch**
   - `Cargo.toml`:
     - Package: `runtime-interfaces`, edition 2024, Apache 2.0, workspace member.
