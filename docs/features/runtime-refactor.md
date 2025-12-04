@@ -89,3 +89,17 @@
 - [x] 2025-12-04: Draft `runtime-interfaces` dependency/feature matrix and façade trait plan.
 - [x] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
 - [ ] 2025-12-04: Draft initial `runtime-interfaces` Cargo layout (deps/features list, license header pattern, macro exports plan).
+- **Initial `runtime-interfaces` crate sketch**
+  - `Cargo.toml`:
+    - Package: `runtime-interfaces`, edition 2024, Apache 2.0, workspace member.
+    - Deps (base): `async-trait`, `linkme`, `snafu`, `tracing` (if any logging remains in traits; otherwise avoid), `secrecy`, `datafusion` (minimal features), `arrow` (for `SchemaRef`), `runtime-datafusion`? (avoid; prefer direct `datafusion`), `paste` (for macros), `serde` (derive?) only if existing traits need it.
+    - Features: pass-through for connector/accelerator-specific optional deps (mirroring runtime features) but keep the crate minimal—only add when signatures require the types.
+    - Dev-deps: tiny smoke test for distributed slice registration.
+  - Layout:
+    - `src/dataconnector.rs`: traits + `register_data_connector!` + distributed slice static.
+    - `src/dataaccelerator.rs`: traits + `register_data_accelerator!` + distributed slice static + `AccelerationSource` (or core subset) + builder types if moved.
+    - `src/parameters.rs`: `ParameterSpec`, `Parameters` (public-facing), maybe a metrics shim module.
+    - `src/metrics.rs`: small trait surface if needed.
+    - `src/lib.rs`: re-exports, feature gating, macro exports (`#[macro_export]`).
+  - License headers: include 2025 Apache header consistent with project requirements.
+  - Macro exports: keep `#[macro_export]` for register macros; ensure paths reference `crate::` so downstream crates can use them after move.
