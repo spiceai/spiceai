@@ -13,14 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::Error;
 use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::{ApiShard, SDKClient};
+use aws_sdk_dynamodbstreams::primitives::DateTime;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use aws_sdk_dynamodbstreams::primitives::DateTime;
-use crate::Error;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ActiveShard {
@@ -73,9 +73,7 @@ pub struct ShardPollResult {
 }
 
 pub enum PollOutcome {
-    Records {
-        records: Vec<Record>,
-    },
+    Records { records: Vec<Record> },
     Empty,
     Failed,
 }
@@ -106,45 +104,45 @@ impl StreamState {
         let mut current_last_produced_at = shard.last_produced_at;
         let mut current_watermark = shard.current_watermark;
 
-        // Update checkpoint and watermark first if possible
-        if !records.is_empty() {
-            if let Some(shard) = self.active.get_mut(shard_id) {
-                shard.update_produced_at();
-                current_last_produced_at = shard.last_produced_at;
+        // First update watermark and checkpoint if possible
+        if !records.is_empty()
+            && let Some(shard) = self.active.get_mut(shard_id)
+        {
+            shard.update_produced_at();
+            current_last_produced_at = shard.last_produced_at;
 
-                // Update watermark
-                let max_event_time = records
-                    .iter()
-                    .filter_map(|r| r.dynamodb.as_ref()?.approximate_creation_date_time)
-                    .max()
-                    .map(datetime_to_system_time);
+            // Update watermark
+            let max_event_time = records
+                .iter()
+                .filter_map(|r| r.dynamodb.as_ref()?.approximate_creation_date_time)
+                .max()
+                .map(datetime_to_system_time);
 
-                if let Some(event_time) = max_event_time {
-                    shard.update_watermark(event_time);
-                    current_watermark = shard.current_watermark;
-                }
+            if let Some(event_time) = max_event_time {
+                shard.update_watermark(event_time);
+                current_watermark = shard.current_watermark;
+            }
 
-                // Update checkpoint
-                let sequence_number = records
-                    .last()
-                    .and_then(|r| r.dynamodb.as_ref())
-                    .and_then(|db| db.sequence_number.clone());
+            // Update checkpoint
+            let sequence_number = records
+                .last()
+                .and_then(|r| r.dynamodb.as_ref())
+                .and_then(|db| db.sequence_number.clone());
 
-                if let Some(seq) = sequence_number {
-                    let checkpoint = ShardCheckpoint {
-                        sequence_number: seq,
-                        parent_id: shard.parent_shard_id.clone(),
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    };
-                    shard.update_checkpoint(checkpoint.clone());
-                    current_checkpoint = checkpoint;
-                } else {
-                    tracing::warn!(
-                        "Missing sequence number for shard {}, keeping previous checkpoint",
-                        shard_id
-                    );
-                }
+            if let Some(seq) = sequence_number {
+                let checkpoint = ShardCheckpoint {
+                    sequence_number: seq,
+                    parent_id: shard.parent_shard_id.clone(),
+                    updated_at: SystemTime::now(),
+                    position: CheckpointPosition::After,
+                };
+                shard.update_checkpoint(checkpoint.clone());
+                current_checkpoint = checkpoint;
+            } else {
+                tracing::warn!(
+                    "Missing sequence number for shard {}, keeping previous checkpoint",
+                    shard_id
+                );
             }
         }
 
@@ -173,11 +171,7 @@ impl StreamState {
         })
     }
 
-    pub fn handle_poll_error(
-        &mut self,
-        shard_id: &str,
-        error: Error,
-    ) -> Option<ShardPollResult> {
+    pub fn handle_poll_error(&mut self, shard_id: &str, error: &Error) -> Option<ShardPollResult> {
         tracing::error!("Poll error for shard {}: {}", shard_id, error);
 
         let shard = self.active.get(shard_id)?;
@@ -195,7 +189,10 @@ impl StreamState {
             || error.to_string().contains("TrimmedDataAccess");
 
         if is_expired_iterator {
-            tracing::warn!("Iterator expired for shard {}, marking for reinitialization", shard_id);
+            tracing::warn!(
+                "Iterator expired for shard {}, marking for reinitialization",
+                shard_id
+            );
             self.reinitialize_shard(shard_id);
         }
 
@@ -411,10 +408,11 @@ async fn start_children_from_trim_horizon(
 pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
     let secs = dt.secs();
     let subsec_nanos = dt.subsec_nanos();
-    UNIX_EPOCH + Duration::new(secs as u64, subsec_nanos)
+    UNIX_EPOCH + Duration::new(secs.try_into().unwrap_or(0), subsec_nanos)
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use aws_sdk_dynamodbstreams::types::StreamRecord;
@@ -723,7 +721,10 @@ mod tests {
                 panic!("Expected PollOutcome::Records");
             }
             assert_eq!(result.last_checkpoint.sequence_number, "102");
-            assert_eq!(result.last_checkpoint.parent_id, Some("parent-1".to_string()));
+            assert_eq!(
+                result.last_checkpoint.parent_id,
+                Some("parent-1".to_string())
+            );
             assert_eq!(result.last_checkpoint.position, CheckpointPosition::After);
 
             // Verify complete state
@@ -1065,7 +1066,10 @@ mod tests {
             assert_eq!(shard.parent_shard_id, Some("parent-1".to_string()));
             assert_eq!(shard.iterator, "new-iter");
             assert_eq!(shard.last_checkpoint.sequence_number, "100");
-            assert_eq!(shard.last_checkpoint.parent_id, Some("parent-1".to_string()));
+            assert_eq!(
+                shard.last_checkpoint.parent_id,
+                Some("parent-1".to_string())
+            );
             assert_eq!(shard.last_checkpoint.position, CheckpointPosition::After);
             assert!(shard.last_produced_at.is_some());
             assert_eq!(
@@ -1077,9 +1081,12 @@ mod tests {
         // Helper function to create record with timestamp
         fn create_record_with_timestamp(seq: &str, timestamp: DateTime) -> Record {
             Record::builder()
-                .dynamodb(StreamRecord::builder()
-                    .sequence_number(seq.to_string())
-                    .approximate_creation_date_time(timestamp).build())
+                .dynamodb(
+                    StreamRecord::builder()
+                        .sequence_number(seq.to_string())
+                        .approximate_creation_date_time(timestamp)
+                        .build(),
+                )
                 .build()
         }
     }

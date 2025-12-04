@@ -27,14 +27,14 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use dynamodb_streams::checkpoint::Checkpoint;
 use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use std::time::{Duration, SystemTime};
-use datafusion::sql::TableReference;
+use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use util::time_format::is_valid_format;
 
 #[derive(Debug)]
@@ -258,7 +258,7 @@ impl DataConnector for DynamoDB {
                     .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
-                let acceptable_lag = acceptable_lag.clone();
+                let acceptable_lag = acceptable_lag;
                 let dataset_name = dataset.name.clone();
                 let dataset_name_2 = dataset_name.clone();
                 let dataset_name_3 = dataset_name.clone();
@@ -371,7 +371,10 @@ async fn load_or_initialize_checkpoint(
             }
         }
     } else {
-        tracing::info!("No existing checkpoint found, starting from bootstrap: table_name={}", dataset_name);
+        tracing::info!(
+            "No existing checkpoint found, starting from bootstrap: table_name={}",
+            dataset_name
+        );
         get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
     }
 }
@@ -400,7 +403,10 @@ async fn changes_stream_from_checkpoint(
     // If this is an initial checkpoint(from_bootstrap=true), commit it immediately.
     // This checkpoint is inclusive and in case of failure stream will restart from the current position, not next.
     if from_bootstrap {
-        tracing::debug!("Committing bootstrap checkpoint: table_name={}", dataset_name);
+        tracing::debug!(
+            "Committing bootstrap checkpoint: table_name={}",
+            dataset_name
+        );
         let committer = DynamoDBStreamCommitter::new(Arc::clone(&dynamodb_sys), checkpoint.clone());
         if let Err(err) = committer.commit() {
             tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
@@ -420,19 +426,16 @@ async fn changes_stream_from_checkpoint(
                 .map(move |msg| {
                     msg.map(|(change_batch, checkpoint, watermark)| {
                         let lag = watermark
-                            .map(|v| SystemTime::now().duration_since(v).ok())
-                            .flatten();
+                            .and_then(|v| SystemTime::now().duration_since(v).ok());
 
                         // TODO: should be trace
                         tracing::info!(
                             "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, records={}",
                             dataset_name,
                             watermark
-                                .map(|w| humantime::format_rfc3339(w).to_string())
-                                .unwrap_or_else(|| "-".to_string()),
+                                .map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),
                             lag
-                                .map(|l| humantime::format_duration(l).to_string())
-                                .unwrap_or_else(|| "-".to_string()),
+                                .map_or_else(|| "-".to_string(), |l| humantime::format_duration(l).to_string()),
                             change_batch.record.num_rows(),
                         );
 
@@ -442,7 +445,7 @@ async fn changes_stream_from_checkpoint(
                                 checkpoint,
                             )),
                             change_batch,
-                            lag.map_or(false, |l| l < acceptable_lag),
+                            lag.is_some_and(|l| l < acceptable_lag),
                         )
                     })
                 })

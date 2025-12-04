@@ -56,7 +56,11 @@ pub async fn index_change_envelope(
     let new_change_batch = replace_change_batch_data(&batches[0], &batch)
         .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-    Ok(ChangeEnvelope::new(change_committer, new_change_batch, is_dataset_ready))
+    Ok(ChangeEnvelope::new(
+        change_committer,
+        new_change_batch,
+        is_dataset_ready,
+    ))
 }
 
 #[cfg(test)]

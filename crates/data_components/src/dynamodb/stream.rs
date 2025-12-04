@@ -297,6 +297,7 @@ mod tests {
             checkpoint: Checkpoint {
                 shards: HashMap::default(),
             },
+            watermark: None,
         })
     }
 
@@ -329,7 +330,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -365,7 +367,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -397,7 +400,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -422,7 +426,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Empty batch should produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -464,7 +469,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Should have 3 rows
             assert_eq!(change_batch.record.num_rows(), 3);
@@ -530,7 +536,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify we can extract primary keys (should be empty)
             let pks = change_batch.primary_keys(0);
@@ -553,7 +560,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -579,7 +587,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -605,7 +614,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
             assert_eq!(change_batch.record.num_rows(), 0);
@@ -637,7 +647,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify primary keys
             let pks = change_batch.primary_keys(0);
@@ -674,7 +685,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Should only process the valid record
             assert_eq!(change_batch.record.num_rows(), 1);
@@ -706,7 +718,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify primary keys can be extracted
             let extracted_pks = change_batch.primary_keys(0);
@@ -739,7 +752,8 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
 
             // Verify data can be extracted
             let data_batch = change_batch.data(0);
