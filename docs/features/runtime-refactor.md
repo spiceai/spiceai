@@ -54,7 +54,7 @@
 - **Traits/macros to extract**:
   - Connectors: `DataConnectorFactory`, `DataConnector`, `register_data_connector!`, distributed slice static.
   - Accelerators: `DataAccelerator`, `register_data_accelerator!`, distributed slice static, `AccelerationSource` (or a slimmer subset).
-  - Shared config: `ParameterSpec`, `Parameters` (public-facing parts only), any metrics/provider traits consumed by connectors/accelerators.
+  - Shared config: `ParameterSpec`, `Parameters` (public-facing parts only), any metrics/provider traits consumed by connectors/accelerators (may need a thin `MetricsProvider` trait shard to avoid pulling full runtime metrics module).
 - **Dependencies to minimize**: `datafusion`/`arrow` types exposed in trait signatures; `secrecy` wrappers; `linkme`; `async_trait`; `snafu` for error types; parameter parsing utilities; `runtime`-specific helpers (secrets, base paths, metrics).
 - **Known runtime downcasts (likely blockers)**:
   - Connectors: `dynamodb` (downcasts to `DynamoDBTableProvider`), `debezium` (downcasts to `DebeziumKafka`), `kafka` (downcasts to `data_components::kafka::Kafka`), `listing` (downcasts to `dataconnector::s3::S3`), `spiceai` (downcasts to `FederatedTableProviderAdaptor`/`FlightTable` and error types), `github` (downcasts to `StructArray`), `postgres`/`mysql` (error downcasts to `dbconnection::Error`).
