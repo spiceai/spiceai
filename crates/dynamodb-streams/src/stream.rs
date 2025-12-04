@@ -80,20 +80,13 @@ impl DynamodbStreamProducer {
                 Ok((next_iter, records)) => {
                     match self.state.handle_poll_result(&shard_id, next_iter, records) {
                         Some(result) => result,
-                        None => {
-                            return Err(Error::UnexpectedShardId {shard_id})
-                        },
+                        None => return Err(Error::UnexpectedShardId { shard_id }),
                     }
                 }
-                Err(e) => {
-                    match self.state.handle_poll_error(&shard_id, e) {
-                        Some(result) => result,
-                        None => {
-                            return Err(Error::UnexpectedShardId {shard_id})
-                        },
-                    }
-
-                }
+                Err(e) => match self.state.handle_poll_error(&shard_id, &e) {
+                    Some(result) => result,
+                    None => return Err(Error::UnexpectedShardId { shard_id }),
+                },
             };
             poll_results.push(poll_result);
         }
@@ -103,7 +96,7 @@ impl DynamodbStreamProducer {
             self.state.add_discovered(shards);
         }
 
-        Ok(combine_shard_batches(poll_results, self.idle_timeout))
+        Ok(combine_shard_batches(&poll_results, self.idle_timeout))
     }
 
     async fn initialize_shards_iterators(&mut self) {
@@ -170,7 +163,7 @@ impl DynamodbStreamProducer {
 }
 
 fn combine_shard_batches(
-    poll_results: Vec<ShardPollResult>,
+    poll_results: &[ShardPollResult],
     idle_timeout: Option<Duration>,
 ) -> DynamoDBStreamBatch {
     let now = SystemTime::now();
@@ -180,14 +173,20 @@ fn combine_shard_batches(
     let mut shard_watermarks = Vec::new();
     let mut shards_checkpoints = HashMap::new();
 
-    for shard_result in &poll_results {
+    for shard_result in poll_results {
         // Collect records
-        if let PollOutcome::Records { records: shard_records } = &shard_result.outcome {
+        if let PollOutcome::Records {
+            records: shard_records,
+        } = &shard_result.outcome
+        {
             records.extend(shard_records.clone());
         }
 
         // Collect checkpoints
-        shards_checkpoints.insert(shard_result.shard_id.clone(), shard_result.last_checkpoint.clone());
+        shards_checkpoints.insert(
+            shard_result.shard_id.clone(),
+            shard_result.last_checkpoint.clone(),
+        );
 
         // Check eligibility for watermark
         let is_eligible = match shard_result.outcome {
@@ -196,48 +195,45 @@ fn combine_shard_batches(
 
             // Shards that produced no records are NOT eligible if they have been idle for longer than the idle_timeout
             PollOutcome::Empty => {
-                match shard_result.last_produced_at {
-                    Some(last_produced_at) => {
-                        match idle_timeout {
-                            Some(timeout) => {
-                                let elapsed = now.duration_since(last_produced_at).unwrap_or(Duration::ZERO);
-                                let is_idle = shard_result.outcome.is_empty() && elapsed > timeout;
+                if let Some(last_produced_at) = shard_result.last_produced_at {
+                    match idle_timeout {
+                        Some(timeout) => {
+                            let elapsed = now
+                                .duration_since(last_produced_at)
+                                .unwrap_or(Duration::ZERO);
+                            let is_idle = shard_result.outcome.is_empty() && elapsed > timeout;
 
-                                if is_idle {
-                                    tracing::debug!(
-                                        "Shard {} excluded from watermark (idle for {:?}, timeout: {:?})",
-                                        shard_result.shard_id,
-                                        elapsed,
-                                        timeout
-                                    );
-                                }
-
-                                !is_idle
+                            if is_idle {
+                                tracing::debug!(
+                                    "Shard {} excluded from watermark (idle for {:?}, timeout: {:?})",
+                                    shard_result.shard_id,
+                                    elapsed,
+                                    timeout
+                                );
                             }
-                            None => true,
+
+                            !is_idle
                         }
+                        None => true,
                     }
-                    None => {
-                        tracing::debug!(
+                } else {
+                    tracing::debug!(
                         "Shard {} excluded from watermark (never produced records)",
                         shard_result.shard_id
                     );
-                        false
-                    }
+                    false
                 }
             }
         };
 
         // If eligible, include its current_watermark
-        if is_eligible {
-            if let Some(watermark) = shard_result.current_watermark {
-                tracing::debug!(
-                    "Shard {} included in watermark: {:?}",
-                    shard_result.shard_id,
-                    watermark
-                );
-                shard_watermarks.push(watermark);
-            }
+        if is_eligible && let Some(watermark) = shard_result.current_watermark {
+            tracing::debug!(
+                "Shard {} included in watermark: {:?}",
+                shard_result.shard_id,
+                watermark
+            );
+            shard_watermarks.push(watermark);
         }
     }
 

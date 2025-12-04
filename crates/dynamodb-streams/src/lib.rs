@@ -23,7 +23,7 @@ mod stream_state;
 
 pub use checkpoint::Checkpoint;
 pub use client::Client;
-pub use stream::{DynamodbStream, DynamoDBStreamBatch};
+pub use stream::{DynamoDBStreamBatch, DynamodbStream};
 
 pub type StreamResult = Result<DynamoDBStreamBatch, Error>;
 

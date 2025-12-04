@@ -64,7 +64,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
@@ -268,8 +267,12 @@ impl DynamoDBTableProvider {
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: Checkpoint,
-    ) -> Result<BoxStream<'static, Result<(ChangeBatch, Checkpoint, Option<SystemTime>), crate::cdc::StreamError>>>
-    {
+    ) -> Result<
+        BoxStream<
+            'static,
+            Result<(ChangeBatch, Checkpoint, Option<SystemTime>), crate::cdc::StreamError>,
+        >,
+    > {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
