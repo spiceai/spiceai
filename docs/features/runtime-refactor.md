@@ -70,7 +70,12 @@
     - Hard deps: `async_trait`, `linkme`, `snafu`, `tracing`? (if kept in signatures), minimal `datafusion`/`arrow` types used in trait methods, `secrecy` for secrets in parameters.
     - Optional features mirroring connectors/accelerators: `duckdb`, `sqlite`, `postgres`, `turso`, `kafka`, `debezium`, `dynamodb`, `odbc`, etc., only when trait signatures or enums need them.
     - Avoid pulling `app`, `runtime`, `runtime_secrets` into the new crate; provide trait abstractions instead.
+  - Outline façade traits to reduce coupling:
+    - Metrics: small trait surface (e.g., `MetricSpec`, `MetricType`, `MetricsProvider`, `ObserveMetricCallback`) to live in `runtime-interfaces` or a new tiny metrics crate.
+    - Acceleration: split `AccelerationSource` into a core trait (names, acceleration config, optional file path hint) that does not expose `app()`/`runtime()`; keep runtime-specific accessors behind a separate runtime-only trait.
+    - Secrets/params: keep `Parameters`/`ParameterSpec` data-only; builders/secret resolution stay in runtime.
 
 ## Progress Log
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
-- [ ] 2025-12-04: Phase 1 inventory started (downcasts cataloged; dependency minimization goals captured).
+- [x] 2025-12-04: Phase 1 inventory started (downcasts cataloged; dependency minimization goals captured).
+- [ ] 2025-12-04: Draft `runtime-interfaces` dependency/feature matrix and façade trait plan.
