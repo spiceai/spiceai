@@ -77,6 +77,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::{
@@ -87,7 +88,6 @@ use tokio::{
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
-use std::pin::Pin;
 
 mod changes;
 
