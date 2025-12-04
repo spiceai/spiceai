@@ -90,6 +90,7 @@
 - [x] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
 - [x] 2025-12-04: Draft initial `runtime-interfaces` Cargo layout (deps/features list, license header pattern, macro exports plan).
 - [x] 2025-12-04: Phase 2 kickoff checklist written (concrete steps to create crate and re-export in runtime).
+- [ ] 2025-12-04: Phase 2 scaffolding started (create `runtime-interfaces` crate, add to workspace, placeholder lib).
 
 ### Phase 2 Kickoff Checklist (planned)
 - [ ] Create `crates/runtime-interfaces` scaffolding (Cargo.toml, lib.rs, modules, license headers).

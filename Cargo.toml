@@ -20,6 +20,7 @@ members = [
     "crates/ns_lookup",
     "crates/otel-arrow",
     "crates/cayenne",
+    "crates/runtime-interfaces",
     "crates/runtime-object-store",
     "crates/package",
     "crates/runtime",
