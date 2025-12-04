@@ -86,4 +86,5 @@
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
 - [x] 2025-12-04: Phase 1 inventory started (downcasts cataloged; dependency minimization goals captured).
 - [x] 2025-12-04: Draft `runtime-interfaces` dependency/feature matrix and façade trait plan.
-- [ ] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
+- [x] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
+- [ ] 2025-12-04: Draft initial `runtime-interfaces` Cargo layout (deps/features list, license header pattern, macro exports plan).
