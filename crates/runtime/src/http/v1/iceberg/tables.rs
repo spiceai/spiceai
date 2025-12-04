@@ -39,6 +39,7 @@ use serde::{Serialize, Serializer};
 use uuid::Uuid;
 
 const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+const MAX_SCHEMA_RECURSION_DEPTH: usize = 10;
 
 /// Check if a table exists.
 ///
@@ -219,19 +220,41 @@ fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference>
     Some(TableReference::full(catalog, schema, table))
 }
 
+struct DepthExceeded;
+
 /// Iceberg requires field IDs to be set for all fields, including nested fields in Struct, List, and Map types.
 /// The iceberg-rust crate expects them to be set in the `PARQUET:field_id` metadata key.
 fn assign_field_ids(schema: &ArrowSchema) -> ArrowSchema {
+    if let Ok(new_schema) = try_assign_field_ids(schema) {
+        new_schema
+    } else {
+        tracing::warn!(
+            "Schema recursion depth limit ({MAX_SCHEMA_RECURSION_DEPTH}) exceeded, returning original schema"
+        );
+        schema.clone()
+    }
+}
+
+fn try_assign_field_ids(schema: &ArrowSchema) -> Result<ArrowSchema, DepthExceeded> {
     let mut counter: i32 = 0;
     let fields: Vec<Arc<Field>> = schema
         .fields
         .iter()
-        .map(|f| Arc::new(assign_field_id_recursive(f, &mut counter)))
-        .collect();
-    ArrowSchema::new(fields)
+        .map(|f| Ok(Arc::new(assign_field_id_recursive(f, &mut counter, 0)?)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ArrowSchema::new(fields))
 }
 
-fn assign_field_id_recursive(field: &Field, counter: &mut i32) -> Field {
+fn assign_field_id_recursive(
+    field: &Field,
+    counter: &mut i32,
+    depth: usize,
+) -> Result<Field, DepthExceeded> {
+    if depth > MAX_SCHEMA_RECURSION_DEPTH {
+        return Err(DepthExceeded);
+    }
+
     let id = *counter;
     *counter += 1;
 
@@ -239,22 +262,28 @@ fn assign_field_id_recursive(field: &Field, counter: &mut i32) -> Field {
         DataType::Struct(fields) => {
             let new_fields: Vec<Arc<Field>> = fields
                 .iter()
-                .map(|f| Arc::new(assign_field_id_recursive(f, counter)))
-                .collect();
+                .map(|f| Ok(Arc::new(assign_field_id_recursive(f, counter, depth + 1)?)))
+                .collect::<Result<Vec<_>, _>>()?;
             DataType::Struct(Fields::from(new_fields))
         }
-        DataType::List(element_field) => {
-            DataType::List(Arc::new(assign_field_id_recursive(element_field, counter)))
-        }
-        DataType::LargeList(element_field) => {
-            DataType::LargeList(Arc::new(assign_field_id_recursive(element_field, counter)))
-        }
+        DataType::List(element_field) => DataType::List(Arc::new(assign_field_id_recursive(
+            element_field,
+            counter,
+            depth + 1,
+        )?)),
+        DataType::LargeList(element_field) => DataType::LargeList(Arc::new(
+            assign_field_id_recursive(element_field, counter, depth + 1)?,
+        )),
         DataType::FixedSizeList(element_field, size) => DataType::FixedSizeList(
-            Arc::new(assign_field_id_recursive(element_field, counter)),
+            Arc::new(assign_field_id_recursive(
+                element_field,
+                counter,
+                depth + 1,
+            )?),
             *size,
         ),
         DataType::Map(struct_field, keys_sorted) => DataType::Map(
-            Arc::new(assign_field_id_recursive(struct_field, counter)),
+            Arc::new(assign_field_id_recursive(struct_field, counter, depth + 1)?),
             *keys_sorted,
         ),
         other => other.clone(),
@@ -264,7 +293,7 @@ fn assign_field_id_recursive(field: &Field, counter: &mut i32) -> Field {
     let mut metadata = field.metadata().clone();
     metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
 
-    Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(metadata)
+    Ok(Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(metadata))
 }
 
 #[cfg(test)]
@@ -279,6 +308,18 @@ mod tests {
             .metadata()
             .get(PARQUET_FIELD_ID_META_KEY)
             .and_then(|v| v.parse().ok())
+    }
+
+    fn create_nested_schema(depth: usize) -> ArrowSchema {
+        let mut current_type = DataType::Int32;
+        for i in (0..depth).rev() {
+            current_type = DataType::Struct(Fields::from(vec![Field::new(
+                format!("level_{i}"),
+                current_type,
+                false,
+            )]));
+        }
+        ArrowSchema::new(vec![Field::new("root", current_type, false)])
     }
 
     #[test]
@@ -517,5 +558,86 @@ mod tests {
         } else {
             panic!("Expected struct type");
         }
+    }
+
+    #[test]
+    fn test_assign_field_ids_at_max_depth() {
+        // Depth of 10 should work (depth starts at 0, so levels 0-10 are allowed)
+        let schema = create_nested_schema(10);
+        let result = assign_field_ids(&schema);
+
+        // Should have field IDs assigned (not return original schema)
+        assert_eq!(get_field_id(&result.fields[0]), Some(0));
+
+        // Verify we can traverse and find field IDs at each level
+        let mut current_field = &result.fields[0];
+        for expected_id in 0..10 {
+            assert_eq!(
+                get_field_id(current_field),
+                Some(expected_id),
+                "Field at depth {expected_id} should have ID {expected_id}"
+            );
+            if let DataType::Struct(fields) = current_field.data_type() {
+                current_field = &fields[0];
+            }
+        }
+    }
+
+    #[test]
+    fn test_assign_field_ids_exceeds_max_depth() {
+        // Depth of 12 exceeds the limit of 10
+        let schema = create_nested_schema(12);
+        let result = assign_field_ids(&schema);
+
+        // Should return original schema (no field IDs assigned)
+        assert_eq!(
+            get_field_id(&result.fields[0]),
+            None,
+            "Original schema should be returned when depth limit exceeded"
+        );
+
+        // Verify the schema structure is preserved (root -> level_0 -> level_1 -> ... -> level_11)
+        assert_eq!(result.fields[0].name(), "root");
+        let mut current_field = &result.fields[0];
+        for i in 0..12 {
+            if let DataType::Struct(fields) = current_field.data_type() {
+                current_field = &fields[0];
+                assert_eq!(current_field.name(), format!("level_{i}").as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn test_assign_field_ids_exactly_at_limit_boundary() {
+        // Test depth = 11 (just over the limit of 10)
+        let schema = create_nested_schema(11);
+        let result = assign_field_ids(&schema);
+
+        // Should return original schema
+        assert_eq!(
+            get_field_id(&result.fields[0]),
+            None,
+            "Original schema should be returned when depth is 11 (exceeds limit of 10)"
+        );
+    }
+
+    #[test]
+    fn test_assign_field_ids_nested_list_depth_limit() {
+        // Create deeply nested lists that exceed the depth limit
+        let mut current_type = DataType::Int32;
+        for _ in 0..12 {
+            current_type =
+                DataType::List(Arc::new(Field::new("element", current_type.clone(), false)));
+        }
+        let schema = ArrowSchema::new(vec![Field::new("nested_lists", current_type, false)]);
+
+        let result = assign_field_ids(&schema);
+
+        // Should return original schema (no field IDs assigned)
+        assert_eq!(
+            get_field_id(&result.fields[0]),
+            None,
+            "Original schema should be returned for deeply nested lists"
+        );
     }
 }
