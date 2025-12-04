@@ -32,6 +32,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
@@ -121,7 +122,7 @@ pub fn process_batch(
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
-) -> Result<(ChangeBatch, Checkpoint), StreamError> {
+) -> Result<(ChangeBatch, Checkpoint, Option<SystemTime>), StreamError> {
     let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
 
@@ -213,7 +214,7 @@ pub fn process_batch(
     let change_batch =
         ChangeBatch::try_new(record_batch).context(FailedToCreateChangeBatchSnafu)?;
 
-    Ok((change_batch, batch.checkpoint))
+    Ok((change_batch, batch.checkpoint, batch.watermark))
 }
 
 fn streams_to_dynamodb_item(

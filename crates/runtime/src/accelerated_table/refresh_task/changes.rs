@@ -95,9 +95,11 @@ impl RefreshTask {
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
 
-                            // Mark the dataset as ready after the first message is received. This covers both streaming append and CDC modes.
-                            self.update_component_status(status::ComponentStatus::Ready)
-                                .await;
+                            // Mark the dataset as ready if possible
+                            if change_envelope.is_dataset_ready() {
+                                self.update_component_status(status::ComponentStatus::Ready)
+                                    .await;
+                            }
 
                             if let Err(e) = change_envelope.commit()
                                 && !self.runtime_status.is_shutdown()
@@ -160,7 +162,8 @@ impl RefreshTask {
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
-        tracing::trace!(
+        // TODO: Should be trace
+        tracing::info!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
             self.dataset_name,
             change_batch.record.num_rows(),

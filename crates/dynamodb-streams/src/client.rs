@@ -121,6 +121,7 @@ impl Client {
                 .method(BackoffMethod::Fibonacci)
                 .max_retries(Some(3))
                 .build(),
+            idle_timeout: None,
         };
 
         tokio::spawn(async move {
