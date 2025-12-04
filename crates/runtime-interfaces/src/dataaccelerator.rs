@@ -109,6 +109,9 @@ pub trait DataAccelerator: Send + Sync {
         vec![]
     }
 
+    /// # Errors
+    ///
+    /// Returns `FilePathError` when the accelerator cannot provide a file path.
     fn file_path(&self, _source: &dyn AccelerationSource) -> Result<String, FilePathError> {
         Err(FilePathError::FileModeUnsupported {})
     }
@@ -264,6 +267,9 @@ impl AcceleratorExternalTableBuilder {
         self
     }
 
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidConfiguration` if schema conversion or configuration fails.
     pub fn build(self) -> Result<CreateExternalTable> {
         if Mode::File == self.mode && matches!(self.engine, Engine::Arrow) {
             return Err(Error::InvalidConfiguration {
@@ -295,7 +301,7 @@ impl AcceleratorExternalTableBuilder {
 
         Ok(CreateExternalTable {
             schema: df_schema,
-            name: self.table_name.clone(),
+            name: self.table_name,
             location: String::new(),
             file_type: String::new(),
             table_partition_cols: vec![],
