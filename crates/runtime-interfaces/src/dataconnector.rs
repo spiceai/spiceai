@@ -214,24 +214,24 @@ pub struct ConnectorParams {
     pub(crate) component: ConnectorComponent,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ConnectorComponent {
     Catalog(CatalogInfo),
     Dataset(DatasetInfoWrapper),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CatalogInfo {
     pub name: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DatasetInfoWrapper {
     pub name: String,
     pub refresh_mode: Option<RefreshMode>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum UnsupportedTypeAction {
     Fail,
     Coerce,

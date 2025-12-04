@@ -28,6 +28,7 @@ use runtime_table_partition::expression::PartitionedBy;
 
 use crate::acceleration::AccelerationSource;
 use crate::{ParameterSpec, Parameters};
+use secrecy::ExposeSecret;
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
