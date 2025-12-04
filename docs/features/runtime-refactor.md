@@ -88,7 +88,7 @@
 - [x] 2025-12-04: Phase 1 inventory started (downcasts cataloged; dependency minimization goals captured).
 - [x] 2025-12-04: Draft `runtime-interfaces` dependency/feature matrix and façade trait plan.
 - [x] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
-- [ ] 2025-12-04: Draft initial `runtime-interfaces` Cargo layout (deps/features list, license header pattern, macro exports plan).
+- [x] 2025-12-04: Draft initial `runtime-interfaces` Cargo layout (deps/features list, license header pattern, macro exports plan).
 - **Initial `runtime-interfaces` crate sketch**
   - `Cargo.toml`:
     - Package: `runtime-interfaces`, edition 2024, Apache 2.0, workspace member.
