@@ -98,6 +98,7 @@ pub mod federated_table;
 pub mod flight;
 mod http;
 mod init;
+pub mod interfaces;
 pub mod internal_table;
 mod management;
 mod metrics;

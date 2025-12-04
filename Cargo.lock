@@ -13130,6 +13130,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-interfaces",
  "runtime-object-store",
  "runtime-parameters",
  "runtime-proto",
@@ -13311,7 +13312,15 @@ dependencies = [
 name = "runtime-interfaces"
 version = "1.10.0-unstable"
 dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
  "runtime-parameters",
+ "runtime-table-partition",
+ "secrecy",
 ]
 
 [[package]]

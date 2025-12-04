@@ -21,3 +21,5 @@ async-trait = { workspace = true }
 linkme = { workspace = true }
 paste = { workspace = true }
 secrecy = { workspace = true }
+
+[dev-dependencies]
