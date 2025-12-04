@@ -181,7 +181,8 @@ pub enum Error {
         msg: String,
     },
     UnknownEngine {
-        engine: Arc<str> },
+        engine: Arc<str>,
+    },
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
