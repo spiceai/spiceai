@@ -110,6 +110,7 @@
 - [x] Add distributed-slice smoke test to validate cross-crate registration.
 - [ ] Define façade traits/structs needed to avoid pulling runtime types (`Dataset`, `AcceleratedTable`, `FederatedTable`, `MetricsProvider`, `AccelerationSource`).
 - [ ] Migrate runtime modules to interface imports (blocked on trait parity/wrappers: `DatasetInfo`/`FederatedTableInfo`/`MetricsProvider` and `TableProviderChangesStream` shape).
+- [x] Simplified interface errors to avoid `ConnectorComponent` leakage (generic connector errors only).
 
 ### Next extraction tasks
 - Draft dataset/acceleration/metrics façade traits with minimal methods used by interfaces; map each to existing runtime types to ensure compatibility.

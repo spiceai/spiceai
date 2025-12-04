@@ -212,24 +212,6 @@ pub enum RefreshMode {
 pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
     pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub(crate) component: ConnectorComponent,
-}
-
-#[derive(Clone, Debug)]
-pub enum ConnectorComponent {
-    Catalog(CatalogInfo),
-    Dataset(DatasetInfoWrapper),
-}
-
-#[derive(Clone, Debug)]
-pub struct CatalogInfo {
-    pub name: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct DatasetInfoWrapper {
-    pub name: String,
-    pub refresh_mode: Option<RefreshMode>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,23 +221,13 @@ pub enum UnsupportedTypeAction {
 }
 
 #[derive(Debug)]
-pub enum ConnectorComponentKind {
-    Catalog,
-    Dataset,
-}
-
-#[derive(Debug)]
 pub enum DataConnectorError {
     InvalidConnectorType {
         dataconnector: String,
-        connector_component: ConnectorComponent,
     },
-    OdbcNotInstalled {
-        connector_component: ConnectorComponent,
-    },
+    OdbcNotInstalled,
     UnsupportedTypeAction {
         dataconnector: String,
-        connector_component: ConnectorComponent,
     },
     UseOfProtectedKeyword {
         dataconnector: String,
@@ -263,13 +235,11 @@ pub enum DataConnectorError {
     },
     InvalidParameter {
         dataconnector: String,
-        connector_component: ConnectorComponent,
         parameter: String,
         message: String,
     },
     UnableToConnect {
         dataconnector: String,
-        connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
