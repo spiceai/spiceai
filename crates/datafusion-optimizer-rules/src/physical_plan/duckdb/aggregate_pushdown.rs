@@ -73,7 +73,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.input.required_input_distribution()
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -85,7 +85,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![true]
+        vec![false]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -241,6 +241,7 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
 
             let optimized_sql = unparser.plan_to_sql(&marker.logical_plan)?;
             let logical_plan_schema = Arc::clone(marker.logical_plan.schema().inner());
+
             let rewritten = duck_exec
                 .clone()
                 .with_optimized_sql(optimized_sql.to_string(), Some(logical_plan_schema));

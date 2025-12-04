@@ -20,6 +20,7 @@ on:
           - 'bench'
           - 'load'
           - 'throughput'
+          - 'append'
           - 'http-consistency'
       update_snapshots:
         description: 'Update snapshots?'
@@ -42,7 +43,7 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/1.9'
+          - 'release/1.10'
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false

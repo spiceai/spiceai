@@ -6,6 +6,10 @@ option java_package = "com.spiceai";
 option java_outer_classname = "SpiceProto";
 
 // RPC
+message GetAppDefinitionRequest {
+    string executor_id = 1;
+}
+
 message ExecutorExpandSecretRequest {
     string executor_id = 1;
     string key = 2;

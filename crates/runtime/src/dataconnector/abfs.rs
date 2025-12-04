@@ -20,8 +20,10 @@ use super::{
     ParameterSpec, Parameters,
 };
 
-use crate::component::dataset::Dataset;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
+use crate::{
+    component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    register_data_connector,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -311,3 +313,5 @@ impl ListingTableConnector for AzureBlobFS {
         Ok(azure_url)
     }
 }
+
+register_data_connector!("abfs", AzureBlobFSFactory);

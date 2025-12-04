@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+use crate::register_data_connector;
 use crate::token_providers::databricks::{
     AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
@@ -665,3 +666,5 @@ mod tests {
         }
     }
 }
+
+register_data_connector!("databricks", DatabricksFactory);

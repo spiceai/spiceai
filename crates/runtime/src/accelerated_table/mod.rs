@@ -54,7 +54,7 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
@@ -223,7 +223,10 @@ pub struct AcceleratedTable {
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
     cache_ttl: Option<Duration>,
+    cache_stale_while_revalidate_ttl: Option<Duration>,
     io_runtime: Handle,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -286,6 +289,7 @@ pub struct Builder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
+    caching_stale_while_revalidate_ttl: Option<Duration>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
@@ -324,6 +328,7 @@ impl Builder {
             cpu_runtime: None,
             io_runtime,
             caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
             resource_monitor: None,
         }
     }
@@ -463,6 +468,15 @@ impl Builder {
         self
     }
 
+    /// Set the stale-while-revalidate duration for cache mode
+    pub fn caching_stale_while_revalidate_ttl(
+        &mut self,
+        stale_while_revalidate: Option<Duration>,
+    ) -> &mut Self {
+        self.caching_stale_while_revalidate_ttl = stale_while_revalidate;
+        self
+    }
+
     /// Build the accelerated table
     #[expect(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
@@ -560,6 +574,8 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
+        // Create the cache mutex early so it can be shared between the Refresher and the AcceleratedTable.
+        let cache_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -569,6 +585,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&cache_mutex),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -628,7 +645,9 @@ impl Builder {
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
             cache_ttl: self.caching_ttl,
+            cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             io_runtime: self.io_runtime,
+            cache_mutex,
         })
     }
 }
@@ -820,6 +839,7 @@ impl TableProvider for AcceleratedTable {
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
                     federated_provider,
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
@@ -827,6 +847,7 @@ impl TableProvider for AcceleratedTable {
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
+                    Arc::clone(&self.cache_mutex),
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,

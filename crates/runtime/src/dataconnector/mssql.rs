@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::{
@@ -226,3 +226,5 @@ impl DataConnector for SqlServer {
         Ok(Arc::new(provider))
     }
 }
+
+register_data_connector!("mssql", SqlServerFactory);

@@ -287,6 +287,10 @@ pub struct Acceleration {
 
     pub refresh_check_interval: Option<Duration>,
 
+    pub caching_ttl: Option<Duration>,
+
+    pub caching_stale_while_revalidate_ttl: Option<Duration>,
+
     pub refresh_cron: Option<Arc<str>>,
 
     pub refresh_sql: Option<String>,
@@ -425,6 +429,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
 
+        let caching_ttl = parse_caching_ttl(&mut params)?;
+        let caching_stale_while_revalidate_ttl =
+            parse_caching_stale_while_revalidate_ttl(&mut params)?;
+
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
             acceleration.refresh_check_interval,
@@ -449,6 +457,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
             refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
+            caching_ttl,
+            caching_stale_while_revalidate_ttl,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -487,6 +497,8 @@ impl Default for Acceleration {
             engine: Engine::default(),
             refresh_mode: None,
             refresh_check_interval: None,
+            caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -530,6 +542,52 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
         }
     }
     Ok(false)
+}
+
+/// Parse `caching_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_ttl(params: &mut Option<Params>) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_ttl")
+}
+
+/// Parse `caching_stale_while_revalidate_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_while_revalidate_ttl(
+    params: &mut Option<Params>,
+) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_stale_while_revalidate_ttl")
+}
+
+/// Helper to parse a duration parameter from params.
+#[expect(clippy::result_large_err)]
+fn parse_duration_param(
+    params: &mut Option<Params>,
+    param_name: &str,
+) -> Result<Option<Duration>, crate::Error> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove(param_name) else {
+        return Ok(None);
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => {
+            fundu::parse_duration(&s)
+                .map(Some)
+                .map_err(|e| crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: param_name.into(),
+                    },
+                })
+        }
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid '{param_name}' param value: {value:?}. Expected a duration string."
+            )
+            .into(),
+        }),
+    }
 }
 
 #[cfg(test)]
