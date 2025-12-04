@@ -62,6 +62,7 @@
   - Identify any shared config/parameter structs that should move with traits vs. stay in `runtime` to avoid churn.
   - Map connector parameter plumbing: `ConnectorParams`/builder rely on `runtime`-local registries, secrets, app/runtime handles, and `Parameters`; likely keep builder/validation in `runtime` and expose only the consumable `Parameters`/`ParameterSpec` types from `runtime-interfaces`.
   - Catalog which helper modules (e.g., `runtime_secrets`, base path helpers, metrics providers) are referenced directly by connectors/accelerators and may need small façade traits to avoid pulling full crates into `runtime-interfaces`.
+  - Document interface dependencies to lift: `AccelerationSource` depends on `app::App` and `Runtime` for `app()`/`runtime()`—may need to expose thin traits (e.g., `HasApp`, `HasRuntimeHandles`) or keep `AccelerationSource` in runtime and add a connector-facing subset for file path resolution.
 
 ## Progress Log
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
