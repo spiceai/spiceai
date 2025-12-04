@@ -14,13 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Interface crate for data connector and accelerator abstractions.
-//!
-//! This crate will host traits, macros, and types that allow the runtime to
-//! depend only on shared interfaces rather than concrete implementations.
+use std::any::Any;
+use std::sync::Arc;
 
-pub mod acceleration;
-pub mod datasets;
-pub mod metrics;
+use arrow_schema::SchemaRef;
+use datafusion::sql::TableReference;
 
-pub use runtime_parameters::{ParameterSpec, Parameters};
+/// Core acceleration source view decoupled from runtime internals.
+pub trait AccelerationSource: Send + Sync {
+    fn name(&self) -> &TableReference;
+    fn schema(&self) -> SchemaRef;
+    fn as_any(&self) -> &dyn Any;
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource>;
+}
