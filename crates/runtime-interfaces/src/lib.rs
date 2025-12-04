@@ -19,5 +19,4 @@ limitations under the License.
 //! This crate will host traits, macros, and types that allow the runtime to
 //! depend only on shared interfaces rather than concrete implementations.
 
-// Placeholder module to be filled in during Phase 2.
-pub mod placeholder {}
+pub use runtime_parameters::{ParameterSpec, Parameters};

@@ -12,3 +12,4 @@ name = "runtime_interfaces"
 path = "src/lib.rs"
 
 [dependencies]
+runtime-parameters = { path = "../runtime-parameters" }
