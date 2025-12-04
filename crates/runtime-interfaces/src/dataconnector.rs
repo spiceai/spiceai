@@ -208,7 +208,7 @@ pub enum RefreshMode {
     Cdc,
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
     pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
