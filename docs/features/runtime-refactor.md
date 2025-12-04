@@ -105,7 +105,7 @@
 - [x] Added minimal metrics trait shard (`MetricsProvider`, `MetricSpec`, `MetricType`) to `runtime-interfaces`.
 - [x] Added dataset/accelerated/federated info façade traits in `runtime-interfaces`.
 - [x] Added acceleration source façade trait in `runtime-interfaces`.
-- [ ] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
+- [x] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
 - [ ] Wire `runtime` to use/re-export interfaces.
 - [ ] Add distributed-slice smoke test to validate cross-crate registration.
 - [ ] Define façade traits/structs needed to avoid pulling runtime types (`Dataset`, `AcceleratedTable`, `FederatedTable`, `MetricsProvider`, `AccelerationSource`).
