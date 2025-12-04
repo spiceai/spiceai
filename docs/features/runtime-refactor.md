@@ -106,8 +106,8 @@
 - [x] Added dataset/accelerated/federated info façade traits in `runtime-interfaces`.
 - [x] Added acceleration source façade trait in `runtime-interfaces`.
 - [x] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
-- [ ] Wire `runtime` to use/re-export interfaces.
-- [ ] Add distributed-slice smoke test to validate cross-crate registration.
+- [x] Wire `runtime` to re-export interfaces for gradual migration.
+- [x] Add distributed-slice smoke test to validate cross-crate registration.
 - [ ] Define façade traits/structs needed to avoid pulling runtime types (`Dataset`, `AcceleratedTable`, `FederatedTable`, `MetricsProvider`, `AccelerationSource`).
 
 ### Next extraction tasks
