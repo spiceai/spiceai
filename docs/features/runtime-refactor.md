@@ -90,7 +90,7 @@
 - [x] 2025-12-04: Enumerate exact trait signatures needing `datafusion`/`arrow` types and propose shims to narrow exposed types.
 - [x] 2025-12-04: Draft initial `runtime-interfaces` Cargo layout (deps/features list, license header pattern, macro exports plan).
 - [x] 2025-12-04: Phase 2 kickoff checklist written (concrete steps to create crate and re-export in runtime).
-- [ ] 2025-12-04: Phase 2 scaffolding started (create `runtime-interfaces` crate, add to workspace, placeholder lib).
+- [x] 2025-12-04: Phase 2 scaffolding started (create `runtime-interfaces` crate, add to workspace, placeholder lib).
 
 ### Phase 2 Kickoff Checklist (planned)
 - [ ] Create `crates/runtime-interfaces` scaffolding (Cargo.toml, lib.rs, modules, license headers).
@@ -98,6 +98,12 @@
 - [ ] Add minimal dependencies/features; verify `cargo check -p runtime-interfaces` and `make lint-rust` still pass.
 - [ ] Update `runtime` to consume the interfaces crate (re-export temporarily for minimal churn).
 - [ ] Add a small smoke test to ensure distributed slice registration works across crates.
+
+### Phase 2 Progress
+- [x] Scaffolding created (`crates/runtime-interfaces` added to workspace, placeholder lib with 2025 header).
+- [ ] Populate `runtime-interfaces` with connector/accelerator traits and registration macros.
+- [ ] Wire `runtime` to use/re-export interfaces.
+- [ ] Add distributed-slice smoke test to validate cross-crate registration.
 - **Initial `runtime-interfaces` crate sketch**
   - `Cargo.toml`:
     - Package: `runtime-interfaces`, edition 2024, Apache 2.0, workspace member.
