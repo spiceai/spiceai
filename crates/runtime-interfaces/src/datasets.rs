@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use datafusion::sql::TableReference;

@@ -13,3 +13,5 @@ path = "src/lib.rs"
 
 [dependencies]
 runtime-parameters = { path = "../runtime-parameters" }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
