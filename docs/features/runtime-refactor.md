@@ -74,6 +74,13 @@
     - Metrics: small trait surface (e.g., `MetricSpec`, `MetricType`, `MetricsProvider`, `ObserveMetricCallback`) to live in `runtime-interfaces` or a new tiny metrics crate.
     - Acceleration: split `AccelerationSource` into a core trait (names, acceleration config, optional file path hint) that does not expose `app()`/`runtime()`; keep runtime-specific accessors behind a separate runtime-only trait.
     - Secrets/params: keep `Parameters`/`ParameterSpec` data-only; builders/secret resolution stay in runtime.
+  - Enumerate trait signatures needing `datafusion`/`arrow` types:
+    - Connectors: `DataConnector::read_provider`/`read_write_provider`/`metadata_provider` return `Arc<dyn TableProvider>`; `changes_stream`/`append_stream` use `ChangesStream` (arrow schema/record batches); parameter validation uses `RefreshMode`, `Dataset`, `FederatedTable`, `AcceleratedTable`.
+    - Accelerators: `DataAccelerator::create_external_table` takes `CreateExternalTable`, `AccelerationSource`, `PartitionedBy`, returns `Arc<dyn TableProvider>`; `AcceleratorExternalTableBuilder` uses `Constraints`, `ColumnReference`, `IndexType`, `OnConflict`, `Mode`, `Engine`.
+    - Common: `ParameterSpec`/`Parameters` may carry `secrecy::SecretString` and need to expose only data/validation methods; avoid leaking runtime registries.
+  - Proposed shims:
+    - Re-export only the minimal `datafusion` types needed in signatures from `runtime-interfaces` to avoid a broad dependency surface.
+    - Define lightweight newtypes/traits for `TableProvider`/`CreateExternalTable` if we want to decouple future signatures (optional; defer if too invasive for initial extraction).
 
 ## Progress Log
 - [x] 2025-12-04: Plan authored; added phased milestones and initial migration ordering.
