@@ -23,4 +23,6 @@ pub use runtime_interfaces::dataaccelerator;
 pub use runtime_interfaces::dataconnector;
 pub use runtime_interfaces::datasets;
 pub use runtime_interfaces::metrics;
+pub use runtime_interfaces::{register_data_accelerator, register_data_connector};
+
 pub use runtime_interfaces::{ParameterSpec, Parameters};
