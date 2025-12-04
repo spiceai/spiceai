@@ -177,8 +177,11 @@ pub enum IndexType {
 
 #[derive(Debug)]
 pub enum Error {
-    InvalidConfiguration { msg: String },
-    UnknownEngine { engine: Arc<str> },
+    InvalidConfiguration {
+        msg: String,
+    },
+    UnknownEngine {
+        engine: Arc<str> },
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -187,7 +190,9 @@ pub enum Error {
 #[derive(Debug)]
 pub enum FilePathError {
     AccelerationNotEnabled,
-    AcceleratorEngineUnavailable { engine: Engine },
+    AcceleratorEngineUnavailable {
+        engine: Engine,
+    },
     FileModeUnsupported {},
     External {
         engine: Engine,
@@ -210,7 +215,11 @@ pub struct AcceleratorExternalTableBuilder {
 
 impl AcceleratorExternalTableBuilder {
     #[must_use]
-    pub fn new(table_name: TableReference, schema: crate::datasets::SchemaRef, engine: Engine) -> Self {
+    pub fn new(
+        table_name: TableReference,
+        schema: crate::datasets::SchemaRef,
+        engine: Engine,
+    ) -> Self {
         Self {
             table_name,
             schema,
@@ -272,7 +281,9 @@ impl AcceleratorExternalTableBuilder {
 
         options.insert("mode".to_string(), self.mode.to_string());
 
-        let constraints = self.constraints.unwrap_or_else(|| Constraints::new_unverified(vec![]));
+        let constraints = self
+            .constraints
+            .unwrap_or_else(|| Constraints::new_unverified(vec![]));
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema)).map_err(|e| {
             Error::InvalidConfiguration {

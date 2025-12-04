@@ -20,6 +20,8 @@ limitations under the License.
 //! depend only on shared interfaces rather than concrete implementations.
 
 pub mod acceleration;
+pub mod dataaccelerator;
+pub mod dataconnector;
 pub mod datasets;
 pub mod metrics;
 
