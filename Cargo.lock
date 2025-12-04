@@ -13084,6 +13084,7 @@ dependencies = [
  "hf-hub",
  "http 1.4.0",
  "http-body-util",
+ "humantime",
  "hyper 1.8.1",
  "hyper-util",
  "iceberg",
