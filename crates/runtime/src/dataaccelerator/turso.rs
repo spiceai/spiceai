@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -688,13 +688,15 @@ impl DataAccelerator for TursoAccelerator {
 
         // Wrap in PolyTableProvider for proper read/write separation
         // This allows the table to support both reading and writing operations
-        let write_provider = Arc::clone(&turso_provider);
-        let delete_provider = Arc::clone(&turso_provider);
         let fed_provider = Arc::new(
             Arc::clone(&turso_provider)
                 .create_federated_table_provider()
                 .boxed()?,
         ) as Arc<dyn TableProvider>;
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) =
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(turso_provider, &cmd.options);
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,

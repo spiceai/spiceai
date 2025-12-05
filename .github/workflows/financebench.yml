@@ -40,7 +40,7 @@ jobs:
     name: Build testoperator
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -53,7 +53,7 @@ jobs:
     name: Build spiced
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -61,7 +61,7 @@ jobs:
           os: darwin
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -77,7 +77,7 @@ jobs:
           chmod +x spiced
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: spiced
           path: spiced
@@ -90,7 +90,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -156,15 +156,15 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Download testoperator
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: spiced
 

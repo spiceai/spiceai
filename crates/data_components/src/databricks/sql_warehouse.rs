@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::RecordBatch,
+    array::{Array, RecordBatch},
     datatypes::{Field, Schema, SchemaRef},
     ipc::reader::StreamReader,
 };
@@ -245,11 +245,12 @@ impl SqlWarehouseApi {
         let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing catalog".into(),
         })?;
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_table = table.table().replace('\'', "''");
+        let escaped_schema = table_schema.replace('\'', "''");
+        let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}' AND table_catalog = '{}'",
-            table.table(),
-            table_schema,
-            table_catalog
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
@@ -605,6 +606,66 @@ impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnec
 impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
     fn new(api: Arc<SqlWarehouseApi>) -> Self {
         Self { api }
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "Databricks tables() not implemented".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let query = "SELECT schema_name FROM information_schema.schemata";
+
+        let token = self.api.token_provider.get_token();
+        let payload = json!({
+            "warehouse_id": self.api.sql_warehouse_id,
+            "format": "ARROW_STREAM",
+            "disposition": "EXTERNAL_LINKS",
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
+            "statement": query,
+        });
+
+        let response = self
+            .api
+            .execute_sql_statement(&token, &payload)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+        SqlWarehouseApi::verify_response_status(&response).map_err(|e| {
+            dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            }
+        })?;
+
+        let mut stream = Arc::clone(&self.api)
+            .fetch_external_links(response)
+            .await
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+        let mut schemas = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                source: Box::new(e),
+            })?;
+
+            if let Some(name_column) = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+            {
+                for value in name_column.iter().flatten() {
+                    schemas.push(value.to_string());
+                }
+            }
+        }
+
+        Ok(schemas)
     }
 
     async fn get_schema(
