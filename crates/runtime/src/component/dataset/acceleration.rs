@@ -272,6 +272,33 @@ impl Display for OnConflictBehavior {
     }
 }
 
+/// Behavior when a stale-if-error condition occurs in caching mode.
+/// When enabled, serves expired cached data if the upstream source returns an error.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum StaleIfError {
+    /// Do not serve stale data on error - propagate the error to the client.
+    #[default]
+    Disabled,
+    /// Serve expired data if the upstream source returns an error.
+    Enabled,
+}
+
+impl StaleIfError {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, StaleIfError::Enabled)
+    }
+}
+
+impl Display for StaleIfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StaleIfError::Disabled => write!(f, "disabled"),
+            StaleIfError::Enabled => write!(f, "enabled"),
+        }
+    }
+}
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
@@ -290,6 +317,8 @@ pub struct Acceleration {
     pub caching_ttl: Option<Duration>,
 
     pub caching_stale_while_revalidate_ttl: Option<Duration>,
+
+    pub caching_stale_if_error: StaleIfError,
 
     pub refresh_cron: Option<Arc<str>>,
 
@@ -432,6 +461,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
+        let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
@@ -459,6 +489,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_check_interval,
             caching_ttl,
             caching_stale_while_revalidate_ttl,
+            caching_stale_if_error,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -499,6 +530,7 @@ impl Default for Acceleration {
             refresh_check_interval: None,
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
+            caching_stale_if_error: StaleIfError::default(),
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -556,6 +588,36 @@ fn parse_caching_stale_while_revalidate_ttl(
     params: &mut Option<Params>,
 ) -> Result<Option<Duration>, crate::Error> {
     parse_duration_param(params, "caching_stale_while_revalidate_ttl")
+}
+
+/// Parse `caching_stale_if_error` from params for caching mode.
+/// Valid values: "enabled", "disabled" (default)
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfError, crate::Error> {
+    let Some(params) = params else {
+        return Ok(StaleIfError::default());
+    };
+    let Some(value) = params.data.remove("caching_stale_if_error") else {
+        return Ok(StaleIfError::default());
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => match s.to_lowercase().as_str() {
+            "enabled" => Ok(StaleIfError::Enabled),
+            "disabled" => Ok(StaleIfError::Disabled),
+            _ => Err(crate::Error::InvalidAccelerationConfiguration {
+                source: format!(
+                    "Invalid 'caching_stale_if_error' value: '{s}'. Expected 'enabled' or 'disabled'."
+                )
+                .into(),
+            }),
+        },
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid 'caching_stale_if_error' param value: {value:?}. Expected 'enabled' or 'disabled'."
+            )
+            .into(),
+        }),
+    }
 }
 
 /// Helper to parse a duration parameter from params.

@@ -224,6 +224,7 @@ pub struct AcceleratedTable {
     synchronized_with: Option<SynchronizedTable>,
     cache_ttl: Option<Duration>,
     cache_stale_while_revalidate_ttl: Option<Duration>,
+    cache_stale_if_error: bool,
     io_runtime: Handle,
     /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
     cache_mutex: Arc<Mutex<()>>,
@@ -290,6 +291,7 @@ pub struct Builder {
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
+    caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
@@ -329,6 +331,7 @@ impl Builder {
             io_runtime,
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
+            caching_stale_if_error: false,
             resource_monitor: None,
         }
     }
@@ -474,6 +477,12 @@ impl Builder {
         stale_while_revalidate: Option<Duration>,
     ) -> &mut Self {
         self.caching_stale_while_revalidate_ttl = stale_while_revalidate;
+        self
+    }
+
+    /// Set whether to serve expired data on upstream error in cache mode
+    pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
+        self.caching_stale_if_error = enabled;
         self
     }
 
@@ -646,6 +655,7 @@ impl Builder {
             synchronized_with: self.synchronize_with,
             cache_ttl: self.caching_ttl,
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
+            cache_stale_if_error: self.caching_stale_if_error,
             io_runtime: self.io_runtime,
             cache_mutex,
         })
@@ -840,6 +850,7 @@ impl TableProvider for AcceleratedTable {
                     input,
                     self.cache_ttl,
                     self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
                     federated_provider,
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
