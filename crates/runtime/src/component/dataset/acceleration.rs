@@ -451,26 +451,31 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let snapshot_trigger = match (
             acceleration.snapshots_trigger,
-            acceleration.snapshots_interval,
+            acceleration.snapshots_batches,
         ) {
             (None, _) => None,
             (Some(spicepod_acceleration::SnapshotTrigger::AfterRefresh), _) => {
                 Some(SnapshotTrigger::AfterRefresh)
             }
-            (Some(spicepod_acceleration::SnapshotTrigger::Interval), None) => {
+            (Some(spicepod_acceleration::SnapshotTrigger::Batches), None) => {
                 return Err(crate::Error::InvalidSpicepodDataset {
                     source: super::Error::SnapshotTriggerIntervalRequiresInterval,
                 });
             }
-            (Some(spicepod_acceleration::SnapshotTrigger::Interval), Some(interval)) => {
-                let Some(duration) = try_parse_duration("snapshots_interval", Some(interval))?
+            (Some(spicepod_acceleration::SnapshotTrigger::Batches), Some(interval)) => {
+                let Some(batches) =
+                    interval
+                        .parse()
+                        .map_err(|e| crate::Error::InvalidSpicepodDataset {
+                            source: super::Error::UnableToParseSnapshotsBatches { source: e },
+                        })?
                 else {
                     return Err(crate::Error::InvalidSpicepodDataset {
                         source: super::Error::SnapshotTriggerIntervalRequiresInterval,
                     });
                 };
 
-                Some(SnapshotTrigger::Interval(duration))
+                Some(SnapshotTrigger::Batches(batches))
             }
         };
 

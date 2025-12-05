@@ -157,8 +157,8 @@ pub enum SnapshotTrigger {
     #[default]
     /// Snapshots are created after each refresh (used by full/append modes).
     AfterRefresh,
-    /// Snapshots are updated on an interval (used by append/changes modes).
-    Interval,
+    /// Snapshots are updated after X batches (used by append/changes modes).
+    Batches,
 }
 
 #[expect(clippy::struct_excessive_bools)]
@@ -264,7 +264,7 @@ pub struct Acceleration {
     pub snapshots_trigger: Option<SnapshotTrigger>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshots_interval: Option<String>,
+    pub snapshots_batches: Option<String>,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -308,7 +308,7 @@ impl Default for Acceleration {
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
             snapshots_trigger: None,
-            snapshots_interval: None,
+            snapshots_batches: None,
         }
     }
 }

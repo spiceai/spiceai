@@ -602,7 +602,7 @@ impl Builder {
                 refresh::AccelerationRefreshMode::Changes(_) => {
                     if let Some(trigger) = self.snapshot_trigger.clone() {
                         match trigger {
-                            SnapshotTrigger::Interval(_) => {}
+                            SnapshotTrigger::Batches(_) => {}
                             SnapshotTrigger::AfterRefresh => {
                                 return Err(AcceleratedTableBuilderError::InvalidSnapshotTrigger {
                                     message: format!(
