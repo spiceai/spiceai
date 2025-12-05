@@ -87,7 +87,6 @@ impl RefreshTask {
         while let Some(update) = changes_stream.next().await {
             match update {
                 Ok(change_envelope) => {
-                    println!("Processing started");
                     match self
                         .write_change(change_envelope.change_batch.clone())
                         .await
@@ -134,7 +133,6 @@ impl RefreshTask {
                             }
                         }
                     }
-                    println!("Processing ended");
                 }
                 Err(e) => {
                     // If the error is transient (e.g., Kafka poll timeout), continue without changing the refresh status to Error
