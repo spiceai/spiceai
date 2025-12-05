@@ -270,6 +270,8 @@ impl StreamState {
                     || self.initializing.contains_key(&p)
             });
 
+            tracing::debug!("Discovered new shard: id={}, parent={:?}, blocked={}", shard_id, shard.parent_shard_id, blocked);
+
             let checkpoint = ShardCheckpoint {
                 sequence_number: shard
                     .starting_sequence_number
@@ -384,6 +386,8 @@ pub async fn initialize_state_from_checkpoint(
                 Some(shard_checkpoint.sequence_number.clone()),
             )
             .await?;
+
+        tracing::debug!("Initialized shard from checkpoint: id={}, parent={:?}", shard_id, shard_checkpoint.parent_id);
 
         let shard = ActiveShard {
             shard_id: shard_id.to_string(),

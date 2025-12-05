@@ -81,6 +81,8 @@ impl Client {
             })
             .collect::<Result<_>>()?;
 
+        tracing::debug!("Latest checkpoint initialized: {:#?}", checkpoint_shards);
+
         Ok(Checkpoint {
             shards: checkpoint_shards,
         })

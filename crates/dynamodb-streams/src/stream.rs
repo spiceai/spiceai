@@ -65,7 +65,7 @@ impl DynamodbStreamProducer {
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
-            tracing::debug!(
+            tracing::trace!(
                 "Polling shard with iterator: shard_id={}, iterator={}",
                 shard.shard_id,
                 shard.iterator
@@ -235,7 +235,7 @@ fn combine_shard_batches(
                             let is_idle = shard_result.outcome.is_empty() && elapsed > timeout;
 
                             if is_idle {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "Shard {} excluded from watermark (idle for {:?}, timeout: {:?})",
                                     shard_result.shard_id,
                                     elapsed,
