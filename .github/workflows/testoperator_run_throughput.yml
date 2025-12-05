@@ -75,7 +75,7 @@ jobs:
     name: Run throughput test
     runs-on: ${{ github.event.inputs.runner_type }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set spicepod path
         id: set_spicepod_path

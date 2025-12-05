@@ -143,6 +143,7 @@ fn mean(values: &[f32]) -> f32 {
     values.iter().sum::<f32>() / n as f32
 }
 
+#[cfg(feature = "models")]
 fn extract_text(output: &DatasetOutput) -> String {
     match output {
         DatasetOutput::AssistantResponse(text) => text.clone(),
