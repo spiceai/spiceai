@@ -950,13 +950,11 @@ fn create_snapshot_callback(
                         let dataset_name = dataset_name.clone();
 
                         Box::pin(async move {
-                            println!("on_batch_process_callback");
 
                             let mut last_time = last_snapshot_time.write().await;
                             let elapsed = last_time.elapsed();
 
                             if elapsed >= snapshot_interval {
-                                println!("Snapshotting dataset {dataset_name}");
                                 tracing::debug!(
                                     "Creating snapshot for changes stream: {} (elapsed: {:?})",
                                     dataset_name,
