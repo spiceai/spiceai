@@ -222,6 +222,7 @@ async fn get_m2m_access_token(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "databricks")]
 pub enum AuthCredentials<'a> {
     Token(&'a SecretString),
     ServicePrincipal(&'a str, &'a SecretString),

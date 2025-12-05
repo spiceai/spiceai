@@ -71,7 +71,7 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set spicepod path
         id: set_spicepod_path
