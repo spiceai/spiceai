@@ -37,7 +37,7 @@ impl DynamoDBSys {
 
         conn.conn
             .call(
-                move |conn: &mut rusqlite::Connection| -> Result<(), tokio_rusqlite::Error> {
+                move |conn: &mut rusqlite::Connection| -> Result<(), rusqlite::Error> {
                     let create_table = format!(
                         "CREATE TABLE IF NOT EXISTS {DYNAMODB_STREAMS_TABLE_NAME} (
                     dataset_name TEXT PRIMARY KEY,
@@ -59,7 +59,7 @@ impl DynamoDBSys {
 
                     conn.execute(&upsert, [dataset_name, checkpoint_data])?;
 
-                    Ok::<(), tokio_rusqlite::Error>(())
+                    Ok::<(), rusqlite::Error>(())
                 },
             )
             .await
@@ -76,7 +76,7 @@ impl DynamoDBSys {
         let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
 
         conn.conn
-            .call(move |conn: &mut rusqlite::Connection| -> Result<DynamoDBCheckpointMetadata, tokio_rusqlite::Error> {
+            .call(move |conn: &mut rusqlite::Connection| -> Result<DynamoDBCheckpointMetadata, rusqlite::Error> {
                 let query = format!(
                     "SELECT checkpoint_data FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
                 );
@@ -88,7 +88,7 @@ impl DynamoDBSys {
 
                     Ok(DynamoDBCheckpointMetadata { checkpoint_data })
                 } else {
-                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                    Err(rusqlite::Error::QueryReturnedNoRows)
                 }
             })
             .await
