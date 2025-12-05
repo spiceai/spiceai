@@ -251,6 +251,11 @@ impl StreamState {
         for shard in shards {
             let shard_id = shard.shard_id.clone();
 
+            // // Skip closed shards (those with ending_sequence_number)
+            // if shard.ending_sequence_number.is_some() {
+            //     continue;
+            // }
+
             // At each iteration we will get all currently non-expired shards
             // Only subset of them we haven't seen before
             if self.active.contains_key(&shard_id)
@@ -382,7 +387,6 @@ pub async fn initialize_state_from_checkpoint(
                 shard_id,
                 &iterator_type,
                 Some(shard_checkpoint.sequence_number.clone()),
-                true,
             )
             .await?;
 
@@ -1179,22 +1183,15 @@ mod tests {
             assert!(state.blocked.contains_key("child"));
             assert!(!state.initializing.contains_key("child"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(child.last_checkpoint.sequence_number, "0");
+            assert_eq!(child.last_checkpoint.parent_id, Some("parent".to_string()));
+            assert_eq!(child.last_checkpoint.position, CheckpointPosition::At);
         }
 
         #[test]
@@ -1227,22 +1224,15 @@ mod tests {
             assert!(state.blocked.contains_key("child"));
             assert!(!state.initializing.contains_key("child"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(child.last_checkpoint.sequence_number, "0");
+            assert_eq!(child.last_checkpoint.parent_id, Some("parent".to_string()));
+            assert_eq!(child.last_checkpoint.position, CheckpointPosition::At);
         }
 
         #[test]
@@ -1277,22 +1267,15 @@ mod tests {
             assert!(state.blocked.contains_key("child"));
             assert!(!state.initializing.contains_key("child"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(child.last_checkpoint.sequence_number, "0");
+            assert_eq!(child.last_checkpoint.parent_id, Some("parent".to_string()));
+            assert_eq!(child.last_checkpoint.position, CheckpointPosition::At);
         }
 
         #[test]
@@ -1366,22 +1349,12 @@ mod tests {
             assert!(state.blocked.contains_key("shard-1"));
             assert!(!state.initializing.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("shard-1")
-                    .expect("shard-1 should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                }
-            );
+            let shard = state
+                .blocked
+                .get("shard-1")
+                .expect("shard-1 should be in pending");
+            assert_eq!(shard.shard_id, "shard-1");
+            assert_eq!(shard.parent_shard_id, None);
         }
 
         #[test]
@@ -1473,22 +1446,18 @@ mod tests {
 
             // child-1: blocked by active parent
             assert!(state.blocked.contains_key("child-1"));
+            let child1 = state
+                .blocked
+                .get("child-1")
+                .expect("child-1 should be in pending");
+            assert_eq!(child1.shard_id, "child-1");
+            assert_eq!(child1.parent_shard_id, Some("parent-1".to_string()));
+            assert_eq!(child1.last_checkpoint.sequence_number, "0");
             assert_eq!(
-                state
-                    .blocked
-                    .get("child-1")
-                    .expect("child-1 should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child-1".to_string(),
-                    parent_shard_id: Some("parent-1".to_string()),
-                }
+                child1.last_checkpoint.parent_id,
+                Some("parent-1".to_string())
             );
+            assert_eq!(child1.last_checkpoint.position, CheckpointPosition::At);
 
             // child-2: parent doesn't exist, not blocked
             assert!(state.initializing.contains_key("child-2"));
@@ -1513,7 +1482,7 @@ mod tests {
 
             state.initializing.insert(
                 "shard-1".to_string(),
-                BlockedShard {
+                InitializingShard {
                     last_checkpoint: ShardCheckpoint {
                         sequence_number: String::new(),
                         parent_id: None,
@@ -1522,6 +1491,8 @@ mod tests {
                     },
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: Some("parent".to_string()),
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1550,7 +1521,7 @@ mod tests {
 
             state.initializing.insert(
                 "shard-1".to_string(),
-                BlockedShard {
+                InitializingShard {
                     last_checkpoint: ShardCheckpoint {
                         sequence_number: String::new(),
                         parent_id: None,
@@ -1559,6 +1530,8 @@ mod tests {
                     },
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1621,22 +1594,12 @@ mod tests {
             assert!(state.blocked.contains_key("shard-1"));
             assert!(!state.initializing.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("shard-1")
-                    .expect("shard-1 should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                }
-            );
+            let shard = state
+                .blocked
+                .get("shard-1")
+                .expect("shard-1 should be in pending");
+            assert_eq!(shard.shard_id, "shard-1");
+            assert_eq!(shard.parent_shard_id, None);
         }
 
         #[test]
@@ -1645,7 +1608,7 @@ mod tests {
 
             state.initializing.insert(
                 "shard-1".to_string(),
-                BlockedShard {
+                InitializingShard {
                     last_checkpoint: ShardCheckpoint {
                         sequence_number: String::new(),
                         parent_id: None,
@@ -1654,11 +1617,13 @@ mod tests {
                     },
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
             state.initializing.insert(
                 "shard-2".to_string(),
-                BlockedShard {
+                InitializingShard {
                     last_checkpoint: ShardCheckpoint {
                         sequence_number: String::new(),
                         parent_id: None,
@@ -1667,6 +1632,8 @@ mod tests {
                     },
                     shard_id: "shard-2".to_string(),
                     parent_shard_id: Some("parent".to_string()),
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1725,22 +1692,12 @@ mod tests {
             assert!(!state.blocked.contains_key("child"));
             assert!(state.initializing.contains_key("child"));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("child")
-                    .expect("child should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .initializing
+                .get("child")
+                .expect("child should be in initializing");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
         }
 
         #[test]
@@ -1801,55 +1758,28 @@ mod tests {
             // Other child should remain pending
             assert!(state.blocked.contains_key("other-child"));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("child-1")
-                    .expect("child-1 should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child-1".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child1 = state
+                .initializing
+                .get("child-1")
+                .expect("child-1 should be in initializing");
+            assert_eq!(child1.shard_id, "child-1");
+            assert_eq!(child1.parent_shard_id, Some("parent".to_string()));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("child-2")
-                    .expect("child-2 should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child-2".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child2 = state
+                .initializing
+                .get("child-2")
+                .expect("child-2 should be in initializing");
+            assert_eq!(child2.shard_id, "child-2");
+            assert_eq!(child2.parent_shard_id, Some("parent".to_string()));
 
+            let other_child = state
+                .blocked
+                .get("other-child")
+                .expect("other-child should be in pending");
+            assert_eq!(other_child.shard_id, "other-child");
             assert_eq!(
-                state
-                    .blocked
-                    .get("other-child")
-                    .expect("other-child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "other-child".to_string(),
-                    parent_shard_id: Some("other-parent".to_string()),
-                }
+                other_child.parent_shard_id,
+                Some("other-parent".to_string())
             );
         }
 
@@ -1880,22 +1810,12 @@ mod tests {
             assert!(state.blocked.contains_key("unrelated"));
             assert!(!state.initializing.contains_key("unrelated"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("unrelated")
-                    .expect("unrelated should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "unrelated".to_string(),
-                    parent_shard_id: Some("other-parent".to_string()),
-                }
-            );
+            let unrelated = state
+                .blocked
+                .get("unrelated")
+                .expect("unrelated should be in pending");
+            assert_eq!(unrelated.shard_id, "unrelated");
+            assert_eq!(unrelated.parent_shard_id, Some("other-parent".to_string()));
         }
 
         #[test]
@@ -1947,22 +1867,12 @@ mod tests {
             assert!(!state.initializing.contains_key("child"));
             assert!(state.active.contains_key("grandparent"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("grandparent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("grandparent".to_string()));
         }
     }
 
@@ -1994,22 +1904,12 @@ mod tests {
             assert!(!state.blocked.contains_key("shard-1"));
             assert!(!state.active.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("shard-1")
-                    .expect("shard-1 should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                }
-            );
+            let shard = state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing");
+            assert_eq!(shard.shard_id, "shard-1");
+            assert_eq!(shard.parent_shard_id, None);
         }
 
         #[test]
@@ -2054,22 +1954,12 @@ mod tests {
             assert!(state.blocked.contains_key("child"));
             assert!(state.active.contains_key("parent"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
         }
 
         #[test]
@@ -2111,22 +2001,12 @@ mod tests {
             assert!(state.blocked.contains_key("child"));
             assert!(state.blocked.contains_key("parent"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
         }
 
         #[test]
@@ -2135,7 +2015,7 @@ mod tests {
 
             state.initializing.insert(
                 "parent".to_string(),
-                BlockedShard {
+                InitializingShard {
                     last_checkpoint: ShardCheckpoint {
                         sequence_number: String::new(),
                         parent_id: None,
@@ -2144,6 +2024,8 @@ mod tests {
                     },
                     shard_id: "parent".to_string(),
                     parent_shard_id: None,
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -2168,39 +2050,19 @@ mod tests {
             assert!(state.blocked.contains_key("child"));
             assert!(state.initializing.contains_key("parent"));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child")
-                    .expect("child should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                }
-            );
+            let child = state
+                .blocked
+                .get("child")
+                .expect("child should be in pending");
+            assert_eq!(child.shard_id, "child");
+            assert_eq!(child.parent_shard_id, Some("parent".to_string()));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("parent")
-                    .expect("parent should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "parent".to_string(),
-                    parent_shard_id: None,
-                }
-            );
+            let parent = state
+                .initializing
+                .get("parent")
+                .expect("parent should be in initializing");
+            assert_eq!(parent.shard_id, "parent");
+            assert_eq!(parent.parent_shard_id, None);
         }
     }
 
@@ -2212,7 +2074,9 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Discover initial shard
-            state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
+            state
+                .add_discovered(vec![create_api_shard("shard-1", None, None)])
+                .unwrap();
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
             assert_eq!(state.initializing.len(), 1);
@@ -2270,10 +2134,12 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Discover parent and child
-            state.add_discovered(vec![
-                create_api_shard("parent", None, None),
-                create_api_shard("child", Some("parent"), None),
-            ]);
+            state
+                .add_discovered(vec![
+                    create_api_shard("parent", None, None),
+                    create_api_shard("child", Some("parent"), None),
+                ])
+                .unwrap();
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
@@ -2329,11 +2195,13 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Add three generations
-            state.add_discovered(vec![
-                create_api_shard("gen1", None, None),
-                create_api_shard("gen2", Some("gen1"), None),
-                create_api_shard("gen3", Some("gen2"), None),
-            ]);
+            state
+                .add_discovered(vec![
+                    create_api_shard("gen1", None, None),
+                    create_api_shard("gen2", Some("gen1"), None),
+                    create_api_shard("gen3", Some("gen2"), None),
+                ])
+                .unwrap();
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -2349,7 +2217,9 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Exhaust gen1
-            state.handle_poll_result("gen1", None, vec![create_record("100")]);
+            state
+                .handle_poll_result("gen1", None, vec![create_record("100")])
+                .unwrap();
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
             assert_eq!(state.initializing.len(), 1);
@@ -2363,7 +2233,9 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Exhaust gen2
-            state.handle_poll_result("gen2", None, vec![create_record("200")]);
+            state
+                .handle_poll_result("gen2", None, vec![create_record("200")])
+                .unwrap();
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
             assert_eq!(state.initializing.len(), 1);
@@ -2387,11 +2259,13 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Parent splits into two children
-            state.add_discovered(vec![
-                create_api_shard("parent", None, None),
-                create_api_shard("child-a", Some("parent"), None),
-                create_api_shard("child-b", Some("parent"), None),
-            ]);
+            state
+                .add_discovered(vec![
+                    create_api_shard("parent", None, None),
+                    create_api_shard("child-a", Some("parent"), None),
+                    create_api_shard("child-b", Some("parent"), None),
+                ])
+                .unwrap();
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -2407,7 +2281,9 @@ mod tests {
             assert!(state.blocked.contains_key("child-b"));
 
             // Exhaust parent
-            state.handle_poll_result("parent", None, vec![create_record("100")]);
+            state
+                .handle_poll_result("parent", None, vec![create_record("100")])
+                .unwrap();
 
             // Both children should now be initializing
             assert_eq!(state.active.len(), 0);
@@ -2448,7 +2324,9 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Add initial shard
-            state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
+            state
+                .add_discovered(vec![create_api_shard("shard-1", None, None)])
+                .unwrap();
             state.mark_active("shard-1".to_string(), "iter-1".to_string());
 
             assert_eq!(state.active.len(), 1);
@@ -2456,7 +2334,9 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Rediscover same shard - should be ignored
-            state.add_discovered(vec![create_api_shard("shard-1", None, None)]);
+            state
+                .add_discovered(vec![create_api_shard("shard-1", None, None)])
+                .unwrap();
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 0);
@@ -2550,22 +2430,12 @@ mod tests {
             assert_eq!(state.initializing.len(), 1);
             assert!(state.initializing.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("shard-1")
-                    .expect("shard-1 should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                }
-            );
+            let shard = state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing");
+            assert_eq!(shard.shard_id, "shard-1");
+            assert_eq!(shard.parent_shard_id, None);
         }
 
         #[test]
@@ -2602,12 +2472,14 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
 
             // Two independent parent-child chains
-            state.add_discovered(vec![
-                create_api_shard("parent-1", None, None),
-                create_api_shard("parent-2", None, None),
-                create_api_shard("child-1", Some("parent-1"), None),
-                create_api_shard("child-2", Some("parent-2"), None),
-            ]);
+            state
+                .add_discovered(vec![
+                    create_api_shard("parent-1", None, None),
+                    create_api_shard("parent-2", None, None),
+                    create_api_shard("child-1", Some("parent-1"), None),
+                    create_api_shard("child-2", Some("parent-2"), None),
+                ])
+                .unwrap();
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -2621,7 +2493,9 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             // Exhaust parent-1
-            state.handle_poll_result("parent-1", None, vec![create_record("100")]);
+            state
+                .handle_poll_result("parent-1", None, vec![create_record("100")])
+                .unwrap();
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);
@@ -2632,39 +2506,19 @@ mod tests {
             assert!(state.active.contains_key("parent-2"));
             assert!(!state.active.contains_key("parent-1"));
 
-            assert_eq!(
-                state
-                    .initializing
-                    .get("child-1")
-                    .expect("child-1 should be in initializing"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child-1".to_string(),
-                    parent_shard_id: Some("parent-1".to_string()),
-                }
-            );
+            let child1 = state
+                .initializing
+                .get("child-1")
+                .expect("child-1 should be in initializing");
+            assert_eq!(child1.shard_id, "child-1");
+            assert_eq!(child1.parent_shard_id, Some("parent-1".to_string()));
 
-            assert_eq!(
-                state
-                    .blocked
-                    .get("child-2")
-                    .expect("child-2 should be in pending"),
-                &BlockedShard {
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: String::new(),
-                        parent_id: None,
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::After,
-                    },
-                    shard_id: "child-2".to_string(),
-                    parent_shard_id: Some("parent-2".to_string()),
-                }
-            );
+            let child2 = state
+                .blocked
+                .get("child-2")
+                .expect("child-2 should be in pending");
+            assert_eq!(child2.shard_id, "child-2");
+            assert_eq!(child2.parent_shard_id, Some("parent-2".to_string()));
 
             let parent2 = state
                 .active

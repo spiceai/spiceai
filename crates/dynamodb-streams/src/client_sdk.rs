@@ -18,14 +18,12 @@ use aws_config::SdkConfig;
 use aws_sdk_dynamodb::Client as DbClient;
 use aws_sdk_dynamodbstreams::types::Record;
 use aws_sdk_dynamodbstreams::{Client as StreamsClient, types::ShardIteratorType};
-use util::retry_strategy::{Backoff, RetryBackoff};
 
 #[derive(Debug, Clone)]
 pub struct SDKClient {
     db: DbClient,
     streams: StreamsClient,
     shard_record_limit: Option<i32>,
-    retry_strategy: RetryBackoff,
 }
 
 #[derive(Clone, Debug)]
@@ -37,147 +35,64 @@ pub struct ApiShard {
 }
 
 impl SDKClient {
-    pub fn new(
-        config: &SdkConfig,
-        shard_record_limit: Option<i32>,
-        retry_strategy: RetryBackoff,
-    ) -> Self {
+    pub fn new(config: &SdkConfig, shard_record_limit: Option<i32>) -> Self {
         Self {
             db: DbClient::new(config),
             streams: StreamsClient::new(config),
             shard_record_limit,
-            retry_strategy,
         }
     }
 
-    pub async fn get_stream_arn(&self, table_name: String, with_retry: bool) -> Result<String> {
-        if with_retry {
-            let mut backoff = self.retry_strategy.clone();
-            loop {
-                match self
-                    .db
-                    .describe_table()
-                    .table_name(&table_name)
-                    .send()
-                    .await
-                    .map_err(Error::from_describe_table)
-                {
-                    Ok(output) => {
-                        let table = output.table.ok_or_else(|| Error::TableNotFound)?;
-                        return table.latest_stream_arn.ok_or_else(|| Error::StreamNotFound);
-                    }
-                    Err(e) if e.is_retriable() => {
-                        if let Some(duration) = backoff.next_backoff() {
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        } else {
-            let table = self
-                .db
-                .describe_table()
-                .table_name(&table_name)
-                .send()
-                .await
-                .map_err(Error::from_describe_table)?
-                .table
-                .ok_or_else(|| Error::TableNotFound)?;
+    pub async fn get_stream_arn(&self, table_name: String) -> Result<String> {
+        let table = self
+            .db
+            .describe_table()
+            .table_name(&table_name)
+            .send()
+            .await
+            .map_err(Error::from_describe_table)?
+            .table
+            .ok_or_else(|| Error::TableNotFound)?;
 
-            table.latest_stream_arn.ok_or_else(|| Error::StreamNotFound)
-        }
+        table.latest_stream_arn.ok_or_else(|| Error::StreamNotFound)
     }
 
     async fn get_shards(
         &self,
         stream_arn: &str,
         exclusive_start_shard_id: Option<String>,
-        with_retry: bool,
     ) -> Result<(Vec<ApiShard>, Option<String>)> {
-        if with_retry {
-            let mut backoff = self.retry_strategy.clone();
-            loop {
-                match self
-                    .streams
-                    .describe_stream()
-                    .stream_arn(stream_arn)
-                    .set_exclusive_start_shard_id(exclusive_start_shard_id.clone())
-                    .send()
-                    .await
-                    .map_err(Error::from_describe_stream)
-                {
-                    Ok(output) => {
-                        let description = output.stream_description.ok_or_else(|| {
-                            Error::StreamDescriptionNotFound {
-                                stream_arn: stream_arn.to_string(),
-                            }
-                        })?;
+        let description = self
+            .streams
+            .describe_stream()
+            .stream_arn(stream_arn)
+            .set_exclusive_start_shard_id(exclusive_start_shard_id)
+            .send()
+            .await
+            .map_err(Error::from_describe_stream)?
+            .stream_description
+            .ok_or_else(|| Error::StreamDescriptionNotFound {
+                stream_arn: stream_arn.to_string(),
+            })?;
 
-                        let shards = description
-                            .shards
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|s| ApiShard {
-                                shard_id: s.shard_id.unwrap_or_default(),
-                                parent_shard_id: s.parent_shard_id,
-                                starting_sequence_number: s
-                                    .sequence_number_range
-                                    .as_ref()
-                                    .and_then(|r| r.starting_sequence_number.clone()),
-                                ending_sequence_number: s
-                                    .sequence_number_range
-                                    .and_then(|r| r.ending_sequence_number),
-                            })
-                            .collect();
+        let shards = description
+            .shards
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| ApiShard {
+                shard_id: s.shard_id.unwrap_or_default(),
+                parent_shard_id: s.parent_shard_id,
+                starting_sequence_number: s
+                    .sequence_number_range
+                    .as_ref()
+                    .and_then(|r| r.starting_sequence_number.clone()),
+                ending_sequence_number: s
+                    .sequence_number_range
+                    .and_then(|r| r.ending_sequence_number),
+            })
+            .collect();
 
-                        return Ok((shards, description.last_evaluated_shard_id));
-                    }
-                    Err(e) if e.is_retriable() => {
-                        if let Some(duration) = backoff.next_backoff() {
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        } else {
-            let description = self
-                .streams
-                .describe_stream()
-                .stream_arn(stream_arn)
-                .set_exclusive_start_shard_id(exclusive_start_shard_id)
-                .send()
-                .await
-                .map_err(Error::from_describe_stream)?
-                .stream_description
-                .ok_or_else(|| Error::StreamDescriptionNotFound {
-                    stream_arn: stream_arn.to_string(),
-                })?;
-
-            let shards = description
-                .shards
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| ApiShard {
-                    shard_id: s.shard_id.unwrap_or_default(),
-                    parent_shard_id: s.parent_shard_id,
-                    starting_sequence_number: s
-                        .sequence_number_range
-                        .as_ref()
-                        .and_then(|r| r.starting_sequence_number.clone()),
-                    ending_sequence_number: s
-                        .sequence_number_range
-                        .and_then(|r| r.ending_sequence_number),
-                })
-                .collect();
-
-            Ok((shards, description.last_evaluated_shard_id))
-        }
+        Ok((shards, description.last_evaluated_shard_id))
     }
 
     pub async fn get_shard_iterator(
@@ -186,55 +101,21 @@ impl SDKClient {
         shard_id: &str,
         shard_iterator_type: &ShardIteratorType,
         sequence_number: Option<String>,
-        with_retry: bool,
     ) -> Result<String> {
-        if with_retry {
-            let mut backoff = self.retry_strategy.clone();
-            loop {
-                match self
-                    .streams
-                    .get_shard_iterator()
-                    .stream_arn(stream_arn)
-                    .shard_id(shard_id)
-                    .shard_iterator_type(shard_iterator_type.clone())
-                    .set_sequence_number(sequence_number.clone())
-                    .send()
-                    .await
-                    .map_err(Error::from_get_shard_iterator)
-                {
-                    Ok(output) => {
-                        return output
-                            .shard_iterator
-                            .ok_or_else(|| Error::ShardIteratorNotFound {
-                                shard_id: shard_id.to_string(),
-                            });
-                    }
-                    Err(e) if e.is_retriable() => {
-                        if let Some(duration) = backoff.next_backoff() {
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        } else {
-            Ok(self
-                .streams
-                .get_shard_iterator()
-                .stream_arn(stream_arn)
-                .shard_id(shard_id)
-                .shard_iterator_type(shard_iterator_type.clone())
-                .set_sequence_number(sequence_number.clone())
-                .send()
-                .await
-                .map_err(Error::from_get_shard_iterator)?
-                .shard_iterator
-                .ok_or_else(|| Error::ShardIteratorNotFound {
-                    shard_id: shard_id.to_string(),
-                })?)
-        }
+        Ok(self
+            .streams
+            .get_shard_iterator()
+            .stream_arn(stream_arn)
+            .shard_id(shard_id)
+            .shard_iterator_type(shard_iterator_type.clone())
+            .set_sequence_number(sequence_number.clone())
+            .send()
+            .await
+            .map_err(Error::from_get_shard_iterator)?
+            .shard_iterator
+            .ok_or_else(|| Error::ShardIteratorNotFound {
+                shard_id: shard_id.to_string(),
+            })?)
     }
 
     pub async fn get_iterator_records(
@@ -256,18 +137,12 @@ impl SDKClient {
         ))
     }
 
-    pub async fn get_all_shards(
-        &self,
-        stream_arn: &str,
-        with_retry: bool,
-    ) -> Result<Vec<ApiShard>> {
+    pub async fn get_all_shards(&self, stream_arn: &str) -> Result<Vec<ApiShard>> {
         let mut all_shards = Vec::new();
         let mut last_shard_id = None;
 
         loop {
-            let (shards, next_shard_id) = self
-                .get_shards(stream_arn, last_shard_id, with_retry)
-                .await?;
+            let (shards, next_shard_id) = self.get_shards(stream_arn, last_shard_id).await?;
             all_shards.extend(shards);
 
             last_shard_id = next_shard_id;

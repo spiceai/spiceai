@@ -86,7 +86,7 @@ impl DynamodbStreamProducer {
 
         // 4. Discover new shards
         // If permanent error is encountered, it is surfaced to the client.
-        match self.client.get_all_shards(&self.stream_arn, false).await {
+        match self.client.get_all_shards(&self.stream_arn).await {
             Ok(shards) => self.state.add_discovered(shards)?,
             Err(e) => {
                 if !e.is_retriable() {
@@ -116,7 +116,6 @@ impl DynamodbStreamProducer {
                     &shard.shard_id,
                     &iterator_type,
                     Some(shard.last_checkpoint.sequence_number.clone()),
-                    false,
                 )
                 .await
             {
