@@ -86,9 +86,7 @@ pub enum Error {
     },
 
     #[snafu(display("Error parsing 'snapshots_batches` as integer: {source}"))]
-    UnableToParseSnapshotsBatches {
-        source: std::num::ParseIntError,
-    },
+    UnableToParseSnapshotsBatches { source: std::num::ParseIntError },
 
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
