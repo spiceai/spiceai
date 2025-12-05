@@ -172,7 +172,7 @@ fn suggest_tables(
 impl Completer for EditorHelper {
     type Candidate = Pair;
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn complete(
         &self,
         line: &str,
@@ -202,8 +202,7 @@ impl Completer for EditorHelper {
                         true
                     } else {
                         // Count words after "from" - if only 1 word (potentially incomplete), suggest tables
-                        let words_after_from: Vec<&str> = after_from.split_whitespace().collect();
-                        words_after_from.len() <= 1
+                        after_from.split_whitespace().count() <= 1
                     }
                 } else {
                     false
@@ -313,7 +312,7 @@ impl Completer for EditorHelper {
     }
 }
 
-#[allow(clippy::similar_names)]
+#[expect(clippy::similar_names)]
 async fn refresh_schema(
     client: FlightServiceClient<Channel>,
     schema_cache: &Arc<RwLock<SchemaCache>>,
@@ -615,7 +614,7 @@ fn extract_word(line: &str, pos: usize) -> (usize, &str) {
 }
 
 fn is_word_boundary(ch: char) -> bool {
-    #[allow(clippy::match_like_matches_macro)]
+    #[expect(clippy::match_like_matches_macro)]
     match ch {
         ' ' | '\t' | '\n' | '\r' => true,
         '(' | ')' | ',' | ';' | '=' | '<' | '>' | '!' | '+' | '-' | '*' | '/' | '%' => true,

@@ -72,7 +72,7 @@ pub fn parse_datetime(input: &str, go_format: &str) -> Option<ParsedDateTime> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
     if go_format.is_empty() {
         return None;
@@ -238,7 +238,6 @@ mod tests {
     use super::*;
     use chrono::{Datelike, FixedOffset, TimeZone, Timelike, Utc};
 
-    #[allow(clippy::too_many_arguments)]
     fn make_utc(
         year: i32,
         month: u32,
@@ -505,7 +504,7 @@ mod tests {
     }
 
     // Helper to unwrap as WithOffset variant
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn expect_with_offset(result: Option<ParsedDateTime>) -> DateTime<FixedOffset> {
         match result {
             Some(ParsedDateTime::WithOffset(dt)) => dt,
@@ -515,7 +514,7 @@ mod tests {
     }
 
     // Helper to unwrap as Naive variant
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn expect_naive(result: Option<ParsedDateTime>) -> NaiveDateTime {
         match result {
             Some(ParsedDateTime::Naive(dt)) => dt,

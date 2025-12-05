@@ -24,7 +24,7 @@ use data_components::Read;
 use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -153,3 +153,5 @@ impl DataConnector for Snowflake {
             })?)
     }
 }
+
+register_data_connector!("snowflake", SnowflakeFactory);

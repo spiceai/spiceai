@@ -53,6 +53,9 @@ pub mod debezium_kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
+
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
@@ -161,7 +164,7 @@ pub enum OpenOption {
     OpenExisting,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,

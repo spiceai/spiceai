@@ -388,7 +388,7 @@ impl Spicepod {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[must_use]
 fn from_definition(
     spicepod_definition: SpicepodDefinition,

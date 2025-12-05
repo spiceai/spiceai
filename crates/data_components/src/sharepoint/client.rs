@@ -151,7 +151,7 @@ enum DrivePtr {
 }
 
 /// Resolves a `DrivePtr` into a `DriveId`. This ensures that the `DriveId` is unique and can be used to fetch drive items.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn resolve_drive_ptr(
     client: Arc<GraphClient>,
     drive: &PublicDrivePtr,
@@ -468,7 +468,7 @@ async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, Strin
 ///    "name2": "id2",
 /// })
 /// ```
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn process_list_objs(
     resp: &serde_json::Value,
     name_key: &str,

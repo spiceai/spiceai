@@ -243,21 +243,17 @@ pub(crate) async fn get(
         HashMap::default()
     };
     let worker_registry = rt.workers.read().await;
-    let workers = worker_registry
-        .iter()
-        .filter_map(|(name, worker)| {
-            Arc::clone(worker).as_model()?;
-            Some(OpenAIModel {
-                id: name.clone(),
-                object: "model".to_string(),
-                owned_by: "spiceai".to_string(),
-                datasets: None,
-                status: worker_statuses.get(name).copied(),
-                metadata: generate_metadata(name, &metadata_keys, &responses_models),
-            })
+    models.extend(worker_registry.iter().filter_map(|(name, worker)| {
+        Arc::clone(worker).as_model()?;
+        Some(OpenAIModel {
+            id: name.clone(),
+            object: "model".to_string(),
+            owned_by: "spiceai".to_string(),
+            datasets: None,
+            status: worker_statuses.get(name).copied(),
+            metadata: generate_metadata(name, &metadata_keys, &responses_models),
         })
-        .collect::<Vec<OpenAIModel>>();
-    models.extend(workers.into_iter());
+    }));
 
     match params.format {
         Format::Json => (

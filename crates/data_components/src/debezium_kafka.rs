@@ -102,7 +102,7 @@ impl DebeziumKafka {
 
                 let val = msg.value();
                 changes::to_change_batch(&schema, &pk, val)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb, true))
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
             });
 

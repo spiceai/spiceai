@@ -115,7 +115,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
@@ -182,7 +182,7 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 

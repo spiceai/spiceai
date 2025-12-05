@@ -21,9 +21,9 @@ mod client_sdk;
 mod stream;
 mod stream_state;
 
-pub use crate::stream_state::DynamoDBStreamBatch;
+pub use checkpoint::Checkpoint;
 pub use client::Client;
-pub use stream::DynamodbStream;
+pub use stream::{DynamoDBStreamBatch, DynamodbStream};
 
 pub type StreamResult = Result<DynamoDBStreamBatch, Error>;
 
@@ -46,4 +46,7 @@ pub enum Error {
         "Failed to initialize checkpoint due to empty starting_sequence_number in one of the open shards"
     ))]
     FailedToInitializeCheckpoint,
+
+    #[snafu(display("Unexpected shard id: {shard_id}"))]
+    UnexpectedShardId { shard_id: String },
 }

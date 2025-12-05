@@ -105,7 +105,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             cache_control::CacheControl::Cache,
         )
         .await;
-        assert!(result.is_ok());
+        result.expect("should succeed with valid API key");
 
         let Err(e) = flightrepl::get_records(
             client,

@@ -70,7 +70,7 @@ jobs:
           echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Validate spicepod file exists
         run: |

@@ -29,6 +29,8 @@ use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
+#[cfg(not(windows))]
+use cayenne::optimizer_rules::CayenneJoinRewriter;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -56,6 +58,8 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -242,7 +246,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -265,12 +269,23 @@ impl DataFusionBuilder {
 
         #[cfg(feature = "duckdb")]
         {
+            let mut physical_optimizers_with_duckdb: Vec<
+                Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+            > = vec![
+                DuckDBAggregatePushdownRewriter::new(),
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            ];
+
+            physical_optimizers_with_duckdb.extend(
+                state
+                    .physical_optimizer_rules()
+                    .clone()
+                    .unwrap_or_else(|| PhysicalOptimizer::new().rules),
+            );
+
             state = state
                 .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
-                .with_physical_optimizer_rule(
-                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
-                );
+                .with_physical_optimizer_rules(physical_optimizers_with_duckdb);
         }
 
         state = state
@@ -278,6 +293,11 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
             )));
+
+        #[cfg(not(windows))]
+        {
+            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+        }
 
         let mut state = state.build();
 
@@ -446,7 +466,7 @@ pub(crate) fn runtime_env(
     // If no memory limit is specified, default to 70% of total memory (container-aware)
     let effective_memory_limit = memory_limit.or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
@@ -456,7 +476,7 @@ pub(crate) fn runtime_env(
         tracing::debug!(
             "No memory limit specified, defaulting to 70% of total memory: {}",
             {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 util::human_readable_bytes(default_limit as usize)
             }
         );

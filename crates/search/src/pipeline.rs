@@ -94,7 +94,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
     }
 
     /// Runs the search pipeline with the provided parameters.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         query: String,
@@ -309,21 +309,21 @@ pub(crate) mod tests {
     fn test_search_request_parse_keywords() {
         let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test keyword with a space
         let keywords = vec!["keyword 1".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test empty keyword
         let keywords = vec![String::new()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test escaping keyword
         let keywords = vec!["'); DROP TABLE testing;".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_err());
+        result.expect_err("should be invalid search keywords");
     }
 }

@@ -73,7 +73,6 @@ impl AppendWorker {
         Self { config, source }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn start(self) -> Result<JoinHandle<Result<()>>> {
         // Outside of the join handle, run some initial setup
         // This ensures the appendable dataset is ready before the workers start

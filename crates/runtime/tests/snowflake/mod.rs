@@ -32,7 +32,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
     let warehouse =

@@ -245,8 +245,6 @@ mod tests {
         let path = object_store::path::Path::from("data");
 
         let stripped = strip_prefix(&table_url, &path).expect("Failed to strip prefix");
-        let parts: Vec<&str> = stripped.collect();
-
-        assert!(parts.is_empty());
+        assert_eq!(stripped.count(), 0);
     }
 }

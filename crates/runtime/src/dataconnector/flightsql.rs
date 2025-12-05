@@ -17,7 +17,7 @@ limitations under the License.
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 };
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -165,3 +165,5 @@ impl DataConnector for FlightSQL {
         )
     }
 }
+
+register_data_connector!("flightsql", FlightSQLFactory);

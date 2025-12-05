@@ -237,7 +237,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -362,7 +362,7 @@ async fn duckdb_regexp() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_duckdb_settings_persist() -> Result<(), String> {
     use spicepod::param::Params;
     use std::collections::HashMap;
@@ -507,7 +507,7 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_duckdb_all_settings() -> Result<(), String> {
     use spicepod::param::Params;
     use std::collections::HashMap;

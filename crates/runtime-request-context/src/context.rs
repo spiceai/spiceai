@@ -86,7 +86,7 @@ pub struct AsyncMarker {
 impl AsyncMarker {
     // This can only be called in async contexts due to .await
     #[must_use]
-    #[allow(clippy::unused_async)]
+    #[expect(clippy::unused_async)]
     pub async fn new() -> Self {
         AsyncMarker {
             marker: PhantomData,

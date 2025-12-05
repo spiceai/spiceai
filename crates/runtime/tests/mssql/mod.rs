@@ -34,7 +34,7 @@ use tracing::instrument;
 const MSSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-types-mssql";
 const MSSQL_PORT: u16 = 11433;
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[instrument]
 async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     let mut config = tiberius::Config::new();

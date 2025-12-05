@@ -71,14 +71,14 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set spicepod path
         id: set_spicepod_path
         run: |
           query_set="${{ github.event.inputs.query_set }}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/accelerated/append/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists

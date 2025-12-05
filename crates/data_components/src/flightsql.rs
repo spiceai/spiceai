@@ -150,7 +150,7 @@ pub struct FlightSQLTable {
     schema: SchemaRef,
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 impl FlightSQLTable {
     pub async fn create(
         name: &'static str,
@@ -517,7 +517,6 @@ impl ExecutionPlan for FlightSqlExec {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     mut client: FlightSqlServiceClient<Channel>,
     sql: String,
@@ -548,9 +547,8 @@ fn query_to_stream(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 pub async fn get_client_for_flight_endpoint(

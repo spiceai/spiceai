@@ -32,7 +32,7 @@ use tokio::{
 };
 
 use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
 use datafusion::{datasource::TableProvider, sql::TableReference};
@@ -52,9 +52,13 @@ pub struct RefreshTaskRunnerBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator.
+    /// Shared with `CachingAccelerationScanExec`.
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl RefreshTaskRunnerBuilder {
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -64,6 +68,7 @@ impl RefreshTaskRunnerBuilder {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
+        cache_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -78,6 +83,7 @@ impl RefreshTaskRunnerBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            cache_mutex,
         }
     }
 
@@ -124,6 +130,7 @@ impl RefreshTaskRunnerBuilder {
             self.federated_source,
             self.accelerator,
             self.io_runtime,
+            self.cache_mutex,
         )
         .with_disable_federation(self.disable_federation)
         .with_metrics(self.metrics);
@@ -167,6 +174,7 @@ type RefreshTaskStartSender = Sender<Option<RefreshOverrides>>;
 type RefreshTaskCompletionReceiver = Receiver<super::Result<()>>;
 
 impl RefreshTaskRunner {
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -176,6 +184,7 @@ impl RefreshTaskRunner {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
+        cache_mutex: Arc<Mutex<()>>,
     ) -> RefreshTaskRunnerBuilder {
         RefreshTaskRunnerBuilder::new(
             runtime_status,
@@ -185,6 +194,7 @@ impl RefreshTaskRunner {
             refresh,
             accelerator,
             io_runtime,
+            cache_mutex,
         )
     }
 

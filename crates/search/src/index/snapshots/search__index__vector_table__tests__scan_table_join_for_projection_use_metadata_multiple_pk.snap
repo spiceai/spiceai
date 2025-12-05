@@ -1,7 +1,6 @@
 ---
 source: crates/search/src/index/vector_table.rs
 expression: "format!(\"{}\", pretty::pretty_format_batches(&col).map_err(|e| e.to_string())?)"
-snapshot_kind: text
 ---
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                             |
@@ -14,7 +13,7 @@ snapshot_kind: text
 |               |     ProjectionExec: expr=[another_column@3 as another_column, body_embedding@8 as body_embedding, not_where@4 as not_where, pk1@0 as pk1, pk2@1 as pk2, pk3@2 as pk3]            |
 |               |       CoalesceBatchesExec: target_batch_size=8192, fetch=5                                                                                                                       |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                              |
-|               |           HashJoinExec: mode=CollectLeft, join_type=Left, on=[(pk1@0, pk1@0), (pk2@1, pk2@1), (pk3@2, pk3@2)]                                                                    |
+|               |           HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(pk1@0, pk1@0), (pk2@1, pk2@1), (pk3@2, pk3@2)]                                 |
 |               |             BaseTable: projection=["pk1", "pk2", "pk3", "another_column", "not_where"] filter=[] limit=Some(5)                                                                   |
 |               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                 |
 |               |               PretendVectorIndex: projection=["pk1", "pk2", "pk3", "body_embedding"] filter=[] limit=None                                                                        |

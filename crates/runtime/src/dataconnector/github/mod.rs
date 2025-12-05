@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
+use crate::{
+    component::dataset::Dataset, dataconnector::github::members::MembersTableArgs,
+    register_data_connector,
+};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -641,11 +644,8 @@ impl DataConnectorFactory for GithubFactory {
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
                 match (token, client_id, private_key, installation_id) {
                     (Some(token), _, _, _) => {
-                        let key = token.clone().expose_secret().to_string();
-                        (
-                            Some(Arc::new(StaticTokenProvider::new(token.clone()))),
-                            Some(key),
-                        )
+                        let key = token.expose_secret().to_string();
+                        (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
                     }
 
                     (None, Some(client_id), Some(private_key), Some(installation_id)) => {
@@ -693,6 +693,8 @@ impl DataConnectorFactory for GithubFactory {
         PARAMETERS
     }
 }
+
+register_data_connector!("github", GithubFactory);
 
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {
@@ -793,7 +795,7 @@ fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
         self

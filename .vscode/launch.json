@@ -94,6 +94,23 @@
       "preLaunchTask": "rust: cargo build testoperator"
     },
     {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Dispatch)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "dispatch",
+        "./tools/testoperator/dispatch/tpch/sf1/accelerated/append/",
+        "--workflow",
+        "append",
+        "--github-token",
+        "<GITHUB_TOKEN>"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
       "name": "spice version",
       "type": "go",
       "request": "launch",
@@ -104,7 +121,7 @@
     {
       "type": "lldb",
       "request": "attach",
-      "name": "[Rust] Attack to spiced",
+      "name": "[Rust] Attach to spiced",
       "program": "~/.spice/bin/spiced",
       "pid": "${input:pid}"
     },

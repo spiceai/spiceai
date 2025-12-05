@@ -78,7 +78,6 @@ impl S3VectorsListTable {
 
 /// Create an execution plan to scan across spill indexes. If no spill indexes
 /// are found return None.
-#[allow(clippy::too_many_arguments)]
 fn create_spill_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -130,7 +129,7 @@ fn create_spill_plan(
 }
 
 /// Create an execution plan to scan across partitions.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn create_partition_plan(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
@@ -390,7 +389,6 @@ impl ExecutionPlan for S3VectorsListExec {
 ///
 /// Results are sent to the provided channel as soon as they are available and may arrive out of order
 /// as they read in parallel using multiple segments.
-#[allow(clippy::cast_possible_wrap)]
 async fn list_vector_stream(
     client: Arc<dyn S3Vectors + Send + Sync>,
     idx: S3VectorIdentifier,

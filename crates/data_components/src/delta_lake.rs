@@ -20,7 +20,7 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, exec_err};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -47,12 +47,13 @@ use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{ExpressionRef, Predicate};
+use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
@@ -82,6 +83,13 @@ pub enum Error {
         "Invalid Delta Lake Table partition value count. The PartitionedFile has a different number of partition values than the number of partition columns."
     ))]
     InvalidPartitionValueCount,
+
+    #[snafu(display(
+        "An error has occurred trying to read or update the current snapshot: {source}"
+    ))]
+    SnapshotLockError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -125,6 +133,7 @@ pub struct DeltaTable {
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     arrow_schema: SchemaRef,
     delta_schema: delta_kernel::schema::SchemaRef,
+    snapshot: RwLock<SnapshotRef>,
 }
 
 impl DeltaTable {
@@ -213,7 +222,32 @@ impl DeltaTable {
             engine,
             arrow_schema: Arc::new(arrow_schema),
             delta_schema,
+            snapshot: RwLock::new(snapshot),
         })
+    }
+
+    /// Gets the latest snapshot by paginating object storage. It uses version hints from the currently
+    /// bound snapshot to prune the log scan.
+    ///
+    /// At the start of a scan, you can get the latest snapshot then reuse it via `DeltaTable::bound_snapshot`
+    /// without polling object storage.
+    fn get_and_update_snapshot(&self) -> Result<SnapshotRef> {
+        let mut current_snapshot = self
+            .snapshot
+            .write()
+            .map_err(|e| Error::SnapshotLockError {
+                source: format!("Unable to update snapshot {e}").into(),
+            })?;
+
+        let new_snapshot = Snapshot::builder_from(Arc::clone(&*current_snapshot))
+            .build(self.engine.as_ref())
+            .context(DeltaTableSnafu)?;
+
+        if new_snapshot != *current_snapshot {
+            *current_snapshot = new_snapshot;
+        }
+
+        Ok(Arc::clone(&*current_snapshot))
     }
 
     fn get_schema(snapshot: &Snapshot) -> Schema {
@@ -231,7 +265,7 @@ impl DeltaTable {
         Schema::new(fields)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn create_parquet_exec(
         &self,
         projection: Option<&Vec<usize>>,
@@ -303,7 +337,7 @@ fn ensure_folder_location(table_location: String) -> String {
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
     delta_data_type: &delta_kernel::schema::DataType,
 ) -> DataType {
@@ -389,7 +423,7 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -397,9 +431,9 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        let snapshot = Snapshot::builder_for(self.table_url.clone())
-            .build(self.engine.as_ref())
-            .map_err(map_delta_error_to_datafusion_err)?;
+        let Ok(snapshot) = self.get_and_update_snapshot() else {
+            return exec_err!("Unable to get latest Delta table snapshot");
+        };
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
 
@@ -645,9 +679,8 @@ struct PartitionFileContext {
     _transform: Option<ExpressionRef>,
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::needless_pass_by_value)]
+#[expect(clippy::cast_sign_loss)]
 fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
@@ -750,8 +783,8 @@ fn get_full_selection_vector(selection_vector: &[bool], total_rows: usize) -> Ve
     new_selection_vector
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 async fn get_parquet_access_plan(
     parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
     partitioned_file: &PartitionedFile,
@@ -801,8 +834,7 @@ async fn get_parquet_access_plan(
 }
 
 /// Convert a `DataFusion` filter expression to a `delta_kernel` expression
-#[allow(clippy::too_many_lines)]
-#[allow(
+#[expect(
     deprecated,
     reason = "Needed to exhaustively match on all expression types"
 )]
@@ -928,8 +960,8 @@ fn to_delta_kernel_binary_expression(
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::too_many_lines)]
 fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
     match scalar {
         ScalarValue::Int8(Some(v)) => Some(Scalar::Byte(v)),
@@ -1104,8 +1136,8 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::similar_names)]
     fn test_to_delta_kernel_expr() {
         // Test basic column reference
         let col_expr = col("name");
@@ -1255,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn test_to_delta_kernel_scalar() {
         // Test string scalar
         let scalar = ScalarValue::Utf8(Some("test".to_string()));

@@ -76,7 +76,7 @@ pub(super) fn to_api_error(err: impl Into<String>) -> OpenAIError {
 }
 
 /// Extract the content, refusal and tool calls from a `ContentBlock`.
-#[allow(clippy::type_complexity, clippy::cast_possible_truncation)]
+#[expect(clippy::type_complexity)]
 pub(super) fn extract_from_content_block(
     blck: &ContentBlock,
 ) -> Result<
@@ -170,7 +170,7 @@ pub(super) fn tool_config(
         .ok()
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 pub(super) fn chat_choice_stream(
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
@@ -192,7 +192,7 @@ pub(super) fn chat_choice_stream(
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 pub(super) fn convert_usage(usage: &TokenUsage) -> CompletionUsage {
     let TokenUsage {
         input_tokens,

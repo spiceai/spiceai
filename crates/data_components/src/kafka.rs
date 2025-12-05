@@ -185,7 +185,7 @@ impl KafkaMetrics {
 }
 
 impl rdkafka::ClientContext for KafkaConsumerContext {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn stats(&self, statistics: rdkafka::Statistics) {
         // Calculate total consumer lag from all topic partitions
         let mut total_lag = 0u64;
@@ -540,7 +540,7 @@ impl Kafka {
 
                 // Wrap the record batch to emulate a change event
                 cdc::wrap_data_as_change_batch(&schema, &rb)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb, true))
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
             });
 
