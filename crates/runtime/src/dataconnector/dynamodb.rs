@@ -19,12 +19,15 @@ use super::{
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
 use crate::component::dataset::Dataset;
+use crate::dataaccelerator::spice_sys::OpenOption;
+use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
 use crate::federated_table::FederatedTable;
 use crate::register_data_connector;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use dynamodb_streams::checkpoint::Checkpoint;
 use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
@@ -237,7 +240,13 @@ impl DataConnector for DynamoDB {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        dataset: &Dataset,
+    ) -> Option<ChangesStream> {
+        let dataset = dataset.clone();
+
         Some(Box::pin(
             stream::once(async move {
                 let table_provider = federated_table.table_provider().await;
@@ -247,57 +256,207 @@ impl DataConnector for DynamoDB {
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
                 let dynamodb = Arc::new(dynamodb_ref.clone());
+                let dynamodb_sys = initialize_dynamodb_sys(&dataset).await?;
 
-                let checkpoint = match dynamodb.latest_global_checkpoint().await {
-                    Ok(checkpoint) => checkpoint,
-                    Err(err) => {
-                        tracing::error!(
-                            "Failed to get latest global checkpoint for DynamoDB Stream: {:?}",
-                            err
-                        );
-                        return None;
-                    }
-                };
+                let (should_bootstrap, checkpoint) =
+                    load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys).await?;
 
-                let bootstrap_stream = match Arc::clone(&dynamodb).bootstrap_stream().await {
-                    Ok(bootstrap_stream) => bootstrap_stream,
-                    Err(err) => {
-                        tracing::error!(
-                            "Failed to get bootstrap stream for DynamoDB Table: {:?}",
-                            err
-                        );
-                        return None;
-                    }
-                };
-
-                Some(
-                    bootstrap_stream
-                        .chain(
-                            stream::once(async move {
-                                tracing::debug!(
-                                    "Starting DynamoDB stream from checkpoint: {:?}",
-                                    checkpoint
-                                );
-
-                                match dynamodb.stream_from_checkpoint(checkpoint).await {
-                                    Ok(stream) => Some(stream),
-                                    Err(err) => {
-                                        tracing::error!(
-                                            "Failed to get bootstrap stream from checkpoint for DynamoDB Table: {:?}",
-                                            err
-                                        );
-                                        None
-                                    }
-                                }
+                if should_bootstrap {
+                    // Initialize bootstrap stream
+                    let bootstrap_stream = Arc::clone(&dynamodb)
+                        .bootstrap_stream()
+                        .await
+                        .ok()?
+                        .map(|msg| {
+                            msg.map(|change_batch| {
+                                // Bootstrap stream doesn't commit changes
+                                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch)
                             })
-                            .filter_map(|opt| async move { opt })
-                            .flatten()
-                        )
+                        });
+
+                    // Attach changes stream from initial checkpoint to bootstrap stream
+                    Some(
+                        bootstrap_stream
+                            .chain(
+                                stream::once(changes_stream_from_checkpoint(
+                                    Arc::clone(&dynamodb),
+                                    Arc::clone(&dynamodb_sys),
+                                    checkpoint,
+                                    true,
+                                ))
+                                .filter_map(|opt| async move { opt })
+                                .flatten(),
+                            )
+                            .boxed(),
+                    )
+                } else {
+                    // Resume reading from a checkpoint
+                    Some(
+                        stream::once(changes_stream_from_checkpoint(
+                            Arc::clone(&dynamodb),
+                            Arc::clone(&dynamodb_sys),
+                            checkpoint,
+                            false,
+                        ))
+                        .filter_map(|opt| async move { opt })
+                        .flatten()
                         .boxed(),
-                )
+                    )
+                }
             })
             .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
+    }
+}
+
+async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<Arc<DynamoDBSys>> {
+    match DynamoDBSys::try_new(dataset, OpenOption::OpenExisting).await {
+        Ok(sys) => Some(Arc::new(sys)),
+        Err(err) => {
+            tracing::error!(
+                "Failed to initialize DynamoDBSys for checkpoint persistence: {:?}",
+                err
+            );
+            None
+        }
+    }
+}
+
+/// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
+async fn load_or_initialize_checkpoint(
+    dynamodb: &Arc<DynamoDBTableProvider>,
+    dynamodb_sys: &Arc<DynamoDBSys>,
+) -> Option<(bool, Checkpoint)> {
+    let existing_checkpoint = dynamodb_sys.get().await;
+
+    if let Some(metadata) = existing_checkpoint {
+        match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
+            Ok(checkpoint) => {
+                tracing::info!(
+                    "Found existing checkpoint for DynamoDB Stream, resuming from checkpoint"
+                );
+                Some((false, checkpoint))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to deserialize checkpoint, falling back to bootstrap: {:?}",
+                    err
+                );
+                get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
+            }
+        }
+    } else {
+        tracing::info!("No existing checkpoint found, starting from bootstrap");
+        get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
+    }
+}
+
+async fn get_latest_checkpoint(dynamodb: &Arc<DynamoDBTableProvider>) -> Option<Checkpoint> {
+    match dynamodb.latest_global_checkpoint().await {
+        Ok(checkpoint) => Some(checkpoint),
+        Err(err) => {
+            tracing::error!(
+                "Failed to get latest global checkpoint for DynamoDB Stream: {:?}",
+                err
+            );
+            None
+        }
+    }
+}
+
+async fn changes_stream_from_checkpoint(
+    dynamodb: Arc<DynamoDBTableProvider>,
+    dynamodb_sys: Arc<DynamoDBSys>,
+    checkpoint: Checkpoint,
+    from_bootstrap: bool,
+) -> Option<ChangesStream> {
+    // If this is an initial checkpoint(from_bootstrap=true), commit it immediately.
+    // This checkpoint is inclusive and in case of failure stream will restart from the current position, not next.
+    if from_bootstrap {
+        tracing::debug!("Committing bootstrap checkpoint");
+        let committer = DynamoDBStreamCommitter::new(Arc::clone(&dynamodb_sys), checkpoint.clone());
+        if let Err(err) = committer.commit() {
+            tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
+        }
+    }
+
+    tracing::debug!(
+        "Starting DynamoDB stream from checkpoint: from_bootstrap={}, checkpoint={:?}",
+        from_bootstrap,
+        checkpoint,
+    );
+
+    match dynamodb.stream_from_checkpoint(checkpoint).await {
+        Ok(stream) => Some(
+            stream
+                .map(move |msg| {
+                    msg.map(|(change_batch, checkpoint)| {
+                        ChangeEnvelope::new(
+                            Box::new(DynamoDBStreamCommitter::new(
+                                Arc::clone(&dynamodb_sys),
+                                checkpoint,
+                            )),
+                            change_batch,
+                        )
+                    })
+                })
+                .boxed(),
+        ),
+        Err(err) => {
+            tracing::error!(
+                "Failed to get stream from checkpoint for DynamoDB Table: {:?}",
+                err
+            );
+            None
+        }
+    }
+}
+
+struct NoOpCommitter;
+impl CommitChange for NoOpCommitter {
+    fn commit(&self) -> Result<(), CommitError> {
+        Ok(())
+    }
+}
+
+pub struct DynamoDBStreamCommitter {
+    dynamodb_sys: Arc<DynamoDBSys>,
+    checkpoint: Checkpoint,
+}
+
+impl DynamoDBStreamCommitter {
+    #[must_use]
+    pub fn new(dynamodb_sys: Arc<DynamoDBSys>, checkpoint: Checkpoint) -> Self {
+        Self {
+            dynamodb_sys,
+            checkpoint,
+        }
+    }
+}
+
+impl CommitChange for DynamoDBStreamCommitter {
+    fn commit(&self) -> Result<(), CommitError> {
+        tracing::debug!("Committing DynamoDB checkpoint: {:?}", self.checkpoint);
+
+        let checkpoint_json = serde_json::to_string(&self.checkpoint).map_err(|e| {
+            CommitError::UnableToCommitChange {
+                source: Box::new(e),
+            }
+        })?;
+
+        let metadata = DynamoDBCheckpointMetadata {
+            checkpoint_data: checkpoint_json,
+        };
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.dynamodb_sys.upsert(&metadata).await.map_err(|e| {
+                    CommitError::UnableToCommitChange {
+                        source: Box::new(e),
+                    }
+                })
+            })
+        })
     }
 }
 

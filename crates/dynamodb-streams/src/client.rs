@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
+use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::SDKClient;
 use crate::stream::{DynamodbStream, DynamodbStreamProducer};
 use crate::stream_state::initialize_state_from_checkpoint;
@@ -53,7 +53,7 @@ impl Client {
     /// - The table has no stream enabled
     /// - AWS API calls fail (network, permissions, etc.)
     /// - Any open shard is missing a starting sequence number
-    pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
+    pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         let stream_arn = self
             .sdk_client
             .get_stream_arn(self.table_name.clone())
@@ -81,7 +81,7 @@ impl Client {
             })
             .collect::<Result<_>>()?;
 
-        Ok(GlobalCheckpoint {
+        Ok(Checkpoint {
             shards: checkpoint_shards,
         })
     }
@@ -97,10 +97,7 @@ impl Client {
     /// - The stream ARN cannot be retrieved
     /// - Checkpoint initialization fails (expired shards, invalid sequence numbers)
     /// - Initial shard iterator requests fail
-    pub async fn stream_from_checkpoint(
-        &self,
-        checkpoint: GlobalCheckpoint,
-    ) -> Result<DynamodbStream> {
+    pub async fn stream_from_checkpoint(&self, checkpoint: Checkpoint) -> Result<DynamodbStream> {
         let stream_arn = self
             .sdk_client
             .get_stream_arn(self.table_name.clone())

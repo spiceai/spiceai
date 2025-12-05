@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
@@ -25,7 +26,7 @@ use std::time::SystemTime;
 /// since no records have been processed yet.
 ///
 /// Exclusive (`After`) checkpoint is returned as part of `StreamResult`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShardCheckpoint {
     pub sequence_number: String,
     pub parent_id: Option<String>, // Root shards don't have parents
@@ -37,7 +38,7 @@ pub struct ShardCheckpoint {
 ///
 /// - `At`: Resume starting AT this sequence (inclusive) - record not yet processed
 /// - `After`: Resume starting AFTER this sequence (exclusive) - record already processed
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CheckpointPosition {
     At,
     After,
@@ -48,12 +49,12 @@ pub enum CheckpointPosition {
 /// Captures the state of multiple shards at a point in time, allowing
 /// resumption from this position. Can be persisted and used to restart
 /// streaming within the 24-hour `DynamoDB` Streams retention window.
-#[derive(Clone, Debug)]
-pub struct GlobalCheckpoint {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Checkpoint {
     pub shards: HashMap<String, ShardCheckpoint>,
 }
 
-impl GlobalCheckpoint {
+impl Checkpoint {
     /// Returns shards that have no children in this checkpoint (leaf nodes in the lineage tree).
     /// These are the active shards to resume from, as their parents are already exhausted.
     #[must_use]

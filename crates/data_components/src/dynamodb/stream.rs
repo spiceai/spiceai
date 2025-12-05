@@ -15,9 +15,7 @@ limitations under the License.
 */
 use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
-use crate::cdc::{
-    ChangeBatch, ChangeBatchError, ChangeEnvelope, CommitChange, CommitError, changes_schema,
-};
+use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
 use crate::dynamodb::unnest::unnest_dynamodb_item;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -29,6 +27,7 @@ use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
 use aws_sdk_dynamodbstreams::types::OperationType;
 use datafusion::error::DataFusionError;
 use dynamodb_streams::StreamResult;
+use dynamodb_streams::checkpoint::Checkpoint;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -58,11 +57,13 @@ pub enum StreamError {
     FailedToReadRecordBatch { source: DataFusionError },
 }
 
-pub fn record_batch_to_change_envelope(
+// This function is used for bootstrapping stream which doesn't have checkpoints.
+// Incoming batches are from TableProvider.scan() method.
+pub fn record_batch_to_change_batch(
     batch: RecordBatch,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
-) -> Result<ChangeEnvelope, StreamError> {
+) -> Result<ChangeBatch, StreamError> {
     let row_count = batch.num_rows();
 
     // "c" stands for ChangeOperation::Create
@@ -86,10 +87,7 @@ pub fn record_batch_to_change_envelope(
     let change_batch =
         ChangeBatch::try_new(new_record_batch).context(FailedToCreateChangeBatchSnafu)?;
 
-    Ok(ChangeEnvelope::new(
-        Box::new(DynamoDBStreamCommitter::new()),
-        change_batch,
-    ))
+    Ok(change_batch)
 }
 
 fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArray {
@@ -115,21 +113,24 @@ fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArra
     list_builder.finish()
 }
 
+// This function is used for processing stream batches which have checkpoints.
+// Incoming batches are from DynamoDB Streams.
 pub fn process_batch(
     batch: StreamResult,
     table_schema: &Arc<Schema>,
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
-) -> Result<ChangeEnvelope, StreamError> {
-    let batch = batch.context(FailedToReceiveMessageSnafu)?.records;
+) -> Result<(ChangeBatch, Checkpoint), StreamError> {
+    let batch = batch.context(FailedToReceiveMessageSnafu)?;
+    let records = batch.records;
 
     let changes_schema = changes_schema(table_schema);
 
     let mut changes_struct_builder =
-        StructBuilder::from_fields(changes_schema.fields().clone(), batch.len());
+        StructBuilder::from_fields(changes_schema.fields().clone(), records.len());
 
-    for record in batch {
+    for record in records {
         let (op_str, item_data) = match (&record.event_name, &record.dynamodb) {
             (Some(event_name), Some(dynamodb)) => match event_name {
                 OperationType::Insert | OperationType::Modify => {
@@ -212,10 +213,7 @@ pub fn process_batch(
     let change_batch =
         ChangeBatch::try_new(record_batch).context(FailedToCreateChangeBatchSnafu)?;
 
-    Ok(ChangeEnvelope::new(
-        Box::new(DynamoDBStreamCommitter::new()),
-        change_batch,
-    ))
+    Ok((change_batch, batch.checkpoint))
 }
 
 fn streams_to_dynamodb_item(
@@ -252,20 +250,6 @@ fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Option<&
     builder.as_any_mut().downcast_mut::<T>()
 }
 
-struct DynamoDBStreamCommitter;
-
-impl DynamoDBStreamCommitter {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl CommitChange for DynamoDBStreamCommitter {
-    fn commit(&self) -> std::result::Result<(), CommitError> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,7 +259,7 @@ mod tests {
         AttributeValue as StreamsAttributeValue, OperationType, Record, StreamRecord,
     };
     use dynamodb_streams::DynamoDBStreamBatch;
-    use dynamodb_streams::checkpoint::GlobalCheckpoint;
+    use dynamodb_streams::checkpoint::Checkpoint;
     use std::collections::HashMap;
 
     const TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
@@ -309,7 +293,7 @@ mod tests {
     fn create_stream_result(records: Vec<Record>) -> StreamResult {
         Ok(DynamoDBStreamBatch {
             records,
-            checkpoint: GlobalCheckpoint {
+            checkpoint: Checkpoint {
                 shards: HashMap::default(),
             },
         })
@@ -344,13 +328,13 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
-            assert_eq!(envelope.change_batch.record.num_rows(), 1);
+            assert_eq!(change_batch.record.num_rows(), 1);
 
             // Verify the op field is "c" for create
-            let op = envelope.change_batch.op(0);
+            let op = change_batch.op(0);
             assert!(matches!(op, ChangeOperation::Create));
         }
 
@@ -380,13 +364,13 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
-            assert_eq!(envelope.change_batch.record.num_rows(), 1);
+            assert_eq!(change_batch.record.num_rows(), 1);
 
             // Verify the op field is "u" for update
-            let op = envelope.change_batch.op(0);
+            let op = change_batch.op(0);
             assert!(matches!(op, ChangeOperation::Update));
         }
 
@@ -412,13 +396,13 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify the batch has 1 row
-            assert_eq!(envelope.change_batch.record.num_rows(), 1);
+            assert_eq!(change_batch.record.num_rows(), 1);
 
             // Verify the op field is "d" for delete
-            let op = envelope.change_batch.op(0);
+            let op = change_batch.op(0);
             assert!(matches!(op, ChangeOperation::Delete));
         }
 
@@ -437,10 +421,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Empty batch should produce 0 rows
-            assert_eq!(envelope.change_batch.record.num_rows(), 0);
+            assert_eq!(change_batch.record.num_rows(), 0);
         }
 
         #[test]
@@ -479,24 +463,15 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should have 3 rows
-            assert_eq!(envelope.change_batch.record.num_rows(), 3);
+            assert_eq!(change_batch.record.num_rows(), 3);
 
             // Verify operations
-            assert!(matches!(
-                envelope.change_batch.op(0),
-                ChangeOperation::Create
-            ));
-            assert!(matches!(
-                envelope.change_batch.op(1),
-                ChangeOperation::Update
-            ));
-            assert!(matches!(
-                envelope.change_batch.op(2),
-                ChangeOperation::Delete
-            ));
+            assert!(matches!(change_batch.op(0), ChangeOperation::Create));
+            assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+            assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
         }
 
         #[test]
@@ -554,10 +529,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify we can extract primary keys (should be empty)
-            let pks = envelope.change_batch.primary_keys(0);
+            let pks = change_batch.primary_keys(0);
             assert_eq!(pks.len(), 0);
         }
 
@@ -577,10 +552,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
-            assert_eq!(envelope.change_batch.record.num_rows(), 0);
+            assert_eq!(change_batch.record.num_rows(), 0);
         }
 
         #[test]
@@ -603,10 +578,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
-            assert_eq!(envelope.change_batch.record.num_rows(), 0);
+            assert_eq!(change_batch.record.num_rows(), 0);
         }
 
         #[test]
@@ -629,10 +604,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should skip the record and produce 0 rows
-            assert_eq!(envelope.change_batch.record.num_rows(), 0);
+            assert_eq!(change_batch.record.num_rows(), 0);
         }
 
         #[test]
@@ -661,10 +636,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify primary keys
-            let pks = envelope.change_batch.primary_keys(0);
+            let pks = change_batch.primary_keys(0);
             assert_eq!(pks.len(), 2);
             assert_eq!(pks[0], "id");
             assert_eq!(pks[1], "sort_key");
@@ -698,10 +673,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Should only process the valid record
-            assert_eq!(envelope.change_batch.record.num_rows(), 1);
+            assert_eq!(change_batch.record.num_rows(), 1);
         }
 
         #[test]
@@ -730,10 +705,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify primary keys can be extracted
-            let extracted_pks = envelope.change_batch.primary_keys(0);
+            let extracted_pks = change_batch.primary_keys(0);
             assert_eq!(extracted_pks, primary_keys);
         }
 
@@ -763,10 +738,10 @@ mod tests {
                 TIME_FORMAT,
             );
 
-            let envelope = result.expect("Should create change envelope");
+            let (change_batch, _checkpoint) = result.expect("Should create change envelope");
 
             // Verify data can be extracted
-            let data_batch = envelope.change_batch.data(0);
+            let data_batch = change_batch.data(0);
             assert_eq!(data_batch.num_rows(), 1);
             assert_eq!(data_batch.num_columns(), 2); // id and name
         }
@@ -803,10 +778,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 1);
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            let change_batch = envelope.change_batch.record;
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
             assert_eq!(change_batch.num_rows(), 1);
         }
 
@@ -816,10 +791,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 100);
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            assert_eq!(envelope.change_batch.record.num_rows(), 100);
+            let change_batch = result.expect("valid change batch");
+            assert_eq!(change_batch.record.num_rows(), 100);
         }
 
         #[test]
@@ -828,10 +803,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 0);
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            assert_eq!(envelope.change_batch.record.num_rows(), 0);
+            let change_batch = result.expect("valid change batch");
+            assert_eq!(change_batch.record.num_rows(), 0);
         }
 
         #[test]
@@ -840,10 +815,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 5);
             let primary_keys = vec!["id".to_string(), "name".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            let change_batch = envelope.change_batch.record;
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
 
             // Verify the primary keys column is a list array
             let pk_column = change_batch.column(1);
@@ -865,10 +840,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 3);
             let primary_keys: Vec<String> = vec![];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            let change_batch = envelope.change_batch.record;
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
 
             let pk_column = change_batch.column(1);
             let pk_list = pk_column
@@ -889,17 +864,17 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 10);
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            let change_batch = envelope.change_batch.record;
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
 
             // First column should be the operation column
             let op_column = change_batch.column(0);
             let op_array = op_column
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .expect("op_column is StringArray");
+                .expect("column is StringArray");
 
             // All operations should be "c" (Create)
             for i in 0..change_batch.num_rows() {
@@ -913,10 +888,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 5);
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            let change_batch = envelope.change_batch.record;
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
 
             // Third column should be the data as a struct
             let data_column = change_batch.column(2);
@@ -944,7 +919,7 @@ mod tests {
                 let string_array = list_value
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .expect("list_value is StringArray");
+                    .expect("column is StringArray");
 
                 assert_eq!(string_array.len(), 2);
                 assert_eq!(string_array.value(0), "id");
@@ -964,7 +939,7 @@ mod tests {
                 let string_array = list_value
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .expect("list_value is StringArray");
+                    .expect("column is StringArray");
 
                 assert_eq!(string_array.len(), 1);
                 assert_eq!(string_array.value(0), "id");
@@ -987,10 +962,10 @@ mod tests {
             let batch = create_test_batch(Arc::clone(&schema), 10000);
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
 
-            let envelope = result.expect("Should create change envelope");
-            assert_eq!(envelope.change_batch.record.num_rows(), 10000);
+            let change_batch = result.expect("valid change batch");
+            assert_eq!(change_batch.record.num_rows(), 10000);
         }
 
         #[test]
@@ -1021,8 +996,8 @@ mod tests {
 
             let primary_keys = vec!["id".to_string()];
 
-            let result = record_batch_to_change_envelope(batch, &schema, &primary_keys);
-            result.expect("Should create change envelope");
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+            let _change_batch = result.expect("valid change batch");
         }
     }
 }

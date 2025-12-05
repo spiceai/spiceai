@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
+use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::{ApiShard, SDKClient};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ use std::time::SystemTime;
 #[derive(Debug)]
 pub struct DynamoDBStreamBatch {
     pub records: Vec<Record>,
-    pub checkpoint: GlobalCheckpoint,
+    pub checkpoint: Checkpoint,
 }
 
 #[derive(Debug, PartialEq)]
@@ -227,7 +227,7 @@ impl StreamState {
 
 pub async fn initialize_state_from_checkpoint(
     stream_arn: String,
-    checkpoint: &GlobalCheckpoint,
+    checkpoint: &Checkpoint,
     sdk_client: Arc<SDKClient>,
 ) -> crate::Result<StreamState> {
     let mut state = StreamState {
