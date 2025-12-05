@@ -248,7 +248,7 @@ impl DataConnector for DynamoDB {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
-        let acceptable_lag = Duration::from_secs(10800);
+        let acceptable_lag = Duration::from_secs(10);
 
         Some(Box::pin(
             stream::once(async move {
