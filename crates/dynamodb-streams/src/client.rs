@@ -117,10 +117,6 @@ impl Client {
             interval: self.interval,
             sender: tx,
             client: Arc::clone(&self.sdk_client),
-            retry_strategy: RetryBackoffBuilder::new()
-                .method(BackoffMethod::Fibonacci)
-                .max_retries(Some(3))
-                .build(),
             idle_timeout: None,
         };
 
@@ -173,8 +169,17 @@ impl ClientBuilder {
 
     #[must_use]
     pub fn build(self) -> Client {
+        let retry_strategy = RetryBackoffBuilder::new()
+            .method(BackoffMethod::Fibonacci)
+            .max_retries(Some(3))
+            .build();
+
         Client {
-            sdk_client: Arc::new(SDKClient::new(&self.sdk_config, self.shard_record_limit)),
+            sdk_client: Arc::new(SDKClient::new(
+                &self.sdk_config,
+                self.shard_record_limit,
+                retry_strategy,
+            )),
             table_name: self.table_name,
             interval: self.interval,
             buffer: self.buffer,

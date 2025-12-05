@@ -15,8 +15,8 @@ limitations under the License.
 */
 use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{BlockedShard, InitializingShard, PollOutcome, ShardPollResult, StreamState};
-use crate::{Error, Result, StreamResult};
+use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
+use crate::{Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
@@ -28,7 +28,6 @@ use tokio::{
     sync::mpsc,
     time::{Duration, sleep},
 };
-use util::retry_strategy::{Backoff, RetryBackoff};
 
 #[derive(Debug)]
 pub struct DynamodbStreamProducer {
@@ -37,7 +36,6 @@ pub struct DynamodbStreamProducer {
     pub interval: Option<Duration>,
     pub sender: mpsc::Sender<StreamResult>,
     pub client: Arc<SDKClient>,
-    pub retry_strategy: RetryBackoff,
     /// Duration after which a shard is considered idle and excluded from watermark calculation.
     /// If None, all shards are included in watermark calculation regardless of activity.
     pub idle_timeout: Option<Duration>,
@@ -55,7 +53,7 @@ impl DynamodbStreamProducer {
 
         // 1. Initialize shards that require iterators
         // If permanent error is encountered, it is surfaced to the client.
-        self.initialize_shards_iterators().await;
+        self.initialize_shards_iterators().await?;
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
@@ -78,7 +76,9 @@ impl DynamodbStreamProducer {
         // 3. Process poll results
         for (shard_id, result) in results {
             let poll_result = match result {
-                Ok((next_iter, records)) => self.state.handle_poll_result(&shard_id, next_iter, records)?,
+                Ok((next_iter, records)) => self
+                    .state
+                    .handle_poll_result(&shard_id, next_iter, records)?,
                 Err(e) => self.state.handle_poll_error(&shard_id, e)?,
             };
             poll_results.push(poll_result);
@@ -93,14 +93,15 @@ impl DynamodbStreamProducer {
                     return Err(e);
                 }
                 tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}")
-            },
+            }
         }
 
         Ok(combine_shard_batches(&poll_results, self.idle_timeout))
     }
 
     async fn initialize_shards_iterators(&mut self) -> Result<()> {
-        let shards: Vec<InitializingShard> = self.state.get_initializing_shards().cloned().collect();
+        let shards: Vec<InitializingShard> =
+            self.state.get_initializing_shards().cloned().collect();
 
         for shard in shards {
             let iterator_type = match shard.last_checkpoint.position {
@@ -126,7 +127,10 @@ impl DynamodbStreamProducer {
                     if !e.is_retriable() {
                         return Err(e);
                     }
-                    tracing::warn!("Failed to initialize shard. Will retry on next iteration : {}", e);
+                    tracing::warn!(
+                        "Failed to initialize shard. Will retry on next iteration : {}",
+                        e
+                    );
                 }
             }
         }

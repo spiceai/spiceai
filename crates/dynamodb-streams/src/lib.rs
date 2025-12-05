@@ -87,10 +87,7 @@ impl Error {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
-            Error::Timeout
-                | Error::ConnectionFailure { .. }
-                | Error::Throttled { .. }
-
+            Error::Timeout | Error::ConnectionFailure { .. } | Error::Throttled { .. }
         )
     }
 
@@ -99,16 +96,12 @@ impl Error {
             SdkError::TimeoutError(_) => Error::Timeout,
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
-            SdkError::ServiceError(e) => {
-                match e.err() {
-                    DescribeTableError::ResourceNotFoundException(_) => {
-                        Error::TableNotFound
-                    }
-                    _ => Error::UnknownSdk {
-                        source: Box::new(e.into_err()),
-                    },
-                }
-            }
+            SdkError::ServiceError(e) => match e.err() {
+                DescribeTableError::ResourceNotFoundException(_) => Error::TableNotFound,
+                _ => Error::UnknownSdk {
+                    source: Box::new(e.into_err()),
+                },
+            },
 
             _ => Error::UnknownSdk {
                 source: Box::new(err),
@@ -119,18 +112,14 @@ impl Error {
     pub fn from_describe_stream(err: SdkError<DescribeStreamError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
-            SdkError::DispatchFailure(e) => Error::ConnectionFailure,
+            SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
-            SdkError::ServiceError(e) => {
-                match e.err() {
-                    DescribeStreamError::ResourceNotFoundException(_) => {
-                        Error::StreamNotFound
-                    }
-                    _ => Error::UnknownSdk {
-                        source: Box::new(e.into_err()),
-                    },
-                }
-            }
+            SdkError::ServiceError(e) => match e.err() {
+                DescribeStreamError::ResourceNotFoundException(_) => Error::StreamNotFound,
+                _ => Error::UnknownSdk {
+                    source: Box::new(e.into_err()),
+                },
+            },
 
             _ => Error::UnknownSdk {
                 source: Box::new(err),
@@ -141,24 +130,16 @@ impl Error {
     pub fn from_get_records(err: SdkError<GetRecordsError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
-            SdkError::DispatchFailure(e) => Error::ConnectionFailure,
+            SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
-            SdkError::ServiceError(e) => {
-                match e.err() {
-                    GetRecordsError::ExpiredIteratorException(_) => {
-                        Error::IteratorExpired
-                    }
-                    GetRecordsError::LimitExceededException(_) => {
-                        Error::Throttled
-                    }
-                    GetRecordsError::TrimmedDataAccessException(_) => {
-                        Error::TrimmedData
-                    }
-                    _ => Error::UnknownSdk {
-                        source: Box::new(e.into_err()),
-                    },
-                }
-            }
+            SdkError::ServiceError(e) => match e.err() {
+                GetRecordsError::ExpiredIteratorException(_) => Error::IteratorExpired,
+                GetRecordsError::LimitExceededException(_) => Error::Throttled,
+                GetRecordsError::TrimmedDataAccessException(_) => Error::TrimmedData,
+                _ => Error::UnknownSdk {
+                    source: Box::new(e.into_err()),
+                },
+            },
 
             _ => Error::UnknownSdk {
                 source: Box::new(err),
@@ -166,21 +147,17 @@ impl Error {
         }
     }
 
-    pub fn from_get_shard_iterator(
-        err: SdkError<GetShardIteratorError>,
-    ) -> Self {
+    pub fn from_get_shard_iterator(err: SdkError<GetShardIteratorError>) -> Self {
         match err {
             SdkError::TimeoutError(_) => Error::Timeout,
-            SdkError::DispatchFailure(e) => Error::ConnectionFailure,
+            SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
-            SdkError::ServiceError(e) => {
-                match e.err() {
-                    GetShardIteratorError::TrimmedDataAccessException(_) => {
-                        Error::TrimmedData
-                    },
-                    _ => Error::UnknownSdk { source: Box::new(e.into_err()) },
-                }
-            }
+            SdkError::ServiceError(e) => match e.err() {
+                GetShardIteratorError::TrimmedDataAccessException(_) => Error::TrimmedData,
+                _ => Error::UnknownSdk {
+                    source: Box::new(e.into_err()),
+                },
+            },
 
             _ => Error::UnknownSdk {
                 source: Box::new(err),
