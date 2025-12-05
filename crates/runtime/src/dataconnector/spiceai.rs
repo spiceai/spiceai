@@ -409,7 +409,7 @@ pub fn subscribe_to_append_stream(
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
                                 match ChangeBatch::try_new(batch).map(|rb| {
-                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
+                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {
                                     Ok(change_batch) => yield Ok(change_batch),
                                     Err(e) => {

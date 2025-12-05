@@ -27,11 +27,13 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use dynamodb_streams::checkpoint::Checkpoint;
 use futures::stream::{self, StreamExt};
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use util::time_format::is_valid_format;
 
@@ -246,6 +248,7 @@ impl DataConnector for DynamoDB {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
+        let acceptable_lag = Duration::from_secs(10);
 
         Some(Box::pin(
             stream::once(async move {
@@ -255,11 +258,16 @@ impl DataConnector for DynamoDB {
                     .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
+                let acceptable_lag = acceptable_lag;
+                let dataset_name = dataset.name.clone();
+                let dataset_name_2 = dataset_name.clone();
+                let dataset_name_3 = dataset_name.clone();
+                let dataset_name_4 = dataset_name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
                 let dynamodb_sys = initialize_dynamodb_sys(&dataset).await?;
 
                 let (should_bootstrap, checkpoint) =
-                    load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys).await?;
+                    load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys, &dataset_name).await?;
 
                 if should_bootstrap {
                     // Initialize bootstrap stream
@@ -267,10 +275,11 @@ impl DataConnector for DynamoDB {
                         .bootstrap_stream()
                         .await
                         .ok()?
-                        .map(|msg| {
+                        .map(move |msg| {
                             msg.map(|change_batch| {
-                                // Bootstrap stream doesn't commit changes
-                                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch)
+                                tracing::info!("Bootstrapping DynamoDB table: table_name={}, records={}", dataset_name.clone(), change_batch.record.num_rows());
+                                // Bootstrap stream doesn't commit changes and doesn't mark dataset as ready
+                                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false)
                             })
                         });
 
@@ -278,11 +287,21 @@ impl DataConnector for DynamoDB {
                     Some(
                         bootstrap_stream
                             .chain(
+                                stream::once(async move {
+                                    tracing::info!("Bootstrapping DynamoDB table complete, starting changes stream. \
+                                        Note it will take some time for table to catch up: table_name={}", dataset_name_2);
+                                    stream::empty()
+                                })
+                                .flatten()
+                            )
+                            .chain(
                                 stream::once(changes_stream_from_checkpoint(
                                     Arc::clone(&dynamodb),
                                     Arc::clone(&dynamodb_sys),
                                     checkpoint,
                                     true,
+                                    acceptable_lag,
+                                    dataset_name_3.clone(),
                                 ))
                                 .filter_map(|opt| async move { opt })
                                 .flatten(),
@@ -297,6 +316,8 @@ impl DataConnector for DynamoDB {
                             Arc::clone(&dynamodb_sys),
                             checkpoint,
                             false,
+                            acceptable_lag,
+                            dataset_name_4.clone(),
                         ))
                         .filter_map(|opt| async move { opt })
                         .flatten()
@@ -314,7 +335,8 @@ async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<Arc<DynamoDBSys>> 
         Ok(sys) => Some(Arc::new(sys)),
         Err(err) => {
             tracing::error!(
-                "Failed to initialize DynamoDBSys for checkpoint persistence: {:?}",
+                "Failed to initialize DynamoDBSys for checkpoint persistence: table={} - {:?}",
+                dataset.name,
                 err
             );
             None
@@ -326,6 +348,7 @@ async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<Arc<DynamoDBSys>> 
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: &Arc<DynamoDBSys>,
+    dataset_name: &TableReference,
 ) -> Option<(bool, Checkpoint)> {
     let existing_checkpoint = dynamodb_sys.get().await;
 
@@ -333,20 +356,25 @@ async fn load_or_initialize_checkpoint(
         match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
             Ok(checkpoint) => {
                 tracing::info!(
-                    "Found existing checkpoint for DynamoDB Stream, resuming from checkpoint"
+                    "Found existing checkpoint for DynamoDB Stream, resuming from checkpoint: table_name={}",
+                    dataset_name
                 );
                 Some((false, checkpoint))
             }
             Err(err) => {
                 tracing::warn!(
-                    "Failed to deserialize checkpoint, falling back to bootstrap: {:?}",
+                    "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
+                    dataset_name,
                     err
                 );
                 get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
             }
         }
     } else {
-        tracing::info!("No existing checkpoint found, starting from bootstrap");
+        tracing::info!(
+            "No existing checkpoint found, starting from bootstrap: table_name={}",
+            dataset_name
+        );
         get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
     }
 }
@@ -369,11 +397,16 @@ async fn changes_stream_from_checkpoint(
     dynamodb_sys: Arc<DynamoDBSys>,
     checkpoint: Checkpoint,
     from_bootstrap: bool,
+    acceptable_lag: Duration,
+    dataset_name: TableReference,
 ) -> Option<ChangesStream> {
     // If this is an initial checkpoint(from_bootstrap=true), commit it immediately.
     // This checkpoint is inclusive and in case of failure stream will restart from the current position, not next.
     if from_bootstrap {
-        tracing::debug!("Committing bootstrap checkpoint");
+        tracing::debug!(
+            "Committing bootstrap checkpoint: table_name={}",
+            dataset_name
+        );
         let committer = DynamoDBStreamCommitter::new(Arc::clone(&dynamodb_sys), checkpoint.clone());
         if let Err(err) = committer.commit() {
             tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
@@ -381,7 +414,8 @@ async fn changes_stream_from_checkpoint(
     }
 
     tracing::debug!(
-        "Starting DynamoDB stream from checkpoint: from_bootstrap={}, checkpoint={:?}",
+        "Starting DynamoDB stream from checkpoint: table_name={}, from_bootstrap={}, checkpoint={:?}",
+        dataset_name,
         from_bootstrap,
         checkpoint,
     );
@@ -390,13 +424,28 @@ async fn changes_stream_from_checkpoint(
         Ok(stream) => Some(
             stream
                 .map(move |msg| {
-                    msg.map(|(change_batch, checkpoint)| {
+                    msg.map(|(change_batch, checkpoint, watermark)| {
+                        let lag = watermark
+                            .and_then(|v| SystemTime::now().duration_since(v).ok());
+
+                        // TODO: should be trace
+                        tracing::info!(
+                            "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, records={}",
+                            dataset_name,
+                            watermark
+                                .map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),
+                            lag
+                                .map_or_else(|| "-".to_string(), |l| humantime::format_duration(l).to_string()),
+                            change_batch.record.num_rows(),
+                        );
+
                         ChangeEnvelope::new(
                             Box::new(DynamoDBStreamCommitter::new(
                                 Arc::clone(&dynamodb_sys),
                                 checkpoint,
                             )),
                             change_batch,
+                            lag.is_some_and(|l| l < acceptable_lag),
                         )
                     })
                 })

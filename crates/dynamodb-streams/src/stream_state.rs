@@ -13,29 +13,40 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::Error;
 use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::{ApiShard, SDKClient};
+use aws_sdk_dynamodbstreams::primitives::DateTime;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug)]
-pub struct DynamoDBStreamBatch {
-    pub records: Vec<Record>,
-    pub checkpoint: Checkpoint,
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ActiveShard {
     pub shard_id: String,
     pub parent_shard_id: Option<String>,
     pub iterator: String,
+    pub last_checkpoint: ShardCheckpoint,
+    pub last_produced_at: Option<SystemTime>,
+    pub current_watermark: Option<SystemTime>,
 }
 
 impl ActiveShard {
-    pub fn set_iterator(&mut self, new_iterator: String) {
+    pub fn update_iterator(&mut self, new_iterator: String) {
         self.iterator = new_iterator;
+    }
+
+    pub fn update_checkpoint(&mut self, checkpoint: ShardCheckpoint) {
+        self.last_checkpoint = checkpoint;
+    }
+
+    pub fn update_produced_at(&mut self) {
+        self.last_produced_at = Some(SystemTime::now());
+    }
+
+    pub fn update_watermark(&mut self, watermark: SystemTime) {
+        self.current_watermark = Some(watermark);
     }
 }
 
@@ -55,24 +66,24 @@ pub struct StreamState {
 
 pub struct ShardPollResult {
     pub shard_id: String,
-    pub records: Vec<Record>,
-    pub checkpoint: ShardCheckpoint,
+    pub outcome: PollOutcome,
+    pub last_checkpoint: ShardCheckpoint,
+    pub last_produced_at: Option<SystemTime>,
+    pub current_watermark: Option<SystemTime>,
 }
 
-/// Manages shard lifecycle across three states to maintain parent-child ordering guarantees.
-///
-/// State Transitions:
-/// - Active: Shards with iterators, ready to poll for records
-/// - Pending: Shards blocked by active/initializing parents (respects lineage order)
-/// - Initializing: Shards awaiting iterator initialization from AWS
-///
-/// Flow:
-/// 1. Discovered shards enter `pending` if parent exists, otherwise `initializing`
-/// 2. `initializing` → `active` when iterator obtained
-/// 3. When parent exhausts, children move `pending` → `initializing`
-/// 4. Failed polls can move `active` → `initializing` for fresh iterator
-///
-/// This ensures parent shards are fully consumed before children begin processing.
+pub enum PollOutcome {
+    Records { records: Vec<Record> },
+    Empty,
+    Failed,
+}
+
+impl PollOutcome {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, PollOutcome::Empty)
+    }
+}
+
 impl StreamState {
     pub fn get_active_shards(&self) -> impl Iterator<Item = &ActiveShard> {
         self.active.values()
@@ -88,47 +99,104 @@ impl StreamState {
         new_iterator: Option<String>,
         records: Vec<Record>,
     ) -> Option<ShardPollResult> {
-        tracing::debug!(
-            "Processing shard poll: shard_id={:?}, new_iterator={:?}, records_num={:?}",
-            shard_id,
-            new_iterator,
-            records.len()
-        );
+        let shard = self.active.get(shard_id)?;
+        let mut current_checkpoint = shard.last_checkpoint.clone();
+        let mut current_last_produced_at = shard.last_produced_at;
+        let mut current_watermark = shard.current_watermark;
 
-        let parent_id = self.active.get(shard_id)?.parent_shard_id.clone();
+        // First update watermark and checkpoint if possible
+        if !records.is_empty()
+            && let Some(shard) = self.active.get_mut(shard_id)
+        {
+            shard.update_produced_at();
+            current_last_produced_at = shard.last_produced_at;
 
+            // Update watermark
+            let max_event_time = records
+                .iter()
+                .filter_map(|r| r.dynamodb.as_ref()?.approximate_creation_date_time)
+                .max()
+                .map(datetime_to_system_time);
+
+            if let Some(event_time) = max_event_time {
+                shard.update_watermark(event_time);
+                current_watermark = shard.current_watermark;
+            }
+
+            // Update checkpoint
+            let sequence_number = records
+                .last()
+                .and_then(|r| r.dynamodb.as_ref())
+                .and_then(|db| db.sequence_number.clone());
+
+            if let Some(seq) = sequence_number {
+                let checkpoint = ShardCheckpoint {
+                    sequence_number: seq,
+                    parent_id: shard.parent_shard_id.clone(),
+                    updated_at: SystemTime::now(),
+                    position: CheckpointPosition::After,
+                };
+                shard.update_checkpoint(checkpoint.clone());
+                current_checkpoint = checkpoint;
+            } else {
+                tracing::warn!(
+                    "Missing sequence number for shard {}, keeping previous checkpoint",
+                    shard_id
+                );
+            }
+        }
+
+        // Check if shard is exhausted and can be removed
         if let Some(iter) = new_iterator {
-            self.active.get_mut(shard_id)?.set_iterator(iter);
+            if let Some(shard) = self.active.get_mut(shard_id) {
+                shard.update_iterator(iter);
+            }
         } else {
             self.active.remove(shard_id);
             self.promote_children(shard_id);
         }
 
-        if records.is_empty() {
-            return None;
-        }
-
-        let last_seq_opt = records.last()?.clone().dynamodb?.sequence_number;
-        tracing::debug!(
-            "Shard latest sequence number: shard_id={:?}, seq_number={:?}",
-            shard_id,
-            last_seq_opt
-        );
-        if last_seq_opt.is_none() {
-            tracing::error!("Missing sequence number: shard_id={}", shard_id);
-        }
-        let last_seq = last_seq_opt?;
+        let outcome = if records.is_empty() {
+            PollOutcome::Empty
+        } else {
+            PollOutcome::Records { records }
+        };
 
         Some(ShardPollResult {
             shard_id: shard_id.to_string(),
-            records,
-            checkpoint: ShardCheckpoint {
-                sequence_number: last_seq,
-                parent_id,
-                updated_at: SystemTime::now(),
-                position: CheckpointPosition::After,
-            },
+            outcome,
+            last_checkpoint: current_checkpoint,
+            last_produced_at: current_last_produced_at,
+            current_watermark,
         })
+    }
+
+    pub fn handle_poll_error(&mut self, shard_id: &str, error: &Error) -> Option<ShardPollResult> {
+        tracing::error!("Poll error for shard {}: {}", shard_id, error);
+
+        let shard = self.active.get(shard_id)?;
+
+        // Capture current state
+        let result = ShardPollResult {
+            shard_id: shard_id.to_string(),
+            outcome: PollOutcome::Failed,
+            last_checkpoint: shard.last_checkpoint.clone(),
+            last_produced_at: shard.last_produced_at,
+            current_watermark: shard.current_watermark,
+        };
+
+        let is_expired_iterator = error.to_string().contains("ExpiredIterator")
+            || error.to_string().contains("TrimmedDataAccess");
+
+        if is_expired_iterator {
+            tracing::warn!(
+                "Iterator expired for shard {}, marking for reinitialization",
+                shard_id
+            );
+            self.reinitialize_shard(shard_id);
+        }
+
+        Some(result)
     }
 
     pub fn reinitialize_shard(&mut self, shard_id: &str) {
@@ -185,16 +253,26 @@ impl StreamState {
     /// Move shard from initializing to active with its iterator
     pub fn mark_active(&mut self, shard_id: String, iterator: String) {
         if let Some(pending) = self.initializing.remove(&shard_id) {
+            // Create initial checkpoint with empty sequence number for newly discovered shards
+            let initial_checkpoint = ShardCheckpoint {
+                sequence_number: String::new(),
+                parent_id: pending.parent_shard_id.clone(),
+                updated_at: SystemTime::now(),
+                position: CheckpointPosition::After,
+            };
+
             let active = ActiveShard {
                 shard_id: shard_id.clone(),
                 parent_shard_id: pending.parent_shard_id,
                 iterator,
+                last_checkpoint: initial_checkpoint,
+                last_produced_at: None,
+                current_watermark: None,
             };
             self.active.insert(shard_id, active);
         }
     }
 
-    /// Promote children of exhausted parent, returns shard IDs that need initialization
     fn promote_children(&mut self, parent_id: &str) {
         let to_promote: Vec<String> = self
             .pending
@@ -257,6 +335,9 @@ pub async fn initialize_state_from_checkpoint(
                     shard_id: shard_id.to_string(),
                     parent_shard_id: shard_checkpoint.parent_id.clone(),
                     iterator,
+                    last_checkpoint: shard_checkpoint.clone(),
+                    last_produced_at: None,
+                    current_watermark: None,
                 };
 
                 state.active.insert(shard_id.to_string(), shard);
@@ -293,10 +374,21 @@ async fn start_children_from_trim_horizon(
                 .await
             {
                 Ok(Some(iterator)) => {
+                    // Create initial checkpoint with empty sequence number
+                    let initial_checkpoint = ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: Some(parent_id.to_string()),
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    };
+
                     let shard = ActiveShard {
                         shard_id: child.shard_id.clone(),
                         parent_shard_id: Some(parent_id.to_string()),
                         iterator,
+                        last_checkpoint: initial_checkpoint,
+                        last_produced_at: None,
+                        current_watermark: None,
                     };
                     state.active.insert(child.shard_id.clone(), shard);
                 }
@@ -312,7 +404,15 @@ async fn start_children_from_trim_horizon(
 
     Ok(())
 }
+
+pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
+    let secs = dt.secs();
+    let subsec_nanos = dt.subsec_nanos();
+    UNIX_EPOCH + Duration::new(secs.try_into().unwrap_or(0), subsec_nanos)
+}
+
 #[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use aws_sdk_dynamodbstreams::types::StreamRecord;
@@ -381,6 +481,14 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
                     iterator: "old-iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -391,29 +499,29 @@ mod tests {
             );
 
             assert!(result.is_some());
-            let batch = result.expect("Expected batch to be Some");
-            assert_eq!(batch.shard_id, "shard-1");
-            assert_eq!(batch.records.len(), 1);
-            assert_eq!(batch.checkpoint.sequence_number, "123");
-            assert_eq!(batch.checkpoint.parent_id, None);
-            assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
+            let result = result.expect("Expected result to be Some");
+            assert_eq!(result.shard_id, "shard-1");
+            if let PollOutcome::Records { records } = result.outcome {
+                assert_eq!(records.len(), 1);
+            } else {
+                panic!("Expected PollOutcome::Records");
+            }
+            assert_eq!(result.last_checkpoint.sequence_number, "123");
+            assert_eq!(result.last_checkpoint.parent_id, None);
+            assert_eq!(result.last_checkpoint.position, CheckpointPosition::After);
 
             // Check complete state
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "new-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "new-iter");
         }
 
         #[test]
@@ -425,16 +533,28 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
                     iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
             let result = state.handle_poll_result("shard-1", None, vec![create_record("123")]);
 
             assert!(result.is_some());
-            let batch = result.expect("Expected batch to be Some");
-            assert_eq!(batch.shard_id, "shard-1");
-            assert_eq!(batch.records.len(), 1);
-            assert_eq!(batch.checkpoint.sequence_number, "123");
+            let result = result.expect("Expected result to be Some");
+            assert_eq!(result.shard_id, "shard-1");
+            if let PollOutcome::Records { records } = result.outcome {
+                assert_eq!(records.len(), 1);
+            } else {
+                panic!("Expected PollOutcome::Records");
+            }
+            assert_eq!(result.last_checkpoint.sequence_number, "123");
 
             // Check complete state - shard should be removed
             assert_eq!(state.active.len(), 0);
@@ -452,29 +572,36 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
                     iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), vec![]);
 
-            assert!(result.is_none());
+            assert!(result.is_some());
+            if let Some(result) = result {
+                assert!(matches!(result.outcome, PollOutcome::Empty));
+            }
 
             // Iterator should still be updated even though no records
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "new-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "new-iter");
         }
 
         #[test]
@@ -486,6 +613,14 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
                     iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -495,24 +630,22 @@ mod tests {
                 vec![create_record_without_seq()],
             );
 
-            assert!(result.is_none());
+            assert!(result.is_some());
+            // When sequence number is missing, the record is still returned
+            // but the checkpoint is not updated
 
-            // State should be updated even though result is None
+            // State should be updated
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "new-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "new-iter");
         }
 
         #[test]
@@ -524,6 +657,14 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
                     iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -533,7 +674,9 @@ mod tests {
                 vec![create_record_without_dynamodb()],
             );
 
-            assert!(result.is_none());
+            assert!(result.is_some());
+            // When dynamodb field is missing, the record is still returned
+            // but the checkpoint is not updated
 
             // State should be updated
             assert_eq!(state.active.len(), 1);
@@ -550,6 +693,14 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: Some("parent-1".to_string()),
                     iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: Some("parent-1".to_string()),
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -562,29 +713,32 @@ mod tests {
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
             assert!(result.is_some());
-            let batch = result.expect("Expected batch to be Some");
-            assert_eq!(batch.shard_id, "shard-1");
-            assert_eq!(batch.records.len(), 3);
-            assert_eq!(batch.checkpoint.sequence_number, "102");
-            assert_eq!(batch.checkpoint.parent_id, Some("parent-1".to_string()));
-            assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
+            let result = result.expect("Expected result to be Some");
+            assert_eq!(result.shard_id, "shard-1");
+            if let PollOutcome::Records { records } = result.outcome {
+                assert_eq!(records.len(), 3);
+            } else {
+                panic!("Expected PollOutcome::Records");
+            }
+            assert_eq!(result.last_checkpoint.sequence_number, "102");
+            assert_eq!(
+                result.last_checkpoint.parent_id,
+                Some("parent-1".to_string())
+            );
+            assert_eq!(result.last_checkpoint.position, CheckpointPosition::After);
 
             // Verify complete state
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: Some("parent-1".to_string()),
-                    iterator: "new-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, Some("parent-1".to_string()));
+            assert_eq!(active_shard.iterator, "new-iter");
         }
 
         #[test]
@@ -598,6 +752,14 @@ mod tests {
                     shard_id: "parent".to_string(),
                     parent_shard_id: None,
                     iterator: "iter-parent".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -614,9 +776,9 @@ mod tests {
             let result = state.handle_poll_result("parent", None, vec![create_record("100")]);
 
             assert!(result.is_some());
-            let batch = result.expect("Expected batch to be Some");
-            assert_eq!(batch.shard_id, "parent");
-            assert_eq!(batch.checkpoint.sequence_number, "100");
+            let result = result.expect("Expected result to be Some");
+            assert_eq!(result.shard_id, "parent");
+            assert_eq!(result.last_checkpoint.sequence_number, "100");
 
             // Verify complete state after exhaustion
             assert_eq!(state.active.len(), 0);
@@ -637,6 +799,295 @@ mod tests {
                     parent_shard_id: Some("parent".to_string()),
                 }
             );
+        }
+
+        #[test]
+        fn test_handle_poll_result_updates_watermark() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "99".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
+                },
+            );
+
+            let records = vec![
+                create_record_with_timestamp("100", DateTime::from_secs(1000)),
+                create_record_with_timestamp("101", DateTime::from_secs(1010)), // Latest
+                create_record_with_timestamp("102", DateTime::from_secs(1005)),
+            ];
+
+            let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
+
+            assert!(result.is_some());
+            let result = result.unwrap();
+
+            // Verify watermark is max timestamp (1010)
+            assert!(result.current_watermark.is_some());
+            let expected_watermark = datetime_to_system_time(DateTime::from_secs(1010));
+            assert_eq!(result.current_watermark.unwrap(), expected_watermark);
+
+            // Verify last_produced_at is set
+            assert!(result.last_produced_at.is_some());
+
+            // Verify active shard state
+            let shard = state.active.get("shard-1").unwrap();
+            assert_eq!(shard.current_watermark.unwrap(), expected_watermark);
+            assert!(shard.last_produced_at.is_some());
+            assert_eq!(shard.last_checkpoint.sequence_number, "102");
+        }
+
+        #[test]
+        fn test_handle_poll_result_watermark_not_updated_without_timestamps() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "99".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
+                },
+            );
+
+            // Records without approximate_creation_date_time
+            let records = vec![create_record("100")]; // Assuming this creates without timestamp
+
+            let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
+
+            assert!(result.is_some());
+            let result = result.unwrap();
+
+            // Watermark should still be None
+            assert!(result.current_watermark.is_none());
+
+            // But last_produced_at should be set
+            assert!(result.last_produced_at.is_some());
+
+            // Checkpoint should be updated
+            assert_eq!(result.last_checkpoint.sequence_number, "100");
+
+            // Verify active shard
+            let shard = state.active.get("shard-1").unwrap();
+            assert!(shard.current_watermark.is_none());
+            assert!(shard.last_produced_at.is_some());
+        }
+
+        #[test]
+        fn test_handle_poll_result_missing_sequence_keeps_old_checkpoint() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let old_checkpoint_time = SystemTime::now();
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "99".to_string(),
+                        parent_id: None,
+                        updated_at: old_checkpoint_time,
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
+                },
+            );
+
+            let result = state.handle_poll_result(
+                "shard-1",
+                Some("new-iter".to_string()),
+                vec![create_record_without_seq()],
+            );
+
+            assert!(result.is_some());
+            let result = result.unwrap();
+
+            // Checkpoint sequence should be unchanged
+            assert_eq!(result.last_checkpoint.sequence_number, "99");
+
+            // But records should still be returned
+            if let PollOutcome::Records { records } = result.outcome {
+                assert_eq!(records.len(), 1);
+            } else {
+                panic!("Expected PollOutcome::Records");
+            }
+
+            // Verify active shard kept old checkpoint
+            let shard = state.active.get("shard-1").unwrap();
+            assert_eq!(shard.last_checkpoint.sequence_number, "99");
+        }
+
+        #[test]
+        fn test_handle_poll_result_exhausted_with_watermark() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let base_time = DateTime::from_secs(2000);
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "99".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
+                },
+            );
+
+            let records = vec![create_record_with_timestamp("100", base_time)];
+
+            // Shard exhausted (new_iterator = None) but has final records
+            let result = state.handle_poll_result("shard-1", None, records);
+
+            assert!(result.is_some());
+            let result = result.unwrap();
+
+            // Should have records
+            if let PollOutcome::Records { records } = result.outcome {
+                assert_eq!(records.len(), 1);
+            } else {
+                panic!("Expected PollOutcome::Records");
+            }
+
+            // Should have updated checkpoint
+            assert_eq!(result.last_checkpoint.sequence_number, "100");
+
+            // Should have watermark
+            assert!(result.current_watermark.is_some());
+            assert_eq!(
+                result.current_watermark.unwrap(),
+                datetime_to_system_time(base_time)
+            );
+
+            // Should have last_produced_at
+            assert!(result.last_produced_at.is_some());
+
+            // Shard should be removed
+            assert!(!state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_handle_poll_result_exhausted_empty_records() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let old_watermark = datetime_to_system_time(DateTime::from_secs(1000));
+            let old_produced_at = SystemTime::now();
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "99".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: Some(old_produced_at),
+                    current_watermark: Some(old_watermark),
+                },
+            );
+
+            // Shard exhausted with no records
+            let result = state.handle_poll_result("shard-1", None, vec![]);
+
+            assert!(result.is_some());
+            let result = result.unwrap();
+
+            // Should be empty
+            assert!(matches!(result.outcome, PollOutcome::Empty));
+
+            // Should preserve old checkpoint, watermark, last_produced_at
+            assert_eq!(result.last_checkpoint.sequence_number, "99");
+            assert_eq!(result.current_watermark.unwrap(), old_watermark);
+            assert_eq!(result.last_produced_at.unwrap(), old_produced_at);
+
+            // Shard should be removed
+            assert!(!state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_handle_poll_result_verifies_all_shard_fields() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let base_time = DateTime::from_secs(3000);
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent-1".to_string()),
+                    iterator: "old-iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "50".to_string(),
+                        parent_id: Some("parent-1".to_string()),
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
+                },
+            );
+
+            let records = vec![create_record_with_timestamp("100", base_time)];
+            let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
+
+            assert!(result.is_some());
+
+            // Verify active shard has ALL fields updated correctly
+            let shard = state.active.get("shard-1").expect("shard should exist");
+            assert_eq!(shard.shard_id, "shard-1");
+            assert_eq!(shard.parent_shard_id, Some("parent-1".to_string()));
+            assert_eq!(shard.iterator, "new-iter");
+            assert_eq!(shard.last_checkpoint.sequence_number, "100");
+            assert_eq!(
+                shard.last_checkpoint.parent_id,
+                Some("parent-1".to_string())
+            );
+            assert_eq!(shard.last_checkpoint.position, CheckpointPosition::After);
+            assert!(shard.last_produced_at.is_some());
+            assert_eq!(
+                shard.current_watermark.unwrap(),
+                datetime_to_system_time(base_time)
+            );
+        }
+
+        // Helper function to create record with timestamp
+        fn create_record_with_timestamp(seq: &str, timestamp: DateTime) -> Record {
+            Record::builder()
+                .dynamodb(
+                    StreamRecord::builder()
+                        .sequence_number(seq.to_string())
+                        .approximate_creation_date_time(timestamp)
+                        .build(),
+                )
+                .build()
         }
     }
 
@@ -713,6 +1164,14 @@ mod tests {
                     shard_id: "parent".to_string(),
                     parent_shard_id: None,
                     iterator: "iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -821,6 +1280,14 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
                     iterator: "original-iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -836,17 +1303,13 @@ mod tests {
             assert!(!state.pending.contains_key("shard-1"));
             assert!(!state.initializing.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "original-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "original-iter");
         }
 
         #[test]
@@ -929,6 +1392,14 @@ mod tests {
                     shard_id: "parent-1".to_string(),
                     parent_shard_id: None,
                     iterator: "iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1019,17 +1490,13 @@ mod tests {
             assert!(!state.pending.contains_key("shard-1"));
             assert!(state.active.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                    iterator: "iterator-1".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(active_shard.iterator, "iterator-1");
         }
 
         #[test]
@@ -1051,17 +1518,13 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
 
             assert!(state.active.contains_key("shard-1"));
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "iterator-1".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "iterator-1");
         }
 
         #[test]
@@ -1139,29 +1602,21 @@ mod tests {
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "iter-1".to_string(),
-                }
-            );
+            let shard1 = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(shard1.shard_id, "shard-1");
+            assert_eq!(shard1.parent_shard_id, None);
+            assert_eq!(shard1.iterator, "iter-1");
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-2")
-                    .expect("shard-2 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-2".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                    iterator: "iter-2".to_string(),
-                }
-            );
+            let shard2 = state
+                .active
+                .get("shard-2")
+                .expect("shard-2 should be in active");
+            assert_eq!(shard2.shard_id, "shard-2");
+            assert_eq!(shard2.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(shard2.iterator, "iter-2");
         }
     }
 
@@ -1319,6 +1774,14 @@ mod tests {
                     shard_id: "grandparent".to_string(),
                     parent_shard_id: None,
                     iterator: "iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1400,6 +1863,14 @@ mod tests {
                     shard_id: "parent".to_string(),
                     parent_shard_id: None,
                     iterator: "iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1541,17 +2012,13 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
             assert!(state.active.contains_key("shard-1"));
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "iter-1".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "iter-1");
 
             // Poll with records
             let batch = state.handle_poll_result(
@@ -1564,24 +2031,20 @@ mod tests {
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "iter-2".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "iter-2");
 
             // Exhaust shard
-            let batch = state.handle_poll_result("shard-1", None, vec![create_record("101")]);
-            assert!(batch.is_some());
-            let batch = batch.expect("Expected batch to be Some");
-            assert_eq!(batch.shard_id, "shard-1");
-            assert_eq!(batch.checkpoint.sequence_number, "101");
+            let result = state.handle_poll_result("shard-1", None, vec![create_record("101")]);
+            assert!(result.is_some());
+            let result = result.expect("Expected result to be Some");
+            assert_eq!(result.shard_id, "shard-1");
+            assert_eq!(result.last_checkpoint.sequence_number, "101");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.pending.len(), 0);
@@ -1613,17 +2076,13 @@ mod tests {
             assert!(state.active.contains_key("parent"));
             assert!(state.pending.contains_key("child"));
 
-            assert_eq!(
-                state
-                    .active
-                    .get("parent")
-                    .expect("parent should be in active"),
-                &ActiveShard {
-                    shard_id: "parent".to_string(),
-                    parent_shard_id: None,
-                    iterator: "parent-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("parent")
+                .expect("parent should be in active");
+            assert_eq!(active_shard.shard_id, "parent");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "parent-iter");
 
             // Exhaust parent
             let batch = state.handle_poll_result("parent", None, vec![create_record("100")]);
@@ -1643,17 +2102,13 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
             assert!(state.active.contains_key("child"));
 
-            assert_eq!(
-                state
-                    .active
-                    .get("child")
-                    .expect("child should be in active"),
-                &ActiveShard {
-                    shard_id: "child".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                    iterator: "child-iter".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("child")
+                .expect("child should be in active");
+            assert_eq!(active_shard.shard_id, "child");
+            assert_eq!(active_shard.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(active_shard.iterator, "child-iter");
         }
 
         #[test]
@@ -1708,14 +2163,10 @@ mod tests {
             assert_eq!(state.initializing.len(), 0);
             assert!(state.active.contains_key("gen3"));
 
-            assert_eq!(
-                state.active.get("gen3").expect("gen3 should be in active"),
-                &ActiveShard {
-                    shard_id: "gen3".to_string(),
-                    parent_shard_id: Some("gen2".to_string()),
-                    iterator: "iter3".to_string(),
-                }
-            );
+            let active_shard = state.active.get("gen3").expect("gen3 should be in active");
+            assert_eq!(active_shard.shard_id, "gen3");
+            assert_eq!(active_shard.parent_shard_id, Some("gen2".to_string()));
+            assert_eq!(active_shard.iterator, "iter3");
         }
 
         #[test]
@@ -1762,29 +2213,21 @@ mod tests {
             assert!(state.active.contains_key("child-a"));
             assert!(state.active.contains_key("child-b"));
 
-            assert_eq!(
-                state
-                    .active
-                    .get("child-a")
-                    .expect("child-a should be in active"),
-                &ActiveShard {
-                    shard_id: "child-a".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                    iterator: "iter-a".to_string(),
-                }
-            );
+            let child_a = state
+                .active
+                .get("child-a")
+                .expect("child-a should be in active");
+            assert_eq!(child_a.shard_id, "child-a");
+            assert_eq!(child_a.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(child_a.iterator, "iter-a");
 
-            assert_eq!(
-                state
-                    .active
-                    .get("child-b")
-                    .expect("child-b should be in active"),
-                &ActiveShard {
-                    shard_id: "child-b".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                    iterator: "iter-b".to_string(),
-                }
-            );
+            let child_b = state
+                .active
+                .get("child-b")
+                .expect("child-b should be in active");
+            assert_eq!(child_b.shard_id, "child-b");
+            assert_eq!(child_b.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(child_b.iterator, "iter-b");
         }
 
         #[test]
@@ -1806,17 +2249,13 @@ mod tests {
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: None,
-                    iterator: "iter-1".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, None);
+            assert_eq!(active_shard.iterator, "iter-1");
         }
 
         #[test]
@@ -1829,6 +2268,14 @@ mod tests {
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: Some("parent".to_string()),
                     iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: Some("parent".to_string()),
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1840,32 +2287,32 @@ mod tests {
                 create_record("104"),
             ];
 
-            let batch = state.handle_poll_result("shard-1", Some("iter-2".to_string()), records);
+            let result = state.handle_poll_result("shard-1", Some("iter-2".to_string()), records);
 
-            assert!(batch.is_some());
-            let batch = batch.expect("Expected batch to be Some");
-            assert_eq!(batch.shard_id, "shard-1");
-            assert_eq!(batch.records.len(), 5);
-            assert_eq!(batch.checkpoint.sequence_number, "104");
-            assert_eq!(batch.checkpoint.parent_id, Some("parent".to_string()));
-            assert_eq!(batch.checkpoint.position, CheckpointPosition::After);
+            assert!(result.is_some());
+            let result = result.expect("Expected result to be Some");
+            assert_eq!(result.shard_id, "shard-1");
+            if let PollOutcome::Records { records } = result.outcome {
+                assert_eq!(records.len(), 5);
+            } else {
+                panic!("Expected PollOutcome::Records");
+            }
+            assert_eq!(result.last_checkpoint.sequence_number, "104");
+            assert_eq!(result.last_checkpoint.parent_id, Some("parent".to_string()));
+            assert_eq!(result.last_checkpoint.position, CheckpointPosition::After);
 
             // Verify state
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.pending.len(), 0);
             assert_eq!(state.initializing.len(), 0);
 
-            assert_eq!(
-                state
-                    .active
-                    .get("shard-1")
-                    .expect("shard-1 should be in active"),
-                &ActiveShard {
-                    shard_id: "shard-1".to_string(),
-                    parent_shard_id: Some("parent".to_string()),
-                    iterator: "iter-2".to_string(),
-                }
-            );
+            let active_shard = state
+                .active
+                .get("shard-1")
+                .expect("shard-1 should be in active");
+            assert_eq!(active_shard.shard_id, "shard-1");
+            assert_eq!(active_shard.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(active_shard.iterator, "iter-2");
         }
 
         #[test]
@@ -1906,6 +2353,14 @@ mod tests {
                     shard_id: "parent".to_string(),
                     parent_shard_id: None,
                     iterator: "iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: String::new(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    last_produced_at: None,
+                    current_watermark: None,
                 },
             );
 
@@ -1974,17 +2429,13 @@ mod tests {
                 }
             );
 
-            assert_eq!(
-                state
-                    .active
-                    .get("parent-2")
-                    .expect("parent-2 should be in active"),
-                &ActiveShard {
-                    shard_id: "parent-2".to_string(),
-                    parent_shard_id: None,
-                    iterator: "iter2".to_string(),
-                }
-            );
+            let parent2 = state
+                .active
+                .get("parent-2")
+                .expect("parent-2 should be in active");
+            assert_eq!(parent2.shard_id, "parent-2");
+            assert_eq!(parent2.parent_shard_id, None);
+            assert_eq!(parent2.iterator, "iter2");
         }
     }
 }

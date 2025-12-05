@@ -26,7 +26,7 @@ use std::time::SystemTime;
 /// since no records have been processed yet.
 ///
 /// Exclusive (`After`) checkpoint is returned as part of `StreamResult`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ShardCheckpoint {
     pub sequence_number: String,
     pub parent_id: Option<String>, // Root shards don't have parents
