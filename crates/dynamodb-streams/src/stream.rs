@@ -54,13 +54,9 @@ impl DynamodbStreamProducer {
         let mut poll_results = Vec::new();
         let mut had_transient_error = false;
 
-        println!("1 - initialize");
-
         // 1. Initialize shards that require iterators
         // If permanent error is encountered, it is surfaced to the client.
         self.initialize_shards_iterators().await?;
-
-        println!("2 - poll");
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
@@ -80,8 +76,6 @@ impl DynamodbStreamProducer {
 
         let results = join_all(futures).await;
 
-        println!("3 - process");
-
         // 3. Process poll results
         for (shard_id, result) in results {
             let poll_result = match result {
@@ -95,8 +89,6 @@ impl DynamodbStreamProducer {
             };
             poll_results.push(poll_result);
         }
-
-        println!("4 - discover");
 
         // 4. Discover new shards
         // If permanent error is encountered, it is surfaced to the client.
