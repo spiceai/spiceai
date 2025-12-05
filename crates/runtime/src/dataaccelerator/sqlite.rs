@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -27,7 +29,7 @@ use datafusion_table_providers::{
 use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
+use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
@@ -38,7 +40,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,20 +95,29 @@ impl Default for SqliteAccelerator {
 }
 
 impl SqliteAccelerator {
+    /// Wrapper to align the decimal extension signature with `sqlite3_auto_extension`.
+    ///
+    /// SAFETY: The wrapper only casts the error message pointer to match the expected mutability.
+    unsafe extern "C" fn sqlite3_decimal_init_wrapper(
+        db: *mut rusqlite::ffi::sqlite3,
+        error_message: *mut *mut c_char,
+        api: *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int {
+        unsafe { sqlite3_decimal_init(db, error_message.cast(), api) }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
         unsafe {
-            sqlite3_auto_extension(Some(sqlite3_decimal_init));
+            sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
                 .with_decimal_between(true)
-                // Prepared statements currently map timestamp values incorrectly (see spiceai#7629),
-                // so use the legacy insert path until the upstream fix lands.
-                .with_batch_insert_use_prepared_statements(false)
+                .with_batch_insert_use_prepared_statements(true)
                 .with_function_support(deny_spice_specific_functions()),
         }
     }
@@ -336,11 +347,14 @@ impl DataAccelerator for SqliteAccelerator {
 
         let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
-        let cloned_writer = Arc::clone(&sqlite_writer);
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) =
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options);
 
         let table_provider = Arc::new(PolyTableProvider::new(
-            cloned_writer,
-            sqlite_writer,
+            write_provider,
+            delete_provider,
             read_provider,
         ));
 
@@ -457,7 +471,9 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![1]);
+        // Expect 2 rows deleted: "1970-01-01" (epoch=0) and "2012-12-01T11:11:11Z" (1354360271000ms)
+        // both are < 1354360272000ms
+        let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
@@ -476,7 +492,9 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
+        // Only 1 row remains after the first delete (time_int=1354360272),
+        // which matches time_int < 1354360273
+        let expected = UInt64Array::from(vec![1]);
         assert_eq!(actual, &expected);
     }
 

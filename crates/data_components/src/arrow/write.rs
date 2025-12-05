@@ -152,7 +152,7 @@ impl MemTable {
 
     #[must_use]
     pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
-        if !matches!(on_conflict, OnConflict::Upsert(_, _)) {
+        if !matches!(on_conflict, OnConflict::Upsert(_)) {
             tracing::warn!(
                 "In-memory tables only support Upsert on_conflict, but got: {on_conflict:?}. Setting will be ignored."
             );
@@ -325,8 +325,7 @@ impl TableProvider for MemTable {
 
         // In-memory tables only support primary keys constraints. Support for `OnConflict` is limited to `Upsert` matching the primary key.
         // So we verify that the `on_conflict` and  the primary key matches
-        if let (Some(OnConflict::Upsert(on_conflict, _)), Some(pk)) =
-            (&self.on_conflict, &primary_key)
+        if let (Some(OnConflict::Upsert(on_conflict)), Some(pk)) = (&self.on_conflict, &primary_key)
         {
             self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
         }

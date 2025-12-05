@@ -181,7 +181,7 @@ logos = "0.15.1"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.3.0", features = ["openssl-tls"] }
-mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
+mysql_async = { version = "0.36.1", features = ["native-tls-tls", "chrono"] }
 num_cpus = "1.16"
 object_store = { version = "0.12.4", features = [
     "aws",
@@ -224,7 +224,7 @@ regex = "1.12.2"
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
 rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a66f66ae345a0fafde1e2ee496ec137d77aef82a" }
 roaring = "0.11"
-rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
+rusqlite = { version = "0.37.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
 schemars = "1.1.0"
@@ -257,7 +257,7 @@ tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
     "with-uuid-1",
 ] }
-tokio-rusqlite = "0.5.1"
+tokio-rusqlite = "0.7"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 tonic = { version = "0.13", features = [
@@ -329,7 +329,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "97ea01e40c79e5aaf34a6126cef95721f8bef3cc" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "97ea01e40c79e5aaf34a6126cef95721f8bef3cc" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "bfe12b5e9ea31950a724cecce04e543f4db02165" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "373b12156a0992357e17d62bcd9f7d542965ae49" } # spiceai
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai:spiceai-50
 
@@ -341,7 +341,7 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "bcc1d9b77ac04709205e8e79b7ca3dec3d34ec48" } # spiceai-1.4.2
 
-rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
