@@ -75,7 +75,7 @@ jobs:
               }
             ];
 
-            const platform_option = context.payload.inputs.platform_option;
+            const platform_option = context.payload.inputs?.platform_option || 'all';
             let filtered = matrix;
 
             if (platform_option !== 'all') {
