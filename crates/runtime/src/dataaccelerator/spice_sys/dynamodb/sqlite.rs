@@ -36,30 +36,32 @@ impl DynamoDBSys {
         };
 
         conn.conn
-            .call(move |conn| {
-                let create_table = format!(
-                    "CREATE TABLE IF NOT EXISTS {DYNAMODB_STREAMS_TABLE_NAME} (
+            .call(
+                move |conn: &mut rusqlite::Connection| -> Result<(), rusqlite::Error> {
+                    let create_table = format!(
+                        "CREATE TABLE IF NOT EXISTS {DYNAMODB_STREAMS_TABLE_NAME} (
                     dataset_name TEXT PRIMARY KEY,
                     checkpoint_data TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )"
-                );
-                conn.execute(&create_table, [])?;
+                    );
+                    conn.execute(&create_table, [])?;
 
-                let upsert = format!(
-                    "INSERT INTO {DYNAMODB_STREAMS_TABLE_NAME}
+                    let upsert = format!(
+                        "INSERT INTO {DYNAMODB_STREAMS_TABLE_NAME}
                  (dataset_name, checkpoint_data, updated_at)
                  VALUES (?1, ?2, CURRENT_TIMESTAMP)
                  ON CONFLICT (dataset_name) DO UPDATE SET
                     checkpoint_data = ?2,
                     updated_at = CURRENT_TIMESTAMP"
-                );
+                    );
 
-                conn.execute(&upsert, [dataset_name, checkpoint_data])?;
+                    conn.execute(&upsert, [dataset_name, checkpoint_data])?;
 
-                Ok(())
-            })
+                    Ok::<(), rusqlite::Error>(())
+                },
+            )
             .await
             .map_err(Error::external)
     }
@@ -74,7 +76,7 @@ impl DynamoDBSys {
         let conn = conn_sync.as_any().downcast_ref::<SqliteConnection>()?;
 
         conn.conn
-            .call(move |conn| {
+            .call(move |conn: &mut rusqlite::Connection| -> Result<DynamoDBCheckpointMetadata, rusqlite::Error> {
                 let query = format!(
                     "SELECT checkpoint_data FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
                 );
@@ -86,7 +88,7 @@ impl DynamoDBSys {
 
                     Ok(DynamoDBCheckpointMetadata { checkpoint_data })
                 } else {
-                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                    Err(rusqlite::Error::QueryReturnedNoRows)
                 }
             })
             .await

@@ -201,6 +201,6 @@ pub enum SnapshotTrigger {
     #[default]
     /// Snapshots are created after each refresh (used by full/append modes).
     AfterRefresh,
-    /// Snapshots are updated on an interval (used by append/changes modes).
-    Interval(Duration),
+    /// Snapshots are updated after X batches (used by append/changes modes).
+    Batches(u8),
 }

@@ -929,35 +929,36 @@ fn create_snapshot_callback(
     match snapshot_trigger {
         SnapshotTrigger::AfterRefresh => {
             tracing::warn!(
-                "Append/changes streams only support 'snapshots_trigger: interval', but 'refresh' is set. No checkpoints will be created."
+                "Append/changes streams only support 'snapshots_trigger: batches', but 'refresh' is set. No checkpoints will be created."
             );
             None
         }
-        SnapshotTrigger::Interval(snapshot_interval) => {
+        SnapshotTrigger::Batches(snapshot_batches) => {
             match (checkpointer, snapshot_manager) {
                 (Some(checkpointer), Some(snapshot_manager)) => {
                     let snapshot_manager = Arc::new(snapshot_manager);
                     let dataset_name = dataset_name.clone();
 
-                    // Track last snapshot time using Arc<RwLock<Instant>>
-                    let last_snapshot_time = Arc::new(RwLock::new(tokio::time::Instant::now()));
+                    // Track number of processed batches since last snapshot
+                    let batches_processed = Arc::new(RwLock::new(0u8));
 
                     let callback = Arc::new(Mutex::new(Box::new(move || {
                         let checkpointer = Arc::clone(&checkpointer);
                         let snapshot_manager = Arc::clone(&snapshot_manager);
-                        let last_snapshot_time = Arc::clone(&last_snapshot_time);
+                        let batches_processed = Arc::clone(&batches_processed);
                         let federated_schema = Arc::<Schema>::clone(&federated_schema);
                         let dataset_name = dataset_name.clone();
 
                         Box::pin(async move {
-                            let mut last_time = last_snapshot_time.write().await;
-                            let elapsed = last_time.elapsed();
+                            let mut batches_processed_value = batches_processed.write().await;
 
-                            if elapsed >= snapshot_interval {
+                            *batches_processed_value += 1;
+                            if *batches_processed_value >= snapshot_batches {
+                                *batches_processed_value = 0;
+
                                 tracing::debug!(
-                                    "Creating snapshot for changes stream: {} (elapsed: {:?})",
-                                    dataset_name,
-                                    elapsed
+                                    "Creating snapshot for changes stream: {}",
+                                    dataset_name
                                 );
 
                                 if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
@@ -983,8 +984,6 @@ fn create_snapshot_callback(
                                         dataset_name
                                     );
                                 }
-
-                                *last_time = tokio::time::Instant::now();
                             }
                         }) as Pin<Box<dyn Future<Output = ()> + Send>>
                     })

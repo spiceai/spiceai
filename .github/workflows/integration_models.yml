@@ -63,7 +63,7 @@ jobs:
     name: Build Test Binary
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -96,7 +96,7 @@ jobs:
 
       # Upload the test archive as an artifact
       - name: Upload test archive
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
@@ -107,7 +107,7 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       
@@ -116,7 +116,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -158,7 +158,7 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       
@@ -167,7 +167,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -248,7 +248,7 @@ jobs:
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           
@@ -257,7 +257,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -295,7 +295,7 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -304,7 +304,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -338,7 +338,7 @@ jobs:
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -347,7 +347,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -371,7 +371,7 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -380,7 +380,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -411,7 +411,7 @@ jobs:
     needs: build
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -420,7 +420,7 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: ai-integration-test-archive
           path: ./integration_test

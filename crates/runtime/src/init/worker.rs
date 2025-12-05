@@ -25,6 +25,7 @@ use snafu::prelude::*;
 pub enum Error {}
 
 impl Runtime {
+    #[cfg(feature = "models")]
     pub(crate) async fn load_workers(self: Arc<Self>) {
         let app_lock = self.app.read().await;
 

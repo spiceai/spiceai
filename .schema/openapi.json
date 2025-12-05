@@ -4262,7 +4262,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Names of datasets to sample from. If omitted, all datasets are used."
+            "description": "Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used."
           },
           "model": {
             "type": "string",

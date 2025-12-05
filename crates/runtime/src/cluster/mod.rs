@@ -31,8 +31,10 @@ use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
+use prost::Message;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
+use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::env;
@@ -173,14 +175,6 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    // Bind app manifest to runtime
-    executor_bind_app(
-        &rt,
-        rt.config.cluster.scheduler_url.to_string(),
-        executor_id,
-    )
-    .await?;
-
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
 
     let executor_poll_loop = tokio::spawn(
@@ -198,6 +192,14 @@ pub async fn initialize_cluster_executor(
             .context(FailedToStartClusterExecutorSnafu)?;
         rt.status.update_cluster("executor", ComponentStatus::Ready);
         executor_bind_object_stores(Arc::clone(&rt)).await?;
+
+        executor_bind_app(
+            &rt,
+            rt.config.cluster.scheduler_url.to_string(),
+            executor_id,
+        )
+        .await?;
+
         executor_poll_loop
             .await
             .boxed()
@@ -279,9 +281,13 @@ async fn executor_bind_app(
     .boxed()
     .context(FailedToStartClusterExecutorSnafu)?;
 
+    let app_definition_request = GetAppDefinitionRequest {
+        executor_id: executor_id.clone(),
+    };
+
     let action = arrow_flight::Action {
         r#type: "GetAppDefinition".to_string(),
-        body: bytes::Bytes::new(),
+        body: bytes::Bytes::from(app_definition_request.encode_to_vec()),
     };
 
     let response = flight_client

@@ -68,7 +68,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -146,7 +146,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -192,14 +192,14 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         continue-on-error: true
         with:
           pattern: spiced_models_cuda_*_linux_x86_64
@@ -232,7 +232,7 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -242,7 +242,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}
