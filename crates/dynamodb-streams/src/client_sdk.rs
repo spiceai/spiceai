@@ -43,30 +43,27 @@ impl SDKClient {
         }
     }
 
-    pub async fn get_stream_arn(&self, table_name: String) -> Result<String> {
+    pub async fn get_stream_arn(&self, table_name: String, with_retry: bool) -> Result<String> {
         let table = self
             .db
             .describe_table()
             .table_name(&table_name)
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?
+            .map_err(Error::from_describe_table)?
             .table
-            .ok_or_else(|| Error::StreamNotFound {
-                table_name: table_name.clone(),
-            })?;
+            .ok_or_else(|| Error::TableNotFound)?;
 
         table
             .latest_stream_arn
-            .ok_or_else(|| Error::StreamNotFound { table_name })
+            .ok_or_else(|| Error::StreamNotFound)
     }
 
     async fn get_shards(
         &self,
         stream_arn: &str,
         exclusive_start_shard_id: Option<String>,
+        with_retry: bool,
     ) -> Result<(Vec<ApiShard>, Option<String>)> {
         let description = self
             .streams
@@ -75,9 +72,7 @@ impl SDKClient {
             .set_exclusive_start_shard_id(exclusive_start_shard_id)
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?
+            .map_err(Error::from_describe_stream)?
             .stream_description
             .ok_or_else(|| Error::StreamDescriptionNotFound {
                 stream_arn: stream_arn.to_string(),
@@ -109,7 +104,8 @@ impl SDKClient {
         shard_id: &str,
         shard_iterator_type: &ShardIteratorType,
         sequence_number: Option<String>,
-    ) -> Result<Option<String>> {
+        with_retry: bool,
+    ) -> Result<String> {
         Ok(self
             .streams
             .get_shard_iterator()
@@ -119,10 +115,11 @@ impl SDKClient {
             .set_sequence_number(sequence_number.clone())
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?
-            .shard_iterator)
+            .map_err(Error::from_get_shard_iterator)?
+            .shard_iterator
+            .ok_or_else(|| Error::ShardIteratorNotFound {
+                shard_id: shard_id.to_string(),
+            })?)
     }
 
     pub async fn get_iterator_records(
@@ -136,9 +133,7 @@ impl SDKClient {
             .set_limit(self.shard_record_limit)
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?;
+            .map_err(Error::from_get_records)?;
 
         Ok((
             output.next_shard_iterator,
@@ -146,12 +141,12 @@ impl SDKClient {
         ))
     }
 
-    pub async fn get_all_shards(&self, stream_arn: &str) -> Result<Vec<ApiShard>> {
+    pub async fn get_all_shards(&self, stream_arn: &str, with_retry: bool) -> Result<Vec<ApiShard>> {
         let mut all_shards = Vec::new();
         let mut last_shard_id = None;
 
         loop {
-            let (shards, next_shard_id) = self.get_shards(stream_arn, last_shard_id).await?;
+            let (shards, next_shard_id) = self.get_shards(stream_arn, last_shard_id, with_retry).await?;
             all_shards.extend(shards);
 
             last_shard_id = next_shard_id;

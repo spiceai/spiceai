@@ -13,9 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{PollOutcome, ShardPollResult, StreamState};
+use crate::stream_state::{BlockedShard, InitializingShard, PollOutcome, ShardPollResult, StreamState};
 use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
@@ -54,6 +54,7 @@ impl DynamodbStreamProducer {
         let mut poll_results = Vec::new();
 
         // 1. Initialize shards that require iterators
+        // If permanent error is encountered, it is surfaced to the client.
         self.initialize_shards_iterators().await;
 
         // 2. Poll active shards
@@ -77,86 +78,79 @@ impl DynamodbStreamProducer {
         // 3. Process poll results
         for (shard_id, result) in results {
             let poll_result = match result {
-                Ok((next_iter, records)) => {
-                    match self.state.handle_poll_result(&shard_id, next_iter, records) {
-                        Some(result) => result,
-                        None => return Err(Error::UnexpectedShardId { shard_id }),
-                    }
-                }
-                Err(e) => match self.state.handle_poll_error(&shard_id, &e) {
-                    Some(result) => result,
-                    None => return Err(Error::UnexpectedShardId { shard_id }),
-                },
+                Ok((next_iter, records)) => self.state.handle_poll_result(&shard_id, next_iter, records)?,
+                Err(e) => self.state.handle_poll_error(&shard_id, e)?,
             };
             poll_results.push(poll_result);
         }
 
         // 4. Discover new shards
-        if let Ok(shards) = self.client.get_all_shards(&self.stream_arn).await {
-            self.state.add_discovered(shards);
+        // If permanent error is encountered, it is surfaced to the client.
+        match self.client.get_all_shards(&self.stream_arn, false).await {
+            Ok(shards) => self.state.add_discovered(shards)?,
+            Err(e) => {
+                if !e.is_retriable() {
+                    return Err(e);
+                }
+                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}")
+            },
         }
 
         Ok(combine_shard_batches(&poll_results, self.idle_timeout))
     }
 
-    async fn initialize_shards_iterators(&mut self) {
-        let shard_ids: Vec<String> = self.state.get_initializing_shards_ids().cloned().collect();
+    async fn initialize_shards_iterators(&mut self) -> Result<()> {
+        let shards: Vec<InitializingShard> = self.state.get_initializing_shards().cloned().collect();
 
-        for shard_id in shard_ids {
+        for shard in shards {
+            let iterator_type = match shard.last_checkpoint.position {
+                CheckpointPosition::At => ShardIteratorType::AtSequenceNumber,
+                CheckpointPosition::After => ShardIteratorType::AfterSequenceNumber,
+            };
+
             match self
                 .client
                 .get_shard_iterator(
                     &self.stream_arn,
-                    &shard_id,
-                    &ShardIteratorType::TrimHorizon,
-                    None,
+                    &shard.shard_id,
+                    &iterator_type,
+                    Some(shard.last_checkpoint.sequence_number.clone()),
+                    false,
                 )
                 .await
             {
                 Ok(iterator) => {
-                    if let Some(iterator) = iterator {
-                        self.state.mark_active(shard_id, iterator);
-                    }
+                    self.state.mark_active(shard.shard_id, iterator);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to initialize shard {}: {}", shard_id, e);
-                }
-            }
-        }
-    }
-
-    async fn perform_iterate_with_retry(&mut self) -> Result<DynamoDBStreamBatch> {
-        let mut backoff = self.retry_strategy.clone();
-
-        loop {
-            match self.collect().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if let Some(duration) = backoff.next_backoff() {
-                        tracing::debug!("Iteration failed, retrying after {:?}: {}", duration, e);
-                        tokio::time::sleep(duration).await;
-                    } else {
-                        tracing::error!("Iteration failed after exhausting retries: {}", e);
+                    if !e.is_retriable() {
                         return Err(e);
                     }
+                    tracing::warn!("Failed to initialize shard. Will retry on next iteration : {}", e);
                 }
             }
         }
+
+        Ok(())
     }
 
     pub async fn streaming(mut self) {
         loop {
-            let Ok(batch) = self.perform_iterate_with_retry().await else {
-                // Error is logged in `perform_iterate_with_retry`
-                return;
-            };
+            match self.collect().await {
+                Ok(batch) => {
+                    if self.sender.send(Ok(batch)).await.is_err() {
+                        return;
+                    }
 
-            if self.sender.send(Ok(batch)).await.is_err() {
-                return;
-            }
-
-            if let Some(duration) = self.interval {
-                sleep(duration).await;
+                    if let Some(duration) = self.interval {
+                        sleep(duration).await;
+                    }
+                }
+                Err(e) => {
+                    // Send permanent error to receiver and stop streaming
+                    let _ = self.sender.send(Err(e)).await;
+                    return;
+                }
             }
         }
     }

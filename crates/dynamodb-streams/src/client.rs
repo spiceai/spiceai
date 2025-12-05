@@ -56,9 +56,9 @@ impl Client {
     pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         let stream_arn = self
             .sdk_client
-            .get_stream_arn(self.table_name.clone())
+            .get_stream_arn(self.table_name.clone(), true)
             .await?;
-        let shards = self.sdk_client.get_all_shards(&stream_arn).await?;
+        let shards = self.sdk_client.get_all_shards(&stream_arn, true).await?;
 
         let checkpoint_shards = shards
             .into_iter()
@@ -100,7 +100,7 @@ impl Client {
     pub async fn stream_from_checkpoint(&self, checkpoint: Checkpoint) -> Result<DynamodbStream> {
         let stream_arn = self
             .sdk_client
-            .get_stream_arn(self.table_name.clone())
+            .get_stream_arn(self.table_name.clone(), true)
             .await?;
         let state = initialize_state_from_checkpoint(
             stream_arn.clone(),
@@ -125,7 +125,6 @@ impl Client {
         };
 
         tokio::spawn(async move {
-            // https://github.com/spiceai/spiceai/issues/8074
             producer.streaming().await;
         });
 
