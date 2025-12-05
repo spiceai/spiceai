@@ -462,9 +462,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                     source: super::Error::SnapshotTriggerIntervalRequiresInterval,
                 });
             }
-            (Some(spicepod_acceleration::SnapshotTrigger::Batches), Some(interval)) => {
+            (Some(spicepod_acceleration::SnapshotTrigger::Batches), Some(batches)) => {
                 let Some(batches) =
-                    interval
+                    batches
                         .parse()
                         .map_err(|e| crate::Error::InvalidSpicepodDataset {
                             source: super::Error::UnableToParseSnapshotsBatches { source: e },
