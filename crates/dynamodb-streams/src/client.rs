@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use util::retry_strategy::{BackoffMethod, RetryBackoffBuilder};
 
 #[derive(Debug, Clone)]
 #[expect(clippy::struct_field_names)]
@@ -57,7 +58,7 @@ impl Client {
             .sdk_client
             .get_stream_arn(self.table_name.clone())
             .await?;
-        let shards = self.sdk_client.get_all_shards(&stream_arn, true).await?;
+        let shards = self.sdk_client.get_all_shards(&stream_arn).await?;
 
         let checkpoint_shards = shards
             .into_iter()
@@ -110,6 +111,11 @@ impl Client {
 
         let (tx, rx) = mpsc::channel(self.buffer);
 
+        let retry_strategy = RetryBackoffBuilder::new()
+            .method(BackoffMethod::Fibonacci)
+            .max_retries(None)
+            .build();
+
         let producer = DynamodbStreamProducer {
             stream_arn,
             state,
@@ -117,6 +123,7 @@ impl Client {
             sender: tx,
             client: Arc::clone(&self.sdk_client),
             idle_timeout: None,
+            retry_strategy,
         };
 
         tokio::spawn(async move {
@@ -169,7 +176,10 @@ impl ClientBuilder {
     #[must_use]
     pub fn build(self) -> Client {
         Client {
-            sdk_client: Arc::new(SDKClient::new(&self.sdk_config, self.shard_record_limit)),
+            sdk_client: Arc::new(SDKClient::new(
+                &self.sdk_config,
+                self.shard_record_limit,
+            )),
             table_name: self.table_name,
             interval: self.interval,
             buffer: self.buffer,

@@ -208,7 +208,7 @@ impl StreamState {
 
         // Handle iterator expiration by reinitializing with current checkpoint
         if error.is_retriable() {
-            tracing::error!(
+            tracing::warn!(
                 "Poll error for shard {}. Will retry on next iteration: {}",
                 shard_id,
                 error
@@ -247,14 +247,9 @@ impl StreamState {
     }
 
     /// Add discovered shards, returns shard IDs that need initialization
-    pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
+        pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
         for shard in shards {
             let shard_id = shard.shard_id.clone();
-
-            // // Skip closed shards (those with ending_sequence_number)
-            // if shard.ending_sequence_number.is_some() {
-            //     continue;
-            // }
 
             // At each iteration we will get all currently non-expired shards
             // Only subset of them we haven't seen before

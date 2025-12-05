@@ -17,3 +17,4 @@ tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
 serde.workspace = true
+util = { path = "../util" }

@@ -54,8 +54,11 @@ pub enum Error {
     ))]
     FailedToInitializeCheckpoint,
 
-    #[snafu(display("Trimmed data access for shard"))]
-    TrimmedData,
+    #[snafu(display("Stream is beyond retention period (more than 24 hours"))]
+    StreamBeyondRetention,
+
+    #[snafu(display("Shard not found."))]
+    ShardNotFound,
 
     #[snafu(display("Missing starting_sequence_number"))]
     MissingStaringSequenceNumber,
@@ -63,22 +66,23 @@ pub enum Error {
     #[snafu(display("Inconsistent shard id: {shard_id}"))]
     UnexpectedShardId { shard_id: String },
 
-    #[snafu(display("Unknown SDK error: {source}"))]
-    UnknownSdk {
+    #[snafu(display("AWS SDK error: {source}"))]
+    SdkError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     // Retriable - network/transport
-    #[snafu(display("Network timeout"))]
+    #[snafu(display("Network timeout. Try again later"))]
     Timeout,
 
-    #[snafu(display("Network connection failure"))]
+    #[snafu(display("Network connection failure. Try again later"))]
     ConnectionFailure,
 
-    #[snafu(display("Throttled"))]
+    #[snafu(display("Request has been throttled. Try again later"))]
     Throttled,
 
-    // Retriable - with special handling
+    // Retriable - with special handling.
+    // Should never surface to the user.
     #[snafu(display("Iterator expired for shard"))]
     IteratorExpired,
 }
@@ -87,7 +91,7 @@ impl Error {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
-            Error::Timeout | Error::ConnectionFailure { .. } | Error::Throttled { .. }
+            Error::Timeout | Error::ConnectionFailure | Error::Throttled
         )
     }
 
@@ -98,12 +102,12 @@ impl Error {
 
             SdkError::ServiceError(e) => match e.err() {
                 DescribeTableError::ResourceNotFoundException(_) => Error::TableNotFound,
-                _ => Error::UnknownSdk {
+                _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
             },
 
-            _ => Error::UnknownSdk {
+            _ => Error::SdkError {
                 source: Box::new(err),
             },
         }
@@ -116,12 +120,12 @@ impl Error {
 
             SdkError::ServiceError(e) => match e.err() {
                 DescribeStreamError::ResourceNotFoundException(_) => Error::StreamNotFound,
-                _ => Error::UnknownSdk {
+                _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
             },
 
-            _ => Error::UnknownSdk {
+            _ => Error::SdkError {
                 source: Box::new(err),
             },
         }
@@ -135,13 +139,13 @@ impl Error {
             SdkError::ServiceError(e) => match e.err() {
                 GetRecordsError::ExpiredIteratorException(_) => Error::IteratorExpired,
                 GetRecordsError::LimitExceededException(_) => Error::Throttled,
-                GetRecordsError::TrimmedDataAccessException(_) => Error::TrimmedData,
-                _ => Error::UnknownSdk {
+                GetRecordsError::TrimmedDataAccessException(_) => Error::StreamBeyondRetention,
+                _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
             },
 
-            _ => Error::UnknownSdk {
+            _ => Error::SdkError {
                 source: Box::new(err),
             },
         }
@@ -153,13 +157,14 @@ impl Error {
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
             SdkError::ServiceError(e) => match e.err() {
-                GetShardIteratorError::TrimmedDataAccessException(_) => Error::TrimmedData,
-                _ => Error::UnknownSdk {
+                GetShardIteratorError::TrimmedDataAccessException(_) => Error::StreamBeyondRetention,
+                GetShardIteratorError::ResourceNotFoundException(_) => Error::ShardNotFound,
+                _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
             },
 
-            _ => Error::UnknownSdk {
+            _ => Error::SdkError {
                 source: Box::new(err),
             },
         }

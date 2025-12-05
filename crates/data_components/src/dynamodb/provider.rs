@@ -64,6 +64,7 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
@@ -96,7 +97,7 @@ impl DynamoDBTableProvider {
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
-                // .buffer(NonZeroUsize::new(1).unwrap())
+                .buffer(NonZeroUsize::new(1).unwrap())
                 .build(),
         );
 

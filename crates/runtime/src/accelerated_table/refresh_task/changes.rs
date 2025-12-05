@@ -27,6 +27,8 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+#[cfg(feature = "dynamodb")]
+use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{Expr, col};
@@ -85,6 +87,7 @@ impl RefreshTask {
         while let Some(update) = changes_stream.next().await {
             match update {
                 Ok(change_envelope) => {
+                    println!("Processing started");
                     match self
                         .write_change(change_envelope.change_batch.clone())
                         .await
@@ -131,6 +134,7 @@ impl RefreshTask {
                             }
                         }
                     }
+                    println!("Processing ended");
                 }
                 Err(e) => {
                     // If the error is transient (e.g., Kafka poll timeout), continue without changing the refresh status to Error
@@ -177,8 +181,8 @@ impl RefreshTask {
                         .await?;
                 }
                 ChangeOperationType::Upsert => {
-                    self.process_upsert_batch(&change_batch, &row_indices)
-                        .await?;
+                    // self.process_upsert_batch(&change_batch, &row_indices)
+                    //     .await?;
                 }
                 ChangeOperationType::Truncate => {
                     tracing::warn!("Truncate operation not yet implemented for {dataset_name}");
@@ -487,6 +491,19 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
             }
         }
         return StreamErrorType::Fatal;
+    }
+
+    #[cfg(feature = "dynamodb")]
+    if let cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage { source }) = err {
+        match source {
+            dynamodb_streams::Error::StreamBeyondRetention => {
+                tracing::error!(
+                    "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
+                );
+                return StreamErrorType::Fatal;
+            }
+            _ => {}
+        }
     }
 
     tracing::error!("Changes stream error for {dataset_name}: {err}");

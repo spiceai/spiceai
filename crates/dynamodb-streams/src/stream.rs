@@ -16,7 +16,7 @@ limitations under the License.
 use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
 use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
-use crate::{Result, StreamResult};
+use crate::{Error, Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, sleep},
 };
+use util::retry_strategy::{Backoff, RetryBackoff};
 
 #[derive(Debug)]
 pub struct DynamodbStreamProducer {
@@ -36,6 +37,7 @@ pub struct DynamodbStreamProducer {
     pub interval: Option<Duration>,
     pub sender: mpsc::Sender<StreamResult>,
     pub client: Arc<SDKClient>,
+    pub retry_strategy: RetryBackoff,
     /// Duration after which a shard is considered idle and excluded from watermark calculation.
     /// If None, all shards are included in watermark calculation regardless of activity.
     pub idle_timeout: Option<Duration>,
@@ -48,12 +50,17 @@ pub struct DynamoDBStreamBatch {
 }
 
 impl DynamodbStreamProducer {
-    async fn collect(&mut self) -> Result<DynamoDBStreamBatch> {
+    async fn collect(&mut self) -> Result<(DynamoDBStreamBatch, bool)> {
         let mut poll_results = Vec::new();
+        let mut had_transient_error = false;
+
+        println!("1 - initialize");
 
         // 1. Initialize shards that require iterators
         // If permanent error is encountered, it is surfaced to the client.
         self.initialize_shards_iterators().await?;
+
+        println!("2 - poll");
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
@@ -73,16 +80,23 @@ impl DynamodbStreamProducer {
 
         let results = join_all(futures).await;
 
+        println!("3 - process");
+
         // 3. Process poll results
         for (shard_id, result) in results {
             let poll_result = match result {
                 Ok((next_iter, records)) => self
                     .state
                     .handle_poll_result(&shard_id, next_iter, records)?,
-                Err(e) => self.state.handle_poll_error(&shard_id, e)?,
+                Err(e) => {
+                    had_transient_error = true;
+                    self.state.handle_poll_error(&shard_id, e)?
+                },
             };
             poll_results.push(poll_result);
         }
+
+        println!("4 - discover");
 
         // 4. Discover new shards
         // If permanent error is encountered, it is surfaced to the client.
@@ -92,11 +106,12 @@ impl DynamodbStreamProducer {
                 if !e.is_retriable() {
                     return Err(e);
                 }
+                had_transient_error = true;
                 tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}")
             }
         }
 
-        Ok(combine_shard_batches(&poll_results, self.idle_timeout))
+        Ok((combine_shard_batches(&poll_results, self.idle_timeout), had_transient_error))
     }
 
     async fn initialize_shards_iterators(&mut self) -> Result<()> {
@@ -104,6 +119,8 @@ impl DynamodbStreamProducer {
             self.state.get_initializing_shards().cloned().collect();
 
         for shard in shards {
+            // Shards that were already polled use `After`.
+            // Newly discovered shards use `At`.
             let iterator_type = match shard.last_checkpoint.position {
                 CheckpointPosition::At => ShardIteratorType::AtSequenceNumber,
                 CheckpointPosition::After => ShardIteratorType::AfterSequenceNumber,
@@ -138,19 +155,36 @@ impl DynamodbStreamProducer {
     }
 
     pub async fn streaming(mut self) {
+        let mut backoff = self.retry_strategy.clone();
+
         loop {
             match self.collect().await {
-                Ok(batch) => {
-                    if self.sender.send(Ok(batch)).await.is_err() {
+                Ok((batch, had_transient_error)) => {
+                    // Send batch if it has records
+                    if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
                         return;
                     }
 
-                    if let Some(duration) = self.interval {
-                        sleep(duration).await;
+                    if had_transient_error {
+                        // Transient error occurred during collection - apply backoff
+                        if let Some(duration) = backoff.next_backoff() {
+                            tokio::time::sleep(duration).await;
+                        } else {
+                            // Backoff exhausted - transient errors persisted too long
+                            // Shouldn't happen as we should have infinite retries.
+                            return;
+                        }
+                    } else {
+                        // Clean success - reset backoff and use normal interval
+                        backoff = self.retry_strategy.clone();
+
+                        if let Some(duration) = self.interval {
+                            sleep(duration).await;
+                        }
                     }
                 }
                 Err(e) => {
-                    // Send permanent error to receiver and stop streaming
+                    // Permanent error - return immediately without retry
                     let _ = self.sender.send(Err(e)).await;
                     return;
                 }
