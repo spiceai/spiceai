@@ -121,7 +121,7 @@
     {
       "type": "lldb",
       "request": "attach",
-      "name": "[Rust] Attack to spiced",
+      "name": "[Rust] Attach to spiced",
       "program": "~/.spice/bin/spiced",
       "pid": "${input:pid}"
     },
