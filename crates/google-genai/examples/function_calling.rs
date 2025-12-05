@@ -29,11 +29,11 @@ use std::collections::HashMap;
 fn get_current_weather(location: &str, unit: Option<&str>) -> String {
     let unit = unit.unwrap_or("fahrenheit");
     format!(
-        "{{\"location\": \"{}\", \"temperature\": \"72\", \"unit\": \"{}\", \"forecast\": \"sunny\"}}",
-        location, unit
+        "{{\"location\": \"{location}\", \"temperature\": \"72\", \"unit\": \"{unit}\", \"forecast\": \"sunny\"}}"
     )
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key =
@@ -115,12 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or("Unknown");
                     let unit = function_call.args.get("unit").and_then(|v| v.as_str());
 
-                    println!(
-                        "Calling function: get_current_weather(\"{}\", {:?})",
-                        location, unit
-                    );
+                    println!("Calling function: get_current_weather(\"{location}\", {unit:?})");
                     let function_result = get_current_weather(location, unit);
-                    println!("Function result: {}\n", function_result);
+                    println!("Function result: {function_result}\n");
 
                     let mut response_map = HashMap::new();
                     response_map.insert("result".to_string(), serde_json::json!(function_result));
@@ -138,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 Part::Text { text } => {
-                    println!("Model text response: {}\n", text);
+                    println!("Model text response: {text}\n");
                 }
                 _ => {}
             }
@@ -158,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(candidate) = final_response.candidates.first() {
         for part in &candidate.content.parts {
             if let Part::Text { text } = part {
-                println!("Final response from model:\n{}\n", text);
+                println!("Final response from model:\n{text}\n");
             }
         }
     }
