@@ -20,7 +20,7 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, exec_err};
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -47,12 +47,13 @@ use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{ExpressionRef, Predicate};
+use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
@@ -82,6 +83,13 @@ pub enum Error {
         "Invalid Delta Lake Table partition value count. The PartitionedFile has a different number of partition values than the number of partition columns."
     ))]
     InvalidPartitionValueCount,
+
+    #[snafu(display(
+        "An error has occurred trying to read or update the current snapshot: {source}"
+    ))]
+    SnapshotLockError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -125,6 +133,7 @@ pub struct DeltaTable {
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     arrow_schema: SchemaRef,
     delta_schema: delta_kernel::schema::SchemaRef,
+    snapshot: RwLock<SnapshotRef>,
 }
 
 impl DeltaTable {
@@ -213,7 +222,32 @@ impl DeltaTable {
             engine,
             arrow_schema: Arc::new(arrow_schema),
             delta_schema,
+            snapshot: RwLock::new(snapshot),
         })
+    }
+
+    /// Gets the latest snapshot by paginating object storage. It uses version hints from the currently
+    /// bound snapshot to prune the log scan.
+    ///
+    /// At the start of a scan, you can get the latest snapshot then reuse it via `DeltaTable::bound_snapshot`
+    /// without polling object storage.
+    fn get_and_update_snapshot(&self) -> Result<SnapshotRef> {
+        let mut current_snapshot = self
+            .snapshot
+            .write()
+            .map_err(|e| Error::SnapshotLockError {
+                source: format!("Unable to update snapshot {e}").into(),
+            })?;
+
+        let new_snapshot = Snapshot::builder_from(Arc::clone(&*current_snapshot))
+            .build(self.engine.as_ref())
+            .context(DeltaTableSnafu)?;
+
+        if new_snapshot != *current_snapshot {
+            *current_snapshot = new_snapshot;
+        }
+
+        Ok(Arc::clone(&*current_snapshot))
     }
 
     fn get_schema(snapshot: &Snapshot) -> Schema {
@@ -397,9 +431,9 @@ impl TableProvider for DeltaTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
-        let snapshot = Snapshot::builder_for(self.table_url.clone())
-            .build(self.engine.as_ref())
-            .map_err(map_delta_error_to_datafusion_err)?;
+        let Ok(snapshot) = self.get_and_update_snapshot() else {
+            return exec_err!("Unable to get latest Delta table snapshot");
+        };
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
 

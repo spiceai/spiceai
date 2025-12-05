@@ -100,8 +100,8 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         if let Some(vector_engine) = &dataset.vectors {
             // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
-                tracing::debug!(
-                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
+                tracing::warn!(
+                    "Dataset {} configured with 'vector_engine: enabled' but acceleration is disabled. Vector indexing will not occur. Enable acceleration with `acceleration.enabled: true` to use vector search.",
                     dataset.name
                 );
             }

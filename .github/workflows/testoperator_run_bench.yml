@@ -68,9 +68,10 @@ on:
       update_snapshots:
         description: 'Update the snapshots?'
         required: false
-        default: 'no'
+        default: 'default'
         type: choice
         options:
+          - 'default'
           - 'always'
           - 'no'
       validate_results:
@@ -94,6 +95,22 @@ jobs:
           DB_NAME: tpch_sf1
     steps:
       - uses: actions/checkout@v6
+
+      - name: Determine snapshot update mode
+        id: determine_update_snapshots
+        run: |
+          update_mode="${{ github.event.inputs.update_snapshots }}"
+          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+            branch_name="${{ github.ref_name }}"
+            if [[ "${branch_name}" == "release/"* ]]; then
+              update_mode="no"
+            else
+              update_mode="always"
+            fi
+          fi
+
+          echo "Using update_snapshots=${update_mode}" >&2
+          echo "update_snapshots=${update_mode}" >> "${GITHUB_OUTPUT}"
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -223,7 +240,7 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
@@ -287,7 +304,7 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
@@ -300,7 +317,7 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Install GH CLI
-        if: github.event.inputs.update_snapshots == 'always'
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
           (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
           && sudo mkdir -p -m 755 /etc/apt/keyrings \
@@ -312,7 +329,7 @@ jobs:
           && sudo apt install gh -y
 
       - name: Upload benchmark snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
           # if the spiced commit is set, use that as the branch ID
           if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
