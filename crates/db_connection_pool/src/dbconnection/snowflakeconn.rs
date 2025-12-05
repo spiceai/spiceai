@@ -96,40 +96,10 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         SnowflakeConnection { api }
     }
 
-    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
-        // Escape single quotes by doubling them to prevent SQL injection
-        let escaped_schema = schema.replace('\'', "''");
-        let query = format!("SHOW TABLES IN SCHEMA IDENTIFIER('{escaped_schema}')");
-
-        let res =
-            self.api
-                .exec(&query)
-                .await
-                .map_err(|e| dbconnection::Error::UnableToGetTables {
-                    source: e.to_string().into(),
-                })?;
-
-        match res {
-            snowflake_api::QueryResult::Arrow(batches) => {
-                let mut tables = Vec::new();
-                for batch in batches {
-                    if let Some(name_column) = batch.column_by_name("name")
-                        && let Some(array) = name_column
-                            .as_any()
-                            .downcast_ref::<arrow::array::StringArray>()
-                    {
-                        for value in array.iter().flatten() {
-                            tables.push(value.to_string());
-                        }
-                    }
-                }
-                Ok(tables)
-            }
-            snowflake_api::QueryResult::Json(_) => Err(dbconnection::Error::UnableToGetTables {
-                source: "Expected Arrow response, got JSON".into(),
-            }),
-            snowflake_api::QueryResult::Empty => Ok(Vec::new()),
-        }
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "Snowflake tables() not implemented".into(),
+        })
     }
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {

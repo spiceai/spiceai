@@ -4929,7 +4929,6 @@ dependencies = [
  "dashmap",
  "datafusion",
  "datafusion-federation",
- "datafusion-physical-expr",
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
