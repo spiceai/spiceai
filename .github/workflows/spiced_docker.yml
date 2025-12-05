@@ -23,7 +23,6 @@ on:
           - all
           - amd64
           - arm64
-          - cuda
         default: all
 
 jobs:
@@ -37,7 +36,6 @@ jobs:
       target: ${{ steps.resolve.outputs.target }}
       run_amd64: ${{ steps.resolve.outputs.run_amd64 }}
       run_arm64: ${{ steps.resolve.outputs.run_arm64 }}
-      run_cuda: ${{ steps.resolve.outputs.run_cuda }}
     steps:
       - name: Resolve release metadata
         id: resolve
@@ -79,21 +77,16 @@ jobs:
 
           run_amd64=false
           run_arm64=false
-          run_cuda=false
           case "$target_input" in
             all|"")
               run_amd64=true
               run_arm64=true
-              run_cuda=true
               ;;
             amd64)
               run_amd64=true
               ;;
             arm64)
               run_arm64=true
-              ;;
-            cuda)
-              run_cuda=true
               ;;
             *)
               echo "Unknown target selection: $target_input" >&2
@@ -107,7 +100,6 @@ jobs:
           echo "target=${target_input}" >> "$GITHUB_OUTPUT"
           echo "run_amd64=${run_amd64}" >> "$GITHUB_OUTPUT"
           echo "run_arm64=${run_arm64}" >> "$GITHUB_OUTPUT"
-          echo "run_cuda=${run_cuda}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
     needs: setup
@@ -242,56 +234,6 @@ jobs:
           path: /tmp/image-arm64-*.tar
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
-  build-cuda:
-    needs: setup
-    runs-on: 'spiceai-dev-runners'
-    env:
-      CUDA_COMPUTE_CAP: 80
-    steps:
-      - name: Skip CUDA build
-        if: ${{ needs.setup.outputs.run_cuda != 'true' }}
-        run: echo "Skipping CUDA image build per workflow configuration."
-
-      - uses: actions/checkout@v6
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-
-      - name: Configure CUDA models build
-        run: |
-          echo "IMAGE_TAG=models-cuda" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-cuda" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-
-      - name: Package CUDA models image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile-cuda-release
-          platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/images-amd64-cuda.tar
-          cache-from: type=gha,scope=build-cuda
-          cache-to: type=gha,scope=build-cuda,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            CUDA_COMPUTE_CAP=${{ env.CUDA_COMPUTE_CAP }}
-            GITHUB_REPOSITORY=${{ github.repository }}
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-
-      - name: Upload CUDA artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: images-amd64-cuda
-          path: /tmp/images-amd64-cuda.tar
-        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-
   publish:
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
@@ -381,12 +323,10 @@ jobs:
               echo "Publishing ${variant} to GHCR and DockerHub"
               docker buildx imagetools create \
                 -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t ghcr.io/spiceai/spiceai:latest${suffix} \
                 "${sources[@]}"
 
               docker buildx imagetools create \
                 -t spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t spiceai/spiceai:latest${suffix} \
                 "${sources[@]}"
 
               echo "Verifying GHCR image:"
@@ -403,77 +343,3 @@ jobs:
               docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
             fi
           done
-
-  publish-cuda:
-    needs: [setup, build-cuda]
-    if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-    runs-on: 'ubuntu-gpu-t4-4-core'
-    env:
-      REL_VERSION: ${{ needs.setup.outputs.rel_version }}
-      PUBLISH: ${{ needs.setup.outputs.publish }}
-    steps:
-      - name: Download CUDA artifacts
-        uses: actions/download-artifact@v6
-        with:
-          name: images-amd64-cuda
-          path: /tmp
-
-      - name: Verify artifacts
-        run: |
-          ls -l /tmp
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Start local registry
-        run: |
-          docker run -d -p 5000:5000 --restart=always --name registry registry:2
-
-      - name: Login to GitHub Package Registry
-        if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to DockerHub
-        if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Import images and create manifests
-        run: |
-          if [ ! -f /tmp/images-amd64-cuda.tar ]; then
-            echo "No CUDA artifacts to publish."
-            exit 0
-          fi
-
-          echo "Handling CUDA models..."
-          docker load -i /tmp/images-amd64-cuda.tar
-          docker push localhost:5000/spiceai:models-cuda-amd64
-
-          if [[ "${PUBLISH}" == "true" ]]; then
-            echo "Pushing CUDA models to GHCR and DockerHub"
-            docker buildx imagetools create \
-              -t spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t spiceai/spiceai:latest-models-cuda \
-              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t ghcr.io/spiceai/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
-
-            echo "Verifying CUDA GHCR image:"
-            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda
-
-            echo "Verifying CUDA DockerHub image:"
-            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-models-cuda
-          else
-            echo "Skipping push for non-publish CUDA build"
-            docker buildx imagetools create \
-              -t localhost:5000/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
-
-            docker buildx imagetools inspect localhost:5000/spiceai:latest-models-cuda
-          fi
