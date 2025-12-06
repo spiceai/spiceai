@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use reqwest::Response;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
@@ -26,7 +27,7 @@ pub enum Error {
     JsonError { source: serde_json::Error },
 
     #[snafu(display("API error: {message}"))]
-    ApiError { message: String, code: Option<i32> },
+    ApiError { message: String, status_code: u16 },
 
     #[snafu(display("Invalid API key"))]
     InvalidApiKey,
@@ -45,3 +46,13 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub(super) async fn handle_unsuccessful_response(response: Response) -> Error {
+    let status_code = response.status().as_u16();
+    let error_body = response.text().await.unwrap_or_default();
+
+    Error::ApiError {
+        message: format!("API request failed with status {status_code}: {error_body}"),
+        status_code,
+    }
+}

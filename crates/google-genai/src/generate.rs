@@ -17,7 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::client::Client;
-use crate::error::{HttpSnafu, JsonSnafu, Result, StreamSnafu};
+use crate::error::{HttpSnafu, JsonSnafu, Result, StreamSnafu, handle_unsuccessful_response};
 use crate::types::{
     CachedContent, Candidate, Content, GenerationConfig, SafetySetting, Tool, ToolConfig,
     UsageMetadata,
@@ -153,13 +153,7 @@ impl Client {
             .context(HttpSnafu)?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-
-            return Err(crate::error::Error::ApiError {
-                message: format!("API request failed with status {status}: {error_body}"),
-                code: Some(i32::from(status.as_u16())),
-            });
+            return Err(handle_unsuccessful_response(response).await);
         }
 
         response
@@ -190,13 +184,7 @@ impl Client {
             .context(HttpSnafu)?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-
-            return Err(crate::error::Error::ApiError {
-                message: format!("API request failed with status {status}: {error_body}"),
-                code: Some(i32::from(status.as_u16())),
-            });
+            return Err(handle_unsuccessful_response(response).await);
         }
 
         let stream = response.bytes_stream();
@@ -255,7 +243,6 @@ mod tests {
         let data =
             r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#;
         let bytes = Bytes::from(data);
-        let result = parse_sse_chunk(&bytes);
-        result.expect("Failed to parse SSE chunk");
+        let result = parse_sse_chunk(&bytes).expect("Failed to parse SSE chunk");
     }
 }

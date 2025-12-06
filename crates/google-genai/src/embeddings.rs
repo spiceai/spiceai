@@ -17,7 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::client::Client;
-use crate::error::{HttpSnafu, Result};
+use crate::error::{HttpSnafu, Result, handle_unsuccessful_response};
 use crate::types::Content;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -101,13 +101,7 @@ impl Client {
             .context(HttpSnafu)?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-
-            return Err(crate::error::Error::ApiError {
-                message: format!("API request failed with status {status}: {error_body}"),
-                code: Some(i32::from(status.as_u16())),
-            });
+            return Err(handle_unsuccessful_response(response).await);
         }
 
         response
@@ -137,13 +131,7 @@ impl Client {
             .context(HttpSnafu)?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-
-            return Err(crate::error::Error::ApiError {
-                message: format!("API request failed with status {status}: {error_body}"),
-                code: Some(i32::from(status.as_u16())),
-            });
+            return Err(handle_unsuccessful_response(response).await);
         }
 
         response

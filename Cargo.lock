@@ -6681,7 +6681,6 @@ dependencies = [
 name = "google-genai"
 version = "1.10.0-unstable"
 dependencies = [
- "async-trait",
  "bytes",
  "futures",
  "reqwest",

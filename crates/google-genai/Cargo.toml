@@ -13,7 +13,6 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream.workspace = true
-async-trait.workspace = true
 snafu.workspace = true
 futures.workspace = true
 bytes.workspace = true

@@ -25,11 +25,21 @@ const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const API_KEY_HEADER: &str = "x-goog-api-key";
 
 #[expect(clippy::struct_field_names)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
     http_client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("http_client", &self.http_client)
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl Client {
