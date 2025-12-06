@@ -236,7 +236,6 @@ impl StreamState {
 
         // Find all ancestors of currently tracked shards
         let ancestors = self.find_all_ancestors(&parent_map);
-
         for shard in shards {
             let shard_id = shard.shard_id.clone();
 
@@ -651,7 +650,7 @@ mod tests {
                 vec![create_record_without_seq()],
             );
 
-            result.unwrap();
+            result.expect("result");
             // When sequence number is missing, the record is still returned
             // but the checkpoint is not updated
 
@@ -694,7 +693,7 @@ mod tests {
                 vec![create_record_without_dynamodb()],
             );
 
-            result.unwrap();
+            result.expect("result");
             // When dynamodb field is missing, the record is still returned
             // but the checkpoint is not updated
 
@@ -850,7 +849,7 @@ mod tests {
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
             assert!(result.is_ok());
-            let result = result.unwrap();
+            let result = result.expect("result");
 
             // Verify watermark is max timestamp (1010)
             assert!(result.current_watermark.is_some());
@@ -889,7 +888,7 @@ mod tests {
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
             assert!(result.is_ok());
-            let result = result.unwrap();
+            let result = result.expect("result");
 
             // Watermark should still be None
             assert!(result.current_watermark.is_none());
@@ -930,7 +929,7 @@ mod tests {
             );
 
             assert!(result.is_ok());
-            let result = result.unwrap();
+            let result = result.expect("result");
 
             // Checkpoint sequence should be unchanged
             assert_eq!(result.last_checkpoint.sequence_number, "99");
@@ -974,7 +973,7 @@ mod tests {
             let result = state.handle_poll_result("shard-1", None, records);
 
             assert!(result.is_ok());
-            let result = result.unwrap();
+            let result = result.expect("result");
 
             // Should have records
             if let PollOutcome::Records { records } = result.outcome {
@@ -1022,7 +1021,7 @@ mod tests {
             let result = state.handle_poll_result("shard-1", None, vec![]);
 
             assert!(result.is_ok());
-            let result = result.unwrap();
+            let result = result.expect("result");
 
             // Should be empty
             assert!(matches!(result.outcome, PollOutcome::Empty));
@@ -1059,7 +1058,7 @@ mod tests {
             let records = vec![create_record_with_timestamp("100", base_time)];
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
-            result.unwrap();
+            result.expect("result");
 
             // Verify active shard has ALL fields updated correctly
             let shard = state.active.get("shard-1").expect("shard should exist");
@@ -1142,9 +1141,17 @@ mod tests {
             // Closed shards are ignored
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
-            assert_eq!(state.initializing.len(), 0);
+            assert_eq!(state.initializing.len(), 1);
 
-            assert!(!state.initializing.contains_key("shard-1"));
+            let shard = state
+                .initializing
+                .get("shard-1")
+                .expect("shard-1 should be in initializing");
+            assert_eq!(shard.shard_id, "shard-1");
+            assert_eq!(shard.parent_shard_id, None);
+            assert_eq!(shard.last_checkpoint.sequence_number, "0");
+            assert_eq!(shard.last_checkpoint.parent_id, None);
+            assert_eq!(shard.last_checkpoint.position, CheckpointPosition::At);
             assert!(!state.blocked.contains_key("shard-1"));
             assert!(!state.active.contains_key("shard-1"));
         }
@@ -1413,7 +1420,7 @@ mod tests {
 
             let shards = vec![
                 create_api_shard("root-1", None, None), // Should go to initializing
-                create_api_shard("root-2", None, Some("999")), // Should be ignored (closed)
+                create_api_shard("root-2", None, Some("999")), // Shouldgo to initializing
                 create_api_shard("child-1", Some("parent-1"), None), // Should go to pending
                 create_api_shard("child-2", Some("nonexistent"), None), // Should go to initializing
             ];
@@ -1422,7 +1429,7 @@ mod tests {
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);
-            assert_eq!(state.initializing.len(), 2);
+            assert_eq!(state.initializing.len(), 3);
 
             // root-1: open shard without parent
             assert!(state.initializing.contains_key("root-1"));
@@ -1433,10 +1440,14 @@ mod tests {
             assert_eq!(root1.shard_id, "root-1");
             assert_eq!(root1.parent_shard_id, None);
 
-            // root-2: closed shard, should not exist anywhere
-            assert!(!state.active.contains_key("root-2"));
-            assert!(!state.blocked.contains_key("root-2"));
-            assert!(!state.initializing.contains_key("root-2"));
+            // root-2: open shard without parent
+            assert!(state.initializing.contains_key("root-2"));
+            let root2 = state
+                .initializing
+                .get("root-2")
+                .expect("root-2 should be in initializing");
+            assert_eq!(root2.shard_id, "root-2");
+            assert_eq!(root2.parent_shard_id, None);
 
             // child-1: blocked by active parent
             assert!(state.blocked.contains_key("child-1"));
