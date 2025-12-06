@@ -333,7 +333,7 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "b64
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "4a9f784fc15a795ca428860b65602b1d777faf9a" } # spiceai
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "007c82d039220478f406d648417d28c0d40a7987" } # spiceai:spiceai-50
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "afcbd1ce99703f1322d176fc1b99745f647234d0" } # spiceai:spiceai-50
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "12957e480d1433b97bbb5de328e6bc0387d8551a" }      # spiceai/spiceai-50
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "12957e480d1433b97bbb5de328e6bc0387d8551a" }  # spiceai/spiceai-50
