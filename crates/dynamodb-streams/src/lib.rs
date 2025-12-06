@@ -25,9 +25,11 @@ pub mod client;
 mod client_sdk;
 mod stream;
 mod stream_state;
+mod metrics;
 
 pub use checkpoint::Checkpoint;
 pub use client::Client;
+pub use metrics::{Metrics, MetricsCollector};
 pub use stream::{DynamoDBStreamBatch, DynamodbStream};
 
 pub type StreamResult = Result<DynamoDBStreamBatch, Error>;

@@ -15,9 +15,10 @@ limitations under the License.
 */
 use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::SDKClient;
+use crate::metrics::MetricsCollector;
 use crate::stream::{DynamodbStream, DynamodbStreamProducer};
 use crate::stream_state::initialize_state_from_checkpoint;
-use crate::{FailedToInitializeCheckpointSnafu, Result};
+use crate::{FailedToInitializeCheckpointSnafu, Metrics, Result};
 use aws_config::SdkConfig;
 use snafu::OptionExt;
 use std::num::NonZeroUsize;
@@ -34,6 +35,7 @@ pub struct Client {
     table_name: String,
     interval: Option<Duration>,
     buffer: usize,
+    metrics_collector: Arc<MetricsCollector>,
 }
 
 const DEFAULT_BUFFER_SIZE: usize = 100;
@@ -104,6 +106,7 @@ impl Client {
             .sdk_client
             .get_stream_arn(self.table_name.clone())
             .await?;
+
         let state = initialize_state_from_checkpoint(
             stream_arn.clone(),
             &checkpoint,
@@ -125,6 +128,7 @@ impl Client {
             sender: tx,
             client: Arc::clone(&self.sdk_client),
             retry_strategy,
+            metrics_collector: Arc::clone(&self.metrics_collector),
         };
 
         tokio::spawn(async move {
@@ -132,6 +136,10 @@ impl Client {
         });
 
         Ok(DynamodbStream { receiver: rx })
+    }
+
+    pub fn metrics(&self) -> Metrics {
+        Metrics::new(Arc::clone(&self.metrics_collector))
     }
 }
 
@@ -142,6 +150,7 @@ pub struct ClientBuilder {
     interval: Option<Duration>,
     buffer: usize,
     shard_record_limit: Option<i32>,
+    metrics_collector: Option<Arc<MetricsCollector>>,
 }
 
 impl ClientBuilder {
@@ -153,6 +162,7 @@ impl ClientBuilder {
             interval: Some(DEFAULT_INTERVAL),
             buffer: DEFAULT_BUFFER_SIZE,
             shard_record_limit: None,
+            metrics_collector: None,
         }
     }
 
@@ -165,6 +175,12 @@ impl ClientBuilder {
     #[must_use]
     pub fn buffer(mut self, buffer: NonZeroUsize) -> Self {
         self.buffer = buffer.get();
+        self
+    }
+
+    #[must_use]
+    pub fn metrics_collector(mut self, metrics_collector: Arc<MetricsCollector>) -> Self {
+        self.metrics_collector = Some(metrics_collector);
         self
     }
 
@@ -184,6 +200,7 @@ impl ClientBuilder {
             table_name: self.table_name,
             interval: self.interval,
             buffer: self.buffer,
+            metrics_collector: self.metrics_collector.unwrap_or(Arc::new(MetricsCollector::default())),
         }
     }
 }
