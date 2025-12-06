@@ -19,7 +19,7 @@ use crate::{Error, MissingStaringSequenceNumberSnafu, Result};
 use aws_sdk_dynamodbstreams::primitives::DateTime;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use snafu::OptionExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -247,7 +247,16 @@ impl StreamState {
     }
 
     /// Add discovered shards, returns shard IDs that need initialization
-        pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
+    pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
+        // Build parent-child map from discovered shards
+        let parent_map: HashMap<String, Option<String>> = shards
+            .iter()
+            .map(|s| (s.shard_id.clone(), s.parent_shard_id.clone()))
+            .collect();
+
+        // Find all ancestors of currently tracked shards
+        let ancestors = self.find_all_ancestors(&parent_map);
+
         for shard in shards {
             let shard_id = shard.shard_id.clone();
 
@@ -257,6 +266,14 @@ impl StreamState {
                 || self.blocked.contains_key(&shard_id)
                 || self.initializing.contains_key(&shard_id)
             {
+                continue;
+            }
+
+            if ancestors.contains(&shard_id) {
+                tracing::debug!(
+                    "Skipping ancestor shard: id={}, already exhausted",
+                    shard_id
+                );
                 continue;
             }
 
@@ -305,6 +322,29 @@ impl StreamState {
         }
 
         Ok(())
+    }
+
+    fn find_all_ancestors(&self, parent_map: &HashMap<String, Option<String>>) -> HashSet<String> {
+        let mut ancestors = HashSet::new();
+
+        // Collect all currently tracked shard IDs
+        let mut to_check: Vec<String> = self.active.keys()
+            .chain(self.initializing.keys())
+            .chain(self.blocked.keys())
+            .cloned()
+            .collect();
+
+        // Walk up the parent chain for each tracked shard
+        while let Some(shard_id) = to_check.pop() {
+            if let Some(Some(parent_id)) = parent_map.get(&shard_id) {
+                if ancestors.insert(parent_id.clone()) {
+                    // New ancestor found, check its ancestors too
+                    to_check.push(parent_id.clone());
+                }
+            }
+        }
+
+        ancestors
     }
 
     /// Move shard from initializing to active with its iterator
