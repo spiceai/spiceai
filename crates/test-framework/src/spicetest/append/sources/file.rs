@@ -30,11 +30,15 @@ use super::AppendableSource;
 
 // Large offset for retention test data primary keys to avoid conflicts with real data.
 // TPC-H SF=1 generates max ~6M rows, so 1 billion offset is safe.
-// Cleanup options:
-//   - By key range: DELETE FROM {table} WHERE {pk_column} >= 1000000000
-//   - By timestamp: DELETE FROM {table} WHERE {timestamp_column} <= TIMESTAMP '2025-01-01'
 const TEMP_DATA_KEY_OFFSET: i64 = 1_000_000_000;
-const RETENTION_TIMESTAMP: &str = "TIMESTAMP '2025-01-01 00:00:00'";
+
+// Retention timestamp: NOW() - 1 day + 1 minute
+// With retention_period=1d, this data will expire ~1 minute after insertion.
+// On first refresh, there's no max timestamp so ALL data is loaded (including this old data).
+// Retention should be configured to 1 day for tests using this data.
+// Using TIMESTAMPTZ to ensure timezone is preserved.
+const RETENTION_TIMESTAMP_EXPR: &str =
+    "(current_timestamp - INTERVAL '1 day' + INTERVAL '1 minute')::TIMESTAMPTZ";
 
 /// TPC-H table name to primary key column mapping for retention data offset.
 const TPCH_PRIMARY_KEYS: &[(&str, &str)] = &[
@@ -56,12 +60,87 @@ fn tpch_primary_key(table_name: &str) -> Option<&'static str> {
         .map(|(_, pk)| *pk)
 }
 
-/// Generates SQL for TPC-H append data generation.
+/// Generates SQL for TPC-H initial setup (step 0).
+/// Unlike `generate_tpch_sql`, this creates fresh tables rather than appending to existing ones.
+fn generate_tpch_setup_sql(
+    load_steps: u16,
+    generate_retention_data: bool,
+    tables: &[TableWithTimeColumn],
+    temp_directory: &Path,
+) -> String {
+    let mut sql = format!(
+        "INSTALL tpch;
+         LOAD tpch;
+         BEGIN;
+         CALL dbgen(sf=1, children={load_steps}, step=0);\n"
+    );
+
+    // Generate retention test data during initial setup so it's included in first load
+    if generate_retention_data {
+        writeln!(
+            &mut sql,
+            "CALL dbgen(sf=1, children={load_steps}, step=0, suffix='_retention');"
+        )
+        .ok();
+    }
+
+    for TableWithTimeColumn { name, column } in tables {
+        let parquet_path = temp_directory.join(format!("{name}.parquet"));
+
+        // Add timestamp column with current timestamp for main data
+        writeln!(
+            &mut sql,
+            "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;"
+        )
+        .ok();
+
+        // Retention test data: offset primary keys + old timestamp for deletion testing
+        if generate_retention_data {
+            writeln!(
+                sql,
+                "ALTER TABLE {name}_retention ADD COLUMN {column} TIMESTAMPTZ;"
+            )
+            .ok();
+            // Offset primary keys and set old timestamp in single UPDATE
+            if let Some(pk_col) = tpch_primary_key(name) {
+                writeln!(
+                    sql,
+                    "UPDATE {name}_retention SET {pk_col} = {pk_col} + {TEMP_DATA_KEY_OFFSET}, {column} = {RETENTION_TIMESTAMP_EXPR};"
+                )
+                .ok();
+            } else {
+                writeln!(
+                    sql,
+                    "UPDATE {name}_retention SET {column} = {RETENTION_TIMESTAMP_EXPR};"
+                )
+                .ok();
+            }
+
+            writeln!(
+                sql,
+                "INSERT INTO {name} SELECT * FROM {name}_retention;
+                DROP TABLE {name}_retention;"
+            )
+            .ok();
+        }
+
+        writeln!(
+            &mut sql,
+            "COPY {name} TO '{}' (FORMAT 'parquet');",
+            parquet_path.to_string_lossy()
+        )
+        .ok();
+    }
+
+    sql += "COMMIT;";
+    sql
+}
+
+/// Generates SQL for TPC-H append data generation (step 1+).
 fn generate_tpch_sql(
     load_steps: u16,
     load_index: u16,
     generate_conflict_data: bool,
-    generate_retention_data: bool,
     tables: &[TableWithTimeColumn],
     temp_directory: &Path,
 ) -> String {
@@ -82,23 +161,13 @@ fn generate_tpch_sql(
         .ok();
     }
 
-    // Generate retention test data: data with OFFSET primary keys and old timestamps
-    if generate_retention_data {
-        let next_step = load_index + 1;
-        writeln!(
-            &mut sql,
-            "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_retention');"
-        )
-        .ok();
-    }
-
     for TableWithTimeColumn { name, column } in tables {
         let parquet_path = temp_directory.join(format!("{name}.parquet"));
 
         // Insert the current step's data with current timestamp
         write!(
             &mut sql,
-            "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
                          INSERT INTO {name} SELECT * FROM {name}_new;
                          DROP TABLE {name}_new;\n"
         )
@@ -106,29 +175,9 @@ fn generate_tpch_sql(
 
         // Conflict data: same primary keys, will be handled by ON CONFLICT
         if generate_conflict_data {
-            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
                              INSERT INTO {name} SELECT * FROM {name}_conflict;
                              DROP TABLE {name}_conflict;\n").ok();
-        }
-
-        // Retention test data: offset primary keys + old timestamp for deletion testing
-        if generate_retention_data {
-            writeln!(&mut sql, "ALTER TABLE {name}_retention ADD COLUMN {column} TIMESTAMP DEFAULT {RETENTION_TIMESTAMP};").ok();
-
-            if let Some(pk_col) = tpch_primary_key(name) {
-                writeln!(
-                    &mut sql,
-                    "UPDATE {name}_retention SET {pk_col} = {pk_col} + {TEMP_DATA_KEY_OFFSET};"
-                )
-                .ok();
-            }
-
-            writeln!(
-                &mut sql,
-                "INSERT INTO {name} SELECT * FROM {name}_retention;
-                               DROP TABLE {name}_retention;"
-            )
-            .ok();
         }
 
         writeln!(
@@ -214,29 +263,50 @@ impl AppendableSource for FileAppendableSource {
         let load_steps = config.load_steps;
         let tables = self.tables.clone();
         let temp_directory = config.temp_directory.clone();
+        let generate_retention_data = config.with_retention_data;
 
         tokio::task::spawn_blocking(move || {
             let dest_conn = Connection::open(&dest_db_file)?;
-            println!("Loading initial data for {query_set} benchmark suite");
+            println!("Loading initial data for {query_set} benchmark suite (with retention: {generate_retention_data})");
             match query_set {
                 QuerySet::Tpch => {
-                    let mut sql = format!(
-                        "INSTALL tpch;
-                         LOAD tpch;
-                         BEGIN;
-                         CALL dbgen(sf=1, children={load_steps}, step=0);\n"
+                    let sql = generate_tpch_setup_sql(
+                        load_steps,
+                        generate_retention_data,
+                        &tables,
+                        &temp_directory,
                     );
-
-                    for TableWithTimeColumn { name, column } in &tables {
-                        let parquet_path = temp_directory.join(format!("{name}.parquet"));
-                        write!(&mut sql,
-                                    "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                             COPY {name} TO '{}' (FORMAT 'parquet');\n", parquet_path.to_string_lossy()).ok();
-                    }
-
-                    sql += "COMMIT;";
-
                     dest_conn.execute_batch(&sql)?;
+
+                    // Debug: verify retention data was generated
+                    if generate_retention_data {
+                        for table in &tables {
+                            let pk_col = tpch_primary_key(&table.name).unwrap_or("rowid");
+                            let query = format!(
+                                "SELECT COUNT(*) as total, \
+                                 SUM(CASE WHEN {pk} >= {offset} THEN 1 ELSE 0 END) as retention_count, \
+                                 CAST(MIN({col}) AS VARCHAR) as min_ts \
+                                 FROM {name}",
+                                name = table.name,
+                                col = table.column,
+                                pk = pk_col,
+                                offset = TEMP_DATA_KEY_OFFSET,
+                            );
+                            if let Ok(mut stmt) = dest_conn.prepare(&query) {
+                                if let Ok(mut rows) = stmt.query([]) {
+                                    if let Ok(Some(row)) = rows.next() {
+                                        let total: i64 = row.get(0).unwrap_or(0);
+                                        let retention: i64 = row.get(1).unwrap_or(0);
+                                        let min_ts: Option<String> = row.get(2).ok();
+                                        println!(
+                                            "[setup-debug] {}: total={}, retention={}, min_ts={:?}",
+                                            table.name, total, retention, min_ts
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 QuerySet::Tpcds => {
                     let mut setup_sql = "INSTALL tpcds;
@@ -291,23 +361,15 @@ impl AppendableSource for FileAppendableSource {
         let generate_conflict_test_data =
             config.with_conflict_data && load_index < config.load_steps - 1;
 
-        // If retention testing is enabled, generate additional data with offset primary keys
-        // and far-future timestamps that can be deleted by retention policies
-        let generate_retention_test_data = config.with_retention_data;
-
         println!(
-            "Loading append data (with conflict data: {generate_conflict_test_data}, with retention test data: {generate_retention_test_data}) {query_set} benchmark suite - {load_index}/{load_steps}",
+            "Loading append data (with conflict: {generate_conflict_test_data}) {query_set} benchmark suite - {load_index}/{load_steps}",
             query_set = config.query_set,
             load_steps = config.load_steps,
             load_index = load_index + 1, // display index is 1-based
         );
 
-        if (generate_conflict_test_data || generate_retention_test_data)
-            && !matches!(config.query_set, QuerySet::Tpch)
-        {
-            anyhow::bail!(
-                "Generating conflict or retention test data is only supported for TPC-H datasets"
-            );
+        if generate_conflict_test_data && !matches!(config.query_set, QuerySet::Tpch) {
+            anyhow::bail!("Generating conflict test data is only supported for TPC-H datasets");
         }
 
         let dest_db_file = self.dest_db_file.clone();
@@ -324,7 +386,6 @@ impl AppendableSource for FileAppendableSource {
                     load_steps,
                     load_index,
                     generate_conflict_test_data,
-                    generate_retention_test_data,
                     &tables,
                     &temp_directory,
                 ),
@@ -336,6 +397,7 @@ impl AppendableSource for FileAppendableSource {
             };
 
             dest_conn.execute_batch(&sql)?;
+
             Ok::<(), anyhow::Error>(())
         })
         .await
