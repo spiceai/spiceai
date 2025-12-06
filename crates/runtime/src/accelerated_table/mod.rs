@@ -161,6 +161,9 @@ pub enum Error {
 
     #[snafu(display("Failed to start refresh task. The task was already started."))]
     RefreshTaskAlreadyStarted {},
+
+    #[snafu(display("Failed to create RecordBatch: {source}"))]
+    FailedToBuildRecordBatch { source: ArrowError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

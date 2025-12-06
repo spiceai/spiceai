@@ -540,7 +540,7 @@ impl Kafka {
 
                 // Wrap the record batch to emulate a change event
                 cdc::wrap_data_as_change_batch(&schema, &rb)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb, true))
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
             });
 
