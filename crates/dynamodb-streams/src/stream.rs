@@ -16,7 +16,7 @@ limitations under the License.
 use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
 use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
-use crate::{Error, Result, StreamResult};
+use crate::{Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
@@ -85,7 +85,7 @@ impl DynamodbStreamProducer {
                 Err(e) => {
                     had_transient_error = true;
                     self.state.handle_poll_error(&shard_id, e)?
-                },
+                }
             };
             poll_results.push(poll_result);
         }
@@ -99,11 +99,14 @@ impl DynamodbStreamProducer {
                     return Err(e);
                 }
                 had_transient_error = true;
-                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}")
+                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}");
             }
         }
 
-        Ok((combine_shard_batches(&poll_results, self.idle_timeout), had_transient_error))
+        Ok((
+            combine_shard_batches(&poll_results, self.idle_timeout),
+            had_transient_error,
+        ))
     }
 
     async fn initialize_shards_iterators(&mut self) -> Result<()> {

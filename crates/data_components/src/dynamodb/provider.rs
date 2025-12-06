@@ -64,7 +64,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {

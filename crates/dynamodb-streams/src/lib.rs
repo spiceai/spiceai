@@ -88,6 +88,7 @@ pub enum Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
@@ -157,7 +158,9 @@ impl Error {
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
             SdkError::ServiceError(e) => match e.err() {
-                GetShardIteratorError::TrimmedDataAccessException(_) => Error::StreamBeyondRetention,
+                GetShardIteratorError::TrimmedDataAccessException(_) => {
+                    Error::StreamBeyondRetention
+                }
                 GetShardIteratorError::ResourceNotFoundException(_) => Error::ShardNotFound,
                 _ => Error::SdkError {
                     source: Box::new(e.into_err()),

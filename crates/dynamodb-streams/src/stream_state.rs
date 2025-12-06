@@ -247,7 +247,7 @@ impl StreamState {
     }
 
     /// Add discovered shards, returns shard IDs that need initialization
-        pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
+    pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
         for shard in shards {
             let shard_id = shard.shard_id.clone();
 
@@ -270,7 +270,12 @@ impl StreamState {
                     || self.initializing.contains_key(&p)
             });
 
-            tracing::debug!("Discovered new shard: id={}, parent={:?}, blocked={}", shard_id, shard.parent_shard_id, blocked);
+            tracing::debug!(
+                "Discovered new shard: id={}, parent={:?}, blocked={}",
+                shard_id,
+                shard.parent_shard_id,
+                blocked
+            );
 
             let checkpoint = ShardCheckpoint {
                 sequence_number: shard
@@ -387,7 +392,11 @@ pub async fn initialize_state_from_checkpoint(
             )
             .await?;
 
-        tracing::debug!("Initialized shard from checkpoint: id={}, parent={:?}", shard_id, shard_checkpoint.parent_id);
+        tracing::debug!(
+            "Initialized shard from checkpoint: id={}, parent={:?}",
+            shard_id,
+            shard_checkpoint.parent_id
+        );
 
         let shard = ActiveShard {
             shard_id: shard_id.to_string(),

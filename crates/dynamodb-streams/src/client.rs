@@ -124,7 +124,6 @@ impl Client {
             interval: self.interval,
             sender: tx,
             client: Arc::clone(&self.sdk_client),
-            idle_timeout: None,
             retry_strategy,
             idle_timeout: None,
         };
@@ -179,10 +178,7 @@ impl ClientBuilder {
     #[must_use]
     pub fn build(self) -> Client {
         Client {
-            sdk_client: Arc::new(SDKClient::new(
-                &self.sdk_config,
-                self.shard_record_limit,
-            )),
+            sdk_client: Arc::new(SDKClient::new(&self.sdk_config, self.shard_record_limit)),
             table_name: self.table_name,
             interval: self.interval,
             buffer: self.buffer,
