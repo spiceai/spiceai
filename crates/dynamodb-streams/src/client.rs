@@ -126,6 +126,7 @@ impl Client {
             client: Arc::clone(&self.sdk_client),
             idle_timeout: None,
             retry_strategy,
+            idle_timeout: None,
         };
 
         tokio::spawn(async move {
