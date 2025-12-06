@@ -22,13 +22,13 @@ use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::{DeletionTableProvider, get_deletion_provider};
+#[cfg(feature = "dynamodb")]
+use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
-#[cfg(feature = "dynamodb")]
-use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{Expr, col};
@@ -210,7 +210,7 @@ impl RefreshTask {
         let indices_array = UInt32Array::from(
             row_indices
                 .iter()
-                .filter_map(|&i| { u32::try_from(i).ok() })
+                .filter_map(|&i| u32::try_from(i).ok())
                 .collect::<Vec<_>>(),
         );
 
@@ -486,7 +486,8 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
     }
 
     #[cfg(feature = "dynamodb")]
-    if let cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage { source }) = err {
+    if let cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage { source }) = err
+    {
         match source {
             dynamodb_streams::Error::StreamBeyondRetention => {
                 tracing::error!(

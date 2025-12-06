@@ -85,7 +85,7 @@ impl DynamodbStreamProducer {
                 Err(e) => {
                     had_transient_error = true;
                     self.state.handle_poll_error(&shard_id, e)?
-                },
+                }
             };
             poll_results.push(poll_result);
         }
@@ -170,7 +170,9 @@ impl DynamodbStreamProducer {
                     }
 
                     if had_transient_error {
-                        self.metrics_collector.transient_errors.fetch_add(1, Ordering::Relaxed);
+                        self.metrics_collector
+                            .transient_errors
+                            .fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Send batch if it has records
@@ -187,7 +189,6 @@ impl DynamodbStreamProducer {
                                 backoff.reset();
                             }
                             tokio::time::sleep(duration).await;
-
                         } else {
                             // Backoff exhausted - transient errors persisted too long
                             // Shouldn't happen as we should have infinite retries.
@@ -241,9 +242,7 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
             PollOutcome::Records { .. } | PollOutcome::Failed => true,
 
             // Shards that produced no records are NOT eligible as there's no lag
-            PollOutcome::Empty => {
-                false
-            }
+            PollOutcome::Empty => false,
         };
 
         // If eligible, include its current_watermark

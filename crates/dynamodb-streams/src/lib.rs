@@ -23,9 +23,9 @@ use snafu::Snafu;
 pub mod checkpoint;
 pub mod client;
 mod client_sdk;
+mod metrics;
 mod stream;
 mod stream_state;
-mod metrics;
 
 pub use checkpoint::Checkpoint;
 pub use client::Client;
@@ -159,7 +159,9 @@ impl Error {
             SdkError::DispatchFailure(_) => Error::ConnectionFailure,
 
             SdkError::ServiceError(e) => match e.err() {
-                GetShardIteratorError::TrimmedDataAccessException(_) => Error::StreamBeyondRetention,
+                GetShardIteratorError::TrimmedDataAccessException(_) => {
+                    Error::StreamBeyondRetention
+                }
                 GetShardIteratorError::ResourceNotFoundException(_) => Error::ShardNotFound,
                 _ => Error::SdkError {
                     source: Box::new(e.into_err()),

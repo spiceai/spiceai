@@ -18,6 +18,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
+use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -31,14 +32,13 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
+use opentelemetry::KeyValue;
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
-use opentelemetry::KeyValue;
 use util::time_format::is_valid_format;
-use crate::component::ComponentType;
 
 #[derive(Debug)]
 pub struct DynamoDB {
@@ -233,7 +233,8 @@ impl DataConnector for DynamoDB {
             .get("acceptable_lag")
             .expose()
             .ok()
-            .and_then(|v| fundu::parse_duration(v).ok()).unwrap_or(Duration::from_secs(3));
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(3));
 
         let provider = DynamoDBTableProvider::try_new(
             config,
@@ -260,9 +261,9 @@ impl DataConnector for DynamoDB {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        Some(Arc::new(DynamoDBMetricsProvider::new(
-            Arc::new(Metrics::new(Arc::clone(&self.metrics_collector)))
-        )))
+        Some(Arc::new(DynamoDBMetricsProvider::new(Arc::new(
+            Metrics::new(Arc::clone(&self.metrics_collector)),
+        ))))
     }
 
     fn changes_stream(
@@ -520,35 +521,23 @@ impl MetricsProvider for DynamoDBMetricsProvider {
         let metrics = Arc::clone(&self.metrics);
         match metric.name {
             "shards_active" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(
-                    metrics.active_shards_number() as u64,
-                    &attributes,
-                );
+                instrument.observe(metrics.active_shards_number() as u64, &attributes);
             }))),
             "records_consumed_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                    instrument.observe(
-                        metrics.records() as u64,
-                        &attributes,
-                    );
+                    instrument.observe(metrics.records() as u64, &attributes);
                 })))
             }
-            "lag_ms" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                    if let Some(lag_ms) = metrics.total_lag_ms() {
-                        instrument.observe(
-                            lag_ms,
-                            &attributes,
-                        );
-                    }
-                })))
-            }
-            "errors_transient_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(
-                    metrics.transient_errors() as u64,
-                    &attributes,
-                );
+            "lag_ms" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                if let Some(lag_ms) = metrics.total_lag_ms() {
+                    instrument.observe(lag_ms, &attributes);
+                }
             }))),
+            "errors_transient_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(metrics.transient_errors() as u64, &attributes);
+                })))
+            }
             _ => None,
         }
     }

@@ -287,7 +287,12 @@ impl StreamState {
                     || self.initializing.contains_key(&p)
             });
 
-            tracing::debug!("Discovered new shard: id={}, parent={:?}, blocked={}", shard_id, shard.parent_shard_id, blocked);
+            tracing::debug!(
+                "Discovered new shard: id={}, parent={:?}, blocked={}",
+                shard_id,
+                shard.parent_shard_id,
+                blocked
+            );
 
             let checkpoint = ShardCheckpoint {
                 sequence_number: shard
@@ -328,7 +333,9 @@ impl StreamState {
         let mut ancestors = HashSet::new();
 
         // Collect all currently tracked shard IDs
-        let mut to_check: Vec<String> = self.active.keys()
+        let mut to_check: Vec<String> = self
+            .active
+            .keys()
             .chain(self.initializing.keys())
             .chain(self.blocked.keys())
             .cloned()
@@ -427,7 +434,11 @@ pub async fn initialize_state_from_checkpoint(
             )
             .await?;
 
-        tracing::debug!("Initialized shard from checkpoint: id={}, parent={:?}", shard_id, shard_checkpoint.parent_id);
+        tracing::debug!(
+            "Initialized shard from checkpoint: id={}, parent={:?}",
+            shard_id,
+            shard_checkpoint.parent_id
+        );
 
         let shard = ActiveShard {
             shard_id: shard_id.to_string(),

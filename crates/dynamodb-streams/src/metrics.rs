@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 #[derive(Debug, Default)]
@@ -67,6 +67,8 @@ impl Metrics {
 
     /// Total number of transient errors encountered (counter)
     pub fn transient_errors(&self) -> usize {
-        self.metrics_collector.transient_errors.load(Ordering::Relaxed)
+        self.metrics_collector
+            .transient_errors
+            .load(Ordering::Relaxed)
     }
 }

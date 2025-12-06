@@ -193,14 +193,13 @@ impl ClientBuilder {
     #[must_use]
     pub fn build(self) -> Client {
         Client {
-            sdk_client: Arc::new(SDKClient::new(
-                &self.sdk_config,
-                self.shard_record_limit,
-            )),
+            sdk_client: Arc::new(SDKClient::new(&self.sdk_config, self.shard_record_limit)),
             table_name: self.table_name,
             interval: self.interval,
             buffer: self.buffer,
-            metrics_collector: self.metrics_collector.unwrap_or(Arc::new(MetricsCollector::default())),
+            metrics_collector: self
+                .metrics_collector
+                .unwrap_or(Arc::new(MetricsCollector::default())),
         }
     }
 }

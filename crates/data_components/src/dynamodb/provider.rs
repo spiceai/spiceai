@@ -55,16 +55,16 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use dynamodb_streams::{Checkpoint, Metrics, Client as StreamsClient, MetricsCollector};
+use dynamodb_streams::{Checkpoint, Client as StreamsClient, Metrics, MetricsCollector};
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, BoxStream, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
-use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone)]
 pub struct DynamoDBTableProvider {
