@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -27,6 +27,154 @@ use crate::{
 };
 
 use super::AppendableSource;
+
+// Large offset for retention test data primary keys to avoid conflicts with real data.
+// TPC-H SF=1 generates max ~6M rows, so 1 billion offset is safe.
+// Cleanup options:
+//   - By key range: DELETE FROM {table} WHERE {pk_column} >= 1000000000
+//   - By timestamp: DELETE FROM {table} WHERE {timestamp_column} <= TIMESTAMP '2025-01-01'
+const TEMP_DATA_KEY_OFFSET: i64 = 1_000_000_000;
+const RETENTION_TIMESTAMP: &str = "TIMESTAMP '2025-01-01 00:00:00'";
+
+/// TPC-H table name to primary key column mapping for retention data offset.
+const TPCH_PRIMARY_KEYS: &[(&str, &str)] = &[
+    ("customer", "c_custkey"),
+    ("orders", "o_orderkey"),
+    ("lineitem", "l_orderkey"),
+    ("part", "p_partkey"),
+    ("partsupp", "ps_partkey"),
+    ("supplier", "s_suppkey"),
+    ("nation", "n_nationkey"),
+    ("region", "r_regionkey"),
+];
+
+/// Returns the primary key column for a TPC-H table, if known.
+fn tpch_primary_key(table_name: &str) -> Option<&'static str> {
+    TPCH_PRIMARY_KEYS
+        .iter()
+        .find(|(t, _)| *t == table_name)
+        .map(|(_, pk)| *pk)
+}
+
+/// Generates SQL for TPC-H append data generation.
+fn generate_tpch_sql(
+    load_steps: u16,
+    load_index: u16,
+    generate_conflict_data: bool,
+    generate_retention_data: bool,
+    tables: &[TableWithTimeColumn],
+    temp_directory: &Path,
+) -> String {
+    let mut sql = format!(
+        "INSTALL tpch;
+         LOAD tpch;
+         BEGIN;
+         CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n"
+    );
+
+    // Generate conflict data: next step's data with SAME primary keys (will conflict on refresh)
+    if generate_conflict_data {
+        let next_step = load_index + 1;
+        writeln!(
+            &mut sql,
+            "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');"
+        )
+        .ok();
+    }
+
+    // Generate retention test data: data with OFFSET primary keys and old timestamps
+    if generate_retention_data {
+        let next_step = load_index + 1;
+        writeln!(
+            &mut sql,
+            "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_retention');"
+        )
+        .ok();
+    }
+
+    for TableWithTimeColumn { name, column } in tables {
+        let parquet_path = temp_directory.join(format!("{name}.parquet"));
+
+        // Insert the current step's data with current timestamp
+        write!(
+            &mut sql,
+            "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                         INSERT INTO {name} SELECT * FROM {name}_new;
+                         DROP TABLE {name}_new;\n"
+        )
+        .ok();
+
+        // Conflict data: same primary keys, will be handled by ON CONFLICT
+        if generate_conflict_data {
+            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                             INSERT INTO {name} SELECT * FROM {name}_conflict;
+                             DROP TABLE {name}_conflict;\n").ok();
+        }
+
+        // Retention test data: offset primary keys + old timestamp for deletion testing
+        if generate_retention_data {
+            writeln!(&mut sql, "ALTER TABLE {name}_retention ADD COLUMN {column} TIMESTAMP DEFAULT {RETENTION_TIMESTAMP};").ok();
+
+            if let Some(pk_col) = tpch_primary_key(name) {
+                writeln!(
+                    &mut sql,
+                    "UPDATE {name}_retention SET {pk_col} = {pk_col} + {TEMP_DATA_KEY_OFFSET};"
+                )
+                .ok();
+            }
+
+            writeln!(
+                &mut sql,
+                "INSERT INTO {name} SELECT * FROM {name}_retention;
+                               DROP TABLE {name}_retention;"
+            )
+            .ok();
+        }
+
+        writeln!(
+            &mut sql,
+            "COPY {name} TO '{}' (FORMAT 'parquet');",
+            parquet_path.to_string_lossy()
+        )
+        .ok();
+    }
+
+    sql += "COMMIT;";
+    sql
+}
+
+/// Generates SQL for TPC-DS append data generation.
+fn generate_tpcds_sql(load_steps: u16, load_index: u16, tables: &[TableWithTimeColumn]) -> String {
+    let mut sql = "BEGIN;\n".to_string();
+
+    for TableWithTimeColumn { name, column } in tables {
+        write!(
+            &mut sql,
+            "INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
+                         FROM {name}_gen
+                         LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
+                         OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
+                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n"
+        )
+        .ok();
+    }
+
+    sql += "COMMIT;";
+    sql
+}
+
+/// Generates SQL for `ClickBench` append data generation.
+fn generate_clickbench_sql(load_steps: u16, load_index: u16) -> String {
+    format!(
+        "BEGIN;
+         INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
+         FROM hits
+         LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
+         OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
+         COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
+         COMMIT;"
+    )
+}
 
 pub(crate) struct FileAppendableSource {
     dest_db_file: PathBuf,
@@ -143,12 +291,24 @@ impl AppendableSource for FileAppendableSource {
         let generate_conflict_test_data =
             config.with_conflict_data && load_index < config.load_steps - 1;
 
+        // If retention testing is enabled, generate additional data with offset primary keys
+        // and far-future timestamps that can be deleted by retention policies
+        let generate_retention_test_data = config.with_retention_data;
+
         println!(
-            "Loading append data (with conflict data: {generate_conflict_test_data})  {query_set} benchmark suite - {load_index}/{load_steps}",
+            "Loading append data (with conflict data: {generate_conflict_test_data}, with retention test data: {generate_retention_test_data}) {query_set} benchmark suite - {load_index}/{load_steps}",
             query_set = config.query_set,
             load_steps = config.load_steps,
             load_index = load_index + 1, // display index is 1-based
         );
+
+        if (generate_conflict_test_data || generate_retention_test_data)
+            && !matches!(config.query_set, QuerySet::Tpch)
+        {
+            anyhow::bail!(
+                "Generating conflict or retention test data is only supported for TPC-H datasets"
+            );
+        }
 
         let dest_db_file = self.dest_db_file.clone();
         let query_set = config.query_set.clone();
@@ -159,74 +319,23 @@ impl AppendableSource for FileAppendableSource {
         tokio::task::spawn_blocking(move || {
             let dest_conn = Connection::open(&dest_db_file)?;
 
-            match query_set {
-                QuerySet::Tpch => {
-                    let mut sql = format!(
-                        "INSTALL tpch;
-                         LOAD tpch;
-                         BEGIN;
-                         CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n"
-                    );
-
-                    if generate_conflict_test_data {
-                        let next_step = load_index + 1;
-                        writeln!(&mut sql, "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');").ok();
-                    }
-
-                    for TableWithTimeColumn { name, column } in &tables {
-                        let parquet_path = temp_directory.join(format!("{name}.parquet"));
-
-                        // Insert the current step's data
-                        write!(&mut sql, "ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                                         INSERT INTO {name} SELECT * FROM {name}_new;
-                                         DROP TABLE {name}_new;\n").ok();
-
-                        if generate_conflict_test_data {
-                            write!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                                             INSERT INTO {name} SELECT * FROM {name}_conflict;
-                                             DROP TABLE {name}_conflict;\n").ok();
-                        }
-
-                        writeln!(&mut sql, "COPY {name} TO '{}' (FORMAT 'parquet');", parquet_path.to_string_lossy()).ok();
-                    }
-
-                    sql += "COMMIT;";
-
-                    dest_conn.execute_batch(&sql)?;
+            let sql = match query_set {
+                QuerySet::Tpch => generate_tpch_sql(
+                    load_steps,
+                    load_index,
+                    generate_conflict_test_data,
+                    generate_retention_test_data,
+                    &tables,
+                    &temp_directory,
+                ),
+                QuerySet::Tpcds => generate_tpcds_sql(load_steps, load_index, &tables),
+                QuerySet::Clickbench => generate_clickbench_sql(load_steps, load_index),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => {
+                    unimplemented!("Appendable file source is not implemented for Scenario or Parameterized query sets")
                 }
-                QuerySet::Tpcds => {
-                    let mut sql = "BEGIN;\n".to_string();
+            };
 
-                    if generate_conflict_test_data {
-                        anyhow::bail!("Generating data for on_conflict testing for TPCDS is not supported");
-                    }
-
-                    for TableWithTimeColumn { name, column } in &tables {
-                        write!(&mut sql, "INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
-                                         FROM {name}_gen
-                                         LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
-                                         OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
-                                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n").ok();
-                    }
-
-                    sql += "COMMIT;";
-
-                    dest_conn.execute_batch(&sql)?;
-                }
-                QuerySet::Clickbench => {
-                    let sql = format!("BEGIN;
-                                       INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
-                                       FROM hits
-                                       LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
-                                       OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
-                                       COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
-                                       COMMIT;");
-
-                    dest_conn.execute_batch(&sql)?;
-                }
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => unimplemented!("Appendable file source is not implemented for Scenario or Parameterized TPC-H query sets"),
-            }
-
+            dest_conn.execute_batch(&sql)?;
             Ok::<(), anyhow::Error>(())
         })
         .await

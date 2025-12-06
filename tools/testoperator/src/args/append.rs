@@ -34,4 +34,8 @@ pub struct AppendTestArgs {
     /// Include additional conflict data to test ON CONFLICT upsert behavior during append operations
     #[arg(long)]
     pub(crate) with_conflict_data: bool,
+
+    /// Include additional data with offset primary keys and outdated timestamps to test retention deletion policies
+    #[arg(long)]
+    pub(crate) with_retention_data: bool,
 }
