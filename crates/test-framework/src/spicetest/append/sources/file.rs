@@ -277,36 +277,6 @@ impl AppendableSource for FileAppendableSource {
                         &temp_directory,
                     );
                     dest_conn.execute_batch(&sql)?;
-
-                    // Debug: verify retention data was generated
-                    if generate_retention_data {
-                        for table in &tables {
-                            let pk_col = tpch_primary_key(&table.name).unwrap_or("rowid");
-                            let query = format!(
-                                "SELECT COUNT(*) as total, \
-                                 SUM(CASE WHEN {pk} >= {offset} THEN 1 ELSE 0 END) as retention_count, \
-                                 CAST(MIN({col}) AS VARCHAR) as min_ts \
-                                 FROM {name}",
-                                name = table.name,
-                                col = table.column,
-                                pk = pk_col,
-                                offset = TEMP_DATA_KEY_OFFSET,
-                            );
-                            if let Ok(mut stmt) = dest_conn.prepare(&query) {
-                                if let Ok(mut rows) = stmt.query([]) {
-                                    if let Ok(Some(row)) = rows.next() {
-                                        let total: i64 = row.get(0).unwrap_or(0);
-                                        let retention: i64 = row.get(1).unwrap_or(0);
-                                        let min_ts: Option<String> = row.get(2).ok();
-                                        println!(
-                                            "[setup-debug] {}: total={}, retention={}, min_ts={:?}",
-                                            table.name, total, retention, min_ts
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
                 QuerySet::Tpcds => {
                     let mut setup_sql = "INSTALL tpcds;
