@@ -359,7 +359,11 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {

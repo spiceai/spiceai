@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -75,7 +75,7 @@ jobs:
               }
             ];
 
-            const platform_option = context.payload.inputs.platform_option;
+            const platform_option = context.payload.inputs?.platform_option || 'all';
             let filtered = matrix;
 
             if (platform_option !== 'all') {
@@ -99,7 +99,7 @@ jobs:
         run: uname -m
 
       - name: checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       # The aarch64 Linux runner does not have tools pre-installed
       - name: Install missing tools
@@ -116,7 +116,7 @@ jobs:
       # nvidia-smi is not available on windows-gpu-t4-4-core, installing CUDA Toolkit
       - name: Install CUDA Toolkit (Windows)
         if: matrix.target.runner == 'windows-gpu-t4-4-core'
-        uses: Jimver/cuda-toolkit@v0.2.29
+        uses: Jimver/cuda-toolkit@6008063726ffe3309d1b22e413d9e88fed91a2f2 # v0.2.29
         id: cuda-toolkit
         with:
           method: network

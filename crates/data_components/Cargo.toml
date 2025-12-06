@@ -101,8 +101,8 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
-clickhouse = ["dep:clickhouse-rs"]
-databricks = ["delta_lake", "spark_connect"]
+clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
+databricks = ["delta_lake", "spark_connect", "datafusion-table-providers/federation"]
 debezium = ["dep:rdkafka"]
 default = []
 delta_lake = ["dep:delta_kernel"]
@@ -124,8 +124,8 @@ imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
 mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
-mysql = ["datafusion-table-providers/mysql"]
-odbc = []
+mysql = ["datafusion-table-providers/mysql", "datafusion-table-providers/mysql-federation"]
+odbc = ["datafusion-table-providers/federation", "db_connection_pool/odbc"]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
     "dep:tokio-postgres",
@@ -137,7 +137,7 @@ s3_vectors = [
     "dep:s3_vectors_metadata_filter",
 ]
 sharepoint = ["dep:graph-rs-sdk"]
-snowflake = ["dep:snowflake-api"]
+snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",

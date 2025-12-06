@@ -29,6 +29,7 @@ use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
+#[cfg(not(windows))]
 use cayenne::optimizer_rules::CayenneJoinRewriter;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -57,6 +58,8 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -266,20 +269,35 @@ impl DataFusionBuilder {
 
         #[cfg(feature = "duckdb")]
         {
+            let mut physical_optimizers_with_duckdb: Vec<
+                Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+            > = vec![
+                DuckDBAggregatePushdownRewriter::new(),
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            ];
+
+            physical_optimizers_with_duckdb.extend(
+                state
+                    .physical_optimizer_rules()
+                    .clone()
+                    .unwrap_or_else(|| PhysicalOptimizer::new().rules),
+            );
+
             state = state
                 .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
-                .with_physical_optimizer_rule(
-                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
-                );
+                .with_physical_optimizer_rules(physical_optimizers_with_duckdb);
         }
 
         state = state
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
-                Box::new(track_bytes_processed),
-            ))))
-            .with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                Arc::new(Box::new(track_bytes_processed)),
+            )));
+
+        #[cfg(not(windows))]
+        {
+            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+        }
 
         let mut state = state.build();
 
