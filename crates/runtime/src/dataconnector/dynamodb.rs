@@ -91,6 +91,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("time_format")
         .description("Go-style time format used for parsing/formatting timestamps")
         .default(DEFAULT_TIME_FORMAT),
+    ParameterSpec::runtime("acceptable_lag")
+        .description("When using Streams, once tables reaches this lag, it will be repored as Ready")
+        .default("3s"),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -220,6 +223,13 @@ impl DataConnector for DynamoDB {
             });
         }
 
+        let acceptable_lag = self
+            .params
+            .get("acceptable_lag")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok()).unwrap_or(Duration::from_secs(3));
+
         let provider = DynamoDBTableProvider::try_new(
             config,
             Arc::from(table_name),
@@ -228,6 +238,7 @@ impl DataConnector for DynamoDB {
             config_segments,
             stream_poll_interval_ms,
             time_format.to_string(),
+            acceptable_lag,
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
@@ -248,7 +259,7 @@ impl DataConnector for DynamoDB {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
-        let acceptable_lag = Duration::from_secs(10);
+        let acceptable_lag = Duration::from_secs(3);
 
         Some(Box::pin(
             stream::once(async move {
@@ -258,7 +269,7 @@ impl DataConnector for DynamoDB {
                     .as_any()
                     .downcast_ref::<DynamoDBTableProvider>()?;
 
-                let acceptable_lag = acceptable_lag;
+                let acceptable_lag = dynamodb_ref.acceptable_lag;
                 let dataset_name = dataset.name.clone();
                 let dataset_name_2 = dataset_name.clone();
                 let dataset_name_3 = dataset_name.clone();
@@ -283,6 +294,9 @@ impl DataConnector for DynamoDB {
                             })
                         });
 
+                    let checkpoint_cloned = checkpoint.clone();
+                    let dynamodb_sys_cloned = Arc::clone(&dynamodb_sys);
+
                     // Attach changes stream from initial checkpoint to bootstrap stream
                     Some(
                         bootstrap_stream
@@ -290,6 +304,12 @@ impl DataConnector for DynamoDB {
                                 stream::once(async move {
                                     tracing::info!("Bootstrapping DynamoDB table complete, starting changes stream. \
                                         Note it will take some time for table to catch up: table_name={}", dataset_name_2);
+
+                                    let committer = DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
+                                    if let Err(err) = committer.commit() {
+                                        tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
+                                    }
+
                                     stream::empty()
                                 })
                                 .flatten()
@@ -299,7 +319,6 @@ impl DataConnector for DynamoDB {
                                     Arc::clone(&dynamodb),
                                     Arc::clone(&dynamodb_sys),
                                     checkpoint,
-                                    true,
                                     acceptable_lag,
                                     dataset_name_3.clone(),
                                 ))
@@ -315,7 +334,6 @@ impl DataConnector for DynamoDB {
                             Arc::clone(&dynamodb),
                             Arc::clone(&dynamodb_sys),
                             checkpoint,
-                            false,
                             acceptable_lag,
                             dataset_name_4.clone(),
                         ))
@@ -396,27 +414,12 @@ async fn changes_stream_from_checkpoint(
     dynamodb: Arc<DynamoDBTableProvider>,
     dynamodb_sys: Arc<DynamoDBSys>,
     checkpoint: Checkpoint,
-    from_bootstrap: bool,
     acceptable_lag: Duration,
     dataset_name: TableReference,
 ) -> Option<ChangesStream> {
-    // If this is an initial checkpoint(from_bootstrap=true), commit it immediately.
-    // This checkpoint is inclusive and in case of failure stream will restart from the current position, not next.
-    if from_bootstrap {
-        tracing::debug!(
-            "Committing bootstrap checkpoint: table_name={}",
-            dataset_name
-        );
-        let committer = DynamoDBStreamCommitter::new(Arc::clone(&dynamodb_sys), checkpoint.clone());
-        if let Err(err) = committer.commit() {
-            tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
-        }
-    }
-
     tracing::debug!(
-        "Starting DynamoDB stream from checkpoint: table_name={}, from_bootstrap={}, checkpoint={:?}",
+        "Starting DynamoDB stream from checkpoint: table_name={}, checkpoint={:?}",
         dataset_name,
-        from_bootstrap,
         checkpoint,
     );
 
@@ -428,8 +431,7 @@ async fn changes_stream_from_checkpoint(
                         let lag = watermark
                             .and_then(|v| SystemTime::now().duration_since(v).ok());
 
-                        // TODO: should be trace
-                        tracing::info!(
+                        tracing::debug!(
                             "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, records={}",
                             dataset_name,
                             watermark

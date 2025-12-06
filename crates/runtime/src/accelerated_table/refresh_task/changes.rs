@@ -164,8 +164,7 @@ impl RefreshTask {
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
-        // TODO: Should be trace
-        tracing::info!(
+        tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
             self.dataset_name,
             change_batch.record.num_rows(),
@@ -179,8 +178,8 @@ impl RefreshTask {
                         .await?;
                 }
                 ChangeOperationType::Upsert => {
-                    // self.process_upsert_batch(&change_batch, &row_indices)
-                    //     .await?;
+                    self.process_upsert_batch(&change_batch, &row_indices)
+                        .await?;
                 }
                 ChangeOperationType::Truncate => {
                     tracing::warn!("Truncate operation not yet implemented for {dataset_name}");
@@ -211,12 +210,7 @@ impl RefreshTask {
         let indices_array = UInt32Array::from(
             row_indices
                 .iter()
-                .map(|&i| {
-                    u32::try_from(i).unwrap_or_else(|_| {
-                        tracing::error!("Index {i} doesn't fit in u32, using 0");
-                        0
-                    })
-                })
+                .filter_map(|&i| { u32::try_from(i).ok() })
                 .collect::<Vec<_>>(),
         );
 

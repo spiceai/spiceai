@@ -76,6 +76,7 @@ pub struct DynamoDBTableProvider {
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
+    pub acceptable_lag: Duration,
 }
 
 type DynamoDBItemStream =
@@ -92,6 +93,7 @@ impl DynamoDBTableProvider {
         config_partitions: Option<usize>,
         stream_poll_interval_ms: u64,
         time_format: String,
+        acceptable_lag: Duration,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let streams_client = Arc::new(
@@ -148,6 +150,7 @@ impl DynamoDBTableProvider {
             unnest_depth,
             config_partitions,
             table_total_item_count,
+            acceptable_lag,
         })
     }
 
