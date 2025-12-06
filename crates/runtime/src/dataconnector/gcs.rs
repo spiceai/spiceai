@@ -368,3 +368,5 @@ impl ListingTableConnector for Gcs {
         }
     }
 }
+
+register_data_connector!("gs", GcsFactory);
