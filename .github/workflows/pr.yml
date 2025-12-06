@@ -171,6 +171,10 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
+      - name: Validate datafusion-table-providers commit
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: bash .github/scripts/validate_table_providers_commit.sh
+
       - name: Build CLI and run nextest
         run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
