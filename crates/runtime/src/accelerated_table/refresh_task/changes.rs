@@ -179,8 +179,8 @@ impl RefreshTask {
                         .await?;
                 }
                 ChangeOperationType::Upsert => {
-                    // self.process_upsert_batch(&change_batch, &row_indices)
-                    //     .await?;
+                    self.process_upsert_batch(&change_batch, &row_indices)
+                        .await?;
                 }
                 ChangeOperationType::Truncate => {
                     tracing::warn!("Truncate operation not yet implemented for {dataset_name}");
@@ -492,17 +492,16 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
     }
 
     #[cfg(feature = "dynamodb")]
-    if let cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage { source }) = err
-    {
-        match source {
-            dynamodb_streams::Error::StreamBeyondRetention => {
-                tracing::error!(
-                    "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
-                );
-                return StreamErrorType::Fatal;
-            }
-            _ => {}
-        }
+    if matches!(
+        err,
+        cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage {
+            source: dynamodb_streams::Error::StreamBeyondRetention,
+        })
+    ) {
+        tracing::error!(
+            "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
+        );
+        return StreamErrorType::Fatal;
     }
 
     tracing::error!("Changes stream error for {dataset_name}: {err}");
