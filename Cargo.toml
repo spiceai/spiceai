@@ -15,6 +15,7 @@ members = [
     "crates/event_stream",
     "crates/flight_client",
     "crates/flightrepl",
+    "crates/google-genai",
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",

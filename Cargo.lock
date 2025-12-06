@@ -6672,6 +6672,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "google-genai"
+version = "1.10.0-unstable"
+dependencies = [
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "governor"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
