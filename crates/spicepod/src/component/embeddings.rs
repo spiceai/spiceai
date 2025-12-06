@@ -141,6 +141,12 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("azure:").map(ToString::to_string)
             }
+            Some(EmbeddingPrefix::Google) => {
+                let from = &self.from;
+                from.strip_prefix("google:")
+                    .or_else(|| from.strip_prefix("gemini:"))
+                    .map(ToString::to_string)
+            }
             Some(EmbeddingPrefix::File) => {
                 let from = &self.from;
                 from.strip_prefix("file:").map(ToString::to_string)
@@ -165,6 +171,7 @@ impl Embeddings {
 pub enum EmbeddingPrefix {
     OpenAi,
     Azure,
+    Google,
     HuggingFace,
     File,
     Databricks,
@@ -184,6 +191,8 @@ impl TryFrom<&str> for EmbeddingPrefix {
             Ok(EmbeddingPrefix::OpenAi)
         } else if value.starts_with("azure") {
             Ok(EmbeddingPrefix::Azure)
+        } else if value.starts_with("google") {
+            Ok(EmbeddingPrefix::Google)
         } else if value.starts_with("databricks") {
             Ok(EmbeddingPrefix::Databricks)
         } else if value.starts_with("bedrock") {
@@ -201,6 +210,7 @@ impl Display for EmbeddingPrefix {
         match self {
             EmbeddingPrefix::OpenAi => write!(f, "openai"),
             EmbeddingPrefix::Azure => write!(f, "azure"),
+            EmbeddingPrefix::Google => write!(f, "google"),
             EmbeddingPrefix::HuggingFace => write!(f, "huggingface"),
             EmbeddingPrefix::File => write!(f, "file"),
             EmbeddingPrefix::Databricks => write!(f, "databricks"),

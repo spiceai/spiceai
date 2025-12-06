@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::chat::{Chat, nsql::SqlGeneration};
+use crate::google::to_completion_usage;
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall,
@@ -28,6 +29,7 @@ use async_openai::types::{
 };
 use async_trait::async_trait;
 use futures::Stream;
+use futures::StreamExt;
 use google_genai::generate::GenerateContentRequest;
 use google_genai::types::{Content, Part};
 use std::pin::Pin;
@@ -45,8 +47,7 @@ impl Chat for Google {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let google_req = convert_to_google_request(req)?;
-        let model = self.model.clone();
+        let google_req = convert_to_google_request(req);
 
         let stream = self
             .client
@@ -61,14 +62,14 @@ impl Chat for Google {
                 })
             })?;
 
-        Ok(Box::pin(convert_google_stream_to_openai(stream, model)))
+        Ok(Box::pin(convert_google_stream_to_openai(stream)))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let google_req = convert_to_google_request(req)?;
+        let google_req = convert_to_google_request(req);
 
         let response = self
             .client
@@ -257,20 +258,15 @@ fn convert_google_response_to_openai(
         })
         .collect();
 
-    let usage = response.usage_metadata.map(|usage| CompletionUsage {
-        prompt_tokens: usage.prompt_token_count as u32,
-        completion_tokens: usage.candidates_token_count.unwrap_or(0) as u32,
-        total_tokens: usage.total_token_count as u32,
-        prompt_tokens_details: None,
-        completion_tokens_details: None,
-    });
-
     Ok(CreateChatCompletionResponse {
         id: response
             .response_id
             .unwrap_or_else(|| "unknown".to_string()),
         model: model.to_string(),
-        usage,
+        usage: response
+            .usage_metadata
+            .as_ref()
+            .map(|m| to_completion_usage(m)),
         created: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
@@ -285,7 +281,6 @@ fn convert_google_response_to_openai(
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn convert_google_stream_response_to_openai(
     response: google_genai::generate::GenerateContentResponse,
-    model: &str,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
     let choices = response
         .candidates
@@ -372,7 +367,7 @@ fn convert_google_stream_response_to_openai(
         id: response
             .response_id
             .unwrap_or_else(|| "unknown".to_string()),
-        model: model.to_string(),
+        model: response.model_version.unwrap_or_default(),
         usage,
         created: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -392,27 +387,17 @@ fn convert_google_stream_to_openai(
                 + Send,
         >,
     >,
-    model: String,
 ) -> impl Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> {
-    futures::stream::unfold((stream, model), |(mut stream, model)| async move {
-        use futures::StreamExt;
-        match stream.next().await {
-            Some(Ok(response)) => {
-                match convert_google_stream_response_to_openai(response, &model) {
-                    Ok(openai_response) => Some((Ok(openai_response), (stream, model))),
-                    Err(e) => Some((Err(e), (stream, model))),
-                }
-            }
-            Some(Err(e)) => Some((
-                Err(OpenAIError::ApiError(ApiError {
-                    message: format!("Google stream error: {e}"),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })),
-                (stream, model),
-            )),
-            None => None,
-        }
+    stream.map(|pkt| match pkt {
+        Ok(response) => match convert_google_stream_response_to_openai(response) {
+            Ok(openai_response) => Ok(openai_response),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(OpenAIError::ApiError(ApiError {
+            message: e.to_string(),
+            r#type: None,
+            param: None,
+            code: None,
+        })),
     })
 }

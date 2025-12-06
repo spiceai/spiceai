@@ -136,12 +136,12 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     Ok(Arc::new(sonar))
 }
 
-pub(crate) fn create_google(model_id: Option<&str>) -> Result<Arc<dyn Chat>, anyhow::Error> {
+pub(crate) fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
         .or_else(|_| std::env::var("GEMINI_API_KEY"))
         .context("SPICE_GOOGLE_API_KEY or GEMINI_API_KEY not set")?;
 
-    let google = Google::new(SecretString::from(api_key), model_id)
+    let google = Google::new(&SecretString::from(api_key), model_id)
         .map_err(|e| anyhow::anyhow!("Failed to create Google client: {e}"))?;
 
     Ok(Arc::new(google))

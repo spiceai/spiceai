@@ -19,6 +19,7 @@ use llms::{
     anthropic::Anthropic,
     bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
+    google::Google,
     openai::UsageTier,
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -129,6 +130,7 @@ pub async fn construct_model(
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
         ModelSource::File => file(component, params).await,
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
+        ModelSource::Google => google(model_id.as_deref(), params),
         ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
@@ -236,6 +238,25 @@ fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat
     })?;
 
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
+}
+
+fn google(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "google".to_string(),
+        });
+    };
+    let Some(api_key) = params.get("api_key").ok() else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "`model.params.google_api_key` is required.".into(),
+        });
+    };
+
+    let google = Google::new(api_key, model_id).map_err(|e| LlmError::FailedToLoadModel {
+        source: format!("Failed to create Google client: {e}").into(),
+    })?;
+
+    Ok(Arc::new(google) as Arc<dyn Chat>)
 }
 
 async fn huggingface(

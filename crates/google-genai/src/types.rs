@@ -336,14 +336,33 @@ pub struct CitationSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
-    pub prompt_token_count: i32,
+    pub prompt_token_count: u32,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidates_token_count: Option<i32>,
-    pub total_token_count: i32,
+    pub cached_content_token_count: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates_token_count: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_prompt_token_count: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thoughts_token_count: Option<u32>,
+
+    pub total_token_count: u32,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<Vec<TokenCountDetails>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_tokens_details: Option<Vec<TokenCountDetails>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates_tokens_details: Option<Vec<TokenCountDetails>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_use_prompt_tokens_details: Option<Vec<TokenCountDetails>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,5 +371,5 @@ pub struct TokenCountDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_count: Option<i32>,
+    pub token_count: Option<u32>,
 }

@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::embeddings::{Embed, EmbeddingInput, Error, Result};
 use async_trait::async_trait;
+use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use google_genai::embeddings::EmbedContentRequest;
 
 use super::Google;
@@ -24,10 +27,16 @@ use super::Google;
 pub struct EmbedGoogle {
     pub(crate) g: Google,
     pub(crate) dimensions: Option<u32>,
+    pub(crate) embeddings_cache:
+        Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
 #[async_trait]
 impl Embed for EmbedGoogle {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.embeddings_cache.clone()
+    }
+
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
         let texts: Vec<String> = match input {
             EmbeddingInput::String(s) => vec![s],
@@ -50,6 +59,7 @@ impl Embed for EmbedGoogle {
         let requests: Vec<EmbedContentRequest> = contents
             .into_iter()
             .map(|v| EmbedContentRequest {
+                model: format!("models/{}", self.g.model),
                 content: v,
                 output_dimensionality: self.dimensions,
                 task_type: None,
@@ -62,9 +72,9 @@ impl Embed for EmbedGoogle {
             .batch_embed_content(&self.g.model, requests)
             .await
             .map_err(|e| Error::FailedToCreateEmbedding {
-                source: Box::new(std::io::Error::other(
-                    format!("Google embedding error: {e}"),
-                )),
+                source: Box::new(std::io::Error::other(format!(
+                    "Google embedding error: {e}"
+                ))),
             })?;
 
         let embeddings = response
