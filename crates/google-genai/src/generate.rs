@@ -243,6 +243,6 @@ mod tests {
         let data =
             r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#;
         let bytes = Bytes::from(data);
-        let result = parse_sse_chunk(&bytes).expect("Failed to parse SSE chunk");
+        let _result = parse_sse_chunk(&bytes).expect("Failed to parse SSE chunk");
     }
 }

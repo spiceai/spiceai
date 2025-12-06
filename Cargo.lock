@@ -8750,6 +8750,7 @@ dependencies = [
  "dotenvy",
  "either",
  "futures",
+ "google-genai",
  "governor",
  "hf-hub",
  "indexmap 2.12.1",

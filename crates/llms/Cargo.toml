@@ -22,6 +22,7 @@ bytes.workspace = true
 cache = { path = "../cache" }
 chunking = { path = "../chunking" }
 futures = { workspace = true }
+google-genai = { path = "../google-genai" }
 governor.workspace = true
 
 hf-hub.workspace = true

@@ -21,6 +21,7 @@ pub mod chat;
 pub mod config;
 pub mod databricks;
 pub mod embeddings;
+pub mod google;
 pub mod model2vec;
 pub mod openai;
 pub mod perplexity;

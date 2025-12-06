@@ -32,7 +32,7 @@ pub struct EmbedContentRequest {
     pub task_type: Option<TaskType>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_dimensionality: Option<i32>,
+    pub output_dimensionality: Option<u32>,
 }
 
 impl EmbedContentRequest {
@@ -52,7 +52,7 @@ impl EmbedContentRequest {
     }
 
     #[must_use]
-    pub fn with_output_dimensionality(mut self, dimensionality: i32) -> Self {
+    pub fn with_output_dimensionality(mut self, dimensionality: u32) -> Self {
         self.output_dimensionality = Some(dimensionality);
         self
     }

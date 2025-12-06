@@ -88,6 +88,15 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                 }),
             ),
             (
+                "google",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_google("gemini-2.0-flash")
+                            .map_err(|e| anyhow::anyhow!("failed to create google model: {e}"))
+                    })
+                }),
+            ),
+            (
                 "openai",
                 Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
             ),
@@ -316,7 +325,7 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                 "messages": [
                     {
                       "role": "user",
-                      "content": "What'\''s the weather like in Boston today?"
+                      "content": "Use 'get_current_weather' to summarise what the weather in celsius is like in Boston, MA today?"
                     }
                 ],
                 "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
@@ -325,7 +334,7 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                     "type": "function",
                     "function": {
                       "name": "get_current_weather",
-                      "description": "Get the current weather in a given location, in Celsius",
+                      "description": "Get the current weather in a given location",
                       "parameters": {
                         "type": "object",
                         "properties": {
@@ -516,6 +525,13 @@ macro_rules! generate_model_tests {
         test_model_case!(openai, system_prompt, true);
         test_model_case!(openai, supports_basic_message_roles, true);
 
+        test_model_case!(google, basic);
+        test_model_case!(google, system_prompt);
+        test_model_case!(google, supports_basic_message_roles);
+        test_model_case!(google, basic, true);
+        test_model_case!(google, system_prompt, true);
+        test_model_case!(google, supports_basic_message_roles, true);
+
         test_model_case!(xai, basic);
         test_model_case!(xai, system_prompt);
         test_model_case!(xai, supports_basic_message_roles);
@@ -566,6 +582,13 @@ macro_rules! generate_model_tests {
         test_model_case!(openai, usage, true);
         test_model_case!(openai, supports_all_message_roles);
         test_model_case!(openai, supports_all_message_roles, true);
+
+        test_model_case!(google, tool_use);
+        test_model_case!(google, tool_use, true);
+        test_model_case!(google, usage);
+        test_model_case!(google, usage, true);
+        test_model_case!(google, supports_all_message_roles);
+        test_model_case!(google, supports_all_message_roles, true);
 
         test_model_case!(xai, tool_use);
         test_model_case!(xai, tool_use, true);
