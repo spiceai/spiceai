@@ -85,6 +85,12 @@ type DynamoDBItemStream =
 const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
+    /// Creates a new `DynamoDB` table provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be accessed or metadata cannot be fetched.
+    #[expect(clippy::too_many_arguments)]
     pub async fn try_new(
         sdk_config: SdkConfig,
         table_name: Arc<str>,
@@ -97,10 +103,12 @@ impl DynamoDBTableProvider {
         metrics_collector: Arc<MetricsCollector>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
+        #[expect(unsafe_code, )]
+        let buffer_size = unsafe { NonZeroUsize::new_unchecked(1) };
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
-                .buffer(NonZeroUsize::new(1).unwrap())
+                .buffer(buffer_size)
                 .metrics_collector(metrics_collector)
                 .build(),
         );
@@ -355,6 +363,7 @@ impl DynamoDBTableProvider {
         Ok(stream.boxed())
     }
 
+    #[must_use]
     pub fn stream_metrics(&self) -> Metrics {
         self.streams_client.metrics()
     }

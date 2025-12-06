@@ -133,10 +133,14 @@ impl DataConnector for DynamoDB {
         self
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Complex configuration parsing required"
+    )]
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let table_name = dataset.path();
 
         let config = initiate_config_with_credentials(
@@ -272,7 +276,6 @@ impl DataConnector for DynamoDB {
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
-        let acceptable_lag = Duration::from_secs(3);
 
         Some(Box::pin(
             stream::once(async move {

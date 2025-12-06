@@ -40,6 +40,7 @@ impl Metrics {
     }
 
     /// Number of currently active shards (gauge)
+    #[must_use]
     pub fn active_shards_number(&self) -> usize {
         self.metrics_collector
             .active_shards_number
@@ -49,23 +50,26 @@ impl Metrics {
     }
 
     /// Total number of records produced (counter)
+    #[must_use]
     pub fn records(&self) -> usize {
         self.metrics_collector.records.load(Ordering::Relaxed)
     }
 
-    /// Total lag in milliseconds (now() - stream watermark)
+    /// Total lag in milliseconds (`now()` - stream watermark)
     /// Returns None if no watermark is available yet
+    #[must_use]
     pub fn total_lag_ms(&self) -> Option<u64> {
         let watermark = self.metrics_collector.watermark.read().ok()?;
         watermark.and_then(|wm| {
             SystemTime::now()
                 .duration_since(wm)
                 .ok()
-                .map(|d| d.as_millis() as u64)
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
         })
     }
 
     /// Total number of transient errors encountered (counter)
+    #[must_use]
     pub fn transient_errors(&self) -> usize {
         self.metrics_collector
             .transient_errors

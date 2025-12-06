@@ -29,7 +29,6 @@ pub struct ActiveShard {
     pub parent_shard_id: Option<String>,
     pub iterator: String,
     pub last_checkpoint: ShardCheckpoint,
-    pub last_produced_at: Option<SystemTime>,
     pub current_watermark: Option<SystemTime>,
 }
 
@@ -42,10 +41,6 @@ impl ActiveShard {
         self.last_checkpoint = checkpoint;
     }
 
-    pub fn update_produced_at(&mut self) {
-        self.last_produced_at = Some(SystemTime::now());
-    }
-
     pub fn update_watermark(&mut self, watermark: SystemTime) {
         self.current_watermark = Some(watermark);
     }
@@ -56,7 +51,6 @@ pub struct InitializingShard {
     pub shard_id: String,
     pub parent_shard_id: Option<String>,
     pub last_checkpoint: ShardCheckpoint,
-    pub last_produced_at: Option<SystemTime>,
     pub current_watermark: Option<SystemTime>,
 }
 
@@ -83,7 +77,6 @@ pub struct ShardPollResult {
     pub shard_id: String,
     pub outcome: PollOutcome,
     pub last_checkpoint: ShardCheckpoint,
-    pub last_produced_at: Option<SystemTime>,
     pub current_watermark: Option<SystemTime>,
 }
 
@@ -91,12 +84,6 @@ pub enum PollOutcome {
     Records { records: Vec<Record> },
     Empty,
     Failed,
-}
-
-impl PollOutcome {
-    pub fn is_empty(&self) -> bool {
-        matches!(self, PollOutcome::Empty)
-    }
 }
 
 impl StreamState {
@@ -120,16 +107,12 @@ impl StreamState {
             });
         };
         let mut current_checkpoint = shard.last_checkpoint.clone();
-        let mut current_last_produced_at = shard.last_produced_at;
         let mut current_watermark = shard.current_watermark;
 
         // First update watermark and checkpoint if possible
         if !records.is_empty()
             && let Some(shard) = self.active.get_mut(shard_id)
         {
-            shard.update_produced_at();
-            current_last_produced_at = shard.last_produced_at;
-
             // Update watermark
             let max_event_time = records
                 .iter()
@@ -185,7 +168,6 @@ impl StreamState {
             shard_id: shard_id.to_string(),
             outcome,
             last_checkpoint: current_checkpoint,
-            last_produced_at: current_last_produced_at,
             current_watermark,
         })
     }
@@ -202,7 +184,6 @@ impl StreamState {
             shard_id: shard_id.to_string(),
             outcome: PollOutcome::Failed,
             last_checkpoint: shard.last_checkpoint.clone(),
-            last_produced_at: shard.last_produced_at,
             current_watermark: shard.current_watermark,
         };
 
@@ -239,7 +220,6 @@ impl StreamState {
                     shard_id: shard_id.to_string(),
                     parent_shard_id: active_shard.parent_shard_id,
                     last_checkpoint: active_shard.last_checkpoint,
-                    last_produced_at: active_shard.last_produced_at,
                     current_watermark: active_shard.current_watermark,
                 },
             );
@@ -319,7 +299,6 @@ impl StreamState {
                         shard_id: shard_id.clone(),
                         parent_shard_id: shard.parent_shard_id.clone(),
                         last_checkpoint: checkpoint,
-                        last_produced_at: None,
                         current_watermark: None,
                     },
                 );
@@ -343,11 +322,11 @@ impl StreamState {
 
         // Walk up the parent chain for each tracked shard
         while let Some(shard_id) = to_check.pop() {
-            if let Some(Some(parent_id)) = parent_map.get(&shard_id) {
-                if ancestors.insert(parent_id.clone()) {
-                    // New ancestor found, check its ancestors too
-                    to_check.push(parent_id.clone());
-                }
+            if let Some(Some(parent_id)) = parent_map.get(&shard_id)
+                && ancestors.insert(parent_id.clone())
+            {
+                // New ancestor found, check its ancestors too
+                to_check.push(parent_id.clone());
             }
         }
 
@@ -361,7 +340,6 @@ impl StreamState {
                 shard_id: shard_id.clone(),
                 parent_shard_id: pending.parent_shard_id,
                 last_checkpoint: pending.last_checkpoint,
-                last_produced_at: pending.last_produced_at,
                 current_watermark: pending.current_watermark,
                 iterator,
             };
@@ -400,7 +378,6 @@ impl StreamState {
                     shard_id: shard_id.to_string(),
                     parent_shard_id: shard.parent_shard_id,
                     last_checkpoint: shard.last_checkpoint,
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -445,7 +422,6 @@ pub async fn initialize_state_from_checkpoint(
             parent_shard_id: shard_checkpoint.parent_id.clone(),
             iterator,
             last_checkpoint: shard_checkpoint.clone(),
-            last_produced_at: None,
             current_watermark: None,
         };
 
@@ -536,7 +512,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -588,7 +563,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -627,7 +601,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -668,7 +641,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -679,7 +651,7 @@ mod tests {
                 vec![create_record_without_seq()],
             );
 
-            assert!(result.is_ok());
+            result.unwrap();
             // When sequence number is missing, the record is still returned
             // but the checkpoint is not updated
 
@@ -712,7 +684,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -723,7 +694,7 @@ mod tests {
                 vec![create_record_without_dynamodb()],
             );
 
-            assert!(result.is_ok());
+            result.unwrap();
             // When dynamodb field is missing, the record is still returned
             // but the checkpoint is not updated
 
@@ -748,7 +719,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -807,7 +777,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -868,7 +837,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -889,13 +857,9 @@ mod tests {
             let expected_watermark = datetime_to_system_time(DateTime::from_secs(1010));
             assert_eq!(result.current_watermark.unwrap(), expected_watermark);
 
-            // Verify last_produced_at is set
-            assert!(result.last_produced_at.is_some());
-
             // Verify active shard state
             let shard = state.active.get("shard-1").unwrap();
             assert_eq!(shard.current_watermark.unwrap(), expected_watermark);
-            assert!(shard.last_produced_at.is_some());
             assert_eq!(shard.last_checkpoint.sequence_number, "102");
         }
 
@@ -915,7 +879,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -931,16 +894,12 @@ mod tests {
             // Watermark should still be None
             assert!(result.current_watermark.is_none());
 
-            // But last_produced_at should be set
-            assert!(result.last_produced_at.is_some());
-
             // Checkpoint should be updated
             assert_eq!(result.last_checkpoint.sequence_number, "100");
 
             // Verify active shard
             let shard = state.active.get("shard-1").unwrap();
             assert!(shard.current_watermark.is_none());
-            assert!(shard.last_produced_at.is_some());
         }
 
         #[test]
@@ -960,7 +919,6 @@ mod tests {
                         updated_at: old_checkpoint_time,
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1006,7 +964,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1036,9 +993,6 @@ mod tests {
                 datetime_to_system_time(base_time)
             );
 
-            // Should have last_produced_at
-            assert!(result.last_produced_at.is_some());
-
             // Shard should be removed
             assert!(!state.active.contains_key("shard-1"));
         }
@@ -1047,7 +1001,6 @@ mod tests {
         fn test_handle_poll_result_exhausted_empty_records() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             let old_watermark = datetime_to_system_time(DateTime::from_secs(1000));
-            let old_produced_at = SystemTime::now();
 
             state.active.insert(
                 "shard-1".to_string(),
@@ -1061,7 +1014,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: Some(old_produced_at),
                     current_watermark: Some(old_watermark),
                 },
             );
@@ -1075,10 +1027,9 @@ mod tests {
             // Should be empty
             assert!(matches!(result.outcome, PollOutcome::Empty));
 
-            // Should preserve old checkpoint, watermark, last_produced_at
+            // Should preserve old checkpoint and watermark
             assert_eq!(result.last_checkpoint.sequence_number, "99");
             assert_eq!(result.current_watermark.unwrap(), old_watermark);
-            assert_eq!(result.last_produced_at.unwrap(), old_produced_at);
 
             // Shard should be removed
             assert!(!state.active.contains_key("shard-1"));
@@ -1101,7 +1052,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1109,7 +1059,7 @@ mod tests {
             let records = vec![create_record_with_timestamp("100", base_time)];
             let result = state.handle_poll_result("shard-1", Some("new-iter".to_string()), records);
 
-            assert!(result.is_ok());
+            result.unwrap();
 
             // Verify active shard has ALL fields updated correctly
             let shard = state.active.get("shard-1").expect("shard should exist");
@@ -1122,7 +1072,6 @@ mod tests {
                 Some("parent-1".to_string())
             );
             assert_eq!(shard.last_checkpoint.position, CheckpointPosition::After);
-            assert!(shard.last_produced_at.is_some());
             assert_eq!(
                 shard.current_watermark.unwrap(),
                 datetime_to_system_time(base_time)
@@ -1217,7 +1166,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1301,7 +1249,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1344,7 +1291,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1422,7 +1368,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1462,7 +1407,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1541,7 +1485,6 @@ mod tests {
                     },
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: Some("parent".to_string()),
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1580,7 +1523,6 @@ mod tests {
                     },
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1667,7 +1609,6 @@ mod tests {
                     },
                     shard_id: "shard-1".to_string(),
                     parent_shard_id: None,
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1682,7 +1623,6 @@ mod tests {
                     },
                     shard_id: "shard-2".to_string(),
                     parent_shard_id: Some("parent".to_string()),
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1885,7 +1825,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -1978,7 +1917,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -2074,7 +2012,6 @@ mod tests {
                     },
                     shard_id: "parent".to_string(),
                     parent_shard_id: None,
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -2153,7 +2090,7 @@ mod tests {
                 Some("iter-2".to_string()),
                 vec![create_record("100")],
             );
-            assert!(batch.is_ok());
+            batch.unwrap();
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 0);
             assert_eq!(state.initializing.len(), 0);
@@ -2215,7 +2152,7 @@ mod tests {
 
             // Exhaust parent
             let batch = state.handle_poll_result("parent", None, vec![create_record("100")]);
-            assert!(batch.is_ok());
+            batch.unwrap();
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -2417,7 +2354,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );
@@ -2504,7 +2440,6 @@ mod tests {
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::After,
                     },
-                    last_produced_at: None,
                     current_watermark: None,
                 },
             );

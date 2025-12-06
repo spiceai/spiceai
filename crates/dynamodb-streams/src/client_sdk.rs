@@ -102,8 +102,7 @@ impl SDKClient {
         shard_iterator_type: &ShardIteratorType,
         sequence_number: Option<String>,
     ) -> Result<String> {
-        Ok(self
-            .streams
+        self.streams
             .get_shard_iterator()
             .stream_arn(stream_arn)
             .shard_id(shard_id)
@@ -115,7 +114,7 @@ impl SDKClient {
             .shard_iterator
             .ok_or_else(|| Error::ShardIteratorNotFound {
                 shard_id: shard_id.to_string(),
-            })?)
+            })
     }
 
     pub async fn get_iterator_records(

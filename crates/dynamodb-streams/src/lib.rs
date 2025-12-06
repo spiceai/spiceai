@@ -90,6 +90,7 @@ pub enum Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,

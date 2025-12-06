@@ -138,6 +138,7 @@ impl Client {
         Ok(DynamodbStream { receiver: rx })
     }
 
+    #[must_use]
     pub fn metrics(&self) -> Metrics {
         Metrics::new(Arc::clone(&self.metrics_collector))
     }

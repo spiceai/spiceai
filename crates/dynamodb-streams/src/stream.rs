@@ -17,13 +17,13 @@ use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
 use crate::metrics::MetricsCollector;
 use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
-use crate::{Metrics, Result, StreamResult};
+use crate::{Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tokio::{
@@ -99,7 +99,7 @@ impl DynamodbStreamProducer {
                     return Err(e);
                 }
                 had_transient_error = true;
-                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}")
+                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}");
             }
         }
 
@@ -162,11 +162,11 @@ impl DynamodbStreamProducer {
                             .fetch_add(batch.records.len(), Ordering::Relaxed);
                     }
 
-                    if let Some(watermark) = batch.watermark {
-                        if let Ok(mut wm) = self.metrics_collector.watermark.write() {
-                            println!("Set watermark {:?}", watermark);
-                            *wm = Some(watermark);
-                        }
+                    if let Some(watermark) = batch.watermark
+                        && let Ok(mut wm) = self.metrics_collector.watermark.write()
+                    {
+                        println!("Set watermark {watermark:?}");
+                        *wm = Some(watermark);
                     }
 
                     if had_transient_error {
@@ -214,8 +214,6 @@ impl DynamodbStreamProducer {
 }
 
 fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatch {
-    let now = SystemTime::now();
-
     // Collect records, checkpoints and watermarks
     let mut records = Vec::new();
     let mut shard_watermarks = Vec::new();

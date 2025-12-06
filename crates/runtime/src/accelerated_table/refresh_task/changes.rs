@@ -487,16 +487,12 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
 
     #[cfg(feature = "dynamodb")]
     if let cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage { source }) = err
+        && matches!(source, dynamodb_streams::Error::StreamBeyondRetention)
     {
-        match source {
-            dynamodb_streams::Error::StreamBeyondRetention => {
-                tracing::error!(
-                    "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
-                );
-                return StreamErrorType::Fatal;
-            }
-            _ => {}
-        }
+        tracing::error!(
+            "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
+        );
+        return StreamErrorType::Fatal;
     }
 
     tracing::error!("Changes stream error for {dataset_name}: {err}");
