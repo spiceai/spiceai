@@ -9,9 +9,8 @@ description: "Query: clickbench_q11"
 |               |   Projection: hits.MobilePhoneModel, count(alias1) AS u                                                                                                                       |
 |               |     Aggregate: groupBy=[[hits.MobilePhoneModel]], aggr=[[count(alias1)]]                                                                                                      |
 |               |       Aggregate: groupBy=[[hits.MobilePhoneModel, hits.UserID AS alias1]], aggr=[[]]                                                                                          |
-|               |         BytesProcessedNode                                                                                                                                                    |
-|               |           Filter: hits.MobilePhoneModel != LargeUtf8("")                                                                                                                      |
-|               |             TableScan: hits projection=[UserID, MobilePhoneModel]                                                                                                             |
+|               |         Filter: hits.MobilePhoneModel != LargeUtf8("")                                                                                                                        |
+|               |           TableScan: hits projection=[UserID, MobilePhoneModel]                                                                                                               |
 | physical_plan | SortPreservingMergeExec: [u@1 DESC], fetch=10                                                                                                                                 |
 |               |   SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[true]                                                                                                     |
 |               |     ProjectionExec: expr=[MobilePhoneModel@0 as MobilePhoneModel, count(alias1)@1 as u]                                                                                       |
@@ -23,10 +22,10 @@ description: "Query: clickbench_q11"
 |               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                   |
 |               |                   RepartitionExec: partitioning=Hash([MobilePhoneModel@0, alias1@1], 16), input_partitions=16                                                                 |
 |               |                     AggregateExec: mode=Partial, gby=[MobilePhoneModel@1 as MobilePhoneModel, UserID@0 as alias1], aggr=[]                                                    |
-|               |                       BytesProcessedExec                                                                                                                                      |
-|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                           |
-|               |                           FilterExec: MobilePhoneModel@1 !=                                                                                                                   |
-|               |                             SchemaCastScanExec                                                                                                                                |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |                         FilterExec: MobilePhoneModel@1 !=                                                                                                                     |
+|               |                           SchemaCastScanExec                                                                                                                                  |
+|               |                             BytesProcessedExec                                                                                                                                |
 |               |                               DataSourceExec: partitions=16, partition_sizes=[1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1526, 1529] |
 |               |                                                                                                                                                                               |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

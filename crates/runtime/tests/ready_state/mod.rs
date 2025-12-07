@@ -58,8 +58,8 @@ use runtime::{
         parameters::ConnectorParams,
     },
     parameters::ParameterSpec,
-    request::{AsyncMarker, Protocol, RequestContext},
 };
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::{Dataset as SpicepodDataset, ReadyState},
@@ -491,7 +491,7 @@ fn get_federated_dataset(
     dataset
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn run_ready_state_test(
     is_native: bool,
     ready_state: ReadyState,

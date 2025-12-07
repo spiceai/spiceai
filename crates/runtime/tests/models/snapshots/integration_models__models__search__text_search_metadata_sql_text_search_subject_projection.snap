@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 495,
+    "subject": "math",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.934
+  },
+  {
+    "id": 494,
+    "subject": "math",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.934
+  },
+  {
+    "id": 499,
+    "subject": "math",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.245
+  },
+  {
+    "id": 1175,
+    "subject": "math",
+    "trunc(text_search(qs, Utf8(\"angles\"), question).score,Int64(3))": 4.129
+  }
+]

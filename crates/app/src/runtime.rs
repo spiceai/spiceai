@@ -30,16 +30,27 @@ impl App {
     pub fn get_runtime_param<T>(app: &Option<Arc<Self>>, param: &str, default_value: T) -> T
     where
         T: Display + FromStr,
+        <T as FromStr>::Err: Display,
     {
-        let Some(value) = app.as_ref().and_then(|app| app.runtime.params.get(param)) else {
-            return default_value;
-        };
+        Self::get_runtime_param_opt(app, param).unwrap_or(default_value)
+    }
 
-        if let Ok(parsed_value) = value.parse::<T>() {
-            parsed_value
-        } else {
-            eprintln!("runtime.params.{param} is not valid, defaulting to {default_value}");
-            default_value
+    #[must_use]
+    pub fn get_runtime_param_opt<T>(app: &Option<Arc<Self>>, param: &str) -> Option<T>
+    where
+        T: FromStr,
+        <T as FromStr>::Err: Display,
+    {
+        let value = app.as_ref().and_then(|app| app.runtime.params.get(param))?;
+
+        match value.parse::<T>() {
+            Ok(parsed_value) => Some(parsed_value),
+            Err(err) => {
+                tracing::warn!(
+                    "runtime.params.{param} is not valid ({err}). Ignoring the configured value."
+                );
+                None
+            }
         }
     }
 
@@ -88,5 +99,33 @@ mod tests {
         // Test case 5: App is None
         assert!(App::get_runtime_param(&None, "test_param", true));
         assert!(!App::get_runtime_param(&None, "test_param", false));
+    }
+
+    #[test]
+    fn test_get_runtime_param_opt() {
+        // Parameter is not set
+        let app = Some(create_app_with_params(HashMap::new()));
+        assert_eq!(App::get_runtime_param_opt::<bool>(&app, "test_param"), None);
+
+        // Parameter is set to "true"
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "true".to_string());
+        let app = Some(create_app_with_params(params));
+        assert_eq!(
+            App::get_runtime_param_opt::<bool>(&app, "test_param"),
+            Some(true)
+        );
+
+        // Parameter is set to an invalid value
+        let mut params = HashMap::new();
+        params.insert("test_param".to_string(), "not_a_bool".to_string());
+        let app = Some(create_app_with_params(params));
+        assert_eq!(App::get_runtime_param_opt::<bool>(&app, "test_param"), None);
+
+        // App is None
+        assert_eq!(
+            App::get_runtime_param_opt::<bool>(&None, "test_param"),
+            None
+        );
     }
 }

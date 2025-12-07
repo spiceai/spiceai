@@ -20,6 +20,7 @@ use datafusion::{
     catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
     physical_plan::collect, prelude::SessionContext,
 };
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use util::RetryError;
 
 use crate::{
@@ -43,14 +44,15 @@ impl TableSink {
         overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let ctx = SessionContext::new();
+        let target_schema = self.table_provider.schema();
+        let streaming_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
+        let cast_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
 
         let insertion_plan = match self
             .table_provider
-            .insert_into(
-                &ctx.state(),
-                Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
-                overwrite,
-            )
+            .insert_into(&ctx.state(), cast_plan, overwrite)
             .await
         {
             Ok(plan) => plan,

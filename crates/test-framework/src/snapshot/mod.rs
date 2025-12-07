@@ -19,6 +19,12 @@ use std::{panic, sync::Arc};
 use crate::{flight::query_to_batches, queries::Query};
 use spiceai::Client as SpiceClient;
 
+const CAYENNE_PATH_FILTER_PATTERN: &str =
+    r"(/data/[A-Za-z0-9_\-\[\]=]+)(?:/[A-Za-z0-9_\-\.\[\]=]+)+\.vortex";
+const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
+const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
+const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
+
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
 }
@@ -57,6 +63,8 @@ pub async fn record_explain_plan(
         snapshot_path => "snapshots/explain",
         filters => vec![
             (path_filter_pattern.as_str(), "/data"),
+            (CAYENNE_PATH_FILTER_PATTERN, CAYENNE_PATH_FILTER_REPLACEMENT),
+            (VORTEX_RANGE_FILTER_PATTERN, VORTEX_RANGE_FILTER_REPLACEMENT),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
             (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>"),
             (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
@@ -121,6 +129,40 @@ mod tests {
             let regex = regex::Regex::new(&path_filter_pattern).map_err(|e| format!("{e}"))?;
             let result = regex.replace(input, "/data");
             assert_eq!(result, expected, "Failed for input: {input}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cayenne_file_filters() -> Result<(), String> {
+        let test_cases = [
+            (
+                "/data/customer/5/019a22d7-f162-7be0-975f-417b334a95c6/tD0GMdUfbVhRvA6E_0.vortex:0..368070",
+                "/data/customer/<CAYENNE_PATH>.vortex:<RANGE>",
+            ),
+            (
+                "/data/customer/expression=22/5/019a4a83-a9a5-76b2-8cb4-3efdd70ce29b/7h45OnUbTA5PyuSE_0.vortex:",
+                "/data/customer/<CAYENNE_PATH>.vortex:",
+            ),
+        ];
+
+        let path_regex =
+            regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let range_regex =
+            regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+
+        for (input, expected) in test_cases {
+            let path_redacted =
+                path_regex.replace_all(input, super::CAYENNE_PATH_FILTER_REPLACEMENT);
+            let fully_redacted = range_regex
+                .replace_all(
+                    path_redacted.as_ref(),
+                    super::VORTEX_RANGE_FILTER_REPLACEMENT,
+                )
+                .into_owned();
+
+            assert_eq!(fully_redacted, expected, "Failed for input: {input}");
         }
 
         Ok(())

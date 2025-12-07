@@ -12,7 +12,10 @@ limitations under the License.
 */
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
+use crate::{
+    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME,
+    generation::text_search::query::FullTextSearchQuery,
+};
 use arrow::{
     array::RecordBatch,
     datatypes::{Field, FieldRef, Schema, SchemaRef},
@@ -22,16 +25,15 @@ use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
+    catalog::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
     logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
-    sql::sqlparser::ast::Ident,
 };
 
 use futures::{Stream, StreamExt};
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Index, ReloadPolicy, TantivyError,
+    Searcher, TantivyError,
     collector::TopDocs,
     query::{Occur, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
@@ -155,10 +157,9 @@ impl Error {
 impl std::fmt::Debug for FullTextSearchFieldIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FullTextSearchFieldIndex")
-            .field("schema", &self.search_schema)
+            .field("schema", self.reader.schema())
             .field("field", &self.field)
             .field("primary_key", &self.primary_key)
-            .field("additional_columns", &self.additional_columns)
             .field("type_hints", &self.type_hints)
             .finish_non_exhaustive()
     }
@@ -168,16 +169,10 @@ impl std::fmt::Debug for FullTextSearchFieldIndex {
 #[derive(Clone)]
 pub struct FullTextSearchFieldIndex {
     // These are components from a [`tantivy::Index`] required to perform a search on a  [`tantivy::Index`] at a given commit.
-    pub search_schema: tantivy::schema::Schema,
     reader: tantivy::Searcher,
-    tokenizer_manager: tantivy::tokenizer::TokenizerManager,
 
     pub field: String,
     pub primary_key: Vec<String>,
-
-    /// If provided, will only consider columns in [`Index`] that are in `field`, `primary_key` or `additional_columns`.
-    /// This allows for the reuse of a generic `Index` in search.
-    pub additional_columns: Option<Vec<String>>,
 
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
     /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
@@ -187,23 +182,14 @@ pub struct FullTextSearchFieldIndex {
 
 impl FullTextSearchFieldIndex {
     pub fn try_new(
-        index: &Index,
+        index_search: Searcher,
         field: String,
         primary_key: Vec<String>,
-        additional_columns: Option<Vec<String>>,
     ) -> Result<Self> {
         let fts = Self {
-            search_schema: index.schema(),
-            reader: index
-                .reader_builder()
-                .reload_policy(ReloadPolicy::OnCommitWithDelay)
-                .try_into()
-                .context(TextSearchSnafu)?
-                .searcher(),
-            tokenizer_manager: index.tokenizers().clone(),
+            reader: index_search,
             field,
             primary_key,
-            additional_columns,
             type_hints: HashMap::from([(
                 SEARCH_SCORE_COLUMN_NAME.to_string(),
                 Arc::new(Field::new(
@@ -220,17 +206,9 @@ impl FullTextSearchFieldIndex {
             if !cols.contains(pk) {
                 return Err(Error::TextSearchIndexMissingColummn {
                     missing: pk.clone(),
-                    index_columns: cols.clone(),
+                    index_columns: cols,
                 });
             }
-        }
-
-        // Ensure that the index has the field to search on.
-        if !cols.contains(&fts.field) {
-            return Err(Error::TextSearchIndexMissingColummn {
-                missing: fts.field.clone(),
-                index_columns: cols,
-            });
         }
 
         Ok(fts)
@@ -238,6 +216,7 @@ impl FullTextSearchFieldIndex {
 
     ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
     fn schema(&self) -> Arc<Schema> {
+        let search_schema = self.reader.schema();
         let fields = self
             .all_columns()
             .iter()
@@ -245,8 +224,8 @@ impl FullTextSearchFieldIndex {
                 let (data_type, nullable) = if let Some(f) = self.get_type_hint(field_name) {
                     (f.data_type().clone(), f.is_nullable())
                 } else {
-                    let f = self.search_schema.get_field(field_name).ok()?;
-                    let entry = self.search_schema.get_field_entry(f);
+                    let f = search_schema.get_field(field_name).ok()?;
+                    let entry = search_schema.get_field_entry(f);
                     (tantivy_to_arrow_type(entry.field_type())?, false)
                 };
                 Some(Field::new(field_name, data_type, nullable))
@@ -275,34 +254,15 @@ impl FullTextSearchFieldIndex {
     }
 
     #[must_use]
-    pub fn additional_columns(&self) -> Vec<String> {
-        self.all_columns()
-            .into_iter()
-            .filter(|name| !self.in_base_cols(name))
-            .collect()
-    }
-
-    fn in_base_cols(&self, name: &String) -> bool {
-        *name == self.field || self.primary_key.contains(name)
-    }
-
-    #[must_use]
     pub fn all_columns(&self) -> Vec<String> {
-        self.search_schema
+        self.reader
+            .schema()
             .fields()
             .filter_map(|(_, f)| {
-                let name = f.name().to_string();
-                if self.in_base_cols(&name) {
-                    Some(name)
-                } else if self
-                    // Filter based on [`self.additional_columns`].
-                    .additional_columns
-                    .as_ref()
-                    .is_some_and(|cols| !cols.contains(&name))
-                {
-                    None
+                if f.is_stored() {
+                    Some(f.name().to_string())
                 } else {
-                    Some(name)
+                    None
                 }
             })
             .collect()
@@ -310,14 +270,15 @@ impl FullTextSearchFieldIndex {
 
     fn query_parser(&self) -> QueryParser {
         let default_field = self
-            .search_schema
+            .reader
+            .schema()
             .find_field(self.field.as_str())
             .map(|(f, _)| vec![f])
             .unwrap_or_default();
         QueryParser::new(
-            self.search_schema.clone(),
+            self.reader.schema().clone(),
             default_field,
-            self.tokenizer_manager.clone(),
+            self.reader.index().tokenizers().clone(),
         )
     }
 
@@ -325,41 +286,12 @@ impl FullTextSearchFieldIndex {
         &self,
         query: String,
         opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
         if !opt_filters.is_empty() {
             return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
         }
-
-        // If search field is explicitly request, must keep in Tantivy response (instead of `value`).
-        let mut keep_search_field = false;
-        let cols = self.all_columns();
-        for proj in addition_projection {
-            let is_supported = match proj {
-                Expr::Identifier(Ident { value, .. }) => {
-                    if *value == self.field {
-                        keep_search_field = true;
-                    }
-                    cols.contains(value)
-                }
-                _ => false,
-            };
-            if !is_supported {
-                return Err(Error::UnsupportedAdditionalColumnsError)
-                    .context(GenerationTextSearchSnafu)?;
-            }
-        }
-
-        for pk in &self.primary_key {
-            // keep the field if it is part of the primary key
-            if pk == &self.field {
-                keep_search_field = true;
-                break;
-            }
-        }
-
-        let strm = make_stream(self.clone(), query, keep_search_field, limit);
+        let strm = make_stream(self.clone(), query, limit);
         let mut strm = Box::pin(strm.peekable());
         let schema = match strm.as_mut().peek().await {
             None => Arc::new(Schema::empty()),
@@ -374,11 +306,9 @@ impl FullTextSearchFieldIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
-    /// If `keep_search_field`, `self.field` will be kept in result (as well as [`SEARCH_VALUE_COLUMN_NAME`]).
     fn search_query_literal(
         &self,
         literal: &str,
-        keep_search_field: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Value>> {
@@ -402,15 +332,13 @@ impl FullTextSearchFieldIndex {
 
                 let mut doc_w_col_names = doc
                     .into_iter()
-                    .map(|(f, v)| (self.search_schema.get_field_name(f), v))
+                    .map(|(f, v)| (self.reader.schema().get_field_name(f), v))
                     .filter(|(name, _)| all_cols.contains(&(*name).to_string()))
                     .collect::<HashMap<_, _>>();
 
                 // Must rename `self.field` -> `SEARCH_VALUE_COLUMN_NAME` for final result.
                 if let Some(value) = doc_w_col_names.remove(self.field.as_str()) {
-                    if keep_search_field {
-                        doc_w_col_names.insert(self.field.as_str(), value.clone());
-                    }
+                    doc_w_col_names.insert(self.field.as_str(), value.clone());
                     doc_w_col_names.insert(SEARCH_VALUE_COLUMN_NAME, value);
                 }
 
@@ -519,38 +447,12 @@ pub struct FullTextSearchCandidate {
 
 #[async_trait]
 impl CandidateGeneration for FullTextSearchCandidate {
-    async fn search(
-        &self,
-        query: String,
-        opt_filters: &[&Expr],
-        addition_projection: &[&Expr],
-        limit: usize,
-    ) -> GenerationResult<SendableRecordBatchStream> {
-        self.inner
-            .search(query, opt_filters, addition_projection, limit)
-            .await
-    }
-
-    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        Ok((0..filters.len()).map(|_| false).collect::<Vec<_>>())
-    }
-
-    /// Whether additional columns of the underlying source can also be retrieved during generation.
-    fn supports_columns(&self, projection: &[&Expr]) -> GenerationResult<Vec<bool>> {
-        let columns = self.inner.all_columns();
-
-        let cols_found = projection
-            .iter()
-            .map(|expr| {
-                if let Expr::Identifier(Ident { value, .. }) = expr {
-                    columns.contains(value) || value == SEARCH_SCORE_COLUMN_NAME
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        Ok(cols_found)
+    fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        Ok(Arc::new(FullTextSearchQuery {
+            index: Arc::clone(&self.inner),
+            query,
+            pre_limit: None,
+        }))
     }
 
     /// Returns the name of the column that is used to derive the value in the [`SEARCH_VALUE_COLUMN_NAME`] column.
@@ -562,7 +464,6 @@ impl CandidateGeneration for FullTextSearchCandidate {
 fn make_stream(
     fts: FullTextSearchFieldIndex,
     query: String,
-    keep_search_field: bool,
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
@@ -571,7 +472,7 @@ fn make_stream(
         while remaining_limit > 0 {
             let limit = min(remaining_limit, DEFAULT_BATCH_SIZE);
             let hits = match fts
-                .search_query_literal(query.as_str(), keep_search_field, limit, offset)
+                .search_query_literal(query.as_str(), limit, offset)
                 .map_err(|e| DataFusionError::Internal(e.to_string())) {
                     Ok(h) => h,
                     Err(e) => {yield Err(e); return}
@@ -613,80 +514,7 @@ pub fn tantivy_to_arrow_type(t: &FieldType) -> Option<arrow::datatypes::DataType
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use datafusion::{execution::SendableRecordBatchStream, physical_plan::common::collect};
-    use serde_json::Value;
-    use tantivy::{
-        Index, IndexWriter, doc,
-        schema::{STORED, Schema, TEXT},
-    };
-
-    use crate::{
-        aggregation::write_to_json_string,
-        generation::{
-            CandidateGeneration, Result as GenerationResult,
-            text_search::{FullTextSearchCandidate, FullTextSearchFieldIndex, parse_query_literal},
-        },
-    };
-
-    pub(crate) fn normalise_result(value: &mut serde_json::Value) {
-        if let Value::Array(vv) = value {
-            for v in vv {
-                if let Value::Object(obj) = v {
-                    obj.sort_keys();
-                    if let Some(Value::Number(n)) = obj.get("score")
-                        && let Some(score) = n.as_f64()
-                        && let Some(truncated_score) =
-                            serde_json::Number::from_f64((1000.0 * score).trunc() / 1000.0)
-                    // Keep 2 decimals
-                    {
-                        obj.insert("score".to_string(), Value::Number(truncated_score));
-                    }
-                }
-            }
-        }
-    }
-
-    // Keep in sync with `crate::generation::post_apply::tests::create_table_provider`.
-    pub(crate) fn create_basic_index() -> Index {
-        let mut schema_builder = Schema::builder();
-        let title = schema_builder.add_text_field("title", TEXT | STORED);
-        let body = schema_builder.add_text_field("body", TEXT | STORED);
-        let schema = schema_builder.build();
-
-        let index = Index::create_in_ram(schema);
-        let mut index_writer: IndexWriter = index
-            .writer(15_000_000) // cannot be less than 15_000_000 for in memory
-            .expect("Failed to make index writer");
-        index_writer.add_document(doc!(
-            title => "The Old Man and the Sea",
-            body => "He was an old man who fished alone in a skiff in the Gulf Stream and he had gone \
-              eighty-four days now without taking a fish.",
-        )).expect("failed to add document");
-
-        index_writer.add_document(doc!(
-        title => "Of Mice and Men",
-        body => "A few miles south of Soledad, the Salinas River drops in close to the hillside \
-                bank and runs deep and green. The water is warm too, for it has slipped twinkling \
-                over the yellow sands in the sunlight before reaching the narrow pool. On one \
-                side of the river the golden foothill slopes curve up to the strong and rocky \
-                Gabilan Mountains, but on the valley side the water is lined with fish and trees—willows \
-                fresh and green with every spring, carrying in their lower leaf junctures the \
-                debris of the winter’s flooding; and sycamores with mottled, white, recumbent \
-                limbs and branches that arch over the pool."
-        )).expect("failed to add document");
-
-        index_writer.add_document(doc!(
-        title => "Frankenstein",
-        body => "You will rejoice to hear that no disaster has accompanied the commencement of an \
-                 enterprise which you have regarded with such evil forebodings.  I arrived here \
-                 yesterday, and my first task is to assure my dear sister of my welfare and \
-                 increasing confidence in the success of getting fish."
-        )).expect("failed to add document");
-
-        index_writer.commit().expect("failed to commit documents");
-
-        index
-    }
+    use crate::generation::text_search::parse_query_literal;
 
     #[test]
     fn test_parse_query_literal() {
@@ -700,42 +528,5 @@ pub(crate) mod tests {
             "operators",
             parse_query_literal("How much (in USD) don't I get?")
         );
-    }
-
-    #[tokio::test]
-    async fn test_basic_index() {
-        let fts = FullTextSearchFieldIndex::try_new(
-            &create_basic_index(),
-            "body".to_string(),
-            vec![],
-            None,
-        )
-        .expect("failed to create FullTextSearch");
-
-        let candidate: FullTextSearchCandidate = fts.into();
-
-        let rb_as_value = validate_result(candidate.search("fish".into(), &[], &[], 3).await).await;
-
-        insta::assert_json_snapshot!(rb_as_value);
-    }
-
-    /// Validates the result of a search operation by collecting the [`RecordBatch`] results into a JSON value.
-    pub(crate) async fn validate_result(
-        output: GenerationResult<SendableRecordBatchStream>,
-    ) -> Value {
-        let output = output.expect("failed to execute search");
-        let rbs = collect(output)
-            .await
-            .expect("failed to collect search results");
-
-        let rb_json =
-            write_to_json_string(rbs.as_slice()).expect("failed to write RecordBatch to JSON");
-
-        let mut rb_as_value = serde_json::from_str::<serde_json::Value>(&rb_json)
-            .expect("failed to parse JSON string");
-
-        normalise_result(&mut rb_as_value);
-
-        rb_as_value
     }
 }

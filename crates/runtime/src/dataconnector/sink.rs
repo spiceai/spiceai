@@ -20,10 +20,13 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, acceleration::RefreshMode};
+use crate::{
+    component::dataset::{Dataset, acceleration::RefreshMode},
+    register_data_connector,
+};
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints},
+    common::{Constraint, Constraints, project_schema},
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, dml::InsertOp},
@@ -153,11 +156,14 @@ impl TableProvider for SinkConnector {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 
     async fn insert_into(
@@ -220,3 +226,5 @@ impl DisplayAs for SinkDataSink {
         write!(f, "SinkDataSink")
     }
 }
+
+register_data_connector!("sink", SinkConnectorFactory);

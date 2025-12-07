@@ -65,7 +65,7 @@ impl Scorer for Includes {
     }
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::Includes;

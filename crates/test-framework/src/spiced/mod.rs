@@ -27,7 +27,11 @@ use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
 use tempfile::TempDir;
 
-use crate::{process::Process, utils::wait_until_true};
+use crate::{
+    constants::{FLIGHT_URL, HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
+    process::Process,
+    utils::wait_until_true,
+};
 
 #[derive(Debug, Clone)]
 pub struct SpicedVersion(String);
@@ -44,10 +48,13 @@ impl Display for SpicedVersion {
     }
 }
 
-pub struct SpicedInstance {
-    child: Child,
-    tempdir: TempDir,
-    version: SpicedVersion,
+pub enum SpicedInstance {
+    Existing,
+    Owned {
+        child: Child,
+        tempdir: TempDir,
+        version: SpicedVersion,
+    },
 }
 
 pub struct StartRequest {
@@ -55,6 +62,7 @@ pub struct StartRequest {
     spicepod: SpicepodDefinition,
     tempdir: TempDir,
     data_dir: Option<PathBuf>,
+    additional_args: Vec<String>,
     prepared: bool,
 }
 
@@ -66,12 +74,19 @@ impl StartRequest {
             tempdir: TempDir::new()?,
             prepared: false,
             data_dir: None,
+            additional_args: Vec::new(),
         })
     }
 
     #[must_use]
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
         self.data_dir = Some(data_dir);
+        self
+    }
+
+    #[must_use]
+    pub fn with_additional_args(mut self, args: Vec<String>) -> Self {
+        self.additional_args = args;
         self
     }
 
@@ -84,7 +99,7 @@ impl StartRequest {
         // Serialize spicepod to `spicepod.yaml` in the tempdir
         let spicepod_yaml = serde_yaml::to_string(&self.spicepod)?;
         let spicepod_yaml_path = self.tempdir.path().join("spicepod.yaml");
-        std::fs::write(spicepod_yaml_path.clone(), spicepod_yaml)?;
+        std::fs::write(spicepod_yaml_path, spicepod_yaml)?;
 
         // Create a symlink to the data directory if one is set
         if let Some(data_dir) = &self.data_dir {
@@ -109,6 +124,11 @@ impl StartRequest {
 }
 
 impl SpicedInstance {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::Existing
+    }
+
     /// Start a spiced instance
     ///
     /// # Errors
@@ -119,7 +139,8 @@ impl SpicedInstance {
     pub async fn start(mut start_request: StartRequest) -> Result<Self> {
         // Check if spiced is already running
         let client = reqwest::Client::new();
-        let response = client.get("http://localhost:8090/health").send().await;
+        let health_url = format!("{HTTP_BASE_URL}{HEALTH_ENDPOINT}");
+        let response = client.get(&health_url).send().await;
         if response.is_ok() {
             anyhow::bail!("Spiced instance is already running");
         }
@@ -154,9 +175,15 @@ impl SpicedInstance {
         let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
+
+        // Add any additional arguments
+        for arg in start_request.additional_args {
+            cmd.arg(arg);
+        }
+
         let child = cmd.spawn()?;
 
-        Ok(Self {
+        Ok(Self::Owned {
             child,
             tempdir,
             version: SpicedVersion::new(version),
@@ -165,12 +192,19 @@ impl SpicedInstance {
 
     #[must_use]
     pub fn version(&self) -> &str {
-        self.version.0.as_str()
+        let Self::Owned { version, .. } = self else {
+            return "unknown";
+        };
+
+        version.0.as_str()
     }
 
-    #[must_use]
-    pub fn get_tempdir_path(&self) -> PathBuf {
-        self.tempdir.path().to_path_buf()
+    pub fn get_tempdir_path(&self) -> Result<PathBuf> {
+        let Self::Owned { tempdir, .. } = self else {
+            anyhow::bail!("SpicedInstance is not owned, no tempdir available");
+        };
+
+        Ok(tempdir.path().to_path_buf())
     }
 
     /// Get a spice client for the spiced instance
@@ -194,7 +228,7 @@ impl SpicedInstance {
         }
 
         let spice_client = spice_client
-            .flight_url("http://localhost:50051")
+            .flight_url(FLIGHT_URL)
             .user_agent("spice-test-framework/1.0")
             .build()
             .await
@@ -222,8 +256,9 @@ impl SpicedInstance {
     pub async fn wait_for_ready(&mut self, timeout: Duration) -> Result<()> {
         // Wait for the spiced instance to be ready by polling the `/v1/ready` endpoint
         let client = self.http_client()?;
+        let ready_url = format!("{HTTP_BASE_URL}{READY_ENDPOINT}");
         if !wait_until_true(timeout, || async {
-            let response = client.get("http://localhost:8090/v1/ready").send().await;
+            let response = client.get(&ready_url).send().await;
             match response {
                 Ok(response) => response.status().is_success(),
                 Err(_) => false,
@@ -233,6 +268,11 @@ impl SpicedInstance {
         {
             anyhow::bail!("Spiced instance not ready within {timeout:?}");
         }
+
+        // Give Flight server a moment to finish starting up after HTTP is ready
+        // Flight starts asynchronously and may not be available immediately
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
         Ok(())
     }
 
@@ -240,7 +280,8 @@ impl SpicedInstance {
         let Ok(client) = self.http_client() else {
             return false;
         };
-        let response = client.get("http://localhost:8090/v1/ready").send().await;
+        let ready_url = format!("{HTTP_BASE_URL}{READY_ENDPOINT}");
+        let response = client.get(&ready_url).send().await;
         match response {
             Ok(response) => response.status().is_success(),
             Err(_) => false,
@@ -253,24 +294,28 @@ impl SpicedInstance {
     ///
     /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
+        let Self::Owned { child, .. } = self else {
+            return Ok(());
+        };
+
         #[cfg(not(target_os = "windows"))]
         {
             // Send a SIGTERM to the spiced instance and wait for it to exit
-            let Ok(pid_i32) = self.child.id().try_into() else {
+            let Ok(pid_i32) = child.id().try_into() else {
                 anyhow::bail!("Failed to convert pid to i32");
             };
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid_i32),
                 nix::sys::signal::Signal::SIGTERM,
             )?;
-            self.child.wait()?;
+            child.wait()?;
         }
 
         #[cfg(target_os = "windows")]
         {
             // On Windows, we can use the built-in process termination
-            self.child.kill()?;
-            self.child.wait()?;
+            child.kill()?;
+            child.wait()?;
         }
 
         Ok(())
@@ -278,15 +323,22 @@ impl SpicedInstance {
 
     /// Returns an instance of a `Process` for the spiced instance
     /// This allows tracking the spiced process, without owning the spiced instance
-    #[must_use]
-    pub fn process(&self) -> Process {
-        Process::new(Pid::from_u32(self.child.id()))
+    pub fn process(&self) -> Result<Process> {
+        let Self::Owned { child, .. } = self else {
+            anyhow::bail!("SpicedInstance is not owned, no process available");
+        };
+
+        Ok(Process::new(Pid::from_u32(child.id())))
     }
 }
 
 impl Drop for SpicedInstance {
     fn drop(&mut self) {
-        match self.child.kill() {
+        let Self::Owned { child, .. } = self else {
+            return;
+        };
+
+        match child.kill() {
             Ok(()) => (),
             Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
         }

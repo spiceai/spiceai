@@ -1,0 +1,18 @@
+[package]
+name = "runtime-parameters"
+description = "Runtime parameters management for the workspace."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+itertools.workspace = true
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
+secrecy.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true

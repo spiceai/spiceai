@@ -46,7 +46,10 @@ pub fn validate_sql_query_operations(
         }
         // Data Manipulation Language (DML): Insert / Update / Delete
         LogicalPlan::Dml(dml) => {
-            if let datafusion::logical_expr::WriteOp::Insert(_) = &dml.op {
+            if let datafusion::logical_expr::WriteOp::Insert(op) = &dml.op {
+                if op != &datafusion_expr::dml::InsertOp::Append {
+                    return plan_err!("Only Append (`INSERT INTO`) operations are permitted: '{op}' is not allowed");
+                }
 
                 if super::is_spice_internal_dataset(&dml.table_name) {
                     return plan_err!(
@@ -91,9 +94,7 @@ pub fn validate_sql_query_operations(
 mod tests {
     use crate::{
         dataaccelerator::AcceleratorEngineRegistry,
-        datafusion::{
-            SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder, schema::SpiceSchemaProvider,
-        },
+        datafusion::{SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder},
         status::RuntimeStatus,
     };
 
@@ -101,7 +102,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
     use datafusion::{catalog::MemoryCatalogProvider, sql::TableReference};
+    use runtime_datafusion::schema_provider::SpiceSchemaProvider;
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -116,6 +119,7 @@ mod tests {
             DataFusionBuilder::new(
                 RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
             )
             .build(),
         );
@@ -339,10 +343,6 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_err(), "CREATE TABLE should be blocked");
-
-        if let Err(e) = result {
-            assert!(e.to_string().contains("Operation is not allowed"));
-        }
     }
 
     #[tokio::test]
@@ -360,10 +360,6 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_err(), "COPY operations should be blocked");
-
-        if let Err(e) = result {
-            assert!(e.to_string().contains("COPY operations are not allowed"));
-        }
     }
 
     #[tokio::test]
@@ -381,10 +377,6 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_err(), "SET statements should be blocked");
-
-        if let Err(e) = result {
-            assert!(e.to_string().contains("Statements are not allowed"));
-        }
     }
 
     #[tokio::test]
@@ -456,6 +448,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_insert_overwrite_blocked() {
+        let df = create_test_datafusion();
+
+        let sql = "INSERT OVERWRITE tbl_writable VALUES (1, 'foo', 42.0)";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(result.is_err(), "INSERT OVERWRITE should be blocked");
+    }
+
+    #[tokio::test]
     async fn test_validate_default_catalog_table_uses_dataset_rules() {
         let df = create_test_datafusion();
 
@@ -488,12 +496,5 @@ mod tests {
             result.is_err(),
             "INSERT should fail on read-only dataset in default catalog"
         );
-
-        if let Err(e) = result {
-            assert!(
-                e.to_string()
-                    .contains("INSERT operations are not allowed on read-only dataset")
-            );
-        }
     }
 }

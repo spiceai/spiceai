@@ -33,7 +33,7 @@ use datafusion::{
 /// [`RecordBatch`] results will be ordered by the relevancy score.
 #[derive(Debug)]
 pub struct FullTextSearchQuery {
-    pub index: FullTextSearchFieldIndex,
+    pub index: Arc<FullTextSearchFieldIndex>,
     pub query: String,
 
     /// If Some(N), will only retrieve `N` results from the index. If filters are provided that are
@@ -91,7 +91,7 @@ impl TableProvider for FullTextSearchQuery {
     ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         Ok(Arc::new(
             FullTextSearchExec::try_new(
-                self.index.clone(),
+                &self.index,
                 self.query.clone(),
                 self.schema(),
                 projection,

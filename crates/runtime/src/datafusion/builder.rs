@@ -17,12 +17,20 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
-use crate::status;
+use super::{
+    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
+    SPICE_RUNTIME_SCHEMA,
+};
+#[cfg(feature = "cluster")]
+use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
+use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
+#[cfg(not(windows))]
+use cayenne::optimizer_rules::CayenneJoinRewriter;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -39,16 +47,37 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::sql::federation_analyzer_rule;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use std::sync::LazyLock;
-use tokio::sync::{RwLock as TokioRwLock, Semaphore};
+use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
+use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 
-use super::{
-    DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
-    SPICE_RUNTIME_SCHEMA,
-    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
-    schema::SpiceSchemaProvider,
+#[cfg(feature = "duckdb")]
+use {
+    datafusion_optimizer_rules::logical_plan::duckdb::aggregate_pushdown::DuckDBAggregateLogicalPushdown,
+    datafusion_optimizer_rules::logical_plan::duckdb::planner::DuckDBLogicalExtensionPlanner,
+    datafusion_optimizer_rules::physical_plan::duckdb::aggregate_pushdown::DuckDBAggregatePushdownRewriter,
+    datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
+};
+
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion_optimizer_rules::{
+    logical_plan::{
+        CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
+    },
+    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+};
+use runtime_datafusion::{
+    extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
+    schema_provider::SpiceSchemaProvider,
+};
+use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
+use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
+use spicepod::metric::Metrics;
+use std::sync::LazyLock;
+use tokio::{
+    runtime::Handle,
+    sync::{RwLock as TokioRwLock, Semaphore},
 };
 
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
@@ -76,6 +105,10 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .execution
         .skip_physical_aggregate_schema_check = true;
 
+    // Enabling parquet filter pushdown can improve query performance by applying filters while decoding
+    // https://docs.rs/datafusion/latest/datafusion/config/struct.ParquetOptions.html#structfield.pushdown_filters
+    df_config.options_mut().execution.parquet.pushdown_filters = true;
+
     RwLock::new(df_config)
 });
 
@@ -88,6 +121,12 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
+    spill_compression: Option<SpillCompression>,
+    #[cfg(feature = "cluster")]
+    cluster_config: Arc<ClusterConfig>,
+    metrics: Option<Metrics>,
+    io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -98,10 +137,16 @@ pub(crate) fn get_df_default_config() -> SessionConfig {
 }
 
 impl DataFusionBuilder {
+    /// Creates a new `DataFusionBuilder` with the runtime defaults.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a managed Tokio runtime cannot be created. This indicates a bug in the runtime initialization.
     #[must_use]
     pub fn new(
         status: Arc<status::RuntimeStatus>,
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+        io_runtime: Handle,
     ) -> Self {
         let mut df_config = get_df_default_config()
             .with_information_schema(true)
@@ -119,6 +164,12 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             task_history_enabled: true,
             caching: None,
+            spill_compression: None,
+            #[cfg(feature = "cluster")]
+            cluster_config: Arc::new(ClusterConfig::default()),
+            metrics: None,
+            io_runtime,
+            resource_monitor: None,
         }
     }
 
@@ -134,9 +185,27 @@ impl DataFusionBuilder {
         self
     }
 
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
+        self.cluster_config = config;
+        self
+    }
+
     #[must_use]
     pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
         self.memory_limit = memory_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn spill_compression(mut self, spill_compression: Option<SpiceSpillCompression>) -> Self {
+        self.spill_compression = match spill_compression {
+            Some(SpiceSpillCompression::Zstd) => Some(SpillCompression::Zstd),
+            Some(SpiceSpillCompression::Lz4Frame) => Some(SpillCompression::Lz4Frame),
+            Some(SpiceSpillCompression::Uncompressed) => Some(SpillCompression::Uncompressed),
+            None => None,
+        };
         self
     }
 
@@ -156,27 +225,98 @@ impl DataFusionBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
+    #[expect(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
+        let mut config = self.config;
+
+        if let Some(spill_compression) = self.spill_compression {
+            config = config.with_spill_compression(spill_compression);
+        }
+
         let mut state = SessionStateBuilder::new()
-            .with_config(self.config)
+            .with_config(config)
             .with_default_features()
-            .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
-            .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
-            .with_analyzer_rules(get_analyzer_rules())
-            .build();
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
+            ))
+            .with_runtime_env(runtime_env(
+                self.memory_limit,
+                self.temp_directory.clone(),
+                self.io_runtime.clone(),
+            ))
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        #[cfg(feature = "duckdb")]
+        {
+            let mut physical_optimizers_with_duckdb: Vec<
+                Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+            > = vec![
+                DuckDBAggregatePushdownRewriter::new(),
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            ];
+
+            physical_optimizers_with_duckdb.extend(
+                state
+                    .physical_optimizer_rules()
+                    .clone()
+                    .unwrap_or_else(|| PhysicalOptimizer::new().rules),
+            );
+
+            state = state
+                .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
+                .with_physical_optimizer_rules(physical_optimizers_with_duckdb);
+        }
+
+        state = state
+            .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                Arc::new(Box::new(track_bytes_processed)),
+            )));
+
+        #[cfg(not(windows))]
+        {
+            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+        }
+
+        let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
         }
 
+        if let Err(e) = datafusion_spark::register_all(&mut state) {
+            panic!("Unable to register Spark functions: {e}");
+        }
+
         let ctx = SessionContext::new_with_state(state);
-        ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
+
+        // Add cache invalidation optimizer rule if caching is enabled
+        if let Some(caching) = &self.caching {
+            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
+                Arc::downgrade(caching),
+            )));
+        }
 
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
@@ -240,22 +380,73 @@ impl DataFusionBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             task_history_enabled: self.task_history_enabled,
+            temp_directory: self.temp_directory.clone(),
+            cpu_runtime: OnceLock::new(),
+            io_runtime: self.io_runtime,
+            metrics: self.metrics,
+            resource_monitor: self.resource_monitor,
+            #[cfg(feature = "cluster")]
+            cluster_config: self.cluster_config,
+            #[cfg(feature = "cluster")]
+            scheduler_server: RwLock::new(None),
+            #[cfg(feature = "cluster")]
+            executor: RwLock::new(None),
         }
     }
 }
 
-/// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
-/// as opposed to when underlying federated query engines will execute the query.
-///
-/// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
-#[must_use]
-pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-    vec![
-        Arc::new(federation_analyzer_rule()),
+pub struct AnalyzerRulesBuilder {
+    include_federation: bool,
+    extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+}
+
+impl AnalyzerRulesBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn include_federation(mut self, include: bool) -> Self {
+        self.include_federation = include;
+        self
+    }
+
+    #[must_use]
+    pub fn with_extra_rules(
+        mut self,
+        extra_rules: impl IntoIterator<Item = Arc<dyn AnalyzerRule + Send + Sync>>,
+    ) -> Self {
+        self.extra_rules.extend(extra_rules);
+        self
+    }
+
+    /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
+    /// as opposed to when underlying federated query engines will execute the query.
+    ///
+    /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
+    #[must_use]
+    pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
+        if self.include_federation {
+            rules.push(Arc::new(federation_analyzer_rule()));
+        }
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
-        Arc::new(ResolveGroupingFunction::new()),
-        Arc::new(TypeCoercion::new()),
-    ]
+        rules.extend([
+            Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+        ]);
+        rules.into_iter().chain(self.extra_rules).collect()
+    }
+}
+
+impl Default for AnalyzerRulesBuilder {
+    fn default() -> Self {
+        Self {
+            include_federation: true,
+            extra_rules: vec![],
+        }
+    }
 }
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
@@ -263,6 +454,7 @@ pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
 pub(crate) fn runtime_env(
     memory_limit: Option<u64>,
     temp_directory: Option<String>,
+    io_runtime: Handle,
 ) -> Arc<RuntimeEnv> {
     let disk_manager_builder = if let Some(directory) = temp_directory {
         let mode = DiskManagerMode::Directories(vec![directory.into()]);
@@ -271,7 +463,27 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
+    // If no memory limit is specified, default to 70% of total memory (container-aware)
+    let effective_memory_limit = memory_limit.or_else(|| {
+        let total_memory = crate::resource_monitor::get_total_memory();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let default_limit = (total_memory as f64 * 0.70) as u64;
+
+        tracing::debug!(
+            "No memory limit specified, defaulting to 70% of total memory: {}",
+            {
+                #[expect(clippy::cast_possible_truncation)]
+                util::human_readable_bytes(default_limit as usize)
+            }
+        );
+        Some(default_limit)
+    });
+
+    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
         let limit = if let Ok(limit) = limit.try_into() {
             limit
         } else {
@@ -300,7 +512,7 @@ pub(crate) fn runtime_env(
     };
 
     match RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
         .with_memory_pool(memory_pool)
         .with_disk_manager_builder(disk_manager_builder)
         .build_arc()
@@ -312,13 +524,23 @@ pub(crate) fn runtime_env(
     }
 }
 
+pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+    vec![
+        Arc::new(IndexTableScanExtensionPlanner::new()),
+        Arc::new(FederatedPlanner::new()),
+        Arc::new(CacheInvalidationExtensionPlanner::new()),
+        #[cfg(feature = "duckdb")]
+        DuckDBLogicalExtensionPlanner::new(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::optimizer::Analyzer;
 
     /// Verifies that the default analyzer rules are in the expected order.
     ///
-    /// If this test fails, `DataFusion` has modified the default analyzer rules and `get_analyzer_rules()` should be updated.
+    /// If this test fails, `DataFusion` has modified the default analyzer rules and `AnalyzerRulesBuilder::build()` should be updated.
     #[test]
     fn test_verify_default_analyzer_rules() {
         let default_rules = Analyzer::new().rules;

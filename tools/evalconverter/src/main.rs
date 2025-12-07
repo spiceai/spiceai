@@ -34,7 +34,7 @@ struct Cli {
     verbose: bool,
 }
 
-#[allow(clippy::unnecessary_debug_formatting)]
+#[expect(clippy::unnecessary_debug_formatting)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -136,6 +136,7 @@ fn spicepod_definition(datasets: Vec<Dataset>, evals: Vec<Eval>) -> SpicepodDefi
             .collect(),
         runtime: spicepod::component::runtime::Runtime::default(),
         management: None,
+        snapshots: None,
         extensions: HashMap::default(),
         secrets: Vec::default(),
         metadata: HashMap::default(),

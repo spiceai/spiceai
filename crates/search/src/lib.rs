@@ -20,7 +20,6 @@ use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
 
 use futures::StreamExt;
 pub mod aggregation;
-pub mod chunking;
 pub mod generation;
 pub mod index;
 pub mod metadata;

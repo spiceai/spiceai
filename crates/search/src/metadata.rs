@@ -38,6 +38,14 @@ impl MetadataColumn {
             Self::Filterable(field) | Self::NonFilterable(field) => Arc::clone(field),
         }
     }
+
+    #[must_use]
+    pub fn type_display(&self) -> &'static str {
+        match self {
+            MetadataColumn::Filterable(_) => "filterable",
+            MetadataColumn::NonFilterable(_) => "non-filterable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

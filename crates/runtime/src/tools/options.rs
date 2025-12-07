@@ -51,7 +51,7 @@ impl SpiceToolsOptions {
     pub(crate) fn tools_by_name(&self) -> Vec<&str> {
         match self {
             SpiceToolsOptions::Auto => vec![
-                "document_similarity",
+                "search",
                 "table_schema",
                 "sql",
                 "list_datasets",

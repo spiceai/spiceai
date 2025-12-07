@@ -17,9 +17,17 @@ limitations under the License.
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::{acceleration as spicepod_acceleration, param::Params};
+use spicepod::{
+    acceleration::{self as spicepod_acceleration},
+    param::Params,
+    partitioning::PartitionedBy,
+};
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
+
+#[cfg(feature = "duckdb")]
+use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -32,6 +40,7 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
+    Caching,
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -40,6 +49,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
             spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
             spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
+            spicepod_acceleration::RefreshMode::Caching => RefreshMode::Caching,
         }
     }
 }
@@ -48,7 +58,12 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
 pub enum Mode {
     #[default]
     Memory,
+    /// Open an existing file if it exists, otherwise create a new one.
+    /// This is the default file behavior that preserves data across restarts.
     File,
+    /// Always create a new file, truncating/overwriting any existing file on startup.
+    /// Use this when you want a fresh acceleration on each startup.
+    FileCreate,
 }
 
 impl From<spicepod_acceleration::Mode> for Mode {
@@ -56,6 +71,7 @@ impl From<spicepod_acceleration::Mode> for Mode {
         match mode {
             spicepod_acceleration::Mode::Memory => Mode::Memory,
             spicepod_acceleration::Mode::File => Mode::File,
+            spicepod_acceleration::Mode::FileCreate => Mode::FileCreate,
         }
     }
 }
@@ -65,6 +81,7 @@ impl Display for Mode {
         match self {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
+            Mode::FileCreate => write!(f, "file_create"),
         }
     }
 }
@@ -130,17 +147,24 @@ pub enum Engine {
     Arrow,
     DuckDB,
     PartitionedDuckDB,
+    TableModePartitionedDuckDB,
     Sqlite,
+    Turso,
     PostgreSQL,
+    Cayenne,
 }
 
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+                write!(f, "duckdb")
+            }
             Engine::Sqlite => write!(f, "sqlite"),
+            Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Cayenne => write!(f, "cayenne"),
         }
     }
 }
@@ -153,7 +177,9 @@ impl TryFrom<&str> for Engine {
             "arrow" => Ok(Engine::Arrow),
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
+            "turso" => Ok(Engine::Turso),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "cayenne" | "vortex" => Ok(Engine::Cayenne),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -246,7 +272,7 @@ impl Display for OnConflictBehavior {
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
     pub enabled: bool,
@@ -260,6 +286,10 @@ pub struct Acceleration {
     pub refresh_on_startup: RefreshOnStartup,
 
     pub refresh_check_interval: Option<Duration>,
+
+    pub caching_ttl: Option<Duration>,
+
+    pub caching_stale_while_revalidate_ttl: Option<Duration>,
 
     pub refresh_cron: Option<Arc<str>>,
 
@@ -297,7 +327,9 @@ pub struct Acceleration {
 
     pub disable_federation: bool,
 
-    pub partition_by: Vec<String>,
+    pub partition_by: Vec<PartitionedBy>,
+
+    pub snapshots: SnapshotBehavior,
 }
 
 impl Acceleration {
@@ -320,7 +352,7 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -365,13 +397,19 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine =
-            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
-                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
-                    Engine::PartitionedDuckDB
+        let mut params = acceleration.params.clone();
+
+        let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+        let engine = match Engine::try_from(engine_str)? {
+            #[cfg(feature = "duckdb")]
+            Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                match get_duckdb_partition_mode(&params) {
+                    DuckDBPartitionMode::Tables => Engine::TableModePartitionedDuckDB,
+                    DuckDBPartitionMode::Files => Engine::PartitionedDuckDB,
                 }
-                engine => engine,
-            };
+            }
+            engine => engine,
+        };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(
@@ -389,9 +427,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let mut params = acceleration.params.clone();
-
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
+
+        let caching_ttl = parse_caching_ttl(&mut params)?;
+        let caching_stale_while_revalidate_ttl =
+            parse_caching_stale_while_revalidate_ttl(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
@@ -408,6 +448,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
 
+        // TODO: Add validation for other refresh mode params here if needed.
+
         Ok(Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
@@ -415,6 +457,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
             refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
+            caching_ttl,
+            caching_stale_while_revalidate_ttl,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -440,6 +484,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
+            snapshots: SnapshotBehavior::disabled(),
         })
     }
 }
@@ -452,6 +497,8 @@ impl Default for Acceleration {
             engine: Engine::default(),
             refresh_mode: None,
             refresh_check_interval: None,
+            caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -472,12 +519,13 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
+            snapshots: SnapshotBehavior::Disabled,
         }
     }
 }
 
 /// Returns true if the `query_federation` parameter is set to "disabled".
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<bool, crate::Error> {
     if let Some(params) = params
         && let Some(value) = params.data.remove("query_federation")
@@ -494,6 +542,52 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
         }
     }
     Ok(false)
+}
+
+/// Parse `caching_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_ttl(params: &mut Option<Params>) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_ttl")
+}
+
+/// Parse `caching_stale_while_revalidate_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_while_revalidate_ttl(
+    params: &mut Option<Params>,
+) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_stale_while_revalidate_ttl")
+}
+
+/// Helper to parse a duration parameter from params.
+#[expect(clippy::result_large_err)]
+fn parse_duration_param(
+    params: &mut Option<Params>,
+    param_name: &str,
+) -> Result<Option<Duration>, crate::Error> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove(param_name) else {
+        return Ok(None);
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => {
+            fundu::parse_duration(&s)
+                .map(Some)
+                .map_err(|e| crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: param_name.into(),
+                    },
+                })
+        }
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid '{param_name}' param value: {value:?}. Expected a duration string."
+            )
+            .into(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -523,7 +617,7 @@ mod tests {
             "invalid".to_string(),
         )]));
         let result_invalid = parse_is_query_federation_disabled(&mut Some(params_invalid));
-        assert!(result_invalid.is_err());
+        result_invalid.expect_err("should error parsing query_federation param");
 
         let params_missing = Params::from_string_map(HashMap::new());
         let is_disabled =

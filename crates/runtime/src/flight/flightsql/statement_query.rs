@@ -30,9 +30,9 @@ use crate::{
         to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Get a `FlightInfo` for executing a SQL query.
 pub(crate) async fn get_flight_info(
@@ -83,6 +83,6 @@ pub(crate) async fn do_get(
 
     let mut response =
         Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-    attach_cache_metadata(&mut response, from_cache);
+    attach_cache_metadata(&mut response, from_cache, &context);
     Ok(response)
 }

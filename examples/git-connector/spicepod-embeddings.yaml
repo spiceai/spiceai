@@ -1,0 +1,37 @@
+version: v1beta1
+kind: Spicepod
+name: git-connector-embeddings-example
+
+datasets:
+  # Example: Auto-fetch content for embeddings
+  # Content is automatically fetched when embeddings are configured,
+  # without needing fetch_content parameter
+  - from: git:https://github.com/spiceai/spiceai.git@trunk
+    name: spiceai_docs_with_embeddings
+    description: Documentation files with automatic content fetching for embeddings
+    params:
+      include: 'docs/**/*.md;README.md;*.md'
+    columns:
+      - name: content
+        embeddings:
+          - from: openai
+            model: text-embedding-3-small
+
+  # Example: Auto-fetch content for full-text search
+  - from: git:https://github.com/spiceai/spiceai.git@trunk
+    name: spiceai_docs_with_search
+    description: Documentation files with automatic content fetching for full-text search
+    params:
+      include: 'docs/**/*.md;README.md;*.md'
+    columns:
+      - name: content
+        full_text_search:
+          enabled: true
+
+  # Example: Explicit fetch_content (traditional way)
+  - from: git:https://github.com/spiceai/spiceai.git@trunk
+    name: spiceai_docs_explicit
+    description: Documentation files with explicit content fetching
+    params:
+      include: 'docs/**/*.md;README.md;*.md'
+      fetch_content: 'true'

@@ -29,6 +29,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -173,15 +174,15 @@ spice dataset configure
 		}
 
 		dirPath := fmt.Sprintf("datasets/%s", dataset.Name)
-		err = os.MkdirAll(dirPath, 0766)
+		// Limit dataset configs to the current user to avoid leaking credentials
+		err = os.MkdirAll(dirPath, 0700)
 		if err != nil {
 			slog.Error("creating dataset directory", "error", err)
 			os.Exit(1)
 		}
 
 		filePath := fmt.Sprintf("%s/dataset.yaml", dirPath)
-		err = os.WriteFile(filePath, datasetBytes, 0766)
-		if err != nil {
+		if err := util.WriteSecureFile(filePath, datasetBytes); err != nil {
 			slog.Error(fmt.Sprintf("writing dataset file to %s", filePath), "error", err)
 			os.Exit(1)
 		}
@@ -217,8 +218,7 @@ spice dataset configure
 				os.Exit(1)
 			}
 
-			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
-			if err != nil {
+			if err := util.WriteSecureFile("spicepod.yaml", spicepodBytes); err != nil {
 				slog.Error("writing spicepod.yaml", "error", err)
 				os.Exit(1)
 			}

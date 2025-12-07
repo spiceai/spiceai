@@ -15,59 +15,102 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_app_and_start_request};
-use crate::{args::DatasetTestArgs, wait_test_and_memory};
-use std::time::Duration;
+use crate::{
+    args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper,
+    wait_test_and_memory,
+};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 use test_framework::{
     TestType, anyhow,
+    app::App,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
+    spicepod::acceleration::Mode,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
-    utils::observe_memory,
+    utils::{observe_memory, recursively_get_dir_size},
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
-    let query_set = QuerySet::from(args.query_set.clone());
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::Result<()> {
+    // determine if any dataset has acceleration enabled with a file mode engine
+    if !app.datasets.iter().any(|ds| {
+        ds.acceleration.as_ref().is_some_and(|accel| {
+            matches!(accel.mode, Mode::File | Mode::FileCreate)
+                && accel.enabled
+                && matches!(
+                    accel.engine.as_deref(),
+                    Some("sqlite" | "duckdb" | "cayenne")
+                )
+        })
+    }) {
+        return Ok(());
+    }
 
+    // calculate the total size of all files inside .spice
+    let spice_dir = app_path.join(".spice");
+    let total_size = recursively_get_dir_size(&spice_dir)?;
+
+    println!("Total acceleration size on disk: {total_size} bytes");
+
+    crate::metrics::ACCELERATION_SIZE_BYTES.record(total_size.try_into().unwrap_or_default(), &[]);
+
+    Ok(())
+}
+
+#[expect(clippy::too_many_lines)]
+pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let ready_wait_start = Instant::now();
+
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
+    let ready_wait_duration = ready_wait_start.elapsed();
+    let health_monitor = HealthMonitor::spawn()?;
+
+    // Start metrics scraper if enabled
+    let metrics_scraper = if args.common.scrape_spiced_metrics {
+        Some(MetricsScraper::spawn()?)
+    } else {
+        None
+    };
+
     // baseline run
     println!("Running benchmark test");
 
-    let benchmark_test = SpiceTest::new(
-        app.name.clone(),
+    let (query_set, test_builder) = super::build_test_with_validation(
+        args,
         NotStarted::new()
-            .with_query_set(queries.clone())
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
             .with_validate(args.validate)
             .with_disable_caching(args.disable_caching)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_http_client(args.http_clients),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_explain_plan_snapshot()
-    .with_results_snapshot(snapshot_predicate)
-    .with_progress_bars(!args.common.disable_progress_bars)
-    .start()
-    .await?;
+    )?;
+
+    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+        .with_spiced_instance(spiced_instance)
+        .with_explain_plan_snapshot()
+        .with_results_snapshot(snapshot_predicate)
+        .with_progress_bars(!args.common.disable_progress_bars)
+        .start()
+        .await?;
 
     let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
 
@@ -81,17 +124,19 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let app_name = app.name.clone();
-    let benchmark_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "benchmark_query"),
-        KeyValue::new("name", app_name.clone()),
-        KeyValue::new("spiced_version", spiced_version.clone()),
-        KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("branch_name", metrics.branch_name.clone()),
-        KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
-    ]);
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "benchmark_query"),
+            KeyValue::new("name", app_name.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", metrics.branch_name.clone()),
+            KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
+        ])
+        .build();
 
     let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
@@ -124,22 +169,41 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         crate::metrics::ROW_COUNT.record((*row_count).try_into()?, &attributes);
     }
 
+    crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
-    telemetry.emit().await?;
+    emit_acceleration_size_if_applicable(&app, &spiced_instance.get_tempdir_path()?)?;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
+
+    let health_report = health_monitor.stop().await;
+
+    // Stop and process metrics scraper if enabled
+    super::process_spiced_metrics(metrics_scraper, args.common.metrics, &[]).await;
+
+    telemetry.emit().await?;
+
     spiced_instance.stop()?;
+    let health_report = health_report?;
+    let mut error_messages = Vec::new();
 
     if !test_succeeded {
-        return Err(anyhow::anyhow!(
+        error_messages.push(format!(
             "Benchmark test failed due to failed queries:\n{}",
             failures.join("\n")
         ));
+    }
+
+    if let Some(message) = health_report.failure_message() {
+        error_messages.push(message);
+    }
+
+    if !error_messages.is_empty() {
+        return Err(anyhow::anyhow!(error_messages.join("\n")));
     }
 
     Ok(row_counts)

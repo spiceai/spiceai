@@ -63,4 +63,3 @@ models:
 embeddings:
   - from: huggingface:huggingface.co/intfloat/e5-base-v2
     name: intfloat_e5
-    metadata: {}

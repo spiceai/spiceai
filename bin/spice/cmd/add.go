@@ -137,8 +137,7 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 				os.Exit(1)
 			}
 
-			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
-			if err != nil {
+			if err := util.WriteSecureFile("spicepod.yaml", spicepodBytes); err != nil {
 				slog.Error("writing spicepod.yaml with dependencies", "error", err)
 				os.Exit(1)
 			}

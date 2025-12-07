@@ -41,10 +41,8 @@ use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
-use crate::{
-    model::tool_use::{combine_opt_u32, encode_tool_name},
-    request::{AsyncMarker, RequestContext},
-};
+use crate::model::tool_use::{combine_opt_u32, encode_tool_name};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Clone, Debug)]
 pub enum OpenAIResponsesTools {
@@ -429,7 +427,7 @@ impl Stream for CustomResponseStream {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn make_responses_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -438,7 +436,7 @@ fn make_responses_stream(
     mut s: ResponseStream,
 ) -> ResponseStream {
     let (sender, receiver) = mpsc::channel(100);
-    let sender_clone = sender.clone();
+    let sender_clone = sender;
 
     tokio::spawn(
         request_context

@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use crate::{
-    http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response},
-    request::{AsyncMarker, RequestContext},
-};
+use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
 use async_openai::types::responses::{
     Content, CreateResponse, OutputContent, OutputMessage, Response as OpenAIResponse,
     ResponseCompleted, ResponseEvent, ResponseIncomplete, ResponseStream,
@@ -18,6 +15,7 @@ use axum::{
 };
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::RwLock;

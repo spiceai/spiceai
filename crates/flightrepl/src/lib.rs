@@ -17,9 +17,13 @@ limitations under the License.
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::Display;
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use ansi_term::Colour;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
@@ -124,8 +128,33 @@ async fn send_nsql_request(
         .await
 }
 
-const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
+const SPECIAL_COMMANDS: [&str; 8] = [
+    ".exit",
+    "exit",
+    "quit",
+    "q",
+    ".error",
+    "help",
+    ".clear",
+    ".clear history",
+];
 const PROMPT_COLOR: Colour = Colour::Fixed(8);
+
+/// Set secure permissions (0600) on a file to ensure only the user can read/write it
+#[cfg(unix)]
+fn set_secure_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_secure_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    // On Windows, file permissions work differently
+    // The file is created with user-only access by default
+    Ok(())
+}
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -204,8 +233,8 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::missing_errors_doc)]
+#[expect(clippy::too_many_lines)]
+#[expect(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();
@@ -217,9 +246,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         user_agent = new_agent;
     }
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
-        let tls_root_certificate = std::fs::read(&tls_root_certificate_file).map_err(|e| {
-            format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
-        })?;
+        let tls_root_certificate = tokio::fs::read(&tls_root_certificate_file)
+            .await
+            .map_err(|e| {
+                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
+            })?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
         let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
         if repl_flight_endpoint == "http://localhost:50051" {
@@ -260,12 +291,56 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     let mut rl = Editor::with_config(config)?;
 
+    // Set up persistent history (with graceful fallback)
+    let history_path = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".spice")
+                .join("query_history.txt")
+        });
+
+    if let Some(ref path) = history_path {
+        // Create .spice directory if it doesn't exist
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Warning: Failed to create history directory: {e}. History will not be persisted."
+            );
+        }
+
+        // Load existing history (ignore errors - just means no history file yet)
+        if let Err(e) = rl.load_history(path) {
+            // Most load failures are just "file not found" which is expected on first run
+            // Only show warnings for other error types
+            match e {
+                ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    // File doesn't exist yet, that's fine
+                }
+                _ => {
+                    eprintln!("Warning: Could not load history file: {e}");
+                }
+            }
+        }
+    } else {
+        eprintln!("Warning: Could not determine home directory. History will not be persisted.");
+    }
+
     rl.set_helper(Some(EditorHelper::new(
         Some(client.clone()),
         repl_config.api_key.clone(),
         user_agent.to_string(),
     )));
     if let Some(helper) = rl.helper_mut() {
+        // Perform initial refresh to populate autocomplete immediately with a 2-second timeout
+        let refresh_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), helper.refresh_now()).await;
+        if refresh_result.is_err() {
+            tracing::debug!("Initial autocomplete metadata refresh timed out after 2 seconds");
+        }
+        // Start background refresh task for updates
         helper.start_refreshing(300);
     }
 
@@ -334,6 +409,28 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     }
                     None => println!("No previous error recorded."),
                 }
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".clear" => {
+                // Clear the screen using ANSI escape codes
+                print!("\x1B[H\x1B[2J");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".clear history" => {
+                // Clear the readline history
+                let _ = rl.clear_history();
+                // Save the empty history to file (if path is available)
+                if let Some(ref path) = history_path {
+                    if let Err(e) = rl.save_history(path) {
+                        eprintln!("Warning: Failed to save cleared history: {e}");
+                    } else if let Err(e) = set_secure_permissions(path) {
+                        eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+                    }
+                }
+                println!("Query history cleared.");
+                let _ = std::io::stdout().flush();
                 continue;
             }
             "help" => {
@@ -346,8 +443,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     "{} Show details of the last error",
                     PROMPT_COLOR.paint(".error:")
                 );
+                println!("{} Clear the screen", PROMPT_COLOR.paint(".clear:"));
+                println!(
+                    "{} Clear the query history",
+                    PROMPT_COLOR.paint(".clear history:")
+                );
                 println!("{} Show this help message", PROMPT_COLOR.paint("help:"));
                 println!("\nOther lines will be interpreted as SQL");
+                let _ = std::io::stdout().flush();
                 continue;
             }
             "show tables" | "show tables;" => {
@@ -386,9 +489,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         )
         .await
         {
-            Ok((_, 0, from_cache)) => {
-                println!("No results{}.", if from_cache { " (cached)" } else { "" });
-            }
             Ok((records, total_rows, from_cache)) => {
                 display_records(&records, start_time, total_rows, from_cache)?;
             }
@@ -401,7 +501,17 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     "{} Unexpected Flight error: {e}. Check connection or query syntax.",
                     Colour::Red.paint("Error:")
                 );
+                let _ = std::io::stdout().flush();
             }
+        }
+    }
+
+    // Save history before exiting (if path is available)
+    if let Some(ref path) = history_path {
+        if let Err(e) = rl.save_history(path) {
+            eprintln!("Warning: Failed to save history on exit: {e}");
+        } else if let Err(e) = set_secure_permissions(path) {
+            eprintln!("Warning: Failed to set secure permissions on history file: {e}");
         }
     }
 
@@ -517,6 +627,8 @@ fn display_records(
     let mut limited_records = Vec::new();
     let mut rows_collected = 0;
 
+    let elapsed = start_time.elapsed();
+
     for batch in records {
         if rows_collected >= 500 {
             break;
@@ -540,15 +652,26 @@ fn display_records(
         }
     };
 
-    println!("{pretty_batches}");
+    if total_rows > 0 {
+        println!("{pretty_batches}");
+    } else {
+        println!("No results.");
+    }
 
-    let elapsed = start_time.elapsed();
     if rows_collected == total_rows {
-        println!(
-            "\nTime: {} seconds. {rows_collected} rows{}.",
-            elapsed.as_secs_f64(),
-            if from_cache { " (cached)" } else { "" }
-        );
+        if total_rows == 0 {
+            println!(
+                "\nTime: {} seconds{}.",
+                elapsed.as_secs_f64(),
+                if from_cache { " (cached)" } else { "" }
+            );
+        } else {
+            println!(
+                "\nTime: {} seconds. {rows_collected} rows{}.",
+                elapsed.as_secs_f64(),
+                if from_cache { " (cached)" } else { "" }
+            );
+        }
     } else {
         println!(
             "\nTime: {} seconds. {rows_collected}/{total_rows} rows displayed{}.",
@@ -556,6 +679,7 @@ fn display_records(
             if from_cache { " (cached)" } else { "" }
         );
     }
+    let _ = std::io::stdout().flush();
     Ok(pretty_batches)
 }
 
@@ -621,8 +745,9 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
 }
 
 /// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+/// 280 is 2x 140,the X post length limit.
 fn lines_need_truncation(lines: &[&str]) -> bool {
-    lines.iter().any(|line| line.len() > 120)
+    lines.iter().any(|line| line.len() > 280)
 }
 
 fn display_grpc_error(err: &Status) {
@@ -694,6 +819,7 @@ fn display_grpc_error(err: &Status) {
         "{} {user_err_msg}",
         Colour::Red.paint(format!("{error_type}:"))
     );
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]

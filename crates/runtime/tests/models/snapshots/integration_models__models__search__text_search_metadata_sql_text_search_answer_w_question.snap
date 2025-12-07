@@ -1,0 +1,17 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 525,
+    "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?",
+    "trunc(text_search(qs, Utf8(\"second\"), answer).score,Int64(3))": 6.331
+  },
+  {
+    "id": 772,
+    "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$",
+    "trunc(text_search(qs, Utf8(\"second\"), answer).score,Int64(3))": 6.192
+  }
+]

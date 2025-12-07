@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::Read;
 #[cfg(feature = "postgres-write")]
@@ -78,9 +78,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("db"),
     ParameterSpec::component("sslmode"),
     ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("connection_pool_min_idle")
+        .description("The minimum number of idle connections to keep open in the pool.")
+        .default("1"),
     ParameterSpec::runtime("connection_pool_size")
-        .description("The maximum number of connections created in the connection pool")
-        .default("10"),
+        .description("The maximum number of connections created in the connection pool.")
+        .default("5"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {
@@ -101,10 +104,11 @@ impl DataConnectorFactory for PostgresFactory {
             );
 
             match PostgresConnectionPool::new(param_map).await {
-                Ok(mut pool) => {
-                    if let Some(unsupported_type_action) = params.unsupported_type_action {
-                        pool = pool.with_unsupported_type_action(unsupported_type_action);
-                    }
+                Ok(pool) => {
+                    let unsupported_type_action = params
+                        .unsupported_type_action
+                        .unwrap_or(datafusion_table_providers::UnsupportedTypeAction::String);
+                    let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
@@ -247,3 +251,5 @@ impl DataConnector for Postgres {
         }
     }
 }
+
+register_data_connector!("postgres", PostgresFactory);

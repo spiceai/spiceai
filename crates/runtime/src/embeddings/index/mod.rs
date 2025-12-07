@@ -14,68 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
-
-use arrow_schema::FieldRef;
-
-use datafusion::{logical_expr::LogicalPlan, prelude::Expr};
-
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
-pub(crate) mod scan_table;
-pub use scan_table::VectorScanTableProvider;
-
-// Returns true if the search index table has all requested columns and can handle all filters (i.e. filters pertain to search index columns, even if they must be post-applied in DataFusion).
-pub(super) fn search_index_table_is_sufficient(
-    projection: &[FieldRef],
-    search_index: &LogicalPlan,
-    filters: &[Expr],
-) -> bool {
-    let search_index_columns: HashSet<String> = search_index
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().to_string())
-        .collect();
-
-    let full_projection = search_index_has_full_projection(projection, &search_index_columns);
-    let search_index_filters = search_index_filters(&search_index_columns, filters);
-
-    full_projection && search_index_filters.len() == filters.len()
-}
-
-/// Returns true if the projection (relative to search query table provider) can be handled by the given search index schema.
-pub(super) fn search_index_has_full_projection(
-    projection: &[FieldRef],
-    search_index_columns: &HashSet<String>,
-) -> bool {
-    let columns_requested: HashSet<String> = projection.iter().map(|f| f.name().clone()).collect();
-
-    search_index_columns.is_superset(&columns_requested)
-}
-
-/// Returns all filters that can be handled by the given search index columns.
-///
-/// This does not require that associated [`TableProvider::supports_filters_pushdown`] is
-/// [`TableProviderFilterPushDown::Unsupported`] for all filters, only that the columns
-/// referenced in the filters, are those available in the `search_index_table`.
-pub(super) fn search_index_filters(
-    search_index_columns: &HashSet<String>,
-    filters: &[Expr],
-) -> Vec<Expr> {
-    filters
-        .iter()
-        .filter(|f| {
-            let filter_columns = f
-                .column_refs()
-                .iter()
-                .map(|c| c.name().to_string())
-                .collect::<HashSet<_>>();
-            search_index_columns.is_superset(&filter_columns)
-        })
-        .cloned()
-        .collect()
-}
+pub mod table;
 
 #[cfg(test)]
 pub mod tests {
@@ -103,11 +44,8 @@ pub mod tests {
     };
     use datafusion_expr::{LogicalPlan, TableScan};
     use runtime_datafusion_index::Index;
+    use search::index::VectorIndex;
     use search::{generation::util::append_fields, index::SearchIndex};
-    use search::{
-        index::VectorIndex,
-        metadata::{MetadataColumn, MetadataColumns},
-    };
     use snafu::ResultExt;
 
     use crate::embedding_col;
@@ -239,35 +177,14 @@ pub mod tests {
         embedded_column: String,
         primary_columns: Vec<Field>,
         schema: Schema,
-        metadata: MetadataColumns,
     }
     impl PretendVectorIndex {
         #[must_use]
         pub fn new(embedded_column: String, primary_columns: Vec<Field>, schema: Schema) -> Self {
-            let primary_key_names: Vec<_> =
-                primary_columns.iter().map(|f| f.name().clone()).collect();
-            let cols = schema
-                .fields()
-                .iter()
-                .filter_map(|f| {
-                    if primary_key_names.contains(f.name())
-                        || *f.name() == embedding_col!(embedded_column)
-                    {
-                        return None;
-                    }
-                    if f.metadata().get("filterable") == Some(&"true".to_string()) {
-                        Some(MetadataColumn::Filterable(Arc::clone(f)))
-                    } else {
-                        Some(MetadataColumn::NonFilterable(Arc::clone(f)))
-                    }
-                })
-                .collect::<Vec<_>>();
-
             Self {
                 embedded_column,
                 primary_columns,
                 schema,
-                metadata: MetadataColumns::from(cols),
             }
         }
     }
@@ -285,31 +202,25 @@ pub mod tests {
                 })
                 .unwrap_or_default()
         }
-        fn list_table_provider(
-            &self,
-        ) -> Result<LogicalPlan, Box<dyn std::error::Error + Send + Sync>> {
+        fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
             let mem_table = MemTable::try_new(
                 Arc::new(self.schema.clone()),
                 vec![vec![one_row_default_record_batch_for_schema(&Arc::new(
                     self.schema.clone(),
                 ))]],
-            )
-            .boxed()?;
+            )?;
 
-            Ok(LogicalPlan::TableScan(
-                TableScan::try_new(
-                    "tbl",
-                    Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
-                        mem_table,
-                        "PretendVectorIndex",
-                    ))
-                        as Arc<dyn TableProvider>)),
-                    None,
-                    vec![],
-                    None,
-                )
-                .boxed()?,
-            ))
+            Ok(LogicalPlan::TableScan(TableScan::try_new(
+                "tbl",
+                Arc::new(DefaultTableSource::new(Arc::new(ExplainMemTable::new(
+                    mem_table,
+                    "PretendVectorIndex",
+                ))
+                    as Arc<dyn TableProvider>)),
+                None,
+                vec![],
+                None,
+            )?))
         }
     }
 
@@ -341,10 +252,6 @@ pub mod tests {
 
         fn primary_fields(&self) -> Vec<Field> {
             self.primary_columns.clone()
-        }
-
-        fn metadata_columns(&self) -> &MetadataColumns {
-            &self.metadata
         }
 
         async fn write(
@@ -406,7 +313,7 @@ pub mod tests {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
         clippy::missing_panics_doc
@@ -432,7 +339,7 @@ pub mod tests {
                     *length,
                 );
                 Arc::new(FixedSizeListArray::from(
-                    ArrayData::builder(list_data_type.clone())
+                    ArrayData::builder(list_data_type)
                         .len(1)
                         .add_child_data(
                             ArrayData::builder(DataType::Float32)
@@ -454,7 +361,7 @@ pub mod tests {
     }
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     #[must_use]
     pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema

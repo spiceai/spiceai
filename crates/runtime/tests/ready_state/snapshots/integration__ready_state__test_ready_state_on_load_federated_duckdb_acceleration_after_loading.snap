@@ -5,13 +5,12 @@ expression: explain_str
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                               |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                                                                                                                 |
-|               |   Federated                                                                                                                                        |
+| logical_plan  | Federated                                                                                                                                          |
 |               |  Projection: federated_on_load_duckdb.id                                                                                                           |
 |               |   TableScan: federated_on_load_duckdb projection=[id]                                                                                              |
-| physical_plan | BytesProcessedExec                                                                                                                                 |
-|               |   SchemaCastScanExec                                                                                                                               |
-|               |     CooperativeExec                                                                                                                                |
+| physical_plan | SchemaCastScanExec                                                                                                                                 |
+|               |   CooperativeExec                                                                                                                                  |
+|               |     BytesProcessedExec                                                                                                                             |
 |               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "federated_on_load_duckdb"."id" FROM "federated_on_load_duckdb" |
 |               |                                                                                                                                                    |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+

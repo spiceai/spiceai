@@ -30,11 +30,11 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::request::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,

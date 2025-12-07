@@ -413,6 +413,7 @@ mod test {
         catalog::MemorySchemaProvider, catalog::SchemaProvider, datasource::MemTable,
     };
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     async fn test_register_dataset_with_schema() {
@@ -436,7 +437,10 @@ mod test {
 
         let monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
 
-        assert!(monitor.register_dataset(&dataset).await.is_ok());
+        monitor
+            .register_dataset(&dataset)
+            .await
+            .expect("should register dataset");
 
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }
@@ -445,7 +449,12 @@ mod test {
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     ) -> Arc<DataFusion> {
         let df = Arc::new(
-            DataFusion::builder(RuntimeStatus::new(), accelerator_engine_registry).build(),
+            DataFusion::builder(
+                RuntimeStatus::new(),
+                accelerator_engine_registry,
+                Handle::current(),
+            )
+            .build(),
         );
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");

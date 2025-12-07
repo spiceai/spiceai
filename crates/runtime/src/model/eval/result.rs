@@ -106,7 +106,7 @@ impl ResultBuilder {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         id: &EvalRunId,

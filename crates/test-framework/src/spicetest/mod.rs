@@ -24,7 +24,7 @@ use crate::spiced::SpicedInstance;
 pub mod append;
 pub mod datasets;
 pub mod http;
-pub mod vector_search;
+pub mod search;
 
 pub trait TestState {}
 pub trait TestNotStarted: TestState {}

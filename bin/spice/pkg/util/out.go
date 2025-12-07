@@ -27,7 +27,37 @@ import (
 
 	"github.com/gocarina/gocsv"
 	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/tw"
 )
+
+var (
+	borderlessRendition = tw.Rendition{
+		Borders: tw.BorderNone,
+		Symbols: tw.NewSymbols(tw.StyleNone),
+		Settings: tw.Settings{
+			Lines:      tw.LinesNone,
+			Separators: tw.SeparatorsNone,
+		},
+	}
+	compactPadding = tw.Padding{
+		Left:      "",
+		Right:     " ",
+		Overwrite: true,
+	}
+)
+
+func newBorderlessTable(writer io.Writer) *tablewriter.Table {
+	return tablewriter.NewTable(
+		writer,
+		tablewriter.WithHeaderAlignment(tw.AlignLeft),
+		tablewriter.WithHeaderAutoFormat(tw.On),
+		tablewriter.WithRowAlignment(tw.AlignLeft),
+		tablewriter.WithRowAutoWrap(tw.WrapTruncate),
+		tablewriter.WithTrimSpace(tw.Off),
+		tablewriter.WithPadding(compactPadding),
+		tablewriter.WithRendition(borderlessRendition),
+	)
+}
 
 func ShowSpinner(done chan bool) {
 	chars := []rune{'⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'}
@@ -53,26 +83,21 @@ func WriteTable(items []interface{}) {
 	// Get all headers dynamically, flattening embedded fields
 	headers := getFlattenedHeaders(reflect.TypeOf(items[0]))
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader(headers)
-	table.SetAutoWrapText(false)
-	table.SetAutoFormatHeaders(true)
-	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetCenterSeparator("")
-	table.SetColumnSeparator("")
-	table.SetRowSeparator("")
-	table.SetHeaderLine(false)
-	table.SetTablePadding(" ")
-	table.SetNoWhiteSpace(true)
+	table := newBorderlessTable(os.Stdout)
+	table.Header(headers)
 
 	// Process each item
 	for _, item := range items {
 		row := getFlattenedValues(reflect.ValueOf(item))
-		table.Append(row)
+		if err := table.Append(row); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to append row: %v\n", err)
+			return
+		}
 	}
 
-	table.Render()
+	if err := table.Render(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to render table: %v\n", err)
+	}
 }
 
 // Recursively extracts flattened headers
@@ -109,15 +134,7 @@ func MarshalAndPrintTable(writer io.Writer, in interface{}) error {
 		return err
 	}
 
-	table := tablewriter.NewWriter(writer)
-	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
-	table.SetAlignment(tablewriter.ALIGN_LEFT)
-	table.SetBorder(false)
-	table.SetHeaderLine(false)
-	table.SetRowLine(false)
-	table.SetCenterSeparator("")
-	table.SetRowSeparator("")
-	table.SetColumnSeparator("")
+	table := newBorderlessTable(writer)
 	scanner := bufio.NewScanner(strings.NewReader(csvContent))
 	header := true
 
@@ -125,13 +142,18 @@ func MarshalAndPrintTable(writer io.Writer, in interface{}) error {
 		text := strings.Split(scanner.Text(), ",")
 
 		if header {
-			table.SetHeader(text)
+			table.Header(text)
 			header = false
 		} else {
-			table.Append(text)
+			if err := table.Append(text); err != nil {
+				return err
+			}
 		}
 	}
 
-	table.Render()
-	return nil
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return table.Render()
 }

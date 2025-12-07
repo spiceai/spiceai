@@ -17,9 +17,9 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::{TestType, queries::QuerySet};
+use test_framework::TestType;
 
-use super::dataset::QueryOverridesArg;
+use super::dataset::{QueryOverridesArg, QuerySetArg};
 
 use super::HttpTestArgs;
 
@@ -44,9 +44,6 @@ pub struct DispatchArgs {
 
     #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
-
-    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
-    pub(crate) validate: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -54,6 +51,7 @@ pub enum Workflow {
     Bench,
     Throughput,
     Load,
+    Append,
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
@@ -65,6 +63,7 @@ impl From<Workflow> for TestType {
             Workflow::Bench => TestType::Benchmark,
             Workflow::Throughput => TestType::Throughput,
             Workflow::Load => TestType::Load,
+            Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
             Workflow::HttpConsistency => TestType::HttpConsistency,
             Workflow::HttpOverhead => TestType::HttpOverhead,
@@ -86,6 +85,7 @@ pub struct DispatchTests {
     pub bench: Option<BenchArgs>,
     pub throughput: Option<BenchArgs>,
     pub load: Option<LoadArgs>,
+    pub append: Option<AppendArgs>,
     pub http_consistency: Option<HttpConsistencyArgs>,
     pub http_overhead: Option<HttpOverheadArgs>,
 }
@@ -94,7 +94,7 @@ pub struct DispatchTests {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
-    pub query_set: QuerySet,
+    pub query_set: QuerySetArg,
     pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
@@ -107,10 +107,12 @@ pub struct BenchArgs {
         serialize_with = "serialize_scale_factor"
     )]
     pub scale_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrape_spiced_metrics: Option<bool>,
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::ref_option)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::ref_option)]
 fn serialize_scale_factor<S>(x: &Option<f64>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -134,12 +136,6 @@ impl BenchArgs {
         self.update_snapshots = Some(update_snapshots);
         self
     }
-
-    #[must_use]
-    pub fn with_validate(mut self, validate: bool) -> Self {
-        self.validate_results = Some(validate);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -160,11 +156,54 @@ impl From<bool> for UpdateSnapshots {
 }
 
 /// Load workflow arguments, defined in the test files
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
     pub duration: Option<u64>,
+}
+
+/// Append workflow arguments, defined in the test files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendArgs {
+    pub spicepod_path: PathBuf,
+    pub query_set: QuerySetArg,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_overrides: Option<QueryOverridesArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_steps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_conflict_data: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for LoadArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct LoadArgsHelper {
+            #[serde(flatten)]
+            bench_args: BenchArgs,
+            duration: Option<u64>,
+        }
+
+        let mut helper = LoadArgsHelper::deserialize(deserializer)?;
+
+        // Default scrape_spiced_metrics to true for load tests if not specified
+        if helper.bench_args.scrape_spiced_metrics.is_none() {
+            helper.bench_args.scrape_spiced_metrics = Some(true);
+        }
+
+        Ok(LoadArgs {
+            bench_args: helper.bench_args,
+            duration: helper.duration,
+        })
+    }
 }
 
 /// Represents the type of runner to use in the action

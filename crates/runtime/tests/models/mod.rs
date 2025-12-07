@@ -19,11 +19,15 @@ use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{Client, header::HeaderMap};
-use runtime::{Runtime, config::Config, get_params_with_secrets};
+use runtime::{Runtime, config::Config};
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::{
+    component::{dataset::Dataset, view::View},
+    param::Params,
+};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -31,6 +35,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+mod ai_udf;
 mod bedrock;
 mod embedding;
 mod hf;
@@ -48,7 +53,7 @@ mod nsql {
         HeaderMap, HeaderValue,
         header::{ACCEPT, CONTENT_TYPE},
     };
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     use crate::models::http_post;
 
@@ -60,7 +65,7 @@ mod nsql {
     pub async fn run_nsql_test(
         base_url: &str,
         ts: &TestCase,
-        trace_provider: &TracerProvider,
+        trace_provider: &SdkTracerProvider,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Running test cases {}", ts.name);
         let task_start_time = std::time::SystemTime::now();
@@ -204,6 +209,17 @@ pub fn get_mega_science_dataset(
     question_column: Option<spicepod::semantic::Column>,
     answer_column: Option<spicepod::semantic::Column>,
 ) -> Dataset {
+    let mut dataset = mega_science_dataset(spice_name, true);
+
+    dataset.columns = [question_column, answer_column]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    dataset
+}
+
+fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
     let mut dataset = Dataset::new(
         // Can use this to run efficiently, locally:
         // "file:../../data/mega-science-small.jsonl",
@@ -215,17 +231,70 @@ pub fn get_mega_science_dataset(
             .into_iter()
             .collect(),
     ));
+
     dataset.acceleration = Some(Acceleration {
+        enabled: accelerate,
+        ..Default::default()
+    });
+
+    dataset
+}
+
+// This dataset view is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
+//  - Any `question` or `answer` > 256 characters is removed.
+//  - An arbitrary but unique `id` integer column is added.
+//
+// ```sql
+//   SELECT *
+//   FROM (
+//      SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'
+//   ) v1
+//   INNER JOIN (
+//     SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'
+//   ) v2
+//   ON v1.id = v2.id
+//   UNION ALL (
+//     SELECT id, question, answer, reference_answer, source, subject FROM mega_science_ds where subject='math'
+//   )
+// ```
+pub fn get_mega_science_view(
+    spice_name: Option<&str>,
+    question_column: Option<spicepod::semantic::Column>,
+    answer_column: Option<spicepod::semantic::Column>,
+) -> (Dataset, Vec<View>) {
+    let ds = mega_science_dataset(Some("mega_science_ds"), false);
+
+    let mut v1 = View::new("v1".to_string());
+    v1.sql = Some(
+        "SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'"
+            .to_string(),
+    );
+
+    let mut v2 = View::new("v2".to_string());
+    v2.sql = Some(
+        "SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'".to_string(),
+    );
+    v2.acceleration = Some(Acceleration {
         enabled: true,
         ..Default::default()
     });
 
-    dataset.columns = [question_column, answer_column]
+    let mut v3 = View::new("v3".to_string());
+    v3.sql = Some("SELECT * FROM mega_science_ds where subject='math'".to_string());
+
+    let mut v = View::new(spice_name.unwrap_or("megascience").to_string());
+    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT id, question, reference_answer, answer, source, subject FROM v3)".to_string());
+
+    v.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    v.columns = [question_column, answer_column]
         .into_iter()
         .flatten()
         .collect();
 
-    dataset
+    (ds, vec![v1, v2, v3, v])
 }
 
 pub fn get_tpcds_dataset(
@@ -495,7 +564,7 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
     let data = rt
         .datafusion()
@@ -540,4 +609,48 @@ async fn get_params_with_secrets_value(
         .collect::<HashMap<_, _>>();
 
     get_params_with_secrets(rt.secrets(), &params).await
+}
+
+pub(crate) fn get_anthropic_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model =
+        spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
+    model.params.insert(
+        "anthropic_api_key".to_string(),
+        "${ secrets:SPICE_ANTHROPIC_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_xai_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(format!("xai:{}", model.into()), name);
+    model.params.insert(
+        "xai_api_key".to_string(),
+        "${ secrets:SPICE_XAI_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_local_model(
+    hf_model: impl Into<String>,
+    model_type: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(
+        format!("huggingface:huggingface.co/{}", hf_model.into()),
+        name,
+    );
+    model
+        .params
+        .insert("model_type".to_string(), model_type.into().into());
+    model
+        .params
+        .insert("hf_max_completion_tokens".to_string(), 10.into());
+    // Local models don't require HF token for public models like Phi
+    model
 }

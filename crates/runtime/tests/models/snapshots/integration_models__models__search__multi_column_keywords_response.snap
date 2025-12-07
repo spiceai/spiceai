@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "Since there are 50 equal numbers, each number is equal to \\("
+      },
+      "primary_key": {
+        "id": 507
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "Find the number of groups of 7 in 21."
+      },
+      "primary_key": {
+        "id": 359
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+      },
+      "primary_key": {
+        "id": 470
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "4, 2))^3 \\times 40}\\)"
+      },
+      "primary_key": {
+        "id": 450
+      },
+      "score": 0.01
+    }
+  ]
+}

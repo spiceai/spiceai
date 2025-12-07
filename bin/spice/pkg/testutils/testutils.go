@@ -34,7 +34,8 @@ func EnsureTestSpiceDirectory(t *testing.T) {
 	}
 
 	podsPath := filepath.Join(constants.DotSpice, "pods")
-	err = os.MkdirAll(podsPath, 0766)
+	// Use 0755 (rwxr-xr-x) instead of 0766 to prevent world-writable directories
+	err = os.MkdirAll(podsPath, 0755)
 	if err != nil {
 		t.Error(err)
 		return

@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    fmt::Write as _,
-    hash::{DefaultHasher, Hash as _, Hasher},
-};
+use std::fmt::Write as _;
 
 use arrow_schema::DataType;
 use datafusion::{
@@ -33,6 +30,7 @@ use datafusion::{
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("Failed to determine data type: {source}"))]
     DataTypeError { source: DataFusionError },
@@ -53,10 +51,10 @@ pub enum Error {
 
 pub type ValidationResult = Result<(), Error>;
 
-#[derive(Debug)]
-pub struct PartitionBy {
-    pub expressions_hash: u64,
-    pub expressions: Vec<Expr>,
+#[derive(Clone, PartialEq, PartialOrd, Eq, Debug, Hash)]
+pub struct PartitionedBy {
+    pub name: String,
+    pub expression: Expr,
 }
 
 /// Converts the spicepod `partition_by` list of [`String`]s into [`Expr`]s,
@@ -66,29 +64,25 @@ pub struct PartitionBy {
 /// Returns an error if the `partition_by` expressions could not be parsed or
 /// validated.
 pub fn partition_by_expressions(
-    partition_by: &[String],
+    partitioned_by: &[spicepod::partitioning::PartitionedBy],
     ctx: &SessionContext,
     df_schema: &DFSchema,
-) -> Result<PartitionBy, Error> {
-    let mut hasher = DefaultHasher::new();
-    partition_by.hash(&mut hasher);
-    let expressions_hash = hasher.finish();
-
-    let expressions = partition_by
+) -> Result<Vec<PartitionedBy>, Error> {
+    let partitioned_by = partitioned_by
         .iter()
-        .map(|sql| {
-            let expr = ctx
-                .parse_sql_expr(sql, df_schema)
+        .map(|p| {
+            let expression = ctx
+                .parse_sql_expr(&p.expression, df_schema)
                 .context(ParsingExpressionSnafu)?;
-            PartitionCriteria.validate(&expr, df_schema)?;
-            Ok(expr)
+            PartitionCriteria.validate(&expression, df_schema)?;
+            Ok(PartitionedBy {
+                name: p.name.clone(),
+                expression,
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(PartitionBy {
-        expressions_hash,
-        expressions,
-    })
+    Ok(partitioned_by)
 }
 
 /// Validates whether a [`ScalarValue`] can be produced by the given [`Expr`].
@@ -125,7 +119,7 @@ pub trait Criterion: Send + Sync {
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult;
 }
 
-pub struct PartitionCriteria;
+struct PartitionCriteria;
 
 impl PartitionCriteria {
     const CRITERIA: &[&dyn Criterion] = &[
@@ -303,23 +297,30 @@ mod tests {
             )
             .otherwise(lit("other"))
             .expect("expression created");
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Valid: date_trunc('month', date)
         let expr = Expr::ScalarFunction(ScalarFunction {
             func: date_trunc(),
             args: vec![lit("month"), col("date")],
         });
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Invalid: Two columns (a + region)
         let expr = col("a") + col("region");
-        assert!(criterion.validate(&expr, &schema).is_err());
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Literal (no column)
         let expr = lit(42);
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         // Invalid: Alias
         let expr = Expr::Alias(Alias {
             expr: Box::new(col("region")),
@@ -327,15 +328,15 @@ mod tests {
             relation: None,
             metadata: None,
         });
-        assert!(
-            criterion.validate(&expr, &schema).is_err(),
-            "forbidden expression"
-        );
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Non-existent column
         let expr = col("missing");
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         Ok(())
     }
 }

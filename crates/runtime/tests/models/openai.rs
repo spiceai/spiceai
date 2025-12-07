@@ -41,7 +41,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::Value;
@@ -52,12 +52,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[allow(clippy::expect_used)]
 mod nsql {
-
-    use crate::models::nsql::{TestCase, run_nsql_test};
-
     use super::*;
+    use crate::models::nsql::{TestCase, run_nsql_test};
 
     #[tokio::test]
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
@@ -149,7 +146,6 @@ mod nsql {
     }
 }
 
-#[allow(clippy::expect_used)]
 mod search {
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
@@ -220,7 +216,7 @@ mod search {
         .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_search_column_casing() -> Result<(), anyhow::Error> {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
@@ -293,7 +289,6 @@ mod search {
     }
 }
 
-#[allow(clippy::expect_used)]
 mod embeddings {
     use spicepod::component::caching::CacheConfig;
     use std::time::{Duration, Instant};
@@ -923,10 +918,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
             )
             .await;
 
-            let mut desired_tools = tools
-                .iter()
-                .map(|t| t.name().clone())
-                .collect::<HashSet<_>>();
+            let mut desired_tools = tools.iter().map(|t| t.name()).collect::<HashSet<_>>();
             desired_tools.insert(std::borrow::Cow::Borrowed("web_search"));
             desired_tools.insert(std::borrow::Cow::Borrowed("code_interpreter"));
 
@@ -971,10 +963,10 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
+    trace_provider: &SdkTracerProvider,
 ) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
@@ -1045,7 +1037,7 @@ async fn verify_sql_query_chat_completion(
 }
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;

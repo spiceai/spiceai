@@ -16,13 +16,18 @@ build-cli-dev:
 build-runtime:
 	make -C bin/spiced
 
+.PHONY: build-validator
+build-validator:
+	cargo build --release -p spicepod-validator
+
 .PHONY: build
-build: build-cli build-runtime
+build: build-cli build-runtime build-validator
 
 .PHONY: build-dev
 build-dev:
 	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
+	cargo build --profile dev -p spicepod-validator
 
 .PHONY: ci
 ci:
@@ -50,11 +55,11 @@ nextest:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture --skip spiceai_integration_test
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -74,28 +79,75 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
 
 lint-go:
 	go vet ./...
 	golangci-lint run
+
+check-rust-features:
+	cargo check $(CARGO_PROFILE) --no-default-features
+	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
+	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
+	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
+	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
+	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
+	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
+	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
+	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
+	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
+	cargo check $(CARGO_PROFILE) --no-default-features --features dremio
+	cargo check $(CARGO_PROFILE) --no-default-features --features clickhouse
+	cargo check $(CARGO_PROFILE) --no-default-features --features debezium
+	cargo check $(CARGO_PROFILE) --no-default-features --features runtime/openapi
+	cargo check $(CARGO_PROFILE) --no-default-features --features dynamodb
+	cargo check $(CARGO_PROFILE) --no-default-features --features oracle
+	cargo check $(CARGO_PROFILE) --no-default-features --features mongodb
 
 .PHONY: fmt-toml
 fmt-toml:
@@ -134,6 +186,12 @@ install: build
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
+.PHONY: install-dev
+install-dev: build-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
+
 .PHONY: install-with-models
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
@@ -165,15 +223,6 @@ install-cli: build-cli
 install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
-
-################################################################################
-# Target: install-dev                                                          #
-################################################################################
-.PHONY: install-dev
-install-dev: build-dev
-	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev

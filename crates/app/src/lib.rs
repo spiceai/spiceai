@@ -16,8 +16,9 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
@@ -32,6 +33,7 @@ use spicepod::{
         model::Model,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
+        snapshot::Snapshots,
         tool::Tool,
         view::View,
         worker::Worker,
@@ -42,7 +44,7 @@ use util::in_tracing_context;
 
 pub mod runtime;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct App {
     pub name: String,
 
@@ -71,6 +73,8 @@ pub struct App {
     pub runtime: Runtime,
 
     pub management: Option<Management>,
+
+    pub snapshots: Option<Arc<Snapshots>>,
 }
 
 impl App {
@@ -82,6 +86,28 @@ impl App {
             .filter(|d| d.from.starts_with(format!("{prefix}:").as_str()))
             .map(|d| d.name.clone())
             .collect()
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App {
+            name: "DEFAULT".to_string(),
+            secrets: vec![],
+            extensions: HashMap::default(),
+            catalogs: vec![],
+            datasets: vec![],
+            views: vec![],
+            models: vec![],
+            embeddings: vec![],
+            evals: vec![],
+            tools: vec![],
+            workers: vec![],
+            spicepods: vec![],
+            runtime: Runtime::default(),
+            management: None,
+            snapshots: None,
+        }
     }
 }
 
@@ -111,6 +137,7 @@ pub struct AppBuilder {
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
     management: Option<Management>,
+    snapshots: Option<Snapshots>,
 }
 
 impl AppBuilder {
@@ -130,6 +157,7 @@ impl AppBuilder {
             spicepods: vec![],
             runtime: Runtime::default(),
             management: None,
+            snapshots: None,
         }
     }
 
@@ -139,6 +167,9 @@ impl AppBuilder {
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
         self.management.clone_from(&spicepod.management);
+        if let Some(ref snapshot) = spicepod.snapshots {
+            self.snapshots = Some(snapshot.clone());
+        }
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
@@ -266,6 +297,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_snapshots(mut self, snapshots: Snapshots) -> AppBuilder {
+        self.snapshots = Some(snapshots);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
@@ -282,6 +319,7 @@ impl AppBuilder {
             spicepods: self.spicepods,
             runtime: self.runtime,
             management: self.management,
+            snapshots: self.snapshots.map(Arc::new),
         }
     }
 
@@ -293,13 +331,14 @@ impl AppBuilder {
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();
         let runtime = spicepod.runtime.clone();
         let extensions = spicepod.extensions.clone();
         let management = spicepod.management.clone();
+        let snapshots = spicepod.snapshots.clone();
         let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
@@ -396,10 +435,26 @@ impl AppBuilder {
                 });
             }
 
+            if dependent_spicepod.snapshots.is_some() {
+                in_tracing_context(|| {
+                    tracing::warn!(
+                        "Spicepod dependency '{dependency}' has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. '{dependency}' snapshots configuration will be ignored."
+                    );
+                });
+            }
+
             spicepods.push(dependent_spicepod);
         }
 
         spicepods.push(spicepod);
+
+        if snapshots.is_some() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Snapshots configuration is defined. Acceleration snapshots (preview) enabled."
+                );
+            });
+        }
 
         Ok(App {
             name: root_spicepod_name,
@@ -416,6 +471,7 @@ impl AppBuilder {
             spicepods,
             runtime,
             management,
+            snapshots: snapshots.map(Arc::new),
         })
     }
 }

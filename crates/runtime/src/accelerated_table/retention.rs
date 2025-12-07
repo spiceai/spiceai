@@ -26,6 +26,7 @@ use datafusion::{
     prelude::{Expr, SessionContext},
     sql::TableReference,
 };
+use tokio::runtime::Handle;
 
 use crate::{
     accelerated_table::{DataRetentionFilter, Retention, refresh},
@@ -38,14 +39,13 @@ use crate::{
 use runtime_object_store::registry::default_runtime_env;
 
 impl super::AcceleratedTable {
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn start_retention_check(
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
         caching: Option<Arc<Caching>>,
+        io_runtime: Handle,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
@@ -117,7 +117,7 @@ impl super::AcceleratedTable {
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),
-                    default_runtime_env(),
+                    default_runtime_env(io_runtime.clone()),
                 );
 
                 let plan = deleted_table_provider
@@ -233,7 +233,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Create test data with different timestamps (some old, some recent)
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("to get current time")
@@ -302,6 +302,7 @@ mod tests {
                 accelerator.schema(),
             )
             .expect("Failed to parse retention SQL")
+            .delete_expr
         });
 
         let retention = Retention::builder()
@@ -323,6 +324,7 @@ mod tests {
             Arc::clone(&accelerator),
             retention,
             caching,
+            Handle::current(),
         ));
 
         // Wait for retention to run

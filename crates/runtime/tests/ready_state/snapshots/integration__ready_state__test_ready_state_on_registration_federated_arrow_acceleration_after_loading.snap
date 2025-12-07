@@ -2,13 +2,12 @@
 source: crates/runtime/tests/ready_state/mod.rs
 expression: explain_str
 ---
-+---------------+--------------------------------------------------------------+
-| plan_type     | plan                                                         |
-+---------------+--------------------------------------------------------------+
-| logical_plan  | BytesProcessedNode                                           |
-|               |   TableScan: federated_on_registration_arrow projection=[id] |
-| physical_plan | BytesProcessedExec                                           |
-|               |   SchemaCastScanExec                                         |
-|               |     DataSourceExec: partitions=1, partition_sizes=[1]        |
-|               |                                                              |
-+---------------+--------------------------------------------------------------+
++---------------+------------------------------------------------------------+
+| plan_type     | plan                                                       |
++---------------+------------------------------------------------------------+
+| logical_plan  | TableScan: federated_on_registration_arrow projection=[id] |
+| physical_plan | SchemaCastScanExec                                         |
+|               |   BytesProcessedExec                                       |
+|               |     DataSourceExec: partitions=1, partition_sizes=[1]      |
+|               |                                                            |
++---------------+------------------------------------------------------------+

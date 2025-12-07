@@ -35,13 +35,16 @@ on:
 env:
   FORBIDDEN_LICENSE_CHECK: |
     grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   license-check-rust:
     name: Check Rust Licenses
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -49,8 +52,7 @@ jobs:
           os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.18.3 || true
-        # TODO: Unpin cargo-deny version after upgrading to Rust 1.88.0
+        run: cargo install cargo-deny || true
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
@@ -59,15 +61,16 @@ jobs:
     name: Check Golang Licenses
     runs-on: self-hosted
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - name: Install go-licences
         run: go get github.com/google/go-licenses

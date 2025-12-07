@@ -66,7 +66,7 @@ impl<T: InputParameter + Sync + Send + DynClone> ODBCSyncParameter for T {
 dyn_clone::clone_trait_object!(ODBCSyncParameter);
 
 pub type ODBCParameter = Box<dyn ODBCSyncParameter>;
-pub type ODBCDbConnection<'a> = (dyn DbConnection<Connection<'a>, ODBCParameter>);
+pub type ODBCDbConnection<'a> = dyn DbConnection<Connection<'a>, ODBCParameter>;
 pub type ODBCDbConnectionPool<'a> =
     dyn DbConnectionPool<Connection<'a>, ODBCParameter> + Sync + Send;
 
@@ -125,11 +125,26 @@ impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self {
-        ODBCConnection {
-            conn: Arc::new(conn.into()),
-            params: Arc::new(HashMap::new()),
-        }
+    fn new(_: Connection<'a>) -> Self {
+        unimplemented!(
+            "ODBCConnection::new() is not used; use the constructor with parameters instead"
+        )
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "ODBC tables() requires driver-specific implementation".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetSchemas {
+            source: "ODBC schemas() requires driver-specific implementation".into(),
+        })
     }
 
     async fn get_schema(
@@ -147,7 +162,7 @@ where
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         let schema = Arc::new(
-            arrow_schema_from(&mut prepared, false)
+            arrow_schema_from(&mut prepared, None, false)
                 .boxed()
                 .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
         );
@@ -194,10 +209,10 @@ where
             let cxn = handle.block_on(async { conn.lock().await });
 
             let mut prepared = cxn.prepare(&sql)?;
-            let schema = Arc::new(arrow_schema_from(&mut prepared, false)?);
+            let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
-            let mut statement = prepared.into_statement();
+            let mut statement = prepared.into_handle();
 
             bind_parameters(&mut statement, &params)?;
 
@@ -266,16 +281,37 @@ where
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
-        let mut statement = prepared.into_statement();
+        let mut statement = prepared.into_handle();
 
         bind_parameters(&mut statement, params)?;
 
         let row_count = unsafe {
-            statement.execute().unwrap();
-            statement.row_count()
+            if let SqlResult::Error { function } = statement.execute() {
+                return Err(Error::ODBCAPIErrorNoSource {
+                    message: format!("Failed to execute statement: {function}"),
+                }
+                .into());
+            }
+
+            match statement.row_count() {
+                SqlResult::Success(count) | SqlResult::SuccessWithInfo(count) => count,
+                SqlResult::NoData => 0,
+                SqlResult::Error { function } => {
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: format!("Failed to get row count: {function}"),
+                    }
+                    .into());
+                }
+                SqlResult::NeedData | SqlResult::StillExecuting => {
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: "Unexpected SQL state when getting row count".to_string(),
+                    }
+                    .into());
+                }
+            }
         };
 
-        Ok(row_count.unwrap().try_into().context(TryFromSnafu)?)
+        Ok(row_count.try_into().context(TryFromSnafu)?)
     }
 }
 
@@ -367,7 +403,7 @@ mod tests {
         let mut statement = driver_cxn
             .prepare("select * from (select 'hopper' as name, 100 as age) as cats where name = ? and age = ?")
             .expect("Must prepare")
-            .into_statement();
+            .into_handle();
 
         let params: Vec<Box<dyn ODBCSyncParameter>> = vec![
             Box::new("hopper".into_parameter()),

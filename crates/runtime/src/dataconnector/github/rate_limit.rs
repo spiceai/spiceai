@@ -168,13 +168,26 @@ impl RateLimiter for GitHubRateLimiter {
                             tokio::time::sleep(wait_duration).await;
                         }
                     } else {
-                        tracing::debug!(
-                            "GitHub API rate limit status: {}/{} remaining. Reset at {}. Resource: {}",
-                            primary.remaining,
-                            primary.limit,
-                            primary.reset_time,
-                            primary.resource
-                        );
+                        let usage_percent =
+                            (f64::from(primary.used) / f64::from(primary.limit)) * 100.0;
+                        if usage_percent >= 80.0 {
+                            tracing::warn!(
+                                "GitHub API rate limit warning: {}/{} remaining ({:.1}% used). Reset at {}. Resource: {}",
+                                primary.remaining,
+                                primary.limit,
+                                usage_percent,
+                                primary.reset_time,
+                                primary.resource
+                            );
+                        } else {
+                            tracing::trace!(
+                                "GitHub API rate limit status: {}/{} remaining. Reset at {}. Resource: {}",
+                                primary.remaining,
+                                primary.limit,
+                                primary.reset_time,
+                                primary.resource
+                            );
+                        }
                     }
                 }
             }

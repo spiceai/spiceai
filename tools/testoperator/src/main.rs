@@ -19,14 +19,16 @@ use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
+mod health;
 mod metrics;
+mod spiced_metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
     HttpOverheadTestArgs, LoadTestArgs, TestCommands,
 };
 
-use crate::args::VectorSearchTestArgs;
+use crate::args::SearchTestArgs;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -53,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
             | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
             | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::Evals(EvalsTestArgs { common, .. })
-            | TestCommands::VectorSearch(VectorSearchTestArgs { common, .. })
+            | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -65,6 +67,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
         Commands::Run(TestCommands::Bench(args)) => {
             commands::bench::run(&args).await?;
+        }
+        Commands::Run(TestCommands::Query(args)) => {
+            commands::query::run(&args).await?;
         }
         Commands::Run(TestCommands::DataConsistency(args)) => {
             commands::data_consistency::run(&args).await?;
@@ -87,10 +92,13 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "append")]
         Commands::Export(TestCommands::Append(args)) => {
-            commands::env_export(&args.common).await?;
+            commands::env_export(&args.test_args.common).await?;
         }
-        Commands::Run(TestCommands::VectorSearch(args)) => {
-            commands::vector_search::run(&args).await?;
+        Commands::Run(TestCommands::Search(args)) => {
+            commands::search::run(&args).await?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unsupported command"));
         }
     }
 

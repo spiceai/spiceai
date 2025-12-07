@@ -9,46 +9,46 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Choices create costs and benefits."
+        "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
       },
       "primary_key": {
-        "id": 863,
-        "question": "What is created by making a choice?"
+        "id": 1015,
+        "question": "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?"
       },
-      "score": 0.87
+      "score": 0.28
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
       },
       "primary_key": {
-        "id": 6,
-        "question": "<refined question>"
+        "id": 821,
+        "question": "What causes dermatomycosis, and what are some examples of this condition?"
       },
-      "score": 0.82
+      "score": 0.24
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "The Cat does not need to drink, as it obtains sufficient water from its prey."
+        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
       },
       "primary_key": {
-        "id": 438,
-        "question": "How does the Cat obtain water?"
+        "id": 449,
+        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
       },
-      "score": 0.8
+      "score": 0.23
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "A common thermometer operates on the principle that matter usually expands when it absorbs heat energy."
+        "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
       },
       "primary_key": {
-        "id": 1041,
-        "question": "What is the principle behind the operation of a common thermometer?"
+        "id": 1193,
+        "question": "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
       },
-      "score": 0.77
+      "score": 0.2
     }
   ]
 }

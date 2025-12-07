@@ -33,6 +33,14 @@ use snafu::{ResultExt as _, Snafu};
 /// Maximum number of buckets, chosen to support large-scale partitioning while preventing excessive memory usage.
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
 
+/// Compile-time assertion that `MAX_NUM_BUCKETS` does not exceed `i32::MAX`
+#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
+#[allow(unfulfilled_lint_expectations)]
+const _: () = assert!(
+    MAX_NUM_BUCKETS <= i32::MAX as i64,
+    "MAX_NUM_BUCKETS exceeds i32::MAX"
+);
+
 /// Static `RandomState` for deterministic hashing.
 static RANDOM_STATE: LazyLock<RandomState> =
     LazyLock::new(|| RandomState::with_seeds(0x53, 0x50, 0x49, 0x43_45));
@@ -69,7 +77,7 @@ impl From<BucketError> for DataFusionError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct Bucket {
     signature: Signature,
 }
@@ -79,7 +87,7 @@ impl Default for Bucket {
         Self::new()
     }
 }
-
+pub static BUCKET_SCALAR_UDF_NAME: &str = "bucket";
 impl Bucket {
     #[must_use]
     pub fn new() -> Self {
@@ -95,7 +103,7 @@ impl ScalarUDFImpl for Bucket {
     }
 
     fn name(&self) -> &'static str {
-        "bucket"
+        BUCKET_SCALAR_UDF_NAME
     }
 
     fn signature(&self) -> &Signature {
@@ -161,7 +169,6 @@ fn compute_bucket(scalar: &ScalarValue, num_buckets: i64) -> Result<ScalarValue,
     )))
 }
 
-#[allow(clippy::missing_panics_doc)]
 fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array, DataFusionError> {
     let num_buckets = i32::try_from(num_buckets).context(BucketLargerThanTypeSnafu)?;
 
@@ -174,15 +181,12 @@ fn compute_bucket_array(array: &ArrayRef, num_buckets: i64) -> Result<Int32Array
         &hash_array,
         &Int32Array::from_value(num_buckets, array.len()),
         |hash, n| {
-            const _: () = assert!(
-                MAX_NUM_BUCKETS <= i32::MAX as i64,
-                "MAX_NUM_BUCKETS exceeds i32::MAX"
-            );
-            #[allow(clippy::expect_used)]
-            // SAFETY: unwrap is safe because we restrict MAX_NUM_BUCKETS at compile time
-            u64::try_from(n)
-                .and_then(|n| i32::try_from(hash % n))
-                .expect("MAX_NUM_BUCKETS smaller than i32 positive maximum")
+            let Ok(n) = u64::try_from(n).and_then(|n| i32::try_from(hash % n)) else {
+                // MAX_NUM_BUCKETS is checked at compile-time to be less than i32::MAX
+                unreachable!("MAX_NUM_BUCKETS smaller than i32 positive maximum");
+            };
+
+            n
         },
     )?;
 
@@ -196,6 +200,7 @@ mod tests {
     use super::*;
     use arrow::array::StringArray;
     use arrow_schema::Field;
+    use datafusion::config::ConfigOptions;
     use insta::assert_snapshot;
 
     #[test]
@@ -209,6 +214,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         assert_snapshot!("bucket_scalar", result);
@@ -225,6 +231,7 @@ mod tests {
             number_rows: 3,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         assert_snapshot!("bucket_array", result);
@@ -245,6 +252,7 @@ mod tests {
                     number_rows: 1,
                     arg_fields: vec![],
                     return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+                    config_options: Arc::new(ConfigOptions::default()),
                 };
                 udf.invoke_with_args(args)
                     .unwrap_or_else(|_| panic!("invoke UDF {i}"))
@@ -283,6 +291,7 @@ mod tests {
                     number_rows: 3,
                     arg_fields: vec![],
                     return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+                    config_options: Arc::new(ConfigOptions::default()),
                 };
                 udf.invoke_with_args(args)
                     .unwrap_or_else(|_| panic!("invoke UDF {i}"))
@@ -332,9 +341,10 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
-        assert!(result.is_err());
+        result.expect_err("Should fail for invalid num_buckets");
     }
 
     #[test]
@@ -348,9 +358,10 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args);
-        assert!(result.is_err());
+        result.expect_err("Should fail for invalid num_buckets");
     }
 
     #[test]
@@ -364,6 +375,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("null_input", result);
@@ -380,6 +392,7 @@ mod tests {
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("decimal_input", result);
@@ -396,6 +409,7 @@ mod tests {
             number_rows: 0,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("empty_array", result);
@@ -416,6 +430,7 @@ mod tests {
             number_rows: 3,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).expect("invoke udf");
         assert_snapshot!("null_array_input", result);

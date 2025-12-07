@@ -228,6 +228,18 @@ impl Dataset {
 
         Some(primary_keys)
     }
+
+    #[must_use]
+    pub fn metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        if let Some(d) = self.description.as_ref() {
+            metadata.insert("description".to_string(), d.to_string());
+        }
+        for (k, v) in &self.metadata {
+            metadata.insert(k.to_string(), v.to_string());
+        }
+        metadata
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
@@ -333,7 +345,7 @@ struct DatasetDeserializer {
     check_availability: CheckAvailability,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
 
@@ -425,7 +437,6 @@ mod check_availability_tests {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_yaml;

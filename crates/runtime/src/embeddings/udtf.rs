@@ -31,24 +31,31 @@ use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::common::exec_err;
+use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
     datasource::{DefaultTableSource, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::{
-        BinaryExpr, LogicalPlan, Operator, Projection, Sort, SortExpr, TableScan,
-        expr::{Alias, ScalarFunction},
-    },
+    logical_expr::{Operator, SortExpr, expr::ScalarFunction},
     physical_plan::ExecutionPlan,
     prelude::{Expr, lit},
     scalar::ScalarValue,
     sql::TableReference,
 };
 
-use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, SubqueryAlias};
+use datafusion_expr::{
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
+};
+use futures::FutureExt;
 use itertools::Itertools;
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
+use search::generation::CandidateGeneration;
+use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
@@ -57,28 +64,27 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{
-    SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex,
-    provider::SearchQueryProvider,
-};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
-#[cfg(feature = "s3_vectors")]
-use crate::embeddings::index::s3::S3Vector;
-
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::search::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::{
     datafusion::DataFusion,
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    request::{AsyncMarker, RequestContext},
-    search::util::{
-        find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
-        to_column_expr,
-    },
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
+};
+use runtime_request_context::{AsyncMarker, RequestContext};
+
+#[cfg(feature = "s3_vectors")]
+use {
+    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
+    search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector,
+    search::provider::SearchQueryProvider,
 };
 
-use search::chunking::ChunkedSearchIndex;
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
@@ -143,6 +149,25 @@ impl VectorSearchTableFuncArgs {
 pub struct VectorSearchTableFunc {
     // This needs to be a weak reference because the DataFusion instance contains the SessionContext which contains this UDTF.
     df: Weak<DataFusion>,
+
+    // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `DataFusion` implement them.
+    df_ptr: u64,
+
+    explicit_pks: HashMap<TableReference, Vec<String>>,
+}
+
+impl PartialEq for VectorSearchTableFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.df_ptr == other.df_ptr && self.explicit_pks == other.explicit_pks
+    }
+}
+
+impl Eq for VectorSearchTableFunc {}
+
+impl std::hash::Hash for VectorSearchTableFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.df_ptr.hash(state);
+    }
 }
 
 pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> {
@@ -166,8 +191,13 @@ pub fn parse_limit_scalar(scalar: &ScalarValue) -> Result<u64, DataFusionError> 
 
 impl VectorSearchTableFunc {
     #[must_use]
-    pub fn new(df: Weak<DataFusion>) -> Self {
-        Self { df }
+    pub fn new(df: Weak<DataFusion>, explicit_pks: HashMap<TableReference, Vec<String>>) -> Self {
+        let ptr = df.as_ptr().addr() as u64;
+        Self {
+            df,
+            explicit_pks,
+            df_ptr: ptr,
+        }
     }
 
     fn scalar_invocation_error<T>() -> Result<T, DataFusionError> {
@@ -210,6 +240,7 @@ impl VectorSearchTableFunc {
                 "First argument must be a table reference, but got a different expression: {tbl:?}."
             )));
         };
+
         let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
@@ -280,7 +311,9 @@ impl VectorSearchTableFunc {
             }
         };
         Ok(VectorSearchTableFuncArgs {
-            tbl: tbl_ref,
+            tbl: tbl_ref
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .into(),
             query: q.to_string(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
@@ -297,7 +330,19 @@ impl VectorSearchTableFunc {
             find_index_in_table_provider::<S3Vector>(tbl),
             find_index_in_table_provider::<ChunkedSearchIndex>(tbl),
         ) {
-            (_, Some((chunked_index, _))) => chunked_index
+            (Some((vector_index, _)), Some((chunked_index, _))) => {
+                let mut indexes = chunked_index
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
+                    .collect::<Vec<_>>();
+                indexes.extend(
+                    vector_index
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+                indexes
+            }
+            (None, Some((chunked_index, _))) => chunked_index
                 .into_iter()
                 .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
                 .collect::<Vec<_>>(),
@@ -326,12 +371,21 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(SearchQueryProvider::try_from_index(
-            &vector_index,
-            Arc::clone(tbl),
-            args.query.as_str(),
-            args.limit,
-        )?)))
+        Ok(Some(Arc::new(
+            SearchQueryProvider::try_from_index(
+                &vector_index,
+                Arc::clone(tbl),
+                args.query.as_str(),
+                args.limit,
+            )?
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_vector_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
+        )))
     }
 }
 
@@ -346,7 +400,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 
@@ -367,11 +421,36 @@ impl TableFunctionImpl for VectorSearchTableFunc {
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
         if embedding_table_provider.is_chunked(col.as_str()) {
-            return Err(DataFusionError::Plan(format!(
-                "Chunked columns (i.e. '{col}' in '{}') are not yet supported by '{VECTOR_SEARCH_UDTF_NAME}()'",
-                args.tbl.clone()
-            )));
+            let state = df.ctx.state();
+            let Some(embed_udf) = state.scalar_functions().get(EMBED_UDF_NAME) else {
+                return Err(DataFusionError::Plan(format!(
+                    "'{VECTOR_SEARCH_UDTF_NAME}()' requires missing UDF: '{EMBED_UDF_NAME}'",
+                )));
+            };
+
+            // Unsafe: worse case is metric without dimensions.
+            let dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            telemetry::track_vector_search(&dimensions);
+            let pks = self
+                .explicit_pks
+                .get(&args.tbl)
+                .cloned()
+                .or_else(|| get_primary_keys(&table_provider).ok());
+
+            let table = ChunkedNonIndexVectorGeneration::new(
+                &table_provider,
+                &args.tbl,
+                embed_udf,
+                embedding_table_provider
+                    .get_embedding_model_used_by(&col)
+                    .unwrap_or_default(),
+                pks.unwrap_or_default(),
+                &col,
+            )
+            .search(args.query)?;
+            return alias_value_to_match(Arc::clone(&table));
         }
+
         Ok(Arc::new(VectorSearchUDTFProvider {
             args,
             underlying: Arc::clone(&table_provider),
@@ -497,11 +576,10 @@ impl TableProvider for VectorSearchUDTFProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
         telemetry::track_vector_search(&request_context.to_dimensions());
-
-        let (col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
+        let (embed_col, cfg) = self.args.get_column_and_config(&self.embedded_columns)?;
 
         let query_vector = self
-            .vector(&col, &cfg)
+            .vector(&embed_col, &cfg)
             .await
             .map_err(DataFusionError::External)?;
 
@@ -516,13 +594,15 @@ impl TableProvider for VectorSearchUDTFProvider {
         };
 
         // TODO: eventually this will need to be a join on underlying, and auxiliary table.
-        let scan = LogicalPlan::TableScan(TableScan::try_new(
+        let mut scan = LogicalPlanBuilder::scan(
             self.args.tbl.clone(),
             Arc::new(DefaultTableSource::new(Arc::clone(&self.underlying))),
             None,
-            filters.to_vec(),
-            None,
-        )?);
+        )?;
+
+        if let Some(f) = filters.iter().cloned().reduce(Expr::and) {
+            scan = scan.filter(f)?;
+        }
 
         let search_field_index = self
             .schema()
@@ -541,7 +621,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
                 // Check it is in projection
                 if projection.is_none() || projection.is_some_and(|proj| proj.contains(&i)) {
-                    Some(Expr::Column(Column::from_name(f.name())))
+                    Some(ident(f.name()))
                 } else {
                     None
                 }
@@ -549,48 +629,62 @@ impl TableProvider for VectorSearchUDTFProvider {
             .collect();
         let mut base_expr = final_expr.clone();
 
-        base_expr.push(Expr::Alias(Alias {
-            expr: Box::from(Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(lit(1.0)),
+        base_expr.push(
+            binary_expr(
+                lit(1.0),
                 Operator::Minus,
-                Box::new(Expr::ScalarFunction(ScalarFunction {
+                Expr::ScalarFunction(ScalarFunction {
                     func: cosine_distance_udf,
                     args: vec![
-                        Expr::Literal(ScalarValue::FixedSizeList(Arc::new(query_vector)), None),
-                        Expr::Column(Column::from_name(embedding_col!(col))),
+                        lit(ScalarValue::FixedSizeList(Arc::new(query_vector))),
+                        ident(embedding_col!(embed_col)),
                     ],
-                })),
-            ))),
-            relation: None,
-            name: SEARCH_SCORE_COLUMN_NAME.to_string(),
-            metadata: None,
-        }));
+                }),
+            )
+            .alias(SEARCH_SCORE_COLUMN_NAME),
+        );
 
         // only include score in the projection if it is requested.
         // Otherwise, if the query is `SELECT a FROM vector_search(...)`, it will fail because we supplied too many columns in the response!
         if projection.is_none() || projection.is_some_and(|proj| proj.contains(&search_field_index))
         {
-            final_expr.push(Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)));
+            final_expr.push(col(SEARCH_SCORE_COLUMN_NAME));
         }
 
-        let proj = LogicalPlan::Projection(Projection::try_new(base_expr, Arc::new(scan))?);
-        let sort = LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr::new(
+        let final_plan = scan
+            .project(base_expr)?
+            .sort(vec![SortExpr::new(
                 Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)),
                 false,
                 false,
-            )],
-            input: Arc::new(proj),
-            fetch: Some(self.limit_to_use(limit)),
-        });
+            )])?
+            .limit(0, Some(self.limit_to_use(limit)))?
+            // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
+            .alias("tbl")?
+            .project(final_expr)?
+            .build()?;
 
-        // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
-        let score_subquery =
-            LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(sort), "tbl")?);
-
-        let final_proj =
-            LogicalPlan::Projection(Projection::try_new(final_expr, Arc::new(score_subquery))?);
-
-        state.create_physical_plan(&final_proj).await
+        state.create_physical_plan(&final_plan).await
     }
+}
+
+/// Create a new [`TableProvider`] where columns named `value` are aliased to `match`.
+///
+/// This is used in chunked table providers which expose 'value' for [`CandidateGeneration`], but match in [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+fn alias_value_to_match(
+    tbl: Arc<dyn TableProvider>,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    let bldr = LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(tbl)), None)?;
+    let cols = Arc::clone(bldr.schema())
+        .columns()
+        .into_iter()
+        .map(|c| {
+            if c.name() == "value" {
+                Expr::Column(c).alias("match")
+            } else {
+                Expr::Column(c)
+            }
+        })
+        .collect::<Vec<Expr>>();
+    Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
 }

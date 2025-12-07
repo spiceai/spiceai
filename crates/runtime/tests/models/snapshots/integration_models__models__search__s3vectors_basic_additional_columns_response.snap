@@ -8,55 +8,55 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "What is created by making a choice?"
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
       "dataset": "qs",
       "matches": {
-        "answer": "Choices create costs and benefits."
+        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
       },
       "primary_key": {
-        "id": 863
+        "id": 468
       },
-      "score": 0.89
+      "score": 0.54
     },
     {
       "data": {
-        "question": "Write down in simplest form \\( 5a - 2b - 3a + 6b \\)."
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\(\\boxed{2a + 4b}\\)"
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 1316
+        "id": 1277
       },
-      "score": 0.84
+      "score": 0.53
     },
     {
       "data": {
-        "question": "Make \\( x \\) the subject of the formula \\( x - A = E \\)."
+        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\(\\boxed{x = A + E}\\)"
+        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
       "primary_key": {
-        "id": 590
+        "id": 189
       },
-      "score": 0.83
+      "score": 0.53
     },
     {
       "data": {
-        "question": "<refined question>"
+        "question": "What is the fifth root of 32?"
       },
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 6
+        "id": 948
       },
-      "score": 0.83
+      "score": 0.52
     }
   ]
 }

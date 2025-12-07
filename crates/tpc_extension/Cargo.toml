@@ -10,8 +10,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-datafusion.workspace = true
+duckdb.workspace = true
 runtime = { path = "../runtime" }
 snafu.workspace = true
 tracing.workspace = true
-duckdb.workspace = true

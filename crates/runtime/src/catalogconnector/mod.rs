@@ -78,6 +78,9 @@ pub enum Error {
 
     #[snafu(transparent)]
     IcebergSnafu { source: iceberg::Error },
+
+    #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
+    RefreshTaskAlreadyStarted {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -239,7 +242,7 @@ pub async fn get_catalog_provider(
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )
-    .start_refresh(refresh_interval);
+    .start_refresh(refresh_interval)?;
     Ok(Arc::new(provider))
 }
 
@@ -251,13 +254,6 @@ pub struct RefreshingCatalogProvider {
 }
 
 impl RefreshingCatalogProvider {
-    pub fn new_with_refresh(
-        inner: Arc<dyn RefreshableCatalogProvider>,
-        refresh_interval: Duration,
-    ) -> Self {
-        Self::new(inner).start_refresh(Some(refresh_interval))
-    }
-
     fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
         Self {
             inner,
@@ -265,8 +261,11 @@ impl RefreshingCatalogProvider {
         }
     }
 
-    fn start_refresh(mut self, interval: Option<Duration>) -> Self {
-        assert!(self.refresh_task.is_none(), "Refresh task already running");
+    fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
+        if self.refresh_task.is_some() {
+            return Err(Error::RefreshTaskAlreadyStarted {});
+        }
+
         let interval = interval.unwrap_or(Duration::from_secs(60));
         let inner = Arc::clone(&self.inner);
         self.refresh_task = Some(tokio::spawn(async move {
@@ -280,7 +279,7 @@ impl RefreshingCatalogProvider {
                 }
             }
         }));
-        self
+        Ok(self)
     }
 }
 

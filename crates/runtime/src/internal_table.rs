@@ -115,7 +115,7 @@ async fn get_local_table_provider(
     Ok(source_table_provider)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
@@ -153,7 +153,9 @@ pub async fn create_internal_accelerated_table(
         "internal".to_string(),
         accelerated_table_provider,
         refresh,
+        runtime.tokio_io_runtime(),
     );
+    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
 
     builder.retention(retention);
 

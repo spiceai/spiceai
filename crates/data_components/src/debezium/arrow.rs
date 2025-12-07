@@ -179,8 +179,8 @@ pub fn append_value_to_struct_builder(
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::too_many_lines)]
 fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,
@@ -485,7 +485,7 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
         Json::String(s) => convert_string_to_decimal(s),
 
         Json::Object(m) => {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let src_scale =
                 m.get("scale")
                     .context(MissingScaleForVariableScaleDecimalSnafu)?
@@ -639,7 +639,7 @@ mod tests {
         let n: i128 = 1;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, -1);
-        assert!(result.is_err());
+        result.expect_err("Should fail for too low target scale");
     }
 
     #[test]
@@ -647,7 +647,7 @@ mod tests {
         let n: i128 = 1;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, 39);
-        assert!(result.is_err());
+        result.expect_err("Should fail for too high target scale");
     }
 
     #[test]
@@ -655,7 +655,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing scale");
     }
 
     #[test]
@@ -663,14 +663,14 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"scale": "abc", "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for non-integer scale");
     }
 
     #[test]
     fn test_object_missing_value() {
         let input = json!({"scale": 2});
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing value");
     }
 
     #[test]
@@ -678,6 +678,6 @@ mod tests {
         let n: i128 = 12345;
         let input = json!(n); // Not a string or object
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for wrong JSON type");
     }
 }

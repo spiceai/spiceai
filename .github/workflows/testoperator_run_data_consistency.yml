@@ -64,14 +64,40 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Validate spicepod files exist
+        run: |
+          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
+            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
+          if [ ! -f "${{ github.event.inputs.compare_spicepod_path }}" ]; then
+            echo "Error: Compare spicepod file not found at ${{ github.event.inputs.compare_spicepod_path }}"
+            exit 1
+          fi
+          echo "Compare spicepod file found at ${{ github.event.inputs.compare_spicepod_path }}"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepods
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+          spicepod-validator "${{ github.event.inputs.compare_spicepod_path }}"
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -80,6 +106,10 @@ jobs:
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -128,6 +158,8 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
 
       - name: Run the data consistency test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -172,3 +204,5 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}

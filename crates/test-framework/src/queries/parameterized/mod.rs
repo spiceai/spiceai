@@ -47,7 +47,7 @@ impl ParameterValue {
             }
             ParameterValue::Number(value) => Arc::new(arrow::array::Int64Array::from(vec![*value])),
             ParameterValue::Float(value) => {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 let decimal_value = (*value * 1_000_000.0) as i128;
                 Arc::new(arrow::array::Decimal128Array::from(vec![decimal_value]))
             }
@@ -57,7 +57,7 @@ impl ParameterValue {
 
 /// Defines parameters for TPC-H queries. Values are extracted from the original TPC-H queries,
 /// with their values replaced with $1 parameters in the `/parameterized/` TPC-H files.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[must_use]
 pub fn add_tpch_parameters(queries: Vec<Query>) -> Vec<Query> {
     queries

@@ -1,0 +1,5 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+expression: explain_plan
+---
+PartitionMemTableExec: partition_value=us-east-1, filters=[value > Int64(20)]

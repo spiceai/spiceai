@@ -22,7 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::Constraints,
+    common::{Constraints, project_schema},
     datasource::{TableProvider, TableType},
     logical_expr::Expr,
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, empty::EmptyExec},
@@ -91,11 +91,14 @@ impl TableProvider for DeferredConnector {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        Ok(Arc::new(EmptyExec::new(project_schema(
+            &self.schema,
+            projection,
+        )?)))
     }
 }
 

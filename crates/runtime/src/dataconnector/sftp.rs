@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
+use crate::{
+    component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    register_data_connector,
+};
 
 use snafu::prelude::*;
 use std::any::Any;
@@ -113,6 +115,10 @@ impl ListingTableConnector for SFTP {
         &self.params
     }
 
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::current()
+    }
+
     fn get_object_store_url(
         &self,
         dataset: &Dataset,
@@ -136,3 +142,5 @@ impl ListingTableConnector for SFTP {
         Ok(ftp_url)
     }
 }
+
+register_data_connector!("sftp", SFTPFactory);

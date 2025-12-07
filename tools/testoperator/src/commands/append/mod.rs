@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use crate::{
+    args::{AppendTestArgs, QuerySetLoader},
+    health::HealthMonitor,
+    wait_test_and_memory,
+};
 use std::time::Duration;
 use test_framework::{
     TestType,
@@ -32,11 +36,15 @@ use test_framework::{
     utils::observe_memory,
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    let query_set = QuerySet::from(args.query_set.clone());
-    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
+    let query_set = args.test_args.load_query_set()?;
+    let query_overrides = args
+        .test_args
+        .query_overrides
+        .clone()
+        .map(QueryOverrides::from);
 
-    let (app, start_request) = get_app_and_start_request(&args.common).await?;
+    let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
 
     check_app_is_appendable(&app)?;
 
@@ -45,22 +53,27 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let append_test = SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_query_set(query_set, query_overrides)
+            .with_query_set(query_set.clone(), query_overrides)
             .with_parallel_count(1)
-            .with_end_duration(Duration::from_secs(60 * 60))
-            .with_tempdir_path(start_request.get_tempdir_path()),
+            .with_end_duration(Duration::from_secs(args.test_args.common.duration))
+            .with_tempdir_path(start_request.get_tempdir_path())
+            .with_load_interval(Duration::from_secs(args.load_interval))
+            .with_load_steps(args.load_steps)
+            .with_conflict_data(args.with_conflict_data)
+            .with_retention_test_data(args.with_retention_data),
     )
-    .with_progress_bars(false)
+    .with_progress_bars(!args.test_args.common.disable_progress_bars)
     .start_appending()
     .await?;
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
+    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
+        .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+    let health_monitor = HealthMonitor::spawn()?;
 
     let append_test = append_test
         .with_spiced_instance(spiced_instance)
@@ -71,17 +84,24 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let mut spiced_instance = test.end()?;
     let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
-    check_table_counts(
+    let table_count_result = check_table_counts(
         &spiced_instance,
-        query_set,
-        args.scale_factor.unwrap_or(1.0),
+        &query_set,
+        args.test_args.scale_factor.unwrap_or(1.0),
     )
-    .await?;
+    .await;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
+    let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
+    let health_report = health_report?;
+
+    table_count_result?;
+    if let Some(message) = health_report.failure_message() {
+        return Err(anyhow::anyhow!(message));
+    }
     Ok(())
 }
 
@@ -113,7 +133,7 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
 
 async fn check_table_counts(
     spiced: &SpicedInstance,
-    query_set: QuerySet,
+    query_set: &QuerySet,
     scale_factor: f64,
 ) -> anyhow::Result<()> {
     let spice_client = spiced.spice_client(None, false).await?;

@@ -16,12 +16,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    LogErrors, Runtime,
-    accelerated_table::refresh::RefreshOverrides,
-    component::dataset::Dataset,
-    datafusion::request_context_extension::get_current_datafusion,
-    request::{AsyncMarker, RequestContext},
-    status::ComponentStatus,
+    LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
+    datafusion::request_context_extension::get_current_datafusion, status::ComponentStatus,
 };
 use app::App;
 use axum::{
@@ -32,6 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use datafusion::sql::TableReference;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -81,6 +78,7 @@ pub struct DatasetResponseItem {
     pub properties: HashMap<String, serde_json::Value>,
 }
 
+#[expect(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
@@ -439,10 +437,22 @@ pub(crate) async fn acceleration(
 fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
     let mut properties = HashMap::new();
 
+    #[cfg(not(feature = "models"))]
+    let _ = ds;
+
     #[cfg(feature = "models")]
     properties.insert(
         "vector_search".to_string(),
         if ds.has_embeddings() {
+            Value::String("supported".to_string())
+        } else {
+            Value::String("unsupported".to_string())
+        },
+    );
+    #[cfg(feature = "models")]
+    properties.insert(
+        "search".to_string(),
+        if ds.has_embeddings() || ds.has_full_text_column() {
             Value::String("supported".to_string())
         } else {
             Value::String("unsupported".to_string())

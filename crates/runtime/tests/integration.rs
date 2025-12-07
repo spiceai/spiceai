@@ -13,13 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-#![allow(clippy::large_futures)]
-
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
+use std::sync::Arc;
 
+use crate::utils::TEST_REQUEST_CONTEXT;
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
@@ -83,11 +82,16 @@ mod postgres;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
+mod refresh_worker_panic;
 mod results_cache;
+#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
+mod s3_location_pruning;
 #[cfg(feature = "postgres")]
 mod schema_evolution;
+#[cfg(feature = "snapshots")]
+mod snapshot_integration;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "spark")]
@@ -119,6 +123,13 @@ fn configure_test_datafusion() {
 
             config.options_mut().optimizer.repartition_joins = false;
         }
+        _ => panic!("Must obtain write lock to defaults"),
+    }
+}
+
+fn configure_test_datafusion_request_context() {
+    match DEFAULT_DATAFUSION_CONFIG.write() {
+        Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
         _ => panic!("Must obtain write lock to defaults"),
     }
 }

@@ -36,10 +36,11 @@ use crate::{
     component::dataset::Dataset,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
-        parameters::aws::load_config,
+        parameters::aws::initiate_config_with_credentials,
     },
     model::params::concat_arrays,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -113,7 +114,7 @@ impl IcebergDataConnector {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_iceberg_table_provider(
         &self,
         dataset: &Dataset,
@@ -139,7 +140,7 @@ impl IcebergDataConnector {
                     source: Box::new(e),
                 })?;
 
-            let aws_sdk_config = load_config(
+            let aws_sdk_config = initiate_config_with_credentials(
                 "IcebergDataConnector",
                 "s3_region",
                 "s3_access_key_id",
@@ -153,7 +154,9 @@ impl IcebergDataConnector {
                 message: e.to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
-            })?;
+            })?
+            .load()
+            .await;
 
             Some(
                 S3CredentialProvider::from_config(&aws_sdk_config)
@@ -317,3 +320,5 @@ impl DataConnector for IcebergDataConnector {
         Some(self.create_iceberg_table_provider(dataset).await)
     }
 }
+
+register_data_connector!("iceberg", IcebergDataConnectorFactory);

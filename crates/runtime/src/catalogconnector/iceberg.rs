@@ -18,7 +18,7 @@ use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
     component::catalog::Catalog,
-    dataconnector::parameters::{ConnectorParams, aws::load_config},
+    dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
@@ -87,6 +87,10 @@ pub enum Error {
     #[snafu(display("Failed to build catalog: {source}"))]
     #[snafu(visibility(pub(crate)))]
     UnableToBuildCatalog { source: iceberg::Error },
+
+    #[snafu(display("Failed to build catalog client: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalogClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -253,7 +257,6 @@ impl CatalogConnector for IcebergCatalog {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         _runtime: Arc<Runtime>,
@@ -288,7 +291,7 @@ impl CatalogConnector for IcebergCatalog {
                     source: Box::new(e),
                 })?;
 
-            let aws_sdk_config = load_config(
+            let aws_sdk_config = initiate_config_with_credentials(
                 "IcebergCatalogConnector",
                 "s3_region",
                 "s3_access_key_id",
@@ -302,7 +305,9 @@ impl CatalogConnector for IcebergCatalog {
                 message: e.to_string(),
                 connector_component: ConnectorComponent::from(catalog),
                 source: Box::new(e),
-            })?;
+            })?
+            .load()
+            .await;
 
             Some(
                 S3CredentialProvider::from_config(&aws_sdk_config)
@@ -765,11 +770,11 @@ mod tests {
         // should deny unknown schemes, or schemes from warehouses that don't match
         let url = "ftp://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("ftp://my-bucket/my-prefix/warehouse"));
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
 
         let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
         let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
@@ -824,28 +829,27 @@ mod tests {
     fn test_invalid_scheme() {
         let url = "ftp://my.iceberg.com/v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_no_host() {
         let url = "https:///v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_missing_namespace_segment() {
         let url = "https://my.iceberg.com/v1/";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_empty_namespace_segment() {
         let url = "https://my.iceberg.com/v1/namespaces";
         let result = parse_catalog_url(url);
-        assert!(result.is_ok());
         assert!(result.expect("Failed to parse catalog URL").2.is_none());
     }
 

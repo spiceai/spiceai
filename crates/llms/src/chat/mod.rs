@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{path::Path, pin::Pin};
-use tracing::Span;
 use tracing_futures::Instrument;
 
 use async_openai::{
@@ -277,8 +276,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                     .collect();
                 x.join("\n")
             }
-        }
-        .clone(),
+        },
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
@@ -298,7 +296,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         .collect();
                 x.join("\n")
             }
-            None => todo!(),
+            None => unimplemented!("Assistant message with no content is not supported"),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -319,7 +317,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
@@ -338,7 +336,7 @@ pub fn message_to_mistral(
                     either::Either::Left(text.clone())
                 }
                 ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let v = array.iter().map(|p| {
+                    let index_map = array.iter().map(|p| {
                         match p {
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                                 ("content".to_string(), Value::String(t.text.clone()))
@@ -351,8 +349,7 @@ pub fn message_to_mistral(
                             }
                         }
 
-                    }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
+                    }).collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -519,7 +516,7 @@ pub fn message_to_mistral(
             (String::from("role"), Either::Left(String::from("function"))),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default().clone()),
+                Either::Left(content.clone().unwrap_or_default()),
             ),
             ("name".to_string(), Either::Left(name.clone())),
         ]),
@@ -530,33 +527,38 @@ pub fn message_to_mistral(
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        async move {
-            Ok::<Option<String>, OpenAIError>(
-                self.chat_request(
-                    CreateChatCompletionRequestArgs::default()
-                        .messages(vec![
-                            ChatCompletionRequestUserMessageArgs::default()
-                                .content(prompt)
-                                .build()?
-                                .into(),
-                        ])
-                        .build()?,
-                )
-                .instrument(Span::current())
-                .await?
-                .choices
-                .pop()
-                .and_then(|c| c.message.content),
-            )
-        }
-        .instrument(Span::current())
+        // BUG FIX: Remove double .instrument(Span::current()) calls that break span propagation
+        // The outer .instrument is redundant and interferes with parent span context
+        self.chat_request(
+            CreateChatCompletionRequestArgs::default()
+                .messages(vec![
+                    ChatCompletionRequestUserMessageArgs::default()
+                        .content(prompt)
+                        .build()
+                        .map_err(|e| Error::FailedToRunModel {
+                            source: Box::new(e),
+                        })?
+                        .into(),
+                ])
+                .build()
+                .map_err(|e| Error::FailedToRunModel {
+                    source: Box::new(e),
+                })?,
+        )
         .await
-        .boxed()
-        .context(FailedToLoadModelSnafu)
+        .map_err(|e| Error::FailedToRunModel {
+            source: Box::new(e),
+        })
+        .map(|resp| {
+            resp.choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content)
+        })
     }
 
-    /// A basic health check to ensure the model can process future [`Self::run`] requests.
-    /// Default implementation is a basic call to [`Self::run`].
+    /// A basic health check to ensure the model can process future [`Self::run`]
+    /// requests. Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -591,7 +593,6 @@ pub trait Chat: Sync + Send {
         Ok(Box::pin(stream! { yield resp }))
     }
 
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -604,6 +605,8 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
+        // BUG FIX: The stream() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
         let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -620,7 +623,7 @@ pub trait Chat: Sync + Send {
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
@@ -632,6 +635,9 @@ pub trait Chat: Sync + Send {
             .map(message_to_content)
             .collect::<Vec<String>>()
             .join("\n");
+
+        // BUG FIX: The run() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
         let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -687,7 +693,6 @@ pub async fn create_hf_model(
         .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
-#[allow(unused_variables)]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,

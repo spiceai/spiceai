@@ -5,7 +5,7 @@ expression: tools_list
 [
   {
     "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
-    "name": "document_similarity",
+    "name": "search",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -88,7 +88,7 @@ expression: tools_list
   },
   {
     "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
-    "name": "mcp_from_spiced/document_similarity",
+    "name": "mcp_from_spiced/search",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

@@ -9,7 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow = "1"
+anyhow.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
@@ -22,6 +22,8 @@ object_store.workspace = true
 reqwest.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+util.workspace = true
 url.workspace = true
 
 [dev-dependencies]

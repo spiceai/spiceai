@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::graphql::{
     self, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
@@ -22,7 +22,7 @@ use data_components::graphql::{
 use datafusion::datasource::TableProvider;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, sync::Arc, time::Duration};
 use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
@@ -105,6 +105,8 @@ pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Resul
 
     reqwest::Client::builder()
         .user_agent("spice")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .default_headers(headers)
         .build()
 }
@@ -225,3 +227,5 @@ impl DataConnector for GraphQL {
         ))
     }
 }
+
+register_data_connector!("graphql", GraphQLFactory);

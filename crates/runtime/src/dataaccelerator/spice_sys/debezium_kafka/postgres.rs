@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Result};
+use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 
@@ -24,7 +24,7 @@ impl DebeziumKafkaSys {
         pool: &PostgresConnectionPool,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         let create_table = format!(
             "CREATE TABLE IF NOT EXISTS {DEBEZIUM_KAFKA_TABLE_NAME} (
@@ -40,7 +40,7 @@ impl DebeziumKafkaSys {
         conn.conn
             .execute(&create_table, &[])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
@@ -55,9 +55,9 @@ impl DebeziumKafkaSys {
         );
 
         let primary_keys =
-            serde_json::to_string(&metadata.primary_keys).map_err(|e| e.to_string())?;
+            serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
-            serde_json::to_string(&metadata.schema_fields).map_err(|e| e.to_string())?;
+            serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
 
         conn.conn
             .execute(
@@ -71,7 +71,7 @@ impl DebeziumKafkaSys {
                 ],
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }

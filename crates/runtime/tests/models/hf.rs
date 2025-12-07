@@ -185,8 +185,8 @@ mod search {
 
     use super::*;
 
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(clippy::too_many_lines)]
     async fn huggingface_test_search() -> Result<(), anyhow::Error> {
         let app = AppBuilder::new("text-to-sql")
             .with_dataset(item_tpcds_dataset_w_embeddings(

@@ -147,7 +147,7 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                 // Check if this is an empty array case
                 if e.classify() == Category::Syntax {
                     // This likely means we hit an empty array - peek to confirm
-                    if let Ok(b']') = self.peek_next_non_ws_byte() {
+                    if matches!(self.peek_next_non_ws_byte(), Ok(b']')) {
                         // Empty array - consume the closing bracket and mark as EOF
                         self.consume_delimiter()?;
                         self.eof = true;
@@ -473,7 +473,7 @@ impl ArrayToNdjsonPush {
     }
 
     /// Process accumulated buffer data using `serde_json::StreamDeserializer`
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn process_buffer(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
             return Ok(());
@@ -482,7 +482,7 @@ impl ArrayToNdjsonPush {
         // Skip whitespace and consume opening bracket if not done yet
         if matches!(self.state, ParsingState::ExpectingArrayStart) {
             let mut cursor = io::Cursor::new(&self.buffer);
-            if let Ok(()) = skip_ws_until(&mut cursor, b'[') {
+            if matches!(skip_ws_until(&mut cursor, b'['), Ok(())) {
                 let consumed = cursor.position() as usize;
                 if consumed <= self.buffer.len() {
                     self.buffer.drain(..consumed);
@@ -873,7 +873,7 @@ mod tests {
         let cursor = Cursor::new(input);
         let adapter = ArrayToNdjson::try_new(cursor).expect("Test should not fail");
         let result = read_all_lines(adapter);
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing closing bracket");
     }
 
     #[test]
@@ -882,7 +882,7 @@ mod tests {
         let cursor = Cursor::new(input);
         let adapter = ArrayToNdjson::try_new(cursor).expect("Test should not fail");
         let result = read_all_lines(adapter);
-        assert!(result.is_err());
+        result.expect_err("Should fail for malformed JSON element");
     }
 
     #[test]
@@ -1182,7 +1182,7 @@ mod tests {
         }
 
         #[test]
-        #[allow(clippy::format_push_string)]
+        #[expect(clippy::format_push_string)]
         fn test_push_large_number_of_elements() {
             let mut input = String::from("[");
             for i in 0..100 {

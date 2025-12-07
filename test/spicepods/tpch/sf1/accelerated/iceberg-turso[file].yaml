@@ -1,0 +1,54 @@
+version: v1
+kind: Spicepod
+name: iceberg-turso[file]
+
+definitions:
+  - &iceberg_params
+    iceberg_catalog_type: rest
+    iceberg_uri: http://iceberg-rest:8181
+    iceberg_warehouse: demo
+  - &acceleration
+    enabled: true
+    engine: turso
+    mode: file
+
+datasets:
+  - from: iceberg:tpch_sf1.customer
+    name: customer
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.lineitem
+    name: lineitem
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.nation
+    name: nation
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.orders
+    name: orders
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.part
+    name: part
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.partsupp
+    name: partsupp
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.region
+    name: region
+    params: *iceberg_params
+    acceleration: *acceleration
+
+  - from: iceberg:tpch_sf1.supplier
+    name: supplier
+    params: *iceberg_params
+    acceleration: *acceleration

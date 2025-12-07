@@ -15,14 +15,17 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use std::time::Duration;
 use token_provider::{Result, TokenProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -66,8 +69,7 @@ pub struct GitHubAppTokenProvider {
     app_client_id: Arc<str>,
     private_key: Arc<str>,
     installation_id: Arc<str>,
-    tx: watch::Sender<String>,
-    rx: watch::Receiver<String>,
+    rx: watch::Receiver<SecretString>,
     _handle: Arc<JoinHandle<()>>,
 }
 
@@ -83,11 +85,31 @@ impl std::fmt::Debug for GitHubAppTokenProvider {
 
 impl TokenProvider for GitHubAppTokenProvider {
     fn get_token(&self) -> String {
-        self.rx.borrow().clone()
+        self.rx.borrow().expose_secret().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
-        Some(self.tx.subscribe())
+        let mut secret_rx = self.rx.clone();
+        let (tx, rx) = watch::channel(secret_rx.borrow().expose_secret().to_string());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tx.closed() => {
+                        break;
+                    }
+                    changed = secret_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let exposed = secret_rx.borrow().expose_secret().to_string();
+                        if tx.send(exposed).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(rx)
     }
 }
 
@@ -111,7 +133,7 @@ impl GitHubAppTokenProvider {
         let cloned_app_client_id = Arc::clone(&app_client_id);
         let cloned_private_key = Arc::clone(&private_key);
         let cloned_installation_id = Arc::clone(&installation_id);
-        let cloned_tx = tx.clone();
+        let cloned_tx = tx;
 
         let handle = tokio::spawn(async move {
             let mut backoff = FibonacciBackoffBuilder::new()
@@ -154,20 +176,28 @@ impl GitHubAppTokenProvider {
             app_client_id,
             private_key,
             installation_id,
-            tx,
             rx,
             _handle: Arc::new(handle),
         })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitHubToken {
-    pub token: String,
+    pub token: SecretString,
     pub expires_at: DateTime<Utc>,
 }
+
+impl fmt::Debug for GitHubToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitHubToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
 impl GitHubToken {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     #[must_use]
     pub fn next_wait(&self) -> Duration {
         Duration::from_secs(
@@ -209,7 +239,11 @@ async fn generate_token(
     let jwt_token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
         .context(UnableToGenerateJWTSnafu {})?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
     let response = client
         .post(format!(
@@ -223,10 +257,10 @@ async fn generate_token(
         .await
         .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
-    #[allow(clippy::items_after_statements)]
+    #[expect(clippy::items_after_statements)]
     #[derive(Deserialize, Debug)]
     struct TokenResponse {
-        token: String,
+        token: SecretString,
         expires_at: String,
     }
     let resp: TokenResponse = response

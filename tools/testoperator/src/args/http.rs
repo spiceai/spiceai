@@ -17,7 +17,11 @@ limitations under the License.
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use test_framework::{anyhow, spicetest::http::component::HttpComponent};
+use test_framework::{
+    anyhow,
+    constants::{API_BASE_PATH, HTTP_BASE_URL},
+    spicetest::http::component::HttpComponent,
+};
 
 use super::CommonArgs;
 
@@ -44,8 +48,6 @@ pub struct HttpTestArgs {
     pub(crate) payload: Option<Vec<String>>,
 }
 
-const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
-
 impl HttpTestArgs {
     pub(crate) fn get_http_component(&self) -> anyhow::Result<HttpComponent> {
         match (&self.model, &self.embedding) {
@@ -57,11 +59,11 @@ impl HttpTestArgs {
             )),
             (Some(model), None) => Ok(HttpComponent::Model {
                 model: model.clone(),
-                api_base: DEFAULT_API_BASE.to_string(),
+                api_base: format!("{HTTP_BASE_URL}{API_BASE_PATH}"),
             }),
             (None, Some(embedding)) => Ok(HttpComponent::Embedding {
                 embedding: embedding.clone(),
-                api_base: DEFAULT_API_BASE.to_string(),
+                api_base: format!("{HTTP_BASE_URL}{API_BASE_PATH}"),
             }),
         }
     }

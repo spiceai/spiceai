@@ -37,35 +37,33 @@ pub(super) async fn create_bedrock_client(
     params: &HashMap<String, SecretString>,
     credential_provider_name: &'static str,
 ) -> Result<BedrockClient, Box<dyn std::error::Error + Send + Sync>> {
-    // Build AWS config
-    let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    // Extract credentials from params
+    let region = extract_secret!(params, "aws_region")
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| "us-east-1".to_string());
 
-    // Set region if provided
-    if let Some(region) = extract_secret!(params, "aws_region") {
-        config_builder = config_builder.region(aws_config::Region::new(region.to_owned()));
-    }
+    let access_key_id =
+        extract_secret!(params, "aws_access_key_id").map(std::string::ToString::to_string);
 
-    // Set profile if provided
+    let secret_access_key =
+        extract_secret!(params, "aws_secret_access_key").map(std::string::ToString::to_string);
+
+    let session_token =
+        extract_secret!(params, "aws_session_token").map(std::string::ToString::to_string);
+
+    // Use common credential initialization from aws-sdk-credential-bridge
+    let mut config_builder = aws_sdk_credential_bridge::initiate_config_with_credentials(
+        credential_provider_name,
+        region,
+        access_key_id,
+        secret_access_key,
+        session_token,
+    )
+    .await;
+
+    // Set profile if provided (additional config not handled by initiate_config_with_credentials)
     if let Some(profile) = extract_secret!(params, "aws_profile") {
         config_builder = config_builder.profile_name(profile);
-    }
-
-    // Set access key and secret key if provided
-    if let (Some(access_key), Some(secret_key)) = (
-        extract_secret!(params, "aws_access_key_id"),
-        extract_secret!(params, "aws_secret_access_key"),
-    ) {
-        let session_token = extract_secret!(params, "aws_session_token");
-
-        let credentials = aws_credential_types::Credentials::new(
-            access_key,
-            secret_key,
-            session_token.map(std::string::ToString::to_string),
-            None,
-            credential_provider_name,
-        );
-
-        config_builder = config_builder.credentials_provider(credentials);
     }
 
     let mut rate_limit_builder = RateControllerBuilder::default();

@@ -25,6 +25,7 @@ on:
           - 'embedding'
           - 'hybrid'
           - 'full_text'
+          - 's3_vectors'
         default: 'embedding'
   schedule:
     - cron: '0 4 * * 2,5' # Every Monday and Thursday at 8pm PST (4am UTC next day)
@@ -39,33 +40,20 @@ jobs:
     name: Build testoperator
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
         with:
-          os: 'darwin'
-
-      - name: Build the testoperator
-        run: |
-          cargo build -p testoperator --release
-
-      - name: make testoperator executable
-        run: |
-          mv target/release/testoperator testoperator
-          chmod +x testoperator
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: testoperator
-          path: testoperator
-
+          install_to_system_path: 'false'
+          upload_artifact: 'true'
+          force_rebuild: 'true'
+          download_from_minio: 'false'
   build-spiced:
     name: Build spiced
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -73,7 +61,7 @@ jobs:
           os: darwin
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -89,7 +77,7 @@ jobs:
           chmod +x spiced
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: spiced
           path: spiced
@@ -102,7 +90,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -146,8 +134,13 @@ jobs:
                     return m;
                 });
               }
+              if (search_option === 's3vectors') {
+                filtered = filtered.map((m) => {
+                    m.spicepod = "./test/spicepods/financebench/embedding[s3vector].yaml";
+                    return m;
+                });
+              }
             }
-
             return filtered;
 
   run-testoperator:
@@ -163,15 +156,15 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Download testoperator
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          name: testoperator
+          name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: spiced
 
@@ -185,9 +178,13 @@ jobs:
           SPICEAI_FINANCEBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_FINANCEBENCH_API_KEY}}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          AWS_REGION: 'us-east-1'
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
+            -z ./test/spicepods/financebench/core \
             -p ${{ matrix.target.spicepod }} \
             --model ${{ matrix.target.name }} \
             --ready-wait 180 \

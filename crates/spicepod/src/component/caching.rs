@@ -32,9 +32,13 @@ pub enum CacheKeyType {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HashingAlgorithm {
-    #[default]
+    #[serde(rename = "siphash")]
     Siphash,
+    #[serde(rename = "ahash")]
     Ahash,
+    #[serde(rename = "blake3")]
+    Blake3,
+    #[default]
     #[serde(rename = "xxh3")]
     XXH3,
     #[serde(rename = "xxh32")]
@@ -43,6 +47,29 @@ pub enum HashingAlgorithm {
     XXH64,
     #[serde(rename = "xxh128")]
     XXH128,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    #[default]
+    None,
+    Zstd,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CachingPolicy {
+    /// Least Recently Used caching policy.
+    /// Suitable for workloads with strong recency bias, such as streaming data processing.
+    #[default]
+    Lru,
+    /// `TinyLFU` caching policy.
+    /// Combines LRU eviction with LFU-based admission policy.
+    /// Suitable for most workloads including database, search, and analytics.
+    TinyLfu,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,7 +102,8 @@ pub struct CacheConfig {
     pub enabled: bool,
     pub max_size: Option<String>,
     pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
+    #[serde(default, alias = "eviction_policy")]
+    pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
 }
@@ -86,7 +114,7 @@ impl Default for CacheConfig {
             enabled: true,
             max_size: None,
             item_ttl: None,
-            eviction_policy: None,
+            caching_policy: CachingPolicy::default(),
             hashing_algorithm: HashingAlgorithm::default(),
         }
     }
@@ -103,11 +131,21 @@ pub struct SQLResultsCacheConfig {
     pub enabled: bool,
     pub max_size: Option<String>,
     pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
+    #[serde(default, alias = "eviction_policy")]
+    pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    /// Maximum age for serving stale cached results while revalidating in the background.
+    /// When set, cached results past their TTL (but within this additional window) will be
+    /// served immediately while a background refresh is triggered.
+    /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_while_revalidate_ttl: Option<String>,
+    /// Encoding algorithm for compressing cached results.
+    #[serde(default)]
+    pub encoding: Encoding,
 }
 
 // serde(default) only applies when deserializing, so to return enabled: true from ::default() calls
@@ -118,9 +156,11 @@ impl Default for SQLResultsCacheConfig {
             enabled: true,
             max_size: None,
             item_ttl: None,
-            eviction_policy: None,
+            caching_policy: CachingPolicy::default(),
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
+            stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
         }
     }
 }
@@ -133,11 +173,14 @@ pub struct ResultsCache {
     pub enabled: bool,
     pub cache_max_size: Option<String>,
     pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
+    #[serde(default, alias = "eviction_policy")]
+    pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    /// Maximum stale-while-revalidate duration to add to the cache TTL.
+    pub max_stale_while_revalidate: Option<String>,
 }
 
 impl Default for ResultsCache {
@@ -146,9 +189,10 @@ impl Default for ResultsCache {
             enabled: true,
             cache_max_size: None,
             item_ttl: None,
-            eviction_policy: None,
+            caching_policy: CachingPolicy::default(),
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            max_stale_while_revalidate: None,
         }
     }
 }
@@ -159,9 +203,11 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             enabled: val.enabled,
             max_size: val.cache_max_size,
             item_ttl: val.item_ttl,
-            eviction_policy: val.eviction_policy,
+            caching_policy: val.caching_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
+            stale_while_revalidate_ttl: None,
+            encoding: Encoding::default(),
         }
     }
 }
@@ -183,7 +229,7 @@ mod tests {
         assert_eq!(sql_results.cache_key_type, CacheKeyType::default());
         assert!(sql_results.max_size.is_none());
         assert!(sql_results.item_ttl.is_none());
-        assert!(sql_results.eviction_policy.is_none());
+        assert_eq!(sql_results.caching_policy, CachingPolicy::Lru);
         assert_eq!(sql_results, SQLResultsCacheConfig::default());
 
         let search_results = caching.search_results.expect("Should have cache config");
@@ -194,7 +240,7 @@ mod tests {
         );
         assert!(search_results.max_size.is_none());
         assert!(search_results.item_ttl.is_none());
-        assert!(search_results.eviction_policy.is_none());
+        assert_eq!(search_results.caching_policy, CachingPolicy::Lru);
         assert_eq!(search_results, CacheConfig::default());
 
         let embeddings = caching.embeddings.expect("Should have cache config");
@@ -202,7 +248,7 @@ mod tests {
         assert_eq!(embeddings.hashing_algorithm, HashingAlgorithm::default());
         assert!(embeddings.max_size.is_none());
         assert!(embeddings.item_ttl.is_none());
-        assert!(embeddings.eviction_policy.is_none());
+        assert_eq!(embeddings.caching_policy, CachingPolicy::Lru);
         assert_eq!(embeddings, CacheConfig::default());
     }
 }

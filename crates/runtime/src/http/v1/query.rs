@@ -24,10 +24,8 @@ use headers_accept::Accept;
 use http::header::CONTENT_TYPE;
 use serde::Deserialize;
 
-use crate::{
-    datafusion::{param_utils, request_context_extension::get_current_datafusion},
-    request::{AsyncMarker, RequestContext},
-};
+use crate::datafusion::{param_utils, request_context_extension::get_current_datafusion};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{ResponseMimeType, sql_to_http_response};
 
@@ -195,7 +193,7 @@ pub(crate) async fn post(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
 
-    let (sql, parameters) = if let Some("application/json") = content_type {
+    let (sql, parameters) = if content_type == Some("application/json") {
         match serde_json::from_slice::<ParameterizedQuery>(&body) {
             Ok(ParameterizedQuery { sql, parameters }) => {
                 let parameters = match param_utils::convert_json_to_param_values(parameters) {
@@ -215,8 +213,9 @@ pub(crate) async fn post(
             }
         }
     } else {
-        let sql = match String::from_utf8(body.to_vec()) {
-            Ok(query) => query,
+        // Use &body directly to avoid unnecessary copy of Bytes
+        let sql = match std::str::from_utf8(&body) {
+            Ok(query) => query.to_string(),
             Err(e) => {
                 tracing::debug!("Error reading query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();

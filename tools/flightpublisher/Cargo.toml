@@ -15,4 +15,8 @@ clap = { workspace = true, features = ["derive"] }
 futures.workspace = true
 parquet.workspace = true
 tokio.workspace = true
-tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+tonic = { workspace = true, features = [
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+] }

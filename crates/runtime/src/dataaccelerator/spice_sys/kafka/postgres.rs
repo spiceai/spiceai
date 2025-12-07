@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
+use super::{Error, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 
 impl KafkaSys {
@@ -23,7 +23,7 @@ impl KafkaSys {
         pool: &PostgresConnectionPool,
         metadata: &KafkaMetadata,
     ) -> Result<()> {
-        let conn = pool.connect_direct().await.map_err(|e| e.to_string())?;
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
 
         let create_table = format!(
             "CREATE TABLE IF NOT EXISTS {KAFKA_TABLE_NAME} (
@@ -38,7 +38,7 @@ impl KafkaSys {
         conn.conn
             .execute(&create_table, &[])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         let upsert = format!(
             "INSERT INTO {KAFKA_TABLE_NAME}
@@ -64,7 +64,7 @@ impl KafkaSys {
                 ],
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }

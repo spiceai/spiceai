@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -28,6 +28,7 @@ use crate::{
     queries::Query,
 };
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
@@ -68,6 +69,8 @@ pub struct NotStarted {
     disable_caching: bool,
     scale_factor: f64,
     http_client: bool,
+    validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    reference_schema: Option<String>,
 }
 
 impl NotStarted {
@@ -116,6 +119,21 @@ impl NotStarted {
     #[must_use]
     pub fn with_http_client(mut self, http_client: bool) -> Self {
         self.http_client = http_client;
+        self
+    }
+
+    #[must_use]
+    pub fn with_validation_data(
+        mut self,
+        validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Self {
+        self.validation_data = Some(validation_data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
         self
     }
 }
@@ -182,39 +200,45 @@ impl SpiceTest<NotStarted> {
             None
         };
 
-        let spice_client = self
-            .get_spiced()?
-            .spice_client(self.api_key.clone(), self.state.disable_caching)
-            .await?;
-
         let http_client = self.get_spiced()?.http_client()?;
 
-        let query_workers = (0..self.state.parallel_count)
-            .map(|id| {
-                let mut worker = SpiceTestQueryWorker::new(
-                    id,
-                    self.state.query_set.clone(),
-                    self.state.end_condition,
-                    spice_client.clone(),
-                    self.name.clone(),
-                )
-                .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate(self.state.validate)
-                .with_scale_factor(self.state.scale_factor);
+        let mut query_workers = Vec::new();
+        for id in 0..self.state.parallel_count {
+            let mut worker = SpiceTestQueryWorker::new(
+                id,
+                self.state.query_set.clone(),
+                self.state.end_condition,
+                self.name.clone(),
+            )
+            .with_explain_plan_snapshot(self.explain_plan_snapshot)
+            .with_results_snapshot(self.results_snapshot_predicate)
+            .with_validate(self.state.validate)
+            .with_scale_factor(self.state.scale_factor);
 
-                if let Some(multi) = &multi {
-                    worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
-                }
+            if let Some(multi) = &multi {
+                worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
+            }
 
-                if self.state.http_client {
-                    worker = worker.with_http_client(http_client.clone());
-                }
+            if self.state.http_client {
+                worker = worker.with_http_client(http_client.clone());
+            } else {
+                let spice_client = self
+                    .get_spiced()?
+                    .spice_client(self.api_key.clone(), self.state.disable_caching)
+                    .await?;
+                worker = worker.with_flight_client(spice_client);
+            }
 
-                worker
-            })
-            .map(SpiceTestQueryWorker::start)
-            .collect();
+            if let Some(validation_data) = &self.state.validation_data {
+                worker = worker.with_validation_data(validation_data.clone());
+            }
+
+            if let Some(reference_schema) = &self.state.reference_schema {
+                worker = worker.with_reference_schema(Some(reference_schema.clone()));
+            }
+
+            query_workers.push(worker.start());
+        }
 
         Ok(SpiceTest {
             name: self.name,
@@ -369,11 +393,10 @@ impl SpiceTest<Completed> {
         for (query, counts) in &self.state.row_counts {
             let first = counts
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {}", query))?;
+                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {query}"))?;
             if !counts.iter().all(|count| count == first) {
                 return Err(anyhow::anyhow!(
-                    "Row counts for query {} are inconsistent",
-                    query
+                    "Row counts for query {query} are inconsistent"
                 ));
             }
 

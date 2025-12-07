@@ -44,9 +44,9 @@ use async_stream::stream;
 use crate::{
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{
     Service, flightsql::prepared_statement_query, metrics,
@@ -85,7 +85,7 @@ pub(crate) async fn handle(
         rate_limit_check()?;
     }
 
-    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
+    match RequestContext::current(AsyncMarker::new().await).auth_principal() {
         Some(principal) => {
             if !principal
                 .groups()

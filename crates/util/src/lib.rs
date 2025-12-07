@@ -21,17 +21,22 @@ use std::{
 };
 
 pub mod fibonacci_backoff;
+pub mod retry_strategy;
+pub mod security;
 pub use backoff::Error as RetryError;
+pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
 mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+pub mod stream_utils;
+pub mod time_format;
 
-#[allow(clippy::cast_precision_loss)]
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_precision_loss)]
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_wrap)]
 #[must_use]
 pub fn human_readable_bytes(num: usize) -> String {
     let units = ["B", "kiB", "MiB", "GiB"];
@@ -58,6 +63,30 @@ pub fn pretty_print_number(num: usize) -> String {
         .collect::<Result<Vec<&str>, _>>()
         .unwrap_or(vec![])
         .join(",")
+}
+
+/// Parses a string parameter as an enabled/disabled boolean value.
+///
+/// Returns `true` if the value is "enabled" (case-insensitive), `false` otherwise.
+/// This is a common pattern across Spice configuration parameters.
+///
+/// # Arguments
+///
+/// * `value` - The string value to parse (typically from a configuration parameter)
+///
+/// # Examples
+///
+/// ```
+/// use util::parse_enabled;
+///
+/// assert_eq!(parse_enabled("enabled"), true);
+/// assert_eq!(parse_enabled("ENABLED"), true);
+/// assert_eq!(parse_enabled("disabled"), false);
+/// assert_eq!(parse_enabled("anything_else"), false);
+/// ```
+#[must_use]
+pub fn parse_enabled(value: &str) -> bool {
+    value.to_lowercase() == "enabled"
 }
 
 pub async fn shutdown_signal() {
@@ -150,7 +179,7 @@ async fn shutdown_signal_impl() {
 
 This function will propagate `SystemTimeError` from `time.elapsed()`
 */
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
     time.elapsed()
         .map(|elapsed| {

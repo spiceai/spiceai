@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
@@ -24,6 +24,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -37,10 +38,10 @@ pub struct DeltaLake {
 
 impl DeltaLake {
     #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters) -> Self {
+    #[expect(clippy::needless_pass_by_value)]
+    pub fn new(params: Parameters, io_runtime: Handle) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(params.to_secret_map()),
+            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime),
         }
     }
 }
@@ -72,6 +73,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description("The AWS session token to use for S3 storage.")
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
@@ -113,10 +117,21 @@ impl DataConnectorFactory for DeltaLakeFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let param_map = params.parameters.to_secret_map();
         Box::pin(async move {
-            // Initialize the AWS SDK and make it available.
-            let _ = aws_sdk_credential_bridge::initialize_sdk_config().await;
-            let delta = DeltaLake::new(params.parameters);
+            // Initialize AWS SDK credentials if not using explicit credentials
+            if !aws_sdk_credential_bridge::has_explicit_credentials(
+                &param_map,
+                "aws_access_key_id",
+                "aws_secret_access_key",
+            ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+            {
+                tracing::warn!(
+                    "Unable to initialize AWS credentials for Delta Lake connector: {err}"
+                );
+            }
+
+            let delta = DeltaLake::new(params.parameters, params.io_runtime);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }
@@ -150,3 +165,5 @@ impl DataConnector for DeltaLake {
         )
     }
 }
+
+register_data_connector!("delta_lake", DeltaLakeFactory);

@@ -15,21 +15,21 @@ limitations under the License.
 */
 
 use std::cmp::min;
+use std::path::PathBuf;
 use std::slice;
-use std::{any::Any, collections::HashSet, path::PathBuf, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
-use crate::metadata::{MetadataColumn, MetadataColumns};
 use arrow::{array::RecordBatch, datatypes::DataType};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{LogicalPlan, TableScan};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use runtime_datafusion_index::Index;
 use snafu::ResultExt;
-use tantivy::schema::DocParsingError;
+use tantivy::schema::{DocParsingError, SchemaBuilder};
 use tantivy::{TantivyDocument, TantivyError};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
@@ -50,9 +50,10 @@ pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
-    pub index: Arc<RwLock<tantivy::Index>>,
-    /// FTS indexes don't have additional metadata columns beyond primary keys and search fields
-    pub metadata_columns: MetadataColumns,
+
+    // `index` access should only be needed for write path. Query/reads should use [`self::reader`].
+    pub index: Arc<Mutex<tantivy::Index>>,
+    pub reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -96,18 +97,23 @@ impl Index for FullTextDatabaseIndex {
 }
 
 impl FullTextDatabaseIndex {
-    pub async fn try_new(
+    pub fn try_new(
         inner: Arc<dyn TableProvider>,
         search_fields: Vec<String>,
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
+        store_field: &[String],
     ) -> Result<Self, super::Error> {
-        let pks = Self::validate_primary_key(&inner, primary_key_override).await?;
-        let tantivy_schema =
-            Self::create_tantivy_schema(&inner, search_fields.as_slice(), pks.as_slice())?;
+        let pks = Self::validate_primary_key(&inner, primary_key_override)?;
+        let tantivy_schema = Self::create_tantivy_schema(
+            &inner,
+            search_fields.as_slice(),
+            pks.as_slice(),
+            store_field,
+        )?;
 
-        let index = if let Some(path) = &directory {
-            match tantivy::Index::create_in_dir(path, tantivy_schema) {
+        let index = if let Some(path) = directory {
+            match tantivy::Index::create_in_dir(path.clone(), tantivy_schema) {
                 Ok(idx) => idx,
                 Err(TantivyError::IndexAlreadyExists) => {
                     tantivy::index::Index::open_in_dir(path).context(TextSearchIndexingSnafu)?
@@ -117,34 +123,29 @@ impl FullTextDatabaseIndex {
         } else {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
+        let reader = index.reader().context(TextSearchIndexingSnafu)?;
 
-        let metadata_columns = Self::derive_metadata_columns(&inner, &index, &pks);
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(RwLock::new(index)),
+            index: Arc::new(Mutex::new(index)),
             primary_key: pks,
-            metadata_columns,
+            reader,
         })
     }
 
-    async fn validate_primary_key(
+    fn validate_primary_key(
         inner: &Arc<dyn TableProvider>,
         primary_key_override: Option<Vec<String>>,
     ) -> Result<Vec<String>, super::Error> {
         // Use 'primary_key_override', fallback to underlying in table.
-        let pks = match (primary_key_override, get_primary_keys(inner).await) {
-            (Some(pks), _) => pks,
-            (None, Ok(pks)) => {
-                if pks.is_empty() {
-                    return Err(super::Error::NoPrimaryKey);
-                }
-
-                pks
-            }
-            (None, Err(e)) => {
+        let pks = match (primary_key_override, get_primary_keys(inner)) {
+            // LHS takes precedence.
+            (Some(pks), _) | (_, Ok(pks)) if !pks.is_empty() => pks,
+            (_, Err(e)) => {
                 return Err(super::Error::FailedToRetrievePrimaryKey { source: e });
             }
+            _ => return Err(super::Error::NoPrimaryKey),
         };
 
         // INDEX_UNIQUE_FIELD_NAME is a reserved field name.
@@ -156,46 +157,14 @@ impl FullTextDatabaseIndex {
         Ok(pks)
     }
 
-    /// Get all [`Field`]s in Tantivy [`tantivy::Index`] that are in base table, and not primary keys.
-    /// These are non-filterable [`MetadataColumn`]s, since we can retrieve the data
-    /// from the [`tantivy::Index`] without access to the base [`TableProvider`].
-    fn derive_metadata_columns(
-        base_table: &Arc<dyn TableProvider>,
-        index: &tantivy::Index,
-        primary_key: &[String],
-    ) -> MetadataColumns {
-        let base_schema = base_table.schema();
-
-        index
-            .schema()
-            .fields()
-            .filter_map(|(_, fe)| {
-                let name = fe.name();
-                if primary_key.contains(&name.to_string()) {
-                    return None;
-                }
-
-                let (_, f) = base_schema.column_with_name(name)?;
-                Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
-            })
-            .collect::<Vec<_>>()
-            .into()
-    }
-
     pub fn full_text_search_field_index(
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self
-            .index
-            .try_read()
-            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
-
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            &index_read,
+            self.reader.searcher(),
             search_field.to_string(),
             self.primary_key.clone(),
-            Some(self.metadata_columns.all_names()),
         )?;
         search_index.add_type_hints(&self.underlying_table().schema());
         Ok(search_index)
@@ -263,30 +232,36 @@ impl FullTextDatabaseIndex {
             rb.to_vec()
         };
 
-        let index_writable = self.index.write().await;
         // Updates in tantivy are a deletion then insertion.
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
-
-        // Deletion.
-        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
-            index_writer.delete_term(t);
-        }
-
-        // Insertion.
+        // Prepare documents to insert/delete with read lock.
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
-        let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
+        let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        let index_writable = self.index.lock().await;
+        let mut index_writer: tantivy::IndexWriter = index_writable
+            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
+            .context(IndexCreationSnafu)?;
+        // Deletion.
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
+        }
+        // Insertion.
         for doc in docs {
             index_writer.add_document(doc).context(IndexCreationSnafu)?;
         }
         index_writer
             .commit()
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        Ok(())
+        drop(index_writable);
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+        })
     }
 
     #[must_use]
@@ -309,14 +284,71 @@ impl FullTextDatabaseIndex {
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
             base_table,
-            metadata_columns: self.metadata_columns.clone(),
+            reader: self.reader.clone(),
         }
+    }
+
+    // Adds the Arrow [`Field`] as a stored and indexed field.
+    //
+    // Note: for Utf8, does not tokenize.
+    fn add_to_tantivy_schema(
+        schema_builder: &mut SchemaBuilder,
+        field: &Field,
+    ) -> Result<(), super::Error> {
+        match field.data_type() {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                schema_builder.add_f64_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                schema_builder.add_u64_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                schema_builder.add_i64_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            DataType::Boolean => {
+                schema_builder.add_bool_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
+                schema_builder.add_text_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::STRING,
+                );
+            }
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                schema_builder.add_bytes_field(
+                    field.name().as_str(),
+                    tantivy::schema::STORED | tantivy::schema::INDEXED,
+                );
+            }
+            dt => {
+                return Err(super::Error::PrimaryKeyInvalidType {
+                    data_type: dt.clone(),
+                    column: field.name().clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn create_tantivy_schema(
         base_table: &Arc<dyn TableProvider>,
         search_fields: &[String],
         primary_key: &[String],
+        store_field: &[String],
     ) -> Result<tantivy::schema::Schema, super::Error> {
         let schema = base_table.schema();
         let mut schema_builder = tantivy::schema::Schema::builder();
@@ -328,52 +360,7 @@ impl FullTextDatabaseIndex {
             let Some((_, field)) = schema.column_with_name(p) else {
                 return Err(super::Error::PrimaryKeyNotFound { column: p.clone() });
             };
-            match field.data_type() {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    schema_builder.add_f64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    schema_builder.add_u64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    schema_builder.add_i64_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                DataType::Boolean => {
-                    schema_builder.add_bool_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                    // [`tantivy::schema::STRING`] means we won't tokenize, important for primary key lookup via [`TermQuery`].
-                    schema_builder.add_text_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::STRING,
-                    );
-                }
-                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                    schema_builder.add_bytes_field(
-                        p.as_str(),
-                        tantivy::schema::STORED | tantivy::schema::INDEXED,
-                    );
-                }
-                dt => {
-                    return Err(super::Error::PrimaryKeyInvalidType {
-                        data_type: dt.clone(),
-                        column: p.clone(),
-                    });
-                }
-            }
+            Self::add_to_tantivy_schema(&mut schema_builder, field)?;
         }
 
         // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
@@ -382,8 +369,22 @@ impl FullTextDatabaseIndex {
         }
 
         for s in search_fields {
-            schema_builder.add_text_field(s, tantivy::schema::TEXT | tantivy::schema::STORED);
+            let mut text_opts = tantivy::schema::TEXT;
+            if store_field.contains(s) || primary_key.contains(s) {
+                text_opts = text_opts | tantivy::schema::STORED;
+            }
+            schema_builder.add_text_field(s, text_opts);
         }
+
+        for f in store_field {
+            if !primary_key.contains(f)
+                && !search_fields.contains(f)
+                && let Some((_, field)) = schema.column_with_name(f)
+            {
+                Self::add_to_tantivy_schema(&mut schema_builder, field)?;
+            }
+        }
+
         Ok(schema_builder.build())
     }
 
@@ -416,10 +417,6 @@ impl SearchIndex for FullTextDatabaseIndex {
             .collect()
     }
 
-    fn metadata_columns(&self) -> &MetadataColumns {
-        &self.metadata_columns
-    }
-
     async fn write(
         &self,
         record: RecordBatch,
@@ -434,17 +431,18 @@ impl SearchIndex for FullTextDatabaseIndex {
             .boxed()
             .map_err(DataFusionError::External)?;
 
-        Ok(Arc::new(LogicalPlan::TableScan(TableScan::try_new(
-            self.name(),
-            Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
-                index: field_index,
-                query: query.to_string(),
-                pre_limit: None,
-            }))),
-            None,
-            vec![],
-            None,
-        )?)))
+        Ok(Arc::new(
+            LogicalPlanBuilder::scan(
+                self.name(),
+                Arc::new(DefaultTableSource::new(Arc::new(FullTextSearchQuery {
+                    index: Arc::new(field_index),
+                    query: query.to_string(),
+                    pre_limit: None,
+                }))),
+                None,
+            )?
+            .build()?,
+        ))
     }
 }
 
@@ -469,57 +467,263 @@ fn parse_json_array(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use arrow::{
-        array::{Int32Array, StringArray},
-        datatypes::{DataType, Field, Schema},
-    };
+    use arrow::{array::record_batch, util::pretty::pretty_format_batches};
+    use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
+    use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::Index;
 
+    /// Create a basic [`MemTable`] with fields: `id`, `content`.
     fn create_test_table() -> Arc<dyn TableProvider> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![
-                    "test content 1",
-                    "test content 2",
-                    "test content 3",
-                ])),
-            ],
+        let batch = record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            (
+                "content",
+                Utf8,
+                ["test content 1", "test content 2", "test content 3"]
+            )
         )
         .expect("Failed to create test batch");
 
-        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("Failed to create test table"))
+        Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("Failed to create test table"),
+        )
+    }
+
+    /// Returns a [`RecordBatch`] where the fields are sorted into alphabetical order.
+    ///
+    /// An error is returned only if [`RecordBatch::try_new`] returns an error (which it should not).
+    fn sort_columns_alphabetically(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+        let mut fields_with_indices: Vec<(usize, Field)> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| (idx, field.as_ref().clone()))
+            .collect();
+
+        fields_with_indices.sort_by(|a, b| a.1.name().cmp(b.1.name()));
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(
+                fields_with_indices
+                    .iter()
+                    .map(|(_, field)| field.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            fields_with_indices
+                .iter()
+                .map(|(original_idx, _)| Arc::clone(batch.column(*original_idx)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    //
+    async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
+        let rb: Vec<RecordBatch> = idx
+            .search(query.into(), &[], 1000)
+            .await
+            .expect("Failed to search")
+            .map(|res| match res {
+                Ok(rb) => sort_columns_alphabetically(&rb)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                Err(e) => Err(e),
+            })
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    #[tokio::test]
+    async fn test_updates_overwrites_on_compute_index() {
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        // Initial table
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3]),
+                    (
+                        "content",
+                        Utf8,
+                        ["test content 1", "test content 2", "test content 3"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        // Initial table as expected
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
+            +----------------+----+---------------------+----------------+
+            | content        | id | score               | value          |
+            +----------------+----+---------------------+----------------+
+            | test content 1 | 1  | 0.26706287264823914 | test content 1 |
+            | test content 2 | 2  | 0.26706287264823914 | test content 2 |
+            | test content 3 | 3  | 0.26706287264823914 | test content 3 |
+            +----------------+----+---------------------+----------------+
+            ");
+        }
+
+        // With an update
+        {
+            index
+                .compute_index(vec![
+                    record_batch!(
+                        ("id", Int32, [1, 3]), // 1 & 3 are existing keys.
+                        ("content", Utf8, ["new content 1", "new content 3"])
+                    )
+                    .expect("Failed to create test record_batch"),
+                ])
+                .await
+                .expect("failed to compute_index");
+
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            // First, ensure old data is no longer existent.
+            insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
+            +----------------+----+--------------------+----------------+
+            | content        | id | score              | value          |
+            +----------------+----+--------------------+----------------+
+            | test content 2 | 2  | 0.5389965176582336 | test content 2 |
+            +----------------+----+--------------------+----------------+
+            ");
+
+            // Second, ensure new data is searchable.
+            insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
+            +---------------+----+--------------------+---------------+
+            | content       | id | score              | value         |
+            +---------------+----+--------------------+---------------+
+            | new content 1 | 1  | 0.8754687905311584 | new content 1 |
+            | new content 3 | 3  | 0.8754687905311584 | new content 3 |
+            +---------------+----+--------------------+---------------+
+            ");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_updates_overwrites_on_compute_index_composite_pk() {
+        let batch = record_batch!(
+            ("id1", Utf8, ["a", "a", "b"]),
+            ("id2", Int32, [1, 2, 1]),
+            (
+                "content",
+                Utf8,
+                ["test content 1", "test content 2", "test content 3"]
+            )
+        )
+        .expect("Failed to create test batch");
+
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .expect("Failed to create test table"),
+            ),
+            vec!["content".to_string()],
+            Some(vec!["id1".to_string(), "id2".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        // Initial table
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        // Initial table as expected
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            insta::assert_snapshot!(search_and_format(&search_index, "test content").await, @r"
+            +----------------+-----+-----+---------------------+----------------+
+            | content        | id1 | id2 | score               | value          |
+            +----------------+-----+-----+---------------------+----------------+
+            | test content 1 | a   | 1   | 0.26706287264823914 | test content 1 |
+            | test content 2 | a   | 2   | 0.26706287264823914 | test content 2 |
+            | test content 3 | b   | 1   | 0.26706287264823914 | test content 3 |
+            +----------------+-----+-----+---------------------+----------------+
+            ");
+        }
+
+        // With an update
+        {
+            index
+                .compute_index(vec![
+                    record_batch!(
+                        ("id1", Utf8, ["a", "b"]),
+                        ("id2", Int32, [1, 1]),
+                        ("content", Utf8, ["new content 1", "new content 3"])
+                    )
+                    .expect("Failed to create test record_batch"),
+                ])
+                .await
+                .expect("failed to compute_index");
+
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            // First, ensure old data is no longer existent.
+            insta::assert_snapshot!(search_and_format(&search_index, "test").await, @r"
+            +----------------+-----+-----+--------------------+----------------+
+            | content        | id1 | id2 | score              | value          |
+            +----------------+-----+-----+--------------------+----------------+
+            | test content 2 | a   | 2   | 0.5389965176582336 | test content 2 |
+            +----------------+-----+-----+--------------------+----------------+
+            ");
+
+            // Second, ensure new data is searchable.
+            insta::assert_snapshot!(search_and_format(&search_index, "new").await, @r"
+            +---------------+-----+-----+--------------------+---------------+
+            | content       | id1 | id2 | score              | value         |
+            +---------------+-----+-----+--------------------+---------------+
+            | new content 1 | a   | 1   | 0.8754687905311584 | new content 1 |
+            | new content 3 | b   | 1   | 0.8754687905311584 | new content 3 |
+            +---------------+-----+-----+--------------------+---------------+
+            ");
+        }
     }
 
     #[tokio::test]
     async fn test_compute_index_returns_batches_unchanged() {
-        let table = create_test_table();
-        let search_fields = vec!["content".to_string()];
-        let primary_key = Some(vec!["id".to_string()]);
-
-        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None)
-            .await
-            .expect("Failed to create index");
-
-        let input_batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("content", DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![4, 5])),
-                Arc::new(StringArray::from(vec!["new content 1", "new content 2"])),
-            ],
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[],
         )
-        .expect("Failed to create input batch");
+        .expect("Failed to create index");
+
+        let input_batch = record_batch!(
+            ("id", Int32, [4, 5]),
+            ("content", Utf8, ["new content 1", "new content 2"])
+        )
+        .expect("Failed to create test batch");
 
         let input_batches = vec![input_batch.clone()];
         let result_batches = index

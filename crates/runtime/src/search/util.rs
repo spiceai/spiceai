@@ -20,14 +20,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use datafusion::common::Column;
+use datafusion::error::DataFusionError;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_datafusion_index::{Index, IndexedTableProvider};
-use search::chunking::ChunkedSearchIndex;
 use search::generation::CandidateGeneration;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::generation::util::get_primary_keys;
 use search::index::SearchIndex;
+use search::index::chunking::ChunkedSearchIndex;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -106,7 +107,8 @@ pub async fn parse_explicit_primary_keys(
     app: Arc<RwLock<Option<Arc<App>>>>,
 ) -> HashMap<TableReference, Vec<String>> {
     app.read().await.as_ref().map_or(HashMap::new(), |app| {
-        app.datasets
+        let mut pks = app
+            .datasets
             .iter()
             .filter_map(|d| {
                 d.primary_key_override().map(|pks| {
@@ -118,7 +120,19 @@ pub async fn parse_explicit_primary_keys(
                     )
                 })
             })
-            .collect::<HashMap<TableReference, Vec<_>>>()
+            .collect::<HashMap<TableReference, Vec<_>>>();
+
+        pks.extend(app.views.iter().filter_map(|d| {
+            d.primary_key_override().map(|pks| {
+                (
+                    TableReference::parse_str(&d.name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                        .into(),
+                    pks,
+                )
+            })
+        }));
+        pks
     })
 }
 
@@ -133,10 +147,9 @@ pub(crate) async fn get_primary_keys_from_table(
             data_source: vec![table.clone()],
         })?;
 
-    get_primary_keys(&tbl_ref)
-        .await
-        .boxed()
-        .map_err(|e| Error::DataFusionError { source: e })
+    get_primary_keys(&tbl_ref).map_err(|e| Error::DataFusionError {
+        source: DataFusionError::from(e),
+    })
 }
 
 /// For a set of tables, get their primary keys. Attempt to determine the primary key(s) of the
@@ -210,7 +223,7 @@ pub async fn embedding_columns_from_table(
     // embedding columns from [`IndexedTableProvider`].
     #[cfg(feature = "s3_vectors")]
     {
-        use crate::embeddings::index::s3::S3Vector;
+        use search::index::s3_vectors::S3Vector;
         if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(&table_provider) {
             embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
         }
@@ -324,8 +337,8 @@ mod tests {
         assert!(find_concrete_table_provider::<EmbeddingTable>(&base).is_none());
     }
 
-    #[tokio::test]
-    async fn test_find_concrete_table_provider_wrapped_in_full_text() {
+    #[test]
+    fn test_find_concrete_table_provider_wrapped_in_full_text() {
         let base_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![Field::new(
@@ -342,10 +355,10 @@ mod tests {
             FullTextDatabaseIndex::try_new(
                 Arc::clone(&base_table),
                 vec!["search_field".to_string()],
-                vec![].into(),
+                Some(vec!["search_field".to_string()]),
                 None,
+                &[],
             )
-            .await
             .expect("cannot make full text table"),
         );
 

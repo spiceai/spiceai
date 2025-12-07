@@ -21,6 +21,14 @@ on:
           - 'release'
           - 'release-lto'
         default: 'lint'
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -39,13 +47,13 @@ jobs:
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
 
       - name: Detect all code changes
         id: changed-code-files
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         with:
           filters: |
             code_changes:
@@ -54,7 +62,6 @@ jobs:
               - 'test/**'
               - 'tools/**'
               - 'install/**'
-              - '.github/workflows/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'go.mod'
@@ -66,18 +73,43 @@ jobs:
           echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
   lint:
-    name: Run Go & Rust Linters
+    name: Run Go & Rust Linters and Build
     runs-on: spiceai-dev-runners
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
     needs: check_changes
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Cache Go modules
+      - name: Cache Go modules
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Set up Go
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
         with:
           go-version: ${{ env.GOVER }}
           cache: false
@@ -92,80 +124,6 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          os: 'linux'
-
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
-      - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
-
-      - name: Install Protoc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up make
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
-
-      - run: make lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
-          CARGO_NET_GIT_FETCH_WITH_CLI: true
-          RUST_PROFILE: ${{ env.RUST_PROFILE }}
-
-      - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
-
-      - name: Check if Cargo.lock is updated
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if git diff --exit-code Cargo.lock; then
-            echo "Cargo.lock is up to date"
-          else
-            echo "Update Cargo.lock"
-            exit 1
-          fi
-
-  build:
-    name: Build Go & Rust
-    runs-on: spiceai-dev-runners
-    env:
-      GOVER: 1.24.2
-    needs: check_changes
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
 
@@ -191,13 +149,34 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
 
+      - name: Install Protoc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up make
         uses: ./.github/actions/setup-make
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make build-cli nextest
+      - run: make lint
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+
+      - name: Validate datafusion-table-providers commit
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: bash .github/scripts/validate_table_providers_commit.sh
+
+      - name: Build CLI and run nextest
+        run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -213,7 +192,7 @@ jobs:
           AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-          NEXTEST_FLAG: --features=xxhash
+          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
       - if: needs.check_changes.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features
@@ -222,24 +201,18 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  build-docker:
-    name: Build Docker Image
-    runs-on: spiceai-dev-runners
-    needs: check_changes
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v6
+      - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always'
+        uses: ./.github/actions/push-snap-changes
         with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: false
-          build-args: |
-            CARGO_FEATURES=odbc
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
-          tags: |
-            ghcr.io/spiceai/spiceai-rust:ci
+          token: ${{ secrets.GITHUB_TOKEN }}

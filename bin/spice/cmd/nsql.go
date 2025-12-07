@@ -199,7 +199,7 @@ func sendNsqlRequest(rtcontext *context.RuntimeContext, body *NsqlRequest) (*htt
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling nsql request body: %w", err)
 	}
-	response, err := rtcontext.Do("POST", "/v1/nsql", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Accept", "text/plain")
+	response, err := rtcontext.DoLongRunning("POST", "/v1/nsql", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Accept", "text/plain")
 	if err != nil {
 		return nil, fmt.Errorf("error sending nsql request: %w", err)
 	}

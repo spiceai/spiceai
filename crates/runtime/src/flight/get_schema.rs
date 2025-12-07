@@ -21,11 +21,8 @@ use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
-use crate::{
-    datafusion::request_context_extension::get_current_datafusion,
-    flight::metrics,
-    request::{AsyncMarker, RequestContext},
-};
+use crate::{datafusion::request_context_extension::get_current_datafusion, flight::metrics};
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, to_tonic_err};
 

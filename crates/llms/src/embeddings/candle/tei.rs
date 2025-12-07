@@ -54,6 +54,7 @@ pub struct TeiEmbed {
 
     // Shared embeddings cache
     cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    cache_model_id: Option<String>, // Used for unique key in `cache`.
 }
 
 impl TeiEmbed {
@@ -207,6 +208,7 @@ impl TeiEmbed {
             model_size: config.hidden_size,
             tok: Arc::new(tokenizer),
             cache: None,
+            cache_model_id: None,
         })
     }
 
@@ -216,6 +218,12 @@ impl TeiEmbed {
         cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
     ) -> Self {
         self.cache = cache;
+        self
+    }
+
+    #[must_use]
+    pub fn set_cache_model_id(mut self, id: impl Into<String>) -> Self {
+        self.cache_model_id = Some(id.into());
         self
     }
 
@@ -257,6 +265,10 @@ impl Embed for TeiEmbed {
         self.cache.as_ref().map(Arc::clone)
     }
 
+    fn model_name(&self) -> Option<&str> {
+        self.cache_model_id.as_deref()
+    }
+
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
         let cache_key = self.embedding_input_cache_key(&input);
 
@@ -288,7 +300,7 @@ impl Embed for TeiEmbed {
         Ok(results)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         if let Some(CachedEmbeddingResult::Response(cached)) =
             self.get_cached_embed((&req).into()).await

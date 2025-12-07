@@ -55,10 +55,9 @@ use crate::{
         DataFusion, SPICE_RUNTIME_SCHEMA, builder::get_df_default_config, error::SpiceExternalError,
     },
     dataupdate::{DataUpdate, UpdateType},
-    get_params_with_secrets,
-    secrets::Secrets,
     task_history::DEFAULT_TASK_HISTORY_TABLE,
 };
+use runtime_secrets::{Secrets, get_params_with_secrets};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -276,6 +275,7 @@ async fn get_spiceai_table_provider(
     };
 
     let secrets = runtime.secrets();
+    let tokio_io_runtime = runtime.tokio_io_runtime();
 
     let mut dataset = DatasetBuilder::try_new(format!("spice.ai/{cloud_dataset_path}"), name)
         .boxed()
@@ -290,7 +290,7 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
 
     let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
-        .build(secrets)
+        .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 

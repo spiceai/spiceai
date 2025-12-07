@@ -138,15 +138,46 @@ pub async fn send_messages_to_kafka<T>(
 where
     T: serde::Serialize,
 {
+    const MAX_RETRIES: u32 = 5;
+    const DELAY_S: u64 = 1;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+
     for message in messages {
         let message_str = serde_json::to_string(message)?;
-        producer
-            .send(
-                FutureRecord::<String, String>::to(topic).payload(&message_str),
-                Duration::from_secs(2),
-            )
-            .await
-            .map_err(|(e, _)| anyhow::Error::msg(format!("Kafka message delivery failed: {e}")))?;
+
+        let mut last_error = None;
+        for attempt in 0..=MAX_RETRIES {
+            let record = FutureRecord::<String, String>::to(topic).payload(&message_str);
+
+            match producer.send(record, QUEUE_TIMEOUT).await {
+                Ok(_) => {
+                    if attempt > 0 {
+                        tracing::debug!("Message sent successfully after {attempt} retries");
+                    }
+                    last_error = None;
+                    break;
+                }
+                Err((e, _)) if attempt < MAX_RETRIES => {
+                    tracing::debug!(
+                        "Kafka send failed (attempt {}/{}): {e}. Retrying in {DELAY_S} seconds",
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_secs(DELAY_S)).await;
+                }
+                Err((e, _)) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        if let Some(e) = last_error {
+            return Err(anyhow::Error::msg(format!(
+                "Kafka message delivery failed after {} attempts: {e}",
+                MAX_RETRIES + 1,
+            )));
+        }
     }
     Ok(())
 }

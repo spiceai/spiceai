@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -46,22 +47,24 @@ const (
 )
 
 type RuntimeContext struct {
-	spiceRuntimeDir string
-	flags           *pflag.FlagSet
-	spiceBinDir     string
-	appDir          string
-	podsDir         string
-	isCloud         bool
-	httpClient      *http.Client
-	userAgent       string
-	extraHeaders    map[string]string
+	spiceRuntimeDir       string
+	flags                 *pflag.FlagSet
+	spiceBinDir           string
+	appDir                string
+	podsDir               string
+	isCloud               bool
+	httpClient            *http.Client
+	longRunningHttpClient *http.Client
+	userAgent             string
+	extraHeaders          map[string]string
 }
 
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
-		httpClient:   &http.Client{},
-		userAgent:    util.GetSpiceUserAgent("spice"),
-		extraHeaders: make(map[string]string),
+		httpClient:            newHTTPClient(30 * time.Second),
+		longRunningHttpClient: newHTTPClient(0),
+		userAgent:             util.GetSpiceUserAgent("spice"),
+		extraHeaders:          make(map[string]string),
 	}
 	return rtcontext
 }
@@ -74,7 +77,13 @@ func FromFlags(flags *pflag.FlagSet) (*RuntimeContext, error) {
 	return ctx, nil
 }
 
-func TlsHttpClient(rootCertPath string) http.Client {
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+	}
+}
+
+func tlsHTTPClient(rootCertPath string, timeout time.Duration) *http.Client {
 	rootCert, err := os.ReadFile(rootCertPath)
 	if err != nil {
 		panic(err)
@@ -93,13 +102,18 @@ func TlsHttpClient(rootCertPath string) http.Client {
 		TLSClientConfig: tlsConfig,
 	}
 
-	return http.Client{
+	return &http.Client{
 		Transport: transport,
+		Timeout:   timeout,
 	}
 }
 
 func (c *RuntimeContext) Client() *http.Client {
 	return c.httpClient
+}
+
+func (c *RuntimeContext) LongRunningClient() *http.Client {
+	return c.longRunningHttpClient
 }
 
 func (c *RuntimeContext) SpiceRuntimeDir() string {
@@ -127,6 +141,26 @@ func (c *RuntimeContext) HttpEndpoint() string {
 }
 
 func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
+	return c.doWithClient(c.httpClient, method, path, body, additionalHeaders...)
+}
+
+func (c *RuntimeContext) DoLongRunning(method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
+	headers := make([]string, len(additionalHeaders))
+	copy(headers, additionalHeaders)
+	hasConnectionHeader := false
+	for i := 0; i < len(headers); i += 2 {
+		if strings.EqualFold(headers[i], "Connection") {
+			hasConnectionHeader = true
+			break
+		}
+	}
+	if !hasConnectionHeader {
+		headers = append(headers, "Connection", "keep-alive")
+	}
+	return c.doWithClient(c.longRunningHttpClient, method, path, body, headers...)
+}
+
+func (c *RuntimeContext) doWithClient(client *http.Client, method, path string, body io.Reader, additionalHeaders ...string) (*http.Response, error) {
 	request, err := http.NewRequest(method, fmt.Sprintf("%s%s", c.HttpEndpoint(), path), body)
 	if err != nil {
 		return nil, fmt.Errorf("error sending HTTP request: %w", err)
@@ -141,7 +175,7 @@ func (c *RuntimeContext) Do(method, path string, body io.Reader, additionalHeade
 		request.Header.Set(additionalHeaders[i], additionalHeaders[i+1])
 	}
 
-	return c.httpClient.Do(request)
+	return client.Do(request)
 }
 
 func (c *RuntimeContext) HttpSocketAddress() string {
@@ -187,7 +221,6 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 		}
 	}
 
-	client := http.Client{}
 	rootCertPath, err := flags.GetString(constants.TlsRootCertificateFile)
 	if err != nil {
 		return err
@@ -195,9 +228,12 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 	cloud, _ := flags.GetBool(constants.CloudKeyFlag)
 	c.isCloud = cloud
 	if rootCertPath != "" {
-		client = TlsHttpClient(rootCertPath)
+		c.httpClient = tlsHTTPClient(rootCertPath, 30*time.Second)
+		c.longRunningHttpClient = tlsHTTPClient(rootCertPath, 0)
+	} else {
+		c.httpClient = newHTTPClient(30 * time.Second)
+		c.longRunningHttpClient = newHTTPClient(0)
 	}
-	c.httpClient = &client
 	return nil
 }
 
@@ -242,11 +278,23 @@ func (c *RuntimeContext) EnsureInstalled(flavor constants.Flavor, autoUpgrade bo
 		slog.Info("Spice runtime installation required")
 		shouldInstall = true
 	} else {
-		upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
-		if err != nil {
-			slog.Warn("error checking for runtime upgrade", "error", err)
-		} else if upgradeVersion != "" && autoUpgrade {
-			shouldInstall = true
+		// Check if version is locked (specific version intentionally installed)
+		if c.IsVersionLocked() {
+			lockedVersion, _ := c.GetVersionLock()
+			upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
+			if err != nil {
+				slog.Warn("error checking for runtime upgrade", "error", err)
+			} else if upgradeVersion != "" {
+				slog.Info(fmt.Sprintf("A newer version %s is available, but version %s is locked. Run 'spice upgrade' to upgrade.", upgradeVersion, lockedVersion))
+			}
+			// Don't auto-upgrade when version is locked
+		} else {
+			upgradeVersion, err = c.IsRuntimeUpgradeAvailable()
+			if err != nil {
+				slog.Warn("error checking for runtime upgrade", "error", err)
+			} else if upgradeVersion != "" && autoUpgrade {
+				shouldInstall = true
+			}
 		}
 	}
 
@@ -343,6 +391,110 @@ func (c *RuntimeContext) InstallMatchingRuntime(flavor constants.Flavor, allowAc
 	return nil
 }
 
+func (c *RuntimeContext) InstallSpecificRuntime(version string, flavor constants.Flavor, allowAccelerator bool) error {
+	err := c.prepareInstallDir()
+	if err != nil {
+		return err
+	}
+
+	// Install runtime for the specified version
+	release, err := github.GetRuntimeRelease(version)
+	if err != nil {
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
+
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
+	if err != nil {
+		slog.Error("downloading Spice.ai runtime binaries", "error", err)
+		return err
+	}
+
+	releaseFilePath := filepath.Join(c.spiceBinDir, constants.SpiceRuntimeFilename)
+
+	err = util.MakeFileExecutable(releaseFilePath)
+	if err != nil {
+		slog.Error("downloading Spice runtime binaries.", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
+
+	// Set version lock to prevent auto-upgrades
+	err = c.SetVersionLock(release.TagName)
+	if err != nil {
+		slog.Warn("failed to set version lock", "error", err)
+	}
+
+	// Update the runtime version cache file
+	runtimeVersionFile := filepath.Join(c.spiceRuntimeDir, "spiced_version.txt")
+	if err := os.WriteFile(runtimeVersionFile, []byte(release.TagName+"\n"), 0644); err != nil {
+		slog.Warn("failed to update runtime version cache", "error", err)
+	}
+
+	return nil
+}
+
+func (c *RuntimeContext) InstallSpecificVersion(version string, flavor constants.Flavor, allowAccelerator bool) error {
+	err := c.prepareInstallDir()
+	if err != nil {
+		return err
+	}
+
+	// Install runtime for the specified version
+	release, err := github.GetRuntimeRelease(version)
+	if err != nil {
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
+
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
+	if err != nil {
+		slog.Error("downloading Spice.ai runtime binaries", "error", err)
+		return err
+	}
+
+	releaseFilePath := filepath.Join(c.spiceBinDir, constants.SpiceRuntimeFilename)
+
+	err = util.MakeFileExecutable(releaseFilePath)
+	if err != nil {
+		slog.Error("downloading Spice runtime binaries.", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
+
+	// Install CLI for the specified version
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai CLI %s ...\n", release.TagName))
+
+	assetName := github.GetAssetName(constants.SpiceCliFilename)
+	err = github.DownloadAsset(release, c.spiceBinDir, assetName)
+	if err != nil {
+		slog.Error("downloading Spice.ai CLI binary", "error", err)
+		return err
+	}
+
+	cliFilePath := filepath.Join(c.spiceBinDir, constants.SpiceCliFilename)
+
+	err = util.MakeFileExecutable(cliFilePath)
+	if err != nil {
+		slog.Error("making CLI binary executable", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice CLI installed into %s successfully.\n", c.spiceBinDir))
+
+	// Set version lock to prevent auto-upgrades
+	err = c.SetVersionLock(release.TagName)
+	if err != nil {
+		slog.Warn("failed to set version lock", "error", err)
+	}
+
+	return nil
+}
+
 func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 	currentVersion, err := c.Version()
 	if err != nil {
@@ -360,6 +512,40 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 	}
 
 	return cliVersion, nil
+}
+
+func (c *RuntimeContext) SetVersionLock(version string) error {
+	lockFilePath := filepath.Join(c.spiceRuntimeDir, ".version_lock")
+	return os.WriteFile(lockFilePath, []byte(version), 0644)
+}
+
+func (c *RuntimeContext) GetVersionLock() (string, error) {
+	lockFilePath := filepath.Join(c.spiceRuntimeDir, ".version_lock")
+	data, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func (c *RuntimeContext) ClearVersionLock() error {
+	lockFilePath := filepath.Join(c.spiceRuntimeDir, ".version_lock")
+	err := os.Remove(lockFilePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (c *RuntimeContext) IsVersionLocked() bool {
+	lockedVersion, err := c.GetVersionLock()
+	if err != nil {
+		return false
+	}
+	return lockedVersion != ""
 }
 
 func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
@@ -384,12 +570,14 @@ func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 }
 
 func (c *RuntimeContext) prepareInstallDir() error {
-	err := os.MkdirAll(c.spiceBinDir, 0777)
+	// Use 0755 (rwxr-xr-x) instead of 0777 to prevent world-writable directories
+	// Owner can read/write/execute, others can only read/execute
+	err := os.MkdirAll(c.spiceBinDir, 0755)
 	if err != nil {
 		return err
 	}
 
-	err = os.Chmod(c.spiceBinDir, 0777)
+	err = os.Chmod(c.spiceBinDir, 0755)
 	if err != nil {
 		return err
 	}

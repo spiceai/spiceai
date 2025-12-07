@@ -68,6 +68,12 @@ impl Column {
     }
 
     #[must_use]
+    pub fn with_embedding(mut self, embedding: ColumnLevelEmbeddingConfig) -> Self {
+        self.embeddings.push(embedding);
+        self
+    }
+
+    #[must_use]
     pub fn with_full_text_search(mut self, full_text_search: FullTextSearchConfig) -> Self {
         self.full_text_search = Some(full_text_search);
         self
@@ -84,6 +90,19 @@ impl Column {
             metadata.insert(k.to_string(), v.to_string());
         }
         metadata
+    }
+
+    #[must_use]
+    pub fn as_vector_metadata(&self) -> Option<MetadataType> {
+        let value = self.metadata.get("vectors")?.clone();
+        // If it doesn't deserialize to `MetadataType`, not an issue, just not a `MetadataType`.
+        serde_json::from_value(value).ok()
+    }
+}
+
+impl From<&str> for Column {
+    fn from(value: &str) -> Self {
+        Column::new(value)
     }
 }
 
@@ -114,6 +133,40 @@ pub struct ColumnLevelEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
+}
+
+impl ColumnLevelEmbeddingConfig {
+    #[must_use]
+    pub fn model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            chunking: None,
+            row_ids: None,
+            vector_size: None,
+        }
+    }
+
+    #[must_use]
+    pub fn chunking(mut self, chunking: EmbeddingChunkConfig) -> Self {
+        self.chunking = Some(chunking);
+        self
+    }
+
+    #[must_use]
+    pub fn with_row_id(self, row_id: &str) -> Self {
+        if let Some(mut row_ids) = self.row_ids {
+            row_ids.push(row_id.to_string());
+            Self {
+                row_ids: Some(row_ids),
+                ..self
+            }
+        } else {
+            Self {
+                row_ids: Some(vec![row_id.to_string()]),
+                ..self
+            }
+        }
+    }
 }
 
 // Let `row_id` handle single string or arrays. All acceptable
@@ -222,6 +275,14 @@ impl FullTextSearchConfig {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MetadataType {
+    #[serde(rename = "non-filterable")]
+    NonFilterable,
+    #[serde(rename = "filterable")]
+    Filterable,
 }
 
 #[cfg(test)]

@@ -48,7 +48,7 @@ func Get(url string, accept string, headers map[string]string) (*net_http.Respon
 }
 
 func do(req *retryablehttp.Request, accept string, headers map[string]string) (*net_http.Response, error) {
-	req.Header.Set("User-Agent", userAgent())
+	req.Header.Set("User-Agent", UserAgent())
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
@@ -65,7 +65,8 @@ func do(req *retryablehttp.Request, accept string, headers map[string]string) (*
 	return resp, nil
 }
 
-func userAgent() string {
+// UserAgent returns the user agent string for Spice CLI
+func UserAgent() string {
 	if _userAgent == "" {
 		_userAgent = fmt.Sprintf("Spice.ai/spice %s/%s (%s)", version.Version(), version.Version(), runtime.GOOS)
 	}

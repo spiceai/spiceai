@@ -145,7 +145,7 @@ FROM
 WHERE
     rn = 1 AND name NOT LIKE 'runtime.%';
 `
-	resp, err := rtContext.Do("POST", "/v1/sql", bytes.NewReader([]byte(componentStatusQuery)), "Accept", "application/vnd.spiceai.sql.v1+json")
+	resp, err := rtContext.DoLongRunning("POST", "/v1/sql", bytes.NewReader([]byte(componentStatusQuery)), "Accept", "application/vnd.spiceai.sql.v1+json")
 	if err != nil {
 		if strings.HasSuffix(err.Error(), "connection refused") {
 			return nil, nil, nil

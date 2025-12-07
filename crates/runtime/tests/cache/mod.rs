@@ -22,10 +22,8 @@ use crate::{
 };
 
 use app::AppBuilder;
-use runtime::{
-    Runtime,
-    request::{CacheControl, Protocol, RequestContext, UserAgent},
-};
+use runtime::Runtime;
+use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
 
 #[tokio::test]
 async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {

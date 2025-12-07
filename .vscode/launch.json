@@ -53,15 +53,59 @@
       "program": "${workspaceFolder}/target/debug/testoperator",
       "args": [
         "run",
-        "vector-search",
+        "search",
         "--ready-wait",
         "1800",
         "--concurrency",
         "10",
         "-p",
-        "./test/spicepods/vector_search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml",
+        "./test/spicepods/search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml",
         "--benchmark-dataset",
         "quora_retrieval"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Append)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "run",
+        "append",
+        "--ready-wait",
+        "300",
+        "--query-set",
+        "tpch",
+        "--load-steps",
+        "10",
+        "--load-interval",
+        "20",
+        "--duration",
+        "240",
+        "--with-conflict-data",
+        "--with-retention-data",
+        "-p",
+        "./test/spicepods/tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Dispatch)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "dispatch",
+        "./tools/testoperator/dispatch/tpch/sf1/accelerated/append/",
+        "--workflow",
+        "append",
+        "--github-token",
+        "<GITHUB_TOKEN>"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",
@@ -78,7 +122,7 @@
     {
       "type": "lldb",
       "request": "attach",
-      "name": "[Rust] Attack to spiced",
+      "name": "[Rust] Attach to spiced",
       "program": "~/.spice/bin/spiced",
       "pid": "${input:pid}"
     },

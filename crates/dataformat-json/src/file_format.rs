@@ -42,7 +42,7 @@ use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::projection::ProjectionExpr;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::{
     catalog::{Session, memory::DataSourceExec},
@@ -475,8 +475,8 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
     fn try_swapping_with_projection(
         &self,
-        projection: &ProjectionExec,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        projection: &[ProjectionExpr],
+    ) -> Result<Option<Arc<dyn DataSource>>> {
         self.inner.try_swapping_with_projection(projection)
     }
 }

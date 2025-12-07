@@ -74,6 +74,10 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	t0 := time.Now()
 	nFiles := 0
 	madeDir := map[string]bool{}
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve target directory: %w", err)
+	}
 	var reader = r
 	if isGzipped {
 		reader, err = gzip.NewReader(r)
@@ -93,11 +97,10 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 		if err != nil {
 			return fmt.Errorf("tar error: %v", err)
 		}
-		if !validRelPath(f.Name) {
-			return fmt.Errorf("tar contained invalid name error %q", f.Name)
+		abs, err := resolveArchivePath(dirAbs, f.Name)
+		if err != nil {
+			return err
 		}
-		rel := filepath.FromSlash(f.Name)
-		abs := filepath.Join(dir, rel)
 
 		fi := f.FileInfo()
 		mode := fi.Mode()
@@ -109,7 +112,8 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 			// write will fail with the same error.
 			dir := filepath.Dir(abs)
 			if !madeDir[dir] {
-				if err := os.MkdirAll(filepath.Dir(abs), 0766); err != nil {
+				// Use 0755 (rwxr-xr-x) instead of 0766 to prevent world-writable directories
+				if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 					return err
 				}
 				madeDir[dir] = true
@@ -148,7 +152,8 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 			}
 			nFiles++
 		case mode.IsDir():
-			if err := os.MkdirAll(abs, 0766); err != nil {
+			// Use 0755 (rwxr-xr-x) instead of 0766 to prevent world-writable directories
+			if err := os.MkdirAll(abs, 0755); err != nil {
 				return err
 			}
 			madeDir[abs] = true
@@ -159,9 +164,25 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	return nil
 }
 
-func validRelPath(p string) bool {
-	if p == "" || strings.Contains(p, `\`) || strings.HasPrefix(p, "/") || strings.Contains(p, "../") {
-		return false
+func resolveArchivePath(baseDir, name string) (string, error) {
+	cleanName := filepath.Clean(filepath.FromSlash(name))
+	if cleanName == "." {
+		return "", fmt.Errorf("tar file entry %q contained invalid name", name)
 	}
-	return true
+	if filepath.IsAbs(cleanName) {
+		return "", fmt.Errorf("tar file entry %q contained absolute path", name)
+	}
+	if cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tar file entry %q attempted directory traversal", name)
+	}
+
+	target := filepath.Join(baseDir, cleanName)
+	rel, err := filepath.Rel(baseDir, target)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve archive path %q: %w", name, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("tar file entry %q attempted directory traversal", name)
+	}
+	return target, nil
 }

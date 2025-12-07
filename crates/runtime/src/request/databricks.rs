@@ -15,13 +15,12 @@ limitations under the License.
 */
 
 use app::App;
+use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use http::HeaderMap;
+use runtime_request_context::{Extension, RequestContextBuilder};
 use secrecy::SecretString;
-use spicepod::{
-    component::{catalog::Catalog, dataset::Dataset},
-    param::ParamValue,
-};
+use spicepod::param::ParamValue;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +46,40 @@ impl Default for DatabricksAuthExtension {
     }
 }
 
+#[async_trait]
+impl Extension for DatabricksAuthExtension {
+    async fn load(&self) {
+        self.load_u2m_components().await;
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl DatabricksAuthExtension {
+    #[must_use]
+    pub fn new(
+        app: Option<Arc<App>>,
+        df: Option<Arc<DataFusion>>,
+        tokens: Arc<HashMap<String, SecretString>>,
+    ) -> Self {
+        Self { app, df, tokens }
+    }
+
+    #[must_use]
+    pub fn add_from_headers(
+        self,
+        mut bldr: RequestContextBuilder,
+        headers: &HeaderMap,
+    ) -> RequestContextBuilder {
+        if let Some(extension) = DatabricksAuthExtension::from_headers(&self.app, &self.df, headers)
+        {
+            bldr = bldr.with_extension(extension);
+        }
+        bldr
+    }
+
     #[must_use]
     pub fn from_headers(
         app: &Option<Arc<App>>,
@@ -92,7 +124,8 @@ impl DatabricksAuthExtension {
     pub async fn load_u2m_components(&self) {
         if let (Some(app), Some(df)) = (self.app.clone(), self.df.clone()) {
             let client_ids = self.tokens.keys().cloned().collect::<Vec<_>>();
-            let databricks_u2m_datasets: Vec<Dataset> = app
+
+            let dataset_futures = app
                 .datasets
                 .iter()
                 .filter_map(|dataset| {
@@ -113,19 +146,17 @@ impl DatabricksAuthExtension {
 
                     Some(dataset.clone())
                 })
-                .collect();
+                .map(|ds| {
+                    let df = Arc::clone(&df);
+                    let tr = TableReference::from(ds.name.clone());
+                    Box::pin(async move {
+                        if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
+                            tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
+                        }
+                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                });
 
-            let dataset_futures = databricks_u2m_datasets.into_iter().map(|ds| {
-                let df = Arc::clone(&df);
-                let tr = TableReference::from(ds.name.clone());
-                Box::pin(async move {
-                    if let Err(err) = df.load_deferred_dataset(tr.clone()).await {
-                        tracing::warn!("Failed to load dataset {}: {}", ds.name, err);
-                    }
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>
-            });
-
-            let databricks_u2m_catalogs: Vec<Catalog> = app
+            let catalog_futures = app
                 .catalogs
                 .iter()
                 .filter_map(|catalog| {
@@ -142,18 +173,16 @@ impl DatabricksAuthExtension {
 
                     Some(catalog.clone())
                 })
-                .collect();
-
-            let catalog_futures = databricks_u2m_catalogs.into_iter().map(|catalog| {
-                let df = Arc::clone(&df);
-                let name = catalog.name.clone();
-                let access = AccessMode::from(catalog.access);
-                Box::pin(async move {
-                    if let Err(err) = df.load_deferred_catalog(name.as_str(), &access).await {
-                        tracing::warn!("Failed to load catalog {}: {}", name, err);
-                    }
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>
-            });
+                .map(|catalog| {
+                    let df = Arc::clone(&df);
+                    let name = catalog.name.clone();
+                    let access = AccessMode::from(catalog.access);
+                    Box::pin(async move {
+                        if let Err(err) = df.load_deferred_catalog(name.as_str(), &access).await {
+                            tracing::warn!("Failed to load catalog {}: {}", name, err);
+                        }
+                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                });
 
             let all_futures: Vec<_> = dataset_futures.chain(catalog_futures).collect();
             futures::future::join_all(all_futures).await;

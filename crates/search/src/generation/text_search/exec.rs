@@ -24,7 +24,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     prelude::Expr as LogicalExpr,
-    sql::sqlparser::ast::{Expr, Ident},
 };
 
 use futures::StreamExt;
@@ -33,7 +32,7 @@ use super::FullTextSearchFieldIndex;
 
 /// Executes a search on a [`FullTextSearchFieldIndex`] with a given query.
 pub struct FullTextSearchExec {
-    pub(super) index: FullTextSearchFieldIndex,
+    pub(super) index: Arc<FullTextSearchFieldIndex>,
     pub(super) query: String,
     filters: Vec<LogicalExpr>,
     limit: usize,
@@ -42,7 +41,7 @@ pub struct FullTextSearchExec {
 
 impl FullTextSearchExec {
     pub fn try_new(
-        index: FullTextSearchFieldIndex,
+        index: &Arc<FullTextSearchFieldIndex>,
         query: String,
         schema: SchemaRef,
         projection: Option<&Vec<usize>>,
@@ -55,7 +54,7 @@ impl FullTextSearchExec {
         };
 
         Ok(Self {
-            index,
+            index: Arc::clone(index),
             query,
             filters,
             limit,
@@ -114,7 +113,7 @@ impl ExecutionPlan for FullTextSearchExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let idx = self.index.clone();
+        let idx = Arc::clone(&self.index);
         let schema = self.schema();
         let limit = self.limit;
         let query = self.query.clone();
@@ -122,7 +121,7 @@ impl ExecutionPlan for FullTextSearchExec {
         let s = stream! {
           // TODO: Support filters.
             match idx
-                .search(query, &[], &[&Expr::Identifier(Ident::new(idx.field.clone()))], limit)
+                .search(query, &[], limit)
                 .await
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {

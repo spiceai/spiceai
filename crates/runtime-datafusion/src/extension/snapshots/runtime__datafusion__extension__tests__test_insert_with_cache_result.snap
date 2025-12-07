@@ -1,0 +1,10 @@
+---
+source: crates/runtime/src/datafusion/extension/mod.rs
+expression: formatted
+snapshot_kind: text
+---
++----+------+-------+
+| id | name | value |
++----+------+-------+
+| 1  | foo  | 42.0  |
++----+------+-------+

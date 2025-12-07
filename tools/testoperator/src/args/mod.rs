@@ -22,7 +22,12 @@ mod http;
 pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
+
+#[cfg(feature = "append")]
+mod append;
+#[cfg(feature = "append")]
+pub use append::AppendTestArgs;
 
 pub mod dispatch;
 use dispatch::DispatchArgs;
@@ -31,32 +36,41 @@ mod evals;
 pub use evals::EvalsTestArgs;
 
 mod search;
-pub use search::VectorSearchTestArgs;
+pub use search::SearchTestArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {
-    // Run a test
+    /// Run a test
     #[command(subcommand)]
     Run(TestCommands),
-    // Export the spicepod environment that would run for a test
+    /// Export the spicepod environment that would run for a test
     #[command(subcommand)]
     Export(TestCommands),
-    // Dispatch a number of tests in GitHub Actions
+    /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
 }
 
 #[derive(Subcommand)]
 pub enum TestCommands {
+    /// Run a throughput test
     Throughput(DatasetTestArgs),
+    /// Run an extended load test
     Load(LoadTestArgs),
+    /// Run a single-run benchmark
     Bench(DatasetTestArgs),
+    /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
+    /// Run an HTTP consistency test
     HttpConsistency(HttpConsistencyTestArgs),
+    /// Run an HTTP overhead test
     HttpOverhead(HttpOverheadTestArgs),
+    /// Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
-    Append(DatasetTestArgs),
-    VectorSearch(VectorSearchTestArgs),
+    Append(AppendTestArgs),
+    Search(SearchTestArgs),
+    /// Execute benchmark queries against a pre-existing spiced instance
+    Query(QueryArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
@@ -65,6 +79,9 @@ pub struct CommonArgs {
     /// Path to the spicepod.yaml file
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
+
+    #[arg(short('z'), long)]
+    pub(crate) spicepod_dependencies: Option<PathBuf>,
 
     /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
     #[arg(long, default_value = "1")]
@@ -93,4 +110,8 @@ pub struct CommonArgs {
     /// Whether to enable metrics collection
     #[arg(long)]
     pub(crate) metrics: bool,
+
+    /// Whether to enable scraping spiced metrics (automatically enables --metrics for spiced)
+    #[arg(long)]
+    pub(crate) scrape_spiced_metrics: bool,
 }

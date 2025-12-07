@@ -24,9 +24,11 @@ use crate::Runtime;
 use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
+    acceleration as spicepod_acceleration,
     component::{
         dataset::{self as spicepod_dataset},
         embeddings::ColumnEmbeddingConfig,
@@ -51,6 +53,7 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub acceleration_snapshot: spicepod_acceleration::SnapshotBehavior,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -65,7 +68,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
             Some(Some(ready_state)) => {
                 tracing::warn!(
@@ -76,6 +79,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             }
             _ => ReadyState::from(dataset.ready_state),
         };
+
+        let acceleration_snapshot = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
+                a.snapshots
+            });
 
         let acceleration = dataset
             .acceleration
@@ -90,8 +100,8 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         if let Some(vector_engine) = &dataset.vectors {
             // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
-                tracing::debug!(
-                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
+                tracing::warn!(
+                    "Dataset {} configured with 'vector_engine: enabled' but acceleration is disabled. Vector indexing will not occur. Enable acceleration with `acceleration.enabled: true` to use vector search.",
                     dataset.name
                 );
             }
@@ -122,6 +132,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
+            acceleration_snapshot,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -136,7 +147,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 }
 
 impl DatasetBuilder {
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
@@ -152,6 +163,7 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
+            acceleration_snapshot: spicepod_acceleration::SnapshotBehavior::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -163,7 +175,7 @@ impl DatasetBuilder {
         })
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -215,7 +227,7 @@ impl DatasetBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Dataset> {
+    pub fn build(mut self) -> Result<Dataset> {
         let app = self.app.ok_or(Error::UnableToBuildDataset {
             dataset: self.name.to_string(),
             missing_component: "app".to_string(),
@@ -224,6 +236,15 @@ impl DatasetBuilder {
             dataset: self.name.to_string(),
             missing_component: "runtime".to_string(),
         })?;
+
+        if let Some(acceleration) = self.acceleration.as_mut() {
+            acceleration.snapshots = SnapshotBehavior::from(
+                app.snapshots.clone(),
+                self.acceleration_snapshot,
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+            );
+        }
 
         let dataset = Dataset {
             from: self.from,

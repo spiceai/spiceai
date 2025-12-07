@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Result};
+use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Error, Result};
 use data_components::debezium::change_event;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
@@ -25,9 +25,9 @@ impl DebeziumKafkaSys {
         pool: &Arc<DuckDbConnectionPool>,
         metadata: &DebeziumKafkaMetadata,
     ) -> Result<()> {
-        let mut db_conn = Arc::clone(pool).connect_sync().map_err(|e| e.to_string())?;
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-            .map_err(|e| e.to_string())?
+            .map_err(Error::external)?
             .get_underlying_conn_mut();
 
         let create_table = format!(
@@ -43,7 +43,7 @@ impl DebeziumKafkaSys {
         );
         duckdb_conn
             .execute(&create_table, [])
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME} (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, created_at, updated_at)
@@ -57,9 +57,9 @@ impl DebeziumKafkaSys {
         );
 
         let primary_keys =
-            serde_json::to_string(&metadata.primary_keys).map_err(|e| e.to_string())?;
+            serde_json::to_string(&metadata.primary_keys).map_err(Error::external)?;
         let schema_fields =
-            serde_json::to_string(&metadata.schema_fields).map_err(|e| e.to_string())?;
+            serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
 
         duckdb_conn
             .execute(
@@ -72,7 +72,7 @@ impl DebeziumKafkaSys {
                     &schema_fields,
                 ],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(Error::external)?;
 
         Ok(())
     }

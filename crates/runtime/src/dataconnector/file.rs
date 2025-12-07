@@ -18,6 +18,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
+use crate::register_data_connector;
 use async_trait::async_trait;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::{any::Any, env};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -42,6 +44,7 @@ use super::{
 #[derive(Debug)]
 pub struct File {
     params: Parameters,
+    tokio_io_runtime: Handle,
 }
 
 impl std::fmt::Display for File {
@@ -77,6 +80,7 @@ impl DataConnectorFactory for FileFactory {
         Box::pin(async move {
             Ok(Arc::new(File {
                 params: params.parameters,
+                tokio_io_runtime: params.io_runtime,
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -98,6 +102,10 @@ impl ListingTableConnector for File {
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> Handle {
+        self.tokio_io_runtime.clone()
     }
 
     /// Creates a valid file [`url::Url`], from the dataset, supporting both
@@ -228,6 +236,8 @@ impl ListingTableConnector for File {
     }
 }
 
+register_data_connector!("file", FileFactory);
+
 fn get_path(dataset: &Dataset) -> PathBuf {
     PathBuf::from(dataset.path())
 }
@@ -282,6 +292,7 @@ mod tests {
 
         let connector = File {
             params: Parameters::new(([]).to_vec(), "test", &[]),
+            tokio_io_runtime: Handle::current(),
         };
 
         let url = connector

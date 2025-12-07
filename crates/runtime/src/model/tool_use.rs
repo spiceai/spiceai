@@ -45,9 +45,10 @@ use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::Runtime;
-use crate::request::{AsyncMarker, RequestContext};
+use crate::model::ModelContextExtension;
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use llms::progress::Progress;
+use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,
@@ -407,6 +408,9 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let context = RequestContext::current(AsyncMarker::new().await);
+        if context.extension::<ModelContextExtension>().is_none() {
+            context.insert_extension(ModelContextExtension::new());
+        }
         let inner_req = self.prepare_req(req).await?;
 
         // wrap the completion stream to track the `ai_inferences_with_spice_count` when it is ready.
@@ -418,13 +422,17 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let context = RequestContext::current(AsyncMarker::new().await);
+        if context.extension::<ModelContextExtension>().is_none() {
+            context.insert_extension(ModelContextExtension::new());
+        }
+
         let inner_req = self.prepare_req(req).await?;
         let response = self
             .chat_request_inner(inner_req, self.recursion_limit)
             .await;
 
         // track ai_inferences_with_spice_count metric
-        let context = RequestContext::current(AsyncMarker::new().await);
         crate::model::track_ai_inferences_with_spice_count(&context);
 
         response
@@ -598,7 +606,7 @@ impl Stream for CustomStream {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn make_a_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -607,7 +615,7 @@ fn make_a_stream(
     mut s: ChatCompletionResponseStream,
 ) -> ChatCompletionResponseStream {
     let (sender, receiver) = mpsc::channel(100);
-    let sender_clone = sender.clone();
+    let sender_clone = sender;
 
     tokio::spawn(
         request_context
@@ -965,7 +973,7 @@ mod tests {
             create_tool_message("test_id", "dataset1, dataset2"),
         ];
 
-        let result = insert_initial_tools(messages.clone(), "list_datasets", &tool_messages);
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
         insta::assert_json_snapshot!(result, {
             "[].Assistant.tool_calls[].id" => "[tool_call_id]"

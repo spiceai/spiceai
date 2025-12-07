@@ -33,6 +33,7 @@ use crate::param::Params;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Secret {
     pub from: String,
 

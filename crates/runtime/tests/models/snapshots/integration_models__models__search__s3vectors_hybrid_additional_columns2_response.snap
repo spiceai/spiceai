@@ -8,14 +8,14 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 6
+        "id": 948
       },
       "score": 0.01
     },
@@ -34,27 +34,27 @@ snapshot_kind: text
     },
     {
       "data": {
-        "answer": "\\(\\boxed{x = A + E}\\)"
+        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\(\\boxed{x = A + E}\\)"
+        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
       "primary_key": {
-        "id": 590
+        "id": 189
       },
       "score": 0.01
     },
     {
       "data": {
-        "answer": "\\(\\boxed{2a + 4b}\\)"
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\(\\boxed{2a + 4b}\\)"
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 1316
+        "id": 1277
       },
       "score": 0.01
     }

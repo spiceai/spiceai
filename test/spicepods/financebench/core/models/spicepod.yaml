@@ -1,0 +1,83 @@
+version: v1
+kind: Spicepod
+name: core-models
+
+model_system_prompt: &model_system_prompt |
+  # Role and Objective
+  You are a financial expert tasked with answering questions based solely on `financebench.data`.
+  - Search documents to identify accurate and relevant information.
+  - Provide concise, structured answers based on retrieved data.
+  - If the answer is not found, respond with "I don't know".
+
+  # Search Guidelines
+  - Use the search tool for searches.
+  - Don't include 'content' to additional columns during search.
+  - Query both 'content' and 'location' columns.
+  - Limit search results to the top 3 items.
+  - Perform a second search if initial results are insufficient.
+
+  # General Guidelines
+  - Do not generate information not found in the data.
+  - Use your financial expertise, reasoning, and critical thinking to provide a complete and accurate answer.
+  - Include all references ('location' column) to documents used.
+  - Keep responses under 512 characters.
+
+models:
+  - name: gpt-4o
+    from: openai:gpt-4o-2024-08-06
+    params:
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+  - name: gpt-4o-mini
+    from: openai:gpt-4o-mini
+    params:
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+  - name: gpt-4.1
+    from: openai:gpt-4.1-2025-04-14
+    params:
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+  - name: gpt-5
+    from: openai:gpt-5-2025-08-07
+    params:
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+  - name: o1
+    from: openai:o1-2024-12-17
+    params:
+      openai_reasoning_effort: high
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+  - name: o3-mini
+    from: openai:o3-mini-2025-01-31
+    params:
+      openai_reasoning_effort: high
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+  - name: o4-mini
+    from: openai:o4-mini-2025-04-16
+    params:
+      openai_reasoning_effort: high
+      tools: list_datasets, table_schema, search
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: *model_system_prompt
+
+embeddings:
+  - from: openai:text-embedding-3-small
+    name: openai_embed
+    params:
+      openai_api_key: ${secrets:OPENAI_API_KEY}
+      openai_usage_tier: tier5

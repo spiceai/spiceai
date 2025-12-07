@@ -29,6 +29,9 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
+
 use datafusion::{
     arrow::record_batch::RecordBatch,
     error::DataFusionError,
@@ -38,22 +41,22 @@ use datafusion::{
 };
 use futures::stream::StreamExt;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::Partition;
 use crate::creator::PartitionCreator;
+use crate::creator::filename::encode_key;
+use crate::expression::PartitionedBy;
+use crate::provider::ScalarValueString;
 
 #[derive(Debug)]
 pub struct PartitionerExec {
     input: Arc<dyn ExecutionPlan>,
     creator: Arc<dyn PartitionCreator>,
     partitions: Arc<RwLock<HashMap<String, Partition>>>,
-    partition_by: Expr,
+    partition_by: PartitionedBy,
     insert_op: InsertOp,
     schema: SchemaRef,
     properties: PlanProperties,
@@ -62,7 +65,7 @@ pub struct PartitionerExec {
 impl PartitionerExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
-        partition_by: Expr,
+        partition_by: PartitionedBy,
         creator: Arc<dyn PartitionCreator>,
         partitions: Arc<RwLock<HashMap<String, Partition>>>,
         insert_op: InsertOp,
@@ -94,9 +97,10 @@ impl DisplayAs for PartitionerExec {
     ) -> std::fmt::Result {
         write!(
             f,
-            "{} (partition_by = {}, insert_op = {})",
+            "{} (partition_by = {} AS {}, insert_op = {})",
             self.name(),
-            self.partition_by,
+            self.partition_by.expression,
+            self.partition_by.name,
             self.insert_op
         )
     }
@@ -135,7 +139,7 @@ impl ExecutionPlan for PartitionerExec {
         )))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,
@@ -157,7 +161,7 @@ impl ExecutionPlan for PartitionerExec {
             let schema = self.schema();
             let row_count_schema = Arc::clone(&row_count_schema);
             let input = Arc::clone(&self.input);
-            let physical_expr = create_physical_expr(&self.partition_by, self.schema())?;
+            let physical_expr = create_physical_expr(&self.partition_by.expression, self.schema())?;
             let creator = Arc::clone(&self.creator);
             let partition_providers = Arc::clone(&self.partitions);
             let insert_op = self.insert_op;
@@ -405,7 +409,11 @@ impl DisplayAs for PartitionInputExec {
 /// Evaluate the `physical_expr` for each row in `batch`. A partition batch is
 /// created for each unique value produced by evaluating the expression
 /// containing the rows that produced that unique partition value.
-fn partition_batch(
+///
+/// # Errors
+/// Returns an error when the expressions cannot be evaluated, the batch cannot
+/// be partitioned, Arrays cannot be created or the batch cannot be filtered.
+pub fn partition_batch(
     batch: &RecordBatch,
     physical_expr: &dyn PhysicalExpr,
 ) -> Result<HashMap<String, (ScalarValue, RecordBatch)>, DataFusionError> {
@@ -426,7 +434,9 @@ fn partition_batch(
     let mut value_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for partition in partitions.ranges() {
         let partition_value = ScalarValue::try_from_array(&array, partition.start)?;
-        let partition_key = partition_value.to_string();
+        let partition_key = encode_key(&partition_value).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
+        })?;
         let value_indices = value_to_indices.entry(partition_key.clone()).or_default();
         partition.into_iter().for_each(|i| value_indices.push(i));
     }
@@ -442,6 +452,58 @@ fn partition_batch(
     }
 
     Ok(batches)
+}
+
+/// Strategy for handling custom insertion logic in partition tables
+#[async_trait::async_trait]
+pub trait InsertStrategy: Send + Sync + std::fmt::Debug {
+    /// Handle the insertion with custom logic
+    ///
+    /// # Arguments
+    /// * `input` - The input execution plan
+    /// * `insert_op` - The insert operation (append/overwrite)
+    /// * `context` - Access to partition context (creator, partitions, schema, etc.)
+    ///
+    /// # Returns
+    /// An execution plan that handles the custom insertion
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError>;
+}
+
+/// Context information for custom insertion handlers
+#[derive(Debug)]
+pub struct PartitionContext {
+    pub creator: Arc<dyn PartitionCreator>,
+    pub partition_by: PartitionedBy,
+    pub partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
+    pub schema: SchemaRef,
+}
+
+/// Default insertion strategy that uses the existing [`PartitionerExec`]
+#[derive(Debug)]
+pub struct DefaultInsertStrategy;
+
+#[async_trait::async_trait]
+impl InsertStrategy for DefaultInsertStrategy {
+    async fn execute_insert(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+        context: &PartitionContext,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        Ok(Arc::new(PartitionerExec::new(
+            input,
+            context.partition_by.clone(),
+            Arc::clone(&context.creator),
+            Arc::clone(&context.partitions),
+            insert_op,
+            Arc::clone(&context.schema),
+        )))
+    }
 }
 
 #[cfg(test)]

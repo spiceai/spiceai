@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, borrow::Cow, sync::Arc};
-
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -28,8 +26,11 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_federation::{
-    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
+    FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
+    FederationProvider,
 };
+use std::collections::HashMap;
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use crate::delete::DeletionTableProvider;
 
@@ -38,6 +39,7 @@ pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn DeletionTableProvider>,
     fed: Arc<dyn TableProvider>,
+    schema_metadata: HashMap<String, String>,
 }
 
 impl PolyTableProvider {
@@ -46,7 +48,26 @@ impl PolyTableProvider {
         delete: Arc<dyn DeletionTableProvider>,
         fed: Arc<dyn TableProvider>,
     ) -> Self {
-        PolyTableProvider { write, delete, fed }
+        PolyTableProvider {
+            write,
+            delete,
+            fed,
+            schema_metadata: HashMap::new(),
+        }
+    }
+
+    pub fn new_with_schema_metadata(
+        write: Arc<dyn TableProvider>,
+        delete: Arc<dyn DeletionTableProvider>,
+        fed: Arc<dyn TableProvider>,
+        schema_metadata: HashMap<String, String>,
+    ) -> Self {
+        PolyTableProvider {
+            write,
+            delete,
+            fed,
+            schema_metadata,
+        }
     }
 
     fn get_federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
@@ -69,6 +90,11 @@ impl PolyTableProvider {
     #[must_use]
     pub fn get_federated_table_provider(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.fed)
+    }
+
+    #[must_use]
+    pub fn writer(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.write)
     }
 }
 
@@ -93,8 +119,9 @@ impl FederationProvider for PolyTableProvider {
             .and_then(|f| f.compute_context())
     }
 
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
-        self.get_federation_provider().and_then(|f| f.analyzer())
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+        self.get_federation_provider()
+            .and_then(|f| f.analyzer(plan))
     }
 }
 
@@ -104,7 +131,8 @@ impl TableProvider for PolyTableProvider {
         self
     }
     fn schema(&self) -> SchemaRef {
-        self.write.schema()
+        let schema = self.write.schema().as_ref().clone();
+        Arc::new(schema.with_metadata(self.schema_metadata.clone()))
     }
     fn constraints(&self) -> Option<&Constraints> {
         self.write.constraints()

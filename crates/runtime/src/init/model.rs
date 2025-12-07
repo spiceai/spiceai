@@ -17,12 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    Runtime, get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
-    timing::TimeMeasurement,
+    Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, timing::TimeMeasurement,
 };
 use app::App;
 use model_components::model::Model;
 use opentelemetry::KeyValue;
+use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
 
@@ -236,7 +236,7 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
         if !std::path::Path::new(&f.path).exists() {
             return Err(Error::ReferencedPathDoesNotExist {
                 name: m.name.clone(),
-                path: f.path.clone(),
+                path: f.path,
             });
         }
     }

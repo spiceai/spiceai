@@ -7,7 +7,7 @@ snapshot_kind: text
   {
     "id": 361,
     "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\).",
-    "array_length(text_search(qs, Utf8(\"second\")).answer_embedding)": 384,
+    "array_length(text_search(qs, Utf8(\"second\")).answer_embedding)": 64,
     "trunc(text_search(qs, Utf8(\"second\")).score,Int64(3))": 5.065
   }
 ]

@@ -37,13 +37,14 @@ use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 use crate::{
     component::dataset::Dataset,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 use super::{
     DataConnector, DataConnectorFactory,
     parameters::{
         ConnectorParams,
-        aws::{self, load_config},
+        aws::{self, initiate_config_with_credentials},
     },
     s3::S3,
 };
@@ -101,12 +102,16 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
+    tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl GlueDataConnector {
     #[must_use]
-    pub fn new(params: Parameters) -> Self {
-        Self { params }
+    pub fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            params,
+            tokio_io_runtime,
+        }
     }
 
     async fn create_table_provider(
@@ -187,7 +192,14 @@ impl GlueDataConnector {
             }
         })? {
             input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
-                create_s3_provider(input_format, dataset.clone(), self.params.clone(), &table).await
+                create_s3_provider(
+                    input_format,
+                    dataset.clone(),
+                    self.params.clone(),
+                    &table,
+                    self.tokio_io_runtime.clone(),
+                )
+                .await
             }
             InputFormat::Iceberg => {
                 create_iceberg_provider(dataset, &config, database.to_string(), &table).await
@@ -198,7 +210,7 @@ impl GlueDataConnector {
 
 impl GlueDataConnector {
     async fn config(&self) -> Result<SdkConfig, aws::Error> {
-        let config = load_config(
+        let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
             "key",
@@ -206,7 +218,9 @@ impl GlueDataConnector {
             "session_token",
             &self.params,
         )
-        .await?;
+        .await?
+        .load()
+        .await;
 
         Ok(config)
     }
@@ -239,7 +253,7 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let glue = GlueDataConnector::new(params.parameters);
+            let glue = GlueDataConnector::new(params.parameters, params.io_runtime);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
         })
     }
@@ -275,6 +289,8 @@ impl DataConnector for GlueDataConnector {
         Some(self.create_table_provider(dataset).await)
     }
 }
+
+register_data_connector!("glue", GlueDataConnectorFactory);
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {
@@ -411,6 +427,11 @@ async fn create_iceberg_provider(
         props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
     }
 
+    // Disable OpenDAL's automatic credential loading from environment variables and config files.
+    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
+    // or other credentials from the environment that may not be valid for this specific connection.
+    props.insert("s3.disable-config-load".to_string(), "true".to_string());
+
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
         metadata_location.to_string(),
@@ -451,6 +472,7 @@ async fn create_s3_provider(
     mut dataset: Dataset,
     mut params: Parameters,
     table: &Table,
+    tokio_io_runtime: tokio::runtime::Handle,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
     let Some(storage_descriptor) = table.storage_descriptor() else {
         let e = Error::MissingStorageDescriptor {
@@ -502,6 +524,7 @@ async fn create_s3_provider(
     let s3 = S3 {
         params,
         runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        tokio_io_runtime,
     };
 
     dataset.from = from;

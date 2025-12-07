@@ -10,14 +10,12 @@ on:
         type: choice
         options:
           - 'all'
-          - 'gpt-4o'
-          - 'gpt-4o-mini'
-          - 'gpt-5'
-          - 'o1'
-          - 'o3_mini'
+          - 'gpt-5.1'
+          - 'gpt-5-mini'
+          - 'o3-mini'
           - 'llama3-3B-Instruct'
-          - 'claude-3-5-sonnet'
-          - 'grok2'
+          - 'claude-sonnet-4-5'
+          - 'grok4'
         default: 'all'
   schedule:
     - cron: '0 5 * * 2,5' # Every Monday and Thursday at 10pm PST (5am UTC next day)
@@ -32,33 +30,19 @@ jobs:
     name: Build testoperator
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
         with:
-          os: 'darwin'
-
-      - name: Build the testoperator
-        run: |
-          cargo build -p testoperator --release
-
-      - name: make testoperator executable
-        run: |
-          mv target/release/testoperator testoperator
-          chmod +x testoperator
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: testoperator
-          path: testoperator
+          install_to_system_path: 'false'
+          upload_artifact: 'true'
 
   build-spiced:
     name: Build spiced
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -66,7 +50,7 @@ jobs:
           os: darwin
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -82,7 +66,7 @@ jobs:
           chmod +x spiced
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: spiced
           path: spiced
@@ -95,19 +79,17 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
             const matrix = [
-              { name: "gpt-4o" },
-              { name: "gpt-4o-mini" },
-              { name: "gpt-5" },
-              { name: "o1" },
-              { name: "o3_mini" },
+              { name: "gpt-5.1" },
+              { name: "gpt-5-mini" },
+              { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
-              { name: "claude-3-5-sonnet"},
-              { name: "grok2" },
+              { name: "claude-sonnet-4-5" },
+              { name: "grok4" },
             ];
 
             const model_option = context.payload.inputs?.model_option || 'all';
@@ -132,15 +114,15 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Download testoperator
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
-          name: testoperator
+          name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: spiced
 

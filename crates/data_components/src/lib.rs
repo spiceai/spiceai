@@ -53,6 +53,8 @@ pub mod odbc;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod refresh_skip;
+pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
@@ -65,14 +67,18 @@ pub mod spark_connect;
 pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "turso")]
+pub mod turso;
 pub mod unity_catalog;
 
+pub mod git;
 pub mod github;
 pub mod rate_limit;
 
 pub mod cdc;
 pub mod delete;
 pub mod graphql;
+pub mod http;
 #[cfg(feature = "imap")]
 pub mod imap;
 pub mod object;

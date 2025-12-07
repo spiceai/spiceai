@@ -64,27 +64,35 @@ pub enum Error {
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "The API returned an invalid response (HTTP {status}). This may indicate a temporary server issue. The data refresh will be retried automatically. If the problem persists, contact support. Technical details: {error}"
+    ))]
+    JsonDecodeError {
+        status: reqwest::StatusCode,
+        error: String,
+        response_preview: String,
+    },
+
     #[snafu(display(
         "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
     ))]
     InternalError { message: String },
 
-    #[snafu(display(
-        "GraphQL Query Error:
-Details:
-- Error: {message}
-- Location: Line {line}, Column {column}
-- Query:
-
-{query}
-
-Verify the syntax of your GraphQL query."
-    ))]
+    #[snafu(display("Server returned an error: {message}"))]
     InvalidGraphQLQuery {
         message: String,
         line: usize,
         column: usize,
         query: String,
+    },
+
+    #[snafu(display(
+        "Failed to build a valid regex from pagination parameters due to the resource name {resource_name}. {source}"
+    ))]
+    InvalidPaginationRegex {
+        source: regex::Error,
+        resource_name: String,
     },
 }
 

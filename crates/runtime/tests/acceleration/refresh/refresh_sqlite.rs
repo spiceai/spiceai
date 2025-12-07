@@ -23,7 +23,7 @@ use crate::{init_tracing, utils::test_request_context};
 use std::sync::Arc;
 
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_sqlite_append() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -67,7 +67,7 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
 }
 
 #[tokio::test]
-async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
+async fn test_acceleration_refresh_sqlite_full() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()

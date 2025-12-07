@@ -64,7 +64,15 @@ pub struct StdFileSystem;
 impl ReadablePath for StdFileSystem {
     async fn open(&self, path: PathBuf) -> Result<Box<dyn io::Read + Send + Sync>> {
         let file =
-            std::fs::File::open(&path).context(UnableToOpenPathSnafu { path: path.clone() })?;
+            tokio::fs::File::open(&path)
+                .await
+                .map_err(|source| Error::UnableToOpenPath {
+                    source,
+                    path: path.clone(),
+                })?;
+
+        let file = file.into_std().await;
+
         Ok(Box::new(file))
     }
 }

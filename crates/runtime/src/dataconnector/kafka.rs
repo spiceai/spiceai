@@ -35,13 +35,14 @@ use crate::{
         dataset::{Dataset, acceleration::RefreshMode},
         metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
     },
-    dataaccelerator::spice_sys::kafka::KafkaSys,
+    dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },
     datafusion::refresh_sql,
     federated_table::FederatedTable,
     parameters::{ExposedParamLookup, ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 /// Default max records to scan to infer the schema
@@ -67,7 +68,7 @@ pub struct Kafka {
 }
 
 impl Kafka {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters) -> Result<Self> {
         let kafka_config = KafkaConfig {
             brokers: params
@@ -405,16 +406,18 @@ pub(crate) struct KafkaMetadata {
 }
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
-    let kafka_sys = KafkaSys::try_new(dataset).await.ok()?;
+    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::OpenExisting)
+        .await
+        .ok()?;
     kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &KafkaMetadata,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let debezium_kafka_sys = KafkaSys::try_new_create_if_not_exists(dataset).await?;
-    debezium_kafka_sys.upsert(metadata).await
+) -> Result<(), spice_sys::Error> {
+    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
+    kafka_sys.upsert(metadata).await
 }
 
 async fn bootstrap_new_kafka_consumer(
@@ -501,6 +504,7 @@ async fn bootstrap_new_kafka_consumer(
     if dataset.is_file_accelerated() {
         set_metadata_to_accelerator(dataset, &metadata)
             .await
+            .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
@@ -607,3 +611,5 @@ impl MetricsProvider for KafkaMetricsProvider {
         }
     }
 }
+
+register_data_connector!("kafka", KafkaFactory);

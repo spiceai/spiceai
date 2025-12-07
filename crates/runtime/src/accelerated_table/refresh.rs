@@ -14,15 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::metrics;
+use super::refresh_task_runner::RefreshTaskRunner;
+use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
@@ -33,17 +36,20 @@ use datafusion::datasource::TableProvider;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::{
+    SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics,
+};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use spicepod::metric::Metrics;
+use tokio::runtime::Handle;
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
-
-use super::metrics;
-use super::refresh_task_runner::RefreshTaskRunner;
-use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,6 +84,8 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
+    /// TTL for cache entries. Data older than this is considered stale.
+    pub(crate) caching_ttl: Option<Duration>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -121,7 +129,6 @@ pub(crate) enum NextRefresh {
 }
 
 impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn new(mode: RefreshMode) -> Self {
         Self {
@@ -181,6 +188,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
+        self.caching_ttl = Some(caching_ttl);
         self
     }
 
@@ -253,6 +266,11 @@ impl Refresh {
         refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> NextRefresh {
+        tracing::debug!(
+            "startup_next_refresh called with mode: {:?}, check_interval: {:?}",
+            self.mode,
+            self.check_interval
+        );
         let previous_checkpoint = match self.mode {
             RefreshMode::Full => {
                 // If there is no checkpoint, we need to start a refresh.
@@ -264,6 +282,24 @@ impl Refresh {
             // Append and Changes modes are always refreshed since they stream changes from the source table.
             RefreshMode::Append | RefreshMode::Changes => {
                 return NextRefresh::WaitFor(Duration::ZERO);
+            }
+            // Caching mode handles refreshes in two ways:
+            // 1. On-demand through cache misses (primary)
+            // 2. Periodic background refresh of stale data (if refresh_check_interval is set)
+            RefreshMode::Caching => {
+                // If refresh_check_interval is set, enable periodic refresh for stale data
+                if let Some(check_interval) = self.check_interval {
+                    tracing::info!(
+                        "Caching mode with refresh_check_interval={:?} - enabling periodic stale data refresh",
+                        check_interval
+                    );
+                    // Start the periodic timer - the first refresh will happen after check_interval
+                    return NextRefresh::WaitFor(check_interval);
+                }
+                tracing::debug!(
+                    "Caching mode without refresh_check_interval - on-demand refresh only"
+                );
+                return NextRefresh::Disabled;
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
@@ -366,6 +402,8 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::Struct(_)
         | arrow::datatypes::DataType::Union(_, _)
         | arrow::datatypes::DataType::Dictionary(_, _)
+        | arrow::datatypes::DataType::Decimal32(_, _)
+        | arrow::datatypes::DataType::Decimal64(_, _)
         | arrow::datatypes::DataType::Decimal128(_, _)
         | arrow::datatypes::DataType::Decimal256(_, _)
         | arrow::datatypes::DataType::Map(_, _)
@@ -401,6 +439,7 @@ impl Default for Refresh {
             append_overlap: None,
             retry_enabled: false,
             retry_max_attempts: None,
+            caching_ttl: None,
         }
     }
 }
@@ -408,13 +447,15 @@ impl Default for Refresh {
 pub(crate) enum AccelerationRefreshMode {
     Disabled,
     Full(Receiver<Option<RefreshOverrides>>),
-    Append(Option<Receiver<Option<RefreshOverrides>>>),
+    Append(Receiver<Option<RefreshOverrides>>),
     Changes(ChangesStream),
+    Caching(Receiver<Option<RefreshOverrides>>),
 }
 
 pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
+    metrics: Option<Metrics>,
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
@@ -425,11 +466,19 @@ pub struct Refresher {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
     synchronize_with: Option<SynchronizedTable>,
+    snapshot_behavior: SnapshotBehavior,
+    snapshot_local_path: Option<PathBuf>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     on_complete_notification: Option<Arc<Notify>>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator.
+    /// Shared with `CachingAccelerationScanExec`.
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -445,6 +494,7 @@ impl std::fmt::Debug for Refresher {
 }
 
 impl Refresher {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
@@ -452,6 +502,9 @@ impl Refresher {
         federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
+        cpu_runtime: Option<Handle>,
+        io_runtime: Handle,
+        cache_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -469,6 +522,13 @@ impl Refresher {
             disable_federation: false,
             semaphore: None,
             on_complete_notification: None,
+            snapshot_behavior: SnapshotBehavior::default(),
+            snapshot_local_path: None,
+            metrics: None,
+            cpu_runtime,
+            io_runtime,
+            resource_monitor: None,
+            cache_mutex,
         }
     }
 
@@ -512,6 +572,21 @@ impl Refresher {
         self
     }
 
+    pub fn with_metrics(&mut self, metrics: Option<Metrics>) -> &mut Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn with_snapshot_behavior(
+        &mut self,
+        snapshot_behavior: SnapshotBehavior,
+        snapshot_path: Option<PathBuf>,
+    ) -> &mut Self {
+        self.snapshot_behavior = snapshot_behavior;
+        self.snapshot_local_path = snapshot_path;
+        self
+    }
+
     #[must_use]
     pub fn on_complete_notification(&self) -> Option<Arc<Notify>> {
         self.on_complete_notification.clone()
@@ -525,6 +600,14 @@ impl Refresher {
     #[must_use]
     pub fn initial_load_completed(&self) -> bool {
         self.initial_load_completed.load(Ordering::Relaxed)
+    }
+
+    pub fn with_resource_monitor(
+        &mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> &mut Self {
+        self.resource_monitor = Some(monitor);
+        self
     }
 
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
@@ -542,11 +625,11 @@ impl Refresher {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
@@ -578,14 +661,15 @@ impl Refresher {
         };
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
-            (AccelerationRefreshMode::Disabled, _) => return None,
-            (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
-            | (AccelerationRefreshMode::Full(receiver), _) => receiver,
-            (AccelerationRefreshMode::Append(_), _) => {
-                return Some(self.start_streaming_append());
-            }
+            (AccelerationRefreshMode::Disabled, _) => return Ok(None),
+            (
+                AccelerationRefreshMode::Append(receiver)
+                | AccelerationRefreshMode::Full(receiver)
+                | AccelerationRefreshMode::Caching(receiver),
+                _,
+            ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                return Some(self.start_changes_stream(stream));
+                return Ok(Some(self.start_changes_stream(stream)));
             }
         };
 
@@ -596,6 +680,8 @@ impl Refresher {
             self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
+            self.io_runtime.clone(),
+            Arc::clone(&self.cache_mutex),
         )
         .with_disable_federation(self.disable_federation);
 
@@ -603,9 +689,18 @@ impl Refresher {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
 
+        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+
+        refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
+
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            refresh_task_runner =
+                refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
+
         let mut refresh_task_runner = refresh_task_runner.build();
 
-        let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start();
+        let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
         self.refresh_task_runner = Some(refresh_task_runner);
 
         let notifier = self.on_complete_notification.clone();
@@ -622,6 +717,22 @@ impl Refresher {
         let synchronize_with = self.synchronize_with.clone();
         let federated_schema = self.federated.schema();
 
+        let snapshot_manager = match (
+            self.snapshot_behavior.create_enabled(),
+            self.snapshot_local_path.clone(),
+        ) {
+            (true, Some(snapshot_local_path)) => Some(
+                SnapshotManager::try_new(
+                    self.dataset_name.to_string(),
+                    self.snapshot_behavior.clone(),
+                    snapshot_local_path,
+                )
+                .await,
+            ),
+            _ => None,
+        }
+        .flatten();
+
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
         //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`
@@ -631,15 +742,16 @@ impl Refresher {
         //   1. Periodic and manual refreshes happening at the same time
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
-        Some(tokio::spawn(async move {
+        Ok(Some(tokio::spawn(async move {
             let mut next_scheduled_refresh_timer =
                 initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
-                    match next_scheduled_refresh_timer.take() {
-                        Some(timer) => Box::pin(timer),
-                        None => Box::pin(std::future::pending()),
+                    if let Some(timer) = next_scheduled_refresh_timer.take() {
+                        Box::pin(timer)
+                    } else {
+                        Box::pin(std::future::pending())
                     };
 
                 select! {
@@ -666,7 +778,7 @@ impl Refresher {
                     Some(res) = on_refresh_complete.recv() => {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
-                        if let Ok(()) = res {
+                        if matches!(res, Ok(())) {
                             notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
                             initial_load_completed.store(true, Ordering::Relaxed);
 
@@ -674,14 +786,28 @@ impl Refresher {
                                 // No cache provider means runtime is shutting down and cache is already cleaned up
                                 if let Some(cache_provider) = cache_provider_ref.upgrade()
                                     && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                        tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
                                     }
                             }
 
-                            if let Some(checkpointer) = &checkpointer
-                                && let Err(e) = checkpointer.checkpoint(&federated_schema).await {
-                                    tracing::warn!("Failed to checkpoint dataset {}: {e}", &dataset_name.to_string());
+                            if let Some(checkpointer) = &checkpointer {
+                                match (checkpointer.checkpoint(&federated_schema).await, snapshot_manager.as_ref()) {
+                                    (Ok(()), Some(snapshot_manager)) => {
+                                        if let Err(e) = snapshot_manager
+                                            .create_snapshot(&federated_schema)
+                                            .await
+                                        {
+                                            let dataset_label = dataset_name.to_string();
+                                            snapshot_metrics::record_snapshot_failure(&dataset_label);
+                                            tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
+                                        }
+                                    }
+                                    (Err(e), _) => {
+                                        tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+                                    }
+                                    (_, None) => {}
                                 }
+                            }
                         }
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
@@ -704,7 +830,7 @@ impl Refresher {
                     }
                 }
             }
-        }))
+        })))
     }
 
     /// Subscribes a new table provider to receive refresh notifications from an existing full refresh mode accelerated table
@@ -713,10 +839,11 @@ impl Refresher {
     ///
     /// Panics if this function is called on an accelerated table that is not configured with a full refresh mode
     pub async fn add_synchronized_table(&self, synchronized_table: SynchronizedTable) {
-        assert!(
-            matches!(self.refresh.read().await.mode, RefreshMode::Full),
-            "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
-        );
+        if !matches!(self.refresh.read().await.mode, RefreshMode::Full) {
+            unreachable!(
+                "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
+            );
+        }
 
         if let Some(refresh_task_runner) = &self.refresh_task_runner {
             refresh_task_runner
@@ -727,35 +854,6 @@ impl Refresher {
                 "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
             );
         }
-    }
-
-    fn start_streaming_append(&mut self) -> tokio::task::JoinHandle<()> {
-        let refresh_task = Arc::new(
-            RefreshTask::builder(
-                Arc::clone(&self.runtime_status),
-                self.dataset_name.clone(),
-                Arc::clone(&self.federated),
-                self.federated_source.clone(),
-                Arc::clone(&self.accelerator),
-            )
-            .with_disable_federation(self.disable_federation)
-            .build(),
-        );
-
-        let refresh_defaults = Arc::clone(&self.refresh);
-
-        let caching = self.caching.clone();
-        let initial_load_completed = Arc::clone(&self.initial_load_completed);
-
-        let notifier = self.on_complete_notification.clone();
-        tokio::spawn(async move {
-            if let Err(err) = refresh_task
-                .start_streaming_append(caching, notifier, refresh_defaults, initial_load_completed)
-                .await
-            {
-                tracing::error!("Append refresh failed with error: {err}");
-            }
-        })
     }
 
     fn start_changes_stream(
@@ -769,8 +867,12 @@ impl Refresher {
                 Arc::clone(&self.federated),
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
+                self.io_runtime.clone(),
+                Arc::clone(&self.cache_mutex),
             )
             .with_disable_federation(self.disable_federation)
+            .with_cpu_runtime(self.cpu_runtime.clone())
+            .with_metrics(self.metrics.clone())
             .build(),
         );
 
@@ -845,7 +947,7 @@ mod tests {
     use prometheus::proto::MetricType;
     use tokio::{sync::mpsc, time::timeout};
 
-    use crate::dataaccelerator::spice_sys::{Result, dataset_checkpoint::DatasetCheckpointer};
+    use crate::dataaccelerator::spice_sys::Result;
     use crate::status;
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
@@ -876,17 +978,24 @@ mod tests {
             self.exists_value
         }
 
-        async fn checkpoint(&self, _schema: &SchemaRef) -> Result<()> {
+        async fn checkpoint(
+            &self,
+            _schema: &SchemaRef,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(())
         }
 
-        async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+        async fn get_schema(
+            &self,
+        ) -> Result<Option<SchemaRef>, Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(None)
         }
 
-        async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
+        async fn last_checkpoint_time(
+            &self,
+        ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.last_checkpoint_time)
         }
     }
@@ -932,13 +1041,19 @@ mod tests {
             Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
 
         let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-        let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+        let refresh_handle = refresher
+            .start(acceleration_refresh_mode)
+            .await
+            .expect("Should start refresh task");
 
         trigger
             .send(None)
@@ -1015,15 +1130,12 @@ mod tests {
         ) -> bool {
             for _attempt in 0..max_attempts {
                 let metrics = registry.gather();
-                if let Some(metric) = metrics
-                    .iter()
-                    .find(|m| m.get_name() == "dataset_load_state")
-                    && metric.get_field_type() == MetricType::GAUGE
+                if let Some(metric) = metrics.iter().find(|m| {
+                    m.name() == "dataset_load_state" && m.get_field_type() == MetricType::GAUGE
+                }) && let Some(gauge) = metric.get_metric()[0].get_gauge().as_ref()
+                    && gauge.value().is_eq(f64::from(desired as i32))
                 {
-                    let value = metric.get_metric()[0].get_gauge().get_value();
-                    if value.is_eq(f64::from(desired as i32)) {
-                        return true;
-                    }
+                    return true;
                 }
                 tokio::time::sleep(delay).await;
             }
@@ -1032,7 +1144,7 @@ mod tests {
 
         let registry = prometheus::Registry::new();
 
-        let resource = Resource::default();
+        let resource = Resource::builder().build();
 
         let prometheus_exporter = opentelemetry_prometheus::exporter()
             .with_registry(registry.clone())
@@ -1094,7 +1206,7 @@ mod tests {
         );
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_iso8601() {
         async fn test(
@@ -1140,13 +1252,19 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
 
             trigger
                 .send(None)
@@ -1240,7 +1358,7 @@ mod tests {
         .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp() {
         async fn test(
@@ -1294,13 +1412,19 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
 
             trigger
                 .send(None)
@@ -1414,7 +1538,7 @@ mod tests {
         .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp_with_more_complicated_structs() {
         async fn test(
@@ -1498,13 +1622,19 @@ mod tests {
                 Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
+                None,
+                Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
-            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
-            let refresh_handle = refresher.start(acceleration_refresh_mode).await;
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
             trigger
                 .send(None)
                 .await
@@ -1639,11 +1769,9 @@ mod tests {
     fn test_validate_time_column_when_no_time_column() {
         let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1758,11 +1886,9 @@ mod tests {
             .time_format(TimeFormat::ISO8601);
 
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1777,11 +1903,9 @@ mod tests {
                 DataType::Int64,
                 false,
             )]));
-            assert!(
-                refresh
-                    .validate_time_format("dataset_name".to_string(), &schema)
-                    .is_ok()
-            );
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .expect("should validate successfully");
         }
     }
 
@@ -1796,11 +1920,9 @@ mod tests {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
             false,
         )]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1814,11 +1936,9 @@ mod tests {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
             false,
         )]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1832,11 +1952,9 @@ mod tests {
             DataType::Date32,
             false,
         )]));
-        assert!(
-            refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok()
-        );
+        refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .expect("should validate successfully");
     }
 
     #[test]
@@ -1865,7 +1983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_startup_next_refresh() {
         struct TestCase {
             description: &'static str,
@@ -2030,7 +2148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_startup_next_refresh_wait_time() {
         struct TestCase {
             description: &'static str,

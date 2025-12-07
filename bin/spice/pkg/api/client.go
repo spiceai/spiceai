@@ -23,8 +23,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"strings"
+	"time"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
@@ -79,22 +82,39 @@ func (s *SpiceApiClient) GetBaseUrl() string {
 }
 
 func (s *SpiceApiClient) GetAuthUrl(authCode string) string {
-	return fmt.Sprintf("%s/auth/token?code=%s", s.baseUrl, authCode)
+	endpoint, err := buildSpiceURL(s.baseUrl, []string{"auth", "token"}, map[string]string{"code": authCode})
+	if err != nil {
+		return fmt.Sprintf("%s/auth/token?code=%s", s.baseUrl, url.QueryEscape(authCode))
+	}
+	return endpoint
 }
 
 func (s *SpiceApiClient) GetAuthContext(accessToken string, orgName *string, appName *string) (SpiceAuthContext, error) {
 	var spiceAuthContext SpiceAuthContext
 
-	url := fmt.Sprintf("%s/api/spice-cli/auth?org_name=%s&app_name=%s", s.baseUrl, *orgName, *appName)
+	query := make(map[string]string)
+	if orgName != nil {
+		query["org_name"] = *orgName
+	}
+	if appName != nil {
+		query["app_name"] = *appName
+	}
 
-	request, err := http.NewRequest("GET", url, nil)
+	endpoint, err := buildSpiceURL(s.baseUrl, []string{"api", "spice-cli", "auth"}, query)
+	if err != nil {
+		return spiceAuthContext, err
+	}
+
+	request, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return spiceAuthContext, err
 	}
 
 	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return spiceAuthContext, err
@@ -137,7 +157,9 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return authStatusResponse, err
@@ -160,4 +182,48 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 	}
 
 	return authStatusResponse, nil
+}
+
+func buildSpiceURL(base string, segments []string, query map[string]string) (string, error) {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+
+	trimmedSegments := make([]string, 0, len(segments)+1)
+	if parsed.Path != "" && parsed.Path != "/" {
+		trimmedSegments = append(trimmedSegments, strings.Trim(parsed.Path, "/"))
+	}
+	for _, segment := range segments {
+		trimmed := strings.Trim(segment, "/")
+		if trimmed != "" {
+			trimmedSegments = append(trimmedSegments, trimmed)
+		}
+	}
+
+	if len(trimmedSegments) > 0 {
+		joined := path.Join(trimmedSegments...)
+		if !strings.HasPrefix(joined, "/") {
+			joined = "/" + joined
+		}
+		parsed.Path = joined
+	} else {
+		parsed.Path = ""
+	}
+
+	q := parsed.Query()
+	for key, value := range query {
+		if value == "" {
+			continue
+		}
+		q.Set(key, value)
+	}
+
+	if len(q) > 0 {
+		parsed.RawQuery = q.Encode()
+	} else {
+		parsed.RawQuery = ""
+	}
+
+	return parsed.String(), nil
 }

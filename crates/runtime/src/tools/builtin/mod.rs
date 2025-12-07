@@ -16,10 +16,10 @@ limitations under the License.
 use super::SpiceModelTool;
 
 pub mod catalog;
-pub mod document_similarity;
 pub mod get_readiness;
 pub mod list_datasets;
 pub mod sample;
+pub mod search;
 pub mod sql;
 pub mod table_schema;
 pub mod web_search;

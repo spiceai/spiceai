@@ -17,10 +17,11 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
-use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
+use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
+use crate::register_data_connector;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -69,7 +70,7 @@ pub struct Debezium {
 }
 
 impl Debezium {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters) -> Result<Self> {
         let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
@@ -231,6 +232,8 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 }
 
+register_data_connector!("debezium", DebeziumFactory);
+
 #[async_trait]
 impl DataConnector for Debezium {
     fn as_any(&self) -> &dyn Any {
@@ -356,7 +359,11 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
@@ -391,15 +398,18 @@ pub(crate) struct DebeziumKafkaMetadata {
 }
 
 async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset).await.ok()?;
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset, OpenOption::OpenExisting)
+        .await
+        .ok()?;
     debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
+) -> Result<(), spice_sys::Error> {
+    let debezium_kafka_sys =
+        DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     debezium_kafka_sys.upsert(metadata).await
 }
 
@@ -491,6 +501,7 @@ async fn get_metadata_from_kafka(
     if dataset.is_file_accelerated() {
         set_metadata_to_accelerator(dataset, &metadata)
             .await
+            .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
                 connector_component: ConnectorComponent::from(dataset),

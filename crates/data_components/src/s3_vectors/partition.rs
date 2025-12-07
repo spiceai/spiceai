@@ -20,9 +20,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use snafu::prelude::*;
-use twox_hash::XxHash64;
-
-const HASH_SEED: u64 = 7;
+use twox_hash::XxHash3_64;
 
 const INDEX_NAME_MAX_LENGTH: usize = 45;
 const COLUMN_NAME_MAX_LENGTH: usize = 5;
@@ -34,6 +32,8 @@ const _NUM_SEPARATORS: usize = 3; // 3 periods '.' separate the 4 parts
 const _S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
 
 // Check at compile time that we use the full amount allowed from S3
+#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
+#[allow(unfulfilled_lint_expectations)]
 const _: () = {
     assert!(
         INDEX_NAME_MAX_LENGTH
@@ -55,10 +55,10 @@ pub enum Error {
     IncorrectNumPartsInName { num_parts: usize },
     #[snafu(display("The 'partition_by' expression, {expr}, is not supported"))]
     UnsupportedPartitionByExpression { expr: Box<Expr> },
-    #[snafu(display("Index names cannot contain hyphens"))]
-    InvalidIndexNameHyphen,
+    #[snafu(display("Index name, '{index}', cannot contain periods when using 'partition_by'"))]
+    InvalidIndexNamePeriod { index: String },
     #[snafu(display(
-        "Index names are restricted to {INDEX_NAME_MAX_LENGTH} characters, but {index} is {len} characters"
+        "Index names are restricted to {INDEX_NAME_MAX_LENGTH} characters when using 'partition_by', but {index} is {len} characters"
     ))]
     InvalidIndexNameLength { index: String, len: usize },
 }
@@ -83,19 +83,19 @@ impl PartitionedIndexName {
     pub fn new(
         index_name: &str,
         column_name: &str,
-        partition_value: &ScalarValue,
         partition_by: &[Expr],
+        partition_value: &ScalarValue,
     ) -> Result<Self, Error> {
         validate_index(index_name)?;
         let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
         let column_name_hash = truncate(&hash_to_hex(column_name), COLUMN_NAME_MAX_LENGTH);
-        let partition_value_hash = truncate(
-            &hash_to_hex(&partition_value.to_string()),
-            PARTITION_VALUE_MAX_LENGTH,
-        );
         let partition_by_hash = truncate(
             &hash_to_hex(&to_stable_string(partition_by)?),
             PARTITION_BY_MAX_LENGTH,
+        );
+        let partition_value_hash = truncate(
+            &hash_to_hex(&partition_value.to_string()),
+            PARTITION_VALUE_MAX_LENGTH,
         );
         Ok(Self {
             index_name,
@@ -105,14 +105,29 @@ impl PartitionedIndexName {
         })
     }
 
+    pub fn common_prefix(
+        index_name: &str,
+        column_name: &str,
+        partition_by: &[Expr],
+    ) -> Result<String, Error> {
+        validate_index(index_name)?;
+        let index_name = truncate(&sanitize_column(index_name), INDEX_NAME_MAX_LENGTH);
+        let column_name_hash = truncate(&hash_to_hex(column_name), COLUMN_NAME_MAX_LENGTH);
+        let partition_by_hash = truncate(
+            &hash_to_hex(&to_stable_string(partition_by)?),
+            PARTITION_BY_MAX_LENGTH,
+        );
+        Ok([index_name, column_name_hash, partition_by_hash].join(PARTS_SEPARATOR))
+    }
+
     /// Format an index name suitable for S3 Vectors
     #[must_use]
     pub fn to_index_name(&self) -> String {
         [
-            self.index_name.clone(),
-            self.column_name_hash.clone(),
-            self.partition_value_hash.clone(),
-            self.partition_by_hash.clone(),
+            self.index_name.as_str(),
+            self.column_name_hash.as_str(),
+            self.partition_by_hash.as_str(),
+            self.partition_value_hash.as_str(),
         ]
         .join(PARTS_SEPARATOR)
     }
@@ -124,8 +139,8 @@ impl PartitionedIndexName {
         Ok(Self {
             index_name: parts[0].to_string(),
             column_name_hash: parts[1].to_string(),
-            partition_value_hash: parts[2].to_string(),
-            partition_by_hash: parts[3].to_string(),
+            partition_by_hash: parts[2].to_string(),
+            partition_value_hash: parts[3].to_string(),
         })
     }
 
@@ -157,7 +172,7 @@ impl PartitionedIndexName {
 }
 
 fn sanitize_column(s: &str) -> String {
-    s.replace('_', "-")
+    s.replace(['_', '.'], "-")
 }
 
 fn validate_index(index: &str) -> Result<(), Error> {
@@ -169,7 +184,7 @@ fn validate_index(index: &str) -> Result<(), Error> {
             len
         }
     );
-    ensure!(!index.contains('-'), InvalidIndexNameHyphenSnafu);
+    ensure!(!index.contains('.'), InvalidIndexNamePeriodSnafu { index });
 
     Ok(())
 }
@@ -179,7 +194,7 @@ fn truncate(s: &str, len: usize) -> String {
 }
 
 fn hash_to_hex(input: &str) -> String {
-    let hash = XxHash64::oneshot(HASH_SEED, input.as_bytes());
+    let hash = XxHash3_64::oneshot(input.as_bytes());
     format!("{hash:x}")
 }
 
@@ -192,7 +207,7 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, Error> {
         .join(PARTS_SEPARATOR))
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
     Ok(match expr {
         Expr::Column(col) => {
@@ -332,8 +347,14 @@ mod tests {
         let index_name = "mydataset";
         let column_name = "_my.column";
         let partition_by = &[col(column_name)];
+        let partition_value = ScalarValue::from("blahh");
 
-        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.b0543.7f7c5")?;
+        // Generate the partitioned index name using the actual hashing logic
+        let partitioned_name =
+            PartitionedIndexName::new(index_name, column_name, partition_by, &partition_value)?;
+        let generated_index = partitioned_name.to_index_name();
+
+        let this = PartitionedIndexName::from_index_name(&generated_index)?;
 
         assert_eq!(
             this.belongs_with(index_name, column_name, partition_by),
@@ -362,10 +383,8 @@ mod tests {
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        assert!(
-            PartitionedIndexName::new(&index_name, column_name, &partition_value, &partition_by)
-                .is_err()
-        );
+        PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
+            .expect_err("Should error on long index name");
     }
 
     #[test]
@@ -376,7 +395,7 @@ mod tests {
         let partition_by = vec![col("col1")];
 
         let result =
-            PartitionedIndexName::new(index_name, column_name, &partition_value, &partition_by)?;
+            PartitionedIndexName::new(index_name, column_name, &partition_by, &partition_value)?;
 
         assert_eq!(result.index_name, "test-index");
         assert_eq!(result.column_name_hash.len(), COLUMN_NAME_MAX_LENGTH);
@@ -391,13 +410,13 @@ mod tests {
 
     #[test]
     fn from_index_name_valid() -> Result<()> {
-        let name = "test-index.test-col.12345.abcde";
+        let name = "test-index.test-col.abcde.12345";
         let result = PartitionedIndexName::from_index_name(name)?;
 
         assert_eq!(result.index_name, "test-index");
         assert_eq!(result.column_name_hash, "test-col");
-        assert_eq!(result.partition_value_hash, "12345");
         assert_eq!(result.partition_by_hash, "abcde");
+        assert_eq!(result.partition_value_hash, "12345");
 
         Ok(())
     }
@@ -407,7 +426,7 @@ mod tests {
         let name = "test.index.col";
         let result = PartitionedIndexName::from_index_name(name);
 
-        assert!(result.is_err());
+        result.expect_err("Should error on invalid index name parts");
     }
 
     #[test]
@@ -437,15 +456,15 @@ mod tests {
         let index = PartitionedIndexName {
             index_name: "idx".to_string(),
             column_name_hash: "col".to_string(),
-            partition_value_hash: "12345".to_string(),
             partition_by_hash: "abcde".to_string(),
+            partition_value_hash: "12345".to_string(),
         };
 
         let result = index.to_index_name();
-        assert_eq!(result, "idx.col.12345.abcde");
+        assert_eq!(result, "idx.col.abcde.12345");
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Hash, PartialEq, Eq)]
     struct Bucket {
         signature: Signature,
     }

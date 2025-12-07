@@ -18,11 +18,11 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
-    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
-    OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::{
         access::AccessMode,
@@ -32,6 +32,7 @@ use crate::{
             builder::DatasetBuilder,
         },
     },
+    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -77,7 +78,6 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         let initialized_datasets = self.initialize_datasets_accelerators(&valid_datasets).await;
-
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
@@ -253,6 +253,15 @@ impl Runtime {
     async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
+        if let Err(err) = validate_dataset(&ds) {
+            let ds_name = &ds.name;
+            metrics::datasets::LOAD_ERROR.add(1, &[]);
+            error_spaced!(spaced_tracer, "{}{err}", "");
+            self.status
+                .update_dataset(ds_name, status::ComponentStatus::Error);
+            return;
+        }
+
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
@@ -294,7 +303,7 @@ impl Runtime {
         .await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn register_loaded_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -461,7 +470,7 @@ impl Runtime {
 
         // Updating a dataset may cause the cached LogicalPlans to be
         // obsolete, so we remove them
-        self.df.clear_cached_plans();
+        self.df.clear_cached_plans().await;
 
         match Arc::clone(&self)
             .load_dataset_connector(Arc::clone(&ds))
@@ -471,10 +480,12 @@ impl Runtime {
                 // File accelerated datasets don't support hot reload.
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
-                    if let Ok(()) = Arc::clone(&self)
-                        .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
-                        .await
-                    {
+                    if matches!(
+                        Arc::clone(&self)
+                            .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
+                            .await,
+                        Ok(())
+                    ) {
                         self.status
                             .update_dataset(&ds.name, status::ComponentStatus::Ready);
                         return;
@@ -596,7 +607,7 @@ impl Runtime {
         let source = ds.source();
 
         let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .build(self.secrets())
+            .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
@@ -693,6 +704,13 @@ impl Runtime {
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
             })?;
+
+        // Warn if Turso engine is being used
+        if accelerator_engine == crate::component::dataset::acceleration::Engine::Turso {
+            tracing::warn!(
+                "Turso data accelerator (Alpha) is in preview and should not be used in production."
+            );
+        }
 
         // The accelerated refresh task will set the dataset status to `Ready` once it finishes loading.
         self.status
@@ -799,45 +817,57 @@ impl Runtime {
 
         let mut initialized_datasets = vec![];
         for ds in datasets {
-            if let Some(acceleration_settings) = &ds.acceleration {
-                let accelerator = match self
-                    .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration_settings.engine)
-                    .await
-                    .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    }) {
-                    Ok(accelerator) => accelerator,
-                    Err(err) => {
-                        let ds_name = &ds.name;
-                        self.status
-                            .update_dataset(ds_name, status::ComponentStatus::Error);
-                        metrics::datasets::LOAD_ERROR.add(1, &[]);
-                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                        continue;
-                    }
-                };
+            // Non-accelerated datasets or disabled acceleration are always successfully initialized
+            if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
+                initialized_datasets.push(Arc::clone(ds));
+                continue;
+            }
 
-                match accelerator.init(ds.as_ref()).await.context(
-                    AcceleratorInitializationFailedSnafu {
-                        name: acceleration_settings.engine.to_string(),
-                    },
-                ) {
-                    Ok(()) => {
-                        initialized_datasets.push(Arc::clone(ds));
-                    }
-                    Err(err) => {
-                        let ds_name = &ds.name;
-                        self.status
-                            .update_dataset(ds_name, status::ComponentStatus::Error);
-                        metrics::datasets::LOAD_ERROR.add(1, &[]);
-                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    }
+            let Some(acceleration_settings) = &ds.acceleration else {
+                unreachable!("acceleration is Some and enabled");
+            };
+
+            let accelerator = match self
+                .accelerator_engine_registry
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineNotAvailableSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                }) {
+                Ok(accelerator) => accelerator,
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    continue;
                 }
-            } else {
-                initialized_datasets.push(Arc::clone(ds)); // non-accelerated datasets are always successfully initialized
+            };
+
+            match accelerator.init(ds.as_ref()).await.context(
+                AcceleratorInitializationFailedSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                },
+            ) {
+                Ok(()) => {
+                    initialized_datasets.push(Arc::clone(ds));
+                }
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                }
             }
         }
+
+        let snapshot_sources: Vec<Arc<dyn AccelerationSource>> = initialized_datasets
+            .iter()
+            .map(|ds| ds.clone_arc())
+            .collect();
+        validate_snapshot_paths(snapshot_sources).await;
 
         initialized_datasets
     }
@@ -875,4 +905,15 @@ pub struct RegisterDatasetContext {
     federated_read_table: FederatedTable,
     source: String,
     accelerated_table: Option<Arc<AcceleratedTable>>,
+}
+
+#[expect(clippy::result_large_err)]
+fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
+    if ds.has_full_text_column() && !ds.is_accelerated() {
+        return Err(FullTextSearchRequiresAccelerationSnafu {
+            dataset_name: ds.name.to_string(),
+        }
+        .build());
+    }
+    Ok(())
 }
