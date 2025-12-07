@@ -86,14 +86,20 @@ pub trait CommitChange {
 pub struct ChangeEnvelope {
     change_committer: Box<dyn CommitChange + Send>,
     pub change_batch: ChangeBatch,
+    is_dataset_ready: bool,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
+    pub fn new(
+        change_committer: Box<dyn CommitChange + Send>,
+        change_batch: ChangeBatch,
+        is_dataset_ready: bool,
+    ) -> Self {
         Self {
             change_committer,
             change_batch,
+            is_dataset_ready,
         }
     }
 
@@ -102,19 +108,30 @@ impl ChangeEnvelope {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
-        (self.change_committer, self.change_batch)
+    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch, bool) {
+        (
+            self.change_committer,
+            self.change_batch,
+            self.is_dataset_ready,
+        )
     }
 
     #[must_use]
     pub fn from_parts(
         change_committer: Box<dyn CommitChange + Send>,
         change_batch: ChangeBatch,
+        is_dataset_ready: bool,
     ) -> Self {
         Self {
             change_committer,
             change_batch,
+            is_dataset_ready,
         }
+    }
+
+    #[must_use]
+    pub fn is_dataset_ready(&self) -> bool {
+        self.is_dataset_ready
     }
 }
 

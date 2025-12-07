@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-duckdb[file]-append_upsert
+name: file[parquet]-duckdb[file]-append_retention_sql
 
 refresh_check_interval: &refresh_check_interval 30s
 
@@ -18,6 +18,8 @@ datasets:
       primary_key: c_custkey
       on_conflict:
         c_custkey: upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM customer WHERE c_custkey >=  1000000000
 
   - from: file:lineitem.parquet
     name: lineitem
@@ -32,6 +34,8 @@ datasets:
       primary_key: '(l_orderkey, l_linenumber)'
       on_conflict:
         '(l_orderkey, l_linenumber)': upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM lineitem WHERE l_orderkey >=  1000000000
 
   - from: file:nation.parquet
     name: nation
@@ -46,6 +50,8 @@ datasets:
       primary_key: n_nationkey
       on_conflict:
         n_nationkey: upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM nation WHERE n_nationkey >=  1000000000
 
   - from: file:orders.parquet
     name: orders
@@ -60,6 +66,8 @@ datasets:
       primary_key: o_orderkey
       on_conflict:
         o_orderkey: upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM orders WHERE o_orderkey >=  1000000000
 
   - from: file:part.parquet
     name: part
@@ -74,6 +82,8 @@ datasets:
       primary_key: p_partkey
       on_conflict:
         p_partkey: upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM part WHERE p_partkey >=  1000000000
 
   - from: file:partsupp.parquet
     name: partsupp
@@ -88,6 +98,8 @@ datasets:
       primary_key: '(ps_partkey, ps_suppkey)'
       on_conflict:
         '(ps_partkey, ps_suppkey)': upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM partsupp WHERE ps_partkey >=  1000000000
 
   - from: file:region.parquet
     name: region
@@ -102,6 +114,8 @@ datasets:
       primary_key: r_regionkey
       on_conflict:
         r_regionkey: upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM region WHERE r_regionkey >=  1000000000
 
   - from: file:supplier.parquet
     name: supplier
@@ -116,3 +130,5 @@ datasets:
       primary_key: s_suppkey
       on_conflict:
         s_suppkey: upsert
+      retention_check_enabled: true
+      retention_sql: DELETE FROM supplier WHERE s_suppkey >=  1000000000

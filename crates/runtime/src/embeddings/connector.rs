@@ -154,7 +154,7 @@ impl EmbeddingConnector {
             e
         })?;
 
-        let (change_committer, batch) = envelope.into_parts();
+        let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(
@@ -182,7 +182,11 @@ impl EmbeddingConnector {
         let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
             .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
+        Ok(ChangeEnvelope::new(
+            change_committer,
+            new_change_batch,
+            is_dataset_ready,
+        ))
     }
 }
 

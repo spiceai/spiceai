@@ -22,6 +22,8 @@ use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::{DeletionTableProvider, get_deletion_provider};
+#[cfg(feature = "dynamodb")]
+use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
@@ -95,9 +97,11 @@ impl RefreshTask {
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
 
-                            // Mark the dataset as ready after the first message is received. This covers both streaming append and CDC modes.
-                            self.update_component_status(status::ComponentStatus::Ready)
-                                .await;
+                            // Mark the dataset as ready if possible
+                            if change_envelope.is_dataset_ready() {
+                                self.update_component_status(status::ComponentStatus::Ready)
+                                    .await;
+                            }
 
                             if let Err(e) = change_envelope.commit()
                                 && !self.runtime_status.is_shutdown()
@@ -162,7 +166,8 @@ impl RefreshTask {
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
-        tracing::trace!(
+        // TODO: Should be trace
+        tracing::info!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
             self.dataset_name,
             change_batch.record.num_rows(),
@@ -491,6 +496,19 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
                 );
             }
         }
+        return StreamErrorType::Fatal;
+    }
+
+    #[cfg(feature = "dynamodb")]
+    if matches!(
+        err,
+        cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage {
+            source: dynamodb_streams::Error::StreamBeyondRetention,
+        })
+    ) {
+        tracing::error!(
+            "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
+        );
         return StreamErrorType::Fatal;
     }
 

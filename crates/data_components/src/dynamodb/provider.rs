@@ -55,15 +55,14 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use dynamodb_streams::Client as StreamsClient;
-use dynamodb_streams::checkpoint::Checkpoint;
+use dynamodb_streams::{Checkpoint, Client as StreamsClient};
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, BoxStream, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -97,6 +96,7 @@ impl DynamoDBTableProvider {
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
+                // .buffer(NonZeroUsize::new(1).unwrap())
                 .build(),
         );
 
@@ -267,8 +267,12 @@ impl DynamoDBTableProvider {
     pub async fn stream_from_checkpoint(
         &self,
         checkpoint: Checkpoint,
-    ) -> Result<BoxStream<'static, Result<(ChangeBatch, Checkpoint), crate::cdc::StreamError>>>
-    {
+    ) -> Result<
+        BoxStream<
+            'static,
+            Result<(ChangeBatch, Checkpoint, Option<SystemTime>), crate::cdc::StreamError>,
+        >,
+    > {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
