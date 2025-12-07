@@ -165,7 +165,6 @@ impl DynamodbStreamProducer {
                     if let Some(watermark) = batch.watermark
                         && let Ok(mut wm) = self.metrics_collector.watermark.write()
                     {
-                        println!("Set watermark {watermark:?}");
                         *wm = Some(watermark);
                     }
 
