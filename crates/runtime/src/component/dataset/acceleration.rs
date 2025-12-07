@@ -429,7 +429,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
-        let snapshot_trigger_batches = parse_snapshots_trigger_batches(&mut params)?;
+        let snapshot_trigger_batches =
+            parse_duration_param(&mut params, "snapshots_trigger_batches");
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
@@ -551,7 +552,29 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
 fn parse_snapshots_trigger_batches(
     params: &mut Option<Params>,
 ) -> Result<Option<u8>, crate::Error> {
-    todo!()
+    if let Some(params) = params
+        && let Some(value) = params.data.remove("snapshots_trigger_batches")
+    {
+        match value {
+            spicepod::param::ParamValue::String(s) => {
+                let value: u8 = s.parse().map_err(|_e| {
+                    crate::Error::InvalidAccelerationConfiguration {
+                        source: format!(
+                            "Invalid 'snapshots_trigger_batches' param value: {s:?}. Expected a number between 0-255."
+                        ).into(),
+                    }
+                })?;
+                Ok(Some(value))
+            }
+            _ => Err(crate::Error::InvalidAccelerationConfiguration {
+                source: format!(
+                    "Invalid 'snapshots_trigger_batches' param value: {value:?}. Expected a string number."
+                ).into(),
+            }),
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 /// Parse `caching_ttl` duration from params for caching mode.
