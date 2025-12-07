@@ -92,13 +92,12 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.as_ref() {
-                                ready_sender.notify_waiters();
-                            }
-                            initial_load_completed.store(true, Ordering::Relaxed);
-
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
+                                initial_load_completed.store(true, Ordering::Relaxed);
+                                if let Some(ready_sender) = ready_sender.as_ref() {
+                                    ready_sender.notify_waiters();
+                                }
                                 self.update_component_status(status::ComponentStatus::Ready)
                                     .await;
                             }
@@ -164,8 +163,7 @@ impl RefreshTask {
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
-        // TODO: Should be trace
-        tracing::info!(
+        tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
             self.dataset_name,
             change_batch.record.num_rows(),
@@ -211,12 +209,7 @@ impl RefreshTask {
         let indices_array = UInt32Array::from(
             row_indices
                 .iter()
-                .map(|&i| {
-                    u32::try_from(i).unwrap_or_else(|_| {
-                        tracing::error!("Index {i} doesn't fit in u32, using 0");
-                        0
-                    })
-                })
+                .filter_map(|&i| u32::try_from(i).ok())
                 .collect::<Vec<_>>(),
         );
 
