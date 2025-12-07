@@ -103,7 +103,7 @@ impl DynamoDBTableProvider {
         metrics_collector: Arc<MetricsCollector>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
-        #[expect(unsafe_code, )]
+        #[expect(unsafe_code)]
         let buffer_size = unsafe { NonZeroUsize::new_unchecked(1) };
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())

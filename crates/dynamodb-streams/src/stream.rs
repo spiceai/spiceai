@@ -103,10 +103,7 @@ impl DynamodbStreamProducer {
             }
         }
 
-        Ok((
-            combine_shard_batches(&poll_results),
-            had_transient_error,
-        ))
+        Ok((combine_shard_batches(&poll_results), had_transient_error))
     }
 
     async fn initialize_shards_iterators(&mut self) -> Result<()> {
