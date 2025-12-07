@@ -249,7 +249,7 @@ impl StreamState {
             }
 
             if ancestors.contains(&shard_id) {
-                tracing::debug!(
+                tracing::trace!(
                     "Skipping ancestor shard: id={}, already exhausted",
                     shard_id
                 );

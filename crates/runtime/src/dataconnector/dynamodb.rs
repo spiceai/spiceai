@@ -301,7 +301,7 @@ impl DataConnector for DynamoDB {
                         .ok()?
                         .map(move |msg| {
                             msg.map(|change_batch| {
-                                tracing::info!("Bootstrapping DynamoDB table: table_name={}, records={}", dataset_name.clone(), change_batch.record.num_rows());
+                                tracing::info!("Bootstrapping DynamoDB table {}, records={}", dataset_name.clone(), change_batch.record.num_rows());
                                 // Bootstrap stream doesn't commit changes and doesn't mark dataset as ready
                                 ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false)
                             })
@@ -315,8 +315,9 @@ impl DataConnector for DynamoDB {
                         bootstrap_stream
                             .chain(
                                 stream::once(async move {
-                                    tracing::info!("Bootstrapping DynamoDB table complete, starting changes stream. \
-                                        Note it will take some time for table to catch up: table_name={}", dataset_name_2);
+                                    tracing::info!("Bootstrapping DynamoDB table {} complete, starting changes stream. \
+                                        Table will be marked as Ready once stream lag reaches < '{}'",
+                                        dataset_name_2, humantime::format_duration(acceptable_lag));
 
                                     let committer = DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
                                     if let Err(err) = committer.commit() {
@@ -387,7 +388,7 @@ async fn load_or_initialize_checkpoint(
         match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
             Ok(checkpoint) => {
                 tracing::info!(
-                    "Found existing checkpoint for DynamoDB Stream, resuming from checkpoint: table_name={}",
+                    "Found existing checkpoint for DynamoDB table {}, resuming from checkpoint",
                     dataset_name
                 );
                 Some((false, checkpoint))
@@ -403,7 +404,7 @@ async fn load_or_initialize_checkpoint(
         }
     } else {
         tracing::info!(
-            "No existing checkpoint found, starting from bootstrap: table_name={}",
+            "No existing checkpoint found for table {}, starting from bootstrap",
             dataset_name
         );
         get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
@@ -567,7 +568,7 @@ impl DynamoDBStreamCommitter {
 
 impl CommitChange for DynamoDBStreamCommitter {
     fn commit(&self) -> Result<(), CommitError> {
-        tracing::debug!("Committing DynamoDB checkpoint: {:?}", self.checkpoint);
+        tracing::trace!("Committing DynamoDB checkpoint: {:?}", self.checkpoint);
 
         let checkpoint_json = serde_json::to_string(&self.checkpoint).map_err(|e| {
             CommitError::UnableToCommitChange {

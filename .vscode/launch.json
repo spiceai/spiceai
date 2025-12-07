@@ -86,8 +86,9 @@
         "--duration",
         "240",
         "--with-conflict-data",
+        "--with-retention-data",
         "-p",
-        "./test/spicepods/tpch/sf1/accelerated/append/file_duckdb_file_on_conflict_upsert.yaml"
+        "./test/spicepods/tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",
