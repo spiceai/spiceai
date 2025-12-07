@@ -36,6 +36,7 @@ use datafusion::physical_plan::{
 use datafusion::physical_plan::{Distribution, Partitioning, PlanProperties};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -670,20 +671,19 @@ impl CacheRefreshHelper {
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
-                if stale_if_error {
-                    if let Some(batches) = expired_batches {
-                        if !batches.is_empty() {
-                            tracing::warn!(
-                                "Cache miss fetch failed for dataset {}, serving stale data due to stale_if_error: {}",
-                                dataset_name,
-                                e
-                            );
-                            let batch_schema = batches[0].schema();
-                            let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
-                            let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                            return Box::pin(adapter);
-                        }
-                    }
+                if stale_if_error
+                    && let Some(batches) = expired_batches
+                    && !batches.is_empty()
+                {
+                    tracing::warn!(
+                        "Cache miss fetch failed for dataset {}, serving stale data due to stale_if_error: {}",
+                        dataset_name,
+                        e
+                    );
+                    let batch_schema = batches[0].schema();
+                    let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                    let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                    return Box::pin(adapter);
                 }
 
                 tracing::error!(
@@ -921,6 +921,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         )))
     }
 
+    #[expect(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,
@@ -963,7 +964,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             tracing::debug!(
                 dataset = %dataset_name,
                 num_filters = filters.len(),
-                "About to read batches from accelerator stream"
+                "About to read batches from accelerator stream; filters: {}", ExprListDisplay::comma_separated(&filters)
             );
 
             let cached_batches: Vec<RecordBatch> = match accelerator_stream.try_collect().await {

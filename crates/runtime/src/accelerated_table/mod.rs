@@ -48,7 +48,7 @@ use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
-    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec,
+    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec, wrap_with_filter,
 };
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -751,6 +751,30 @@ impl AcceleratedTable {
 
         Ok(())
     }
+
+    /// Returns the subset of filters that the accelerator does not fully support
+    /// (i.e., `Inexact` or `Unsupported`) and need to be re-applied after scanning.
+    fn get_filters_to_reapply(&self, filters: &[Expr]) -> DataFusionResult<Vec<Expr>> {
+        if filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let filter_refs: Vec<&Expr> = filters.iter().collect();
+        let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+
+        let filters_to_reapply: Vec<Expr> = filters
+            .iter()
+            .zip(pushdown_support.iter())
+            .filter_map(|(filter, support)| match support {
+                TableProviderFilterPushDown::Exact => None,
+                TableProviderFilterPushDown::Inexact | TableProviderFilterPushDown::Unsupported => {
+                    Some(filter.clone())
+                }
+            })
+            .collect();
+
+        Ok(filters_to_reapply)
+    }
 }
 
 impl Drop for AcceleratedTable {
@@ -845,6 +869,16 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+
+                // Check which filters the accelerator doesn't fully support and need to be re-applied.
+                // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
+                let filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                let input = if filters_to_reapply.is_empty() {
+                    input
+                } else {
+                    wrap_with_filter(input, state, &filters_to_reapply)?
+                };
+
                 let federated_provider = self.federated.table_provider().await;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
