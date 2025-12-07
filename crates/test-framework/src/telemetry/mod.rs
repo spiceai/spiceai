@@ -50,8 +50,21 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
+    /// Create telemetry with empty resource.
+    /// Use `set_resource()` later to set the actual resource before calling `emit()`.
     #[must_use]
-    pub fn new(resource: &Resource, api_key_name: &str) -> Self {
+    pub fn new(api_key_name: &str) -> Self {
+        let resource = Resource::builder_empty().build();
+        Self::new_with_resource(&resource, api_key_name)
+    }
+
+    /// Create telemetry with a resource provided upfront.
+    ///
+    /// Use this when the resource attributes are already available at creation time.
+    /// For most cases, prefer `new()` + `set_resource()` to ensure telemetry is initialized
+    /// before any metrics calls.
+    #[must_use]
+    pub fn new_with_resource(resource: &Resource, api_key_name: &str) -> Self {
         let reader = InitialReader::default();
 
         let provider = SdkMeterProvider::builder()
@@ -59,12 +72,10 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        let setup = if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
+        let setup = METER_PROVIDER_ONCE.set(Arc::new(provider)).is_ok();
+        if !setup {
             println!("Telemetry disabled");
-            false
-        } else {
-            true
-        };
+        }
 
         Self {
             reader,
@@ -75,6 +86,14 @@ impl Telemetry {
                 .as_deref()
                 .map(|key| SecretString::new(key.into())),
         }
+    }
+
+    /// Set the resource to be used when emitting metrics.
+    ///
+    /// Call this after collecting all the resource attributes (e.g., `spiced_version`, `commit_sha`)
+    /// but before calling `emit()`.
+    pub fn set_resource(&mut self, resource: Resource) {
+        self.resource = resource;
     }
 
     pub async fn emit(&self) -> Result<()> {
@@ -102,6 +121,11 @@ impl Telemetry {
             };
 
             self.reader.collect(&mut rm)?;
+
+            // Replace the resource from the provider with our potentially deferred resource.
+            // The provider was initialized with an empty resource, but we set the
+            // actual resource later via set_resource() once all attributes are known.
+            rm.resource = self.resource.clone();
 
             telemetry_exporter
                 .export(&mut rm)
