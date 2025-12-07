@@ -219,10 +219,9 @@ fn google(
     let google =
         llms::google::Google::new_embeddings(api_key, &model_id, dimensions, embeddings_cache)
             .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to create Google embeddings client: {e}"),
-                )),
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to create Google embeddings client: {e}"
+                ))),
             })?;
 
     Ok(Arc::new(google) as Arc<dyn Embed>)
