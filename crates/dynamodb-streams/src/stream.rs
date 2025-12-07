@@ -13,10 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{PollOutcome, ShardPollResult, StreamState};
-use crate::{Error, Result, StreamResult};
+use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
+use crate::{Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
@@ -50,16 +50,18 @@ pub struct DynamoDBStreamBatch {
 }
 
 impl DynamodbStreamProducer {
-    async fn collect(&mut self) -> Result<DynamoDBStreamBatch> {
+    async fn collect(&mut self) -> Result<(DynamoDBStreamBatch, bool)> {
         let mut poll_results = Vec::new();
+        let mut had_transient_error = false;
 
         // 1. Initialize shards that require iterators
-        self.initialize_shards_iterators().await;
+        // If permanent error is encountered, it is surfaced to the client.
+        self.initialize_shards_iterators().await?;
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
-            tracing::debug!(
+            tracing::trace!(
                 "Polling shard with iterator: shard_id={}, iterator={}",
                 shard.shard_id,
                 shard.iterator
@@ -77,86 +79,110 @@ impl DynamodbStreamProducer {
         // 3. Process poll results
         for (shard_id, result) in results {
             let poll_result = match result {
-                Ok((next_iter, records)) => {
-                    match self.state.handle_poll_result(&shard_id, next_iter, records) {
-                        Some(result) => result,
-                        None => return Err(Error::UnexpectedShardId { shard_id }),
-                    }
+                Ok((next_iter, records)) => self
+                    .state
+                    .handle_poll_result(&shard_id, next_iter, records)?,
+                Err(e) => {
+                    had_transient_error = true;
+                    self.state.handle_poll_error(&shard_id, e)?
                 }
-                Err(e) => match self.state.handle_poll_error(&shard_id, &e) {
-                    Some(result) => result,
-                    None => return Err(Error::UnexpectedShardId { shard_id }),
-                },
             };
             poll_results.push(poll_result);
         }
 
         // 4. Discover new shards
-        if let Ok(shards) = self.client.get_all_shards(&self.stream_arn).await {
-            self.state.add_discovered(shards);
+        // If permanent error is encountered, it is surfaced to the client.
+        match self.client.get_all_shards(&self.stream_arn).await {
+            Ok(shards) => self.state.add_discovered(shards)?,
+            Err(e) => {
+                if !e.is_retriable() {
+                    return Err(e);
+                }
+                had_transient_error = true;
+                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}");
+            }
         }
 
-        Ok(combine_shard_batches(&poll_results, self.idle_timeout))
+        Ok((
+            combine_shard_batches(&poll_results, self.idle_timeout),
+            had_transient_error,
+        ))
     }
 
-    async fn initialize_shards_iterators(&mut self) {
-        let shard_ids: Vec<String> = self.state.get_initializing_shards_ids().cloned().collect();
+    async fn initialize_shards_iterators(&mut self) -> Result<()> {
+        let shards: Vec<InitializingShard> =
+            self.state.get_initializing_shards().cloned().collect();
 
-        for shard_id in shard_ids {
+        for shard in shards {
+            // Shards that were already polled use `After`.
+            // Newly discovered shards use `At`.
+            let iterator_type = match shard.last_checkpoint.position {
+                CheckpointPosition::At => ShardIteratorType::AtSequenceNumber,
+                CheckpointPosition::After => ShardIteratorType::AfterSequenceNumber,
+            };
+
             match self
                 .client
                 .get_shard_iterator(
                     &self.stream_arn,
-                    &shard_id,
-                    &ShardIteratorType::TrimHorizon,
-                    None,
+                    &shard.shard_id,
+                    &iterator_type,
+                    Some(shard.last_checkpoint.sequence_number.clone()),
                 )
                 .await
             {
                 Ok(iterator) => {
-                    if let Some(iterator) = iterator {
-                        self.state.mark_active(shard_id, iterator);
-                    }
+                    self.state.mark_active(shard.shard_id, iterator);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to initialize shard {}: {}", shard_id, e);
+                    if !e.is_retriable() {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "Failed to initialize shard. Will retry on next iteration : {}",
+                        e
+                    );
                 }
             }
         }
+
+        Ok(())
     }
 
-    async fn perform_iterate_with_retry(&mut self) -> Result<DynamoDBStreamBatch> {
+    pub async fn streaming(mut self) {
         let mut backoff = self.retry_strategy.clone();
 
         loop {
             match self.collect().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if let Some(duration) = backoff.next_backoff() {
-                        tracing::debug!("Iteration failed, retrying after {:?}: {}", duration, e);
-                        tokio::time::sleep(duration).await;
+                Ok((batch, had_transient_error)) => {
+                    // Send batch if it has records
+                    if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
+                        return;
+                    }
+
+                    if had_transient_error {
+                        // Transient error occurred during collection - apply backoff
+                        if let Some(duration) = backoff.next_backoff() {
+                            tokio::time::sleep(duration).await;
+                        } else {
+                            // Backoff exhausted - transient errors persisted too long
+                            // Shouldn't happen as we should have infinite retries.
+                            return;
+                        }
                     } else {
-                        tracing::error!("Iteration failed after exhausting retries: {}", e);
-                        return Err(e);
+                        // Clean success - reset backoff and use normal interval
+                        backoff = self.retry_strategy.clone();
+
+                        if let Some(duration) = self.interval {
+                            sleep(duration).await;
+                        }
                     }
                 }
-            }
-        }
-    }
-
-    pub async fn streaming(mut self) {
-        loop {
-            let Ok(batch) = self.perform_iterate_with_retry().await else {
-                // Error is logged in `perform_iterate_with_retry`
-                return;
-            };
-
-            if self.sender.send(Ok(batch)).await.is_err() {
-                return;
-            }
-
-            if let Some(duration) = self.interval {
-                sleep(duration).await;
+                Err(e) => {
+                    // Permanent error - return immediately without retry
+                    let _ = self.sender.send(Err(e)).await;
+                    return;
+                }
             }
         }
     }
@@ -204,7 +230,7 @@ fn combine_shard_batches(
                             let is_idle = shard_result.outcome.is_empty() && elapsed > timeout;
 
                             if is_idle {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "Shard {} excluded from watermark (idle for {:?}, timeout: {:?})",
                                     shard_result.shard_id,
                                     elapsed,

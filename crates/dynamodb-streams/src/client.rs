@@ -81,6 +81,8 @@ impl Client {
             })
             .collect::<Result<_>>()?;
 
+        tracing::debug!("Latest checkpoint initialized: {:#?}", checkpoint_shards);
+
         Ok(Checkpoint {
             shards: checkpoint_shards,
         })
@@ -111,21 +113,22 @@ impl Client {
 
         let (tx, rx) = mpsc::channel(self.buffer);
 
+        let retry_strategy = RetryBackoffBuilder::new()
+            .method(BackoffMethod::Fibonacci)
+            .max_retries(None)
+            .build();
+
         let producer = DynamodbStreamProducer {
             stream_arn,
             state,
             interval: self.interval,
             sender: tx,
             client: Arc::clone(&self.sdk_client),
-            retry_strategy: RetryBackoffBuilder::new()
-                .method(BackoffMethod::Fibonacci)
-                .max_retries(Some(3))
-                .build(),
+            retry_strategy,
             idle_timeout: None,
         };
 
         tokio::spawn(async move {
-            // https://github.com/spiceai/spiceai/issues/8074
             producer.streaming().await;
         });
 
