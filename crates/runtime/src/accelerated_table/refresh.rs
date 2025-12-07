@@ -39,7 +39,7 @@ use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{
-    SnapshotBehavior, SnapshotManager, SnapshotTrigger, metrics as snapshot_metrics,
+    SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics,
 };
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;

@@ -19,7 +19,7 @@ use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
-use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotTrigger};
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
@@ -430,7 +430,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
         let snapshot_trigger_batches =
-            parse_duration_param(&mut params, "snapshots_trigger_batches");
+            parse_duration_param(&mut params, "snapshots_trigger_batches")?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =

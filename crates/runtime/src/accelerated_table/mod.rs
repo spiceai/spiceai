@@ -44,7 +44,7 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotTrigger};
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
