@@ -63,7 +63,7 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
-const DEFAULT_STREAM_POLL_INTERVAL_MS_STR: &str = "200";
+const DEFAULT_STREAM_POLL_INTERVAL_MS_STR: &str = "0";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -96,8 +96,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Go-style time format used for parsing/formatting timestamps")
         .default(DEFAULT_TIME_FORMAT),
     ParameterSpec::runtime("acceptable_lag")
-        .description("When using Streams, once tables reaches this lag, it will be repored as Ready")
-        .default("3s"),
+        .description("When using Streams, once tables reaches this lag, it will be reported as Ready")
+        .default("2s"),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -133,10 +133,7 @@ impl DataConnector for DynamoDB {
         self
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Complex configuration parsing required"
-    )]
+    #[expect(clippy::too_many_lines)]
     async fn read_provider(
         &self,
         dataset: &Dataset,
@@ -174,7 +171,7 @@ impl DataConnector for DynamoDB {
             .expose()
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200);
+            .unwrap_or(0);
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
@@ -238,7 +235,7 @@ impl DataConnector for DynamoDB {
             .expose()
             .ok()
             .and_then(|v| fundu::parse_duration(v).ok())
-            .unwrap_or(Duration::from_secs(3));
+            .unwrap_or(Duration::from_secs(2));
 
         let provider = DynamoDBTableProvider::try_new(
             config,

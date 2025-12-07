@@ -92,13 +92,12 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.as_ref() {
-                                ready_sender.notify_waiters();
-                            }
-                            initial_load_completed.store(true, Ordering::Relaxed);
-
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
+                                initial_load_completed.store(true, Ordering::Relaxed);
+                                if let Some(ready_sender) = ready_sender.as_ref() {
+                                    ready_sender.notify_waiters();
+                                }
                                 self.update_component_status(status::ComponentStatus::Ready)
                                     .await;
                             }
