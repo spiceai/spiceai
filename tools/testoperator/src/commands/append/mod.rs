@@ -20,7 +20,7 @@ use crate::{
     health::HealthMonitor,
     wait_test_and_memory,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use test_framework::{
     TestType,
     anyhow::{self, Context},
@@ -28,13 +28,45 @@ use test_framework::{
     arrow::{self, array::AsArray, util::pretty::print_batches},
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     queries::{QueryOverrides, QuerySet, TableWithRowCount},
     spiced::SpicedInstance,
     spicepod::acceleration::RefreshMode,
     spicetest::{SpiceTest, append::NotStarted},
+    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestStatus {
+    /// Test completed successfully
+    Passed,
+    /// Test failed
+    Failed,
+}
+
+impl From<bool> for TestStatus {
+    fn from(passed: bool) -> Self {
+        if passed {
+            TestStatus::Passed
+        } else {
+            TestStatus::Failed
+        }
+    }
+}
+
+impl TestStatus {
+    /// Convert `TestStatus` to a u64 value for metrics recording (1 = passed, 0 = failed)
+    #[must_use]
+    pub fn to_u64(self) -> u64 {
+        match self {
+            TestStatus::Passed => 1,
+            TestStatus::Failed => 0,
+        }
+    }
+}
 
 pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     let query_set = args.test_args.load_query_set()?;
@@ -67,12 +99,14 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     .await?;
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let ready_wait_start = Instant::now();
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+    let ready_wait_duration = ready_wait_start.elapsed();
     let health_monitor = HealthMonitor::spawn()?;
 
     let append_test = append_test
@@ -80,9 +114,10 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         .start_test()
         .await?;
     let test = wait_test_and_memory!(append_test, memory_token, memory_readings);
-    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Append)?;
+    let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
+    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
 
     let table_count_result = check_table_counts(
         &spiced_instance,
@@ -91,10 +126,39 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     )
     .await;
 
+    // Test succeeds only if rows count check succeed and there are no failed queries
+    let test_status: TestStatus = (table_count_result.is_ok() && test_succeeded).into();
+
+    // Build resource for telemetry
+    let commit_sha = metrics.commit_sha.clone();
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let spiced_version = metrics.spiced_version.clone();
+    let app_name = app.name.clone();
+    let append_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "append_test"),
+            KeyValue::new("name", app_name.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", metrics.branch_name.clone()),
+        ])
+        .build();
+
+    let telemetry = Telemetry::new(&append_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+    crate::metrics::STATUS.record(test_status.to_u64(), &[]);
+    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;
+    telemetry.emit().await?;
     spiced_instance.stop()?;
     let health_report = health_report?;
 
