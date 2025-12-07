@@ -228,6 +228,8 @@ pub struct AcceleratedTable {
     io_runtime: Handle,
     /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
     cache_mutex: Arc<Mutex<()>>,
+    /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
+    in_flight_revalidations: caching::InFlightRevalidations,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -585,6 +587,9 @@ impl Builder {
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the cache mutex early so it can be shared between the Refresher and the AcceleratedTable.
         let cache_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
+        let in_flight_revalidations: caching::InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -658,6 +663,7 @@ impl Builder {
             cache_stale_if_error: self.caching_stale_if_error,
             io_runtime: self.io_runtime,
             cache_mutex,
+            in_flight_revalidations,
         })
     }
 }
@@ -893,6 +899,7 @@ impl TableProvider for AcceleratedTable {
                     projection.cloned(),
                     limit,
                     Arc::clone(&self.cache_mutex),
+                    Arc::clone(&self.in_flight_revalidations),
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,

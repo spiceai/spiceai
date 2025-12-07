@@ -38,10 +38,17 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
+use std::collections::HashSet;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
+
+/// Type alias for tracking in-flight revalidation requests.
+/// The key is a cache key derived from the filter expressions (request_path, request_query, request_body).
+/// When a revalidation is in progress for a cache key, other requests for the same key will skip
+/// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
+pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
 
@@ -150,6 +157,15 @@ fn check_cache_freshness(
     }
 
     Ok(worst_freshness)
+}
+
+/// Compute a cache key from filter expressions.
+/// The cache key is a string representation of the filter values for `request_path`, `request_query`, and `request_body`.
+fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
+    // Sort and join filter expressions to create a consistent cache key
+    let mut parts: Vec<String> = filters.iter().map(|e| e.to_string()).collect();
+    parts.sort();
+    parts.join("|")
 }
 
 /// Helper functions for cache refresh operations
@@ -705,10 +721,10 @@ impl CacheRefreshHelper {
     ///
     /// Cache behavior based on freshness:
     /// - `Fresh`: Return cached data immediately, no refresh needed
-    /// - `Stale`: Return cached data immediately, trigger background refresh
+    /// - `Stale`: Return cached data immediately, trigger background refresh (if not already in-flight)
     /// - `Expired`: This should not be called for expired data (handled as cache miss)
     #[expect(clippy::too_many_arguments)]
-    fn handle_cache_hit(
+    async fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
         accelerator: &Arc<dyn TableProvider>,
@@ -718,6 +734,8 @@ impl CacheRefreshHelper {
         io_runtime: &Handle,
         schema: SchemaRef,
         accelerator_mutex: &Arc<Mutex<()>>,
+        filters: &[Expr],
+        in_flight_revalidations: &InFlightRevalidations,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -742,43 +760,72 @@ impl CacheRefreshHelper {
                     );
                 }
                 CacheFreshness::Stale => {
-                    tracing::debug!(
-                        "Data is stale for dataset={dataset_name}, triggering background refresh"
-                    );
+                    // Compute cache key to check for in-flight revalidation
+                    let cache_key = compute_cache_key_from_filters(filters);
 
-                    // Log current fetched_at for debugging
-                    if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0]) {
-                        tracing::debug!(
-                            "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
-                        );
-                    }
-
-                    let federated_clone = Arc::clone(federated);
-                    let accelerator_clone = Arc::clone(accelerator);
-                    let dataset_name_clone = dataset_name.to_string();
-                    let accelerator_mutex_clone = Arc::clone(accelerator_mutex);
-
-                    io_runtime.spawn(async move {
-                        tracing::debug!(
-                            "Background refresh task started for dataset={dataset_name_clone}"
-                        );
-                        match Self::refresh_stale_rows(
-                            federated_clone,
-                            accelerator_clone,
-                            &dataset_name_clone,
-                            max_age,
-                            accelerator_mutex_clone,
-                        )
-                        .await
-                        {
-                            Ok(rows) => {
-                                tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
-                            }
-                            Err(e) => {
-                                tracing::error!("Background refresh task failed for dataset={dataset_name_clone}: {e}");
-                            }
+                    // Try to acquire the revalidation slot for this cache key
+                    // Use async lock since we're in an async context
+                    let should_revalidate = {
+                        let mut in_flight = in_flight_revalidations.lock().await;
+                        if in_flight.contains(&cache_key) {
+                            tracing::debug!(
+                                "Skipping background refresh for dataset={dataset_name}, cache_key={cache_key} - revalidation already in progress"
+                            );
+                            false
+                        } else {
+                            in_flight.insert(cache_key.clone());
+                            true
                         }
-                    });
+                    };
+
+                    if should_revalidate {
+                        tracing::debug!(
+                            "Data is stale for dataset={dataset_name}, triggering background refresh"
+                        );
+
+                        // Log current fetched_at for debugging
+                        if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0])
+                        {
+                            tracing::debug!(
+                                "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                            );
+                        }
+
+                        let federated_clone = Arc::clone(federated);
+                        let accelerator_clone = Arc::clone(accelerator);
+                        let dataset_name_clone = dataset_name.to_string();
+                        let accelerator_mutex_clone = Arc::clone(accelerator_mutex);
+                        let in_flight_clone = Arc::clone(in_flight_revalidations);
+
+                        io_runtime.spawn(async move {
+                            tracing::debug!(
+                                "Background refresh task started for dataset={dataset_name_clone}"
+                            );
+                            let result = Self::refresh_stale_rows(
+                                federated_clone,
+                                accelerator_clone,
+                                &dataset_name_clone,
+                                max_age,
+                                accelerator_mutex_clone,
+                            )
+                            .await;
+
+                            // Remove the cache key from in-flight set when done
+                            {
+                                let mut in_flight = in_flight_clone.lock().await;
+                                in_flight.remove(&cache_key);
+                            }
+
+                            match result {
+                                Ok(rows) => {
+                                    tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
+                                }
+                                Err(e) => {
+                                    tracing::error!("Background refresh task failed for dataset={dataset_name_clone}: {e}");
+                                }
+                            }
+                        });
+                    }
                 }
                 CacheFreshness::Expired => {
                     // This shouldn't happen as expired data should be handled as cache miss
@@ -819,6 +866,8 @@ pub struct CachingAccelerationScanExec {
     limit: Option<usize>,
     /// Mutex to protect concurrent access to the accelerator during cache operations
     accelerator_mutex: Arc<Mutex<()>>,
+    /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
+    in_flight_revalidations: InFlightRevalidations,
 }
 
 impl CachingAccelerationScanExec {
@@ -836,6 +885,7 @@ impl CachingAccelerationScanExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
         accelerator_mutex: Arc<Mutex<()>>,
+        in_flight_revalidations: InFlightRevalidations,
     ) -> Self {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
@@ -860,6 +910,7 @@ impl CachingAccelerationScanExec {
             projection,
             limit,
             accelerator_mutex,
+            in_flight_revalidations,
         }
     }
 }
@@ -918,6 +969,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.projection.clone(),
             self.limit,
             Arc::clone(&self.accelerator_mutex),
+            Arc::clone(&self.in_flight_revalidations),
         )))
     }
 
@@ -947,6 +999,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let stale_if_error = self.stale_if_error;
         let io_runtime = self.io_runtime.clone();
         let accelerator_mutex = Arc::clone(&self.accelerator_mutex);
+        let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -1031,7 +1084,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &io_runtime,
                     Arc::clone(&schema_clone),
                     &accelerator_mutex,
+                    &filters,
+                    &in_flight_revalidations,
                 )
+                .await
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
                 tracing::debug!(
