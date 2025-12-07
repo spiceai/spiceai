@@ -17,11 +17,13 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::chat::{Chat, nsql::SqlGeneration};
-use crate::google::to_completion_usage;
-use async_openai::error::{ApiError, OpenAIError};
+use crate::google::{openai_api_error, to_completion_usage};
+use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatChoiceStream, ChatCompletionMessageToolCall,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
     ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
@@ -30,8 +32,8 @@ use async_openai::types::{
 use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
-use google_genai::generate::GenerateContentRequest;
-use google_genai::types::{Content, Part};
+use google_genai::generate::{GenerateContentRequest, GenerateContentResponse};
+use google_genai::types::{Content, FunctionDeclaration, Part};
 use std::pin::Pin;
 use std::time::SystemTime;
 
@@ -53,14 +55,7 @@ impl Chat for Google {
             .client
             .stream_generate_content(&self.model, google_req)
             .await
-            .map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: format!("Google API error: {e}"),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?;
+            .map_err(|e| openai_api_error(e.to_string()))?;
 
         Ok(Box::pin(convert_google_stream_to_openai(stream)))
     }
@@ -75,14 +70,7 @@ impl Chat for Google {
             .client
             .generate_content(&self.model, google_req)
             .await
-            .map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: format!("Google API error: {e}"),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?;
+            .map_err(|e| openai_api_error(e.to_string()))?;
 
         convert_google_response_to_openai(response, &self.model)
     }
@@ -95,30 +83,22 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
         let content = match message {
             ChatCompletionRequestMessage::User(msg) => {
                 let text = match msg.content {
-                    async_openai::types::ChatCompletionRequestUserMessageContent::Text(t) => t,
-                    async_openai::types::ChatCompletionRequestUserMessageContent::Array(parts) => {
-                        parts
-                            .into_iter()
-                            .filter_map(|p| match p {
-                                async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => Some(t.text),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    ChatCompletionRequestUserMessageContent::Text(t) => t,
+                    ChatCompletionRequestUserMessageContent::Array(parts) => parts
+                        .into_iter()
+                        .filter_map(|p| match p {
+                            ChatCompletionRequestUserMessageContentPart::Text(t) => Some(t.text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 };
                 Content::user(text)
             }
             ChatCompletionRequestMessage::Assistant(msg) => {
                 let text = match msg.content {
-                    Some(
-                        async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(t),
-                    ) => t,
-                    Some(
-                        async_openai::types::ChatCompletionRequestAssistantMessageContent::Array(
-                            parts,
-                        ),
-                    ) => parts
+                    Some(ChatCompletionRequestAssistantMessageContent::Text(t)) => t,
+                    Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts
                         .into_iter()
                         .filter_map(|p| match p {
                             ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
@@ -134,16 +114,14 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
             }
             ChatCompletionRequestMessage::System(msg) => {
                 let text = match msg.content {
-                    async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t,
-                    async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
-                        parts
-                            .into_iter()
-                            .map(|p| match p {
-                                async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => t.text,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    ChatCompletionRequestSystemMessageContent::Text(t) => t,
+                    ChatCompletionRequestSystemMessageContent::Array(parts) => parts
+                        .into_iter()
+                        .map(|p| match p {
+                            ChatCompletionRequestSystemMessageContentPart::Text(t) => t.text,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 };
                 Content::user(text)
             }
@@ -159,7 +137,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
         let google_tools: Vec<google_genai::types::Tool> = openai_tools
             .into_iter()
             .map(|tool| {
-                let func_decl = google_genai::types::FunctionDeclaration {
+                let func_decl = FunctionDeclaration {
                     name: tool.function.name,
                     description: tool.function.description.unwrap_or_default(),
                     parameters: tool.function.parameters.and_then(|params| {
@@ -182,7 +160,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
 
 #[expect(clippy::cast_possible_truncation)]
 fn convert_google_response_to_openai(
-    response: google_genai::generate::GenerateContentResponse,
+    response: GenerateContentResponse,
     model: &str,
 ) -> Result<CreateChatCompletionResponse, OpenAIError> {
     use async_openai::types::ChatChoice;
@@ -277,7 +255,7 @@ fn convert_google_response_to_openai(
 
 #[expect(clippy::cast_possible_truncation)]
 fn convert_google_stream_response_to_openai(
-    response: google_genai::generate::GenerateContentResponse,
+    response: GenerateContentResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
     let choices = response
         .candidates
@@ -378,23 +356,10 @@ fn convert_google_stream_response_to_openai(
 }
 
 fn convert_google_stream_to_openai(
-    stream: Pin<
-        Box<
-            dyn Stream<Item = google_genai::Result<google_genai::generate::GenerateContentResponse>>
-                + Send,
-        >,
-    >,
+    stream: Pin<Box<dyn Stream<Item = google_genai::Result<GenerateContentResponse>> + Send>>,
 ) -> impl Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> {
-    stream.map(|pkt| match pkt {
-        Ok(response) => match convert_google_stream_response_to_openai(response) {
-            Ok(openai_response) => Ok(openai_response),
-            Err(e) => Err(e),
-        },
-        Err(e) => Err(OpenAIError::ApiError(ApiError {
-            message: e.to_string(),
-            r#type: None,
-            param: None,
-            code: None,
-        })),
+    stream.map(|pkt| {
+        convert_google_stream_response_to_openai(pkt.map_err(|e| openai_api_error(e.to_string()))?)
+            .map_err(|e| openai_api_error(e.to_string()))
     })
 }

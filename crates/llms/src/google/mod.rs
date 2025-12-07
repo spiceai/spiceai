@@ -20,7 +20,10 @@ mod embed;
 
 use std::sync::Arc;
 
-use async_openai::types::{CompletionTokensDetails, CompletionUsage, PromptTokensDetails};
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::{CompletionTokensDetails, CompletionUsage, PromptTokensDetails},
+};
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use google_genai::types::UsageMetadata;
 use secrecy::{ExposeSecret, SecretString};
@@ -115,4 +118,13 @@ pub fn to_completion_usage(usage_metadata: &UsageMetadata) -> CompletionUsage {
         prompt_tokens_details,
         completion_tokens_details,
     }
+}
+
+pub(super) fn openai_api_error(msg: impl Into<String>) -> OpenAIError {
+    OpenAIError::ApiError(ApiError {
+        message: msg.into(),
+        r#type: None,
+        param: None,
+        code: None,
+    })
 }
