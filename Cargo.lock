@@ -3176,6 +3176,7 @@ dependencies = [
 name = "chunking"
 version = "1.10.0-unstable"
 dependencies = [
+ "criterion 0.7.0",
  "snafu",
  "text-splitter",
  "tiktoken-rs",
