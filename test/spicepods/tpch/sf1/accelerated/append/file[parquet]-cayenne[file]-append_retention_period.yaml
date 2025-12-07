@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file[parquet]-duckdb[file]-append_retention_period
+name: file[parquet]-cayenne[file]-append_retention_period
 
 refresh_check_interval: &refresh_check_interval 30s
 retention_check_interval: &retention_check_interval 30s
@@ -13,13 +13,10 @@ datasets:
     time_column: c_created_at
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: c_custkey
-      on_conflict:
-        c_custkey: upsert
       retention_check_enabled: true
       retention_check_interval: *retention_check_interval
       retention_period: *retention_period
@@ -30,13 +27,10 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: '(l_orderkey, l_linenumber)'
-      on_conflict:
-        '(l_orderkey, l_linenumber)': upsert
       retention_check_enabled: true
       retention_check_interval: *retention_check_interval
       retention_period: *retention_period
@@ -47,13 +41,10 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: n_nationkey
-      on_conflict:
-        n_nationkey: upsert
       retention_check_enabled: true
       retention_check_interval: *retention_check_interval
       retention_period: *retention_period
@@ -64,16 +55,13 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: o_orderkey
-      on_conflict:
-        o_orderkey: upsert
       retention_check_enabled: true
-      retention_check_interval: 30s
-      retention_period: 1d
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
 
   - from: file:part.parquet
     name: part
@@ -81,16 +69,13 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: p_partkey
-      on_conflict:
-        p_partkey: upsert
       retention_check_enabled: true
-      retention_check_interval: 30s
-      retention_period: 1d
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
 
   - from: file:partsupp.parquet
     name: partsupp
@@ -98,13 +83,10 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: '(ps_partkey, ps_suppkey)'
-      on_conflict:
-        '(ps_partkey, ps_suppkey)': upsert
       retention_check_enabled: true
       retention_check_interval: *retention_check_interval
       retention_period: *retention_period
@@ -115,13 +97,10 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: r_regionkey
-      on_conflict:
-        r_regionkey: upsert
       retention_check_enabled: true
       retention_check_interval: *retention_check_interval
       retention_period: *retention_period
@@ -132,13 +111,10 @@ datasets:
     time_format: timestamptz
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
       refresh_mode: append
       refresh_check_interval: *refresh_check_interval
-      primary_key: s_suppkey
-      on_conflict:
-        s_suppkey: upsert
       retention_check_enabled: true
       retention_check_interval: *retention_check_interval
       retention_period: *retention_period

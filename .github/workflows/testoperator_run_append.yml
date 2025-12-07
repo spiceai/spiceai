@@ -64,6 +64,11 @@ on:
         required: false
         type: boolean
         default: false
+      with_retention_data:
+        description: 'Include additional data to test retention behavior'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-append:
@@ -138,7 +143,8 @@ jobs:
             --load-interval ${{ github.event.inputs.load_interval }} \
             --load-steps ${{ github.event.inputs.load_steps }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }}
+            ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }} \
+            ${{ github.event.inputs.with_retention_data == 'true' && '--with-retention-data' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
