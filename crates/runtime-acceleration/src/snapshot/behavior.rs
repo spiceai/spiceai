@@ -194,12 +194,3 @@ impl SnapshotBehavior {
         }
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum SnapshotTrigger {
-    #[default]
-    /// Snapshots are created after each refresh (used by full/append modes).
-    AfterRefresh,
-    /// Snapshots are updated after X batches (used by append/changes modes).
-    Batches(u8),
-}

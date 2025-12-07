@@ -202,11 +202,6 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
-
-    #[snafu(display(
-        "{message}, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
-    ))]
-    InvalidSnapshotTrigger { message: String },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
