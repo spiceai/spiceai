@@ -568,7 +568,7 @@ impl DynamoDBStreamCommitter {
 
 impl CommitChange for DynamoDBStreamCommitter {
     fn commit(&self) -> Result<(), CommitError> {
-        tracing::debug!("Committing DynamoDB checkpoint: {:?}", self.checkpoint);
+        tracing::trace!("Committing DynamoDB checkpoint: {:?}", self.checkpoint);
 
         let checkpoint_json = serde_json::to_string(&self.checkpoint).map_err(|e| {
             CommitError::UnableToCommitChange {
