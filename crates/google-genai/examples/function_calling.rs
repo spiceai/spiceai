@@ -124,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let function_response_part = Part::FunctionResponse {
                         function_response: FunctionResponse {
+                            id: function_call.id.clone(),
                             name: function_call.name.clone(),
                             response: response_map,
                         },

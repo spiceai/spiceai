@@ -23,17 +23,19 @@ use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
-    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionCallStream, Role,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionCallStream, Role,
 };
 use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
 use google_genai::generate::{GenerateContentRequest, GenerateContentResponse};
-use google_genai::types::{Content, FunctionDeclaration, Part};
+use google_genai::types::{Content, FunctionDeclaration, FunctionResponse, Part};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::SystemTime;
 
@@ -95,7 +97,43 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                 };
                 Content::user(text)
             }
+            ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+                content,
+                tool_call_id,
+            }) => {
+                let response = match content {
+                    ChatCompletionRequestToolMessageContent::Text(t) => t,
+                    ChatCompletionRequestToolMessageContent::Array(parts) => parts
+                        .into_iter()
+                        .map(|p| match p {
+                            ChatCompletionRequestToolMessageContentPart::Text(t) => t.text,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                };
+                let response =
+                    match serde_json::from_str::<serde_json::Value>(&response).map_err(|e| {
+                        HashMap::from([(
+                            "error".to_string(),
+                            serde_json::Value::String(e.to_string()),
+                        )])
+                    }) {
+                        Ok(map) => HashMap::from([("result".to_string(), map)]),
+                        Err(err_map) => err_map,
+                    };
+                Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part::FunctionResponse {
+                        function_response: FunctionResponse {
+                            id: Some(tool_call_id.clone()),
+                            name: tool_call_id, // Don't have access to name.
+                            response,
+                        },
+                    }],
+                }
+            }
             ChatCompletionRequestMessage::Assistant(msg) => {
+                // TODO: match tool call.
                 let text = match msg.content {
                     Some(ChatCompletionRequestAssistantMessageContent::Text(t)) => t,
                     Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts
@@ -109,6 +147,29 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                         .collect::<Vec<_>>()
                         .join("\n"),
                     None => String::new(),
+                };
+                if let Some(tools) = msg.tool_calls {
+                    for ChatCompletionMessageToolCall {
+                        id,
+                        function: FunctionCall { name, arguments },
+                        ..
+                    } in tools
+                    {
+                        contents.push(Content {
+                            role: Some("assistant".to_string()),
+                            parts: vec![Part::FunctionCall {
+                                function_call: google_genai::types::FunctionCall {
+                                    id: Some(id),
+                                    name: name,
+                                    args:
+                                        serde_json::from_str::<HashMap<String, serde_json::Value>>(
+                                            &arguments,
+                                        )
+                                        .unwrap_or_default(),
+                                },
+                            }],
+                        });
+                    }
                 };
                 Content::model(text)
             }
@@ -125,6 +186,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                 };
                 Content::user(text)
             }
+
             _ => continue,
         };
         contents.push(content);

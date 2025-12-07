@@ -143,9 +143,7 @@ impl Embeddings {
             }
             Some(EmbeddingPrefix::Google) => {
                 let from = &self.from;
-                from.strip_prefix("google:")
-                    .or_else(|| from.strip_prefix("gemini:"))
-                    .map(ToString::to_string)
+                from.strip_prefix("google:").map(ToString::to_string)
             }
             Some(EmbeddingPrefix::File) => {
                 let from = &self.from;
