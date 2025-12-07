@@ -5,6 +5,7 @@ datasets:
   - from: file:customer.parquet
     name: customer
     time_column: c_created_at
+    time_format: timestamptz
     acceleration: &acceleration
       enabled: true
       engine: duckdb
@@ -14,28 +15,35 @@ datasets:
   - from: file:lineitem.parquet
     name: lineitem
     time_column: l_created_at
+    time_format: timestamptz
     acceleration: *acceleration
   - from: file:nation.parquet
     name: nation
     time_column: n_created_at
+    time_format: timestamptz
     acceleration: *acceleration
   - from: file:orders.parquet
     name: orders
     time_column: o_created_at
+    time_format: timestamptz
     acceleration: *acceleration
   - from: file:part.parquet
     name: part
     time_column: p_created_at
+    time_format: timestamptz
     acceleration: *acceleration
   - from: file:partsupp.parquet
     name: partsupp
     time_column: ps_created_at
+    time_format: timestamptz
     acceleration: *acceleration
   - from: file:region.parquet
     name: region
     time_column: r_created_at
+    time_format: timestamptz
     acceleration: *acceleration
   - from: file:supplier.parquet
     name: supplier
     time_column: s_created_at
+    time_format: timestamptz
     acceleration: *acceleration

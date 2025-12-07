@@ -4495,13 +4495,14 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=007c82d039220478f406d648417d28c0d40a7987#007c82d039220478f406d648417d28c0d40a7987"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=afcbd1ce99703f1322d176fc1b99745f647234d0#afcbd1ce99703f1322d176fc1b99745f647234d0"
 dependencies = [
  "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",
  "futures",
+ "tracing",
 ]
 
 [[package]]
@@ -4914,7 +4915,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8b2d747ec3f3d422b5059cae6d848d76509450a6#8b2d747ec3f3d422b5059cae6d848d76509450a6"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=4a9f784fc15a795ca428860b65602b1d777faf9a#4a9f784fc15a795ca428860b65602b1d777faf9a"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -4930,6 +4931,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "datafusion-federation",
+ "datafusion-physical-expr",
  "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
@@ -6668,6 +6670,20 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "google-genai"
+version = "1.10.0-unstable"
+dependencies = [
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
