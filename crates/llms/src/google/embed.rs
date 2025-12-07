@@ -16,12 +16,11 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use super::Google;
 use crate::embeddings::{Embed, EmbeddingInput, Error, Result};
 use async_trait::async_trait;
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
-use google_genai::embeddings::EmbedContentRequest;
-
-use super::Google;
+use google_genai::{embeddings::EmbedContentRequest, types::Content};
 
 #[derive(Debug)]
 pub struct EmbedGoogle {
@@ -51,16 +50,11 @@ impl Embed for EmbedGoogle {
             }
         };
 
-        let contents: Vec<google_genai::types::Content> = texts
-            .into_iter()
-            .map(google_genai::types::Content::user)
-            .collect();
-
-        let requests: Vec<EmbedContentRequest> = contents
+        let requests: Vec<EmbedContentRequest> = texts
             .into_iter()
             .map(|v| EmbedContentRequest {
                 model: format!("models/{}", self.g.model),
-                content: v,
+                content: Content::user(v),
                 output_dimensionality: self.dimensions,
                 task_type: None,
             })
@@ -90,6 +84,7 @@ impl Embed for EmbedGoogle {
         Some(&self.g.model)
     }
 
+    #[expect(clippy::cast_possible_wrap)]
     fn size(&self) -> i32 {
         match self.dimensions {
             None => -1,

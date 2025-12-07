@@ -55,6 +55,7 @@ impl Google {
     }
 }
 
+#[must_use]
 pub fn to_completion_usage(usage_metadata: &UsageMetadata) -> CompletionUsage {
     // Extract audio tokens
     let prompt_audio_tokens = usage_metadata
@@ -100,20 +101,16 @@ pub fn to_completion_usage(usage_metadata: &UsageMetadata) -> CompletionUsage {
 
     CompletionUsage {
         prompt_tokens: usage_metadata.prompt_token_count
-            + prompt_tokens_details
-                .as_ref()
-                .map(|c| c.audio_tokens.unwrap_or_default() + c.cached_tokens.unwrap_or_default())
-                .unwrap_or(0),
+            + prompt_tokens_details.as_ref().map_or(0, |c| {
+                c.audio_tokens.unwrap_or_default() + c.cached_tokens.unwrap_or_default()
+            }),
         completion_tokens: usage_metadata.candidates_token_count.unwrap_or_default()
-            + completion_tokens_details
-                .as_ref()
-                .map(|c| {
-                    c.accepted_prediction_tokens.unwrap_or_default()
-                        + c.audio_tokens.unwrap_or_default()
-                        + c.reasoning_tokens.unwrap_or_default()
-                        + c.rejected_prediction_tokens.unwrap_or_default()
-                })
-                .unwrap_or(0),
+            + completion_tokens_details.as_ref().map_or(0, |c| {
+                c.accepted_prediction_tokens.unwrap_or_default()
+                    + c.audio_tokens.unwrap_or_default()
+                    + c.reasoning_tokens.unwrap_or_default()
+                    + c.rejected_prediction_tokens.unwrap_or_default()
+            }),
         total_tokens: usage_metadata.total_token_count,
         prompt_tokens_details,
         completion_tokens_details,

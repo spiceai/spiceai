@@ -180,7 +180,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
     google_req
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
 fn convert_google_response_to_openai(
     response: google_genai::generate::GenerateContentResponse,
     model: &str,
@@ -263,10 +263,7 @@ fn convert_google_response_to_openai(
             .response_id
             .unwrap_or_else(|| "unknown".to_string()),
         model: model.to_string(),
-        usage: response
-            .usage_metadata
-            .as_ref()
-            .map(|m| to_completion_usage(m)),
+        usage: response.usage_metadata.as_ref().map(to_completion_usage),
         created: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
@@ -278,7 +275,7 @@ fn convert_google_response_to_openai(
     })
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_truncation)]
 fn convert_google_stream_response_to_openai(
     response: google_genai::generate::GenerateContentResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -356,9 +353,9 @@ fn convert_google_stream_response_to_openai(
         .collect();
 
     let usage = response.usage_metadata.map(|usage| CompletionUsage {
-        prompt_tokens: usage.prompt_token_count as u32,
-        completion_tokens: usage.candidates_token_count.unwrap_or(0) as u32,
-        total_tokens: usage.total_token_count as u32,
+        prompt_tokens: usage.prompt_token_count,
+        completion_tokens: usage.candidates_token_count.unwrap_or(0),
+        total_tokens: usage.total_token_count,
         prompt_tokens_details: None,
         completion_tokens_details: None,
     });

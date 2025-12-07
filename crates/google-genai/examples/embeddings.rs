@@ -43,7 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_output_dimensionality(768)
                 .with_task_type(TaskType::RetrievalQuery);
 
-
         let response = client.embed_content("text-embedding-004", request).await?;
 
         println!("Text {}: \"{}\"", i + 1, text);
