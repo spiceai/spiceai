@@ -50,17 +50,11 @@ impl SDKClient {
             .table_name(&table_name)
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?
+            .map_err(Error::from_describe_table)?
             .table
-            .ok_or_else(|| Error::StreamNotFound {
-                table_name: table_name.clone(),
-            })?;
+            .ok_or_else(|| Error::TableNotFound)?;
 
-        table
-            .latest_stream_arn
-            .ok_or_else(|| Error::StreamNotFound { table_name })
+        table.latest_stream_arn.ok_or_else(|| Error::StreamNotFound)
     }
 
     async fn get_shards(
@@ -75,9 +69,7 @@ impl SDKClient {
             .set_exclusive_start_shard_id(exclusive_start_shard_id)
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?
+            .map_err(Error::from_describe_stream)?
             .stream_description
             .ok_or_else(|| Error::StreamDescriptionNotFound {
                 stream_arn: stream_arn.to_string(),
@@ -109,9 +101,8 @@ impl SDKClient {
         shard_id: &str,
         shard_iterator_type: &ShardIteratorType,
         sequence_number: Option<String>,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .streams
+    ) -> Result<String> {
+        self.streams
             .get_shard_iterator()
             .stream_arn(stream_arn)
             .shard_id(shard_id)
@@ -119,10 +110,11 @@ impl SDKClient {
             .set_sequence_number(sequence_number.clone())
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?
-            .shard_iterator)
+            .map_err(Error::from_get_shard_iterator)?
+            .shard_iterator
+            .ok_or_else(|| Error::ShardIteratorNotFound {
+                shard_id: shard_id.to_string(),
+            })
     }
 
     pub async fn get_iterator_records(
@@ -136,9 +128,7 @@ impl SDKClient {
             .set_limit(self.shard_record_limit)
             .send()
             .await
-            .map_err(|e| Error::SDKError {
-                source: Box::new(e),
-            })?;
+            .map_err(Error::from_get_records)?;
 
         Ok((
             output.next_shard_iterator,

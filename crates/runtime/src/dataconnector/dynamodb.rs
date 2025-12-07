@@ -453,7 +453,8 @@ async fn changes_stream_from_checkpoint(
         ),
         Err(err) => {
             tracing::error!(
-                "Failed to get stream from checkpoint for DynamoDB Table: {:?}",
+                "Failed to get stream from checkpoint for DynamoDB Table: {} - {}",
+                dataset_name,
                 err
             );
             None
