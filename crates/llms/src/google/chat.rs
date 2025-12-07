@@ -108,8 +108,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                         .map(|p| match p {
                             ChatCompletionRequestToolMessageContentPart::Text(t) => t.text,
                         })
-                        .collect::<Vec<_>>()
-                        .join(""),
+                        .collect::<String>(),
                 };
                 let response =
                     match serde_json::from_str::<serde_json::Value>(&response).map_err(|e| {
@@ -160,7 +159,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                             parts: vec![Part::FunctionCall {
                                 function_call: google_genai::types::FunctionCall {
                                     id: Some(id),
-                                    name: name,
+                                    name,
                                     args:
                                         serde_json::from_str::<HashMap<String, serde_json::Value>>(
                                             &arguments,
@@ -170,7 +169,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                             }],
                         });
                     }
-                };
+                }
                 Content::model(text)
             }
             ChatCompletionRequestMessage::System(msg) => {
