@@ -28,10 +28,13 @@ use test_framework::{
     arrow::{self, array::AsArray, util::pretty::print_batches},
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     queries::{QueryOverrides, QuerySet, TableWithRowCount},
     spiced::SpicedInstance,
     spicepod::acceleration::RefreshMode,
     spicetest::{SpiceTest, append::NotStarted},
+    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
@@ -46,11 +49,16 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
 
+    let test_metrics = AppendTestMetrics::new(app.name.clone(), query_set.to_string())
+        .with_spiced_commit_sha(
+            std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+        );
+
     check_app_is_appendable(&app)?;
 
     println!("Running append test");
 
-    let append_test = SpiceTest::new(
+    let append_test = match SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
             .with_query_set(query_set.clone(), query_overrides)
@@ -64,15 +72,32 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     )
     .with_progress_bars(!args.test_args.common.disable_progress_bars)
     .start_appending()
-    .await?;
+    .await
+    {
+        Ok(test) => test,
+        Err(e) => {
+            test_metrics.emit(TestStatus::Failed).await?;
+            return Err(e);
+        }
+    };
 
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let mut spiced_instance = match SpicedInstance::start(start_request).await {
+        Ok(instance) => instance,
+        Err(e) => {
+            test_metrics.emit(TestStatus::Failed).await?;
+            return Err(e);
+        }
+    };
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
 
-    spiced_instance
+    if let Err(e) = spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
-        .await?;
+        .await
+    {
+        test_metrics.emit(TestStatus::Failed).await?;
+        return Err(e);
+    }
     let health_monitor = HealthMonitor::spawn()?;
 
     let append_test = append_test
@@ -80,9 +105,16 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         .start_test()
         .await?;
     let test = wait_test_and_memory!(append_test, memory_token, memory_readings);
-    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Append)?;
+    let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
+    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+
+    let test_metrics = test_metrics
+        .with_spiced_version(metrics.spiced_version.clone())
+        .with_testoperator_commit_sha(metrics.commit_sha.clone())
+        .with_branch_name(metrics.branch_name.clone())
+        .with_memory(max_memory, median_memory);
 
     let table_count_result = check_table_counts(
         &spiced_instance,
@@ -95,6 +127,12 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;
+
+    // Test passes only if: (1) table row counts match expected values, (2) all queries succeeded, and (3) health checks passed
+    let test_status: TestStatus =
+        (table_count_result.is_ok() && test_succeeded && health_report.is_ok()).into();
+    test_metrics.emit(test_status).await?;
+
     spiced_instance.stop()?;
     let health_report = health_report?;
 
@@ -103,6 +141,126 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!(message));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestStatus {
+    /// Test completed successfully
+    Passed,
+    /// Test failed
+    Failed,
+}
+
+impl From<bool> for TestStatus {
+    fn from(passed: bool) -> Self {
+        if passed {
+            TestStatus::Passed
+        } else {
+            TestStatus::Failed
+        }
+    }
+}
+
+impl TestStatus {
+    /// Convert `TestStatus` to a u64 value for metrics recording (1 = passed, 0 = failed)
+    #[must_use]
+    pub fn to_u64(self) -> u64 {
+        match self {
+            TestStatus::Passed => 1,
+            TestStatus::Failed => 0,
+        }
+    }
+}
+
+/// Builder for emitting append test metrics.
+#[derive(Default)]
+struct AppendTestMetrics {
+    app_name: String,
+    spiced_version: Option<String>,
+    query_set: String,
+    testoperator_commit_sha: Option<String>,
+    spiced_commit_sha: Option<String>,
+    branch_name: Option<String>,
+    max_memory: Option<f64>,
+    median_memory: Option<f64>,
+}
+
+impl AppendTestMetrics {
+    fn new(app_name: impl Into<String>, query_set: impl Into<String>) -> Self {
+        Self {
+            app_name: app_name.into(),
+            query_set: query_set.into(),
+            ..Self::default()
+        }
+    }
+
+    fn with_spiced_version(mut self, version: impl Into<String>) -> Self {
+        self.spiced_version = Some(version.into());
+        self
+    }
+
+    fn with_testoperator_commit_sha(mut self, sha: impl Into<String>) -> Self {
+        self.testoperator_commit_sha = Some(sha.into());
+        self
+    }
+
+    fn with_spiced_commit_sha(mut self, sha: impl Into<String>) -> Self {
+        self.spiced_commit_sha = Some(sha.into());
+        self
+    }
+
+    fn with_branch_name(mut self, name: impl Into<String>) -> Self {
+        self.branch_name = Some(name.into());
+        self
+    }
+
+    fn with_memory(mut self, max_memory: f64, median_memory: f64) -> Self {
+        self.max_memory = Some(max_memory);
+        self.median_memory = Some(median_memory);
+        self
+    }
+
+    /// Emit metrics and telemetry for the test result.
+    async fn emit(self, test_status: TestStatus) -> anyhow::Result<()> {
+        let resource = Resource::builder_empty()
+            .with_attributes(vec![
+                KeyValue::new("service.name", "testoperator"),
+                KeyValue::new("type", "append_test"),
+                KeyValue::new("name", self.app_name),
+                KeyValue::new(
+                    "spiced_version",
+                    self.spiced_version.unwrap_or_else(|| "unknown".to_string()),
+                ),
+                KeyValue::new("query_set", self.query_set),
+                KeyValue::new(
+                    "testoperator_commit_sha",
+                    self.testoperator_commit_sha
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                KeyValue::new(
+                    "spiced_commit_sha",
+                    self.spiced_commit_sha
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                KeyValue::new(
+                    "branch_name",
+                    self.branch_name.unwrap_or_else(|| "unknown".to_string()),
+                ),
+            ])
+            .build();
+
+        crate::metrics::STATUS.record(test_status.to_u64(), &[]);
+
+        if let Some(max_mem) = self.max_memory {
+            crate::metrics::PEAK_MEMORY_USAGE.record(max_mem * 1024.0, &[]);
+        }
+        if let Some(median_mem) = self.median_memory {
+            crate::metrics::MEDIAN_MEMORY_USAGE.record(median_mem * 1024.0, &[]);
+        }
+
+        let telemetry = Telemetry::new(&resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+        telemetry.emit().await
+    }
 }
 
 fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
