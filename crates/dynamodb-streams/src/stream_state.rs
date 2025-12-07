@@ -19,7 +19,7 @@ use crate::{Error, MissingStaringSequenceNumberSnafu, Result};
 use aws_sdk_dynamodbstreams::primitives::DateTime;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use snafu::OptionExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -237,8 +237,8 @@ impl StreamState {
     }
 
     /// Add discovered shards, returns shard IDs that need initialization
-    pub fn add_discovered(&mut self, shards: Vec<ApiShard>) -> Result<()> {
-        for shard in shards.clone() {
+    pub fn add_discovered(&mut self, shards: &[ApiShard]) -> Result<()> {
+        for shard in shards.iter().cloned() {
             let shard_id = shard.shard_id.clone();
 
             // If we've seen this shard before, skip it entirely
@@ -479,7 +479,7 @@ pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_dynamodbstreams::types::{Shard, StreamRecord};
+    use aws_sdk_dynamodbstreams::types::StreamRecord;
 
     impl StreamState {
         #[must_use]
@@ -1141,7 +1141,7 @@ mod tests {
         #[test]
         fn test_add_discovered_empty_list() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
-            state.add_discovered(vec![]).expect("result");
+            state.add_discovered(&[]).expect("result");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -1156,7 +1156,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             let shards = vec![create_api_shard("shard-1", None, None)];
 
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -1179,7 +1179,7 @@ mod tests {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
             let shards = vec![create_api_shard("shard-1", None, Some("999"))];
 
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             // Closed shards are ignored
             assert_eq!(state.active.len(), 0);
@@ -1221,7 +1221,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("child", Some("parent"), None)];
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);
@@ -1262,7 +1262,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("child", Some("parent"), None)];
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 2);
@@ -1304,7 +1304,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("child", Some("parent"), None)];
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
@@ -1354,7 +1354,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("shard-1", None, None)];
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             // Should not change existing active shard
             assert_eq!(state.active.len(), 1);
@@ -1401,7 +1401,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("shard-1", None, None)];
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 1);
@@ -1447,7 +1447,7 @@ mod tests {
             );
 
             let shards = vec![create_api_shard("shard-1", None, None)];
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -1492,7 +1492,7 @@ mod tests {
                 create_api_shard("child-2", Some("nonexistent"), None), // Should go to initializing
             ];
 
-            state.add_discovered(shards).expect("result");
+            state.add_discovered(&shards).expect("result");
 
             assert_eq!(state.active.len(), 1);
             assert_eq!(state.blocked.len(), 1);
@@ -1594,7 +1594,7 @@ mod tests {
             create_api_shard("shard-A", None, Some("100")),
         ];
 
-        state.add_discovered(discovered).expect("result");
+        state.add_discovered(&discovered).expect("result");
 
         assert!(
             !state.initializing.contains_key("shard-A"),
@@ -2201,7 +2201,7 @@ mod tests {
 
             // Discover initial shard
             state
-                .add_discovered(vec![create_api_shard("shard-1", None, None)])
+                .add_discovered(&[create_api_shard("shard-1", None, None)])
                 .expect("result");
             assert_eq!(state.active.len(), 0);
             assert_eq!(state.blocked.len(), 0);
@@ -2261,7 +2261,7 @@ mod tests {
 
             // Discover parent and child
             state
-                .add_discovered(vec![
+                .add_discovered(&[
                     create_api_shard("parent", None, None),
                     create_api_shard("child", Some("parent"), None),
                 ])
@@ -2322,7 +2322,7 @@ mod tests {
 
             // Add three generations
             state
-                .add_discovered(vec![
+                .add_discovered(&[
                     create_api_shard("gen1", None, None),
                     create_api_shard("gen2", Some("gen1"), None),
                     create_api_shard("gen3", Some("gen2"), None),
@@ -2386,7 +2386,7 @@ mod tests {
 
             // Parent splits into two children
             state
-                .add_discovered(vec![
+                .add_discovered(&[
                     create_api_shard("parent", None, None),
                     create_api_shard("child-a", Some("parent"), None),
                     create_api_shard("child-b", Some("parent"), None),
@@ -2451,7 +2451,7 @@ mod tests {
 
             // Add initial shard
             state
-                .add_discovered(vec![create_api_shard("shard-1", None, None)])
+                .add_discovered(&[create_api_shard("shard-1", None, None)])
                 .expect("result");
             state.mark_active("shard-1".to_string(), "iter-1".to_string());
 
@@ -2461,7 +2461,7 @@ mod tests {
 
             // Rediscover same shard - should be ignored
             state
-                .add_discovered(vec![create_api_shard("shard-1", None, None)])
+                .add_discovered(&[create_api_shard("shard-1", None, None)])
                 .expect("result");
 
             assert_eq!(state.active.len(), 1);
@@ -2597,7 +2597,7 @@ mod tests {
 
             // Two independent parent-child chains
             state
-                .add_discovered(vec![
+                .add_discovered(&[
                     create_api_shard("parent-1", None, None),
                     create_api_shard("parent-2", None, None),
                     create_api_shard("child-1", Some("parent-1"), None),

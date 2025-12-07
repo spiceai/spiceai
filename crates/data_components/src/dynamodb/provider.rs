@@ -90,6 +90,7 @@ impl DynamoDBTableProvider {
     /// # Errors
     ///
     /// Returns an error if the table cannot be accessed or metadata cannot be fetched.
+    #[allow(clippy::too_many_argumentsi)]
     pub async fn try_new(
         sdk_config: SdkConfig,
         table_name: Arc<str>,

@@ -22,7 +22,6 @@ use futures::{Stream, future::join_all};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tokio::{
@@ -91,7 +90,7 @@ impl DynamodbStreamProducer {
         // 4. Discover new shards
         // If permanent error is encountered, it is surfaced to the client.
         match self.client.get_all_shards(&self.stream_arn).await {
-            Ok(shards) => self.state.add_discovered(shards)?,
+            Ok(shards) => self.state.add_discovered(&shards)?,
             Err(e) => {
                 if !e.is_retriable() {
                     return Err(e);
