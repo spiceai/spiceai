@@ -429,8 +429,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
-        let snapshot_trigger_batches =
-            parse_duration_param(&mut params, "snapshots_trigger_batches")?;
+        let snapshot_trigger_batches = parse_snapshots_trigger_batches(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
