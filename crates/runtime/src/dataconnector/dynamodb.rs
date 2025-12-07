@@ -446,12 +446,13 @@ async fn changes_stream_from_checkpoint(
                             .and_then(|v| SystemTime::now().duration_since(v).ok());
 
                         tracing::debug!(
-                            "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, records={}",
+                            "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, shards={}, records={}",
                             dataset_name,
                             watermark
                                 .map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),
                             lag
                                 .map_or_else(|| "-".to_string(), |l| humantime::format_duration(l).to_string()),
+                            checkpoint.shards.len(),
                             change_batch.record.num_rows(),
                         );
 

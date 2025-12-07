@@ -114,6 +114,8 @@ impl Client {
         )
         .await?;
 
+        tracing::debug!("Stream initialized from checkpoint: {:#?}", state);
+
         let (tx, rx) = mpsc::channel(self.buffer);
 
         let retry_strategy = RetryBackoffBuilder::new()

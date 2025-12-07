@@ -48,7 +48,7 @@ impl DynamoDBTableSchema {
         Self {
             table_name,
             table_schema,
-            primary_keys: vec!["id".to_string(), "version".to_string()],
+            primary_keys,
             partition_key,
             sort_key,
             flattened_fields,
