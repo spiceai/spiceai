@@ -868,7 +868,7 @@ impl Refresher {
         let checkpointer = self.checkpointer.clone();
 
         let on_batch_process_callback = create_snapshot_callback(
-            self.snapshot_trigger_batches.clone(),
+            self.snapshot_trigger_batches,
             checkpointer,
             snapshot_manager,
             &self.dataset_name,
