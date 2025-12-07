@@ -246,11 +246,14 @@ impl StreamState {
                 continue;
             }
 
-            self.historical.insert(shard_id.clone(), HistoricalShard {
-                shard_id: shard_id.clone(),
-                parent_shard_id: shard.parent_shard_id.clone(),
-                created_at: SystemTime::now(),
-            });
+            self.historical.insert(
+                shard_id.clone(),
+                HistoricalShard {
+                    shard_id: shard_id.clone(),
+                    parent_shard_id: shard.parent_shard_id.clone(),
+                    created_at: SystemTime::now(),
+                },
+            );
 
             // Shards in DynamoDB Streams have a parent-child relationship.
             // Until we exhausted the parent shard, we don't want to read from its children.
@@ -377,7 +380,10 @@ pub async fn initialize_state_from_checkpoint(
     let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
     for shard in &all_shards {
         if let Some(parent) = &shard.parent_shard_id {
-            parent_map.entry(parent.clone()).or_default().push(shard.shard_id.clone());
+            parent_map
+                .entry(parent.clone())
+                .or_default()
+                .push(shard.shard_id.clone());
         }
     }
 
@@ -435,20 +441,26 @@ fn add_all_descendants_to_blocked(
     parent_id: &str,
     parent_map: &HashMap<String, Vec<String>>,
     all_shards: &[ApiShard],
-) -> Result<()>{
+) -> Result<()> {
     if let Some(children) = parent_map.get(parent_id) {
         for child_id in children {
             if let Some(child) = all_shards.iter().find(|s| &s.shard_id == child_id) {
-                state.blocked.insert(child_id.clone(), BlockedShard {
-                    shard_id: child_id.clone(),
-                    parent_shard_id: child.parent_shard_id.clone(),
-                    last_checkpoint: ShardCheckpoint {
-                        sequence_number: child.starting_sequence_number.clone().context(MissingStaringSequenceNumberSnafu)?,
-                        parent_id: child.parent_shard_id.clone(),
-                        updated_at: SystemTime::now(),
-                        position: CheckpointPosition::At,
+                state.blocked.insert(
+                    child_id.clone(),
+                    BlockedShard {
+                        shard_id: child_id.clone(),
+                        parent_shard_id: child.parent_shard_id.clone(),
+                        last_checkpoint: ShardCheckpoint {
+                            sequence_number: child
+                                .starting_sequence_number
+                                .clone()
+                                .context(MissingStaringSequenceNumberSnafu)?,
+                            parent_id: child.parent_shard_id.clone(),
+                            updated_at: SystemTime::now(),
+                            position: CheckpointPosition::At,
+                        },
                     },
-                });
+                );
 
                 add_all_descendants_to_blocked(state, child_id, parent_map, all_shards)?;
             }
@@ -882,7 +894,10 @@ mod tests {
             // Verify watermark is max timestamp (1010)
             assert!(result.current_watermark.is_some());
             let expected_watermark = datetime_to_system_time(DateTime::from_secs(1010));
-            assert_eq!(result.current_watermark.expect("result"), expected_watermark);
+            assert_eq!(
+                result.current_watermark.expect("result"),
+                expected_watermark
+            );
 
             // Verify active shard state
             let shard = state.active.get("shard-1").expect("result");
@@ -1313,11 +1328,14 @@ mod tests {
         #[test]
         fn test_add_discovered_ignores_existing_active_shard() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
-            state.historical.insert("shard-1".to_string(), HistoricalShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                created_at: SystemTime::now(),
-            });
+            state.historical.insert(
+                "shard-1".to_string(),
+                HistoricalShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    created_at: SystemTime::now(),
+                },
+            );
 
             state.active.insert(
                 "shard-1".to_string(),
@@ -1359,11 +1377,14 @@ mod tests {
         #[test]
         fn test_add_discovered_ignores_existing_pending_shard() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
-            state.historical.insert("shard-1".to_string(), HistoricalShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                created_at: SystemTime::now(),
-            });
+            state.historical.insert(
+                "shard-1".to_string(),
+                HistoricalShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    created_at: SystemTime::now(),
+                },
+            );
 
             state.blocked.insert(
                 "shard-1".to_string(),
@@ -1401,11 +1422,14 @@ mod tests {
         #[test]
         fn test_add_discovered_ignores_existing_initializing_shard() {
             let mut state = StreamState::new("arn:aws:stream:test".to_string());
-            state.historical.insert("shard-1".to_string(), HistoricalShard {
-                shard_id: "shard-1".to_string(),
-                parent_shard_id: None,
-                created_at: SystemTime::now(),
-            });
+            state.historical.insert(
+                "shard-1".to_string(),
+                HistoricalShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    created_at: SystemTime::now(),
+                },
+            );
 
             state.initializing.insert(
                 "shard-1".to_string(),
@@ -1530,7 +1554,7 @@ mod tests {
             HistoricalShard {
                 shard_id: "shard-A".to_string(),
                 parent_shard_id: None,
-                created_at: SystemTime::now()
+                created_at: SystemTime::now(),
             },
         );
         state.historical.insert(
@@ -1538,7 +1562,7 @@ mod tests {
             HistoricalShard {
                 shard_id: "shard-B".to_string(),
                 parent_shard_id: Some("shard-A".to_string()),
-                created_at: SystemTime::now()
+                created_at: SystemTime::now(),
             },
         );
 
@@ -1560,7 +1584,9 @@ mod tests {
         );
 
         // Shard-B expires - handle_poll_result with None iterator removes it and adds to expired
-        state.handle_poll_result("shard-B", None, vec![]).expect("result");
+        state
+            .handle_poll_result("shard-B", None, vec![])
+            .expect("result");
 
         // Discovery returns both shard-A and shard-B
         let discovered = vec![

@@ -103,8 +103,7 @@ impl DynamoDBTableProvider {
         metrics_collector: Arc<MetricsCollector>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
-        #[expect(unsafe_code)]
-        let buffer_size = unsafe { NonZeroUsize::new_unchecked(1) };
+        let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
