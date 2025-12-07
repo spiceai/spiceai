@@ -59,7 +59,6 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
-const DEFAULT_STREAM_POLL_INTERVAL_MS_STR: &str = "0";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -85,9 +84,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("scan_segments")
         .description("Number of segments. 'auto' by default.")
         .default(SEGMENTS_AUTO_STR),
-    ParameterSpec::runtime("stream_poll_interval_ms")
+    ParameterSpec::runtime("scan_interval")
         .description("Interval in milliseconds between polling for new records in a DynamoDB stream.")
-        .default(DEFAULT_STREAM_POLL_INTERVAL_MS_STR),
+        .default("0s"),
     ParameterSpec::runtime("time_format")
         .description("Go-style time format used for parsing/formatting timestamps")
         .default(DEFAULT_TIME_FORMAT),
@@ -160,13 +159,13 @@ impl DataConnector for DynamoDB {
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(10);
 
-        let stream_poll_interval_ms = self
+        let scan_interval = self
             .params
-            .get("stream_poll_interval_ms")
+            .get("scan_interval")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(0));
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
@@ -238,7 +237,7 @@ impl DataConnector for DynamoDB {
             unnest_depth,
             schema_infer_max_records,
             config_segments,
-            stream_poll_interval_ms,
+            scan_interval,
             time_format.to_string(),
             ready_lag,
         )

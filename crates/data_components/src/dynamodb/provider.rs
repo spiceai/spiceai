@@ -96,7 +96,7 @@ impl DynamoDBTableProvider {
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
-        stream_poll_interval_ms: u64,
+        scan_interval: Duration,
         time_format: String,
         ready_lag: Duration,
     ) -> Result<Self, Error> {
@@ -105,7 +105,7 @@ impl DynamoDBTableProvider {
         let buffer_size = unsafe { NonZeroUsize::new_unchecked(1) };
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
-                .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
+                .interval(Some(scan_interval))
                 .buffer(buffer_size)
                 .build(),
         );
