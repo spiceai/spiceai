@@ -548,7 +548,7 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
     Ok(false)
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn parse_snapshots_trigger_batches(
     params: &mut Option<Params>,
 ) -> Result<Option<u8>, crate::Error> {
