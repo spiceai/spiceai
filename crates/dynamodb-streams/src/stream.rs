@@ -244,7 +244,7 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
 
         // If eligible, include its current_watermark
         if is_eligible && let Some(watermark) = shard_result.current_watermark {
-            tracing::debug!(
+            tracing::trace!(
                 "Shard {} included in watermark: {}",
                 shard_result.shard_id,
                 humantime::format_rfc3339(watermark),
