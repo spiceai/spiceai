@@ -330,7 +330,7 @@ pub struct Acceleration {
 
     pub snapshot_behavior: SnapshotBehavior,
 
-    pub snapshot_trigger: Option<SnapshotTrigger>,
+    pub snapshot_trigger_batches: Option<u8>,
 }
 
 impl Acceleration {
@@ -429,6 +429,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
+        let snapshot_trigger_batches = parse_snapshots_trigger_batches(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
@@ -448,36 +449,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
-
-        let snapshot_trigger = match (
-            acceleration.snapshots_trigger,
-            acceleration.snapshots_batches,
-        ) {
-            (None, _) => None,
-            (Some(spicepod_acceleration::SnapshotTrigger::AfterRefresh), _) => {
-                Some(SnapshotTrigger::AfterRefresh)
-            }
-            (Some(spicepod_acceleration::SnapshotTrigger::Batches), None) => {
-                return Err(crate::Error::InvalidSpicepodDataset {
-                    source: super::Error::SnapshotTriggerIntervalRequiresInterval,
-                });
-            }
-            (Some(spicepod_acceleration::SnapshotTrigger::Batches), Some(batches)) => {
-                let Some(batches) =
-                    batches
-                        .parse()
-                        .map_err(|e| crate::Error::InvalidSpicepodDataset {
-                            source: super::Error::UnableToParseSnapshotsBatches { source: e },
-                        })?
-                else {
-                    return Err(crate::Error::InvalidSpicepodDataset {
-                        source: super::Error::SnapshotTriggerIntervalRequiresInterval,
-                    });
-                };
-
-                Some(SnapshotTrigger::Batches(batches))
-            }
-        };
 
         // TODO: Add validation for other refresh mode params here if needed.
 
@@ -516,7 +487,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             on_conflict,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
-            snapshot_trigger,
+            snapshot_trigger_batches,
         })
     }
 }
@@ -552,7 +523,7 @@ impl Default for Acceleration {
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
             snapshot_behavior: SnapshotBehavior::Disabled,
-            snapshot_trigger: None,
+            snapshot_trigger_batches: None,
         }
     }
 }
@@ -575,6 +546,12 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
         }
     }
     Ok(false)
+}
+
+fn parse_snapshots_trigger_batches(
+    params: &mut Option<Params>,
+) -> Result<Option<u8>, crate::Error> {
+    todo!()
 }
 
 /// Parse `caching_ttl` duration from params for caching mode.

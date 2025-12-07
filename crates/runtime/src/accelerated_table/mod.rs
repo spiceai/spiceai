@@ -293,7 +293,7 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
-    snapshot_trigger: Option<SnapshotTrigger>,
+    snapshot_trigger_batches: Option<u8>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -333,7 +333,7 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
-            snapshot_trigger: None,
+            snapshot_trigger_batches: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -466,11 +466,11 @@ impl Builder {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
-        snapshot_trigger: Option<SnapshotTrigger>,
+        snapshot_trigger_batches: Option<u8>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
-        self.snapshot_trigger = snapshot_trigger;
+        self.snapshot_trigger_batches = snapshot_trigger_batches;
         self
     }
 
@@ -583,41 +583,6 @@ impl Builder {
             }
         };
 
-        if self.snapshot_behavior.create_enabled() && self.snapshot_local_path.is_some() {
-            match acceleration_refresh_mode {
-                refresh::AccelerationRefreshMode::Append(_)
-                | refresh::AccelerationRefreshMode::Full(_)
-                | refresh::AccelerationRefreshMode::Caching(_) => {
-                    if let Some(trigger) = self.snapshot_trigger.clone()
-                        && !matches!(trigger, SnapshotTrigger::AfterRefresh)
-                    {
-                        return Err(AcceleratedTableBuilderError::InvalidSnapshotTrigger {
-                            message: format!(
-                                "Refresh mode '{:?}' only supports 'refresh' snapshot_trigger",
-                                self.refresh.mode
-                            ),
-                        });
-                    }
-                }
-                refresh::AccelerationRefreshMode::Changes(_) => {
-                    if let Some(trigger) = self.snapshot_trigger.clone() {
-                        match trigger {
-                            SnapshotTrigger::Batches(_) => {}
-                            SnapshotTrigger::AfterRefresh => {
-                                return Err(AcceleratedTableBuilderError::InvalidSnapshotTrigger {
-                                    message: format!(
-                                        "Refresh mode '{:?}' only supports 'interval' snapshot_trigger",
-                                        self.refresh.mode
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-                refresh::AccelerationRefreshMode::Disabled => {}
-            }
-        }
-
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
@@ -650,7 +615,7 @@ impl Builder {
         refresher.with_snapshot_behavior(
             self.snapshot_behavior,
             self.snapshot_local_path.clone(),
-            self.snapshot_trigger,
+            self.snapshot_trigger_batches,
         );
 
         if let Some(ref resource_monitor) = self.resource_monitor {

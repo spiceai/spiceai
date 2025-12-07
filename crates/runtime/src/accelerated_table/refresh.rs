@@ -468,7 +468,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
-    snapshot_trigger: Option<SnapshotTrigger>,
+    snapshot_trigger_batches: Option<u8>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -525,7 +525,7 @@ impl Refresher {
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
-            snapshot_trigger: None,
+            snapshot_trigger_batches: None,
             metrics: None,
             cpu_runtime,
             io_runtime,
@@ -583,11 +583,11 @@ impl Refresher {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
-        snapshot_trigger: Option<SnapshotTrigger>,
+        snapshot_trigger: Option<u8>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
-        self.snapshot_trigger = snapshot_trigger;
+        self.snapshot_trigger_batches = snapshot_trigger;
         self
     }
 
@@ -868,7 +868,7 @@ impl Refresher {
         let checkpointer = self.checkpointer.clone();
 
         let on_batch_process_callback = create_snapshot_callback(
-            self.snapshot_trigger.clone(),
+            self.snapshot_trigger_batches.clone(),
             checkpointer,
             snapshot_manager,
             &self.dataset_name,
@@ -918,22 +918,20 @@ type SnapshotCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
 fn create_snapshot_callback(
-    snapshot_trigger: Option<SnapshotTrigger>,
+    snapshot_trigger_batches: Option<u8>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     snapshot_manager: Option<SnapshotManager>,
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
 ) -> Option<SnapshotCallback> {
-    let snapshot_trigger = snapshot_trigger?;
-
-    match snapshot_trigger {
-        SnapshotTrigger::AfterRefresh => {
+    match snapshot_trigger_batches {
+        None => {
             tracing::warn!(
-                "Append/changes streams only support 'snapshots_trigger: batches', but 'refresh' is set. No checkpoints will be created."
+                "snapshot_trigger_batches is not defined. Snapshotting is disabled for dataset {dataset_name}"
             );
             None
         }
-        SnapshotTrigger::Batches(snapshot_batches) => {
+        Some(batches) => {
             match (checkpointer, snapshot_manager) {
                 (Some(checkpointer), Some(snapshot_manager)) => {
                     let snapshot_manager = Arc::new(snapshot_manager);
@@ -953,7 +951,7 @@ fn create_snapshot_callback(
                             let mut batches_processed_value = batches_processed.write().await;
 
                             *batches_processed_value += 1;
-                            if *batches_processed_value >= snapshot_batches {
+                            if *batches_processed_value >= batches {
                                 *batches_processed_value = 0;
 
                                 tracing::debug!(

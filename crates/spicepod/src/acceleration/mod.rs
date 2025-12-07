@@ -150,17 +150,6 @@ fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::Disabled
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotTrigger {
-    #[default]
-    /// Snapshots are created after each refresh (used by full/append modes).
-    AfterRefresh,
-    /// Snapshots are updated after X batches (used by append/changes modes).
-    Batches,
-}
-
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -259,12 +248,6 @@ pub struct Acceleration {
     /// `create_only` will only create snapshots, it won't attempt to bootstrap from one.
     #[serde(default, skip_serializing_if = "is_default_snapshot_behavior")]
     pub snapshots: SnapshotBehavior,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshots_trigger: Option<SnapshotTrigger>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshots_batches: Option<String>,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -307,8 +290,6 @@ impl Default for Acceleration {
             metrics: None,
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
-            snapshots_trigger: None,
-            snapshots_batches: None,
         }
     }
 }
