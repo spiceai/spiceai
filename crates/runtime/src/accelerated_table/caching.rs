@@ -45,7 +45,7 @@ use tokio::sync::Mutex;
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 
 /// Type alias for tracking in-flight revalidation requests.
-/// The key is a cache key derived from the filter expressions (request_path, request_query, request_body).
+/// The key is a cache key derived from the filter expressions (`request_path`, `request_query`, `request_body`).
 /// When a revalidation is in progress for a cache key, other requests for the same key will skip
 /// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
 pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
@@ -163,7 +163,7 @@ fn check_cache_freshness(
 /// The cache key is a string representation of the filter values for `request_path`, `request_query`, and `request_body`.
 fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
     // Sort and join filter expressions to create a consistent cache key
-    let mut parts: Vec<String> = filters.iter().map(|e| e.to_string()).collect();
+    let mut parts: Vec<String> = filters.iter().map(ToString::to_string).collect();
     parts.sort();
     parts.join("|")
 }
