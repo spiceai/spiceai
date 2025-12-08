@@ -7,6 +7,8 @@ use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
 };
 use ::datafusion::execution::SessionStateBuilder;
+use ::datafusion::physical_optimizer::PhysicalOptimizerRule;
+use ::datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use ::datafusion::prelude::SessionConfig;
 use app::App;
 use arrow_flight::FlightClient;
@@ -30,10 +32,12 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_optimizer_rules::physical_plan::cluster::ensure_supported_file_scan::EnsureSupportedFileScan;
+use datafusion_optimizer_rules::physical_plan::cluster::union_projection_pushdown::UnionProjectionPushdownOptimizer;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use flight_client::Credentials;
 use flight_client::arrow_flight_factory::make_arrow_flight_client;
-use futures::TryFutureExt;
+use futures::{StreamExt, TryFutureExt};
 use prost::Message;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;

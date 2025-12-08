@@ -62,9 +62,9 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
+use datafusion::common::config_err;
 #[cfg(feature = "cluster")]
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::config_err;
 use datafusion::config::ExtensionOptions;
 use futures::StreamExt;
 
@@ -73,6 +73,7 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 use super::managed_runtime;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
+use crate::datafusion::query::Error::UnableToExecuteQuery;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };

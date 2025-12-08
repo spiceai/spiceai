@@ -6,7 +6,7 @@ pub async fn make_arrow_flight_client(
     endpoint: &str,
     api_key: Option<String>,
 ) -> crate::Result<arrow_flight::FlightClient> {
-    let flight_channel = tls::new_tls_flight_channel(&endpoint)
+    let flight_channel = tls::new_tls_flight_channel(endpoint)
         .await
         .context(UnableToConnectToServerSnafu)?;
 
@@ -14,7 +14,7 @@ pub async fn make_arrow_flight_client(
 
     if let Some(api_key) = api_key {
         client
-            .add_header("authorization", format!("Bearer {}", api_key).as_str())
+            .add_header("authorization", format!("Bearer {api_key}").as_str())
             .context(ArrowFlightSnafu)?;
     }
 

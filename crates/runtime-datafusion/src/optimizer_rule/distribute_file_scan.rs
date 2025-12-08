@@ -1,6 +1,3 @@
-<<<<<<<< HEAD:crates/datafusion-optimizer-rules/src/physical_plan/cluster/distribute_file_scan.rs
-use crate::concrete;
-========
 /*
 Copyright 2025 The Spice.ai OSS Authors
 
@@ -18,7 +15,6 @@ limitations under the License.
 */
 use crate::concrete;
 use crate::config::cluster_config::SpiceClusterConfig;
->>>>>>>> trunk:crates/runtime-datafusion/src/optimizer_rule/distribute_file_scan.rs
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
@@ -34,7 +30,6 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use itertools::Itertools;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use std::cmp::max;
 use std::sync::Arc;
 
@@ -348,19 +343,14 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::common::plan_node_key::PlanNodeKey;
-    use crate::common::search_visitor::SearchVisitor;
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
     use datafusion::datasource::physical_plan::ArrowSource;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion_datasource::FileRange;
-<<<<<<<< HEAD:crates/datafusion-optimizer-rules/src/physical_plan/cluster/distribute_file_scan.rs
-========
     use datafusion_optimizer_rules::common::{
         plan_node_key::PlanNodeKey, search_visitor::SearchVisitor,
     };
->>>>>>>> trunk:crates/runtime-datafusion/src/optimizer_rule/distribute_file_scan.rs
     use object_store::ObjectMeta;
     use object_store::path::Path;
     use std::sync::LazyLock;
