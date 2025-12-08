@@ -50,12 +50,7 @@ impl ResolvedTableAwareAllowlist {
         for t in tables {
             let resolved = Self::parse_table_with_wildcards(&t)
                 .resolve(&self.default_catalog, &self.default_schema);
-            println!("Resolved: {}", resolved);
-            // Must escape the dots in the resolved string for glob matching
-            println!(
-                r#"{}\.{}\.{}"#,
-                resolved.catalog, resolved.schema, resolved.table
-            );
+
             bldr.add(Glob::new(
                 format!(
                     r#"{}.{}.{}"#,
@@ -77,11 +72,6 @@ impl ResolvedTableAwareAllowlist {
             .clone()
             .resolve(&self.default_catalog, &self.default_schema);
 
-        // Must escape the dots in the resolved string for glob matching
-        println!(
-            r#"{}\.{}\.{}"#,
-            resolved.catalog, resolved.schema, resolved.table
-        );
         self.allowed.is_match(
             format!(
                 r#"{}.{}.{}"#,
