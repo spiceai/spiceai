@@ -277,6 +277,11 @@ pub enum Error {
         connector: String,
     },
 
+    #[snafu(display(
+        "Invalid configuration detected for dataset {dataset_name}. Setting both `caching_stale_while_revalidate_ttl` on a dataset with a `refresh_mode: caching` acceleration and `stale_while_revalidate_ttl` on the runtime SQL results cache is unsupported. Remove one of those parameters and retry."
+    ))]
+    ConflictingStaleWhileRevalidateConfig { dataset_name: String },
+
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
 
@@ -1154,6 +1159,21 @@ impl DataFusion {
 
         // For caching mode, set the TTL (max_age) and stale_while_revalidate from params
         if refresh_mode == RefreshMode::Caching {
+            // Check for conflicting stale_while_revalidate configuration
+            if acceleration_settings
+                .caching_stale_while_revalidate_ttl
+                .is_some()
+            {
+                if let Some(results_cache) = &self.caching.results {
+                    ensure!(
+                        results_cache.stale_while_revalidate_ttl().is_none(),
+                        ConflictingStaleWhileRevalidateConfigSnafu {
+                            dataset_name: dataset.name.to_string(),
+                        }
+                    );
+                }
+            }
+
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
             accelerated_table_builder.caching_stale_while_revalidate_ttl(
                 acceleration_settings.caching_stale_while_revalidate_ttl,
