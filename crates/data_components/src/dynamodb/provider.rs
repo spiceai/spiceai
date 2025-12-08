@@ -61,6 +61,7 @@ use futures::pin_mut;
 use futures::stream::{self, BoxStream, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
@@ -75,6 +76,7 @@ pub struct DynamoDBTableProvider {
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
+    pub ready_lag: Duration,
 }
 
 type DynamoDBItemStream =
@@ -83,20 +85,28 @@ type DynamoDBItemStream =
 const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
+    /// Creates a new `DynamoDB` table provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be accessed or metadata cannot be fetched.
+    #[expect(clippy::too_many_arguments)]
     pub async fn try_new(
         sdk_config: SdkConfig,
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
-        stream_poll_interval_ms: u64,
+        scan_interval: Duration,
         time_format: String,
+        ready_lag: Duration,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
+        let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
-                .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
-                // .buffer(NonZeroUsize::new(1).unwrap())
+                .interval(Some(scan_interval))
+                .buffer(buffer_size)
                 .build(),
         );
 
@@ -147,6 +157,7 @@ impl DynamoDBTableProvider {
             unnest_depth,
             config_partitions,
             table_total_item_count,
+            ready_lag,
         })
     }
 
