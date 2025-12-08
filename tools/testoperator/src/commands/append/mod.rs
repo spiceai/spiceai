@@ -173,7 +173,6 @@ impl TestStatus {
 }
 
 /// Builder for emitting append test metrics.
-#[derive(Default)]
 struct AppendTestMetrics {
     app_name: String,
     spiced_version: Option<String>,
@@ -183,14 +182,23 @@ struct AppendTestMetrics {
     branch_name: Option<String>,
     max_memory: Option<f64>,
     median_memory: Option<f64>,
+    telemetry: Telemetry,
 }
 
 impl AppendTestMetrics {
     fn new(app_name: impl Into<String>, query_set: impl Into<String>) -> Self {
+        let telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+
         Self {
             app_name: app_name.into(),
             query_set: query_set.into(),
-            ..Self::default()
+            telemetry,
+            spiced_version: None,
+            testoperator_commit_sha: None,
+            spiced_commit_sha: None,
+            branch_name: None,
+            max_memory: None,
+            median_memory: None,
         }
     }
 
@@ -221,7 +229,7 @@ impl AppendTestMetrics {
     }
 
     /// Emit metrics and telemetry for the test result.
-    async fn emit(self, test_status: TestStatus) -> anyhow::Result<()> {
+    async fn emit(mut self, test_status: TestStatus) -> anyhow::Result<()> {
         let resource = Resource::builder_empty()
             .with_attributes(vec![
                 KeyValue::new("service.name", "testoperator"),
@@ -249,6 +257,8 @@ impl AppendTestMetrics {
             ])
             .build();
 
+        self.telemetry.set_resource(resource);
+
         crate::metrics::STATUS.record(test_status.to_u64(), &[]);
 
         if let Some(max_mem) = self.max_memory {
@@ -258,8 +268,7 @@ impl AppendTestMetrics {
             crate::metrics::MEDIAN_MEMORY_USAGE.record(median_mem * 1024.0, &[]);
         }
 
-        let telemetry = Telemetry::new(&resource, "SPICEAI_BENCHMARK_METRICS_KEY");
-        telemetry.emit().await
+        self.telemetry.emit().await
     }
 }
 
