@@ -459,10 +459,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
         let snapshots_trigger_threshold = parse_snapshots_trigger_threshold(&mut params)?;
-
-        let caching_ttl = parse_caching_ttl(&mut params)?;
-        let caching_stale_while_revalidate_ttl =
-            parse_caching_stale_while_revalidate_ttl(&mut params)?;
         let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
