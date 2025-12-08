@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::get_app_and_start_request;
 use crate::{
-    args::{AppendTestArgs, QuerySetLoader},
+    args::AppendTestArgs,
     health::HealthMonitor,
     wait_test_and_memory,
 };
@@ -62,6 +62,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         app.name.clone(),
         NotStarted::new()
             .with_query_set(query_set.clone(), query_overrides)
+            .await?
             .with_parallel_count(1)
             .with_end_duration(Duration::from_secs(args.test_args.common.duration))
             .with_tempdir_path(start_request.get_tempdir_path())

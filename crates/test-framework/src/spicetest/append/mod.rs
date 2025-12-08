@@ -40,6 +40,7 @@ use worker::{AppendConfig, AppendWorker};
 
 mod sources;
 use sources::FileAppendableSource;
+use crate::queries::QueryOverrides;
 
 #[derive(Default)]
 pub struct NotStarted {
@@ -68,11 +69,15 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_query_set(mut self, query_set: QuerySet, queries: Vec<queries::Query>) -> Self {
-        self.queries = queries;
+    pub async fn with_query_set(
+        mut self,
+        query_set: QuerySet,
+        overrides: Option<QueryOverrides>,
+    ) -> Result<Self> {
+        self.queries = query_set.get_queries(overrides, None, None).await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
-        self
+        Ok(self)
     }
 
     #[must_use]

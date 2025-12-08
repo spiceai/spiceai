@@ -81,7 +81,7 @@ fn generate_tpch_setup_sql(
             &mut sql,
             "CALL dbgen(sf=1, children={load_steps}, step=0, suffix='_retention');"
         )
-        .ok();
+            .ok();
     }
 
     for TableWithTimeColumn { name, column } in tables {
@@ -92,7 +92,7 @@ fn generate_tpch_setup_sql(
             &mut sql,
             "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;"
         )
-        .ok();
+            .ok();
 
         // Retention test data: offset primary keys + old timestamp for deletion testing
         if generate_retention_data {
@@ -100,20 +100,20 @@ fn generate_tpch_setup_sql(
                 sql,
                 "ALTER TABLE {name}_retention ADD COLUMN {column} TIMESTAMPTZ;"
             )
-            .ok();
+                .ok();
             // Offset primary keys and set old timestamp in single UPDATE
             if let Some(pk_col) = tpch_primary_key(name) {
                 writeln!(
                     sql,
                     "UPDATE {name}_retention SET {pk_col} = {pk_col} + {TEMP_DATA_KEY_OFFSET}, {column} = {RETENTION_TIMESTAMP_EXPR};"
                 )
-                .ok();
+                    .ok();
             } else {
                 writeln!(
                     sql,
                     "UPDATE {name}_retention SET {column} = {RETENTION_TIMESTAMP_EXPR};"
                 )
-                .ok();
+                    .ok();
             }
 
             writeln!(
@@ -121,7 +121,7 @@ fn generate_tpch_setup_sql(
                 "INSERT INTO {name} SELECT * FROM {name}_retention;
                 DROP TABLE {name}_retention;"
             )
-            .ok();
+                .ok();
         }
 
         writeln!(
@@ -129,7 +129,7 @@ fn generate_tpch_setup_sql(
             "COPY {name} TO '{}' (FORMAT 'parquet');",
             parquet_path.to_string_lossy()
         )
-        .ok();
+            .ok();
     }
 
     sql += "COMMIT;";
@@ -158,7 +158,7 @@ fn generate_tpch_sql(
             &mut sql,
             "CALL dbgen(sf=1, children={load_steps}, step={next_step}, suffix='_conflict');"
         )
-        .ok();
+            .ok();
     }
 
     for TableWithTimeColumn { name, column } in tables {
@@ -171,7 +171,7 @@ fn generate_tpch_sql(
                          INSERT INTO {name} SELECT * FROM {name}_new;
                          DROP TABLE {name}_new;\n"
         )
-        .ok();
+            .ok();
 
         // Conflict data: same primary keys, will be handled by ON CONFLICT
         if generate_conflict_data {
@@ -185,7 +185,7 @@ fn generate_tpch_sql(
             "COPY {name} TO '{}' (FORMAT 'parquet');",
             parquet_path.to_string_lossy()
         )
-        .ok();
+            .ok();
     }
 
     sql += "COMMIT;";
@@ -205,7 +205,7 @@ fn generate_tpcds_sql(load_steps: u16, load_index: u16, tables: &[TableWithTimeC
                          OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
                          COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n"
         )
-        .ok();
+            .ok();
     }
 
     sql += "COMMIT;";
@@ -289,7 +289,7 @@ impl AppendableSource for FileAppendableSource {
                         // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
                         // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
                         write!(&mut setup_sql,
-                            "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
+                               "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                              ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                              INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
                              LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
@@ -312,15 +312,15 @@ impl AppendableSource for FileAppendableSource {
 
                     dest_conn.execute_batch(setup_sql)?;
                 }
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => unimplemented!("Appendable file source is not implemented for Scenario or Parameterized TPC-H query sets"),
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ParameterizedSaffron => unimplemented!("Appendable file source is not implemented for Scenario or Parameterized TPC-H query sets"),
             }
 
             drop(dest_conn);
 
             Ok::<(), anyhow::Error>(())
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
 
         Ok(())
     }
@@ -361,7 +361,7 @@ impl AppendableSource for FileAppendableSource {
                 ),
                 QuerySet::Tpcds => generate_tpcds_sql(load_steps, load_index, &tables),
                 QuerySet::Clickbench => generate_clickbench_sql(load_steps, load_index),
-                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch => {
+                QuerySet::Scenario { .. } | QuerySet::ParameterizedTpch | QuerySet::ParameterizedSaffron => {
                     unimplemented!("Appendable file source is not implemented for Scenario or Parameterized query sets")
                 }
             };
@@ -370,8 +370,8 @@ impl AppendableSource for FileAppendableSource {
 
             Ok::<(), anyhow::Error>(())
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to spawn blocking task: {e}"))??;
 
         Ok(())
     }

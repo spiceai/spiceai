@@ -219,7 +219,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ])
         .build();
 
-    let telemetry = Telemetry::new(&load_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    let telemetry = Telemetry::new_with_resource(&load_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
     // Record per-query metrics for load test
     for query in &metrics.metrics {
