@@ -325,11 +325,12 @@ mod tests {
             .into_iter()
             .collect();
 
-        let metric_names = vec!["keep_me", "remove_me", "also_keep", "remove_too"];
+        let metric_names = ["keep_me", "remove_me", "also_keep", "remove_too"];
 
         // Apply the same retain logic used in filter_metrics
         let filtered: Vec<&str> = metric_names
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|name| whitelist.is_empty() || whitelist.contains(*name))
             .collect();
 
@@ -344,29 +345,28 @@ mod tests {
     fn test_filtering_retain_keeps_all_when_empty_whitelist() {
         let whitelist: HashSet<String> = HashSet::new();
 
-        let metric_names = vec!["metric_a", "metric_b", "metric_c"];
+        let metric_names = ["metric_a", "metric_b", "metric_c"];
 
         // Apply the same retain logic - empty whitelist means keep all
-        let filtered: Vec<&str> = metric_names
-            .into_iter()
-            .filter(|name| whitelist.is_empty() || whitelist.contains(*name))
-            .collect();
+        let count = metric_names
+            .iter()
+            .filter(|name| whitelist.is_empty() || whitelist.contains(**name))
+            .count();
 
-        assert_eq!(filtered.len(), 3);
+        assert_eq!(count, 3);
     }
 
     #[test]
     fn test_filtering_retain_removes_all_when_none_match() {
         let whitelist: HashSet<String> = vec!["nonexistent".to_string()].into_iter().collect();
 
-        let metric_names = vec!["metric_a", "metric_b"];
+        let metric_names = ["metric_a", "metric_b"];
 
-        let filtered: Vec<&str> = metric_names
-            .into_iter()
-            .filter(|name| whitelist.is_empty() || whitelist.contains(*name))
-            .collect();
+        let any_match = metric_names
+            .iter()
+            .any(|name| whitelist.is_empty() || whitelist.contains(*name));
 
         // Should have no metrics left since none matched
-        assert!(filtered.is_empty());
+        assert!(!any_match);
     }
 }
