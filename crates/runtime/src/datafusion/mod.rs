@@ -278,7 +278,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Invalid configuration detected for dataset {dataset_name}. Setting both `caching_stale_while_revalidate_ttl` on a dataset with a `refresh_mode: caching` acceleration and `stale_while_revalidate_ttl` on the runtime SQL results cache is unsupported. Remove one of those parameters and retry."
+        "Conflicting stale-while-revalidate settings for dataset {dataset_name}. When using `refresh_mode: caching`, set either acceleration `caching_stale_while_revalidate_ttl` or results cache `stale_while_revalidate_ttl`, but not both.
     ))]
     ConflictingStaleWhileRevalidateConfig { dataset_name: String },
 
