@@ -39,7 +39,7 @@ jobs:
     steps:
       - name: Resolve run metadata
         id: resolve
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             let run;
@@ -87,7 +87,7 @@ jobs:
     steps:
       - name: Set up matrix
         id: setup
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           IS_PR: ${{ needs.resolve-run.outputs.is_pr }}
         with:
@@ -128,7 +128,7 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ needs.resolve-run.outputs.head_sha }}
           fetch-depth: 1
@@ -205,7 +205,7 @@ jobs:
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ needs.resolve-run.outputs.head_sha }}
           fetch-depth: 1

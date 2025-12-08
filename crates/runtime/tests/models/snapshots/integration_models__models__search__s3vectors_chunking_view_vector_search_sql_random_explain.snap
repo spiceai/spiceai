@@ -21,7 +21,7 @@ description: "SELECT subject FROM vector_search(qs_view, 'second', answer) order
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                    |
 |               |                     BytesProcessedExec                                                                                                    |
 |               |                       CooperativeExec                                                                                                     |
-|               |                         S3VectorsQueryExec: limit=30                                                                                      |
+|               |                         S3VectorsQueryExec: limit=100                                                                                     |
 |               |       SchemaCastScanExec                                                                                                                  |
 |               |         BytesProcessedExec                                                                                                                |
 |               |           DataSourceExec: partitions=1, partition_sizes=[1]                                                                               |

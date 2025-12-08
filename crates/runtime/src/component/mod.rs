@@ -146,10 +146,16 @@ fn find_first_delimiter(from: &str) -> Option<(usize, usize)> {
 ///
 /// [`OnStartup`] indicates that the component should be initialized when runtime started.
 /// [`OnTrigger`] indicates that the component should be initialized when a specific trigger event occurs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentInitialization {
-    OnStartup,
+    OnStartup(StartupOptions),
     OnTrigger,
+}
+
+impl Default for ComponentInitialization {
+    fn default() -> Self {
+        Self::OnStartup(StartupOptions::default())
+    }
 }
 
 impl ComponentInitialization {
@@ -157,6 +163,31 @@ impl ComponentInitialization {
     pub fn is_on_trigger(&self) -> bool {
         matches!(self, ComponentInitialization::OnTrigger)
     }
+
+    /// Returns whether the dataset health monitor should be enabled for this component.
+    #[must_use]
+    pub fn is_dataset_health_monitor_enabled(&self) -> bool {
+        match self {
+            ComponentInitialization::OnStartup(options) => {
+                options.dataset_health_monitor == DatasetHealthMonitor::Enabled
+            }
+            ComponentInitialization::OnTrigger => false,
+        }
+    }
+}
+
+/// Controls whether the dataset health monitor is enabled for a component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatasetHealthMonitor {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+/// Options for components initialized on startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartupOptions {
+    pub dataset_health_monitor: DatasetHealthMonitor,
 }
 
 #[cfg(test)]

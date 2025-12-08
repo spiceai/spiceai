@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -45,8 +46,8 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::select;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
 
@@ -83,6 +84,8 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
+    /// TTL for cache entries. Data older than this is considered stale.
+    pub(crate) caching_ttl: Option<Duration>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -185,6 +188,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
+        self.caching_ttl = Some(caching_ttl);
         self
     }
 
@@ -430,6 +439,7 @@ impl Default for Refresh {
             append_overlap: None,
             retry_enabled: false,
             retry_max_attempts: None,
+            caching_ttl: None,
         }
     }
 }
@@ -458,6 +468,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    snapshots_trigger_threshold: Option<i64>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -466,6 +477,9 @@ pub struct Refresher {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator.
+    /// Shared with `CachingAccelerationScanExec`.
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -491,6 +505,7 @@ impl Refresher {
         accelerator: Arc<dyn TableProvider>,
         cpu_runtime: Option<Handle>,
         io_runtime: Handle,
+        cache_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -510,10 +525,12 @@ impl Refresher {
             on_complete_notification: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            snapshots_trigger_threshold: None,
             metrics: None,
             cpu_runtime,
             io_runtime,
             resource_monitor: None,
+            cache_mutex,
         }
     }
 
@@ -566,9 +583,11 @@ impl Refresher {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
+        snapshots_trigger_threshold: Option<i64>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
+        self.snapshots_trigger_threshold = snapshots_trigger_threshold;
         self
     }
 
@@ -645,6 +664,22 @@ impl Refresher {
             }
         };
 
+        let snapshot_manager = match (
+            self.snapshot_behavior.create_enabled(),
+            self.snapshot_local_path.clone(),
+        ) {
+            (true, Some(snapshot_local_path)) => Some(
+                SnapshotManager::try_new(
+                    self.dataset_name.to_string(),
+                    self.snapshot_behavior.clone(),
+                    snapshot_local_path,
+                )
+                .await,
+            ),
+            _ => None,
+        }
+        .flatten();
+
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
             (
@@ -654,7 +689,7 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                return Ok(Some(self.start_changes_stream(stream)));
+                return Ok(Some(self.start_changes_stream(stream, snapshot_manager)));
             }
         };
 
@@ -666,6 +701,7 @@ impl Refresher {
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
             self.io_runtime.clone(),
+            Arc::clone(&self.cache_mutex),
         )
         .with_disable_federation(self.disable_federation);
 
@@ -700,22 +736,6 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
         let federated_schema = self.federated.schema();
-
-        let snapshot_manager = match (
-            self.snapshot_behavior.create_enabled(),
-            self.snapshot_local_path.clone(),
-        ) {
-            (true, Some(snapshot_local_path)) => Some(
-                SnapshotManager::try_new(
-                    self.dataset_name.to_string(),
-                    self.snapshot_behavior.clone(),
-                    snapshot_local_path,
-                )
-                .await,
-            ),
-            _ => None,
-        }
-        .flatten();
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
@@ -843,7 +863,18 @@ impl Refresher {
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
+        snapshot_manager: Option<SnapshotManager>,
     ) -> tokio::task::JoinHandle<()> {
+        let checkpointer = self.checkpointer.clone();
+
+        let on_batch_process_callback = create_snapshot_callback(
+            self.snapshots_trigger_threshold,
+            checkpointer,
+            snapshot_manager,
+            &self.dataset_name,
+            self.federated.schema(),
+        );
+
         let refresh_task = Arc::new(
             RefreshTask::builder(
                 Arc::clone(&self.runtime_status),
@@ -852,10 +883,12 @@ impl Refresher {
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
                 self.io_runtime.clone(),
+                Arc::clone(&self.cache_mutex),
             )
             .with_disable_federation(self.disable_federation)
             .with_cpu_runtime(self.cpu_runtime.clone())
             .with_metrics(self.metrics.clone())
+            .with_on_stream_batch_process_callback(on_batch_process_callback)
             .build(),
         );
 
@@ -878,6 +911,72 @@ impl Refresher {
                 tracing::error!("Changes stream failed with error: {err}");
             }
         })
+    }
+}
+
+type SnapshotCallback =
+    Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
+fn create_snapshot_callback(
+    snapshots_trigger_threshold: Option<i64>,
+    checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
+    snapshot_manager: Option<SnapshotManager>,
+    dataset_name: &TableReference,
+    federated_schema: Arc<Schema>,
+) -> Option<SnapshotCallback> {
+    let threshold = snapshots_trigger_threshold.unwrap_or(300i64);
+
+    match (checkpointer, snapshot_manager) {
+        (Some(checkpointer), Some(snapshot_manager)) => {
+            let snapshot_manager = Arc::new(snapshot_manager);
+            let dataset_name = dataset_name.clone();
+
+            // Track number of processed batches since last snapshot
+            let batches_processed = Arc::new(RwLock::new(0i64));
+
+            let callback = Arc::new(Mutex::new(Box::new(move || {
+                let checkpointer = Arc::clone(&checkpointer);
+                let snapshot_manager = Arc::clone(&snapshot_manager);
+                let batches_processed = Arc::clone(&batches_processed);
+                let federated_schema = Arc::<Schema>::clone(&federated_schema);
+                let dataset_name = dataset_name.clone();
+
+                Box::pin(async move {
+                    let mut batches_processed_value = batches_processed.write().await;
+
+                    *batches_processed_value += 1;
+                    if *batches_processed_value >= threshold {
+                        *batches_processed_value = 0;
+
+                        tracing::debug!("Creating snapshot for changes stream: {}", dataset_name);
+
+                        if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+                            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+                            return;
+                        }
+
+                        if let Err(e) = snapshot_manager.create_snapshot(&federated_schema).await {
+                            let dataset_label = dataset_name.to_string();
+                            snapshot_metrics::record_snapshot_failure(&dataset_label);
+                            tracing::warn!(
+                                "Failed to create snapshot for changes stream {}: {}",
+                                dataset_name,
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                "Successfully created snapshot for changes stream: {}",
+                                dataset_name
+                            );
+                        }
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            })
+                as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
+
+            Some(callback)
+        }
+        _ => None,
     }
 }
 
@@ -1026,6 +1125,7 @@ mod tests {
             Arc::clone(&accelerator),
             None,
             Handle::current(),
+            Arc::new(Mutex::new(())),
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1236,6 +1336,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1395,6 +1496,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1604,6 +1706,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));

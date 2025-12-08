@@ -48,13 +48,13 @@ use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
-    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec,
+    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec, wrap_with_filter,
 };
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
@@ -161,6 +161,9 @@ pub enum Error {
 
     #[snafu(display("Failed to start refresh task. The task was already started."))]
     RefreshTaskAlreadyStarted {},
+
+    #[snafu(display("Failed to create RecordBatch: {source}"))]
+    FailedToBuildRecordBatch { source: ArrowError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -223,7 +226,13 @@ pub struct AcceleratedTable {
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
     cache_ttl: Option<Duration>,
+    cache_stale_while_revalidate_ttl: Option<Duration>,
+    cache_stale_if_error: bool,
     io_runtime: Handle,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
+    cache_mutex: Arc<Mutex<()>>,
+    /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
+    in_flight_revalidations: caching::InFlightRevalidations,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -282,10 +291,13 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    snapshots_trigger_threshold: Option<i64>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     caching_ttl: Option<Duration>,
+    caching_stale_while_revalidate_ttl: Option<Duration>,
+    caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
@@ -320,10 +332,13 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            snapshots_trigger_threshold: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
             caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
+            caching_stale_if_error: false,
             resource_monitor: None,
         }
     }
@@ -451,15 +466,32 @@ impl Builder {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
+        snapshots_trigger_threshold: Option<i64>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
+        self.snapshots_trigger_threshold = snapshots_trigger_threshold;
         self
     }
 
     /// Set the TTL for cache mode
     pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
         self.caching_ttl = ttl;
+        self
+    }
+
+    /// Set the stale-while-revalidate duration for cache mode
+    pub fn caching_stale_while_revalidate_ttl(
+        &mut self,
+        stale_while_revalidate: Option<Duration>,
+    ) -> &mut Self {
+        self.caching_stale_while_revalidate_ttl = stale_while_revalidate;
+        self
+    }
+
+    /// Set whether to serve expired data on upstream error in cache mode
+    pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
+        self.caching_stale_if_error = enabled;
         self
     }
 
@@ -560,6 +592,11 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
+        // Create the cache mutex early so it can be shared between the Refresher and the AcceleratedTable.
+        let cache_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
+        let in_flight_revalidations: caching::InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -569,6 +606,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&cache_mutex),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -583,7 +621,11 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
+        refresher.with_snapshot_behavior(
+            self.snapshot_behavior,
+            self.snapshot_local_path.clone(),
+            self.snapshots_trigger_threshold,
+        );
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
@@ -628,7 +670,11 @@ impl Builder {
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
             cache_ttl: self.caching_ttl,
+            cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
+            cache_stale_if_error: self.caching_stale_if_error,
             io_runtime: self.io_runtime,
+            cache_mutex,
+            in_flight_revalidations,
         })
     }
 }
@@ -721,6 +767,30 @@ impl AcceleratedTable {
         }
 
         Ok(())
+    }
+
+    /// Returns the subset of filters that the accelerator does not fully support
+    /// (i.e., `Inexact` or `Unsupported`) and need to be re-applied after scanning.
+    fn get_filters_to_reapply(&self, filters: &[Expr]) -> DataFusionResult<Vec<Expr>> {
+        if filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let filter_refs: Vec<&Expr> = filters.iter().collect();
+        let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+
+        let filters_to_reapply: Vec<Expr> = filters
+            .iter()
+            .zip(pushdown_support.iter())
+            .filter_map(|(filter, support)| match support {
+                TableProviderFilterPushDown::Exact => None,
+                TableProviderFilterPushDown::Inexact | TableProviderFilterPushDown::Unsupported => {
+                    Some(filter.clone())
+                }
+            })
+            .collect();
+
+        Ok(filters_to_reapply)
     }
 }
 
@@ -816,10 +886,22 @@ impl TableProvider for AcceleratedTable {
         let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
             (true, _) => {
                 // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+
+                // Check which filters the accelerator doesn't fully support and need to be re-applied.
+                // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
+                let filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                let input = if filters_to_reapply.is_empty() {
+                    input
+                } else {
+                    wrap_with_filter(input, state, &filters_to_reapply)?
+                };
+
                 let federated_provider = self.federated.table_provider().await;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
                     federated_provider,
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
@@ -827,6 +909,8 @@ impl TableProvider for AcceleratedTable {
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
+                    Arc::clone(&self.cache_mutex),
+                    Arc::clone(&self.in_flight_revalidations),
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,

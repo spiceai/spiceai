@@ -19,12 +19,12 @@ use super::{
     FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
     TableStatusIsNotActiveSnafu,
 };
-use crate::cdc::ChangesStream;
+use crate::cdc::ChangeBatch;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
 use crate::dynamodb::schema::infer_arrow_schema_from_items;
-use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_envelope};
+use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_items;
 use arrow::datatypes::SchemaRef;
@@ -55,15 +55,15 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use dynamodb_streams::Client as StreamsClient;
-use dynamodb_streams::checkpoint::GlobalCheckpoint;
+use dynamodb_streams::{Checkpoint, Client as StreamsClient, Metrics, MetricsCollector};
 use futures::Stream;
 use futures::pin_mut;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt};
 use snafu::prelude::*;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 #[derive(Debug, Clone)]
@@ -76,6 +76,7 @@ pub struct DynamoDBTableProvider {
     unnest_depth: Option<usize>,
     config_partitions: Option<usize>,
     table_total_item_count: Option<i64>,
+    pub ready_lag: Duration,
 }
 
 type DynamoDBItemStream =
@@ -84,19 +85,30 @@ type DynamoDBItemStream =
 const DEFAULT_PARTITIONS: usize = 8;
 
 impl DynamoDBTableProvider {
+    /// Creates a new `DynamoDB` table provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be accessed or metadata cannot be fetched.
+    #[expect(clippy::too_many_arguments)]
     pub async fn try_new(
         sdk_config: SdkConfig,
         table_name: Arc<str>,
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         config_partitions: Option<usize>,
-        stream_poll_interval_ms: u64,
+        scan_interval: Duration,
         time_format: String,
+        ready_lag: Duration,
+        metrics_collector: Arc<MetricsCollector>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
+        let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
         let streams_client = Arc::new(
             StreamsClient::builder(sdk_config, table_name.to_string())
-                .interval(Some(Duration::from_millis(stream_poll_interval_ms)))
+                .interval(Some(scan_interval))
+                .buffer(buffer_size)
+                .metrics_collector(metrics_collector)
                 .build(),
         );
 
@@ -147,6 +159,7 @@ impl DynamoDBTableProvider {
             unnest_depth,
             config_partitions,
             table_total_item_count,
+            ready_lag,
         })
     }
 
@@ -257,7 +270,7 @@ impl DynamoDBTableProvider {
         }
     }
 
-    pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
+    pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         self.streams_client
             .latest_global_checkpoint()
             .await
@@ -266,8 +279,13 @@ impl DynamoDBTableProvider {
 
     pub async fn stream_from_checkpoint(
         &self,
-        checkpoint: GlobalCheckpoint,
-    ) -> Result<ChangesStream> {
+        checkpoint: Checkpoint,
+    ) -> Result<
+        BoxStream<
+            'static,
+            Result<(ChangeBatch, Checkpoint, Option<SystemTime>), crate::cdc::StreamError>,
+        >,
+    > {
         let table_schema = Arc::clone(self.table_schema.schema());
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
@@ -292,7 +310,16 @@ impl DynamoDBTableProvider {
         Ok(Box::pin(stream))
     }
 
-    pub async fn bootstrap_stream(self: Arc<Self>) -> Result<ChangesStream> {
+    /// Creates a bootstrap stream for the `DynamoDB` table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Logical plan construction fails
+    /// - Stream execution fails
+    pub async fn bootstrap_stream(
+        self: Arc<Self>,
+    ) -> Result<BoxStream<'static, Result<ChangeBatch, crate::cdc::StreamError>>> {
         let schema = Arc::clone(self.table_schema.schema());
         let table_name = self.table_schema.table_name();
         let primary_keys = self.table_schema.primary_keys();
@@ -305,7 +332,7 @@ impl DynamoDBTableProvider {
 
         let logical_plan = LogicalPlanBuilder::scan(table_name, table_source, None)
             .and_then(|b| b.project(columns))
-            .and_then(LogicalPlanBuilder::build)
+            .and_then(datafusion::logical_expr::LogicalPlanBuilder::build)
             .context(FailedToBootstrapTableSnafu)?;
 
         let ctx = SessionContext::new();
@@ -324,7 +351,7 @@ impl DynamoDBTableProvider {
                         self.table_schema.table_name(),
                         record_batch.num_rows()
                     );
-                    record_batch_to_change_envelope(record_batch, &schema, &primary_keys)
+                    record_batch_to_change_batch(record_batch, &schema, &primary_keys)
                         .map_err(crate::cdc::StreamError::DynamoDB)
                 }
                 Err(e) => Err(crate::cdc::StreamError::DynamoDB(
@@ -333,6 +360,11 @@ impl DynamoDBTableProvider {
             });
 
         Ok(stream.boxed())
+    }
+
+    #[must_use]
+    pub fn stream_metrics(&self) -> Metrics {
+        self.streams_client.metrics()
     }
 }
 

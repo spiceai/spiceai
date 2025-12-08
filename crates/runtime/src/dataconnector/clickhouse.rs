@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use clickhouse_rs::Options;
 use data_components::Read;
@@ -222,6 +222,8 @@ impl DataConnectorFactory for ClickhouseFactory {
         RESERVED_KEYWORDS
     }
 }
+
+register_data_connector!("clickhouse", ClickhouseFactory);
 
 #[async_trait]
 impl DataConnector for Clickhouse {

@@ -456,9 +456,12 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
     let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
     load_runtime(Arc::clone(&runtime)).await?;
 
-    let baseline = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-        .await
-        .context("Executing baseline query for DuckDB snapshot")?;
+    let baseline = run_query(
+        &runtime,
+        "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+    )
+    .await
+    .context("Executing baseline query for DuckDB snapshot")?;
 
     let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
         .await
@@ -541,9 +544,12 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
     load_runtime(Arc::clone(&runtime)).await?;
 
-    let baseline = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-        .await
-        .context("Executing baseline query for SQLite snapshot")?;
+    let baseline = run_query(
+        &runtime,
+        "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+    )
+    .await
+    .context("Executing baseline query for SQLite snapshot")?;
 
     let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
         .await
@@ -629,9 +635,12 @@ async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let bootstrap_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                .await
-                .context("Querying dataset bootstrapped from DuckDB snapshot")?;
+            let bootstrap_results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset bootstrapped from DuckDB snapshot")?;
             let expected = fixture.baseline_pretty()?;
             let actual = pretty_format_batches(&bootstrap_results)
                 .map(|fmt| fmt.to_string())
@@ -698,7 +707,7 @@ async fn snapshot_int_test2_duckdb_bootstrap_without_federation() -> Result<()> 
                 "Dataset should be ready using the downloaded snapshot even when federation is disabled"
             );
 
-            let offline_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+            let offline_results = run_query(&runtime, "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1")
                 .await
                 .context("Querying dataset with federation disabled")?;
             let expected = fixture.baseline_pretty()?;
@@ -746,9 +755,12 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let bootstrap_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                .await
-                .context("Querying dataset bootstrapped from SQLite snapshot")?;
+            let bootstrap_results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset bootstrapped from SQLite snapshot")?;
             let expected = fixture.baseline_pretty()?;
             let actual = pretty_format_batches(&bootstrap_results)
                 .map(|fmt| fmt.to_string())
@@ -794,7 +806,7 @@ async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> R
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+            let results = run_query(&runtime, "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1")
                 .await
                 .context("Querying dataset with pre-existing acceleration file")?;
             let expected = fixture.baseline_pretty()?;
@@ -891,9 +903,12 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                .await
-                .context("Querying dataset after restart with generated snapshot")?;
+            let results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset after restart with generated snapshot")?;
             let expected = fixture.baseline_pretty()?;
             let actual = pretty_format_batches(&results)
                 .map(|fmt| fmt.to_string())
@@ -1141,7 +1156,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+            let results = run_query(&runtime, "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1")
                 .await
                 .context("Querying dataset after metadata-directed bootstrap")?;
             let expected = fixture.baseline_pretty()?;

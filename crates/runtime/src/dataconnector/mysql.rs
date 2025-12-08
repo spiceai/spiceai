@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -471,3 +472,5 @@ impl MetricsProvider for MySQLMetricsProvider {
         }
     }
 }
+
+register_data_connector!("mysql", MySQLFactory);
