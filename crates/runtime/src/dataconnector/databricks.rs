@@ -118,7 +118,7 @@ impl Databricks {
         let auth_credentials = Self::build_auth_credentials(&params)?;
         let initialization = match auth_credentials {
             AuthCredentials::U2M(_) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::OnStartup,
+            _ => ComponentInitialization::default(),
         };
 
         match mode {
@@ -325,7 +325,7 @@ impl Databricks {
             read_provider,
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
-            initialization: ComponentInitialization::OnStartup,
+            initialization: ComponentInitialization::default(),
         })
     }
 

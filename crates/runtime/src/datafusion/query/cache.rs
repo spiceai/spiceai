@@ -607,6 +607,8 @@ impl Query {
 
             if result == Some(()) {
                 // This task was the one that ran the revalidation
+                // Remove the single-flight guard so future stale hits can trigger another refresh
+                locks.invalidate(&cache_key_u64).await;
             } else {
                 // Another task is already revalidating this key
                 tracing::debug!(
