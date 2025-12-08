@@ -330,7 +330,7 @@ pub struct Acceleration {
 
     pub snapshot_behavior: SnapshotBehavior,
 
-    pub snapshot_trigger_batches: Option<i64>,
+    pub snapshots_trigger_threshold: Option<i64>,
 }
 
 impl Acceleration {
@@ -429,7 +429,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
-        let snapshot_trigger_batches = parse_snapshots_trigger_batches(&mut params)?;
+        let snapshots_trigger_threshold = parse_snapshots_trigger_threshold(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
@@ -487,7 +487,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             on_conflict,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
-            snapshot_trigger_batches,
+            snapshots_trigger_threshold,
         })
     }
 }
@@ -523,7 +523,7 @@ impl Default for Acceleration {
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
             snapshot_behavior: SnapshotBehavior::Disabled,
-            snapshot_trigger_batches: None,
+            snapshots_trigger_threshold: None,
         }
     }
 }
@@ -549,11 +549,11 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
 }
 
 #[expect(clippy::result_large_err)]
-fn parse_snapshots_trigger_batches(
+fn parse_snapshots_trigger_threshold(
     params: &mut Option<Params>,
 ) -> Result<Option<i64>, crate::Error> {
     if let Some(params) = params
-        && let Some(value) = params.data.remove("snapshots_trigger_batches")
+        && let Some(value) = params.data.remove("snapshots_trigger_threshold")
     {
         match value {
             spicepod::param::ParamValue::Int(s) => {
@@ -561,7 +561,7 @@ fn parse_snapshots_trigger_batches(
             }
             _ => Err(crate::Error::InvalidAccelerationConfiguration {
                 source: format!(
-                    "Invalid 'snapshots_trigger_batches' param value: {value:?}. Expected an integer number."
+                    "Invalid 'snapshots_trigger_threshold' param value: {value:?}. Expected an integer number."
                 ).into(),
             }),
         }
