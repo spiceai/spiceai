@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
+use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
+use crate::allowlist::ResolvedTableAwareAllowlist;
 use crate::search::search_engine::SearchEngine;
+use crate::tools::builtin::list_datasets::get_dataset_elements;
 use crate::{
     Runtime,
     search::{
@@ -35,6 +38,7 @@ pub struct SearchTool {
     name: String,
     description: String,
     rt: Arc<Runtime>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 impl SearchTool {
     #[must_use]
@@ -45,7 +49,12 @@ impl SearchTool {
                 .unwrap_or("Search across available, searchable datasets")
                 .to_string(),
             rt,
+            table_allowlist: None,
         }
+    }
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
+        self
     }
 }
 
@@ -75,7 +84,25 @@ impl SpiceModelTool for SearchTool {
                 parse_explicit_primary_keys(Arc::clone(&self.rt.app)).await,
             );
 
-            let search_request = SearchRequest::try_from(req)?;
+            let mut search_request = SearchRequest::try_from(req)?;
+            let allowed_tables = match (search_request.datasets, self.table_allowlist.as_ref()) {
+                (tables, None) => tables,
+                // TODO confirm that we should filter or error.
+                (Some(ds), Some(allowlist)) => Some(
+                    ds.into_iter()
+                        .filter(|d| allowlist.table_is_allowed(&TableReference::parse_str(d)))
+                        .collect::<Vec<String>>(),
+                ),
+                (None, Some(allowlist)) => {
+                    let tables = get_dataset_elements(self.rt.clone(), Some(allowlist))
+                        .await
+                        .into_iter()
+                        .map(|d| d.table)
+                        .collect::<Vec<String>>();
+                    Some(tables)
+                }
+            };
+            search_request.datasets = allowed_tables;
             let request_context = RequestContext::current(AsyncMarker::new().await);
 
             let (result, _) = vs

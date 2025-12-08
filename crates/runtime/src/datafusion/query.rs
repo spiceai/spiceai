@@ -30,13 +30,12 @@ use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
     error::DataFusionError,
-    execution::SendableRecordBatchStream,
-    execution::TaskContext,
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::LogicalPlan,
     physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
+    sql::TableReference,
 };
 use error_code::ErrorCode;
-use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
 use tokio::time::Instant;
 use tracing::Span;
@@ -72,8 +71,11 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 use super::managed_runtime;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::datafusion::{
-    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+use crate::{
+    allowlist::ResolvedTableAwareAllowlist,
+    datafusion::{
+        DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+    },
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -88,6 +90,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Error {
     #[snafu(display("Failed to execute query: {source}"))]
     UnableToExecuteQuery { source: DataFusionError },
+
+    #[snafu(display("Failed to execute query: {source}"))]
+    UnableToExecuteQueryWithErrorCode {
+        source: DataFusionError,
+        code: ErrorCode,
+    },
 
     #[snafu(display("Failed to access query results cache: {source}"))]
     FailedToAccessCache { source: ::cache::Error },
@@ -133,7 +141,9 @@ pub enum QueryMethod {
     Text {
         sql: Arc<str>,
         parameters: Option<ParamValues>,
-        table_allowlist: Option<GlobSet>,
+
+        /// An optional allowlist of tables that can be accessed by this query. When [`Option::is_some`], no SQL results caching is performed. [`LogicalPlan`] caching can still occur (since allowlisting is done post-plan).
+        table_allowlist: Option<ResolvedTableAwareAllowlist>,
     },
 }
 
@@ -299,7 +309,52 @@ impl Query {
                 QueryMethod::Text {
                     sql,
                     parameters,
-                    table_allowlist,
+                    table_allowlist: Some(allowlist),
+                } => {
+                    let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                        .as_raw_key(Query::plan_hasher(&ctx.df));
+                    let plan = match Self::get_plan(
+                        &ctx.df,
+                        &session,
+                        sql,
+                        &raw_cache_key,
+                        parameters.clone(),
+                    )
+                    .await
+                    {
+                        Ok(plan) => plan,
+                        Err(e) => match e {
+                            Error::UnableToExecuteQueryWithErrorCode { source, code } => {
+                                if let Some(t) = tracker {
+                                    t.finish_with_error(&request_context, source.to_string(), code);
+                                }
+                                return Err(Error::UnableToExecuteQuery { source });
+                            }
+                            _ => return Err(e),
+                        },
+                    };
+                    let tables_referenced = plan.as_table_refs();
+                    let disallowed_tables = tables_referenced
+                        .iter()
+                        .filter(|&t| !allowlist.table_is_allowed(t))
+                        .collect::<Vec<_>>();
+
+                    if !disallowed_tables.is_empty() {
+                        return Err(Error::TableAccessDisallowed {
+                            tables: disallowed_tables.into_iter().cloned().collect(),
+                        });
+                    }
+
+                    (
+                        Box::new(plan),
+                        tracker,
+                        RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
+                    )
+                }
+                QueryMethod::Text {
+                    sql,
+                    parameters,
+                    table_allowlist: None,
                 } => {
                     match Self::get_plan_or_cached(
                         &ctx.df,
@@ -312,22 +367,8 @@ impl Query {
                     .await?
                     {
                         PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                            if let Some(allow_list) = table_allowlist {
-                                let tables_referenced = plan.as_table_refs();
-                                let disallowed_tables = tables_referenced
-                                    .iter()
-                                    .filter(|t| allow_list.is_match(t.to_string()))
-                                    .collect::<Vec<_>>();
-
-                                if !disallowed_tables.is_empty() {
-                                    return Err(Error::TableAccessDisallowed {
-                                        tables: disallowed_tables.into_iter().cloned().collect(),
-                                    });
-                                }
-                            }
                             (plan, tracker, cache_manager)
                         }
-                        // TODO: need to use `table_allowlist` here, or LLM retry will bypass allowlist.
                         PlanOrCached::Cached(query_result) => return Ok(query_result),
                     }
                 }

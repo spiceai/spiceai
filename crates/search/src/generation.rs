@@ -41,14 +41,6 @@ pub enum Error {
 
 impl Error {
     #[must_use]
-    pub fn is_user_error(&self) -> bool {
-        matches!(
-            self,
-            Error::TextSearchError { source } if source.is_user_error()
-        )
-    }
-
-    #[must_use]
     pub fn internal(msg: &str) -> Self {
         Self::InternalError {
             source: Box::from(msg),

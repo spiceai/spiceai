@@ -46,7 +46,6 @@ use tracing::{Instrument, Span};
 
 use crate::Runtime;
 use crate::model::ModelContextExtension;
-use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -119,7 +118,7 @@ impl ToolUsingChat {
                     id: "initial_list_datasets".to_string(),
                     r#type: ChatCompletionToolType::Function,
                     function: FunctionCall {
-                        name: t.name().to_string(),
+                        name: list_datasets.name().to_string(),
                         arguments: String::new(),
                     },
                 }])

@@ -15,6 +15,7 @@ limitations under the License.
 */
 use crate::{
     Runtime,
+    allowlist::ResolvedTableAwareAllowlist,
     tools::{SpiceModelTool, utils::parameters},
 };
 use app::App;
@@ -30,7 +31,7 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::{error::DataFusionError, sql::TableReference};
 use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,8 @@ pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
     rt: Arc<Runtime>,
+
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl TableSchemaTool {
@@ -87,7 +90,13 @@ impl TableSchemaTool {
                     .to_string(),
             ),
             rt,
+            table_allowlist: None,
         }
+    }
+
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
+        self
     }
 
     pub async fn get_schema(
@@ -115,6 +124,14 @@ impl TableSchemaTool {
                 let mut table_schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
 
                 for (i, t) in tables.iter().enumerate() {
+                    if self.table_allowlist.as_ref().is_some_and(|list| {
+                        !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
+                    }) {
+                        return Err(crate::datafusion::Error::UnableToGetTable {
+                            source: DataFusionError::Plan(format!("Table '{t}' is not accessible")),
+                        })
+                        .boxed();
+                    }
                     let base_schema = self
                         .rt
                         .datafusion()

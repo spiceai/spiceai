@@ -18,6 +18,7 @@ datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
 futures.workspace = true
+globset.workspace = true
 itertools.workspace = true
 opentelemetry.workspace = true
 parking_lot.workspace = true

@@ -15,10 +15,10 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use globset::GlobSet;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
+    allowlist::ResolvedTableAwareAllowlist,
     datafusion::DataFusion,
     tools::{SpiceModelTool, utils::parameters},
 };
@@ -40,8 +40,7 @@ pub struct SqlTool {
     description: String,
     df: Arc<DataFusion>,
 
-    /// If [`Option::is_some`], then only allow the SQL tool to access tables that match the [`GlobSet`] pattern(s).
-    allowed_tables: Option<GlobSet>,
+    allowed_tables: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl SqlTool {
@@ -50,7 +49,7 @@ impl SqlTool {
         df: Arc<DataFusion>,
         name: Option<&str>,
         description: Option<&str>,
-        allowed_tables: Option<GlobSet>,
+        allowed_tables: Option<ResolvedTableAwareAllowlist>,
     ) -> Self {
         Self {
             df,

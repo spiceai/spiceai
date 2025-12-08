@@ -17,11 +17,13 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
-use globset::GlobSet;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::datafusion::{DataFusion, query::QueryMethod};
+use crate::{
+    allowlist::ResolvedTableAwareAllowlist,
+    datafusion::{DataFusion, query::QueryMethod},
+};
 
 use super::{Query, tracker::QueryTracker};
 
@@ -29,7 +31,7 @@ pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
     parameters: Option<ParamValues>,
-    table_allowlist: Option<GlobSet>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
 }
 
@@ -44,8 +46,8 @@ impl<'a> QueryBuilder<'a> {
         }
     }
 
-    pub fn allow_tables(mut self, table_glob: GlobSet) -> Self {
-        self.table_allowlist = Some(table_glob);
+    pub fn allow_tables(mut self, allowed_tables: ResolvedTableAwareAllowlist) -> Self {
+        self.table_allowlist = Some(allowed_tables);
         self
     }
 

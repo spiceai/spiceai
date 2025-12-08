@@ -225,6 +225,11 @@ impl RequestContext {
         self.cache_control
     }
 
+    pub fn update_cache_control(mut self, control: CacheControl) -> Self {
+        self.cache_control = control;
+        self
+    }
+
     #[must_use]
     pub fn client_supplied_cache_key(&self) -> &Option<String> {
         &self.client_supplied_cache_key
