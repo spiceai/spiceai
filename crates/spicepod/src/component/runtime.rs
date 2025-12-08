@@ -1402,7 +1402,7 @@ mod tests {
             metrics: vec![],
         };
         let result = config.push_interval_duration();
-        assert!(result.is_err());
+        let _ = result.expect_err("Expected an error for invalid push_interval");
     }
 
     #[test]
