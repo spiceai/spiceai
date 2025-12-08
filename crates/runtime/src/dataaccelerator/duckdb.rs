@@ -552,17 +552,16 @@ pub(crate) async fn create_table_provider(
         "duckdb".to_string(),
     );
 
-    if cmd
+    let agg_pushdown_optimization = cmd
         .options
         .get("aggregate_pushdown_optimization")
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(false)
-    {
-        schema_metadata.insert(
-            SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
-            "true".to_string(),
-        );
-    }
+        .map(|v| v.to_lowercase())
+        .unwrap_or("disabled".to_string());
+
+    schema_metadata.insert(
+        SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
+        agg_pushdown_optimization.to_string(),
+    );
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,

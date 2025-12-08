@@ -85,12 +85,11 @@ impl DuckDBAggregateLogicalPushdown {
                 .get(SPICE_ACCELERATOR_METADATA_KEY)
                 .map(String::as_str),
             Some("duckdb")
-        ) && matches!(
-            schema_meta
-                .get(SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY)
-                .map(|p| p.parse::<bool>().unwrap_or(false)),
-            Some(true)
-        );
+        ) && schema_meta
+            .get(SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY)
+            .map(|p| p.to_lowercase())
+            .unwrap_or("disabled".to_string())
+            == "enabled";
         Ok(should_optimize)
     }
 
@@ -312,7 +311,7 @@ mod tests {
 
         metadata.insert(
             SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
-            "true".to_string(),
+            "enabled".to_string(),
         );
 
         let schema = df.schema().inner().as_ref().clone().with_metadata(metadata);
