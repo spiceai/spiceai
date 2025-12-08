@@ -93,6 +93,7 @@ ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.30", features = [
     "gen-tonic-messages",
