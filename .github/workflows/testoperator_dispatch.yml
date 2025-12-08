@@ -76,7 +76,7 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Build spicepod validator
-        run: cargo build --release -p spicepod-validator
+        run: make build-validator
 
       - name: Validate spicepods - TPCH - SF1
         run: |
