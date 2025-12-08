@@ -27,7 +27,6 @@ pub mod anonymous;
 pub mod exporter;
 pub mod meter;
 pub mod noop;
-pub mod otel_exporter;
 pub mod reader;
 
 // As recommended by the OpenTelemetry Semantic Conventions:
