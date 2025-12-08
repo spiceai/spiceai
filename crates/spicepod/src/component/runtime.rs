@@ -91,10 +91,8 @@ impl Runtime {
             let duration = fundu::parse_duration(timeout_str)
                 .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
 
-            if duration.as_secs() == 0 {
-                return Err(
-                    "'shutdown_timeout' must be a positive duration greater than 0 seconds".into(),
-                );
+            if duration.is_zero() {
+                return Err("'shutdown_timeout' must be a positive duration greater than 0".into());
             }
 
             Ok(Some(duration))
@@ -218,6 +216,19 @@ impl OtelExporterConfig {
             || self.endpoint.contains("/v1/metrics")
     }
 
+    /// Returns the endpoint formatted for gRPC use.
+    /// If no port is specified, defaults to 4317.
+    #[must_use]
+    pub fn grpc_endpoint(&self) -> String {
+        let endpoint = &self.endpoint;
+        // If it already has a port, use as-is with http:// prefix for tonic
+        if endpoint.contains(':') {
+            format!("http://{endpoint}")
+        } else {
+            format!("http://{endpoint}:4317")
+        }
+    }
+
     /// Parses the push interval string into a Duration
     ///
     /// # Errors
@@ -233,10 +244,8 @@ impl OtelExporterConfig {
             )
         })?;
 
-        if duration.as_secs() == 0 {
-            return Err(
-                "'push_interval' must be a positive duration greater than 0 seconds".into(),
-            );
+        if duration.is_zero() {
+            return Err("'push_interval' must be a positive duration greater than 0".into());
         }
 
         Ok(duration)
@@ -1354,6 +1363,18 @@ mod tests {
             .push_interval_duration()
             .expect("should parse duration");
         assert_eq!(duration, std::time::Duration::from_secs(3600));
+
+        // Sub-second intervals should also work
+        let config_ms = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "500ms".to_string(),
+            metrics: vec![],
+        };
+        let duration = config_ms
+            .push_interval_duration()
+            .expect("should parse sub-second duration");
+        assert_eq!(duration, std::time::Duration::from_millis(500));
     }
 
     #[test]
@@ -1369,7 +1390,7 @@ mod tests {
         let Err(err) = result else {
             panic!("Expected error");
         };
-        assert!(err.to_string().contains("greater than 0 seconds"));
+        assert!(err.to_string().contains("greater than 0"));
     }
 
     #[test]
@@ -1440,6 +1461,36 @@ mod tests {
             metrics: vec![],
         };
         assert!(http_path.is_http());
+    }
+
+    #[test]
+    fn test_otel_exporter_grpc_endpoint() {
+        // Bare hostname gets default port 4317
+        let bare = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert_eq!(bare.grpc_endpoint(), "http://otel-collector:4317");
+
+        // Hostname with port preserves port
+        let with_port = OtelExporterConfig {
+            enabled: true,
+            endpoint: "otel-collector:9090".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert_eq!(with_port.grpc_endpoint(), "http://otel-collector:9090");
+
+        // localhost with port
+        let localhost = OtelExporterConfig {
+            enabled: true,
+            endpoint: "localhost:4317".to_string(),
+            push_interval: "60s".to_string(),
+            metrics: vec![],
+        };
+        assert_eq!(localhost.grpc_endpoint(), "http://localhost:4317");
     }
 
     #[test]

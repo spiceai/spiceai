@@ -429,21 +429,7 @@ fn init_metrics(
 fn create_otel_reader(
     config: &app::spicepod::component::runtime::OtelExporterConfig,
 ) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
-    use runtime::otel_push_exporter::OtelPushExporterConfig;
-
-    let push_interval = config.push_interval_duration().map_err(|e| {
-        runtime::otel_push_exporter::Error::ExporterCreationFailed {
-            message: e.to_string(),
-        }
-    })?;
-
-    let otel_config = OtelPushExporterConfig {
-        endpoint: config.endpoint.clone(),
-        push_interval,
-        metrics: config.metrics.clone(),
-    };
-
-    runtime::otel_push_exporter::create_otel_periodic_reader(&otel_config)
+    runtime::otel_push_exporter::create_otel_periodic_reader(config)
 }
 
 async fn start_anonymous_telemetry(
