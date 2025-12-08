@@ -290,6 +290,10 @@ pub async fn run(args: Args) -> Result<()> {
 
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
+    if let Some(otel_config) = telemetry_config.as_ref().and_then(|c| c.otel_exporter.as_ref()) {
+        start_otel_metrics_exporter(otel_config, app_name.as_ref());
+    }
+
     let rt = Arc::new(rt);
 
     if prometheus_registry.is_some() {
@@ -424,6 +428,48 @@ async fn start_anonymous_telemetry(
             telemetry_properties,
         )
         .await;
+    }
+}
+
+fn start_otel_metrics_exporter(
+    config: &app::spicepod::component::runtime::OtelExporterConfig,
+    spicepod_name: Option<&String>,
+) {
+    use telemetry::otel_exporter::OtelExporterConfig;
+
+    let push_interval = match config.push_interval_duration() {
+        Ok(duration) => duration,
+        Err(e) => {
+            tracing::error!("Failed to parse OTEL exporter push interval: {e}");
+            return;
+        }
+    };
+
+    let otel_config = OtelExporterConfig {
+        endpoint: config.endpoint.clone(),
+        push_interval,
+    };
+
+    let resource_attributes = vec![KeyValue::new(
+        "spicepod.name",
+        spicepod_name.cloned().unwrap_or_else(|| "unknown".to_string()),
+    )];
+
+    let protocol = if config.is_http() { "http" } else { "grpc" };
+
+    match telemetry::otel_exporter::create_otel_meter_provider(otel_config, resource_attributes) {
+        Ok(provider) => {
+            global::set_meter_provider(provider);
+            tracing::info!(
+                endpoint = %config.endpoint,
+                protocol = protocol,
+                push_interval = %config.push_interval,
+                "OTEL metrics exporter initialized"
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to initialize OTEL metrics exporter: {e}");
+        }
     }
 }
 

@@ -14,6 +14,7 @@ async-trait.workspace = true
 flight_client = { path = "../flight_client" }
 hostname = "0.4.1"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 sha2.workspace = true
