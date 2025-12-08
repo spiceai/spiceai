@@ -58,6 +58,7 @@ pub enum Workflow {
     Bench,
     Throughput,
     Load,
+    Append,
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
@@ -69,6 +70,7 @@ impl From<Workflow> for TestType {
             Workflow::Bench => TestType::Benchmark,
             Workflow::Throughput => TestType::Throughput,
             Workflow::Load => TestType::Load,
+            Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
             Workflow::HttpConsistency => TestType::HttpConsistency,
             Workflow::HttpOverhead => TestType::HttpOverhead,
@@ -94,6 +96,8 @@ pub struct DispatchTests {
     pub throughput: Vec<BenchArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub load: Vec<LoadArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub append: Vec<AppendArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub http_consistency: Vec<HttpConsistencyArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
@@ -197,6 +201,25 @@ pub struct LoadArgs {
     pub random_param_set_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_clients: Option<bool>,
+}
+
+/// Append workflow arguments, defined in the test files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendArgs {
+    pub spicepod_path: PathBuf,
+    pub query_set: QuerySetArg,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_overrides: Option<QueryOverridesArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_steps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_conflict_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_retention_data: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for LoadArgs {

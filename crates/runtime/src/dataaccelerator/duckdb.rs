@@ -70,6 +70,8 @@ pub(crate) mod settings;
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 
+use super::upsert_dedup;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create table: {source}"))]
@@ -532,11 +534,14 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer = match on_data_written {
+    let duckdb_writer: Arc<DuckDBTableWriter> = match on_data_written {
         Some(handler) => Arc::new(duckdb_writer.clone().with_on_data_written_handler(handler)),
         None => Arc::new(duckdb_writer.clone()),
     };
-    let cloned_writer = Arc::clone(&duckdb_writer);
+
+    // Wrap with upsert deduplication if needed
+    let (write_provider, delete_provider) =
+        upsert_dedup::wrap_with_upsert_dedup_if_needed(duckdb_writer, &cmd.options);
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(
@@ -545,8 +550,8 @@ pub(crate) async fn create_table_provider(
     );
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
-        cloned_writer,
-        duckdb_writer,
+        write_provider,
+        delete_provider,
         read_provider,
         schema_metadata,
     ));

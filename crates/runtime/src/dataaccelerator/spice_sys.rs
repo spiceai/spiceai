@@ -53,6 +53,9 @@ pub mod debezium_kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
+
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),

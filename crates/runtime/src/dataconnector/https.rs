@@ -19,6 +19,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
+use crate::register_data_connector;
 
 use snafu::prelude::*;
 use std::any::Any;
@@ -626,3 +627,16 @@ impl ListingTableConnector for HttpListingConnector {
         Ok(u)
     }
 }
+
+register_data_connector!(
+    register_http_connector,
+    REGISTER_HTTP_CONNECTOR,
+    "http",
+    HttpsFactory
+);
+register_data_connector!(
+    register_https_connector,
+    REGISTER_HTTPS_CONNECTOR,
+    "https",
+    HttpsFactory
+);

@@ -13,16 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::GlobalCheckpoint;
+use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
-use crate::stream_state::{DynamoDBStreamBatch, ShardPollResult, StreamState};
-use crate::{Error, Result, StreamResult};
-use aws_sdk_dynamodbstreams::types::ShardIteratorType;
+use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
+use crate::{Result, StreamResult};
+use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use futures::{Stream, future::join_all};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 use tokio::{
     sync::mpsc,
     time::{Duration, sleep},
@@ -37,19 +38,30 @@ pub struct DynamodbStreamProducer {
     pub sender: mpsc::Sender<StreamResult>,
     pub client: Arc<SDKClient>,
     pub retry_strategy: RetryBackoff,
+    /// Duration after which a shard is considered idle and excluded from watermark calculation.
+    /// If None, all shards are included in watermark calculation regardless of activity.
+    pub idle_timeout: Option<Duration>,
+}
+
+pub struct DynamoDBStreamBatch {
+    pub records: Vec<Record>,
+    pub checkpoint: Checkpoint,
+    pub watermark: Option<SystemTime>,
 }
 
 impl DynamodbStreamProducer {
-    async fn collect(&mut self) -> Result<DynamoDBStreamBatch> {
-        let mut batches = Vec::new();
+    async fn collect(&mut self) -> Result<(DynamoDBStreamBatch, bool)> {
+        let mut poll_results = Vec::new();
+        let mut had_transient_error = false;
 
         // 1. Initialize shards that require iterators
-        self.initialize_shards_iterators().await;
+        // If permanent error is encountered, it is surfaced to the client.
+        self.initialize_shards_iterators().await?;
 
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
-            tracing::debug!(
+            tracing::trace!(
                 "Polling shard with iterator: shard_id={}, iterator={}",
                 shard.shard_id,
                 shard.iterator
@@ -66,117 +78,206 @@ impl DynamodbStreamProducer {
 
         // 3. Process poll results
         for (shard_id, result) in results {
-            match result {
-                Ok((next_iter, records)) => {
-                    if let Some(batch) =
-                        self.state.handle_poll_result(&shard_id, next_iter, records)
-                    {
-                        batches.push(batch);
-                    }
-                }
+            let poll_result = match result {
+                Ok((next_iter, records)) => self
+                    .state
+                    .handle_poll_result(&shard_id, next_iter, records)?,
                 Err(e) => {
-                    tracing::error!("Shard poll failed: shard_id={}, {}", shard_id, e);
-                    self.handle_failed_shard(&shard_id, &e);
+                    had_transient_error = true;
+                    self.state.handle_poll_error(&shard_id, e)?
                 }
-            }
+            };
+            poll_results.push(poll_result);
         }
 
         // 4. Discover new shards
-        if let Ok(shards) = self.client.get_all_shards(&self.stream_arn).await {
-            self.state.add_discovered(shards);
+        // If permanent error is encountered, it is surfaced to the client.
+        match self.client.get_all_shards(&self.stream_arn).await {
+            Ok(shards) => self.state.add_discovered(shards)?,
+            Err(e) => {
+                if !e.is_retriable() {
+                    return Err(e);
+                }
+                had_transient_error = true;
+                tracing::warn!("Failed to discover new shards. Will retry on next iteration: {e}");
+            }
         }
 
-        Ok(combine_shard_batches(batches))
+        Ok((
+            combine_shard_batches(&poll_results, self.idle_timeout),
+            had_transient_error,
+        ))
     }
 
-    fn handle_failed_shard(&mut self, shard_id: &str, error: &Error) {
-        let is_expired_iterator = error.to_string().contains("ExpiredIterator")
-            || error.to_string().contains("TrimmedDataAccess");
+    async fn initialize_shards_iterators(&mut self) -> Result<()> {
+        let shards: Vec<InitializingShard> =
+            self.state.get_initializing_shards().cloned().collect();
 
-        if is_expired_iterator {
-            tracing::warn!("Iterator expired for shard {}, will reinitialize", shard_id);
+        for shard in shards {
+            // Shards that were already polled use `After`.
+            // Newly discovered shards use `At`.
+            let iterator_type = match shard.last_checkpoint.position {
+                CheckpointPosition::At => ShardIteratorType::AtSequenceNumber,
+                CheckpointPosition::After => ShardIteratorType::AfterSequenceNumber,
+            };
 
-            self.state.reinitialize_shard(shard_id);
-        }
-    }
-
-    async fn initialize_shards_iterators(&mut self) {
-        let shard_ids: Vec<String> = self.state.get_initializing_shards_ids().cloned().collect();
-
-        for shard_id in shard_ids {
             match self
                 .client
                 .get_shard_iterator(
                     &self.stream_arn,
-                    &shard_id,
-                    &ShardIteratorType::TrimHorizon,
-                    None,
+                    &shard.shard_id,
+                    &iterator_type,
+                    Some(shard.last_checkpoint.sequence_number.clone()),
                 )
                 .await
             {
                 Ok(iterator) => {
-                    if let Some(iterator) = iterator {
-                        self.state.mark_active(shard_id, iterator);
-                    }
+                    self.state.mark_active(shard.shard_id, iterator);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to initialize shard {}: {}", shard_id, e);
+                    if !e.is_retriable() {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "Failed to initialize shard. Will retry on next iteration : {}",
+                        e
+                    );
                 }
             }
         }
+
+        Ok(())
     }
 
-    async fn perform_iterate_with_retry(&mut self) -> Result<DynamoDBStreamBatch> {
+    pub async fn streaming(mut self) {
         let mut backoff = self.retry_strategy.clone();
 
         loop {
             match self.collect().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if let Some(duration) = backoff.next_backoff() {
-                        tracing::debug!("Iteration failed, retrying after {:?}: {}", duration, e);
-                        tokio::time::sleep(duration).await;
+                Ok((batch, had_transient_error)) => {
+                    // Send batch if it has records
+                    if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
+                        return;
+                    }
+
+                    if had_transient_error {
+                        // Transient error occurred during collection - apply backoff
+                        if let Some(duration) = backoff.next_backoff() {
+                            tokio::time::sleep(duration).await;
+                        } else {
+                            // Backoff exhausted - transient errors persisted too long
+                            // Shouldn't happen as we should have infinite retries.
+                            return;
+                        }
                     } else {
-                        tracing::error!("Iteration failed after exhausting retries: {}", e);
-                        return Err(e);
+                        // Clean success - reset backoff and use normal interval
+                        backoff = self.retry_strategy.clone();
+
+                        if let Some(duration) = self.interval {
+                            sleep(duration).await;
+                        }
                     }
                 }
-            }
-        }
-    }
-
-    pub async fn streaming(mut self) {
-        loop {
-            let Ok(batch) = self.perform_iterate_with_retry().await else {
-                // Error is logged in `perform_iterate_with_retry`
-                return;
-            };
-
-            if self.sender.send(Ok(batch)).await.is_err() {
-                return;
-            }
-
-            if let Some(duration) = self.interval {
-                sleep(duration).await;
+                Err(e) => {
+                    // Permanent error - return immediately without retry
+                    let _ = self.sender.send(Err(e)).await;
+                    return;
+                }
             }
         }
     }
 }
 
-fn combine_shard_batches(batches: Vec<ShardPollResult>) -> DynamoDBStreamBatch {
+fn combine_shard_batches(
+    poll_results: &[ShardPollResult],
+    idle_timeout: Option<Duration>,
+) -> DynamoDBStreamBatch {
+    let now = SystemTime::now();
+
+    // Collect records, checkpoints and watermarks
     let mut records = Vec::new();
+    let mut shard_watermarks = Vec::new();
     let mut shards_checkpoints = HashMap::new();
 
-    for batch in batches {
-        records.extend(batch.records);
-        shards_checkpoints.insert(batch.shard_id, batch.checkpoint);
+    for shard_result in poll_results {
+        // Collect records
+        if let PollOutcome::Records {
+            records: shard_records,
+        } = &shard_result.outcome
+        {
+            records.extend(shard_records.clone());
+        }
+
+        // Collect checkpoints
+        shards_checkpoints.insert(
+            shard_result.shard_id.clone(),
+            shard_result.last_checkpoint.clone(),
+        );
+
+        // Check eligibility for watermark
+        let is_eligible = match shard_result.outcome {
+            // Shards that produced records and those that failed are always eligible
+            PollOutcome::Records { .. } | PollOutcome::Failed => true,
+
+            // Shards that produced no records are NOT eligible if they have been idle for longer than the idle_timeout
+            PollOutcome::Empty => {
+                if let Some(last_produced_at) = shard_result.last_produced_at {
+                    match idle_timeout {
+                        Some(timeout) => {
+                            let elapsed = now
+                                .duration_since(last_produced_at)
+                                .unwrap_or(Duration::ZERO);
+                            let is_idle = shard_result.outcome.is_empty() && elapsed > timeout;
+
+                            if is_idle {
+                                tracing::trace!(
+                                    "Shard {} excluded from watermark (idle for {:?}, timeout: {:?})",
+                                    shard_result.shard_id,
+                                    elapsed,
+                                    timeout
+                                );
+                            }
+
+                            !is_idle
+                        }
+                        None => true,
+                    }
+                } else {
+                    tracing::debug!(
+                        "Shard {} excluded from watermark (never produced records)",
+                        shard_result.shard_id
+                    );
+                    false
+                }
+            }
+        };
+
+        // If eligible, include its current_watermark
+        if is_eligible && let Some(watermark) = shard_result.current_watermark {
+            tracing::debug!(
+                "Shard {} included in watermark: {:?}",
+                shard_result.shard_id,
+                watermark
+            );
+            shard_watermarks.push(watermark);
+        }
     }
+
+    let watermark = if shard_watermarks.is_empty() {
+        tracing::trace!("No eligible shards with watermarks, watermark is None");
+        None
+    } else {
+        let min_watermark = shard_watermarks.into_iter().min();
+        tracing::trace!("Calculated watermark: {:?}", min_watermark);
+        min_watermark
+    };
 
     DynamoDBStreamBatch {
         records,
-        checkpoint: GlobalCheckpoint {
+        checkpoint: Checkpoint {
             shards: shards_checkpoints,
         },
+        watermark,
     }
 }
 

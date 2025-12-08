@@ -64,6 +64,11 @@ on:
         required: false
         type: boolean
         default: false
+      with_retention_data:
+        description: 'Include additional data to test retention behavior'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-append:
@@ -71,14 +76,14 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set spicepod path
         id: set_spicepod_path
         run: |
           query_set="${{ github.event.inputs.query_set }}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/accelerated/append/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
@@ -134,12 +139,15 @@ jobs:
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait 300 \
             --disable-progress-bars \
+            --metrics \
             --duration ${{ github.event.inputs.duration }} \
             --load-interval ${{ github.event.inputs.load_interval }} \
             --load-steps ${{ github.event.inputs.load_steps }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
-            ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }}
+            ${{ github.event.inputs.with_conflict_data == 'true' && '--with-conflict-data' || '' }} \
+            ${{ github.event.inputs.with_retention_data == 'true' && '--with-retention-data' || '' }}
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

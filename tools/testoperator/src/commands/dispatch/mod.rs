@@ -114,6 +114,17 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
+            TestType::Append => {
+                for append in &test_file.tests.append {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: append.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
             _ => {
                 println!("Test type {test_type} not supported for dispatching");
             }

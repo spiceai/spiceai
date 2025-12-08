@@ -31,7 +31,7 @@ jobs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
 
@@ -64,7 +64,7 @@ jobs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set Nightly REL_VERSION from current timestamp
         run: python3 ./.github/scripts/get_release_version.py
@@ -80,6 +80,94 @@ jobs:
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
 
+  build-arm64:
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Install docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      - name: Start Docker service
+        run: |
+          sudo systemctl start docker
+          sudo systemctl status docker
+
+      - name: chown /var/run/docker.sock to current user
+        run: |
+          sudo chown $USER /var/run/docker.sock
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+
+      - name: default
+        run: |
+          echo "IMAGE_TAG=models" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+      - &build-arm64-image
+        name: Build ARM64 ${{ env.IMAGE_TAG }} image
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
+          cache-from: type=gha,scope=build-arm64
+          cache-to: type=gha,scope=build-arm64,mode=max
+          build-args: |
+            REL_VERSION=${{ needs.setup.outputs.rel_version }}
+            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
+      - name: models-jemalloc
+        run: |
+          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
+      - *build-arm64-image
+      - name: models-mimalloc
+        run: |
+          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
+      - *build-arm64-image
+      - name: models-sysalloc
+        run: |
+          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
+      - *build-arm64-image
+      - name: Upload ARM64 artifacts
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: images-arm64
+          path: /tmp/image-arm64-*.tar
+
   build-amd64:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
@@ -89,7 +177,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Add nightly postfix to version in Cargo.toml
         env:
@@ -105,7 +193,7 @@ jobs:
           grep '^version =' Cargo.toml
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
         with:
           # Enable docker driver for layer caching
           driver-opts: |
@@ -117,7 +205,7 @@ jobs:
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
       - &build-amd64-image
         name: Build AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
         with:
           context: .
           file: Dockerfile
@@ -132,7 +220,7 @@ jobs:
             INSTALL_ORACLE_ODPIC=true
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
@@ -144,7 +232,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: /tmp
           pattern: images-*
@@ -154,7 +242,7 @@ jobs:
         run: |
           ls -l /tmp
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
 
       - name: Start local registry
         run: |
@@ -162,7 +250,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: github.event_name == 'schedule' || inputs.publish
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -211,7 +299,7 @@ jobs:
             fi
           done
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: github.event_name == 'schedule' || inputs.publish
         with:
           fetch-depth: 0

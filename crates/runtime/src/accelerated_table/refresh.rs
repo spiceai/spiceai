@@ -45,6 +45,7 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
@@ -83,6 +84,8 @@ pub struct Refresh {
     pub(crate) append_overlap: Option<Duration>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
+    /// TTL for cache entries. Data older than this is considered stale.
+    pub(crate) caching_ttl: Option<Duration>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -185,6 +188,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
+        self.caching_ttl = Some(caching_ttl);
         self
     }
 
@@ -430,6 +439,7 @@ impl Default for Refresh {
             append_overlap: None,
             retry_enabled: false,
             retry_max_attempts: None,
+            caching_ttl: None,
         }
     }
 }
@@ -466,6 +476,9 @@ pub struct Refresher {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator.
+    /// Shared with `CachingAccelerationScanExec`.
+    cache_mutex: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -491,6 +504,7 @@ impl Refresher {
         accelerator: Arc<dyn TableProvider>,
         cpu_runtime: Option<Handle>,
         io_runtime: Handle,
+        cache_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -514,6 +528,7 @@ impl Refresher {
             cpu_runtime,
             io_runtime,
             resource_monitor: None,
+            cache_mutex,
         }
     }
 
@@ -666,6 +681,7 @@ impl Refresher {
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
             self.io_runtime.clone(),
+            Arc::clone(&self.cache_mutex),
         )
         .with_disable_federation(self.disable_federation);
 
@@ -852,6 +868,7 @@ impl Refresher {
                 self.federated_source.clone(),
                 Arc::clone(&self.accelerator),
                 self.io_runtime.clone(),
+                Arc::clone(&self.cache_mutex),
             )
             .with_disable_federation(self.disable_federation)
             .with_cpu_runtime(self.cpu_runtime.clone())
@@ -1026,6 +1043,7 @@ mod tests {
             Arc::clone(&accelerator),
             None,
             Handle::current(),
+            Arc::new(Mutex::new(())),
         );
 
         refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1236,6 +1254,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1395,6 +1414,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));
@@ -1604,6 +1624,7 @@ mod tests {
                 Arc::clone(&accelerator),
                 None,
                 Handle::current(),
+                Arc::new(Mutex::new(())),
             );
 
             refresher.with_completion_notifier(Arc::clone(&notifier));

@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
-use crate::parameters::Parameters;
+use crate::{component::dataset::Dataset, parameters::Parameters, register_data_connector};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::odbc::ODBCTableFactory;
@@ -272,6 +271,8 @@ impl DataConnectorFactory for ODBCFactory {
         PARAMETERS
     }
 }
+
+register_data_connector!("odbc", ODBCFactory);
 
 #[async_trait]
 impl<'a> DataConnector for ODBC<'a>
