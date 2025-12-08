@@ -21,7 +21,7 @@ build-validator:
 	cargo build --release -p spicepod-validator
 
 .PHONY: build
-build: build-cli build-runtime build-validator
+build: build-cli build-runtime
 
 .PHONY: build-dev
 build-dev:

@@ -35,7 +35,7 @@ pub(super) async fn download_snapshot_if_needed(
     source: &dyn AccelerationSource,
     path: PathBuf,
 ) {
-    if !acceleration.snapshots.bootstrap_enabled() {
+    if !acceleration.snapshot_behavior.bootstrap_enabled() {
         return;
     }
 
@@ -49,7 +49,7 @@ pub(super) async fn download_snapshot_if_needed(
 
     let dataset_name = source.name().to_string();
     let source = source.clone_arc();
-    let snapshot_behavior = acceleration.snapshots.clone();
+    let snapshot_behavior = acceleration.snapshot_behavior.clone();
     let checkpoint_factory = make_checkpointer_factory(move || {
         let source = Arc::clone(&source);
         let snapshot_behavior = snapshot_behavior.clone();
@@ -64,8 +64,12 @@ pub(super) async fn download_snapshot_if_needed(
                 })
         }
     });
-    if let Some(manager) =
-        SnapshotManager::try_new(dataset_name.clone(), acceleration.snapshots.clone(), path).await
+    if let Some(manager) = SnapshotManager::try_new(
+        dataset_name.clone(),
+        acceleration.snapshot_behavior.clone(),
+        path,
+    )
+    .await
     {
         let manager = manager.with_checkpointer_factory(checkpoint_factory);
         let start_time = Instant::now();
@@ -99,7 +103,7 @@ pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSou
             continue;
         };
 
-        if matches!(acceleration.snapshots, SnapshotBehavior::Disabled) {
+        if matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
             continue;
         }
 

@@ -310,7 +310,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "serde",
  "snafu",
@@ -503,7 +503,7 @@ dependencies = [
  "paste",
  "prost 0.13.5",
  "prost-types 0.13.5",
- "tonic",
+ "tonic 0.13.1",
 ]
 
 [[package]]
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2031,7 +2031,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-stream",
- "tonic",
+ "tonic 0.13.1",
  "tonic-build",
  "url",
  "uuid 1.18.1",
@@ -2059,7 +2059,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tonic",
+ "tonic 0.13.1",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -2090,7 +2090,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-stream",
- "tonic",
+ "tonic 0.13.1",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "snafu",
  "text-splitter",
@@ -4085,7 +4085,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4158,7 +4158,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-util",
- "tonic",
+ "tonic 0.13.1",
  "tracing",
  "tracing-subscriber",
  "turso",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4681,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-stream",
@@ -4970,7 +4970,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5350,7 +5350,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -5487,12 +5487,13 @@ dependencies = [
 
 [[package]]
 name = "dynamodb-streams"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-dynamodbstreams",
  "futures",
+ "humantime",
  "serde",
  "snafu",
  "tokio",
@@ -5756,7 +5757,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "futures",
  "snafu",
@@ -6033,7 +6034,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6043,12 +6044,12 @@ dependencies = [
  "rustls-native-certs 0.8.2",
  "secrecy",
  "snafu",
- "tonic",
+ "tonic 0.13.1",
 ]
 
 [[package]]
 name = "flightpublisher"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6056,12 +6057,12 @@ dependencies = [
  "futures",
  "parquet",
  "tokio",
- "tonic",
+ "tonic 0.13.1",
 ]
 
 [[package]]
 name = "flightrepl"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -6078,20 +6079,20 @@ dependencies = [
  "rustyline",
  "serde_json",
  "tokio",
- "tonic",
+ "tonic 0.13.1",
  "tracing",
  "winver",
 ]
 
 [[package]]
 name = "flightsubscriber"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-flight",
  "clap",
  "futures",
  "tokio",
- "tonic",
+ "tonic 0.13.1",
  "tracing",
  "tracing-subscriber",
 ]
@@ -6673,7 +6674,7 @@ dependencies = [
 
 [[package]]
 name = "google-genai"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -8703,7 +8704,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -9512,7 +9513,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10012,7 +10013,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "hickory-resolver",
  "snafu",
@@ -10749,6 +10750,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-otlp"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d899720fe06916ccba71c01d04ecd77312734e2de3467fd30d9d580c8ce85656"
+dependencies = [
+ "futures-core",
+ "http 1.4.0",
+ "opentelemetry 0.29.1",
+ "opentelemetry-http",
+ "opentelemetry-proto 0.29.0",
+ "opentelemetry_sdk 0.29.0",
+ "prost 0.13.5",
+ "reqwest",
+ "thiserror 2.0.17",
+ "tokio",
+ "tonic 0.12.3",
+]
+
+[[package]]
 name = "opentelemetry-prometheus"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10763,6 +10783,18 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-proto"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c40da242381435e18570d5b9d50aca2a4f4f4d8e146231adb4e7768023309b3"
+dependencies = [
+ "opentelemetry 0.29.1",
+ "opentelemetry_sdk 0.29.0",
+ "prost 0.13.5",
+ "tonic 0.12.3",
+]
+
+[[package]]
+name = "opentelemetry-proto"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e046fd7660710fe5a05e8748e70d9058dc15c94ba914e7c4faa7c728f0e8ddc"
@@ -10773,7 +10805,7 @@ dependencies = [
  "opentelemetry_sdk 0.30.0",
  "prost 0.13.5",
  "serde",
- "tonic",
+ "tonic 0.13.1",
 ]
 
 [[package]]
@@ -10912,7 +10944,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -10923,12 +10955,12 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "clap",
- "opentelemetry-proto",
+ "opentelemetry-proto 0.30.0",
  "tokio",
- "tonic",
+ "tonic 0.13.1",
 ]
 
 [[package]]
@@ -10992,7 +11024,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -11116,7 +11148,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "bytes",
  "chunking",
@@ -12996,7 +13028,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -13094,8 +13126,9 @@ dependencies = [
  "object_store",
  "once_cell",
  "opentelemetry 0.29.1",
+ "opentelemetry-otlp",
  "opentelemetry-prometheus",
- "opentelemetry-proto",
+ "opentelemetry-proto 0.30.0",
  "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "package",
@@ -13154,7 +13187,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tokio-stream",
  "tokio-util",
- "tonic",
+ "tonic 0.13.1",
  "tonic-health",
  "tools",
  "tower 0.5.2",
@@ -13179,7 +13212,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -13208,7 +13241,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "futures",
  "num_cpus",
@@ -13219,7 +13252,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "axum",
@@ -13227,14 +13260,14 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "pin-project",
- "tonic",
+ "tonic 0.13.1",
  "tower 0.5.2",
  "tracing",
 ]
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -13261,7 +13294,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -13274,7 +13307,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -13297,7 +13330,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13321,7 +13354,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -13333,7 +13366,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -13346,7 +13379,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "futures",
  "governor",
@@ -13357,7 +13390,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "async-trait",
@@ -13377,7 +13410,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -13405,7 +13438,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -13755,7 +13788,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13767,7 +13800,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -13869,7 +13902,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14021,7 +14054,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14697,7 +14730,7 @@ dependencies = [
  "rand 0.8.5",
  "serde_json",
  "tokio",
- "tonic",
+ "tonic 0.13.1",
  "tonic-build",
  "url",
  "uuid 1.18.1",
@@ -14725,7 +14758,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14762,14 +14795,14 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
- "tonic",
+ "tonic 0.13.1",
  "tracing",
  "winver",
 ]
 
 [[package]]
 name = "spiced"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14805,7 +14838,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -14828,7 +14861,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14838,7 +14871,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "schemars 1.1.0",
  "serde_json",
@@ -14847,7 +14880,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "clap",
  "runtime",
@@ -15598,7 +15631,7 @@ checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
 name = "telemetry"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -15685,7 +15718,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -15721,14 +15754,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tonic",
+ "tonic 0.13.1",
  "util",
  "uuid 1.18.1",
 ]
 
 [[package]]
 name = "testoperator"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
@@ -16067,7 +16100,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "secrecy",
  "snafu",
@@ -16376,6 +16409,32 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tonic"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-timeout",
+ "hyper-util",
+ "percent-encoding",
+ "pin-project",
+ "prost 0.13.5",
+ "tokio",
+ "tokio-stream",
+ "tower 0.4.13",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tonic"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
@@ -16429,12 +16488,12 @@ dependencies = [
  "prost 0.13.5",
  "tokio",
  "tokio-stream",
- "tonic",
+ "tonic 0.13.1",
 ]
 
 [[package]]
 name = "tools"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -16449,8 +16508,11 @@ checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
 dependencies = [
  "futures-core",
  "futures-util",
+ "indexmap 1.9.3",
  "pin-project",
  "pin-project-lite",
+ "rand 0.8.5",
+ "slab",
  "tokio",
  "tokio-util",
  "tower-layer",
@@ -16511,7 +16573,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -17297,7 +17359,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -18941,7 +19003,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.10.0-enterprise-beta"
+version = "1.10.0-unstable"
 dependencies = [
  "async-openai",
  "async-trait",
