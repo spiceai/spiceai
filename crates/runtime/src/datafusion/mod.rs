@@ -1158,6 +1158,8 @@ impl DataFusion {
             accelerated_table_builder.caching_stale_while_revalidate_ttl(
                 acceleration_settings.caching_stale_while_revalidate_ttl,
             );
+            accelerated_table_builder
+                .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
         if acceleration_settings.snapshot_behavior.create_enabled()
