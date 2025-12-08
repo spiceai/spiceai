@@ -139,6 +139,7 @@ jobs:
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait 300 \
             --disable-progress-bars \
+            --metrics \
             --duration ${{ github.event.inputs.duration }} \
             --load-interval ${{ github.event.inputs.load_interval }} \
             --load-steps ${{ github.event.inputs.load_steps }} \
@@ -149,3 +150,4 @@ jobs:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

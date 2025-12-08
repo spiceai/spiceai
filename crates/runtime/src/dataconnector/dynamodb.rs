@@ -63,7 +63,6 @@ impl DynamoDBFactory {
 
 const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
-const DEFAULT_STREAM_POLL_INTERVAL_MS_STR: &str = "200";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -95,6 +94,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("time_format")
         .description("Go-style time format used for parsing/formatting timestamps")
         .default(DEFAULT_TIME_FORMAT),
+    ParameterSpec::runtime("ready_lag")
+        .description("When using Streams, once tables reaches this lag, it will be reported as Ready")
+        .default("2s"),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -167,8 +169,8 @@ impl DataConnector for DynamoDB {
             .get("scan_interval")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200);
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(0));
 
         let unnest_depth = match self.params.get("unnest_depth").expose() {
             ExposedParamLookup::Present(unnest_depth_str) => Some(usize::from_str(unnest_depth_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
@@ -225,6 +227,14 @@ impl DataConnector for DynamoDB {
                 connector_component: ConnectorComponent::from(dataset),
             });
         }
+
+        let ready_lag = self
+            .params
+            .get("ready_lag")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(2));
 
         let provider = DynamoDBTableProvider::try_new(
             config,

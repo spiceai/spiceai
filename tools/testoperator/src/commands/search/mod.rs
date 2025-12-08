@@ -71,6 +71,11 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+
+    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
+    // Resource will be set later with set_resource() before emit()
+    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+
     let health_monitor = HealthMonitor::spawn()?;
 
     let index_finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
@@ -137,7 +142,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         ])
         .build();
 
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    telemetry.set_resource(benchmark_resource);
 
     crate::metrics::TEST_DURATION
         .record(u64::try_from((finished_at - started_at).as_millis())?, &[]);
