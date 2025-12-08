@@ -38,9 +38,6 @@ pub struct DynamodbStreamProducer {
     pub sender: mpsc::Sender<StreamResult>,
     pub client: Arc<SDKClient>,
     pub retry_strategy: RetryBackoff,
-    /// Duration after which a shard is considered idle and excluded from watermark calculation.
-    /// If None, all shards are included in watermark calculation regardless of activity.
-    pub idle_timeout: Option<Duration>,
 }
 
 pub struct DynamoDBStreamBatch {
@@ -93,7 +90,7 @@ impl DynamodbStreamProducer {
         // 4. Discover new shards
         // If permanent error is encountered, it is surfaced to the client.
         match self.client.get_all_shards(&self.stream_arn).await {
-            Ok(shards) => self.state.add_discovered(shards)?,
+            Ok(shards) => self.state.add_discovered(&shards)?,
             Err(e) => {
                 if !e.is_retriable() {
                     return Err(e);
@@ -103,10 +100,7 @@ impl DynamodbStreamProducer {
             }
         }
 
-        Ok((
-            combine_shard_batches(&poll_results, self.idle_timeout),
-            had_transient_error,
-        ))
+        Ok((combine_shard_batches(&poll_results), had_transient_error))
     }
 
     async fn initialize_shards_iterators(&mut self) -> Result<()> {
@@ -162,7 +156,12 @@ impl DynamodbStreamProducer {
 
                     if had_transient_error {
                         // Transient error occurred during collection - apply backoff
-                        if let Some(duration) = backoff.next_backoff() {
+                        if let Some(mut duration) = backoff.next_backoff() {
+                            // Avoid sleeping for more than 60 seconds
+                            if duration > Duration::from_secs(60) {
+                                duration = Duration::from_secs(1);
+                                backoff.reset();
+                            }
                             tokio::time::sleep(duration).await;
                         } else {
                             // Backoff exhausted - transient errors persisted too long
@@ -188,12 +187,7 @@ impl DynamodbStreamProducer {
     }
 }
 
-fn combine_shard_batches(
-    poll_results: &[ShardPollResult],
-    idle_timeout: Option<Duration>,
-) -> DynamoDBStreamBatch {
-    let now = SystemTime::now();
-
+fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatch {
     // Collect records, checkpoints and watermarks
     let mut records = Vec::new();
     let mut shard_watermarks = Vec::new();
@@ -219,45 +213,16 @@ fn combine_shard_batches(
             // Shards that produced records and those that failed are always eligible
             PollOutcome::Records { .. } | PollOutcome::Failed => true,
 
-            // Shards that produced no records are NOT eligible if they have been idle for longer than the idle_timeout
-            PollOutcome::Empty => {
-                if let Some(last_produced_at) = shard_result.last_produced_at {
-                    match idle_timeout {
-                        Some(timeout) => {
-                            let elapsed = now
-                                .duration_since(last_produced_at)
-                                .unwrap_or(Duration::ZERO);
-                            let is_idle = shard_result.outcome.is_empty() && elapsed > timeout;
-
-                            if is_idle {
-                                tracing::trace!(
-                                    "Shard {} excluded from watermark (idle for {:?}, timeout: {:?})",
-                                    shard_result.shard_id,
-                                    elapsed,
-                                    timeout
-                                );
-                            }
-
-                            !is_idle
-                        }
-                        None => true,
-                    }
-                } else {
-                    tracing::debug!(
-                        "Shard {} excluded from watermark (never produced records)",
-                        shard_result.shard_id
-                    );
-                    false
-                }
-            }
+            // Shards that produced no records are NOT eligible as there's no lag
+            PollOutcome::Empty => false,
         };
 
         // If eligible, include its current_watermark
         if is_eligible && let Some(watermark) = shard_result.current_watermark {
-            tracing::debug!(
-                "Shard {} included in watermark: {:?}",
+            tracing::trace!(
+                "Shard {} included in watermark: {}",
                 shard_result.shard_id,
-                watermark
+                humantime::format_rfc3339(watermark),
             );
             shard_watermarks.push(watermark);
         }
