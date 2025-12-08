@@ -94,7 +94,7 @@ impl Default for App {
         App {
             name: "DEFAULT".to_string(),
             secrets: vec![],
-            extensions: Default::default(),
+            extensions: HashMap::default(),
             catalogs: vec![],
             datasets: vec![],
             views: vec![],
@@ -104,7 +104,7 @@ impl Default for App {
             tools: vec![],
             workers: vec![],
             spicepods: vec![],
-            runtime: Default::default(),
+            runtime: Runtime::default(),
             management: None,
             snapshots: None,
         }
@@ -331,7 +331,7 @@ impl AppBuilder {
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();

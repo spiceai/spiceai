@@ -21,7 +21,6 @@ use axum::{
 };
 use serde::{Serialize, Serializer};
 
-#[allow(dead_code)]
 #[derive(Debug)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 enum IcebergErrorType {
@@ -97,7 +96,7 @@ impl IcebergResponseError {
         }
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn bad_request(message: String) -> Self {
         Self {
             error: IcebergError {
@@ -108,7 +107,6 @@ impl IcebergResponseError {
         }
     }
 
-    #[allow(dead_code)]
     pub fn internal(code: InternalServerErrorCode) -> Self {
         Self {
             error: IcebergError {

@@ -761,7 +761,7 @@ pub(crate) struct GraphQLQueryResult {
 }
 
 impl GraphQLClient {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
         endpoint: Url,
@@ -814,7 +814,7 @@ impl GraphQLClient {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &mut GraphQLQuery,
@@ -995,7 +995,7 @@ impl GraphQLClient {
         }
 
         let mut unwrapped = match extracted_data {
-            Value::Array(val) => Ok(val.clone()),
+            Value::Array(val) => Ok(val),
             obj @ Value::Object(_) => Ok(vec![obj]),
             _ => Err(Error::InvalidObjectAccess {
                 message: format!("GraphQL response has unexpected format. Response {response:?}"),
@@ -1418,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, clippy::needless_raw_string_hashes)]
+    #[expect(clippy::too_many_lines, clippy::needless_raw_string_hashes)]
     fn test_pagination_parse() {
         let test_cases = vec![
             TestPaginationParseCase {

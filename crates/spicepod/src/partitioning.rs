@@ -63,7 +63,6 @@ mod tests {
 
     use serde_yaml::from_str;
 
-    #[allow(clippy::struct_excessive_bools)]
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(deny_unknown_fields)]

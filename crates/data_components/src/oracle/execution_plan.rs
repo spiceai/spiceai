@@ -18,6 +18,7 @@ use std::{any::Any, fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
 use datafusion::{
+    common::utils::quote_identifier,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::Expr,
@@ -89,14 +90,13 @@ impl OracleExecPlan {
             .build()
     }
 
-    #[allow(clippy::unnecessary_wraps)]
     pub fn sql(&self) -> DataFusionResult<String> {
         let columns = self
             .projected_schema
             .fields()
             .iter()
             // columns must be quoted to handle spaces and special characters
-            .map(|f| format!("\"{col}\"", col = f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -246,11 +246,10 @@ fn project_schema_safe(
     Ok(schema)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn to_execution_error(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 fn to_datafusion_err(e: super::Error) -> datafusion::error::DataFusionError {

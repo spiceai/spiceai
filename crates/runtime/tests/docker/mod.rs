@@ -53,12 +53,12 @@ impl RunningContainer<'_> {
         remove(&self.docker, self.name).await
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         stop(&self.docker, self.name).await
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         start(&self.docker, self.name).await
     }
@@ -115,10 +115,12 @@ pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
         .await?)
 }
 
+#[expect(dead_code)]
 pub async fn stop(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
     Ok(docker.stop_container(name, None).await?)
 }
 
+#[expect(dead_code)]
 pub async fn start(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
     Ok(docker
         .start_container(name, None::<StartContainerOptions<String>>)
@@ -156,7 +158,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
         self.env_vars.push((key.to_string(), value.to_string()));
         self
@@ -243,7 +245,7 @@ impl<'a> ContainerRunner<'a> {
         let (exposed_ports, port_bindings) = if port_bindings_map.is_empty() {
             (None, None)
         } else {
-            #[allow(clippy::zero_sized_map_values)]
+            #[expect(clippy::zero_sized_map_values)]
             let exposed_ports = port_bindings_keys
                 .iter()
                 .map(|k| (k.as_str(), HashMap::new()))

@@ -151,11 +151,11 @@ fn trace_query(
 
     tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
 
-    if let Some(true) = query_tracker.results_cache_hit {
+    if query_tracker.results_cache_hit == Some(true) {
         tracing::info!(target: "task_history", results_cache_hit = true, "labels");
     }
 
-    if let Some(true) = &query_tracker.is_accelerated {
+    if matches!(&query_tracker.is_accelerated, Some(true)) {
         tracing::info!(target: "task_history", accelerated = true, "labels");
     }
 

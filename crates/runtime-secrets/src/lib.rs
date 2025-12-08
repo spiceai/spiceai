@@ -255,7 +255,7 @@ pub enum SecretStoreType {
     SchedulerRPC,
 }
 
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn get_params_with_secrets(
     secrets: Arc<RwLock<Secrets>>,
     params: &HashMap<String, String>,
@@ -274,7 +274,6 @@ pub async fn get_params_with_secrets(
     params_with_secrets
 }
 
-#[allow(clippy::result_large_err)]
 fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType> {
     let provider = secret_store_provider(&store.from);
     let selector = secret_selector(&store.from);
@@ -313,7 +312,6 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     let Some(selector) = selector else {
         return SecretStoreRequiresSecretSelectorSnafu {
@@ -325,7 +323,6 @@ fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     Ok(selector.to_string())
 }
 
-#[allow(clippy::result_large_err)]
 fn require_no_selector(provider: &str, selector: Option<&str>) -> Result<()> {
     if selector.is_some() {
         SecretStoreInvalidSecretSelectorSnafu {

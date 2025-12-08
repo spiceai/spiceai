@@ -409,7 +409,7 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -532,7 +532,7 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -760,7 +760,7 @@ async fn test_date_trunc_plan_filtering() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn timestamp_nanos(datetime: &str) -> i64 {
     let naive =
         NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").expect("datetime parse");
@@ -1233,7 +1233,7 @@ async fn test_truncate_partition_inequality_snapshot() -> Result<(), Box<dyn std
         let start = truncated_value;
         let end = truncated_value + 999;
         let sales: Vec<i64> = (start..=end).step_by(100).collect();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ids: Vec<i32> = (0..sales.len() as i32).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -1325,7 +1325,7 @@ async fn test_date_trunc_partition_inequality_snapshot() -> Result<(), Box<dyn s
             .map(|hour| partition_ts + hour * 3600 * 1_000_000_000)
             .collect();
         let ids: Vec<i32> = (0..24).collect();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let values: Vec<i32> = vec![idx as i32 * 100; 24];
 
         let batch = RecordBatch::try_new(

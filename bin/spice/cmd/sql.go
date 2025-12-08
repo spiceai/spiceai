@@ -595,6 +595,9 @@ func runREPLWithHealthAndMetadata(endpoint string, executor QueryExecutor, metad
 		}
 
 		if strings.ToLower(queryStr) == ".clear history" {
+			// Clear session history (in-memory)
+			line.ClearHistory()
+			// Clear persistent history
 			if historyMgr != nil {
 				historyMgr.Clear()
 				if err := historyMgr.Save(); err != nil {
@@ -744,7 +747,7 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		// Check cache status header
 		cacheStatus := resp.Header.Get("Results-Cache-Status")
 		cachedStr := ""
-		if cacheStatus == "HIT" {
+		if cacheStatus == "HIT" || cacheStatus == "STALE" {
 			cachedStr = " (cached)"
 		}
 

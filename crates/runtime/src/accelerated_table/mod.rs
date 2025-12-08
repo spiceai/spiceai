@@ -24,10 +24,10 @@ use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
+use ::cache::Caching;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
@@ -48,15 +48,16 @@ use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
-    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec,
+    schema_cast::SchemaCastScanExec, slice::SliceExec, tee::TeeExec, wrap_with_filter,
 };
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+pub mod caching;
 pub mod federation;
 mod metrics;
 pub mod refresh;
@@ -160,6 +161,9 @@ pub enum Error {
 
     #[snafu(display("Failed to start refresh task. The task was already started."))]
     RefreshTaskAlreadyStarted {},
+
+    #[snafu(display("Failed to create RecordBatch: {source}"))]
+    FailedToBuildRecordBatch { source: ArrowError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -217,9 +221,18 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
     ready_state: ReadyState,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
+    refresh_mode: RefreshMode,
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
     synchronized_with: Option<SynchronizedTable>,
+    cache_ttl: Option<Duration>,
+    cache_stale_while_revalidate_ttl: Option<Duration>,
+    cache_stale_if_error: bool,
+    io_runtime: Handle,
+    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
+    cache_mutex: Arc<Mutex<()>>,
+    /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
+    in_flight_revalidations: caching::InFlightRevalidations,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -278,9 +291,14 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
+    snapshots_trigger_threshold: Option<i64>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
+    caching_ttl: Option<Duration>,
+    caching_stale_while_revalidate_ttl: Option<Duration>,
+    caching_stale_if_error: bool,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 }
 
 impl Builder {
@@ -314,9 +332,14 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
+            snapshots_trigger_threshold: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
+            caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
+            caching_stale_if_error: false,
+            resource_monitor: None,
         }
     }
 
@@ -362,6 +385,14 @@ impl Builder {
 
     pub fn cpu_runtime(&mut self, runtime: Option<Handle>) -> &mut Self {
         self.cpu_runtime = runtime;
+        self
+    }
+
+    pub fn with_resource_monitor(
+        &mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> &mut Self {
+        self.resource_monitor = Some(monitor);
         self
     }
 
@@ -435,14 +466,37 @@ impl Builder {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
+        snapshots_trigger_threshold: Option<i64>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
+        self.snapshots_trigger_threshold = snapshots_trigger_threshold;
+        self
+    }
+
+    /// Set the TTL for cache mode
+    pub fn caching_ttl(&mut self, ttl: Option<Duration>) -> &mut Self {
+        self.caching_ttl = ttl;
+        self
+    }
+
+    /// Set the stale-while-revalidate duration for cache mode
+    pub fn caching_stale_while_revalidate_ttl(
+        &mut self,
+        stale_while_revalidate: Option<Duration>,
+    ) -> &mut Self {
+        self.caching_stale_while_revalidate_ttl = stale_while_revalidate;
+        self
+    }
+
+    /// Set whether to serve expired data on upstream error in cache mode
+    pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
+        self.caching_stale_if_error = enabled;
         self
     }
 
     /// Build the accelerated table
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
             return ExpectedChangesModeForChangesStreamSnafu.fail();
@@ -524,10 +578,25 @@ impl Builder {
                     None,
                 )
             }
+            RefreshMode::Caching => {
+                // Cache mode supports manual refresh triggers to force refresh of stale data
+                let (start_refresh, on_start_refresh) =
+                    mpsc::channel::<Option<RefreshOverrides>>(1);
+                (
+                    refresh::AccelerationRefreshMode::Caching(on_start_refresh),
+                    Some(start_refresh),
+                )
+            }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
+        let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
+        // Create the cache mutex early so it can be shared between the Refresher and the AcceleratedTable.
+        let cache_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
+        let in_flight_revalidations: caching::InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -537,6 +606,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
+            Arc::clone(&cache_mutex),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -551,7 +621,15 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(self.snapshot_behavior, self.snapshot_local_path.clone());
+        refresher.with_snapshot_behavior(
+            self.snapshot_behavior,
+            self.snapshot_local_path.clone(),
+            self.snapshots_trigger_threshold,
+        );
+
+        if let Some(ref resource_monitor) = self.resource_monitor {
+            refresher.with_resource_monitor(resource_monitor.clone());
+        }
 
         let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
         let refresher = Arc::new(refresher);
@@ -573,7 +651,7 @@ impl Builder {
         }
 
         // If the table should be ready immediately, mark it as ready.
-        if let ReadyState::OnRegistration = self.ready_state {
+        if self.ready_state == ReadyState::OnRegistration {
             self.runtime_status
                 .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
         }
@@ -587,9 +665,16 @@ impl Builder {
             zero_results_action: self.zero_results_action,
             ready_state: self.ready_state,
             refresh_params,
+            refresh_mode,
             refresher,
             disable_federation: self.disable_federation,
             synchronized_with: self.synchronize_with,
+            cache_ttl: self.caching_ttl,
+            cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
+            cache_stale_if_error: self.caching_stale_if_error,
+            io_runtime: self.io_runtime,
+            cache_mutex,
+            in_flight_revalidations,
         })
     }
 }
@@ -683,6 +768,30 @@ impl AcceleratedTable {
 
         Ok(())
     }
+
+    /// Returns the subset of filters that the accelerator does not fully support
+    /// (i.e., `Inexact` or `Unsupported`) and need to be re-applied after scanning.
+    fn get_filters_to_reapply(&self, filters: &[Expr]) -> DataFusionResult<Vec<Expr>> {
+        if filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let filter_refs: Vec<&Expr> = filters.iter().collect();
+        let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+
+        let filters_to_reapply: Vec<Expr> = filters
+            .iter()
+            .zip(pushdown_support.iter())
+            .filter_map(|(filter, support)| match support {
+                TableProviderFilterPushDown::Exact => None,
+                TableProviderFilterPushDown::Inexact | TableProviderFilterPushDown::Unsupported => {
+                    Some(filter.clone())
+                }
+            })
+            .collect();
+
+        Ok(filters_to_reapply)
+    }
 }
 
 impl Drop for AcceleratedTable {
@@ -715,6 +824,12 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // In caching mode, we handle filters ourselves (not pushed to accelerator)
+        // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
+        if self.refresh_mode == RefreshMode::Caching {
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+        }
+
         match self.zero_results_action {
             ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
             ZeroResultsAction::UseSource => {
@@ -730,8 +845,11 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Check if we're in caching mode
+        let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
+
         // If the initial load hasn't completed yet, we need to handle the loading behavior.
-        if !self.refresher().initial_load_completed() {
+        if !self.refresher().initial_load_completed() && !is_caching_mode {
             match self.ready_state {
                 ReadyState::OnLoad => {
                     return Err(DataFusionError::External(
@@ -753,20 +871,50 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
+        // In caching mode, pass filters to accelerator so it can check for cached data.
+        // If accelerator returns 0 rows → cache miss → fetch from source.
         let input = self
             .accelerator
             .scan(state, projection, filters, limit)
             .await?;
-
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
             let federated = Arc::clone(&federated);
             Box::pin(async move { federated.table_provider().await })
         });
 
-        let plan: Arc<dyn ExecutionPlan> = match &self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => input,
-            ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
+        let plan: Arc<dyn ExecutionPlan> = match (is_caching_mode, &self.zero_results_action) {
+            (true, _) => {
+                // Caching mode: wrap with cache execution plan to handle staleness and background refresh
+
+                // Check which filters the accelerator doesn't fully support and need to be re-applied.
+                // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
+                let filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                let input = if filters_to_reapply.is_empty() {
+                    input
+                } else {
+                    wrap_with_filter(input, state, &filters_to_reapply)?
+                };
+
+                let federated_provider = self.federated.table_provider().await;
+                Arc::new(caching::CachingAccelerationScanExec::new(
+                    input,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                    federated_provider,
+                    Arc::clone(&self.accelerator),
+                    self.dataset_name.to_string(),
+                    self.io_runtime.clone(),
+                    filters.to_vec(),
+                    projection.cloned(),
+                    limit,
+                    Arc::clone(&self.cache_mutex),
+                    Arc::clone(&self.in_flight_revalidations),
+                ))
+            }
+            (false, ZeroResultsAction::ReturnEmpty) => input,
+            (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
                 fallback_fn,

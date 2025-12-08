@@ -259,7 +259,7 @@ fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
 }
 
 /// Converts an array of any numeric type to a `Float64Array`.
-#[allow(clippy::cast_lossless, clippy::cast_precision_loss)]
+#[expect(clippy::cast_lossless, clippy::cast_precision_loss)]
 fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
     match array.data_type() {
         DataType::Float64 => Ok(as_float64_array(array)?.clone()),
@@ -288,7 +288,7 @@ mod tests {
 
     use super::cosine_distance;
 
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     #[test]
     fn test_cosine_distance() {
         assert_eq!(

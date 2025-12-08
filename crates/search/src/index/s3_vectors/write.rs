@@ -101,7 +101,6 @@ pub enum Error {
 }
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
-#[allow(clippy::too_many_lines)]
 pub async fn write(
     index: &S3Vector,
     table: &S3VectorsTable,
@@ -451,7 +450,7 @@ fn update_embedding_column_in_batch(
 }
 
 /// Create an Arrow array from embedding vectors.
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 fn create_embedding_array(
     embedding_vectors: &[Option<Vec<f32>>],
     dimension: i32,
@@ -494,7 +493,7 @@ fn create_embedding_array(
 }
 
 /// Filter out zero vectors (all values in the vector are 0.0)
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
     mut primary_keys: Vec<Option<String>>,
@@ -536,7 +535,7 @@ mod tests {
     use arrow::datatypes::{DataType, Schema};
 
     // Helper function to create a test RecordBatch with text and embedding columns
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn create_test_record_batch_with_embeddings(
         texts: Vec<Option<&str>>,
         embeddings: Vec<Option<Vec<f32>>>,
@@ -589,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     fn test_create_embedding_array_valid_embeddings() {
         let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
 
@@ -632,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     fn test_update_embedding_column_in_batch_with_existing_column() {
         let record = create_test_record_batch_with_embeddings(
             vec![Some("hello"), Some("world")],
@@ -666,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
+    #[expect(clippy::float_cmp)]
     fn test_update_embedding_column_in_batch_append_embedding_column() {
         let record = create_test_record_batch_text_only(vec![Some("hello"), Some("world")]);
 

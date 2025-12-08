@@ -15,9 +15,12 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
+use crate::register_data_connector;
 
 use snafu::prelude::*;
 use std::any::Any;
@@ -53,6 +56,47 @@ impl std::fmt::Display for Https {
     }
 }
 
+impl Https {
+    /// Determines if the dataset uses a structured file format (parquet, csv, etc.)
+    /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
+    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+        let file_format = self
+            .params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
+
+        // Check if explicitly configured as a structured format
+        if matches!(
+            file_format.as_str(),
+            "parquet" | "csv" | "tsv" | "arrow" | "avro"
+        ) {
+            return true;
+        }
+
+        // If file_format is "auto", try to detect from URL extension
+        if file_format == "auto"
+            && let Ok(url) = Url::parse(&dataset.from)
+            && let Some(mut path) = url.path_segments()
+            && let Some(last_segment) = path.next_back()
+        {
+            let extension = last_segment
+                .split('.')
+                .next_back()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+
+            return matches!(
+                extension.as_str(),
+                "parquet" | "csv" | "tsv" | "arrow" | "avro"
+            );
+        }
+
+        false
+    }
+}
+
 struct HttpProviderParams {
     file_format: String,
     acceleration_enabled: bool,
@@ -66,6 +110,7 @@ struct HttpProviderParams {
     max_query_length: usize,
     allow_body_filters: bool,
     max_body_bytes: usize,
+    health_probe: Option<String>,
 }
 
 impl Https {
@@ -154,6 +199,13 @@ impl Https {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(data_components::http::provider::DEFAULT_MAX_BODY_BYTES);
 
+        let health_probe = self
+            .params
+            .get("health_probe")
+            .expose()
+            .ok()
+            .map(std::string::ToString::to_string);
+
         HttpProviderParams {
             file_format,
             acceleration_enabled: dataset.is_accelerated(),
@@ -167,6 +219,7 @@ impl Https {
             max_query_length,
             allow_body_filters,
             max_body_bytes,
+            health_probe,
         }
     }
 
@@ -212,7 +265,9 @@ impl Https {
     fn parse_custom_headers(&self, dataset_name: &str) -> HeaderMap {
         let mut custom_headers = HeaderMap::new();
         if let Some(headers_str) = self.params.get("http_headers").expose().ok() {
-            for header in headers_str.split(',') {
+            // Split by semicolon or comma
+            let delimiter = if headers_str.contains(';') { ';' } else { ',' };
+            for header in headers_str.split(delimiter) {
                 let parts: Vec<&str> = header.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     let name = parts[0].trim();
@@ -315,6 +370,7 @@ impl Https {
             max_query_length,
             allow_body_filters,
             max_body_bytes,
+            health_probe,
         } = self.resolve_http_provider_params(dataset);
 
         let mut provider = data_components::http::provider::HttpTableProvider::new(
@@ -327,7 +383,14 @@ impl Https {
         .with_backoff_method(backoff_method)
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
-        .with_headers(custom_headers);
+        .with_headers(custom_headers)
+        .with_health_probe(health_probe)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: "https".to_string(),
+            message: format!("Invalid health_probe configuration: {e}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: e.into(),
+        })?;
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
@@ -368,48 +431,46 @@ impl DataConnector for Https {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        // Determine file format - default to "auto" if not specified
-        let file_format = self
-            .params
-            .get("file_format")
-            .expose()
-            .ok()
-            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
-
-        // For structured file formats (parquet, csv, arrow, avro), delegate to ListingTableConnector
-        // which properly handles file parsing with correct schemas
-        let mut is_structured_format = matches!(
-            file_format.as_str(),
-            "parquet" | "csv" | "tsv" | "arrow" | "avro"
-        );
-
-        // If file_format is "auto", try to detect from URL extension
-        if file_format == "auto"
-            && let Ok(url) = Url::parse(&dataset.from)
-            && let Some(mut path) = url.path_segments()
-            && let Some(last_segment) = path.next_back()
-        {
-            let extension = last_segment
-                .split('.')
-                .next_back()
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-
-            is_structured_format = matches!(
-                extension.as_str(),
-                "parquet" | "csv" | "tsv" | "arrow" | "avro"
-            );
-        }
-
-        if is_structured_format {
-            // Use ListingTableConnector for file-based structured formats
+        if self.is_structured_format(dataset) {
+            // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
+            // which properly handles file parsing with correct schemas
             let listing_connector =
                 HttpListingConnector::new(self.params.clone(), Handle::current());
             return listing_connector.read_provider(dataset).await;
         }
 
+        // Validate acceleration mode for HTTP connector (JSON API endpoints only)
+        // Structured file formats (parquet, csv, etc.) are handled by ListingTableConnector above
+        // and support full refresh mode without refresh_sql
+        if let Some(acceleration) = &dataset.acceleration
+            && acceleration.enabled
+        {
+            let refresh_mode = self.resolve_refresh_mode(acceleration.refresh_mode);
+
+            // HTTP connector only supports append or caching mode unless refresh_sql is provided
+            if matches!(refresh_mode, RefreshMode::Full) && dataset.refresh_sql().is_none() {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: "HTTP connector with acceleration mode 'full' requires 'refresh_sql' to be specified. Supported acceleration modes without refresh_sql are 'append' or 'caching'.".to_string(),
+                    });
+            }
+        }
+
         // For JSON API endpoints and other formats, use HttpTableProvider
         self.create_http_table_provider(dataset)
+    }
+
+    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+        // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
+        // that require filters to work properly, so skip health monitoring for them.
+        if self.is_structured_format(dataset) {
+            ComponentInitialization::default()
+        } else {
+            ComponentInitialization::OnStartup(StartupOptions {
+                dataset_health_monitor: DatasetHealthMonitor::Disabled,
+            })
+        }
     }
 }
 
@@ -464,6 +525,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("max_request_body_bytes")
             .description("Maximum size (in bytes) for request_body filter values. Default: 16384 (16KiB)."),
+        ParameterSpec::runtime("health_probe")
+            .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -586,3 +649,16 @@ impl ListingTableConnector for HttpListingConnector {
         Ok(u)
     }
 }
+
+register_data_connector!(
+    register_http_connector,
+    REGISTER_HTTP_CONNECTOR,
+    "http",
+    HttpsFactory
+);
+register_data_connector!(
+    register_https_connector,
+    REGISTER_HTTPS_CONNECTOR,
+    "https",
+    HttpsFactory
+);

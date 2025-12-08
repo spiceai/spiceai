@@ -19,9 +19,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::metrics;
+
 use test_framework::{
     anyhow::{self, Context},
     constants::{HEALTH_ENDPOINT, HTTP_BASE_URL, READY_ENDPOINT},
+    opentelemetry::KeyValue,
     tokio_util::sync::CancellationToken,
 };
 
@@ -116,6 +119,7 @@ impl HealthMonitor {
                     let start = Instant::now();
                     let response = client.get(&url).send().await;
                     let latency = start.elapsed();
+                    let latency_ms = latency.as_secs_f64() * 1_000.0;
 
                     let failure_reason = match response {
                         Ok(response) => {
@@ -133,6 +137,21 @@ impl HealthMonitor {
                         }
                         Err(error) => Some(error.to_string()),
                     };
+
+                    metrics::HEALTH_LATENCY.record(
+                        latency_ms,
+                        &[
+                            KeyValue::new("endpoint", endpoint),
+                            KeyValue::new(
+                                "status",
+                                if failure_reason.is_some() {
+                                    "failure"
+                                } else {
+                                    "success"
+                                },
+                            ),
+                        ],
+                    );
 
                     if let Some(entry) = stats.get_mut(endpoint) {
                         entry.record_sample(latency, failure_reason);

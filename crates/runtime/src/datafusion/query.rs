@@ -62,6 +62,8 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
+#[cfg(feature = "cluster")]
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::config_err;
 use datafusion::config::ExtensionOptions;
 use futures::StreamExt;
@@ -71,7 +73,6 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 use super::managed_runtime;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::datafusion::query::Error::UnableToExecuteQuery;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
@@ -158,7 +159,7 @@ macro_rules! handle_error {
 
 impl Query {
     #[cfg(not(feature = "cluster"))]
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn get_session_state(&self) -> Result<SessionState> {
         Ok(self.df.ctx.state())
     }
@@ -201,6 +202,29 @@ impl Query {
             .build()
             .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
+        let mut should_distribute = true;
+
+        let _ = plan.apply(|p| {
+            if let LogicalPlan::DescribeTable(_) = p {
+                should_distribute = false;
+            } else if let LogicalPlan::TableScan(scan) = p
+                && matches!(scan.table_name.schema(), Some(SPICE_RUNTIME_SCHEMA))
+            {
+                should_distribute = false;
+            }
+
+            if should_distribute {
+                Ok(TreeNodeRecursion::Continue)
+            } else {
+                Ok(TreeNodeRecursion::Stop)
+            }
+        })?;
+
+        Ok(should_distribute)
     }
 
     /// Run a query and return the result.
@@ -254,7 +278,7 @@ impl Query {
         Ok(QueryResult::new(stream, cache_status))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
@@ -348,20 +372,18 @@ impl Query {
                 t
             });
 
-            // Special handling for DescribeTable in cluster mode - execute locally
+            // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
             #[cfg(feature = "cluster")]
-            let use_local_session = {
-                matches!(ctx.df.cluster_config.mode, Some(ClusterMode::Scheduler))
-                    && matches!(&*plan, LogicalPlan::DescribeTable { .. })
-            };
+            let should_distribute =
+                Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
 
             #[cfg(not(feature = "cluster"))]
-            let use_local_session = false;
+            let should_distribute = false;
 
-            let session_for_execution = if use_local_session {
-                ctx.df.ctx.state()
-            } else {
+            let session_for_execution = if should_distribute {
                 session
+            } else {
+                ctx.df.ctx.state()
             };
 
             let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
@@ -1073,13 +1095,13 @@ mod tests {
 
     impl Debug for TestExecutionPlan {
         fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-            todo!()
+            unimplemented!("Not used in tests")
         }
     }
 
     impl DisplayAs for TestExecutionPlan {
         fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> std::fmt::Result {
-            todo!()
+            unimplemented!("Not used in tests")
         }
     }
 
@@ -1116,7 +1138,7 @@ mod tests {
             _partition: usize,
             _context: Arc<TaskContext>,
         ) -> datafusion::common::Result<SendableRecordBatchStream> {
-            todo!()
+            unimplemented!("Not used in tests")
         }
     }
 

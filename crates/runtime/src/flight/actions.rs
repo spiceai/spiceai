@@ -32,7 +32,9 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
-use runtime_proto::{ExecutorExpandSecretRequest, ExecutorExpandSecretResponse};
+use runtime_proto::{
+    ExecutorExpandSecretRequest, ExecutorExpandSecretResponse, GetAppDefinitionRequest,
+};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use secrecy::ExposeSecret;
 
@@ -148,6 +150,11 @@ pub(crate) async fn do_action(
         ActionType::GetAppDefinition => {
             tracing::trace!("do_action: GetAppDefinition");
             let context = RequestContext::current(AsyncMarker::new().await);
+            let request =
+                GetAppDefinitionRequest::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            check_executor_registration(&context, &request.executor_id).await?;
+
             let Some(app) = context
                 .extension::<AppContextExtension>()
                 .and_then(|a| a.app())
@@ -247,6 +254,59 @@ pub(crate) async fn do_action(
             let result = arrow_flight::Result::new(response.encode_to_vec());
             futures::stream::iter(vec![Ok(result)])
         }
+        ActionType::ExpandSecret => {
+            tracing::trace!("do_action: ExpandSecret");
+
+            let request = ExecutorExpandSecretRequest::decode(&*request.get_ref().body)
+                .map_err(to_tonic_err)?;
+
+            let span = tracing::span!(
+                target: "task_history",
+                tracing::Level::INFO,
+                "cluster::expand_secret",
+                executor_id = %request.executor_id,
+                key = %request.key
+            );
+            let _guard = span.enter();
+
+            let context = RequestContext::current(AsyncMarker::new().await);
+            check_executor_registration(&context, &request.executor_id).await?;
+
+            tracing::debug!(
+                "ExpandSecret: expanding secret {} for executor {}",
+                request.key,
+                request.executor_id
+            );
+
+            let Some(sctx) = context.extension::<SecretsContextExtension>() else {
+                return Err(Status::internal("Secrets context not available"));
+            };
+
+            let secrets = sctx.secrets();
+            let secrets = secrets.read().await;
+            let Some(value) = secrets
+                .get_secret(&request.key)
+                .await
+                .map_err(to_tonic_err)?
+            else {
+                tracing::error!(target: "task_history", "Secret not found");
+                return Err(Status::invalid_argument(format!(
+                    "Unable to read secret {}",
+                    request.key
+                )));
+            };
+
+            let exposed = value.expose_secret();
+            let response = ExecutorExpandSecretResponse {
+                key: request.key,
+                value: exposed.to_string(),
+            };
+
+            tracing::debug!(target: "task_history", "Secret expanded successfully");
+
+            let result = arrow_flight::Result::new(response.encode_to_vec());
+            futures::stream::iter(vec![Ok(result)])
+        }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };
 
@@ -254,4 +314,48 @@ pub(crate) async fn do_action(
         stream,
         move || start,
     ))))
+}
+
+/// Checks if executor is a part of the Ballista cluster
+async fn check_executor_registration(
+    request_context: &RequestContext,
+    executor_id: &str,
+) -> Result<(), Status> {
+    let Some(df) = request_context
+        .extension::<DataFusionContextExtension>()
+        .map(|df| df.datafusion())
+    else {
+        return Err(Status::internal("DataFusion context not available"));
+    };
+
+    let scheduler = {
+        let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
+            return Err(Status::internal("Cluster scheduler context cannot be read"));
+        };
+
+        let Some(ref scheduler) = *maybe_scheduler else {
+            return Err(Status::internal("Cluster scheduler context not available"));
+        };
+
+        Arc::clone(scheduler)
+    };
+
+    let executor_state = scheduler
+        .state
+        .executor_manager
+        .get_executor_state()
+        .await
+        .map_err(to_tonic_err)?;
+    let executors = executor_state
+        .into_iter()
+        .map(|(e, _)| e.id)
+        .collect::<HashSet<_>>();
+
+    if executors.contains(executor_id) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "Executor {executor_id} is not a part of the cluster"
+        )))
+    }
 }

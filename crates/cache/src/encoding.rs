@@ -85,7 +85,7 @@ impl ZstdEncoder {
 
 impl Default for ZstdEncoder {
     fn default() -> Self {
-        Self::new(3) // Zstd default compression level
+        Self::new(6) // Zstd compression level 6
     }
 }
 

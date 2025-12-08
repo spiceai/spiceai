@@ -37,7 +37,7 @@ struct ExprUnixTimestamp {
     scale: u128,
 }
 
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 #[derive(Clone, Debug)]
 pub(crate) struct TimestampFilterConvert {
     time_column: String,
@@ -48,7 +48,7 @@ pub(crate) struct TimestampFilterConvert {
     time_partition_format: Option<ExprTimeFormat>,
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 impl TimestampFilterConvert {
     pub(crate) fn create(
         field: Option<arrow::datatypes::Field>,
@@ -74,8 +74,6 @@ impl TimestampFilterConvert {
         })
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn convert(&self, timestamp_in_nanos: u128, op: Operator) -> Expr {
         let time_expr =
             convert_to_expr(timestamp_in_nanos, &self.time_column, &self.time_format, op);
@@ -94,7 +92,7 @@ impl TimestampFilterConvert {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn convert_to_expr(
     timestamp_in_nanos: u128,
     time_column: &str,

@@ -21,7 +21,7 @@ build-validator:
 	cargo build --release -p spicepod-validator
 
 .PHONY: build
-build: build-cli build-runtime build-validator
+build: build-cli build-runtime
 
 .PHONY: build-dev
 build-dev:
@@ -79,14 +79,20 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
 	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
@@ -95,18 +101,30 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
-		-Aclippy::disallowed_macros
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
 
 lint-go:
 	go vet ./...

@@ -33,15 +33,21 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
+    Caching,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
     Memory,
+    /// Open an existing file if it exists, otherwise create a new one.
+    /// This is the default file behavior that preserves data across restarts.
     File,
+    /// Always create a new file, truncating/overwriting any existing file on startup.
+    /// Use this when you want a fresh acceleration on each startup.
+    FileCreate,
 }
 
 impl Display for Mode {
@@ -49,6 +55,7 @@ impl Display for Mode {
         match self {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
+            Mode::FileCreate => write!(f, "file_create"),
         }
     }
 }
@@ -138,12 +145,12 @@ pub enum SnapshotBehavior {
     CreateOnly,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::Disabled
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -243,7 +250,7 @@ pub struct Acceleration {
     pub snapshots: SnapshotBehavior,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -253,7 +260,7 @@ const fn default_true() -> bool {
 }
 
 impl Default for Acceleration {
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     fn default() -> Self {
         Self {
             enabled: true,

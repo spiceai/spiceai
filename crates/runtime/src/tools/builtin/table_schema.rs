@@ -104,7 +104,7 @@ impl TableSchemaTool {
                 .map(|t| {
                     let tbl = TableReference::parse_str(t);
                     let cols = Self::table_column_information_for_table(&tbl, &Arc::clone(&app));
-                    (tbl.clone(), cols)
+                    (tbl, cols)
                 })
                 .collect_vec(),
             _ => vec![],
@@ -143,7 +143,7 @@ impl TableSchemaTool {
                                                     f.data_type().clone(),
                                                     f.is_nullable(),
                                                 )
-                                                .with_metadata(c.metadata().clone()),
+                                                .with_metadata(c.metadata()),
                                             ),
                                             None => Arc::clone(f),
                                         }
@@ -227,8 +227,7 @@ impl TableSchemaTool {
                 function: FunctionCall {
                     name: self.name().to_string(),
                     arguments: serde_json::to_string(&params)
-                        .map_err(OpenAIError::JSONDeserialize)?
-                        .to_string(),
+                        .map_err(OpenAIError::JSONDeserialize)?,
                 },
             }])
             .build()

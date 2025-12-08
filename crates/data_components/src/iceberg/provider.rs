@@ -88,20 +88,15 @@ impl IcebergCatalogProvider {
             },
         };
 
-        let providers = try_join_all(
-            schema_names
-                .iter()
-                .map(|name| {
-                    let semaphore_clone = Arc::clone(&load_semaphore);
-                    IcebergSchemaProvider::try_new(
-                        Arc::clone(&client),
-                        NamespaceIdent::new(name.clone()),
-                        semaphore_clone,
-                        includes,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
+        let providers = try_join_all(schema_names.iter().map(|name| {
+            let semaphore_clone = Arc::clone(&load_semaphore);
+            IcebergSchemaProvider::try_new(
+                Arc::clone(&client),
+                NamespaceIdent::new(name.clone()),
+                semaphore_clone,
+                includes,
+            )
+        }))
         .await?;
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names

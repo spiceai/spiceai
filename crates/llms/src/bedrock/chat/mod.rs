@@ -119,7 +119,7 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are neither [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`Message`] format.
     ///
     /// Other enum variants will be ignored.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
+    #[expect(clippy::too_many_lines)]
     fn convert_non_system_messages(
         msgs: Vec<ChatCompletionRequestMessage>,
     ) -> Result<Vec<Message>, BuildError> {
@@ -130,13 +130,13 @@ impl BedrockConverse {
                     ..
                 }) => MessageBuilder::default()
                     .set_content(Some(vec![ContentBlock::Text(match content {
-                        ChatCompletionRequestUserMessageContent::Text(s) => s.clone(),
+                        ChatCompletionRequestUserMessageContent::Text(s) => s,
                         ChatCompletionRequestUserMessageContent::Array(arr) => arr
                             .into_iter()
                             .filter_map(|p| match p {
                                 ChatCompletionRequestUserMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
-                                ) => Some(text.clone()),
+                                ) => Some(text),
                                 _ => None,
                             })
                             .join(""),
@@ -152,15 +152,13 @@ impl BedrockConverse {
                 ) => {
                     let mut message_content = vec![];
                     let text_content: Option<String> = match content {
-                        Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
-                            Some(s.clone())
-                        }
+                        Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => Some(s),
                         Some(ChatCompletionRequestAssistantMessageContent::Array(arr)) => arr
                             .into_iter()
                             .filter_map(|p| match p {
                                 ChatCompletionRequestAssistantMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
-                                ) => Some(text.clone()),
+                                ) => Some(text),
                                 ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => {
                                     None
                                 }
@@ -214,7 +212,7 @@ impl BedrockConverse {
                 }) => {
                     let block_content = match content {
                         ChatCompletionRequestToolMessageContent::Text(t) => {
-                            vec![ToolResultContentBlock::Text(t.clone())]
+                            vec![ToolResultContentBlock::Text(t)]
                         }
                         ChatCompletionRequestToolMessageContent::Array(arr) => arr
                             .into_iter()
@@ -222,7 +220,7 @@ impl BedrockConverse {
                                 let ChatCompletionRequestToolMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
                                 ) = s;
-                                ToolResultContentBlock::Text(text.clone())
+                                ToolResultContentBlock::Text(text)
                             })
                             .collect(),
                     };
@@ -230,7 +228,7 @@ impl BedrockConverse {
                         .set_content(
                             ToolResultBlockBuilder::default()
                                 .set_content(Some(block_content))
-                                .set_tool_use_id(Some(tool_call_id.clone()))
+                                .set_tool_use_id(Some(tool_call_id))
                                 .set_status(Some(ToolResultStatus::Success))
                                 .build()
                                 .ok()
@@ -251,7 +249,6 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`SystemContentBlock`] format.
     ///
     /// Other enum variants will be ignored.
-    #[allow(clippy::cast_possible_wrap)]
     fn convert_system_messages(msgs: Vec<ChatCompletionRequestMessage>) -> Vec<SystemContentBlock> {
         msgs.into_iter()
             .flat_map(|m| match m {
@@ -275,7 +272,7 @@ impl BedrockConverse {
                 | ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Text(s),
                     name: _,
-                }) => vec![SystemContentBlock::Text(s.to_string())],
+                }) => vec![SystemContentBlock::Text(s)],
                 ChatCompletionRequestMessage::Developer(
                     ChatCompletionRequestDeveloperMessage {
                         content: ChatCompletionRequestDeveloperMessageContent::Array(arr),
@@ -293,7 +290,7 @@ impl BedrockConverse {
             .collect()
     }
 
-    #[allow(clippy::cast_possible_wrap, deprecated)]
+    #[expect(clippy::cast_possible_wrap, deprecated)]
     fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
         InferenceConfiguration::builder()
             .set_max_tokens(
@@ -366,7 +363,6 @@ impl BedrockConverse {
         Ok(bldr)
     }
 
-    #[allow(deprecated)]
     fn to_converse(
         &self,
         client: &Arc<BedrockClient>,
@@ -423,7 +419,7 @@ impl BedrockConverse {
         Ok(bldr)
     }
 
-    #[allow(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
+    #[expect(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
     fn convert_converse_output(
         &self,
         output: ConverseOutput,
@@ -482,7 +478,7 @@ impl BedrockConverse {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn process_stream(
         model: &str,
         input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
@@ -665,7 +661,6 @@ impl BedrockConverse {
 
 #[async_trait]
 impl Chat for BedrockConverse {
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,

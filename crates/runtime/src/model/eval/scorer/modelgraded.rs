@@ -97,7 +97,7 @@ impl ModelGradedScorer {
         Ok(Some(score))
     }
 
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn convert_number_to_f32(value: &Number) -> Option<f32> {
         match value {
             v if v.is_u64() => Some(v.as_u64().unwrap_or_default() as f32),

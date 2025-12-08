@@ -15,35 +15,34 @@ limitations under the License.
 */
 #![allow(clippy::too_many_arguments)]
 
-use crate::embeddings::construct_chunker;
-use crate::embeddings::index::VectorScanTableProvider;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
-use arrow_schema::Schema;
-use arrow_schema::SchemaRef;
-use chunking::ChunkingConfig;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-use runtime_datafusion_index::Index;
-use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::util::get_primary_keys;
-use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
-use search::metadata::MetadataColumn;
+use spicepod::vector::VectorStore;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use datafusion::common::ToDFSchema as _;
-use runtime_table_partition::expression::partition_by_expressions;
 use spicepod::semantic::Column;
 
 #[cfg(feature = "s3_vectors")]
 use {
-    search::index::s3_vectors::S3Vector, snafu::ResultExt,
+    crate::embeddings::construct_chunker,
+    arrow_schema::{Schema, SchemaRef},
+    chunking::ChunkingConfig,
+    datafusion::common::ToDFSchema as _,
+    runtime_datafusion_index::{Index, IndexedTableProvider},
+    runtime_table_partition::expression::partition_by_expressions,
+    search::generation::util::get_primary_keys,
+    search::index::s3_vectors::S3Vector,
+    search::index::{
+        SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
+    },
+    search::metadata::MetadataColumn,
+    snafu::ResultExt,
     spicepod::component::embeddings::EmbeddingChunkConfig,
+    spicepod::semantic::MetadataType,
 };
-
-use spicepod::semantic::MetadataType;
-use spicepod::vector::VectorStore;
-use std::sync::Arc;
 
 pub async fn wrap_table_as_index(
     ctx: &Arc<SessionContext>,
@@ -55,6 +54,17 @@ pub async fn wrap_table_as_index(
     inner_table_provider: Arc<dyn TableProvider>,
     vector_store: &VectorStore,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(feature = "s3_vectors"))]
+    let _ = (
+        ctx,
+        embedding_models,
+        secrets,
+        tbl,
+        columns,
+        file_format,
+        inner_table_provider.as_ref(),
+    );
+
     match vector_store.engine.as_deref() {
         #[cfg(feature = "s3_vectors")]
         Some("s3" | "s3_vectors") => {
@@ -104,7 +114,14 @@ async fn wrap_table_as_index_s3(
                 .map(|embed| (c.name.clone(), embed.clone()))
         })
         .collect();
-    let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
+    let mut provider = if let Some(indexed) = inner_table_provider
+        .as_any()
+        .downcast_ref::<IndexedTableProvider>()
+    {
+        indexed.clone()
+    } else {
+        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
     for (column, config) in embedding_columns {
         let (columns, index_schema) = if config.chunking.as_ref().is_some_and(|cfg| cfg.enabled) {
             updated_chunked_search_index_format(&inner_table_provider, columns, &column)
@@ -195,6 +212,7 @@ async fn construct_s3_chunked_vector_index(
 }
 
 /// Provide updated columns and underlying [`SchemaRef`] for a [`SearchIndex`] to use based off the index being chunked.
+#[cfg(feature = "s3_vectors")]
 fn updated_chunked_search_index_format(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],

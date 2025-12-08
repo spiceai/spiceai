@@ -52,6 +52,7 @@ datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true, optional = true }
 datafusion-spark.workspace = true
 datafusion-table-providers = { workspace = true }
+dynamodb-streams = { path="../dynamodb-streams", optional = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -70,6 +71,7 @@ graphql-parser.workspace = true
 headers-accept = "0.1.3"
 http.workspace = true
 http-body-util = "0.1.3"
+humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
 hyper-util = { version = "0.1.17", features = ["service"] }
 iceberg.workspace = true
@@ -91,6 +93,7 @@ ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
 once_cell = "1.21.3"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.30", features = [
     "gen-tonic-messages",
@@ -100,7 +103,10 @@ opentelemetry-proto = { version = "0.30", features = [
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
+parking_lot.workspace = true
 percent-encoding.workspace = true
+linkme.workspace = true
+paste.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
@@ -149,6 +155,7 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 strsim = { version = "0.11.1", optional = true }
+sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
@@ -179,6 +186,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
+gethostname.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -243,7 +251,7 @@ delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb", "datafusion-optimizer-rules/duckdb"]
-dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
+dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams", "dep:humantime"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]

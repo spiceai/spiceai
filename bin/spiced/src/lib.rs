@@ -30,7 +30,6 @@ use flightrepl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::runtime::Tokio;
 use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
 use runtime::config::ClusterMode;
@@ -116,7 +115,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
@@ -183,7 +182,7 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -281,7 +280,12 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     if let Some(ref metrics_registry) = prometheus_registry {
-        init_metrics(&rt.datafusion(), metrics_registry.clone())
+        let otel_config = telemetry_config
+            .as_ref()
+            .and_then(|c| c.otel_exporter.as_ref())
+            .filter(|c| c.enabled);
+
+        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config)
             .context(UnableToInitializeMetricsSnafu)?;
     }
 
@@ -372,8 +376,9 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
 fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
+    otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resource = Resource::default();
+    let resource = Resource::builder().build();
 
     let prometheus_exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry)
@@ -386,19 +391,45 @@ fn init_metrics(
     let spice_metrics_exporter =
         OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
 
-    let periodic_reader = PeriodicReader::builder(spice_metrics_exporter, Tokio)
+    let spice_metrics_reader = PeriodicReader::builder(spice_metrics_exporter)
         .with_interval(Duration::from_secs(30))
-        .with_timeout(Duration::from_secs(10))
         .build();
 
-    let provider = SdkMeterProvider::builder()
+    let mut provider_builder = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(prometheus_exporter)
-        .with_reader(periodic_reader)
-        .build();
+        .with_reader(spice_metrics_reader);
+
+    // Add OTEL push exporter if configured
+    if let Some(config) = otel_config {
+        match create_otel_reader(config) {
+            Ok(otel_reader) => {
+                provider_builder = provider_builder.with_reader(otel_reader);
+                let protocol = if config.is_http() { "http" } else { "grpc" };
+                tracing::info!(
+                    endpoint = %config.endpoint,
+                    protocol = protocol,
+                    push_interval = %config.push_interval,
+                    "OTEL metrics exporter enabled"
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize OTEL metrics exporter: {e}");
+            }
+        }
+    }
+
+    let provider = provider_builder.build();
     global::set_meter_provider(provider);
 
     Ok(())
+}
+
+/// Creates an OTEL periodic reader from the spicepod config
+fn create_otel_reader(
+    config: &app::spicepod::component::runtime::OtelExporterConfig,
+) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
+    runtime::otel_push_exporter::create_otel_periodic_reader(config)
 }
 
 async fn start_anonymous_telemetry(

@@ -122,21 +122,16 @@ pub async fn parse_explicit_primary_keys(
             })
             .collect::<HashMap<TableReference, Vec<_>>>();
 
-        pks.extend(
-            app.views
-                .iter()
-                .filter_map(|d| {
-                    d.primary_key_override().map(|pks| {
-                        (
-                            TableReference::parse_str(&d.name)
-                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                                .into(),
-                            pks,
-                        )
-                    })
-                })
-                .collect::<HashMap<TableReference, Vec<_>>>(),
-        );
+        pks.extend(app.views.iter().filter_map(|d| {
+            d.primary_key_override().map(|pks| {
+                (
+                    TableReference::parse_str(&d.name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                        .into(),
+                    pks,
+                )
+            })
+        }));
         pks
     })
 }

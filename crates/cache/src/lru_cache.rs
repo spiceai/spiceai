@@ -28,7 +28,7 @@ use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
-use spicepod::component::caching::CacheConfig;
+use spicepod::component::caching::{CacheConfig, CachingPolicy};
 use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
@@ -110,7 +110,12 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
     };
 
     let hash_builder = get_hash_builder(cache_config.hashing_algorithm)?;
-    Ok(Arc::new(LruCache::new(cache_max_size, ttl, hash_builder)))
+    Ok(Arc::new(LruCache::new(
+        cache_max_size,
+        ttl,
+        hash_builder,
+        cache_config.caching_policy,
+    )))
 }
 
 impl<
@@ -118,7 +123,18 @@ impl<
     T: BuildHasher + Clone + Send + Sync + 'static,
 > LruCache<V, T>
 {
-    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
+    #[must_use]
+    pub fn new(
+        cache_max_size: u64,
+        ttl: Duration,
+        hasher: T,
+        caching_policy: CachingPolicy,
+    ) -> Self {
+        let moka_eviction_policy = match caching_policy {
+            CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
+            CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
+        };
+
         let cache: Cache<u64, V, T> = Cache::builder()
             .time_to_live(ttl)
             .weigher(|_key, value: &V| -> u32 {
@@ -138,7 +154,7 @@ impl<
                 }
             })
             .max_capacity(cache_max_size)
-            .eviction_policy(moka::policy::EvictionPolicy::lru())
+            .eviction_policy(moka_eviction_policy)
             .support_invalidation_closures()
             .eviction_listener(|_key, _value, cause| {
                 if cause.was_evicted() {
@@ -307,7 +323,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use rstest::rstest;
-    use spicepod::component::caching::HashingAlgorithm;
+    use spicepod::component::caching::{CachingPolicy, HashingAlgorithm};
     use std::collections::{HashMap, HashSet};
     use std::hash::RandomState;
     use std::time::Duration;
@@ -373,7 +389,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
+            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -398,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
+            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
@@ -417,7 +433,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
+            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
@@ -458,7 +474,7 @@ mod tests {
         #[case] hasher: T,
     ) {
         let cache: LruCache<CachedSearchResult, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher);
+            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
@@ -498,7 +514,7 @@ mod tests {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_millis(100), hasher);
+            LruCache::new(10, Duration::from_millis(100), hasher, CachingPolicy::Lru);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -533,7 +549,7 @@ mod tests {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
         let cache: LruCache<CachedQueryResult, _> =
-            LruCache::new(10, Duration::from_millis(100), hasher);
+            LruCache::new(10, Duration::from_millis(100), hasher, CachingPolicy::Lru);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -556,5 +572,30 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should not contain key after TTL expiry");
+    }
+
+    #[rstest]
+    #[case::lru(CachingPolicy::Lru)]
+    #[case::tiny_lfu(CachingPolicy::TinyLfu)]
+    #[tokio::test]
+    async fn test_cache_with_caching_policy(#[case] caching_policy: CachingPolicy) {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _> =
+            LruCache::new(10, Duration::from_secs(60), hasher, caching_policy);
+
+        let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result().await;
+
+        // Put a value in the cache
+        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+
+        // Get the value from the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        let retrieved = retrieved.expect("cache should contain the key");
+        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
+        let result_len = result.records().await.expect("Failed to decode").len();
+        (retrieved_len == result_len)
+            .then_some(())
+            .expect("retrieved and result should have same length");
     }
 }

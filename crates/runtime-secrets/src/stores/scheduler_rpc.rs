@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 /// Used by cluster mode to resolve secrets declared in the scheduler
 /// via flight RPC
 pub struct SchedulerRPCSecretStore {
+    scheduler_url: String,
     executor_id: String,
     flight_client: arrow_flight::FlightClient,
 }
@@ -38,6 +39,13 @@ impl SchedulerRPCSecretStore {
 impl SecretStore for SchedulerRPCSecretStore {
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
         tracing::trace!("SchedulerRPCSecretStore: Requesting secret {}", key);
+
+        let flight_client = flight_client::FlightClient::try_new(
+            self.scheduler_url.clone().into(),
+            flight_client::Credentials::anonymous(),
+            None,
+        )
+        .await?;
 
         let request = ExecutorExpandSecretRequest {
             executor_id: self.executor_id.clone(),

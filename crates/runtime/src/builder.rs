@@ -147,7 +147,7 @@ impl RuntimeBuilder {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -204,6 +204,9 @@ impl RuntimeBuilder {
         let caching = Runtime::init_caching(Some(&caching_config));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
+        // Create resource monitor early so it can be passed to DataFusion
+        let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -214,7 +217,8 @@ impl RuntimeBuilder {
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
         .with_caching(caching)
-        .with_metrics(metrics);
+        .with_metrics(metrics)
+        .with_resource_monitor(resource_monitor.clone());
 
         #[cfg(feature = "cluster")]
         {
@@ -303,6 +307,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };
 
@@ -347,7 +352,7 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     let memory_limit = memory_limit?;
     let original_memory_limit = memory_limit.clone();
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let memory_limit = byte_unit::Byte::from_str(&memory_limit)
         .ok()
         // losing the fractional part of a byte is not a problem

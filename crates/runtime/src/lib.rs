@@ -104,6 +104,8 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod otel_push_exporter;
+pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
 
@@ -447,7 +449,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
@@ -480,7 +482,8 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
-    #[allow(dead_code)] // used in "cluster" feature
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     config: Arc<Config>,
 }
 
@@ -545,6 +548,11 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
     }
 
     #[must_use]
@@ -617,7 +625,7 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
@@ -713,13 +721,7 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let (auth, has_auth) = match endpoint_auth.http_auth.clone() {
-            Some(auth) => (auth, true),
-            None => (
-                Arc::new(auth::no_auth::NoAuth) as Arc<dyn runtime_auth::HttpAuth + Send + Sync>,
-                false,
-            ),
-        };
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
@@ -733,7 +735,6 @@ impl Runtime {
                     cloned_config.into(),
                     cloned_tls_config,
                     auth,
-                    has_auth,
                     Some(http_shutdown),
                 )
                 .map_err(Error::from),
@@ -860,9 +861,9 @@ impl Runtime {
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
     }
 
@@ -870,7 +871,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         Arc::clone(&self).set_components_initializing().await;
 
@@ -1185,13 +1186,13 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     make_spice_data_sub_directory(&[])?;
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);
@@ -1201,13 +1202,6 @@ pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<Path
 
 impl From<http::Error> for Error {
     fn from(err: http::Error) -> Self {
-        match err {
-            http::Error::UnableToBindServerToPort { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToBindServerToPort { source },
-            },
-            http::Error::UnableToStartHttpServer { source } => Error::UnableToStartHttpServer {
-                source: http::Error::UnableToStartHttpServer { source },
-            },
-        }
+        Error::UnableToStartHttpServer { source: err }
     }
 }

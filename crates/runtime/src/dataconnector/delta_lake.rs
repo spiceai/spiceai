@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
@@ -38,7 +38,7 @@ pub struct DeltaLake {
 
 impl DeltaLake {
     #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters, io_runtime: Handle) -> Self {
         Self {
             delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime),
@@ -165,3 +165,5 @@ impl DataConnector for DeltaLake {
         )
     }
 }
+
+register_data_connector!("delta_lake", DeltaLakeFactory);
