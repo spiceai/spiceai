@@ -148,7 +148,9 @@ impl RefreshTask {
             }
         }
 
-        tracing::warn!("Changes stream ended for dataset {dataset_name}");
+        if !self.runtime_status.is_shutdown() {
+            tracing::warn!("Changes stream ended for dataset {dataset_name}");
+        }
 
         Ok(())
     }
@@ -187,6 +189,12 @@ impl RefreshTask {
                     tracing::error!("Unknown change operation type for {dataset_name}");
                 }
             }
+        }
+
+        if let Some(ref callback) = self.on_stream_batch_process_callback {
+            let mut callback_guard = callback.lock().await;
+            let future = callback_guard();
+            future.await;
         }
 
         Ok(())
