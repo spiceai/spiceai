@@ -1163,15 +1163,14 @@ impl DataFusion {
             if acceleration_settings
                 .caching_stale_while_revalidate_ttl
                 .is_some()
+                && let Some(results_cache) = &self.caching.results
             {
-                if let Some(results_cache) = &self.caching.results {
-                    ensure!(
-                        results_cache.stale_while_revalidate_ttl().is_none(),
-                        ConflictingStaleWhileRevalidateConfigSnafu {
-                            dataset_name: dataset.name.to_string(),
-                        }
-                    );
-                }
+                ensure!(
+                    results_cache.stale_while_revalidate_ttl().is_none(),
+                    ConflictingStaleWhileRevalidateConfigSnafu {
+                        dataset_name: dataset.name.to_string(),
+                    }
+                );
             }
 
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
