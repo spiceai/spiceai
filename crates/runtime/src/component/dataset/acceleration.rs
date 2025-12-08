@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "duckdb")]
+use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
@@ -25,9 +27,6 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
-
-#[cfg(feature = "duckdb")]
-use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -329,7 +328,9 @@ pub struct Acceleration {
 
     pub partition_by: Vec<PartitionedBy>,
 
-    pub snapshots: SnapshotBehavior,
+    pub snapshot_behavior: SnapshotBehavior,
+
+    pub snapshot_trigger_batches: Option<u8>,
 }
 
 impl Acceleration {
@@ -428,6 +429,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
+        let snapshot_trigger_batches = parse_snapshots_trigger_batches(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
@@ -484,7 +486,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
-            snapshots: SnapshotBehavior::disabled(),
+            snapshot_behavior: SnapshotBehavior::disabled(),
+            snapshot_trigger_batches,
         })
     }
 }
@@ -519,7 +522,8 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
-            snapshots: SnapshotBehavior::Disabled,
+            snapshot_behavior: SnapshotBehavior::Disabled,
+            snapshot_trigger_batches: None,
         }
     }
 }
@@ -542,6 +546,35 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
         }
     }
     Ok(false)
+}
+
+#[expect(clippy::result_large_err)]
+fn parse_snapshots_trigger_batches(
+    params: &mut Option<Params>,
+) -> Result<Option<u8>, crate::Error> {
+    if let Some(params) = params
+        && let Some(value) = params.data.remove("snapshots_trigger_batches")
+    {
+        match value {
+            spicepod::param::ParamValue::String(s) => {
+                let value: u8 = s.parse().map_err(|_e| {
+                    crate::Error::InvalidAccelerationConfiguration {
+                        source: format!(
+                            "Invalid 'snapshots_trigger_batches' param value: {s:?}. Expected a number between 0-255."
+                        ).into(),
+                    }
+                })?;
+                Ok(Some(value))
+            }
+            _ => Err(crate::Error::InvalidAccelerationConfiguration {
+                source: format!(
+                    "Invalid 'snapshots_trigger_batches' param value: {value:?}. Expected a string number."
+                ).into(),
+            }),
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 /// Parse `caching_ttl` duration from params for caching mode.
