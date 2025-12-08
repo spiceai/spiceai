@@ -44,6 +44,7 @@ use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
+use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -215,8 +216,6 @@ pub async fn initialize_cluster_executor(
             .await
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
-        rt.status.update_cluster("executor", ComponentStatus::Ready);
-        executor_bind_object_stores(Arc::clone(&rt)).await?;
 
         executor_bind_app(
             &rt,
@@ -224,6 +223,10 @@ pub async fn initialize_cluster_executor(
             executor_id,
         )
         .await?;
+
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
+
+        rt.status.update_cluster("executor", ComponentStatus::Ready);
 
         executor_poll_loop
             .await
@@ -303,7 +306,7 @@ async fn executor_bind_app(
         });
     };
 
-    let mut flight_client = make_arrow_flight_client(&scheduler_flight_url, Some(api_key))
+    let mut flight_client = make_arrow_flight_client(&scheduler_flight_url, Some(api_key.clone()))
         .await
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
@@ -326,9 +329,16 @@ async fn executor_bind_app(
         .await;
 
     if let Some(Ok(bytes)) = response {
-        let app_def: App = serde_json::from_slice(&bytes)
+        let mut app_def: App = serde_json::from_slice(&bytes)
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
+
+        app_def.runtime.auth = Some(Auth {
+            api_key: Some(ApiKeyAuth {
+                enabled: true,
+                keys: vec![ApiKey::ReadOnly { key: api_key }],
+            }),
+        });
 
         *rt.app.write().await = Some(Arc::new(app_def));
     }

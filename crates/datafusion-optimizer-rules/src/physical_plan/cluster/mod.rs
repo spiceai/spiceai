@@ -14,6 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-
 pub mod ensure_supported_file_scan;
 pub mod union_projection_pushdown;
