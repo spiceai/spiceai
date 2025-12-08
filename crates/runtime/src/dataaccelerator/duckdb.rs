@@ -69,6 +69,8 @@ pub(crate) mod settings;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+    "spice.optimizer.duckdb_aggregate_pushdown";
 
 use super::upsert_dedup;
 
@@ -301,6 +303,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("partitioned_write_buffer"),
+    ParameterSpec::runtime("aggregate_pushdown_optimization"),
 ];
 
 #[async_trait]
@@ -548,6 +551,18 @@ pub(crate) async fn create_table_provider(
         SPICE_ACCELERATOR_METADATA_KEY.to_string(),
         "duckdb".to_string(),
     );
+
+    if cmd
+        .options
+        .get("aggregate_pushdown_optimization")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false)
+    {
+        schema_metadata.insert(
+            SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,

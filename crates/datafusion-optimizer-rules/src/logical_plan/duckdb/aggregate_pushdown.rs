@@ -12,6 +12,8 @@ use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+    "spice.optimizer.duckdb_aggregate_pushdown";
 
 // https://duckdb.org/docs/stable/sql/functions/aggregates
 // https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
@@ -72,17 +74,24 @@ impl DuckDBAggregateLogicalPushdown {
         Arc::new(Self {})
     }
 
-    fn is_duckdb_provider(scan: &TableScan) -> Result<bool> {
+    fn should_optimize(scan: &TableScan) -> Result<bool> {
         let provider = source_as_provider(&scan.source)?;
 
-        Ok(matches!(
-            provider
-                .schema()
-                .metadata
+        let schema = provider.schema();
+        let schema_meta = schema.metadata();
+
+        let should_optimize = matches!(
+            schema_meta
                 .get(SPICE_ACCELERATOR_METADATA_KEY)
                 .map(String::as_str),
             Some("duckdb")
-        ))
+        ) && matches!(
+            schema_meta
+                .get(SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY)
+                .map(|p| p.parse::<bool>().unwrap_or(false)),
+            Some(true)
+        );
+        Ok(should_optimize)
     }
 
     /// If this aggregate's root scan is from a `DuckDB` accelerated source, with supported expressions,
@@ -108,7 +117,7 @@ impl DuckDBAggregateLogicalPushdown {
         let mut found = false;
 
         let _ = plan.apply(|p| match p {
-            LogicalPlan::TableScan(table_scan) if Self::is_duckdb_provider(table_scan)? => {
+            LogicalPlan::TableScan(table_scan) if Self::should_optimize(table_scan)? => {
                 found = true;
                 Ok(TreeNodeRecursion::Stop)
             }
@@ -262,7 +271,8 @@ impl UserDefinedLogicalNodeCore for DuckDBAggregatePushdownNode {
 mod tests {
     use crate::concrete;
     use crate::logical_plan::duckdb::aggregate_pushdown::{
-        DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode, SPICE_ACCELERATOR_METADATA_KEY,
+        DuckDBAggregateLogicalPushdown, DuckDBAggregatePushdownNode,
+        SPICE_ACCELERATOR_METADATA_KEY, SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY,
     };
     use datafusion::catalog::MemTable;
     use datafusion::common::Result;
@@ -298,6 +308,11 @@ mod tests {
         metadata.insert(
             SPICE_ACCELERATOR_METADATA_KEY.to_string(),
             "duckdb".to_string(),
+        );
+
+        metadata.insert(
+            SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
+            "true".to_string(),
         );
 
         let schema = df.schema().inner().as_ref().clone().with_metadata(metadata);
