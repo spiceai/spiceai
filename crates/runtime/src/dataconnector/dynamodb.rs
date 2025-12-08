@@ -18,7 +18,9 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
 };
+use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
+use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
 use crate::federated_table::FederatedTable;
@@ -28,8 +30,9 @@ use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitEr
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use dynamodb_streams::Checkpoint;
+use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
+use opentelemetry::KeyValue;
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
 use std::str::FromStr;
@@ -40,6 +43,7 @@ use util::time_format::is_valid_format;
 #[derive(Debug)]
 pub struct DynamoDB {
     params: Parameters,
+    metrics_collector: Arc<MetricsCollector>,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -107,6 +111,7 @@ impl DataConnectorFactory for DynamoDBFactory {
         Box::pin(async move {
             let dynamodb = DynamoDB {
                 params: params.parameters,
+                metrics_collector: Arc::new(MetricsCollector::default()),
             };
             Ok(Arc::new(dynamodb) as Arc<dyn DataConnector>)
         })
@@ -240,6 +245,7 @@ impl DataConnector for DynamoDB {
             scan_interval,
             time_format.to_string(),
             ready_lag,
+            Arc::clone(&self.metrics_collector),
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
@@ -252,6 +258,12 @@ impl DataConnector for DynamoDB {
 
     fn supports_changes_stream(&self) -> bool {
         true
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(DynamoDBMetricsProvider::new(Arc::new(
+            Metrics::new(Arc::clone(&self.metrics_collector)),
+        ))))
     }
 
     fn changes_stream(
@@ -462,6 +474,72 @@ async fn changes_stream_from_checkpoint(
                 err
             );
             None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DynamoDBMetricsProvider {
+    metrics: Arc<Metrics>,
+}
+
+impl DynamoDBMetricsProvider {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+const METRICS: &[MetricSpec] = &[
+    MetricSpec::new("shards_active", MetricType::ObservableGaugeU64)
+        .description("Current number of active shards in the stream."),
+    MetricSpec::new("records_consumed_total", MetricType::ObservableCounterU64)
+        .description("Total number of records consumed from the stream."),
+    MetricSpec::new("lag_ms", MetricType::ObservableGaugeU64)
+        .description("Current lag in milliseconds between stream watermark and the current time.")
+        .unit("ms"),
+    MetricSpec::new("errors_transient_total", MetricType::ObservableCounterU64)
+        .description("Total number of transient errors encountered while polling from the stream."),
+];
+
+impl MetricsProvider for DynamoDBMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "dynamodb"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        let metrics = Arc::clone(&self.metrics);
+        match metric.name {
+            "shards_active" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(metrics.active_shards_number() as u64, &attributes);
+            }))),
+            "records_consumed_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(metrics.records() as u64, &attributes);
+                })))
+            }
+            "lag_ms" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                if let Some(lag_ms) = metrics.total_lag_ms() {
+                    instrument.observe(lag_ms, &attributes);
+                }
+            }))),
+            "errors_transient_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(metrics.transient_errors() as u64, &attributes);
+                })))
+            }
+            _ => None,
         }
     }
 }

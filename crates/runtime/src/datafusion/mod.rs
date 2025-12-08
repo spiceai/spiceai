@@ -1168,7 +1168,7 @@ impl DataFusion {
             accelerated_table_builder.snapshot_behavior(
                 acceleration_settings.snapshot_behavior.clone(),
                 Some(snapshot_path),
-                acceleration_settings.snapshot_trigger_batches,
+                acceleration_settings.snapshots_trigger_threshold,
             );
         }
 
