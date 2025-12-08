@@ -278,7 +278,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Conflicting stale-while-revalidate settings for dataset {dataset_name}. When using `refresh_mode: caching`, set either acceleration `caching_stale_while_revalidate_ttl` or results cache `stale_while_revalidate_ttl`, but not both.
+        "Conflicting stale-while-revalidate settings for dataset {dataset_name}. When using `refresh_mode: caching`, set either acceleration `caching_stale_while_revalidate_ttl` or results cache `stale_while_revalidate_ttl`, but not both."
     ))]
     ConflictingStaleWhileRevalidateConfig { dataset_name: String },
 
