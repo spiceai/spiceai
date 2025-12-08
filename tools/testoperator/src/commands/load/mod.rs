@@ -58,6 +58,10 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
 
+    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
+    // Resource will be set later with set_resource() before emit()
+    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+
     let queries = query_set
         .get_queries(
             query_overrides,
@@ -219,7 +223,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ])
         .build();
 
-    let telemetry = Telemetry::new_with_resource(&load_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    telemetry.set_resource(load_resource);
 
     // Record per-query metrics for load test
     for query in &metrics.metrics {
