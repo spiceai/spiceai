@@ -213,6 +213,7 @@ opentelemetry_sdk = { version = "0.29", default-features = false, features = [
     "rt-tokio",
     "trace",
     "experimental_trace_batch_span_processor_with_async_runtime",
+    "experimental_metrics_periodicreader_with_async_runtime",
 ] }
 parking_lot = "0.12"
 parquet = "56.0.0"
