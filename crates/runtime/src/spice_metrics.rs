@@ -74,28 +74,6 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
             ));
         };
 
-        // match df.cpu_runtime() {
-        //     None => df
-        //         .write_data(&get_metrics_table_reference(), data_update)
-        //         .await
-        //         .map_err(|e| OTelSdkError::InternalFailure(e.to_string())),
-        //     Some(runtime) => {
-        //         let df = Arc::clone(&df);
-        //         runtime
-        //             .spawn(async move {
-        //                 df.write_data(&get_metrics_table_reference(), data_update)
-        //                     .await
-        //                     .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))
-        //             })
-        //             .await
-        //             .unwrap_or_else(|e| {
-        //                 Err(OTelSdkError::InternalFailure(format!(
-        //                     "Failed to spawn metrics export task: {e}"
-        //                 )))
-        //             })
-        //     }
-        // }
-
         df.write_data(&get_metrics_table_reference(), data_update)
             .await
             .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))
