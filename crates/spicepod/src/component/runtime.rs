@@ -192,12 +192,20 @@ impl OtelExporterConfig {
     /// # Errors
     ///
     /// Returns an error if the duration cannot be parsed
-    pub fn push_interval_duration(&self) -> Result<std::time::Duration, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(&self.push_interval)
-            .map_err(|e| format!("Failed to parse 'push_interval' value '{}': {e}", self.push_interval))?;
+    pub fn push_interval_duration(
+        &self,
+    ) -> Result<std::time::Duration, Box<dyn Error + Send + Sync>> {
+        let duration = fundu::parse_duration(&self.push_interval).map_err(|e| {
+            format!(
+                "Failed to parse 'push_interval' value '{}': {e}",
+                self.push_interval
+            )
+        })?;
 
         if duration.as_secs() == 0 {
-            return Err("'push_interval' must be a positive duration greater than 0 seconds".into());
+            return Err(
+                "'push_interval' must be a positive duration greater than 0 seconds".into(),
+            );
         }
 
         Ok(duration)
@@ -1319,11 +1327,13 @@ mod tests {
         };
         let result = config.push_interval_duration();
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .expect("should be error")
-            .to_string()
-            .contains("greater than 0 seconds"));
+        assert!(
+            result
+                .err()
+                .expect("should be error")
+                .to_string()
+                .contains("greater than 0 seconds")
+        );
     }
 
     #[test]
