@@ -15,11 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{
-    args::AppendTestArgs,
-    health::HealthMonitor,
-    wait_test_and_memory,
-};
+use crate::{args::AppendTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     TestType,

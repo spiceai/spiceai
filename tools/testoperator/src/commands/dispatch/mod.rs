@@ -163,7 +163,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     Some(payload),
                     max_concurrent,
                 )
-                    .await?;
+                .await?;
             }
             None => {
                 // Dispatch workflow without concurrency limit
@@ -198,7 +198,7 @@ async fn dispatch_workflow_with_concurrency(
         max_concurrent,
         Duration::from_secs(1800), // 30 mins
     )
-        .await
+    .await
     {
         eprintln!("Error waiting for slot: {err}");
     }

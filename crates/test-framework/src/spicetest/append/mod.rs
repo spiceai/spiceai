@@ -39,8 +39,8 @@ mod worker;
 use worker::{AppendConfig, AppendWorker};
 
 mod sources;
-use sources::FileAppendableSource;
 use crate::queries::QueryOverrides;
+use sources::FileAppendableSource;
 
 #[derive(Default)]
 pub struct NotStarted {
