@@ -104,12 +104,15 @@ impl Client {
             .sdk_client
             .get_stream_arn(self.table_name.clone())
             .await?;
+
         let state = initialize_state_from_checkpoint(
             stream_arn.clone(),
             &checkpoint,
             Arc::clone(&self.sdk_client),
         )
         .await?;
+
+        tracing::debug!("Stream initialized from checkpoint: {:#?}", state);
 
         let (tx, rx) = mpsc::channel(self.buffer);
 
@@ -125,7 +128,6 @@ impl Client {
             sender: tx,
             client: Arc::clone(&self.sdk_client),
             retry_strategy,
-            idle_timeout: None,
         };
 
         tokio::spawn(async move {

@@ -1055,7 +1055,7 @@ impl DataFusion {
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
-                && acceleration_settings.snapshots.bootstrap_enabled();
+                && acceleration_settings.snapshot_behavior.bootstrap_enabled();
 
             if !delay_initial_ready {
                 self.runtime_status
@@ -1158,13 +1158,18 @@ impl DataFusion {
             accelerated_table_builder.caching_stale_while_revalidate_ttl(
                 acceleration_settings.caching_stale_while_revalidate_ttl,
             );
+            accelerated_table_builder
+                .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
-        if acceleration_settings.snapshots.create_enabled()
+        if acceleration_settings.snapshot_behavior.create_enabled()
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
         {
-            accelerated_table_builder
-                .snapshot_behavior(acceleration_settings.snapshots.clone(), Some(snapshot_path));
+            accelerated_table_builder.snapshot_behavior(
+                acceleration_settings.snapshot_behavior.clone(),
+                Some(snapshot_path),
+                acceleration_settings.snapshot_trigger_batches,
+            );
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -1172,7 +1177,7 @@ impl DataFusion {
                 .await
                 .map(|checkpoint| {
                     checkpoint
-                        .with_snapshot_behavior(acceleration_settings.snapshots)
+                        .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
                         .to_arc()
                 })
                 .ok(),
@@ -1700,7 +1705,7 @@ impl DataFusion {
                 .await
                 .map(|checkpoint| {
                     checkpoint
-                        .with_snapshot_behavior(acceleration.snapshots.clone())
+                        .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
                         .to_arc()
                 })
                 .ok(),
