@@ -68,7 +68,6 @@ impl NotStarted {
         self
     }
 
-    #[must_use]
     pub async fn with_query_set(
         mut self,
         query_set: QuerySet,
