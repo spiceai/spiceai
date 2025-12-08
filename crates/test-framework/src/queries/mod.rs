@@ -683,7 +683,7 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::DuckDBPartitioned) => remove_tpch_query!(
             queries,
             17, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/8384
-            20, // hysical plan does not support logical expression ScalarSubquery(<subquery>); https://github.com/spiceai/spiceai/issues/8384
+            20, // Physical plan does not support logical expression ScalarSubquery(<subquery>); https://github.com/spiceai/spiceai/issues/8384
             21  // Binder Error; https://github.com/spiceai/spiceai/issues/8384
         ),
         _ => queries,
