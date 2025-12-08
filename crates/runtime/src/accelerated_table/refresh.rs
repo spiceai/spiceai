@@ -867,7 +867,7 @@ impl Refresher {
     ) -> tokio::task::JoinHandle<()> {
         let checkpointer = self.checkpointer.clone();
 
-        let on_batch_process_callback = create_snapshot_callback(
+        let on_batch_process_callback = create_periodic_snapshot_callback(
             self.snapshots_trigger_threshold,
             checkpointer,
             snapshot_manager,
@@ -917,7 +917,7 @@ impl Refresher {
 type SnapshotCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
-fn create_snapshot_callback(
+fn create_periodic_snapshot_callback(
     snapshots_trigger_threshold: Option<i64>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     snapshot_manager: Option<SnapshotManager>,
