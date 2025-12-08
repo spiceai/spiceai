@@ -150,15 +150,21 @@ fn default_otel_push_interval() -> String {
 /// Configuration for pushing metrics to an OpenTelemetry collector.
 ///
 /// The protocol is inferred from the endpoint:
-/// - Endpoints containing `/v1/metrics` use HTTP protocol
-/// - All other endpoints use gRPC protocol (default)
+/// - **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`
+/// - **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)
 ///
 /// # Examples
 ///
-/// gRPC (default):
+/// gRPC (hostname only, port defaults to 4317):
 /// ```yaml
 /// otel_exporter:
-///   endpoint: "http://localhost:4317"
+///   endpoint: "otel-collector"
+/// ```
+///
+/// gRPC (hostname with port):
+/// ```yaml
+/// otel_exporter:
+///   endpoint: "otel-collector:4317"
 /// ```
 ///
 /// HTTP:
@@ -171,8 +177,9 @@ fn default_otel_push_interval() -> String {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct OtelExporterConfig {
     /// The endpoint of the OTEL collector.
-    /// Use gRPC endpoint (e.g., `http://localhost:4317`) or
-    /// HTTP endpoint with path (e.g., `http://localhost:4318/v1/metrics`)
+    ///
+    /// For gRPC: use hostname with optional port (e.g., `otel-collector` or `localhost:4317`)
+    /// For HTTP: use full URL (e.g., `http://localhost:4318/v1/metrics`)
     pub endpoint: String,
 
     /// How often to push metrics to the collector (e.g., "30s", "1m", "5m")
@@ -181,10 +188,19 @@ pub struct OtelExporterConfig {
 }
 
 impl OtelExporterConfig {
-    /// Returns true if the endpoint is configured for HTTP protocol
+    /// Returns true if the endpoint is configured for HTTP protocol.
+    ///
+    /// HTTP is used when:
+    /// - The endpoint has an `http://` or `https://` scheme
+    /// - The endpoint contains `/v1/metrics` path
+    ///
+    /// gRPC is used when the endpoint is just a hostname and optional port
+    /// (e.g., `localhost:4317` or `otel-collector`)
     #[must_use]
     pub fn is_http(&self) -> bool {
-        self.endpoint.contains("/v1/metrics")
+        self.endpoint.starts_with("http://")
+            || self.endpoint.starts_with("https://")
+            || self.endpoint.contains("/v1/metrics")
     }
 
     /// Parses the push interval string into a Duration
@@ -1232,33 +1248,33 @@ mod tests {
 
     #[test]
     fn test_otel_exporter_config_parsing_grpc() {
-        let yaml = r#"
+        let yaml = r"
             telemetry:
                 enabled: true
                 otel_exporter:
-                    endpoint: "http://localhost:4317"
-                    push_interval: "30s"
-        "#;
+                    endpoint: otel-collector:4317
+                    push_interval: 30s
+        ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
             .otel_exporter
             .expect("otel_exporter should be present");
-        assert_eq!(otel_config.endpoint, "http://localhost:4317");
-        assert!(!otel_config.is_http()); // gRPC inferred
+        assert_eq!(otel_config.endpoint, "otel-collector:4317");
+        assert!(!otel_config.is_http()); // gRPC: bare hostname:port
         assert_eq!(otel_config.push_interval, "30s");
     }
 
     #[test]
     fn test_otel_exporter_config_parsing_http() {
-        let yaml = r#"
+        let yaml = r"
             telemetry:
                 enabled: true
                 otel_exporter:
-                    endpoint: "http://localhost:4318/v1/metrics"
-                    push_interval: "1m"
-        "#;
+                    endpoint: http://localhost:4318/v1/metrics
+                    push_interval: 1m
+        ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
@@ -1266,33 +1282,33 @@ mod tests {
             .otel_exporter
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.endpoint, "http://localhost:4318/v1/metrics");
-        assert!(otel_config.is_http()); // HTTP inferred
+        assert!(otel_config.is_http()); // HTTP: has http:// scheme
         assert_eq!(otel_config.push_interval, "1m");
     }
 
     #[test]
     fn test_otel_exporter_config_defaults() {
         // Test with minimal config - push_interval should use default
-        let yaml = r#"
+        let yaml = r"
             telemetry:
                 otel_exporter:
-                    endpoint: "http://otel-collector:4317"
-        "#;
+                    endpoint: otel-collector
+        ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
             .otel_exporter
             .expect("otel_exporter should be present");
-        assert_eq!(otel_config.endpoint, "http://otel-collector:4317");
-        assert!(!otel_config.is_http()); // gRPC inferred (no /v1/metrics)
+        assert_eq!(otel_config.endpoint, "otel-collector");
+        assert!(!otel_config.is_http()); // gRPC: bare hostname
         assert_eq!(otel_config.push_interval, "60s"); // default
     }
 
     #[test]
     fn test_otel_exporter_push_interval_duration_parsing() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: "30s".to_string(),
         };
         let duration = config
@@ -1301,7 +1317,7 @@ mod tests {
         assert_eq!(duration, std::time::Duration::from_secs(30));
 
         let config_minutes = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: "5m".to_string(),
         };
         let duration = config_minutes
@@ -1310,7 +1326,7 @@ mod tests {
         assert_eq!(duration, std::time::Duration::from_secs(300));
 
         let config_hours = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: "1h".to_string(),
         };
         let duration = config_hours
@@ -1322,24 +1338,21 @@ mod tests {
     #[test]
     fn test_otel_exporter_push_interval_zero_fails() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: "0s".to_string(),
         };
         let result = config.push_interval_duration();
         assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .expect("should be error")
-                .to_string()
-                .contains("greater than 0 seconds")
-        );
+        let Err(err) = result else {
+            panic!("Expected error");
+        };
+        assert!(err.to_string().contains("greater than 0 seconds"));
     }
 
     #[test]
     fn test_otel_exporter_push_interval_invalid_fails() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: "invalid".to_string(),
         };
         let result = config.push_interval_duration();
@@ -1348,57 +1361,64 @@ mod tests {
 
     #[test]
     fn test_telemetry_config_without_otel_exporter() {
-        let yaml = r#"
+        let yaml = r"
             telemetry:
                 enabled: true
-        "#;
+        ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert!(runtime.telemetry.otel_exporter.is_none());
     }
 
     #[test]
     fn test_otel_exporter_is_http_detection() {
-        // gRPC endpoints (no /v1/metrics)
-        let grpc_config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+        // gRPC: bare hostname
+        let grpc_bare = OtelExporterConfig {
+            endpoint: "otel-collector".to_string(),
             push_interval: "60s".to_string(),
         };
-        assert!(!grpc_config.is_http());
+        assert!(!grpc_bare.is_http());
 
-        // HTTP endpoints (with /v1/metrics)
-        let http_config = OtelExporterConfig {
+        // gRPC: hostname with port
+        let grpc_port = OtelExporterConfig {
+            endpoint: "otel-collector:4317".to_string(),
+            push_interval: "60s".to_string(),
+        };
+        assert!(!grpc_port.is_http());
+
+        // HTTP: http:// scheme
+        let http_scheme = OtelExporterConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            push_interval: "60s".to_string(),
+        };
+        assert!(http_scheme.is_http());
+
+        // HTTP: https:// scheme
+        let https_scheme = OtelExporterConfig {
+            endpoint: "https://otel.example.com:4318".to_string(),
+            push_interval: "60s".to_string(),
+        };
+        assert!(https_scheme.is_http());
+
+        // HTTP: with /v1/metrics path
+        let http_path = OtelExporterConfig {
             endpoint: "http://localhost:4318/v1/metrics".to_string(),
             push_interval: "60s".to_string(),
         };
-        assert!(http_config.is_http());
-
-        // HTTPS gRPC
-        let https_grpc = OtelExporterConfig {
-            endpoint: "https://otel.example.com:4317".to_string(),
-            push_interval: "60s".to_string(),
-        };
-        assert!(!https_grpc.is_http());
-
-        // HTTPS HTTP
-        let https_http = OtelExporterConfig {
-            endpoint: "https://otel.example.com/v1/metrics".to_string(),
-            push_interval: "60s".to_string(),
-        };
-        assert!(https_http.is_http());
+        assert!(http_path.is_http());
     }
 
     #[test]
     fn test_otel_exporter_with_telemetry_properties() {
-        let yaml = r#"
+        let yaml = r"
             telemetry:
                 enabled: true
                 properties:
                     environment: production
                     team: platform
                 otel_exporter:
-                    endpoint: "http://collector:4317"
-                    push_interval: "45s"
-        "#;
+                    endpoint: otel-collector:4317
+                    push_interval: 45s
+        ";
         let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         assert!(runtime.telemetry.enabled);
@@ -1415,7 +1435,7 @@ mod tests {
             .telemetry
             .otel_exporter
             .expect("otel_exporter should be present");
-        assert_eq!(otel_config.endpoint, "http://collector:4317");
+        assert_eq!(otel_config.endpoint, "otel-collector:4317");
         assert_eq!(otel_config.push_interval, "45s");
     }
 }

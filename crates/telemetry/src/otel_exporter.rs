@@ -49,10 +49,32 @@ pub struct OtelExporterConfig {
 }
 
 impl OtelExporterConfig {
-    /// Returns true if the endpoint is configured for HTTP protocol
+    /// Returns true if the endpoint is configured for HTTP protocol.
+    ///
+    /// HTTP is used when:
+    /// - The endpoint has an `http://` or `https://` scheme
+    /// - The endpoint contains `/v1/metrics` path
+    ///
+    /// gRPC is used when the endpoint is just a hostname and optional port
+    /// (e.g., `localhost:4317` or `otel-collector`)
     #[must_use]
     pub fn is_http(&self) -> bool {
-        self.endpoint.contains("/v1/metrics")
+        self.endpoint.starts_with("http://")
+            || self.endpoint.starts_with("https://")
+            || self.endpoint.contains("/v1/metrics")
+    }
+
+    /// Returns the endpoint formatted for gRPC use.
+    /// If no port is specified, defaults to 4317.
+    #[must_use]
+    pub fn grpc_endpoint(&self) -> String {
+        let endpoint = &self.endpoint;
+        // If it already has a port, use as-is with http:// prefix for tonic
+        if endpoint.contains(':') {
+            format!("http://{endpoint}")
+        } else {
+            format!("http://{endpoint}:4317")
+        }
     }
 }
 
@@ -96,18 +118,14 @@ impl OtelMetricsExporterBuilder {
         let exporter = if config.is_http() {
             create_http_exporter(&config.endpoint)?
         } else {
-            create_grpc_exporter(&config.endpoint)?
+            create_grpc_exporter(&config.grpc_endpoint())?
         };
 
         let resource = Resource::builder_empty()
-            .with_attributes(
-                self.resource_attributes
-                    .into_iter()
-                    .chain(vec![
-                        KeyValue::new("service.name", "spiced"),
-                        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-                    ]),
-            )
+            .with_attributes(self.resource_attributes.into_iter().chain(vec![
+                KeyValue::new("service.name", "spiced"),
+                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            ]))
             .build();
 
         let periodic_reader = PeriodicReader::builder(exporter)
@@ -192,7 +210,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_http_detects_http_endpoint() {
+    fn test_is_http_detects_http_scheme() {
+        // http:// scheme is HTTP
+        let config = OtelExporterConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert!(config.is_http());
+
+        // https:// scheme is HTTP
+        let config_https = OtelExporterConfig {
+            endpoint: "https://otel-collector:4318".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert!(config_https.is_http());
+    }
+
+    #[test]
+    fn test_is_http_detects_v1_metrics_path() {
         let config = OtelExporterConfig {
             endpoint: "http://localhost:4318/v1/metrics".to_string(),
             push_interval: Duration::from_secs(60),
@@ -201,12 +236,54 @@ mod tests {
     }
 
     #[test]
-    fn test_is_http_detects_grpc_endpoint() {
+    fn test_is_http_detects_grpc_bare_hostname() {
+        // Bare hostname is gRPC
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: Duration::from_secs(60),
         };
         assert!(!config.is_http());
+
+        // Hostname with port is gRPC
+        let config_with_port = OtelExporterConfig {
+            endpoint: "otel-collector:4317".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert!(!config_with_port.is_http());
+
+        // localhost with port is gRPC
+        let config_localhost = OtelExporterConfig {
+            endpoint: "localhost:4317".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert!(!config_localhost.is_http());
+    }
+
+    #[test]
+    fn test_grpc_endpoint_adds_default_port() {
+        let config = OtelExporterConfig {
+            endpoint: "otel-collector".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert_eq!(config.grpc_endpoint(), "http://otel-collector:4317");
+    }
+
+    #[test]
+    fn test_grpc_endpoint_preserves_custom_port() {
+        let config = OtelExporterConfig {
+            endpoint: "otel-collector:9090".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert_eq!(config.grpc_endpoint(), "http://otel-collector:9090");
+    }
+
+    #[test]
+    fn test_grpc_endpoint_with_localhost() {
+        let config = OtelExporterConfig {
+            endpoint: "localhost:4317".to_string(),
+            push_interval: Duration::from_secs(60),
+        };
+        assert_eq!(config.grpc_endpoint(), "http://localhost:4317");
     }
 
     #[test]
@@ -225,7 +302,7 @@ mod tests {
     #[test]
     fn test_builder_stores_grpc_config() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector:4317".to_string(),
             push_interval: Duration::from_secs(60),
         };
 
@@ -234,7 +311,7 @@ mod tests {
         // Verify config is stored
         assert!(builder.config.is_some());
         let stored_config = builder.config.as_ref().expect("config should be set");
-        assert_eq!(stored_config.endpoint, "http://localhost:4317");
+        assert_eq!(stored_config.endpoint, "otel-collector:4317");
         assert!(!stored_config.is_http());
         assert_eq!(stored_config.push_interval, Duration::from_secs(60));
     }
@@ -257,7 +334,7 @@ mod tests {
     #[test]
     fn test_builder_stores_resource_attributes() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: Duration::from_secs(60),
         };
 
@@ -287,21 +364,21 @@ mod tests {
     fn test_config_various_push_intervals() {
         // Test short interval config
         let config_short = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: Duration::from_secs(1),
         };
         assert_eq!(config_short.push_interval, Duration::from_secs(1));
 
         // Test longer interval config
         let config_long = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: Duration::from_secs(3600),
         };
         assert_eq!(config_long.push_interval, Duration::from_secs(3600));
 
         // Test sub-second intervals (milliseconds)
         let config_ms = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector".to_string(),
             push_interval: Duration::from_millis(500),
         };
         assert_eq!(config_ms.push_interval, Duration::from_millis(500));
@@ -338,7 +415,7 @@ mod tests {
     #[test]
     fn test_config_clone() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector:4317".to_string(),
             push_interval: Duration::from_secs(60),
         };
 
@@ -350,40 +427,59 @@ mod tests {
     #[test]
     fn test_config_debug_format() {
         let config = OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
+            endpoint: "otel-collector:4317".to_string(),
             push_interval: Duration::from_secs(60),
         };
 
         let debug_str = format!("{config:?}");
-        assert!(debug_str.contains("localhost:4317"));
+        assert!(debug_str.contains("otel-collector:4317"));
     }
 
     #[test]
-    fn test_http_protocol_detection_various_endpoints() {
-        // gRPC endpoints (no /v1/metrics)
-        assert!(!OtelExporterConfig {
-            endpoint: "http://localhost:4317".to_string(),
-            push_interval: Duration::from_secs(60),
-        }
-        .is_http());
+    fn test_protocol_detection_comprehensive() {
+        // gRPC: bare hostname
+        assert!(
+            !OtelExporterConfig {
+                endpoint: "otel-collector".to_string(),
+                push_interval: Duration::from_secs(60),
+            }
+            .is_http()
+        );
 
-        assert!(!OtelExporterConfig {
-            endpoint: "https://otel-collector.example.com:4317".to_string(),
-            push_interval: Duration::from_secs(60),
-        }
-        .is_http());
+        // gRPC: hostname with port
+        assert!(
+            !OtelExporterConfig {
+                endpoint: "otel-collector:4317".to_string(),
+                push_interval: Duration::from_secs(60),
+            }
+            .is_http()
+        );
 
-        // HTTP endpoints (with /v1/metrics)
-        assert!(OtelExporterConfig {
-            endpoint: "http://localhost:4318/v1/metrics".to_string(),
-            push_interval: Duration::from_secs(60),
-        }
-        .is_http());
+        // HTTP: http:// scheme
+        assert!(
+            OtelExporterConfig {
+                endpoint: "http://localhost:4318".to_string(),
+                push_interval: Duration::from_secs(60),
+            }
+            .is_http()
+        );
 
-        assert!(OtelExporterConfig {
-            endpoint: "https://otel-collector.example.com/v1/metrics".to_string(),
-            push_interval: Duration::from_secs(60),
-        }
-        .is_http());
+        // HTTP: https:// scheme
+        assert!(
+            OtelExporterConfig {
+                endpoint: "https://otel-collector.example.com:4318".to_string(),
+                push_interval: Duration::from_secs(60),
+            }
+            .is_http()
+        );
+
+        // HTTP: with /v1/metrics path
+        assert!(
+            OtelExporterConfig {
+                endpoint: "http://localhost:4318/v1/metrics".to_string(),
+                push_interval: Duration::from_secs(60),
+            }
+            .is_http()
+        );
     }
 }
