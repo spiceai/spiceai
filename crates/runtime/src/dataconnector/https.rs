@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
@@ -465,9 +465,11 @@ impl DataConnector for Https {
         // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
         // that require filters to work properly, so skip health monitoring for them.
         if self.is_structured_format(dataset) {
-            ComponentInitialization::OnStartup
+            ComponentInitialization::default()
         } else {
-            ComponentInitialization::OnTrigger
+            ComponentInitialization::OnStartup(StartupOptions {
+                dataset_health_monitor: DatasetHealthMonitor::Disabled,
+            })
         }
     }
 }

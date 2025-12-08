@@ -566,7 +566,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
     }
 
     /// Returns whether the data connector should be initialized on startup or on trigger,

@@ -54,7 +54,7 @@ impl Databricks {
         let component_initialization =
             match DatabricksDataConnector::build_auth_credentials(&params.parameters) {
                 Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-                _ => ComponentInitialization::OnStartup,
+                _ => ComponentInitialization::default(),
             };
 
         Arc::new(Self {
