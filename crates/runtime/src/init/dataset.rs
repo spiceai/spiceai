@@ -380,7 +380,9 @@ impl Runtime {
                         self.df.results_cache_provider().is_some()
                     )
                 );
-                if !data_connector.initialization().is_on_trigger()
+                if data_connector
+                    .initialization_for_dataset(&ds)
+                    .is_dataset_health_monitor_enabled()
                     && let Some(datasets_health_monitor) = &self.datasets_health_monitor
                     && let Err(err) = datasets_health_monitor.register_dataset(&ds).await
                 {

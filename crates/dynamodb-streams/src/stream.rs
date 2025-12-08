@@ -15,6 +15,7 @@ limitations under the License.
 */
 use crate::checkpoint::{Checkpoint, CheckpointPosition};
 use crate::client_sdk::SDKClient;
+use crate::metrics::MetricsCollector;
 use crate::stream_state::{InitializingShard, PollOutcome, ShardPollResult, StreamState};
 use crate::{Result, StreamResult};
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
@@ -22,6 +23,7 @@ use futures::{Stream, future::join_all};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tokio::{
@@ -38,6 +40,7 @@ pub struct DynamodbStreamProducer {
     pub sender: mpsc::Sender<StreamResult>,
     pub client: Arc<SDKClient>,
     pub retry_strategy: RetryBackoff,
+    pub metrics_collector: Arc<MetricsCollector>,
 }
 
 pub struct DynamoDBStreamBatch {
@@ -147,8 +150,30 @@ impl DynamodbStreamProducer {
         let mut backoff = self.retry_strategy.clone();
 
         loop {
+            if let Ok(mut guard) = self.metrics_collector.active_shards_number.write() {
+                *guard = self.state.get_active_shards().count();
+            }
+
             match self.collect().await {
                 Ok((batch, had_transient_error)) => {
+                    if !batch.records.is_empty() {
+                        self.metrics_collector
+                            .records
+                            .fetch_add(batch.records.len(), Ordering::Relaxed);
+                    }
+
+                    if let Some(watermark) = batch.watermark
+                        && let Ok(mut wm) = self.metrics_collector.watermark.write()
+                    {
+                        *wm = Some(watermark);
+                    }
+
+                    if had_transient_error {
+                        self.metrics_collector
+                            .transient_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+
                     // Send batch if it has records
                     if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
                         return;

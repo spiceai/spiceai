@@ -566,7 +566,16 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
+    }
+
+    /// Returns whether the data connector should be initialized on startup or on trigger,
+    /// with dataset-specific logic.
+    ///
+    /// This method allows connectors to make initialization decisions based on the specific
+    /// dataset configuration. The default implementation delegates to `initialization()`.
+    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+        self.initialization()
     }
 }
 
