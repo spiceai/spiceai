@@ -686,4 +686,34 @@ mod tests {
             parse_is_query_federation_disabled(&mut Some(params_missing)).expect("to parse");
         assert!(!is_disabled);
     }
+
+    #[test]
+    fn test_parse_caching_stale_if_error() {
+        // Test "enabled"
+        let params_enabled = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "enabled".to_string(),
+        )]));
+        let result = parse_caching_stale_if_error(&mut Some(params_enabled)).expect("to parse");
+        assert_eq!(result, StaleIfError::Enabled);
+
+        // Test "disabled"
+        let params_disabled = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "disabled".to_string(),
+        )]));
+        let result = parse_caching_stale_if_error(&mut Some(params_disabled)).expect("to parse");
+        assert_eq!(result, StaleIfError::Disabled);
+
+        // Test invalid value
+        let params_invalid = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "invalid".to_string(),
+        )]));
+        parse_caching_stale_if_error(&mut Some(params_invalid)).expect_err("should error");
+
+        // Test missing parameter (default)
+        let result = parse_caching_stale_if_error(&mut None).expect("to parse");
+        assert_eq!(result, StaleIfError::Disabled);
+    }
 }
