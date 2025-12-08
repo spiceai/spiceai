@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::dataconnector::listing::{
@@ -52,6 +53,47 @@ pub struct Https {
 impl std::fmt::Display for Https {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "https")
+    }
+}
+
+impl Https {
+    /// Determines if the dataset uses a structured file format (parquet, csv, etc.)
+    /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
+    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+        let file_format = self
+            .params
+            .get("file_format")
+            .expose()
+            .ok()
+            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
+
+        // Check if explicitly configured as a structured format
+        if matches!(
+            file_format.as_str(),
+            "parquet" | "csv" | "tsv" | "arrow" | "avro"
+        ) {
+            return true;
+        }
+
+        // If file_format is "auto", try to detect from URL extension
+        if file_format == "auto"
+            && let Ok(url) = Url::parse(&dataset.from)
+            && let Some(mut path) = url.path_segments()
+            && let Some(last_segment) = path.next_back()
+        {
+            let extension = last_segment
+                .split('.')
+                .next_back()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+
+            return matches!(
+                extension.as_str(),
+                "parquet" | "csv" | "tsv" | "arrow" | "avro"
+            );
+        }
+
+        false
     }
 }
 
@@ -389,41 +431,9 @@ impl DataConnector for Https {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        // Determine file format - default to "auto" if not specified
-        let file_format = self
-            .params
-            .get("file_format")
-            .expose()
-            .ok()
-            .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
-
-        // For structured file formats (parquet, csv, arrow, avro), delegate to ListingTableConnector
-        // which properly handles file parsing with correct schemas
-        let mut is_structured_format = matches!(
-            file_format.as_str(),
-            "parquet" | "csv" | "tsv" | "arrow" | "avro"
-        );
-
-        // If file_format is "auto", try to detect from URL extension
-        if file_format == "auto"
-            && let Ok(url) = Url::parse(&dataset.from)
-            && let Some(mut path) = url.path_segments()
-            && let Some(last_segment) = path.next_back()
-        {
-            let extension = last_segment
-                .split('.')
-                .next_back()
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-
-            is_structured_format = matches!(
-                extension.as_str(),
-                "parquet" | "csv" | "tsv" | "arrow" | "avro"
-            );
-        }
-
-        if is_structured_format {
-            // Use ListingTableConnector for file-based structured formats
+        if self.is_structured_format(dataset) {
+            // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
+            // which properly handles file parsing with correct schemas
             let listing_connector =
                 HttpListingConnector::new(self.params.clone(), Handle::current());
             return listing_connector.read_provider(dataset).await;
@@ -449,6 +459,16 @@ impl DataConnector for Https {
 
         // For JSON API endpoints and other formats, use HttpTableProvider
         self.create_http_table_provider(dataset)
+    }
+
+    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+        // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
+        // that require filters to work properly, so skip health monitoring for them.
+        if self.is_structured_format(dataset) {
+            ComponentInitialization::OnStartup
+        } else {
+            ComponentInitialization::OnTrigger
+        }
     }
 }
 
