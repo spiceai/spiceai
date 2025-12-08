@@ -747,7 +747,7 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		// Check cache status header
 		cacheStatus := resp.Header.Get("Results-Cache-Status")
 		cachedStr := ""
-		if cacheStatus == "HIT" {
+		if cacheStatus == "HIT" || cacheStatus == "STALE" {
 			cachedStr = " (cached)"
 		}
 

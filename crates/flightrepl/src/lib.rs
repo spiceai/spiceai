@@ -578,7 +578,9 @@ pub async fn get_records(
         .metadata()
         .get("results-cache-status")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|s| s.to_lowercase().starts_with("hit"));
+        .is_some_and(|s| {
+            s.to_lowercase().starts_with("hit") || s.to_lowercase().starts_with("stale")
+        });
 
     let stream = response.into_inner();
 
