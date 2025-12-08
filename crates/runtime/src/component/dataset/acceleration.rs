@@ -330,7 +330,7 @@ pub struct Acceleration {
 
     pub snapshot_behavior: SnapshotBehavior,
 
-    pub snapshot_trigger_batches: Option<u32>,
+    pub snapshot_trigger_batches: Option<i64>,
 }
 
 impl Acceleration {
@@ -551,24 +551,17 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
 #[expect(clippy::result_large_err)]
 fn parse_snapshots_trigger_batches(
     params: &mut Option<Params>,
-) -> Result<Option<u32>, crate::Error> {
+) -> Result<Option<i64>, crate::Error> {
     if let Some(params) = params
         && let Some(value) = params.data.remove("snapshots_trigger_batches")
     {
         match value {
-            spicepod::param::ParamValue::String(s) => {
-                let value: u32 = s.parse().map_err(|_e| {
-                    crate::Error::InvalidAccelerationConfiguration {
-                        source: format!(
-                            "Invalid 'snapshots_trigger_batches' param value: {s:?}. Expected integer number"
-                        ).into(),
-                    }
-                })?;
-                Ok(Some(value))
+            spicepod::param::ParamValue::Int(s) => {
+                Ok(Some(s))
             }
             _ => Err(crate::Error::InvalidAccelerationConfiguration {
                 source: format!(
-                    "Invalid 'snapshots_trigger_batches' param value: {value:?}. Expected a string number."
+                    "Invalid 'snapshots_trigger_batches' param value: {value:?}. Expected an integer number."
                 ).into(),
             }),
         }

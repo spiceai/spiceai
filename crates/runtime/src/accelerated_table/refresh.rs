@@ -468,7 +468,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
-    snapshot_trigger_batches: Option<u32>,
+    snapshot_trigger_batches: Option<i64>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -583,7 +583,7 @@ impl Refresher {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
-        snapshot_trigger: Option<u32>,
+        snapshot_trigger: Option<i64>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
@@ -918,13 +918,13 @@ type SnapshotCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
 fn create_snapshot_callback(
-    snapshot_trigger_batches: Option<u32>,
+    snapshot_trigger_batches: Option<i64>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     snapshot_manager: Option<SnapshotManager>,
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
 ) -> Option<SnapshotCallback> {
-    let batches = snapshot_trigger_batches.unwrap_or(300u32);
+    let batches = snapshot_trigger_batches.unwrap_or(300i64);
 
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -932,7 +932,7 @@ fn create_snapshot_callback(
             let dataset_name = dataset_name.clone();
 
             // Track number of processed batches since last snapshot
-            let batches_processed = Arc::new(RwLock::new(0u32));
+            let batches_processed = Arc::new(RwLock::new(0i64));
 
             let callback = Arc::new(Mutex::new(Box::new(move || {
                 let checkpointer = Arc::clone(&checkpointer);
