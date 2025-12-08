@@ -198,6 +198,12 @@ opentelemetry = { version = "0.29", default-features = false, features = [
     "trace",
 ] }
 opentelemetry-http = { version = "0.29", features = ["reqwest-rustls"] }
+opentelemetry-otlp = { version = "0.29", default-features = false, features = [
+    "metrics",
+    "grpc-tonic",
+    "http-proto",
+    "reqwest-rustls",
+] }
 opentelemetry-prometheus = "0.29"
 opentelemetry-zipkin = { version = "0.29", default-features = false, features = [
     "reqwest",
@@ -208,6 +214,7 @@ opentelemetry_sdk = { version = "0.29", default-features = false, features = [
     "rt-tokio",
     "trace",
     "experimental_trace_batch_span_processor_with_async_runtime",
+    "experimental_metrics_periodicreader_with_async_runtime",
 ] }
 parking_lot = "0.12"
 parquet = "56.0.0"
