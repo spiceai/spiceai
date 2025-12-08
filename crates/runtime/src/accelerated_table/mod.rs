@@ -288,7 +288,7 @@ pub struct Builder {
     initial_load_complete: bool,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
-    snapshot_trigger_batches: Option<u8>,
+    snapshot_trigger_batches: Option<u32>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -461,7 +461,7 @@ impl Builder {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
-        snapshot_trigger_batches: Option<u8>,
+        snapshot_trigger_batches: Option<u32>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;

@@ -468,7 +468,7 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
-    snapshot_trigger_batches: Option<u8>,
+    snapshot_trigger_batches: Option<u32>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -583,7 +583,7 @@ impl Refresher {
         &mut self,
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
-        snapshot_trigger: Option<u8>,
+        snapshot_trigger: Option<u32>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
@@ -918,80 +918,65 @@ type SnapshotCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
 fn create_snapshot_callback(
-    snapshot_trigger_batches: Option<u8>,
+    snapshot_trigger_batches: Option<u32>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     snapshot_manager: Option<SnapshotManager>,
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
 ) -> Option<SnapshotCallback> {
-    match snapshot_trigger_batches {
-        None => {
-            tracing::warn!(
-                "snapshot_trigger_batches is not defined. Snapshotting is disabled for dataset {dataset_name}"
-            );
-            None
+    let batches = snapshot_trigger_batches.unwrap_or(300u32);
+
+    match (checkpointer, snapshot_manager) {
+        (Some(checkpointer), Some(snapshot_manager)) => {
+            let snapshot_manager = Arc::new(snapshot_manager);
+            let dataset_name = dataset_name.clone();
+
+            // Track number of processed batches since last snapshot
+            let batches_processed = Arc::new(RwLock::new(0u32));
+
+            let callback = Arc::new(Mutex::new(Box::new(move || {
+                let checkpointer = Arc::clone(&checkpointer);
+                let snapshot_manager = Arc::clone(&snapshot_manager);
+                let batches_processed = Arc::clone(&batches_processed);
+                let federated_schema = Arc::<Schema>::clone(&federated_schema);
+                let dataset_name = dataset_name.clone();
+
+                Box::pin(async move {
+                    let mut batches_processed_value = batches_processed.write().await;
+
+                    *batches_processed_value += 1;
+                    if *batches_processed_value >= batches {
+                        *batches_processed_value = 0;
+
+                        tracing::debug!("Creating snapshot for changes stream: {}", dataset_name);
+
+                        if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+                            tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+                            return;
+                        }
+
+                        if let Err(e) = snapshot_manager.create_snapshot(&federated_schema).await {
+                            let dataset_label = dataset_name.to_string();
+                            snapshot_metrics::record_snapshot_failure(&dataset_label);
+                            tracing::warn!(
+                                "Failed to create snapshot for changes stream {}: {}",
+                                dataset_name,
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                "Successfully created snapshot for changes stream: {}",
+                                dataset_name
+                            );
+                        }
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            })
+                as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
+
+            Some(callback)
         }
-        Some(batches) => {
-            match (checkpointer, snapshot_manager) {
-                (Some(checkpointer), Some(snapshot_manager)) => {
-                    let snapshot_manager = Arc::new(snapshot_manager);
-                    let dataset_name = dataset_name.clone();
-
-                    // Track number of processed batches since last snapshot
-                    let batches_processed = Arc::new(RwLock::new(0u8));
-
-                    let callback = Arc::new(Mutex::new(Box::new(move || {
-                        let checkpointer = Arc::clone(&checkpointer);
-                        let snapshot_manager = Arc::clone(&snapshot_manager);
-                        let batches_processed = Arc::clone(&batches_processed);
-                        let federated_schema = Arc::<Schema>::clone(&federated_schema);
-                        let dataset_name = dataset_name.clone();
-
-                        Box::pin(async move {
-                            let mut batches_processed_value = batches_processed.write().await;
-
-                            *batches_processed_value += 1;
-                            if *batches_processed_value >= batches {
-                                *batches_processed_value = 0;
-
-                                tracing::debug!(
-                                    "Creating snapshot for changes stream: {}",
-                                    dataset_name
-                                );
-
-                                if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
-                                    tracing::warn!(
-                                        "Failed to checkpoint dataset {dataset_name}: {e}"
-                                    );
-                                    return;
-                                }
-
-                                if let Err(e) =
-                                    snapshot_manager.create_snapshot(&federated_schema).await
-                                {
-                                    let dataset_label = dataset_name.to_string();
-                                    snapshot_metrics::record_snapshot_failure(&dataset_label);
-                                    tracing::warn!(
-                                        "Failed to create snapshot for changes stream {}: {}",
-                                        dataset_name,
-                                        e
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "Successfully created snapshot for changes stream: {}",
-                                        dataset_name
-                                    );
-                                }
-                            }
-                        }) as Pin<Box<dyn Future<Output = ()> + Send>>
-                    })
-                        as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
-
-                    Some(callback)
-                }
-                _ => None,
-            }
-        }
+        _ => None,
     }
 }
 

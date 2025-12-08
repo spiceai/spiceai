@@ -479,7 +479,7 @@ pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_dynamodbstreams::types::{Shard, StreamRecord};
+    use aws_sdk_dynamodbstreams::types::{StreamRecord};
 
     impl StreamState {
         #[must_use]
