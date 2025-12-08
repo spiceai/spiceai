@@ -55,7 +55,7 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use dynamodb_streams::{Checkpoint, Client as StreamsClient};
+use dynamodb_streams::{Checkpoint, Client as StreamsClient, Metrics, MetricsCollector};
 use futures::Stream;
 use futures::pin_mut;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -100,6 +100,7 @@ impl DynamoDBTableProvider {
         scan_interval: Duration,
         time_format: String,
         ready_lag: Duration,
+        metrics_collector: Arc<MetricsCollector>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
@@ -107,6 +108,7 @@ impl DynamoDBTableProvider {
             StreamsClient::builder(sdk_config, table_name.to_string())
                 .interval(Some(scan_interval))
                 .buffer(buffer_size)
+                .metrics_collector(metrics_collector)
                 .build(),
         );
 
@@ -358,6 +360,11 @@ impl DynamoDBTableProvider {
             });
 
         Ok(stream.boxed())
+    }
+
+    #[must_use]
+    pub fn stream_metrics(&self) -> Metrics {
+        self.streams_client.metrics()
     }
 }
 

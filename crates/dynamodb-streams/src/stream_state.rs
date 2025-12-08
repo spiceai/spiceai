@@ -19,7 +19,7 @@ use crate::{Error, MissingStaringSequenceNumberSnafu, Result};
 use aws_sdk_dynamodbstreams::primitives::DateTime;
 use aws_sdk_dynamodbstreams::types::{Record, ShardIteratorType};
 use snafu::OptionExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -479,7 +479,7 @@ pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_dynamodbstreams::types::StreamRecord;
+    use aws_sdk_dynamodbstreams::types::{Shard, StreamRecord};
 
     impl StreamState {
         #[must_use]
