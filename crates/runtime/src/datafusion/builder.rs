@@ -294,11 +294,6 @@ impl DataFusionBuilder {
                 Arc::new(Box::new(track_bytes_processed)),
             )));
 
-        #[cfg(not(windows))]
-        {
-            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
-        }
-
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
