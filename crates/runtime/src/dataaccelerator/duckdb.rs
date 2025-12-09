@@ -554,7 +554,7 @@ pub(crate) async fn create_table_provider(
 
     let agg_pushdown_optimization = cmd
         .options
-        .get("optimizer_duckdb_aggregrate_pushdown")
+        .get("optimizer_duckdb_aggregate_pushdown")
         .map_or("disabled", |v| v.as_str())
         .to_lowercase();
 
