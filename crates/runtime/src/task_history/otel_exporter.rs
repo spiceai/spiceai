@@ -34,7 +34,7 @@ use crate::datafusion::DataFusion;
 use super::TaskSpan;
 
 /// Label key used to identify plan capture spans in OpenTelemetry traces.
-/// This is used to override the default behavior of captured_output processing to ensure that
+/// This is used to override the default behavior of `captured_output` processing to ensure that
 /// plan capture spans always retain their output.
 const PLAN_CAPTURE_LABEL: &str = "plan_capture";
 
