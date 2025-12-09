@@ -555,12 +555,11 @@ pub(crate) async fn create_table_provider(
     let agg_pushdown_optimization = cmd
         .options
         .get("aggregate_pushdown_optimization")
-        .map(|v| v.to_lowercase())
-        .unwrap_or("disabled".to_string());
+        .map_or("disabled".to_string(), |v| v.to_lowercase());
 
     schema_metadata.insert(
         SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
-        agg_pushdown_optimization.to_string(),
+        agg_pushdown_optimization,
     );
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
