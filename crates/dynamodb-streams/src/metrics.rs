@@ -226,16 +226,16 @@ mod tests {
     }
 }
 
-/// Tests that verify the correct handling of poisoned RwLocks.
+/// Tests that verify the correct handling of poisoned `RwLock`s.
 /// The implementation recovers from poisoned locks by using `into_inner()`.
 #[cfg(test)]
 mod poisoned_lock_tests {
     use super::*;
     use std::time::Duration;
 
-    /// Verifies that `active_shards_number()` recovers data from a poisoned RwLock.
+    /// Verifies that `active_shards_number()` recovers data from a poisoned `RwLock`.
     ///
-    /// When the RwLock is poisoned (which can happen if a thread panics while holding it),
+    /// When the `RwLock` is poisoned (which can happen if a thread panics while holding it),
     /// `active_shards_number()` should still return the correct value by recovering
     /// the data using `into_inner()`.
     #[test]
@@ -270,9 +270,9 @@ mod poisoned_lock_tests {
         );
     }
 
-    /// Verifies that `total_lag_ms()` recovers data from a poisoned RwLock.
+    /// Verifies that `total_lag_ms()` recovers data from a poisoned `RwLock`.
     ///
-    /// When the RwLock is poisoned, `total_lag_ms()` should still return the
+    /// When the `RwLock` is poisoned, `total_lag_ms()` should still return the
     /// correct lag value by recovering the watermark using `into_inner()`.
     #[test]
     fn test_total_lag_recovers_from_poisoned_lock() {

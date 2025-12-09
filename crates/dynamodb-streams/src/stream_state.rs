@@ -470,7 +470,7 @@ fn add_all_descendants_to_blocked(
     Ok(())
 }
 
-#[allow(clippy::cast_sign_loss)] // Negative case handled above
+#[expect(clippy::cast_sign_loss, reason = "Negative case handled above")]
 pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
     let secs = dt.secs();
     let subsec_nanos = dt.subsec_nanos();
@@ -1219,7 +1219,7 @@ mod tests {
 
             let result = state.handle_poll_error("shard-1", Error::ConnectionFailure);
 
-            assert!(result.is_ok());
+            result.expect("should be ok");
             assert!(state.active.contains_key("shard-1"));
         }
 
@@ -1244,7 +1244,7 @@ mod tests {
 
             let result = state.handle_poll_error("shard-1", Error::Throttled);
 
-            assert!(result.is_ok());
+            result.expect("should be ok");
             assert!(state.active.contains_key("shard-1"));
         }
 
@@ -3007,7 +3007,7 @@ mod tests {
         }
 
         /// Verifies that negative timestamps (pre-1970) are correctly handled.
-        /// The implementation subtracts from UNIX_EPOCH to get the correct time.
+        /// The implementation subtracts from `UNIX_EPOCH` to get the correct time.
         #[test]
         fn test_datetime_negative_seconds_handled_correctly() {
             // -315_619_200 seconds = approximately 1960-01-01

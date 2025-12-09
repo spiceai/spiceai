@@ -1342,11 +1342,9 @@ mod tests {
     /// Tests that demonstrate bugs in the stream conversion module.
     /// These tests document incorrect behavior and will FAIL when the bugs are fixed.
     mod bug_tests {
-        use super::*;
-
-        /// BUG: `streams_to_dynamodb_attribute` silently converts unknown variants to Null(true).
+        /// BUG: `streams_to_dynamodb_attribute` silently converts unknown variants to `Null(true)`.
         ///
-        /// When AWS adds a new AttributeValue variant (which has happened in the past,
+        /// When AWS adds a new `AttributeValue` variant (which has happened in the past,
         /// e.g., when they added Document types), this function will silently convert
         /// it to Null, causing DATA LOSS.
         ///
@@ -1385,10 +1383,6 @@ mod tests {
             //
             // This test passes to document the finding - the actual fix requires
             // a code change to the function signature.
-            assert!(
-                true,
-                "This test documents the unknown variant bug - see code comments"
-            );
         }
     }
 }

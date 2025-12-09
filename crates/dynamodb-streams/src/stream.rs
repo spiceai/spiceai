@@ -538,7 +538,7 @@ mod tests {
             assert_eq!(shard2_checkpoint.parent_id, Some("shard-1".to_string()));
         }
 
-        /// Verifies that duplicate shard_ids are handled consistently.
+        /// Verifies that duplicate `shard_id`s are handled consistently.
         /// The implementation skips duplicates to ensure consistency between
         /// records and checkpoints.
         #[test]

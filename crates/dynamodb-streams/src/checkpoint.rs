@@ -259,15 +259,15 @@ mod tests {
             assert!(deserialized.shards.contains_key("shard-1"));
             assert!(deserialized.shards.contains_key("shard-2"));
 
-            let shard1 = deserialized.shards.get("shard-1").expect("shard-1 exists");
-            assert_eq!(shard1.sequence_number, "100");
-            assert_eq!(shard1.parent_id, None);
-            assert_eq!(shard1.position, CheckpointPosition::After);
+            let first_shard = deserialized.shards.get("shard-1").expect("shard-1 exists");
+            assert_eq!(first_shard.sequence_number, "100");
+            assert_eq!(first_shard.parent_id, None);
+            assert_eq!(first_shard.position, CheckpointPosition::After);
 
-            let shard2 = deserialized.shards.get("shard-2").expect("shard-2 exists");
-            assert_eq!(shard2.sequence_number, "200");
-            assert_eq!(shard2.parent_id, Some("shard-1".to_string()));
-            assert_eq!(shard2.position, CheckpointPosition::At);
+            let second_shard = deserialized.shards.get("shard-2").expect("shard-2 exists");
+            assert_eq!(second_shard.sequence_number, "200");
+            assert_eq!(second_shard.parent_id, Some("shard-1".to_string()));
+            assert_eq!(second_shard.position, CheckpointPosition::At);
         }
 
         #[test]
