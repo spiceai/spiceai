@@ -115,7 +115,7 @@ impl VectorSearchTableFuncArgs {
             .cloned();
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => Err(DataFusionError::Internal(format!(
+            (Some(col), None) => Err(DataFusionError::Plan(format!(
                 "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}",
                 self.tbl,
                 embedded_columns
@@ -359,7 +359,7 @@ impl VectorSearchTableFunc {
                 .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`",
                     args.tbl,
                     vector_indexes.len()
