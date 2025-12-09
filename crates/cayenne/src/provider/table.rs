@@ -48,7 +48,9 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use tokio::task;
+use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
+use vortex_session::VortexSession;
 
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
@@ -132,58 +134,6 @@ impl CayenneTableProvider {
         url_str
     }
 
-    /// Create a configured `VortexSession` with selected encodings for hardware acceleration.
-    ///
-    /// This method registers only the encodings that are enabled in the configuration,
-    /// allowing fine-grained control over compression vs performance tradeoffs.
-    fn create_vortex_session(
-        config: &crate::metadata::VortexConfig,
-    ) -> vortex_session::VortexSession {
-        use vortex::VortexSessionDefault;
-        use vortex_session::VortexSession;
-
-        // Use default session which registers all encodings
-        // Note: If all encodings are enabled, this is optimal. Otherwise, the overhead
-        // of unused encodings is minimal compared to the complexity of custom registration.
-        // Future enhancement: Vortex may provide API for selective encoding registration.
-        let session = VortexSession::default();
-
-        // Log which encodings are configured to be used
-        let mut enabled = Vec::new();
-        if config.enable_alp {
-            enabled.push("ALP (SIMD numeric compression)");
-        }
-        if config.enable_fsst {
-            enabled.push("FSST (SIMD string compression)");
-        }
-        if config.enable_bitpacking {
-            enabled.push("BitPacking (SIMD integer compression)");
-        }
-        if config.enable_delta {
-            enabled.push("Delta");
-        }
-        if config.enable_rle {
-            enabled.push("RLE");
-        }
-        if config.enable_dict {
-            enabled.push("Dictionary");
-        }
-        if config.enable_for {
-            enabled.push("FOR");
-        }
-        if config.enable_zigzag {
-            enabled.push("ZigZag");
-        }
-
-        if enabled.is_empty() {
-            tracing::warn!("All Cayenne Vortex encodings disabled - using canonical encoding only");
-        } else {
-            tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
-        }
-
-        session
-    }
-
     /// Create a new `ListingTable` for a snapshot directory.
     ///
     /// # Arguments
@@ -208,7 +158,7 @@ impl CayenneTableProvider {
             })?;
 
         // Create a configured Vortex session with selected encodings
-        let vortex_session = Self::create_vortex_session(vortex_config);
+        let vortex_session = VortexSession::default();
 
         // Configure VortexFormat with hardware-optimized settings
         let vortex_opts = vortex_datafusion::VortexOptions {
