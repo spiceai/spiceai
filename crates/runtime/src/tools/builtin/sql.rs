@@ -18,11 +18,11 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    allowlist::ResolvedTableAwareAllowlist,
     datafusion::DataFusion,
     tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
@@ -24,7 +24,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     Runtime,
-    allowlist::ResolvedTableAwareAllowlist,
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     tools::{
         catalog::SpiceToolCatalog, factory::IndividualToolFactory, options::SpiceToolsOptions,
@@ -97,7 +96,11 @@ impl BuiltinToolCatalog {
         let table_allowlist: Option<ResolvedTableAwareAllowlist> = params
             .get("table_allowlist")
             .map(|t| {
-                let tables = t.expose_secret().split(',').collect::<Vec<String>>();
+                let tables = t
+                    .expose_secret()
+                    .split(',')
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>();
                 ResolvedTableAwareAllowlist::with_defaults(
                     SPICE_DEFAULT_CATALOG,
                     SPICE_DEFAULT_SCHEMA,

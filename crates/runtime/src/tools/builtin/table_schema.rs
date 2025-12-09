@@ -15,7 +15,6 @@ limitations under the License.
 */
 use crate::{
     Runtime,
-    allowlist::ResolvedTableAwareAllowlist,
     tools::{SpiceModelTool, utils::parameters},
 };
 use app::App;
@@ -33,6 +32,7 @@ use async_openai::{
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, sql::TableReference};
 use itertools::Itertools;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -94,6 +94,7 @@ impl TableSchemaTool {
         }
     }
 
+    #[must_use] 
     pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
         self.table_allowlist = allowlist;
         self
@@ -128,7 +129,7 @@ impl TableSchemaTool {
                         !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
                     }) {
                         return Err(crate::datafusion::Error::UnableToGetTable {
-                            source: DataFusionError::Plan(format!("Table '{t}' is not accessible")),
+                            source: DataFusionError::Plan(format!(": No table named {t}")),
                         })
                         .boxed();
                     }

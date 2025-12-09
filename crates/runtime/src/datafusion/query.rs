@@ -33,7 +33,6 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::LogicalPlan,
     physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
-    sql::TableReference,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -71,14 +70,13 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 use super::managed_runtime;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::{
-    allowlist::ResolvedTableAwareAllowlist,
-    datafusion::{
-        DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
-    },
+
+use crate::datafusion::{
+    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 #[cfg(feature = "cluster")]
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -112,8 +110,9 @@ pub enum Error {
     #[snafu(display("Failed to set parameters in logical plan: {source}"))]
     BindingParameters { source: DataFusionError },
 
-    #[snafu(display("Forbidden to access tables {tables:?}"))]
-    TableAccessDisallowed { tables: Vec<TableReference> },
+    // Error message matches DataFusion's own error for table not found (not exposing existance of un-authorized table to unauthorized user).
+    #[snafu(display("Failed to execute query: Error during planning: table {table} not found"))]
+    TableAccessDisallowed { table: String },
 
     #[snafu(display(
         "Cache-Control header specifies 'stale-while-revalidate' which is only supported with cache_key_type: sql (raw). \
@@ -334,14 +333,12 @@ impl Query {
                         },
                     };
                     let tables_referenced = plan.as_table_refs();
-                    let disallowed_tables = tables_referenced
+                    if let Some(disallowed_table) = tables_referenced
                         .iter()
-                        .filter(|&t| !allowlist.table_is_allowed(t))
-                        .collect::<Vec<_>>();
-
-                    if !disallowed_tables.is_empty() {
+                        .find(|&t| !allowlist.table_is_allowed(t))
+                    {
                         return Err(Error::TableAccessDisallowed {
-                            tables: disallowed_tables.into_iter().cloned().collect(),
+                            table: disallowed_table.to_string(),
                         });
                     }
 

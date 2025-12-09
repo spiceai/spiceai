@@ -140,9 +140,8 @@ impl Query {
                         t.finish_with_error(&request_context, source.to_string(), code);
                     }
                     return Err(super::Error::UnableToExecuteQuery { source });
-                } else {
-                    return Err(e);
                 }
+                return Err(e);
             }
         };
 

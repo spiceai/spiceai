@@ -53,7 +53,7 @@ impl ResolvedTableAwareAllowlist {
 
             bldr.add(Glob::new(
                 format!(
-                    r#"{}.{}.{}"#,
+                    r"{}.{}.{}",
                     resolved.catalog, resolved.schema, resolved.table
                 )
                 .as_str(),
@@ -67,6 +67,7 @@ impl ResolvedTableAwareAllowlist {
     }
 
     /// Check if the provided [`TableReference`] is allowed by the allowlist.
+    #[must_use] 
     pub fn table_is_allowed(&self, table: &TableReference) -> bool {
         let resolved = table
             .clone()
@@ -74,7 +75,7 @@ impl ResolvedTableAwareAllowlist {
 
         self.allowed.is_match(
             format!(
-                r#"{}.{}.{}"#,
+                r"{}.{}.{}",
                 resolved.catalog, resolved.schema, resolved.table
             )
             .as_str(),
@@ -129,7 +130,7 @@ impl ResolvedTableAwareAllowlist {
                     "Unexpected token in identifier: {token}"
                 )))?;
             }
-        };
+        }
 
         loop {
             match parser.next_token().token {

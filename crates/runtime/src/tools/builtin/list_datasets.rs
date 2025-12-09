@@ -13,21 +13,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::{
+    Runtime,
+    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
+    tools::SpiceModelTool,
+};
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use itertools::Itertools;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use tracing_futures::Instrument;
-
-use crate::{
-    Runtime,
-    allowlist::ResolvedTableAwareAllowlist,
-    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
-    tools::SpiceModelTool,
-};
 
 pub struct ListDatasetsTool {
     name: String,
@@ -171,7 +170,7 @@ pub async fn get_catalog_elements(
                             schema: s.as_str().into(),
                             catalog: c.name.as_str().into(),
                         })
-                        .filter(|d| opt_include.is_none_or(|ts| ts.table_is_allowed(&d)))
+                        .filter(|d| opt_include.is_none_or(|ts| ts.table_is_allowed(d)))
                         .map(|table| ListDatasetElement {
                             table: table.to_string(),
                             can_search_documents: false,

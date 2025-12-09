@@ -20,7 +20,8 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
-use crate::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+
 use crate::search::search_engine::SearchEngine;
 use crate::tools::builtin::list_datasets::get_dataset_elements;
 use crate::{
@@ -52,6 +53,7 @@ impl SearchTool {
             table_allowlist: None,
         }
     }
+    #[must_use] 
     pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
         self.table_allowlist = allowlist;
         self

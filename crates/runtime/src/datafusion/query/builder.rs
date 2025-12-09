@@ -17,13 +17,11 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::common::ParamValues;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::{
-    allowlist::ResolvedTableAwareAllowlist,
-    datafusion::{DataFusion, query::QueryMethod},
-};
+use crate::datafusion::{DataFusion, query::QueryMethod};
 
 use super::{Query, tracker::QueryTracker};
 
@@ -46,6 +44,7 @@ impl<'a> QueryBuilder<'a> {
         }
     }
 
+    #[must_use] 
     pub fn allow_tables(mut self, allowed_tables: ResolvedTableAwareAllowlist) -> Self {
         self.table_allowlist = Some(allowed_tables);
         self
