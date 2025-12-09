@@ -31,3 +31,4 @@ version,qa_start_time,qa_end_time,human_count,human_hours,recipes_total,recipes_
 1.9.0-rc.2,2025-11-10T19:00:00Z,2025-11-11T23:00:00Z,6,14,81,81,0,AI QA engineer testing skipped.
 1.9.1,2025-11-24T19:00:00Z,2025-11-25T02:00:00Z,6,14,82,82,0,AI QA engineer testing skipped.
 1.10.0-rc.1,2025-12-02T19:00:00Z,2025-12-03T02:00:00Z,6,14,82,82,0,AI QA engineer testing skipped.
+1.10.0,2025-12-08T19:00:00Z,2025-12-09T02:00:00Z,6,14,82,82,0,AI QA engineer testing skipped.
