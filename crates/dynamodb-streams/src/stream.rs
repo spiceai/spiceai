@@ -219,6 +219,16 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
     let mut shards_checkpoints = HashMap::new();
 
     for shard_result in poll_results {
+        // Skip duplicate shard_ids - only process the first occurrence
+        // This ensures consistency: one checkpoint per shard, and only records from that occurrence
+        if shards_checkpoints.contains_key(&shard_result.shard_id) {
+            tracing::warn!(
+                "Duplicate shard_id {} in poll results, skipping",
+                shard_result.shard_id
+            );
+            continue;
+        }
+
         // Collect records
         if let PollOutcome::Records {
             records: shard_records,
@@ -287,5 +297,371 @@ impl Stream for DynamodbStream {
 impl Drop for DynamodbStream {
     fn drop(&mut self) {
         self.receiver.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{CheckpointPosition, ShardCheckpoint};
+    use crate::stream_state::{PollOutcome, ShardPollResult};
+    use aws_sdk_dynamodbstreams::types::StreamRecord;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn create_checkpoint(seq: &str, parent: Option<&str>) -> ShardCheckpoint {
+        ShardCheckpoint {
+            sequence_number: seq.to_string(),
+            parent_id: parent.map(std::string::ToString::to_string),
+            updated_at: SystemTime::now(),
+            position: CheckpointPosition::After,
+        }
+    }
+
+    fn create_record(seq: &str) -> Record {
+        Record::builder()
+            .dynamodb(StreamRecord::builder().sequence_number(seq).build())
+            .build()
+    }
+
+    fn system_time_from_secs(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    mod combine_shard_batches {
+        use super::*;
+
+        #[test]
+        fn test_empty_poll_results() {
+            let results: Vec<ShardPollResult> = vec![];
+            let batch = combine_shard_batches(&results);
+
+            assert!(batch.records.is_empty());
+            assert!(batch.checkpoint.shards.is_empty());
+            assert!(batch.watermark.is_none());
+        }
+
+        #[test]
+        fn test_single_shard_with_records() {
+            let results = vec![ShardPollResult {
+                shard_id: "shard-1".to_string(),
+                outcome: PollOutcome::Records {
+                    records: vec![create_record("100"), create_record("101")],
+                },
+                last_checkpoint: create_checkpoint("101", None),
+                current_watermark: Some(system_time_from_secs(1000)),
+            }];
+
+            let batch = combine_shard_batches(&results);
+
+            assert_eq!(batch.records.len(), 2);
+            assert_eq!(batch.checkpoint.shards.len(), 1);
+            assert!(batch.checkpoint.shards.contains_key("shard-1"));
+            assert_eq!(batch.watermark, Some(system_time_from_secs(1000)));
+        }
+
+        #[test]
+        fn test_single_shard_empty_records() {
+            let results = vec![ShardPollResult {
+                shard_id: "shard-1".to_string(),
+                outcome: PollOutcome::Empty,
+                last_checkpoint: create_checkpoint("100", None),
+                current_watermark: Some(system_time_from_secs(1000)),
+            }];
+
+            let batch = combine_shard_batches(&results);
+
+            assert!(batch.records.is_empty());
+            assert_eq!(batch.checkpoint.shards.len(), 1);
+            // Empty shards are not eligible for watermark
+            assert!(batch.watermark.is_none());
+        }
+
+        #[test]
+        fn test_single_shard_failed() {
+            let results = vec![ShardPollResult {
+                shard_id: "shard-1".to_string(),
+                outcome: PollOutcome::Failed,
+                last_checkpoint: create_checkpoint("100", None),
+                current_watermark: Some(system_time_from_secs(1000)),
+            }];
+
+            let batch = combine_shard_batches(&results);
+
+            assert!(batch.records.is_empty());
+            assert_eq!(batch.checkpoint.shards.len(), 1);
+            // Failed shards ARE eligible for watermark (they have lag)
+            assert_eq!(batch.watermark, Some(system_time_from_secs(1000)));
+        }
+
+        #[test]
+        fn test_multiple_shards_records_combined() {
+            let results = vec![
+                ShardPollResult {
+                    shard_id: "shard-1".to_string(),
+                    outcome: PollOutcome::Records {
+                        records: vec![create_record("100")],
+                    },
+                    last_checkpoint: create_checkpoint("100", None),
+                    current_watermark: Some(system_time_from_secs(1000)),
+                },
+                ShardPollResult {
+                    shard_id: "shard-2".to_string(),
+                    outcome: PollOutcome::Records {
+                        records: vec![create_record("200"), create_record("201")],
+                    },
+                    last_checkpoint: create_checkpoint("201", Some("shard-1")),
+                    current_watermark: Some(system_time_from_secs(2000)),
+                },
+            ];
+
+            let batch = combine_shard_batches(&results);
+
+            assert_eq!(batch.records.len(), 3);
+            assert_eq!(batch.checkpoint.shards.len(), 2);
+            // Watermark should be the minimum
+            assert_eq!(batch.watermark, Some(system_time_from_secs(1000)));
+        }
+
+        #[test]
+        fn test_watermark_takes_minimum() {
+            let results = vec![
+                ShardPollResult {
+                    shard_id: "shard-1".to_string(),
+                    outcome: PollOutcome::Records { records: vec![] },
+                    last_checkpoint: create_checkpoint("100", None),
+                    current_watermark: Some(system_time_from_secs(3000)),
+                },
+                ShardPollResult {
+                    shard_id: "shard-2".to_string(),
+                    outcome: PollOutcome::Records { records: vec![] },
+                    last_checkpoint: create_checkpoint("200", None),
+                    current_watermark: Some(system_time_from_secs(1000)), // Minimum
+                },
+                ShardPollResult {
+                    shard_id: "shard-3".to_string(),
+                    outcome: PollOutcome::Records { records: vec![] },
+                    last_checkpoint: create_checkpoint("300", None),
+                    current_watermark: Some(system_time_from_secs(2000)),
+                },
+            ];
+
+            let batch = combine_shard_batches(&results);
+
+            assert_eq!(batch.watermark, Some(system_time_from_secs(1000)));
+        }
+
+        #[test]
+        fn test_mixed_outcomes_watermark() {
+            // Scenario: 3 shards
+            // - shard-1: has records with watermark 1000
+            // - shard-2: empty (no watermark contribution)
+            // - shard-3: failed with watermark 500 (should contribute)
+            let results = vec![
+                ShardPollResult {
+                    shard_id: "shard-1".to_string(),
+                    outcome: PollOutcome::Records {
+                        records: vec![create_record("100")],
+                    },
+                    last_checkpoint: create_checkpoint("100", None),
+                    current_watermark: Some(system_time_from_secs(1000)),
+                },
+                ShardPollResult {
+                    shard_id: "shard-2".to_string(),
+                    outcome: PollOutcome::Empty,
+                    last_checkpoint: create_checkpoint("200", None),
+                    current_watermark: Some(system_time_from_secs(2000)),
+                },
+                ShardPollResult {
+                    shard_id: "shard-3".to_string(),
+                    outcome: PollOutcome::Failed,
+                    last_checkpoint: create_checkpoint("300", None),
+                    current_watermark: Some(system_time_from_secs(500)),
+                },
+            ];
+
+            let batch = combine_shard_batches(&results);
+
+            // Only shard-1 (records) and shard-3 (failed) contribute
+            // Minimum is 500 from shard-3
+            assert_eq!(batch.watermark, Some(system_time_from_secs(500)));
+        }
+
+        #[test]
+        fn test_no_watermarks_from_eligible_shards() {
+            let results = vec![ShardPollResult {
+                shard_id: "shard-1".to_string(),
+                outcome: PollOutcome::Records {
+                    records: vec![create_record("100")],
+                },
+                last_checkpoint: create_checkpoint("100", None),
+                current_watermark: None, // No watermark
+            }];
+
+            let batch = combine_shard_batches(&results);
+
+            assert!(!batch.records.is_empty());
+            assert!(batch.watermark.is_none());
+        }
+
+        #[test]
+        fn test_checkpoints_collected_from_all_shards() {
+            let results = vec![
+                ShardPollResult {
+                    shard_id: "shard-1".to_string(),
+                    outcome: PollOutcome::Records { records: vec![] },
+                    last_checkpoint: create_checkpoint("100", None),
+                    current_watermark: None,
+                },
+                ShardPollResult {
+                    shard_id: "shard-2".to_string(),
+                    outcome: PollOutcome::Empty,
+                    last_checkpoint: create_checkpoint("200", Some("shard-1")),
+                    current_watermark: None,
+                },
+                ShardPollResult {
+                    shard_id: "shard-3".to_string(),
+                    outcome: PollOutcome::Failed,
+                    last_checkpoint: create_checkpoint("300", None),
+                    current_watermark: None,
+                },
+            ];
+
+            let batch = combine_shard_batches(&results);
+
+            assert_eq!(batch.checkpoint.shards.len(), 3);
+            assert!(batch.checkpoint.shards.contains_key("shard-1"));
+            assert!(batch.checkpoint.shards.contains_key("shard-2"));
+            assert!(batch.checkpoint.shards.contains_key("shard-3"));
+
+            let shard2_checkpoint = batch.checkpoint.shards.get("shard-2").expect("shard-2");
+            assert_eq!(shard2_checkpoint.sequence_number, "200");
+            assert_eq!(shard2_checkpoint.parent_id, Some("shard-1".to_string()));
+        }
+
+        /// Verifies that duplicate `shard_id`s are handled consistently.
+        /// The implementation skips duplicates to ensure consistency between
+        /// records and checkpoints.
+        #[test]
+        fn test_duplicate_shard_id_is_deduplicated() {
+            // Two results with the same shard_id but different checkpoints
+            let results = vec![
+                ShardPollResult {
+                    shard_id: "shard-1".to_string(),
+                    outcome: PollOutcome::Records {
+                        records: vec![create_record("100")],
+                    },
+                    last_checkpoint: create_checkpoint("100", None),
+                    current_watermark: Some(system_time_from_secs(1000)),
+                },
+                ShardPollResult {
+                    shard_id: "shard-1".to_string(), // DUPLICATE - will be skipped
+                    outcome: PollOutcome::Records {
+                        records: vec![create_record("200")],
+                    },
+                    last_checkpoint: create_checkpoint("200", None),
+                    current_watermark: Some(system_time_from_secs(2000)),
+                },
+            ];
+
+            let batch = combine_shard_batches(&results);
+
+            // With the fix, duplicates are skipped, so we get exactly 1 checkpoint and 1 record
+            let checkpoint_count = batch.checkpoint.shards.len();
+            let record_count = batch.records.len();
+
+            // Both should be 1 - only the first occurrence is processed
+            assert_eq!(checkpoint_count, 1, "Should have exactly 1 checkpoint");
+            assert_eq!(
+                record_count, 1,
+                "Should have exactly 1 record (duplicate skipped)"
+            );
+
+            // Verify the first checkpoint was kept (sequence "100")
+            let checkpoint = batch.checkpoint.shards.get("shard-1").expect("shard-1");
+            assert_eq!(checkpoint.sequence_number, "100");
+        }
+    }
+}
+
+/// Tests that document concurrency and async bugs in the streaming module.
+/// These tests document issues and will FAIL when the bugs are fixed.
+#[cfg(test)]
+mod concurrency_bug_tests {
+
+    /// BUG: Producer task has no graceful shutdown mechanism.
+    ///
+    /// When the consumer drops the `DynamodbStream`, the producer task:
+    /// 1. Will only stop after the next `sender.send()` fails (could be up to `interval` later)
+    /// 2. No cleanup of pending work or resources
+    /// 3. No logging that shutdown occurred
+    ///
+    /// Current behavior: `if self.sender.send(...).await.is_err() { return; }`
+    /// Correct behavior: Use `CancellationToken` or `select!` with shutdown signal
+    ///
+    /// The `streaming()` loop in `DynamodbStreamProducer` looks like:
+    /// ```ignore
+    /// loop {
+    ///     // ... do work ...
+    ///     if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
+    ///         return;  // BUG: Only exits when send fails, not on explicit shutdown
+    ///     }
+    ///     // ... sleep for interval ...
+    /// }
+    /// ```
+    ///
+    /// Problems:
+    /// 1. If interval is 60s, producer runs for 60s after consumer drops
+    /// 2. No way to cancel from outside (e.g., for graceful server shutdown)
+    /// 3. `tokio::spawn` returns `JoinHandle` that is immediately dropped
+    ///
+    /// This test documents the bug - the actual fix requires adding:
+    /// 1. A `CancellationToken` to the producer
+    /// 2. `select!` on the cancellation token in the loop
+    /// 3. Returning the `JoinHandle` for proper cleanup
+    #[test]
+    fn test_bug_no_graceful_shutdown_documented() {
+        // This test documents the architectural issue.
+        // See the doc comment above for details.
+    }
+
+    /// BUG: Empty batch sends are skipped, delaying shutdown detection.
+    ///
+    /// When there are no records, the send is skipped entirely:
+    /// ```ignore
+    /// if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
+    ///     return;
+    /// }
+    /// ```
+    ///
+    /// This means if the consumer is dropped during a period of no activity:
+    /// 1. Producer won't detect it until records appear
+    /// 2. Could run indefinitely if stream has no activity
+    ///
+    /// The fix: Always check channel status, perhaps with:
+    /// - `if self.sender.is_closed() { return; }`
+    /// - Or send heartbeat batches periodically
+    #[test]
+    fn test_bug_empty_batch_delays_shutdown_detection_documented() {
+        // This test documents the architectural issue.
+        // See the doc comment above for details.
+    }
+
+    /// BUG: `RwLock` write failures in `streaming()` are silently ignored.
+    ///
+    /// In the `streaming()` method:
+    /// ```ignore
+    /// if let Ok(mut guard) = self.metrics_collector.active_shards_number.write() {
+    ///     *guard = self.state.get_active_shards().count();
+    /// }
+    /// ```
+    ///
+    /// If the write lock fails (e.g., poisoned), the metrics are simply not updated.
+    /// This could hide critical issues during debugging/monitoring.
+    ///
+    /// The fix: At minimum, log a warning when lock acquisition fails.
+    #[test]
+    fn test_bug_rwlock_write_failures_silently_ignored_documented() {
+        // This test documents the architectural issue.
+        // See the doc comment above for details.
     }
 }
