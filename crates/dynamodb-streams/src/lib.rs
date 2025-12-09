@@ -196,3 +196,183 @@ impl Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod error_is_retriable {
+        use super::*;
+
+        #[test]
+        fn test_timeout_is_retriable() {
+            let err = Error::Timeout;
+            assert!(err.is_retriable());
+        }
+
+        #[test]
+        fn test_connection_failure_is_retriable() {
+            let err = Error::ConnectionFailure;
+            assert!(err.is_retriable());
+        }
+
+        #[test]
+        fn test_throttled_is_retriable() {
+            let err = Error::Throttled;
+            assert!(err.is_retriable());
+        }
+
+        #[test]
+        fn test_table_not_found_is_not_retriable() {
+            let err = Error::TableNotFound;
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_stream_not_found_is_not_retriable() {
+            let err = Error::StreamNotFound;
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_stream_description_not_found_is_not_retriable() {
+            let err = Error::StreamDescriptionNotFound {
+                stream_arn: "arn:aws:dynamodb:region:account:table/name/stream/time".to_string(),
+            };
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_shard_iterator_not_found_is_not_retriable() {
+            let err = Error::ShardIteratorNotFound {
+                shard_id: "shard-123".to_string(),
+            };
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_failed_to_initialize_checkpoint_is_not_retriable() {
+            let err = Error::FailedToInitializeCheckpoint;
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_stream_beyond_retention_is_not_retriable() {
+            let err = Error::StreamBeyondRetention;
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_shard_not_found_is_not_retriable() {
+            let err = Error::ShardNotFound;
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_missing_starting_sequence_number_is_not_retriable() {
+            let err = Error::MissingStaringSequenceNumber;
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_unexpected_shard_id_is_not_retriable() {
+            let err = Error::UnexpectedShardId {
+                shard_id: "shard-xyz".to_string(),
+            };
+            assert!(!err.is_retriable());
+        }
+
+        #[test]
+        fn test_iterator_expired_is_not_retriable() {
+            // Iterator expired is handled specially (reinitialization)
+            // but should NOT be in the retriable category
+            let err = Error::IteratorExpired;
+            assert!(!err.is_retriable());
+        }
+    }
+
+    mod error_display {
+        use super::*;
+
+        #[test]
+        fn test_table_not_found_display() {
+            let err = Error::TableNotFound;
+            assert_eq!(format!("{err}"), "Table not found");
+        }
+
+        #[test]
+        fn test_stream_not_found_display() {
+            let err = Error::StreamNotFound;
+            assert_eq!(format!("{err}"), "Stream not found");
+        }
+
+        #[test]
+        fn test_stream_description_not_found_display() {
+            let err = Error::StreamDescriptionNotFound {
+                stream_arn: "arn:aws:dynamodb:us-east-1:123456789:table/test/stream/2024"
+                    .to_string(),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("Stream description not found"));
+            assert!(msg.contains("arn:aws:dynamodb:us-east-1:123456789:table/test/stream/2024"));
+        }
+
+        #[test]
+        fn test_shard_iterator_not_found_display() {
+            let err = Error::ShardIteratorNotFound {
+                shard_id: "shardId-000000000001".to_string(),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("Shard iterator not found"));
+            assert!(msg.contains("shardId-000000000001"));
+        }
+
+        #[test]
+        fn test_unexpected_shard_id_display() {
+            let err = Error::UnexpectedShardId {
+                shard_id: "unknown-shard".to_string(),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("Inconsistent shard id"));
+            assert!(msg.contains("unknown-shard"));
+        }
+
+        #[test]
+        fn test_timeout_display() {
+            let err = Error::Timeout;
+            assert_eq!(format!("{err}"), "Network timeout. Try again later");
+        }
+
+        #[test]
+        fn test_connection_failure_display() {
+            let err = Error::ConnectionFailure;
+            assert_eq!(
+                format!("{err}"),
+                "Network connection failure. Try again later"
+            );
+        }
+
+        #[test]
+        fn test_throttled_display() {
+            let err = Error::Throttled;
+            assert_eq!(
+                format!("{err}"),
+                "Request has been throttled. Try again later"
+            );
+        }
+
+        #[test]
+        fn test_iterator_expired_display() {
+            let err = Error::IteratorExpired;
+            assert_eq!(format!("{err}"), "Iterator expired for shard");
+        }
+
+        #[test]
+        fn test_stream_beyond_retention_display() {
+            let err = Error::StreamBeyondRetention;
+            let msg = format!("{err}");
+            assert!(msg.contains("beyond retention period"));
+            assert!(msg.contains("24 hours"));
+        }
+    }
+}
