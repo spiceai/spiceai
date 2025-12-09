@@ -267,20 +267,16 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
         }
     }
 
-    let watermark = match shard_watermarks.is_empty() {
-        true if empty_shards_num == poll_results.len() => {
-            tracing::trace!("All shards are empty, watermark is Now()");
-            Some(SystemTime::now())
-        }
-        true => {
-            tracing::trace!("No eligible shards with watermarks, watermark is None");
-            None
-        }
-        false => {
-            let min_watermark = shard_watermarks.into_iter().min();
-            tracing::trace!("Calculated watermark: {:?}", min_watermark);
-            min_watermark
-        }
+    let watermark = if !shard_watermarks.is_empty() {
+        let min_watermark = shard_watermarks.into_iter().min();
+        tracing::trace!("Calculated watermark: {:?}", min_watermark);
+        min_watermark
+    } else if empty_shards_num == poll_results.len() {
+        tracing::trace!("All shards are empty, watermark is Now()");
+        Some(SystemTime::now())
+    } else {
+        tracing::trace!("No eligible shards with watermarks, watermark is None");
+        None
     };
 
     DynamoDBStreamBatch {
