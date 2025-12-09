@@ -79,7 +79,7 @@ impl TextSearchTableFuncArgs {
         let col: String = if let Some(col) = column {
             if !search_fields.contains(col) {
                 return Err(DataFusionError::Internal(format!(
-                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
+                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}",
                     search_fields.join(", ")
                 )));
             }
@@ -91,13 +91,13 @@ impl TextSearchTableFuncArgs {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
                     return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
+                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
                         search_fields.len()
                     )));
                 }
                 _ => {
                     return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index."
+                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index"
                     )));
                 }
             }
