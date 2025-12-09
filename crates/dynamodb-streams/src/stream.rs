@@ -49,6 +49,8 @@ pub struct DynamoDBStreamBatch {
     pub watermark: Option<SystemTime>,
 }
 
+const DEFAULT_SLEEP_DURATION: Duration = Duration::from_secs(1);
+
 impl DynamodbStreamProducer {
     async fn collect(&mut self) -> Result<(DynamoDBStreamBatch, bool)> {
         let mut poll_results = Vec::new();
@@ -61,11 +63,6 @@ impl DynamodbStreamProducer {
         // 2. Poll active shards
         let futures = self.state.get_active_shards().map(|shard| {
             let client = Arc::clone(&self.client);
-            tracing::trace!(
-                "Polling shard with iterator: shard_id={}, iterator={}",
-                shard.shard_id,
-                shard.iterator
-            );
             async move {
                 (
                     shard.shard_id.clone(),
@@ -156,11 +153,11 @@ impl DynamodbStreamProducer {
 
             match self.collect().await {
                 Ok((batch, had_transient_error)) => {
-                    if !batch.records.is_empty() {
-                        self.metrics_collector
-                            .records
-                            .fetch_add(batch.records.len(), Ordering::Relaxed);
-                    }
+                    let is_batch_empty = false;
+
+                    self.metrics_collector
+                        .records
+                        .fetch_add(batch.records.len(), Ordering::Relaxed);
 
                     if let Some(watermark) = batch.watermark
                         && let Ok(mut wm) = self.metrics_collector.watermark.write()
@@ -175,7 +172,7 @@ impl DynamodbStreamProducer {
                     }
 
                     // Send batch if it has records
-                    if !batch.records.is_empty() && self.sender.send(Ok(batch)).await.is_err() {
+                    if self.sender.send(Ok(batch)).await.is_err() {
                         return;
                     }
 
@@ -197,7 +194,10 @@ impl DynamodbStreamProducer {
                         // Clean success - reset backoff and use normal interval
                         backoff = self.retry_strategy.clone();
 
-                        if let Some(duration) = self.interval {
+                        if is_batch_empty {
+                            // To avoid throttling - wait at least 1 second before polling again
+                            sleep(DEFAULT_SLEEP_DURATION.max(self.interval.unwrap_or(Duration::from_secs(0)))).await;
+                        } else if let Some(duration) = self.interval {
                             sleep(duration).await;
                         }
                     }
@@ -218,6 +218,8 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
     let mut shard_watermarks = Vec::new();
     let mut shards_checkpoints = HashMap::new();
 
+    let mut empty_shards_num = 0;
+
     for shard_result in poll_results {
         // Skip duplicate shard_ids - only process the first occurrence
         // This ensures consistency: one checkpoint per shard, and only records from that occurrence
@@ -229,31 +231,29 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
             continue;
         }
 
-        // Collect records
-        if let PollOutcome::Records {
-            records: shard_records,
-        } = &shard_result.outcome
-        {
-            records.extend(shard_records.clone());
-        }
-
         // Collect checkpoints
         shards_checkpoints.insert(
             shard_result.shard_id.clone(),
             shard_result.last_checkpoint.clone(),
         );
 
-        // Check eligibility for watermark
-        let is_eligible = match shard_result.outcome {
-            // Shards that produced records and those that failed are always eligible
-            PollOutcome::Records { .. } | PollOutcome::Failed => true,
-
-            // Shards that produced no records are NOT eligible as there's no lag
-            PollOutcome::Empty => false,
+        // Collect records and check watermark eligibility
+        let is_watermark_eligible = match &shard_result.outcome {
+            PollOutcome::Records {
+                records: shard_records,
+            } => {
+                records.extend(shard_records.clone());
+                true
+            }
+            PollOutcome::Failed => true,
+            PollOutcome::Empty => {
+                empty_shards_num += 1;
+                false
+            }
         };
 
         // If eligible, include its current_watermark
-        if is_eligible && let Some(watermark) = shard_result.current_watermark {
+        if is_watermark_eligible && let Some(watermark) = shard_result.current_watermark {
             tracing::trace!(
                 "Shard {} included in watermark: {}",
                 shard_result.shard_id,
@@ -263,13 +263,20 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
         }
     }
 
-    let watermark = if shard_watermarks.is_empty() {
-        tracing::trace!("No eligible shards with watermarks, watermark is None");
-        None
-    } else {
-        let min_watermark = shard_watermarks.into_iter().min();
-        tracing::trace!("Calculated watermark: {:?}", min_watermark);
-        min_watermark
+    let watermark = match shard_watermarks.is_empty() {
+        true if empty_shards_num == poll_results.len() => {
+            tracing::trace!("All shards are empty, watermark is Now()");
+            Some(SystemTime::now())
+        }
+        true => {
+            tracing::trace!("No eligible shards with watermarks, watermark is None");
+            None
+        }
+        false => {
+            let min_watermark = shard_watermarks.into_iter().min();
+            tracing::trace!("Calculated watermark: {:?}", min_watermark);
+            min_watermark
+        }
     };
 
     DynamoDBStreamBatch {
