@@ -489,11 +489,11 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
     ParameterSpec::component("footer_cache_mb")
-        .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 64 MB")
-        .default("64"),
+        .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB")
+        .default("128"),
     ParameterSpec::component("segment_cache_mb")
-        .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 32 MB")
-        .default("32"),
+        .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
+        .default("256"),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
