@@ -49,7 +49,7 @@ pub struct DynamoDBStreamBatch {
     pub watermark: Option<SystemTime>,
 }
 
-const DEFAULT_SLEEP_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_SLEEP_DURATION: Duration = Duration::from_millis(500);
 
 impl DynamodbStreamProducer {
     async fn collect(&mut self) -> Result<(DynamoDBStreamBatch, bool)> {
@@ -171,7 +171,7 @@ impl DynamodbStreamProducer {
                             .fetch_add(1, Ordering::Relaxed);
                     }
 
-                    // Send batch if it has records
+                    // Send batch even if it's empty
                     if self.sender.send(Ok(batch)).await.is_err() {
                         return;
                     }
