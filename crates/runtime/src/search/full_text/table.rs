@@ -36,6 +36,16 @@ pub(crate) fn add_full_text_search_to_table(
     columns: &[Column],
     tbl: &TableReference,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    let schema = inner_table_provider.schema();
+    for c in columns {
+        if schema.column_with_name(&c.name).is_none() {
+            tracing::warn!(
+                "The table {} is configured with column {} in the spicepod, but the column is not in the table's schema",
+                tbl.to_string(),
+                c.name
+            );
+        }
+    }
     let Some(FullTextSearchDatasetConfig {
         index_store,
         index_path,
