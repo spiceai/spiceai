@@ -15,24 +15,19 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v1.10 (December 2025)](https://github.com/spiceai/spiceai/milestone/79)
+### [v1.10.1 (January 2026)](https://github.com/spiceai/spiceai/milestone/90)
 
 **Focus:** Lakehouse Architecture.
 
 - **DataFusion**: Upgrade to v51.
-- **Data Connectors**:
-  - DynamoDB Streams Data Connector.
-
-### v1.1x (H1 2026)
-
-**Focus:** Lakehouse Architecture.
-
 - **DuckLake**: Initial support for DuckDB-based lakehouse architectures.
 - **Write Support**:
   - Apache Iceberg write support (expanded).
   - PostgreSQL write support (expanded).
   - Spice Cloud write support (expanded).
 - **DataFusion**: Upgrade to v52.
+
+### v1.1x (H1 2026)
 
 **Focus:** Extensibility.
 
