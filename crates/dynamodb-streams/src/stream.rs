@@ -195,7 +195,7 @@ impl DynamodbStreamProducer {
                         backoff = self.retry_strategy.clone();
 
                         if is_batch_empty {
-                            // To avoid throttling - wait at least 1 second before polling again
+                            // To avoid throttling - wait at least 500ms before polling again
                             sleep(DEFAULT_SLEEP_DURATION.max(self.interval.unwrap_or(Duration::from_secs(0)))).await;
                         } else if let Some(duration) = self.interval {
                             sleep(duration).await;
