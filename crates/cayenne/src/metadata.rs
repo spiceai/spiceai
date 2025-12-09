@@ -128,7 +128,6 @@ pub struct PartitionStats {
 
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[expect(clippy::struct_excessive_bools)]
 pub struct VortexConfig {
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
