@@ -209,6 +209,10 @@ impl Parameters {
         }
     }
 
+    pub fn exists(&self, name: &str) -> bool {
+        self.params.iter().any(|p| p.0 == name)
+    }
+
     /// Gets the `ParameterSpec` for the given parameter name.
     ///
     /// # Panics

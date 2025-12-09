@@ -51,6 +51,46 @@ impl SpiceObjectStoreRegistry {
         }
     }
 
+    fn prepare_gcs_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(bucket_name) = url.host_str() else {
+            return Err(DataFusionError::Configuration(
+                "No bucket name provided".to_string(),
+            ));
+        };
+        let mut gcs_builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(bucket_name)
+            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()));
+
+        let mut client_options = ClientOptions::default();
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        if let Some(timeout) = params.get("client_timeout") {
+            client_options =
+                client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
+                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
+                })?);
+        }
+
+        if let Some(key) = params.get("service_account_key") {
+            gcs_builder = gcs_builder.with_service_account_key(key);
+        }
+        if let Some(path) = params.get("service_account_path") {
+            gcs_builder = gcs_builder.with_service_account_path(path);
+        }
+        if let Some(application_credentials) = params.get("application_credentials") {
+            gcs_builder = gcs_builder.with_application_credentials(application_credentials);
+        }
+
+        gcs_builder = gcs_builder.with_client_options(client_options);
+        Ok(Arc::new(gcs_builder.build()?))
+    }
+
     fn prepare_s3_object_store(
         &self,
         url: &Url,
@@ -457,6 +497,9 @@ impl SpiceObjectStoreRegistry {
 
         if url.as_str().starts_with("abfs://") {
             return self.prepare_azure_object_store(url);
+        }
+        if url.as_str().starts_with("gs://") {
+            return self.prepare_gcs_object_store(url);
         }
 
         #[cfg(feature = "ftp")]

@@ -133,51 +133,36 @@ impl Validator for GcsAuthValidator {
             .ok()
             .unwrap_or("public");
 
-        match auth {
-            "public" | "application_default" | "service_account" => {
-                // Valid auth methods
-            }
-            method => {
-                return Err(Error::UnsupportedAuthenticationMethod {
-                    method: method.to_string(),
-                });
-            }
+        if !matches!(auth, "public" | "application_default" | "service_account") {
+            return Err(Error::UnsupportedAuthenticationMethod {
+                method: auth.to_string(),
+            });
         }
 
         // Validate service_account auth requirements
-        if auth == "service_account" {
-            let has_key = params.parameters.get("service_account_key").expose().ok();
-            let has_path = params.parameters.get("service_account_path").expose().ok();
-
-            if !has_key && !has_path {
-                return Err(Error::NoServiceAccountKey);
-            }
+        if auth == "service_account"
+            && !params.parameters.exists("service_account_key")
+            && !params.parameters.exists("service_account_path")
+        {
+            return Err(Error::NoServiceAccountKey);
         }
 
         // Validate that service account parameters are only used with service_account auth
-        if auth != "service_account" {
-            if params.parameters.get("service_account_key").expose().ok() {
-                return Err(Error::InvalidAuthParameterCombination {
-                    parameter: "gcs_service_account_key".to_string(),
-                    auth: "service_account".to_string(),
-                });
-            }
-            if params.parameters.get("service_account_path").expose().ok() {
-                return Err(Error::InvalidAuthParameterCombination {
-                    parameter: "gcs_service_account_path".to_string(),
-                    auth: "service_account".to_string(),
-                });
-            }
+        if auth != "service_account" && params.parameters.exists("service_account_key") {
+            return Err(Error::InvalidAuthParameterCombination {
+                parameter: "gcs_service_account_key".to_string(),
+                auth: "service_account".to_string(),
+            });
+        }
+        if auth != "service_account" && params.parameters.exists("service_account_path") {
+            return Err(Error::InvalidAuthParameterCombination {
+                parameter: "gcs_service_account_path".to_string(),
+                auth: "service_account".to_string(),
+            });
         }
 
         // Validate that application_credentials is only used with application_default auth
-        if auth != "application_default"
-            && params
-                .parameters
-                .get("application_credentials")
-                .expose()
-                .ok()
-        {
+        if auth != "application_default" && params.parameters.exists("application_credentials") {
             return Err(Error::InvalidAuthParameterCombination {
                 parameter: "gcs_application_credentials".to_string(),
                 auth: "application_default".to_string(),
