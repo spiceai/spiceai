@@ -95,6 +95,9 @@ pub struct CayenneTableProvider {
     ///
     /// Uses `tokio::sync::Mutex` because the lock is held across `.await` points during insert operations.
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
+    /// When set, this object store is registered with `SessionContext` for data file operations.
+    object_store_config: Option<crate::metadata::ObjectStoreConfig>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -188,7 +191,7 @@ impl CayenneTableProvider {
     ///
     /// # Arguments
     ///
-    /// * `snapshot_dir` - Path to the snapshot directory
+    /// * `snapshot_dir_url` - URL string for the snapshot directory (local path or S3 URL)
     /// * `schema` - Arrow schema for the table
     /// * `vortex_config` - Vortex encoding configuration
     ///
@@ -196,16 +199,15 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be created.
     fn create_listing_table(
-        snapshot_dir: &std::path::Path,
+        snapshot_dir_url: &str,
         schema: SchemaRef,
         vortex_config: &crate::metadata::VortexConfig,
     ) -> CatalogResult<Arc<ListingTable>> {
-        let dir_url_str = Self::dir_to_url_string(snapshot_dir);
-
-        let table_url =
-            ListingTableUrl::parse(&dir_url_str).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to parse table URL: {e}"),
-            })?;
+        let table_url = ListingTableUrl::parse(snapshot_dir_url).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!("Failed to parse table URL '{snapshot_dir_url}': {e}"),
+            }
+        })?;
 
         // Create a configured Vortex session with selected encodings
         let vortex_session = Self::create_vortex_session(vortex_config);
@@ -230,6 +232,28 @@ impl CayenneTableProvider {
             })?;
 
         Ok(Arc::new(listing_table))
+    }
+
+    /// Construct the snapshot directory URL string.
+    ///
+    /// For local paths, returns a file:// URL or path string.
+    /// For S3 paths, returns the S3 URL with proper path components.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - The base path for the table (local path or S3 URL)
+    /// * `table_id` - The unique identifier for the table
+    /// * `snapshot_id` - The snapshot identifier
+    fn snapshot_dir_url(table_path: &str, table_id: i64, snapshot_id: &str) -> String {
+        if table_path.starts_with("s3://") || table_path.starts_with("s3a://") {
+            // S3 URL: join path components with /
+            let base = table_path.trim_end_matches('/');
+            format!("{base}/{table_id}/{snapshot_id}/")
+        } else {
+            // Local path: use PathBuf and convert to URL string
+            let path = Self::snapshot_dir_path(table_path, table_id, snapshot_id);
+            Self::dir_to_url_string(&path)
+        }
     }
 
     /// Ensure a snapshot directory exists, creating it if necessary.
@@ -362,12 +386,38 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
     ) -> CatalogResult<Self> {
+        Self::new_with_retention_and_object_store(table_name, catalog, retention_filters, None)
+            .await
+    }
+
+    /// Create a new table provider with explicit retention filters and optional object store.
+    ///
+    /// This is primarily used by the runtime when datasets specify `retention_sql`
+    /// and/or use S3 Express One Zone storage for data files.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_name` - The name of the table to open
+    /// * `catalog` - The metadata catalog
+    /// * `retention_filters` - Filters for automatic deletion on writes
+    /// * `object_store_config` - Optional object store for remote storage (S3)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be found in the catalog or if the listing
+    /// table cannot be created.
+    pub async fn new_with_retention_and_object_store(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        retention_filters: Vec<Expr>,
+        object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
-        // Construct path to current snapshot
+        // Construct URL to current snapshot
         // Directory structure: [table_path]/[table_id]/[snapshot_id]/
         // All tables have a snapshot ID (created on table initialization)
-        let snapshot_dir = Self::snapshot_dir_path(
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &table_metadata.path,
             table_metadata.table_id,
             &table_metadata.current_snapshot_id,
@@ -376,7 +426,7 @@ impl CayenneTableProvider {
         let vortex_config = table_metadata.vortex_config.clone();
 
         let listing_table = Self::create_listing_table(
-            &snapshot_dir,
+            &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
             &vortex_config,
         )?;
@@ -395,6 +445,7 @@ impl CayenneTableProvider {
             // Wrap in Arc for zero-copy sharing across concurrent scans
             cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            object_store_config,
         })
     }
 
@@ -407,7 +458,7 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
     ) -> CatalogResult<Self> {
-        Self::create_table_with_retention(catalog, options, Vec::new()).await
+        Self::create_table_with_retention_and_object_store(catalog, options, Vec::new(), None).await
     }
 
     /// Create a new table in Cayenne with retention filters applied to subsequent writes.
@@ -420,8 +471,42 @@ impl CayenneTableProvider {
         options: CreateTableOptions,
         retention_filters: Vec<Expr>,
     ) -> CatalogResult<Self> {
-        let _table_id = catalog.create_table(options.clone()).await?;
-        Self::new_with_retention(&options.table_name, catalog, retention_filters).await
+        Self::create_table_with_retention_and_object_store(
+            catalog,
+            options,
+            retention_filters,
+            None,
+        )
+        .await
+    }
+
+    /// Create a new table in Cayenne with retention filters and optional object store for S3.
+    ///
+    /// # Arguments
+    ///
+    /// * `catalog` - The metadata catalog
+    /// * `options` - Table creation options
+    /// * `retention_filters` - Filters for automatic deletion on writes
+    /// * `object_store_config` - Optional object store for remote storage (S3 Express One Zone)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created in the catalog.
+    pub async fn create_table_with_retention_and_object_store(
+        catalog: Arc<dyn MetadataCatalog>,
+        options: CreateTableOptions,
+        retention_filters: Vec<Expr>,
+        object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    ) -> CatalogResult<Self> {
+        let table_name = options.table_name.clone();
+        let _table_id = catalog.create_table(options).await?;
+        Self::new_with_retention_and_object_store(
+            &table_name,
+            catalog,
+            retention_filters,
+            object_store_config,
+        )
+        .await
     }
 
     /// Get a reference to the catalog.
@@ -711,6 +796,7 @@ impl CayenneTableProvider {
             retention_filters: Vec::new(), // Applied once after all chunks complete, not per-chunk
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
+            object_store_config: self.object_store_config.clone(),
         }
     }
 
@@ -804,7 +890,7 @@ impl CayenneTableProvider {
         };
 
         // Create a session context and scan the listing table to get all data
-        let ctx = SessionContext::new();
+        let ctx = self.create_session_context();
         let df = ctx
             .read_table(listing_table)
             .map_err(|e| CatalogError::InvalidOperation {
@@ -823,13 +909,22 @@ impl CayenneTableProvider {
         let sorted_stream = self.sort_stream(stream)?;
 
         // Delete all existing Vortex files in the snapshot directory before rewriting
-        let snapshot_dir = Self::snapshot_dir_path(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &self.table_metadata.current_snapshot_id,
-        );
+        // Note: For S3 paths, we skip deletion and let new files coexist (may need future cleanup)
+        let is_s3_path = self.table_metadata.path.starts_with("s3://")
+            || self.table_metadata.path.starts_with("s3a://");
 
-        self.delete_snapshot_files(&snapshot_dir).await?;
+        if is_s3_path {
+            tracing::warn!(
+                "Sorted rewrite for S3 storage skips file deletion - old files may remain in snapshot directory"
+            );
+        } else {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &self.table_metadata.current_snapshot_id,
+            );
+            self.delete_snapshot_files(&snapshot_dir).await?;
+        }
 
         // Write the sorted data back in chunks
         let (total_rows, chunk_count) = self
@@ -885,6 +980,23 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Create a `SessionContext` for data operations, registering object store if configured.
+    fn create_session_context(&self) -> SessionContext {
+        let ctx = SessionContext::new();
+
+        // Register object store if configured for remote storage (e.g., S3 Express One Zone)
+        if let Some(ref config) = self.object_store_config {
+            ctx.runtime_env()
+                .register_object_store(&config.url, Arc::clone(&config.store));
+            tracing::debug!(
+                "Registered object store for S3 URL: {}",
+                config.url.as_str()
+            );
+        }
+
+        ctx
+    }
+
     /// Write a single chunk of record batches as a Vortex file.
     ///
     /// # Errors
@@ -907,8 +1019,8 @@ impl CayenneTableProvider {
             Box::pin(chunk_stream),
         ));
 
-        // Create a session context for executing the insert
-        let ctx = SessionContext::new();
+        // Create a session context for executing the insert (with object store if needed)
+        let ctx = self.create_session_context();
         let state = ctx.state();
 
         // Delegate to ListingTable's insert_into to write Vortex files
@@ -1064,15 +1176,15 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be refreshed.
     fn refresh_listing_table(&self) -> CatalogResult<()> {
-        // Construct path to current snapshot
-        let snapshot_dir = Self::snapshot_dir_path(
+        // Construct URL to current snapshot
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             self.table_metadata.table_id,
             &self.table_metadata.current_snapshot_id,
         );
 
         let new_listing_table = Self::create_listing_table(
-            &snapshot_dir,
+            &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
             &self.vortex_config,
         )?;
@@ -1277,19 +1389,29 @@ impl TableProvider for CayenneTableProvider {
             // Generate a new UUIDv7 for the snapshot
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
 
-            // Create snapshot directory: [table_path]/[table_id]/[snapshot_id]/
-            let snapshot_dir = Self::snapshot_dir_path(
+            // Construct snapshot directory URL
+            let snapshot_dir_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
                 self.table_metadata.table_id,
                 &new_snapshot_id,
             );
 
-            // Create the snapshot directory
-            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+            // For local paths, ensure the directory exists
+            // S3 doesn't require directory creation (object storage creates paths on write)
+            if !self.table_metadata.path.starts_with("s3://")
+                && !self.table_metadata.path.starts_with("s3a://")
+            {
+                let snapshot_dir = Self::snapshot_dir_path(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &new_snapshot_id,
+                );
+                Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+            }
 
             // Create a new ListingTable pointing to the snapshot directory
             let new_listing_table = Self::create_listing_table(
-                &snapshot_dir,
+                &snapshot_dir_url,
                 Arc::clone(&self.table_metadata.schema),
                 &self.vortex_config,
             )
@@ -1344,14 +1466,17 @@ impl TableProvider for CayenneTableProvider {
         }
 
         // For regular appends, use the existing snapshot and listing table
-        // Ensure the snapshot directory exists (it might not if this is the first write to a newly created table)
-        let snapshot_dir = Self::snapshot_dir_path(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &self.table_metadata.current_snapshot_id,
-        );
-
-        Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        // Ensure the snapshot directory exists for local paths (S3 creates paths on write)
+        if !self.table_metadata.path.starts_with("s3://")
+            && !self.table_metadata.path.starts_with("s3a://")
+        {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &self.table_metadata.current_snapshot_id,
+            );
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {

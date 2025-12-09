@@ -42,10 +42,11 @@ pub enum Error {
 impl Error {
     #[must_use]
     pub fn is_user_error(&self) -> bool {
-        matches!(
-            self,
-            Error::TextSearchError { source } if source.is_user_error()
-        )
+        #[cfg(feature = "text_search")]
+        if let Error::TextSearchError { source } = self {
+            return source.is_user_error();
+        }
+        false
     }
 
     #[must_use]

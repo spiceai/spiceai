@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -25,6 +26,7 @@ use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown}
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
+use object_store::{ClientOptions, aws::AmazonS3Builder, client::SpawnedReqwestConnector};
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
     encode_key, parse_partition_value, to_hive_partition_dir,
@@ -37,6 +39,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+use url::Url;
 
 use super::{AccelerationSource, DataAccelerator};
 use crate::component::dataset::acceleration::{Engine, Mode, RefreshMode};
@@ -78,6 +81,24 @@ pub enum Error {
         "A single partition by expression is required for Partitioned Cayenne acceleration"
     ))]
     PartitionByRequired,
+
+    #[snafu(display("Failed to create S3 Express One Zone object store: {source}"))]
+    S3ObjectStoreCreation {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Invalid S3 Express One Zone URL '{url}': {source}"))]
+    InvalidS3Url {
+        url: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Standard S3 paths are not supported for Cayenne acceleration. Only S3 Express One Zone is supported. \
+        S3 Express One Zone buckets use the naming convention: 's3://{{bucket-name}}--{{zone-id}}--x-s3/'. \
+        Received: '{path}'"
+    ))]
+    StandardS3NotSupported { path: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -236,6 +257,13 @@ impl CayenneAccelerator {
 
     /// Returns the `Cayenne` data directory path that would be used for a file-based `Cayenne` accelerator from this dataset.
     /// Cayenne uses a directory-based approach to support append operations.
+    ///
+    /// If `cayenne_file_path` is an S3 Express One Zone path (e.g., `s3://{bucket}--{zone-id}--x-s3/`),
+    /// data files will be stored exclusively in S3 Express One Zone while metadata remains on local disk.
+    ///
+    /// Order:
+    /// 1. `cayenne_file_path` - Custom path (local or S3 Express One Zone)
+    /// 2. Default: `spice_data_base_path()/{dataset_name}/`
     pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
@@ -247,9 +275,20 @@ impl CayenneAccelerator {
             // Get the sanitized dataset name
             let dataset_name = source.name().to_string().replace(['.', '/'], "_");
 
-            // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
             let dir_path = if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
-                custom_path.clone()
+                // Validate the path - reject standard S3, only allow S3 Express One Zone or local
+                Self::validate_file_path(custom_path)?;
+
+                // Check if it's an S3 Express One Zone path
+                if Self::is_s3_express_path(custom_path) {
+                    tracing::info!(
+                        "Using S3 Express One Zone storage for Cayenne data files: {}",
+                        custom_path
+                    );
+                }
+                // Add dataset name as a suffix for isolation
+                let base = custom_path.trim_end_matches('/');
+                format!("{base}/{dataset_name}/")
             } else {
                 format!("{}/{}", spice_data_base_path(), dataset_name)
             };
@@ -265,6 +304,184 @@ impl CayenneAccelerator {
                 dataset: Arc::from(source.name().to_string()),
             })
         }
+    }
+
+    /// Returns true if the path is any S3 path (standard or Express).
+    fn is_s3_path(path: &str) -> bool {
+        path.starts_with("s3://") || path.starts_with("s3a://")
+    }
+
+    /// Returns true if the path is an S3 Express One Zone path.
+    ///
+    /// S3 Express One Zone buckets have the naming convention: `{base-name}--{zone-id}--x-s3`
+    /// Example: `s3://mybucket--usw2-az1--x-s3/prefix/`
+    fn is_s3_express_path(path: &str) -> bool {
+        path.starts_with("s3://") && path.contains("--x-s3")
+    }
+
+    /// Validates that the path is either a local path or an S3 Express One Zone path.
+    /// Standard S3 paths are not supported.
+    fn validate_file_path(path: &str) -> Result<()> {
+        if Self::is_s3_path(path) && !Self::is_s3_express_path(path) {
+            return Err(Error::StandardS3NotSupported {
+                path: path.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns true if the data path for this source is an S3 Express One Zone path.
+    fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
+        source
+            .acceleration()
+            .and_then(|a| a.params.get("cayenne_file_path"))
+            .is_some_and(|path| Self::is_s3_express_path(path))
+    }
+
+    /// Build an S3 object store for S3 Express One Zone storage.
+    ///
+    /// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "S3 object store setup requires extensive configuration"
+    )]
+    async fn build_s3_object_store(
+        source: &dyn AccelerationSource,
+    ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
+        let data_path = match source.acceleration() {
+            Some(a) => a.params.get("cayenne_file_path").cloned(),
+            None => None,
+        };
+
+        let Some(data_path) = data_path else {
+            return Ok(None);
+        };
+
+        if !Self::is_s3_express_path(&data_path) {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "Building S3 Express One Zone object store for path: {}",
+            data_path
+        );
+
+        // Parse the S3 URL
+        let url = Url::parse(&data_path).map_err(|e| Error::InvalidS3Url {
+            url: data_path.clone(),
+            source: Box::new(e),
+        })?;
+
+        // Get bucket name from URL
+        let bucket_name = get_bucket_name(&url).map_err(|e| Error::InvalidS3Url {
+            url: data_path.clone(),
+            source: Box::new(e),
+        })?;
+
+        // Extract S3 configuration from acceleration params
+        let params = source.acceleration().map(|a| &a.params);
+
+        let s3_region = params.and_then(|p| p.get("s3_region"));
+        let s3_endpoint = params.and_then(|p| p.get("s3_endpoint"));
+        let s3_key = params.and_then(|p| p.get("s3_key"));
+        let s3_secret = params.and_then(|p| p.get("s3_secret"));
+        let s3_session_token = params.and_then(|p| p.get("s3_session_token"));
+        let s3_auth = params
+            .and_then(|p| p.get("s3_auth"))
+            .map_or("iam_role", String::as_str);
+        let s3_client_timeout = params.and_then(|p| p.get("s3_client_timeout"));
+        let s3_allow_http = params
+            .and_then(|p| p.get("s3_allow_http"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+        // Build the S3 object store
+        let io_runtime = tokio::runtime::Handle::current();
+        let mut s3_builder = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket_name)
+            .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
+            .with_allow_http(s3_allow_http);
+
+        let mut client_options = ClientOptions::default();
+
+        if let Some(region) = s3_region {
+            s3_builder = s3_builder.with_region(region);
+        }
+
+        if let Some(endpoint) = s3_endpoint {
+            s3_builder = s3_builder.with_endpoint(endpoint);
+            if endpoint.starts_with("http://") {
+                client_options = client_options.with_allow_http(true);
+            }
+        }
+
+        if let Some(timeout) = s3_client_timeout {
+            client_options =
+                client_options.with_timeout(fundu::parse_duration(timeout).map_err(|e| {
+                    Error::S3ObjectStoreCreation {
+                        source: Box::new(e),
+                    }
+                })?);
+        }
+
+        let mut load_credentials_from_environment = true;
+
+        // Handle explicit key/secret credentials
+        if s3_auth == "key" {
+            if let (Some(key), Some(secret)) = (s3_key, s3_secret) {
+                s3_builder = s3_builder.with_access_key_id(key);
+                s3_builder = s3_builder.with_secret_access_key(secret);
+                if let Some(token) = s3_session_token {
+                    s3_builder = s3_builder.with_token(token);
+                }
+                load_credentials_from_environment = false;
+            } else {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "S3 auth method 'key' requires both 's3_key' and 's3_secret' parameters",
+                    ),
+                });
+            }
+        }
+
+        s3_builder = s3_builder.with_client_options(client_options);
+
+        // Load credentials from environment if not using explicit keys
+        if load_credentials_from_environment {
+            tracing::debug!("Loading S3 credentials from environment for Cayenne");
+            match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                Ok(Some(sdk_config)) => {
+                    if sdk_config.credentials_provider().is_some() {
+                        tracing::debug!("Using S3 credentials provider from SDK config");
+                        s3_builder = s3_builder.with_credentials(Arc::new(
+                            S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(
+                                |e| Error::S3ObjectStoreCreation {
+                                    source: Box::new(e),
+                                },
+                            )?,
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "No AWS SDK credentials available for Cayenne S3 Express storage; assuming public access"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!("Unable to initialize AWS credentials for Cayenne: {err}");
+                }
+            }
+        }
+
+        let store = s3_builder
+            .build()
+            .map_err(|e| Error::S3ObjectStoreCreation {
+                source: Box::new(e),
+            })?;
+
+        Ok(Some(cayenne::metadata::ObjectStoreConfig {
+            url,
+            store: Arc::new(store),
+        }))
     }
 
     fn resolve_storage_config(&self, source: &dyn AccelerationSource) -> Result<String> {
@@ -382,6 +599,11 @@ impl CayenneAccelerator {
     }
 
     fn ensure_directory(dir_path: &str) -> Result<PathBuf> {
+        // Skip directory creation for S3/object store URLs
+        if dir_path.starts_with("s3://") || dir_path.starts_with("s3a://") {
+            return Ok(PathBuf::from(dir_path));
+        }
+
         let path_buf = PathBuf::from(dir_path);
         if !path_buf.exists() {
             std::fs::create_dir_all(&path_buf).map_err(|err| {
@@ -474,6 +696,9 @@ impl CayenneAccelerator {
 
         let vortex_config = Self::get_vortex_config(source);
 
+        // Build S3 object store if using S3 Express One Zone storage
+        let object_store = Self::build_s3_object_store(source).await?;
+
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
@@ -483,11 +708,12 @@ impl CayenneAccelerator {
             vortex_config,
         };
 
-        // Create CayenneTableProvider
-        let cayenne_table = CayenneTableProvider::create_table_with_retention(
+        // Create CayenneTableProvider with object store for S3 Express One Zone
+        let cayenne_table = CayenneTableProvider::create_table_with_retention_and_object_store(
             catalog,
             table_options,
             retention_filters,
+            object_store,
         )
         .await
         .map_err(|e| Error::AccelerationCreationFailed {
@@ -499,7 +725,8 @@ impl CayenneAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("file_path"),
+    ParameterSpec::component("file_path")
+        .description("Path for storing Cayenne data files (Vortex files). Can be a local path or an S3 Express One Zone path. For S3 Express One Zone, use format: 's3://{bucket-name}--{zone-id}--x-s3/{prefix}/'. When S3 Express One Zone is specified, data files are stored exclusively in S3 while metadata (SQLite) remains on local disk."),
     ParameterSpec::component("metastore")
         .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
         .default("sqlite"),
@@ -507,6 +734,31 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("unsupported_type_action")
         .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
+    // S3 Express One Zone authentication parameters (used when file_path is an S3 Express path)
+    ParameterSpec::component("s3_region")
+        .description("AWS region for S3 Express One Zone storage. If not specified, uses AWS SDK default.")
+        .secret(),
+    ParameterSpec::component("s3_endpoint")
+        .description("Custom S3 endpoint URL. Required for S3 Express One Zone (format: 's3express-{zone-id}.{region}.amazonaws.com').")
+        .secret(),
+    ParameterSpec::component("s3_key")
+        .description("AWS access key ID for S3 authentication.")
+        .secret(),
+    ParameterSpec::component("s3_secret")
+        .description("AWS secret access key for S3 authentication.")
+        .secret(),
+    ParameterSpec::component("s3_session_token")
+        .description("AWS session token for temporary credentials (optional).")
+        .secret(),
+    ParameterSpec::component("s3_auth")
+        .description("Authentication method for S3 Express One Zone. Options: 'iam_role' (default, uses environment credentials), 'key' (uses explicit s3_key/s3_secret).")
+        .default("iam_role")
+        .one_of(&["iam_role", "key"]),
+    ParameterSpec::runtime("s3_client_timeout")
+        .description("Timeout for S3 client operations (e.g., '30s', '5m')."),
+    ParameterSpec::runtime("s3_allow_http")
+        .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
+        .default("false"),
     // Vortex encoding configuration for hardware acceleration
     ParameterSpec::component("cayenne_alp")
         .description("Enable Adaptive Lossless Precision (ALP) encoding for numeric columns. Provides 5-10x compression with SIMD decompression on ARM64 (NEON) and x86_64 (AVX2/AVX-512). Options: 'enabled' (default), 'disabled'")
@@ -569,6 +821,12 @@ impl DataAccelerator for CayenneAccelerator {
             return true; // memory mode Vortex is always initialized
         }
 
+        // S3 Express One Zone paths are always considered initialized
+        // (the bucket/prefix is assumed to exist or will be created by the object store)
+        if Self::is_s3_express_data_path(source) {
+            return true;
+        }
+
         // otherwise, we're initialized if the directory exists
         if let Ok(dir_path) = self.file_path(source) {
             PathBuf::from(dir_path).exists()
@@ -629,6 +887,19 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         let dir_path = self.file_path(source)?;
+        let is_s3_express = Self::is_s3_express_data_path(source);
+
+        // Log S3 Express One Zone configuration
+        if is_s3_express {
+            tracing::warn!(
+                "Cayenne S3 Express One Zone storage (Alpha) is experimental and may not be fully functional."
+            );
+            tracing::debug!(
+                "Skipping local directory initialization for S3 Express One Zone path: {}",
+                dir_path
+            );
+            return Ok(());
+        }
 
         // If mode is FileCreate, delete the existing directory to start fresh
         if let Some(acceleration) = source.acceleration()
@@ -826,6 +1097,9 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             })?;
 
+            // Build S3 object store if using S3 Express One Zone storage
+            let object_store_config = Self::build_s3_object_store(source).await?;
+
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let vortex_config = Self::get_vortex_config(source);
@@ -839,6 +1113,7 @@ impl DataAccelerator for CayenneAccelerator {
                 unsupported_type_action,
                 retention_filters,
                 vortex_config,
+                object_store_config,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -894,6 +1169,7 @@ struct CayennePartitionCreator {
     unsupported_type_action: UnsupportedTypeAction,
     retention_filters: Vec<Expr>,
     vortex_config: cayenne::metadata::VortexConfig,
+    object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -908,6 +1184,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("retention_filters", &self.retention_filters.len())
             .field("vortex_config", &"<VortexConfig>")
+            .field("object_store_config", &self.object_store_config.is_some())
             .finish()
     }
 }
@@ -924,6 +1201,7 @@ impl CayennePartitionCreator {
         unsupported_type_action: UnsupportedTypeAction,
         retention_filters: Vec<Expr>,
         vortex_config: cayenne::metadata::VortexConfig,
+        object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
     ) -> Self {
         Self {
             table_name,
@@ -935,6 +1213,7 @@ impl CayennePartitionCreator {
             unsupported_type_action,
             retention_filters,
             vortex_config,
+            object_store_config,
         }
     }
 
@@ -1011,16 +1290,18 @@ impl PartitionCreator for CayennePartitionCreator {
             vortex_config: self.vortex_config.clone(),
         };
 
-        // Create Cayenne table provider for this partition
-        let cayenne_table = cayenne::CayenneTableProvider::create_table_with_retention(
-            Arc::clone(&self.catalog),
-            table_options,
-            self.retention_filters.clone(),
-        )
-        .await
-        .map_err(|e| creator::Error::CreatePartition {
-            source: Box::new(e),
-        })?;
+        // Create Cayenne table provider for this partition with S3 support
+        let cayenne_table =
+            cayenne::CayenneTableProvider::create_table_with_retention_and_object_store(
+                Arc::clone(&self.catalog),
+                table_options,
+                self.retention_filters.clone(),
+                self.object_store_config.clone(),
+            )
+            .await
+            .map_err(|e| creator::Error::CreatePartition {
+                source: Box::new(e),
+            })?;
 
         Ok(Partition {
             partition_value,
@@ -1154,5 +1435,114 @@ mod tests {
         };
         assert!(dir_path.contains("cayenne_data_accelerator_test"));
         assert!(dir_path.ends_with('/'));
+    }
+
+    #[test]
+    fn test_is_s3_path() {
+        // S3 paths
+        assert!(CayenneAccelerator::is_s3_path("s3://bucket/prefix/"));
+        assert!(CayenneAccelerator::is_s3_path(
+            "s3://mybucket--usw2-az1--x-s3/data/"
+        ));
+        assert!(CayenneAccelerator::is_s3_path("s3a://bucket/prefix/"));
+
+        // Non-S3 paths
+        assert!(!CayenneAccelerator::is_s3_path("/local/path/data/"));
+        assert!(!CayenneAccelerator::is_s3_path("./relative/path/"));
+        assert!(!CayenneAccelerator::is_s3_path("file:///local/path/"));
+        assert!(!CayenneAccelerator::is_s3_path("gs://bucket/prefix/"));
+        assert!(!CayenneAccelerator::is_s3_path("az://container/prefix/"));
+    }
+
+    #[test]
+    fn test_is_s3_express_path() {
+        // Valid S3 Express One Zone paths
+        assert!(CayenneAccelerator::is_s3_express_path(
+            "s3://mybucket--usw2-az1--x-s3/prefix/"
+        ));
+        assert!(CayenneAccelerator::is_s3_express_path(
+            "s3://data-bucket--use1-az4--x-s3/"
+        ));
+        assert!(CayenneAccelerator::is_s3_express_path(
+            "s3://my-bucket-name--euw1-az2--x-s3/some/nested/path/"
+        ));
+
+        // Standard S3 paths (not Express)
+        assert!(!CayenneAccelerator::is_s3_express_path(
+            "s3://mybucket/prefix/"
+        ));
+        assert!(!CayenneAccelerator::is_s3_express_path(
+            "s3://mybucket-with-dashes/prefix/"
+        ));
+        assert!(!CayenneAccelerator::is_s3_express_path(
+            "s3://mybucket--partial/prefix/"
+        ));
+
+        // Non-S3 paths
+        assert!(!CayenneAccelerator::is_s3_express_path("/local/path/"));
+        assert!(!CayenneAccelerator::is_s3_express_path(
+            "s3a://mybucket--usw2-az1--x-s3/prefix/"
+        ));
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_local_paths() {
+        CayenneAccelerator::validate_file_path("/local/path/data/")
+            .expect("local absolute path should be valid");
+        CayenneAccelerator::validate_file_path("./relative/path/")
+            .expect("relative path should be valid");
+        CayenneAccelerator::validate_file_path("/var/spice/data/")
+            .expect("another local path should be valid");
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_s3_express() {
+        CayenneAccelerator::validate_file_path("s3://mybucket--usw2-az1--x-s3/prefix/")
+            .expect("S3 Express One Zone path should be valid");
+        CayenneAccelerator::validate_file_path("s3://data--use1-az4--x-s3/cayenne/")
+            .expect("another S3 Express One Zone path should be valid");
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_standard_s3() {
+        // Standard S3 paths should be rejected
+        let result = CayenneAccelerator::validate_file_path("s3://mybucket/prefix/");
+        assert!(result.is_err());
+        let err = result.expect_err("expected error");
+        assert!(
+            matches!(err, Error::StandardS3NotSupported { .. }),
+            "Expected StandardS3NotSupported error, got: {err:?}"
+        );
+
+        let result = CayenneAccelerator::validate_file_path("s3://my-data-bucket/cayenne/data/");
+        assert!(result.is_err());
+
+        // s3a:// scheme should also be rejected (not S3 Express)
+        let result = CayenneAccelerator::validate_file_path("s3a://mybucket/prefix/");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_file_path_error_message() {
+        let result = CayenneAccelerator::validate_file_path("s3://regular-bucket/data/");
+        let err = result.expect_err("expected error");
+        let error_message = err.to_string();
+
+        assert!(
+            error_message.contains("Standard S3 paths are not supported"),
+            "Error message should mention standard S3 not supported: {error_message}"
+        );
+        assert!(
+            error_message.contains("S3 Express One Zone"),
+            "Error message should mention S3 Express One Zone: {error_message}"
+        );
+        assert!(
+            error_message.contains("--x-s3"),
+            "Error message should show the bucket naming convention: {error_message}"
+        );
+        assert!(
+            error_message.contains("s3://regular-bucket/data/"),
+            "Error message should include the invalid path: {error_message}"
+        );
     }
 }
