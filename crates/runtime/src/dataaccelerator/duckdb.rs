@@ -303,7 +303,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("partitioned_write_buffer"),
-    ParameterSpec::runtime("optimizer_duckdb_aggregrate_pushdown"),
+    ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
 #[async_trait]
