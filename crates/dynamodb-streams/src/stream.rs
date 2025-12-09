@@ -153,7 +153,7 @@ impl DynamodbStreamProducer {
 
             match self.collect().await {
                 Ok((batch, had_transient_error)) => {
-                    let is_batch_empty = false;
+                    let is_batch_empty = batch.records.is_empty();
 
                     self.metrics_collector
                         .records
