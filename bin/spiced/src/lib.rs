@@ -29,7 +29,8 @@ use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
 use runtime::config::ClusterMode;
@@ -391,9 +392,10 @@ fn init_metrics(
     let spice_metrics_exporter =
         OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
 
-    let spice_metrics_reader = PeriodicReader::builder(spice_metrics_exporter)
-        .with_interval(Duration::from_secs(30))
-        .build();
+    let spice_metrics_reader =
+        PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_interval(Duration::from_secs(30))
+            .build();
 
     let mut provider_builder = SdkMeterProvider::builder()
         .with_resource(resource)
