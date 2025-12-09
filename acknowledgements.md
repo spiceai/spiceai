@@ -60,10 +60,10 @@ go.opentelemetry.io/otel/sdk, https://github.com/open-telemetry/opentelemetry-go
 go.opentelemetry.io/otel/trace, https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.31.0/trace/LICENSE, Apache-2.0
 go.yaml.in/yaml/v3, https://github.com/yaml/go-yaml/blob/v3.0.4/LICENSE, MIT
 golang.org/x/exp, https://cs.opensource.google/go/x/exp/+/f66d83c2:LICENSE, BSD-3-Clause
-golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.29.0:LICENSE, BSD-3-Clause
-golang.org/x/net, https://cs.opensource.google/go/x/net/+/v0.44.0:LICENSE, BSD-3-Clause
+golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.30.0:LICENSE, BSD-3-Clause
+golang.org/x/net, https://cs.opensource.google/go/x/net/+/v0.46.0:LICENSE, BSD-3-Clause
 golang.org/x/sys, https://cs.opensource.google/go/x/sys/+/v0.38.0:LICENSE, BSD-3-Clause
-golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.29.0:LICENSE, BSD-3-Clause
+golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.30.0:LICENSE, BSD-3-Clause
 golang.org/x/xerrors, https://cs.opensource.google/go/x/xerrors/+/7835f813:LICENSE, BSD-3-Clause
 google.golang.org/genproto/googleapis/rpc/status, https://github.com/googleapis/go-genproto/blob/324edc3d5d38/googleapis/rpc/LICENSE, Apache-2.0
 google.golang.org/grpc, https://github.com/grpc/grpc-go/blob/v1.67.1/LICENSE, Apache-2.0
@@ -72,7 +72,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
 
-- aegis 0.9.3, MIT 
+- aegis 0.9.5, MIT 
   <br/>https://github.com/jedisct1/rust-aegis
 
 - ahash 0.7.8, Apache-2.0 OR MIT 
@@ -111,11 +111,14 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-json 56.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-odbc 18.1.2, MIT 
+- arrow-odbc 21.0.0, MIT 
   <br/>https://github.com/pacman82/arrow-odbc
 
 - arrow-schema 56.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
+
+- async-compression 0.4.19, Apache-2.0 OR MIT 
+  <br/>https://github.com/Nullus157/async-compression
 
 - async-graphql 7.0.17, Apache-2.0 OR MIT 
   <br/>https://github.com/async-graphql/async-graphql
@@ -132,40 +135,43 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.89, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.8.10, Apache-2.0 
+- aws-config 1.8.11, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-credential-types 1.2.9, Apache-2.0 
+- aws-credential-types 1.2.10, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-runtime 1.5.14, Apache-2.0 
+- aws-runtime 1.5.16, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-sdk-bedrockruntime 1.113.0, Apache-2.0 
+- aws-sdk-bedrockruntime 1.118.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-cognitoidentity 1.90.0, Apache-2.0 
+- aws-sdk-cognitoidentity 1.91.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-cognitoidentityprovider 1.103.0, Apache-2.0 
+- aws-sdk-cognitoidentityprovider 1.104.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-dynamodb 1.98.0, Apache-2.0 
+- aws-sdk-dynamodb 1.100.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-glue 1.128.0, Apache-2.0 
+- aws-sdk-dynamodbstreams 1.91.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-s3 1.112.0, Apache-2.0 
+- aws-sdk-glue 1.131.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-s3vectors 1.14.0, Apache-2.0 
+- aws-sdk-s3 1.115.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-secretsmanager 1.93.0, Apache-2.0 
+- aws-sdk-s3vectors 1.15.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.91.0, Apache-2.0 
+- aws-sdk-secretsmanager 1.95.0, Apache-2.0 
+  <br/>https://github.com/awslabs/aws-sdk-rust
+
+- aws-sdk-sts 1.94.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - aws-smithy-async 1.2.6, Apache-2.0 
@@ -180,7 +186,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-smithy-types 1.3.4, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- axum 0.8.6, MIT 
+- axum 0.8.7, MIT 
   <br/>https://github.com/tokio-rs/axum
 
 - axum-extra 0.10.3, MIT 
@@ -219,10 +225,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - base64 0.22.1, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
 
-- bb8 0.8.6, MIT 
-  <br/>https://github.com/djc/bb8
-
-- bb8 0.9.0, MIT 
+- bb8 0.9.1, MIT 
   <br/>https://github.com/djc/bb8
 
 - bb8-oracle 0.3.0, Apache-2.0 OR MIT 
@@ -231,13 +234,16 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - bigdecimal 0.4.9, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
 
+- blake3 1.8.2, Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR CC0-1.0 
+  <br/>https://github.com/BLAKE3-team/BLAKE3
+
 - bollard 0.18.1, Apache-2.0 
   <br/>https://github.com/fussybeaver/bollard
 
-- byte-unit 5.1.6, MIT 
+- byte-unit 5.2.0, MIT 
   <br/>https://github.com/magiclen/byte-unit
 
-- bytes 1.10.1, MIT 
+- bytes 1.11.0, MIT 
   <br/>https://github.com/tokio-rs/bytes
 
 - charset 0.1.5, Apache-2.0 OR MIT 
@@ -255,7 +261,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono-tz 0.10.4, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono-tz
 
-- clap 4.5.51, Apache-2.0 OR MIT 
+- clap 4.5.53, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
 - clickhouse-rs 1.1.0-alpha.1, MIT 
@@ -284,6 +290,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - cudarc 0.13.9, Apache-2.0 OR MIT 
   <br/>https://github.com/coreylowman/cudarc
+
+- cudarc 0.18.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/chelsea0x3b/cudarc
 
 - dashmap 6.1.0, MIT 
   <br/>https://github.com/xacrimon/dashmap
@@ -360,13 +369,16 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - futures 0.3.31, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/futures-rs
 
+- gethostname 1.1.0, Apache-2.0 
+  <br/>https://codeberg.org/swsnr/gethostname.rs.git
+
 - git2 0.20.2, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/git2-rs
 
 - globset 0.4.18, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 
-- governor 0.10.1, MIT 
+- governor 0.10.2, MIT 
   <br/>https://github.com/boinkor-net/governor.git
 
 - graph-rs-sdk 2.0.1, MIT 
@@ -384,6 +396,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hf-hub 0.4.3, Apache-2.0 
   <br/>https://github.com/huggingface/hf-hub
 
+- hickory-resolver 0.25.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/hickory-dns/hickory-dns
+
 - hostname 0.3.1, MIT 
   <br/>https://github.com/svartalf/hostname
 
@@ -393,11 +408,14 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - http 0.2.12, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
 
-- http 1.3.1, Apache-2.0 OR MIT 
+- http 1.4.0, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
 
 - http-body-util 0.1.3, MIT 
   <br/>https://github.com/hyperium/http-body
+
+- httpdate 1.0.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/pyfisch/httpdate
 
 - humantime 2.3.0, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/humantime
@@ -405,10 +423,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hyper 0.14.32, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper 1.7.0, MIT 
+- hyper 1.8.1, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper-util 0.1.17, MIT 
+- hyper-util 0.1.18, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
 - iceberg 0.7.0, Apache-2.0 
@@ -432,16 +450,16 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
-- indexmap 2.12.0, Apache-2.0 OR MIT 
+- indexmap 2.12.1, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
 - indicatif 0.17.11, MIT 
   <br/>https://github.com/console-rs/indicatif
 
-- indicatif 0.18.2, MIT 
+- indicatif 0.18.3, MIT 
   <br/>https://github.com/console-rs/indicatif
 
-- insta 1.43.2, Apache-2.0 
+- insta 1.44.1, Apache-2.0 
   <br/>https://github.com/mitsuhiko/insta
 
 - itertools 0.10.5, Apache-2.0 OR MIT 
@@ -465,10 +483,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - keyring 3.6.3, Apache-2.0 OR MIT 
   <br/>https://github.com/hwchen/keyring-rs.git
 
+- linkme 0.3.35, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/linkme
+
 - logos 0.15.1, Apache-2.0 OR MIT 
   <br/>https://github.com/maciejhirsz/logos
 
-- mailparse 0.15.0, 0BSD 
+- mailparse 0.16.1, 0BSD 
   <br/>https://github.com/staktrace/mailparse
 
 - mediatype 0.19.20, MIT 
@@ -489,10 +510,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - moka 0.12.11, (Apache-2.0 OR MIT) AND Apache-2.0 
   <br/>https://github.com/moka-rs/moka
 
-- mongodb 3.3.0, Apache-2.0 
+- mongodb 3.4.1, Apache-2.0 
   <br/>https://github.com/mongodb/mongo-rust-driver
 
-- mysql_async 0.35.1, Apache-2.0 OR MIT 
+- mysql_async 0.36.1, Apache-2.0 OR MIT 
   <br/>https://github.com/blackbeam/mysql_async
 
 - ndarray 0.15.6, Apache-2.0 OR MIT 
@@ -516,7 +537,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - octocrab 0.47.1, Apache-2.0 OR MIT 
   <br/>https://github.com/XAMPPRocky/octocrab.git
 
-- odbc-api 14.3.0, MIT 
+- odbc-api 20.1.0, MIT 
   <br/>https://github.com/pacman82/odbc-api
 
 - once_cell 1.21.3, Apache-2.0 OR MIT 
@@ -525,26 +546,32 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - opendal 0.54.1, Apache-2.0 
   <br/>https://github.com/apache/opendal
 
-- opentelemetry 0.27.1, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry 0.29.1, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry
 
 - opentelemetry 0.30.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry
 
-- opentelemetry-http 0.27.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry-http 0.29.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http
 
-- opentelemetry-prometheus 0.27.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry-otlp 0.29.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp
+
+- opentelemetry-prometheus 0.29.1, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-prometheus
+
+- opentelemetry-proto 0.29.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
 - opentelemetry-proto 0.30.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
-- opentelemetry-zipkin 0.27.0, Apache-2.0 
+- opentelemetry-zipkin 0.29.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-zipkin
 
-- opentelemetry_sdk 0.27.1, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
+- opentelemetry_sdk 0.29.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk
 
 - opentelemetry_sdk 0.30.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-sdk
@@ -582,7 +609,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - postcard 1.1.3, Apache-2.0 OR MIT 
   <br/>https://github.com/jamesmunns/postcard
 
-- prometheus 0.13.4, Apache-2.0 
+- prometheus 0.14.0, Apache-2.0 
   <br/>https://github.com/tikv/rust-prometheus
 
 - prost 0.11.9, Apache-2.0 
@@ -595,6 +622,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/tokio-rs/prost
 
 - prost 0.14.1, Apache-2.0 
+  <br/>https://github.com/tokio-rs/prost
+
+- prost-build 0.13.5, Apache-2.0 
   <br/>https://github.com/tokio-rs/prost
 
 - r2d2 0.8.10, Apache-2.0 OR MIT 
@@ -636,7 +666,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rstest 0.26.1, Apache-2.0 OR MIT 
   <br/>https://github.com/la10736/rstest
 
-- rusqlite 0.31.0, MIT 
+- rusqlite 0.37.0, MIT 
   <br/>https://github.com/rusqlite/rusqlite
 
 - rustls 0.21.12, Apache-2.0 OR ISC OR MIT 
@@ -705,7 +735,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - spiceai 3.1.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 1.9.0-unstable, Apache-2.0 
+- spicepod-validator 1.10.0, Apache-2.0 
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
@@ -716,6 +746,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - strsim 0.11.1, MIT 
   <br/>https://github.com/rapidfuzz/strsim-rs
+
+- subtle 2.6.1, BSD-3-Clause 
+  <br/>https://github.com/dalek-cryptography/subtle
 
 - suppaftp 6.3.0, Apache-2.0 OR MIT 
   <br/>https://github.com/veeso/suppaftp
@@ -768,7 +801,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokio-postgres 0.7.15, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-postgres/rust-postgres
 
-- tokio-rusqlite 0.5.1, MIT 
+- tokio-rusqlite 0.7.0, MIT 
   <br/>https://github.com/programatik29/tokio-rusqlite
 
 - tokio-rustls 0.24.1, Apache-2.0 OR MIT 
@@ -783,6 +816,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tokio-util 0.7.17, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
+- tonic 0.12.3, MIT 
+  <br/>https://github.com/hyperium/tonic
+
 - tonic 0.13.1, MIT 
   <br/>https://github.com/hyperium/tonic
 
@@ -795,7 +831,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tower 0.5.2, MIT 
   <br/>https://github.com/tower-rs/tower
 
-- tower-http 0.6.6, MIT 
+- tower-http 0.6.7, MIT 
   <br/>https://github.com/tower-rs/tower-http
 
 - tracing 0.1.41, MIT 
@@ -807,7 +843,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tracing-log 0.2.0, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
-- tracing-opentelemetry 0.28.0, MIT 
+- tracing-opentelemetry 0.30.0, MIT 
   <br/>https://github.com/tokio-rs/tracing-opentelemetry
 
 - tracing-subscriber 0.3.20, MIT 
@@ -821,9 +857,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - tract-onnx 0.22.0, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
-
-- trust-dns-resolver 0.23.2, Apache-2.0 OR MIT 
-  <br/>https://github.com/bluejekyll/trust-dns
 
 - turso 0.3.0, MIT 
   <br/>https://github.com/tursodatabase/turso
@@ -867,9 +900,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - vortex-decimal-byte-parts 0.1.0, Apache-2.0 
   <br/>https://github.com/spiraldb/vortex
 
-- vortex-dict 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
 - vortex-fastlanes 0.1.0, Apache-2.0 
   <br/>https://github.com/spiraldb/vortex
 
@@ -894,7 +924,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - winver 1.0.0, MIT 
   <br/>https://github.com/rhysd/winver
 
-- x509-certificate 0.23.1, MPL-2.0 
+- x509-certificate 0.25.0, MPL-2.0 
   <br/>https://github.com/indygreg/cryptography-rs.git
 
 - zip 0.6.6, MIT 
