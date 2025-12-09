@@ -39,7 +39,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::{Engine, Mode, RefreshMode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -226,6 +226,14 @@ impl Default for CayenneAccelerator {
     }
 }
 
+fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize {
+    acceleration
+        .params
+        .get(key)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -303,40 +311,21 @@ impl CayenneAccelerator {
         let mut config = cayenne::metadata::VortexConfig::default();
 
         if let Some(acceleration) = source.acceleration() {
-            // Helper to get enabled/disabled parameter with default
-            let get_enabled = |key: &str, default: bool| -> bool {
-                acceleration
-                    .params
-                    .get(key)
-                    .map_or(default, |v| util::parse_enabled(v))
-            };
-
-            // Helper to parse usize parameter
-            let parse_usize = |key: &str, default: usize| -> usize {
-                acceleration
-                    .params
-                    .get(key)
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(default)
-            };
-
-            // Parse encoding options - use VortexConfig defaults if not specified
-            config.enable_alp = get_enabled("cayenne_alp", config.enable_alp);
-            config.enable_fsst = get_enabled("cayenne_fsst", config.enable_fsst);
-            config.enable_bitpacking = get_enabled("cayenne_bitpacking", config.enable_bitpacking);
-            config.enable_delta = get_enabled("cayenne_delta", config.enable_delta);
-            config.enable_rle = get_enabled("cayenne_rle", config.enable_rle);
-            config.enable_dict = get_enabled("cayenne_dict", config.enable_dict);
-            config.enable_for = get_enabled("cayenne_for", config.enable_for);
-            config.enable_zigzag = get_enabled("cayenne_zigzag", config.enable_zigzag);
-
             // Parse cache options - use VortexConfig defaults if not specified
-            config.footer_cache_mb = parse_usize("cayenne_footer_cache_mb", config.footer_cache_mb);
-            config.segment_cache_mb =
-                parse_usize("cayenne_segment_cache_mb", config.segment_cache_mb);
+            config.footer_cache_mb = parse_usize(
+                acceleration,
+                "cayenne_footer_cache_mb",
+                config.footer_cache_mb,
+            );
+            config.segment_cache_mb = parse_usize(
+                acceleration,
+                "cayenne_segment_cache_mb",
+                config.segment_cache_mb,
+            );
 
             // Parse file size options
             config.target_vortex_file_size_mb = parse_usize(
+                acceleration,
                 "cayenne_target_file_size_mb",
                 config.target_vortex_file_size_mb,
             );
@@ -351,15 +340,7 @@ impl CayenneAccelerator {
             }
 
             tracing::debug!(
-                "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}",
-                config.enable_alp,
-                config.enable_fsst,
-                config.enable_bitpacking,
-                config.enable_delta,
-                config.enable_rle,
-                config.enable_dict,
-                config.enable_for,
-                config.enable_zigzag,
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -507,37 +488,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("unsupported_type_action")
         .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
-    // Vortex encoding configuration for hardware acceleration
-    ParameterSpec::component("cayenne_alp")
-        .description("Enable Adaptive Lossless Precision (ALP) encoding for numeric columns. Provides 5-10x compression with SIMD decompression on ARM64 (NEON) and x86_64 (AVX2/AVX-512). Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_fsst")
-        .description("Enable Fast String Suffix Trie (FSST) encoding for string columns. Provides 2-5x compression with SIMD acceleration. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_bitpacking")
-        .description("Enable BitPacking encoding for integer columns. Provides SIMD-optimized integer unpacking, especially effective on ARM64 with NEON. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_delta")
-        .description("Enable Delta encoding for sorted/sequential numeric data. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_rle")
-        .description("Enable Run-Length Encoding (RLE) for data with repeated values. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_dict")
-        .description("Enable Dictionary encoding for low-cardinality columns. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_for")
-        .description("Enable Frame-of-Reference (FOR) encoding for integer columns with small ranges. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_zigzag")
-        .description("Enable ZigZag encoding for signed integers. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_footer_cache_mb")
-        .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 64 MB")
-        .default("64"),
-    ParameterSpec::component("cayenne_segment_cache_mb")
-        .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 0 (disabled)")
-        .default("0"),
+    ParameterSpec::component("footer_cache_mb")
+        .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB")
+        .default("128"),
+    ParameterSpec::component("segment_cache_mb")
+        .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
+        .default("256"),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
