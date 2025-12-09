@@ -67,7 +67,7 @@ impl ResolvedTableAwareAllowlist {
     }
 
     /// Check if the provided [`TableReference`] is allowed by the allowlist.
-    #[must_use] 
+    #[must_use]
     pub fn table_is_allowed(&self, table: &TableReference) -> bool {
         let resolved = table
             .clone()

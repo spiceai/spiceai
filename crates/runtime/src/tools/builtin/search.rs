@@ -53,7 +53,7 @@ impl SearchTool {
             table_allowlist: None,
         }
     }
-    #[must_use] 
+    #[must_use]
     pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
         self.table_allowlist = allowlist;
         self

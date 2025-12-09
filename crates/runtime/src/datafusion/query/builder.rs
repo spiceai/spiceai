@@ -44,7 +44,7 @@ impl<'a> QueryBuilder<'a> {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn allow_tables(mut self, allowed_tables: ResolvedTableAwareAllowlist) -> Self {
         self.table_allowlist = Some(allowed_tables);
         self
