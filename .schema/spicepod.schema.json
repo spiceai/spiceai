@@ -300,6 +300,7 @@
       ]
     },
     "ApiKey": {
+      "description": "API key for authentication. Keys can be read-only or read-write.\nThe key value is redacted in Debug output to prevent credential leakage.\n\nAll comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use\nconstant-time comparison via the `subtle` crate to prevent timing attacks.",
       "oneOf": [
         {
           "type": "object",
@@ -389,19 +390,17 @@
     "CacheConfig": {
       "type": "object",
       "properties": {
+        "caching_policy": {
+          "$ref": "#/$defs/CachingPolicy",
+          "default": "lru"
+        },
         "enabled": {
           "type": "boolean",
           "default": true
         },
-        "eviction_policy": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "hashing_algorithm": {
           "$ref": "#/$defs/HashingAlgorithm",
-          "default": "siphash"
+          "default": "xxh3"
         },
         "item_ttl": {
           "type": [
@@ -460,6 +459,20 @@
         }
       },
       "additionalProperties": false
+    },
+    "CachingPolicy": {
+      "oneOf": [
+        {
+          "description": "Least Recently Used caching policy.\nSuitable for workloads with strong recency bias, such as streaming data processing.",
+          "type": "string",
+          "const": "lru"
+        },
+        {
+          "description": "`TinyLFU` caching policy.\nCombines LRU eviction with LFU-based admission policy.\nSuitable for most workloads including database, search, and analytics.",
+          "type": "string",
+          "const": "tiny_lfu"
+        }
+      ]
     },
     "Catalog": {
       "type": "object",
@@ -1135,6 +1148,7 @@
       "enum": [
         "siphash",
         "ahash",
+        "blake3",
         "xxh3",
         "xxh32",
         "xxh64",
@@ -1227,10 +1241,23 @@
       ]
     },
     "Mode": {
-      "type": "string",
-      "enum": [
-        "memory",
-        "file"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "memory"
+          ]
+        },
+        {
+          "description": "Open an existing file if it exists, otherwise create a new one.\nThis is the default file behavior that preserves data across restarts.",
+          "type": "string",
+          "const": "file"
+        },
+        {
+          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.",
+          "type": "string",
+          "const": "file_create"
+        }
       ]
     },
     "Model": {
@@ -1347,6 +1374,37 @@
         "upsert_dedup_by_row_id"
       ]
     },
+    "OtelExporterConfig": {
+      "description": "Configuration for pushing metrics to an OpenTelemetry collector.\n\nThe protocol is inferred from the endpoint:\n- **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`\n- **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)\n\n# Examples\n\ngRPC (hostname only, port defaults to 4317):\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"otel-collector\"\n```\n\nWith metric whitelist:\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"otel-collector:4317\"\n  metrics:\n    - requests_total\n    - request_duration_seconds\n```\n\nHTTP:\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"http://localhost:4318/v1/metrics\"\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the OTEL exporter is enabled",
+          "type": "boolean",
+          "default": true
+        },
+        "endpoint": {
+          "description": "The endpoint of the OTEL collector.\n\nFor gRPC: use hostname with optional port (e.g., `otel-collector` or `localhost:4317`)\nFor HTTP: use full URL (e.g., `http://localhost:4318/v1/metrics`)",
+          "type": "string"
+        },
+        "metrics": {
+          "description": "Optional whitelist of metric names to export.\nIf not specified or empty, all metrics are exported.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "push_interval": {
+          "description": "How often to push metrics to the collector (e.g., \"30s\", \"1m\", \"5m\")",
+          "type": "string",
+          "default": "60s"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "endpoint"
+      ]
+    },
     "OutputLevel": {
       "type": "string",
       "enum": [
@@ -1444,7 +1502,8 @@
       "enum": [
         "full",
         "append",
-        "changes"
+        "changes",
+        "caching"
       ]
     },
     "RefreshOnStartup": {
@@ -1483,19 +1542,17 @@
             "null"
           ]
         },
+        "caching_policy": {
+          "$ref": "#/$defs/CachingPolicy",
+          "default": "lru"
+        },
         "enabled": {
           "type": "boolean",
           "default": true
         },
-        "eviction_policy": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "hashing_algorithm": {
           "$ref": "#/$defs/HashingAlgorithm",
-          "default": "siphash"
+          "default": "xxh3"
         },
         "item_ttl": {
           "type": [
@@ -1707,6 +1764,10 @@
           "$ref": "#/$defs/CacheKeyType",
           "default": "plan"
         },
+        "caching_policy": {
+          "$ref": "#/$defs/CachingPolicy",
+          "default": "lru"
+        },
         "enabled": {
           "type": "boolean",
           "default": true
@@ -1716,15 +1777,9 @@
           "$ref": "#/$defs/Encoding",
           "default": "none"
         },
-        "eviction_policy": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "hashing_algorithm": {
           "$ref": "#/$defs/HashingAlgorithm",
-          "default": "siphash"
+          "default": "xxh3"
         },
         "item_ttl": {
           "type": [
@@ -1906,6 +1961,17 @@
         "enabled": {
           "type": "boolean",
           "default": true
+        },
+        "otel_exporter": {
+          "description": "Optional configuration for pushing metrics to an OpenTelemetry collector",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OtelExporterConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "properties": {
           "type": "object",
