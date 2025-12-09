@@ -19,3 +19,6 @@ futures.workspace = true
 serde.workspace = true
 util = { path = "../util" }
 humantime.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
