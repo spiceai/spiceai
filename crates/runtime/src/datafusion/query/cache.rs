@@ -186,9 +186,7 @@ impl Query {
         ))
     }
 
-    ///
-    ///
-    /// If [`QueryTracker::finish_with_error`] is called, this function will always return an error.
+    /// Get the logical plan for the given SQL query, applying parameter values if provided.
     pub(super) async fn get_plan(
         df: &Arc<DataFusion>,
         session: &SessionState,
