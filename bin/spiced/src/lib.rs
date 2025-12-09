@@ -439,6 +439,10 @@ async fn start_anonymous_telemetry(
     spicepod_telemetry_config: Option<&TelemetryConfig>,
     spicepod_name: Option<&String>,
 ) {
+    // Always log hardware info at debug level regardless of telemetry settings
+    let hardware_info = telemetry::hardware::HardwareInfo::detect();
+    hardware_info.log_debug();
+
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 

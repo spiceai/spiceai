@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{exporter::TelemetryExporterBuilder, reader::InitialReader};
+use crate::{exporter::TelemetryExporterBuilder, hardware::HardwareInfo, reader::InitialReader};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     Resource,
@@ -58,6 +58,9 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
+    // Detect hardware info (vCPUs, GPUs, and memory)
+    let hardware_info = HardwareInfo::detect();
+
     Resource::builder_empty()
         .with_attributes(telemetry_properties.into_iter().chain(vec![
             KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
@@ -65,6 +68,18 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             KeyValue::new("service.instance.id", instance_id),
             KeyValue::new("spicepod.id", spicepod_id),
+            KeyValue::new(
+                "host.cpu.count",
+                i64::try_from(hardware_info.vcpu_count).unwrap_or(0),
+            ),
+            KeyValue::new(
+                "host.gpu.count",
+                i64::try_from(hardware_info.gpu_count).unwrap_or(0),
+            ),
+            KeyValue::new(
+                "host.memory.bytes",
+                i64::try_from(hardware_info.total_memory_bytes).unwrap_or(0),
+            ),
         ]))
         .build()
 }
