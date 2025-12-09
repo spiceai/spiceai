@@ -96,7 +96,7 @@ impl SpiceModelTool for SearchTool {
                         .collect::<Vec<String>>(),
                 ),
                 (None, Some(allowlist)) => {
-                    let tables = get_dataset_elements(self.rt.clone(), Some(allowlist))
+                    let tables = get_dataset_elements(Arc::clone(&self.rt), Some(allowlist))
                         .await
                         .into_iter()
                         .map(|d| d.table)
