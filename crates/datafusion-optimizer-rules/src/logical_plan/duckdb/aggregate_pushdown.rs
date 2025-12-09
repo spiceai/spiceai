@@ -87,8 +87,8 @@ impl DuckDBAggregateLogicalPushdown {
             Some("duckdb")
         ) && schema_meta
             .get(SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY)
-            .map_or("disabled".to_string(), |p| p.to_lowercase())
-            == "enabled";
+            .map_or("disabled", |p| p.as_str())
+            .eq_ignore_ascii_case("enabled");
         Ok(should_optimize)
     }
 

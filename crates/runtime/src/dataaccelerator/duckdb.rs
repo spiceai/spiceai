@@ -555,7 +555,8 @@ pub(crate) async fn create_table_provider(
     let agg_pushdown_optimization = cmd
         .options
         .get("aggregate_pushdown_optimization")
-        .map_or("disabled".to_string(), |v| v.to_lowercase());
+        .map_or("disabled", |v| v.as_str())
+        .to_lowercase();
 
     schema_metadata.insert(
         SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
