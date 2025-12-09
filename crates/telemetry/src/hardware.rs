@@ -24,10 +24,15 @@ limitations under the License.
 //! For containerized deployments, this module automatically detects and respects
 //! container resource limits from cgroup v1 and v2:
 //!
-//! - **CPU limits**: Reads from `/sys/fs/cgroup/cpu.max` (v2) or
-//!   `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` (v1)
-//! - **Memory limits**: Reads from `/sys/fs/cgroup/memory.max` (v2) or
-//!   `/sys/fs/cgroup/memory/memory.limit_in_bytes` (v1)
+//! - **CPU limits**: Reads from cgroup v2 `cpu.max` or cgroup v1 `cpu.cfs_quota_us`
+//! - **Memory limits**: Reads from cgroup v2 `memory.max` or cgroup v1 `memory.limit_in_bytes`
+//!
+//! ### Cgroup Path Resolution
+//!
+//! The cgroup files may be located at:
+//! 1. Process-specific path: `/sys/fs/cgroup/<cgroup_path>/{cpu.max,memory.max}`
+//!    where `<cgroup_path>` is read from `/proc/self/cgroup`
+//! 2. Root cgroup: `/sys/fs/cgroup/{cpu.max,memory.max}` (containers in root cgroup)
 //!
 //! ## GPU Detection
 //!
@@ -148,9 +153,52 @@ fn get_container_cpu_limit() -> Option<usize> {
     get_cgroup_v1_cpu_limit()
 }
 
+/// Gets the process's cgroup path from `/proc/self/cgroup`.
+///
+/// For cgroup v2 unified hierarchy, the format is:
+/// `0::<path>` where `<path>` is the cgroup path relative to `/sys/fs/cgroup`
+///
+/// For cgroup v1, there may be multiple lines with different controllers.
+/// Returns the path for cgroup v2 (line starting with `0::`) if present.
+fn get_process_cgroup_path() -> Option<String> {
+    let contents = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    parse_proc_cgroup_v2_path(&contents)
+}
+
+/// Parses `/proc/self/cgroup` to extract the cgroup v2 path.
+///
+/// Expected format for cgroup v2: `0::<path>`
+/// Example: `0::/user.slice/user-1000.slice/user@1000.service/app.slice/run.service`
+fn parse_proc_cgroup_v2_path(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        // cgroup v2 unified hierarchy has format "0::<path>"
+        if let Some(path) = line.strip_prefix("0::") {
+            // Don't return empty or root path - those are handled by root cgroup fallback
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && trimmed != "/" {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Reads CPU limit from cgroup v2.
-/// cgroup v2 uses cpu.max file with format: "$MAX $PERIOD"
+/// cgroup v2 uses `cpu.max` file with format: `$MAX $PERIOD`
+///
+/// On cgroup v2 unified hierarchy, the `cpu.max` file may be in:
+/// 1. Process-specific path: `/sys/fs/cgroup/<cgroup_path>/cpu.max`
+/// 2. Root path: `/sys/fs/cgroup/cpu.max` (for containers in root cgroup)
 fn get_cgroup_v2_cpu_limit() -> Option<usize> {
+    // Try process-specific cgroup path first (common on systemd-managed systems)
+    if let Some(cgroup_path) = get_process_cgroup_path() {
+        let path = format!("/sys/fs/cgroup{cgroup_path}/cpu.max");
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            return parse_cgroup_v2_cpu_max(&contents);
+        }
+    }
+
+    // Fall back to root cgroup path (containers often mount cgroup at root)
     let contents = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
     parse_cgroup_v2_cpu_max(&contents)
 }
@@ -249,7 +297,20 @@ fn get_container_memory_limit() -> Option<u64> {
 }
 
 /// Reads memory limit from cgroup v2.
+///
+/// On cgroup v2 unified hierarchy, the `memory.max` file may be in:
+/// 1. Process-specific path: `/sys/fs/cgroup/<cgroup_path>/memory.max`
+/// 2. Root path: `/sys/fs/cgroup/memory.max` (for containers in root cgroup)
 fn get_cgroup_v2_memory_limit() -> Option<u64> {
+    // Try process-specific cgroup path first (common on systemd-managed systems)
+    if let Some(cgroup_path) = get_process_cgroup_path() {
+        let path = format!("/sys/fs/cgroup{cgroup_path}/memory.max");
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            return parse_cgroup_v2_memory_max(&contents);
+        }
+    }
+
+    // Fall back to root cgroup path (containers often mount cgroup at root)
     let contents = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
     parse_cgroup_v2_memory_max(&contents)
 }
@@ -557,6 +618,62 @@ mod tests {
         assert_eq!(parse_cgroup_v1_cpu_quota("100000", ""), None);
         assert_eq!(parse_cgroup_v1_cpu_quota("invalid", "100000"), None);
         assert_eq!(parse_cgroup_v1_cpu_quota("100000", "0"), None); // Zero period
+    }
+
+    #[test]
+    fn test_parse_proc_cgroup_v2_path_user_slice() {
+        // Typical user session on systemd-managed Linux
+        let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-p363181-i363182.service\n";
+        assert_eq!(
+            parse_proc_cgroup_v2_path(contents),
+            Some("/user.slice/user-1000.slice/user@1000.service/app.slice/run-p363181-i363182.service".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_proc_cgroup_v2_path_container() {
+        // Docker container with cgroup v2
+        let contents = "0::/docker/abc123def456\n";
+        assert_eq!(
+            parse_proc_cgroup_v2_path(contents),
+            Some("/docker/abc123def456".to_string())
+        );
+
+        // Kubernetes pod
+        let contents = "0::/kubepods/besteffort/pod12345/container-abc\n";
+        assert_eq!(
+            parse_proc_cgroup_v2_path(contents),
+            Some("/kubepods/besteffort/pod12345/container-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_proc_cgroup_v2_path_root() {
+        // Root cgroup should return None (handled by fallback)
+        let contents = "0::/\n";
+        assert_eq!(parse_proc_cgroup_v2_path(contents), None);
+
+        // Empty path should also return None
+        let contents = "0::\n";
+        assert_eq!(parse_proc_cgroup_v2_path(contents), None);
+    }
+
+    #[test]
+    fn test_parse_proc_cgroup_v2_path_cgroup_v1_only() {
+        // cgroup v1 only (no 0:: line)
+        let contents =
+            "12:blkio:/docker/abc123\n11:memory:/docker/abc123\n10:cpu,cpuacct:/docker/abc123\n";
+        assert_eq!(parse_proc_cgroup_v2_path(contents), None);
+    }
+
+    #[test]
+    fn test_parse_proc_cgroup_v2_path_hybrid() {
+        // Hybrid cgroup v1/v2 setup (some distros)
+        let contents = "12:blkio:/docker/abc123\n0::/system.slice/docker.service\n";
+        assert_eq!(
+            parse_proc_cgroup_v2_path(contents),
+            Some("/system.slice/docker.service".to_string())
+        );
     }
 
     // -------------------------------------------------------------------------
