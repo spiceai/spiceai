@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
 use aws_sdk_dynamodbstreams::error::SdkError;
 use aws_sdk_dynamodbstreams::operation::describe_stream::DescribeStreamError;
@@ -89,6 +90,22 @@ pub enum Error {
     IteratorExpired,
 }
 
+/// Checks if an error code indicates a retriable throttling condition.
+///
+/// AWS SDK may return throttling errors as "unhandled" errors with specific error codes.
+/// This function checks for common throttling-related error codes.
+fn is_throttling_error_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "ThrottlingException"
+                | "Throttling"
+                | "ProvisionedThroughputExceededException"
+                | "RequestLimitExceeded"
+        )
+    )
+}
+
 impl Error {
     #[must_use]
     pub fn is_retriable(&self) -> bool {
@@ -105,6 +122,7 @@ impl Error {
 
             SdkError::ServiceError(e) => match e.err() {
                 DescribeTableError::ResourceNotFoundException(_) => Error::TableNotFound,
+                other if is_throttling_error_code(other.code()) => Error::Throttled,
                 _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
@@ -123,6 +141,7 @@ impl Error {
 
             SdkError::ServiceError(e) => match e.err() {
                 DescribeStreamError::ResourceNotFoundException(_) => Error::StreamNotFound,
+                other if is_throttling_error_code(other.code()) => Error::Throttled,
                 _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
@@ -143,6 +162,7 @@ impl Error {
                 GetRecordsError::ExpiredIteratorException(_) => Error::IteratorExpired,
                 GetRecordsError::LimitExceededException(_) => Error::Throttled,
                 GetRecordsError::TrimmedDataAccessException(_) => Error::StreamBeyondRetention,
+                other if is_throttling_error_code(other.code()) => Error::Throttled,
                 _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
@@ -164,6 +184,7 @@ impl Error {
                     Error::StreamBeyondRetention
                 }
                 GetShardIteratorError::ResourceNotFoundException(_) => Error::ShardNotFound,
+                other if is_throttling_error_code(other.code()) => Error::Throttled,
                 _ => Error::SdkError {
                     source: Box::new(e.into_err()),
                 },
