@@ -289,20 +289,10 @@ util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
 vortex = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-alp = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
 vortex-array = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-bytebool = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
 vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-datetime-parts = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-decimal-byte-parts = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-fastlanes = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-fsst = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-runend = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-sequence = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
 vortex-session = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-sparse = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
 vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
-vortex-zigzag = { git = "https://github.com/spiceai/vortex", rev = "c279ace2ebe54eee109c760930621979cff6372f" }
 x509-certificate = "0.25.0"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
