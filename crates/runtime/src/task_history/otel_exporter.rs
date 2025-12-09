@@ -77,7 +77,11 @@ impl TaskHistoryExporter {
         }
     }
 
-    fn process_output(&self, output: Arc<str>) -> Arc<str> {
+    fn process_output(&self, output: Arc<str>, force_capture: bool) -> Arc<str> {
+        if force_capture {
+            return output;
+        }
+
         match self.captured_output {
             TaskHistoryCapturedOutput::None => "".into(),
             TaskHistoryCapturedOutput::Truncated => output,
@@ -123,7 +127,8 @@ impl TaskHistoryExporter {
                 tracing::Level::INFO,
                 "plan",
                 input = %explain_query,
-                runtime_query = true
+                runtime_query = true,
+                plan_capture = true
             );
             plan_span.record("parent_id", span.span_id.as_ref());
 
@@ -147,9 +152,6 @@ impl TaskHistoryExporter {
                             }
                         }
 
-                        // Format the batches as a pretty-printed string and capture it
-                        // This ensures the EXPLAIN output is always captured regardless of
-                        // the global captured_output setting
                         match pretty_format_batches(&batches) {
                             Ok(formatted) => {
                                 let output = formatted.to_string();
@@ -212,9 +214,6 @@ impl TaskHistoryExporter {
                 None
             });
 
-        let captured_output: Option<Arc<str>> =
-            extract_attr!(span, "captured_output").map(|output| self.process_output(output));
-
         let start_time = span.start_time;
         let end_time = span.end_time;
         let execution_duration_ms = end_time
@@ -260,6 +259,17 @@ impl TaskHistoryExporter {
             labels.insert("runtime_query".into(), "true".into());
         }
 
+        let plan_capture = span.attributes.iter().any(|kv| {
+            kv.key.as_str() == "plan_capture"
+                && matches!(kv.value, opentelemetry::Value::Bool(true))
+        });
+        if plan_capture {
+            labels.insert("plan_capture".into(), "true".into());
+        }
+
+        let captured_output: Option<Arc<str>> = extract_attr!(span, "captured_output")
+            .map(|output| self.process_output(output, plan_capture));
+
         // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
         labels.remove(&Into::<Arc<str>>::into("trace_id"));
         labels.remove(&Into::<Arc<str>>::into("parent_id"));
@@ -293,6 +303,11 @@ impl SpanExporter for TaskHistoryExporter {
         let df = Arc::clone(&self.df);
 
         let should_include = |task_span: &TaskSpan| {
+            // Always include plan capture spans regardless of duration since they are already
+            // filtered by min_plan_duration when created.
+            if task_span.labels.contains_key("plan_capture") {
+                return true;
+            }
             min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
         };
         let spans: Vec<TaskSpan> = batch
