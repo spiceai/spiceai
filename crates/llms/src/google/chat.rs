@@ -78,6 +78,7 @@ impl Chat for Google {
     }
 }
 
+#[expect(clippy::too_many_lines)]
 fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateContentRequest {
     let mut contents = Vec::new();
 
