@@ -130,6 +130,14 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench

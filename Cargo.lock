@@ -3011,19 +3011,8 @@ dependencies = [
  "util",
  "uuid 1.18.1",
  "vortex",
- "vortex-alp",
- "vortex-array",
- "vortex-bytebool",
  "vortex-datafusion",
- "vortex-datetime-parts",
- "vortex-decimal-byte-parts",
- "vortex-fastlanes",
- "vortex-fsst",
- "vortex-runend",
- "vortex-sequence",
  "vortex-session",
- "vortex-sparse",
- "vortex-zigzag",
 ]
 
 [[package]]
@@ -3173,6 +3162,7 @@ dependencies = [
 name = "chunking"
 version = "1.10.0-unstable"
 dependencies = [
+ "criterion 0.7.0",
  "snafu",
  "text-splitter",
  "tiktoken-rs",
@@ -5492,6 +5482,7 @@ dependencies = [
  "futures",
  "humantime",
  "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tracing",
