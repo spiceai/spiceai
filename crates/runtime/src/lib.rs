@@ -103,6 +103,7 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod otel_push_exporter;
 pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;

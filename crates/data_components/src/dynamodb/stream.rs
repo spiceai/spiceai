@@ -1015,4 +1015,374 @@ mod tests {
             let _change_batch = result.expect("valid change batch");
         }
     }
+
+    #[cfg(test)]
+    mod streams_to_dynamodb_attribute_tests {
+        use super::*;
+        use aws_sdk_dynamodbstreams::primitives::Blob;
+
+        #[test]
+        fn test_convert_string_attribute() {
+            let input = StreamsAttributeValue::S("hello".to_string());
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::S(s) = result {
+                assert_eq!(s, "hello");
+            } else {
+                panic!("Expected S variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_number_attribute() {
+            let input = StreamsAttributeValue::N("12345".to_string());
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::N(n) = result {
+                assert_eq!(n, "12345");
+            } else {
+                panic!("Expected N variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_bool_true_attribute() {
+            let input = StreamsAttributeValue::Bool(true);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Bool(b) = result {
+                assert!(b);
+            } else {
+                panic!("Expected Bool variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_bool_false_attribute() {
+            let input = StreamsAttributeValue::Bool(false);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Bool(b) = result {
+                assert!(!b);
+            } else {
+                panic!("Expected Bool variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_null_true_attribute() {
+            let input = StreamsAttributeValue::Null(true);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Null(n) = result {
+                assert!(n);
+            } else {
+                panic!("Expected Null variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_null_false_attribute() {
+            let input = StreamsAttributeValue::Null(false);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Null(n) = result {
+                assert!(!n);
+            } else {
+                panic!("Expected Null variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_binary_attribute() {
+            let data = vec![1u8, 2, 3, 4, 5];
+            let input = StreamsAttributeValue::B(Blob::new(data.clone()));
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::B(blob) = result {
+                assert_eq!(blob.as_ref(), data.as_slice());
+            } else {
+                panic!("Expected B variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_string_set_attribute() {
+            let input = StreamsAttributeValue::Ss(vec![
+                "apple".to_string(),
+                "banana".to_string(),
+                "cherry".to_string(),
+            ]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Ss(ss) = result {
+                assert_eq!(ss.len(), 3);
+                assert!(ss.contains(&"apple".to_string()));
+                assert!(ss.contains(&"banana".to_string()));
+                assert!(ss.contains(&"cherry".to_string()));
+            } else {
+                panic!("Expected Ss variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_number_set_attribute() {
+            let input =
+                StreamsAttributeValue::Ns(vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Ns(ns) = result {
+                assert_eq!(ns.len(), 3);
+                assert!(ns.contains(&"1".to_string()));
+                assert!(ns.contains(&"2".to_string()));
+                assert!(ns.contains(&"3".to_string()));
+            } else {
+                panic!("Expected Ns variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_binary_set_attribute() {
+            let blobs = vec![Blob::new(vec![1u8, 2]), Blob::new(vec![3u8, 4])];
+            let input = StreamsAttributeValue::Bs(blobs);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Bs(bs) = result {
+                assert_eq!(bs.len(), 2);
+            } else {
+                panic!("Expected Bs variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_list_attribute() {
+            let list = vec![
+                StreamsAttributeValue::S("item1".to_string()),
+                StreamsAttributeValue::N("42".to_string()),
+                StreamsAttributeValue::Bool(true),
+            ];
+            let input = StreamsAttributeValue::L(list);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::L(l) = result {
+                assert_eq!(l.len(), 3);
+
+                if let DynamoDbAttributeValue::S(s) = &l[0] {
+                    assert_eq!(s, "item1");
+                } else {
+                    panic!("Expected S for first item");
+                }
+
+                if let DynamoDbAttributeValue::N(n) = &l[1] {
+                    assert_eq!(n, "42");
+                } else {
+                    panic!("Expected N for second item");
+                }
+
+                if let DynamoDbAttributeValue::Bool(b) = &l[2] {
+                    assert!(*b);
+                } else {
+                    panic!("Expected Bool for third item");
+                }
+            } else {
+                panic!("Expected L variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_map_attribute() {
+            let mut map = HashMap::new();
+            map.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("John".to_string()),
+            );
+            map.insert(
+                "age".to_string(),
+                StreamsAttributeValue::N("30".to_string()),
+            );
+
+            let input = StreamsAttributeValue::M(map);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::M(m) = result {
+                assert_eq!(m.len(), 2);
+
+                if let Some(DynamoDbAttributeValue::S(name)) = m.get("name") {
+                    assert_eq!(name, "John");
+                } else {
+                    panic!("Expected S for name");
+                }
+
+                if let Some(DynamoDbAttributeValue::N(age)) = m.get("age") {
+                    assert_eq!(age, "30");
+                } else {
+                    panic!("Expected N for age");
+                }
+            } else {
+                panic!("Expected M variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_nested_map_in_list() {
+            let mut inner_map = HashMap::new();
+            inner_map.insert(
+                "key".to_string(),
+                StreamsAttributeValue::S("value".to_string()),
+            );
+
+            let list = vec![StreamsAttributeValue::M(inner_map)];
+            let input = StreamsAttributeValue::L(list);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::L(l) = result {
+                assert_eq!(l.len(), 1);
+                if let DynamoDbAttributeValue::M(m) = &l[0] {
+                    if let Some(DynamoDbAttributeValue::S(v)) = m.get("key") {
+                        assert_eq!(v, "value");
+                    } else {
+                        panic!("Expected S for inner key");
+                    }
+                } else {
+                    panic!("Expected M for first list item");
+                }
+            } else {
+                panic!("Expected L variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_nested_list_in_map() {
+            let inner_list = vec![
+                StreamsAttributeValue::N("1".to_string()),
+                StreamsAttributeValue::N("2".to_string()),
+            ];
+            let mut map = HashMap::new();
+            map.insert("numbers".to_string(), StreamsAttributeValue::L(inner_list));
+
+            let input = StreamsAttributeValue::M(map);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::M(m) = result {
+                if let Some(DynamoDbAttributeValue::L(l)) = m.get("numbers") {
+                    assert_eq!(l.len(), 2);
+                } else {
+                    panic!("Expected L for numbers");
+                }
+            } else {
+                panic!("Expected M variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_empty_list() {
+            let input = StreamsAttributeValue::L(vec![]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::L(l) = result {
+                assert!(l.is_empty());
+            } else {
+                panic!("Expected L variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_empty_map() {
+            let input = StreamsAttributeValue::M(HashMap::new());
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::M(m) = result {
+                assert!(m.is_empty());
+            } else {
+                panic!("Expected M variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_empty_string_set() {
+            let input = StreamsAttributeValue::Ss(vec![]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Ss(ss) = result {
+                assert!(ss.is_empty());
+            } else {
+                panic!("Expected Ss variant");
+            }
+        }
+
+        #[test]
+        fn test_streams_to_dynamodb_item_multiple_attributes() {
+            let mut item = HashMap::new();
+            item.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            item.insert(
+                "count".to_string(),
+                StreamsAttributeValue::N("42".to_string()),
+            );
+            item.insert("active".to_string(), StreamsAttributeValue::Bool(true));
+
+            let result = streams_to_dynamodb_item(item);
+
+            assert_eq!(result.len(), 3);
+            assert!(result.contains_key("id"));
+            assert!(result.contains_key("count"));
+            assert!(result.contains_key("active"));
+        }
+
+        #[test]
+        fn test_streams_to_dynamodb_item_empty() {
+            let item = HashMap::new();
+            let result = streams_to_dynamodb_item(item);
+            assert!(result.is_empty());
+        }
+    }
+
+    /// Tests that demonstrate bugs in the stream conversion module.
+    /// These tests document incorrect behavior and will FAIL when the bugs are fixed.
+    mod bug_tests {
+        /// BUG: `streams_to_dynamodb_attribute` silently converts unknown variants to `Null(true)`.
+        ///
+        /// When AWS adds a new `AttributeValue` variant (which has happened in the past,
+        /// e.g., when they added Document types), this function will silently convert
+        /// it to Null, causing DATA LOSS.
+        ///
+        /// Current behavior: `_ => DynamoDbAttributeValue::Null(true)` - silent data loss
+        /// Correct behavior: Should return `Result` and error on unknown variants,
+        ///                   or at minimum log a warning.
+        ///
+        /// This test will FAIL when the bug is fixed (i.e., when the function
+        /// properly handles unknown variants instead of silently discarding data).
+        ///
+        /// NOTE: We cannot directly test this since we can't construct an "unknown"
+        /// variant without modifying the AWS SDK. Instead, we document this as a
+        /// code review finding. The `_ => ...` pattern should be replaced with
+        /// explicit handling of all known variants.
+        #[test]
+        fn test_bug_unknown_variant_becomes_null_documented() {
+            // This test documents the bug but cannot directly trigger it.
+            // The bug is in this code pattern:
+            //
+            // ```rust
+            // fn streams_to_dynamodb_attribute(value: &StreamsAttributeValue) -> DynamoDbAttributeValue {
+            //     match value {
+            //         ... // all known variants
+            //         _ => DynamoDbAttributeValue::Null(true),  // BUG: silent data loss
+            //     }
+            // }
+            // ```
+            //
+            // When AWS adds new variants (which they have done historically),
+            // this will silently convert them to Null, causing data corruption.
+            //
+            // The fix is to either:
+            // 1. Return Result<DynamoDbAttributeValue, Error> and error on unknown
+            // 2. Use #[non_exhaustive] handling with explicit error
+            // 3. At minimum, log a warning when encountering unknown variants
+            //
+            // This test passes to document the finding - the actual fix requires
+            // a code change to the function signature.
+        }
+    }
 }

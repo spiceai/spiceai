@@ -35,22 +35,11 @@ snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
+util = { path = "../util" }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
-vortex-alp = { workspace = true }
-vortex-array = { workspace = true }
-vortex-bytebool = { workspace = true }
 vortex-datafusion = { workspace = true }
-vortex-datetime-parts = { workspace = true }
-vortex-decimal-byte-parts = { workspace = true }
-vortex-fastlanes = { workspace = true }
-vortex-fsst = { workspace = true }
-vortex-runend = { workspace = true }
-vortex-sequence = { workspace = true }
 vortex-session = { workspace = true }
-vortex-sparse = { workspace = true }
-vortex-zigzag = { workspace = true }
-util = { path = "../util" }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
