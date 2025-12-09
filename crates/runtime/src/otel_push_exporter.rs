@@ -34,8 +34,12 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::metrics::{
-    PeriodicReader, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
+use opentelemetry_sdk::{
+    metrics::{
+        Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
+        periodic_reader_with_async_runtime::PeriodicReader,
+    },
+    runtime::Tokio,
 };
 use reqwest::Client;
 use snafu::prelude::*;
@@ -189,7 +193,7 @@ pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPe
     // Wrap with filtering exporter
     let exporter = FilteringExporter::new(inner_exporter, &config.metrics);
 
-    let reader = PeriodicReader::builder(exporter)
+    let reader = PeriodicReader::builder(exporter, Tokio)
         .with_interval(push_interval)
         .build();
 
