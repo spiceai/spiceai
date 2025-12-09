@@ -33,6 +33,11 @@ use crate::datafusion::DataFusion;
 
 use super::TaskSpan;
 
+/// Label key used to identify plan capture spans in OpenTelemetry traces.
+/// This is used to override the default behavior of captured_output processing to ensure that
+/// plan capture spans always retain their output.
+const PLAN_CAPTURE_LABEL: &str = "plan_capture";
+
 macro_rules! extract_attr {
     ($span:expr, $key:expr) => {
         $span.events.iter().find_map(|event| {
@@ -260,11 +265,11 @@ impl TaskHistoryExporter {
         }
 
         let plan_capture = span.attributes.iter().any(|kv| {
-            kv.key.as_str() == "plan_capture"
+            kv.key.as_str() == PLAN_CAPTURE_LABEL
                 && matches!(kv.value, opentelemetry::Value::Bool(true))
         });
         if plan_capture {
-            labels.insert("plan_capture".into(), "true".into());
+            labels.insert(PLAN_CAPTURE_LABEL.into(), "true".into());
         }
 
         let captured_output: Option<Arc<str>> = extract_attr!(span, "captured_output")
@@ -305,7 +310,7 @@ impl SpanExporter for TaskHistoryExporter {
         let should_include = |task_span: &TaskSpan| {
             // Always include plan capture spans regardless of duration since they are already
             // filtered by min_plan_duration when created.
-            if task_span.labels.contains_key("plan_capture") {
+            if task_span.labels.contains_key(PLAN_CAPTURE_LABEL) {
                 return true;
             }
             min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
