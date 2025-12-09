@@ -503,4 +503,88 @@ pub mod tests {
 
         assert_eq!(plan_key, optimized_plan_key);
     }
+
+    #[cfg(feature = "cluster")]
+    pub mod cluster {
+        use super::*;
+
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::projection::ProjectionExec;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_optimizer_rules::common::search_visitor::SearchVisitor;
+        use datafusion_optimizer_rules::physical_plan::cluster::{
+            ensure_supported_file_scan::EnsureSupportedFileScan,
+            union_projection_pushdown::UnionProjectionPushdownOptimizer,
+        };
+
+        use std::sync::{Arc, LazyLock};
+
+        use crate::optimizer_rule::distribute_file_scan::DistributeFileScanOptimizer;
+        use crate::optimizer_rule::distribute_file_scan::tests::DEFAULT_CONFIG_OPTIONS;
+
+        static OPTIMIZER: LazyLock<PhysicalOptimizer> = LazyLock::new(|| {
+            let mut rules = PhysicalOptimizer::new().rules;
+            rules.extend([
+                EnsureSupportedFileScan::new(),
+                DistributeFileScanOptimizer::new(),
+                UnionProjectionPushdownOptimizer::new(),
+            ]
+                as [Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>;
+                    3]);
+            PhysicalOptimizer::with_rules(rules)
+        });
+
+        fn optimize(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+            OPTIMIZER.rules.iter().fold(Arc::clone(plan), |acc, rule| {
+                rule.optimize(acc, &DEFAULT_CONFIG_OPTIONS)
+                    .expect("Must optimize")
+            })
+        }
+
+        #[test]
+        fn test_projection_pushdown() {
+            let files = vec![
+                create_partitioned_file("file:///file4.parquet", 256_000_000, None),
+                create_partitioned_file("file:///file5.parquet", 256_000_000, None),
+            ];
+
+            let data_source_exec = create_data_source_exec(files);
+            let projection_exec = ProjectionExec::try_new(
+                vec![(
+                    col("id", data_source_exec.schema().as_ref()).expect("Must bind expr"),
+                    "foo".to_string(),
+                )],
+                data_source_exec,
+            )
+            .expect("Must make projection_exec");
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(projection_exec);
+
+            // We start with 1 projection
+            assert_eq!(
+                SearchVisitor::collect_concrete_down::<ProjectionExec>(&plan)
+                    .expect("Must collect")
+                    .len(),
+                1
+            );
+
+            let optimized = optimize(&plan);
+            let data_source_exec_leaves =
+                SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized)
+                    .expect("Must collect")
+                    .len();
+
+            // Make sure we have enough leaves to test with
+            assert!(data_source_exec_leaves > 1);
+
+            // The number of projections must match the number of DataSourceExec leaves
+            assert_eq!(
+                SearchVisitor::collect_concrete_down::<ProjectionExec>(&optimized)
+                    .expect("Must collect")
+                    .len(),
+                data_source_exec_leaves
+            );
+        }
+    }
 }
