@@ -303,7 +303,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("partitioned_write_buffer"),
-    ParameterSpec::runtime("aggregate_pushdown_optimization"),
+    ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
 #[async_trait]
@@ -554,7 +554,7 @@ pub(crate) async fn create_table_provider(
 
     let agg_pushdown_optimization = cmd
         .options
-        .get("aggregate_pushdown_optimization")
+        .get("optimizer_duckdb_aggregate_pushdown")
         .map_or("disabled", |v| v.as_str())
         .to_lowercase();
 
