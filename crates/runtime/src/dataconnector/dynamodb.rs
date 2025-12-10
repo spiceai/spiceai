@@ -100,7 +100,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("When using Streams, once tables reaches this lag, it will be reported as Ready")
         .default("2s"),
     ParameterSpec::runtime("endpoint_url")
-        .description("Custom endpoint URL for DynamoDB. Useful for development and testing.")
+        .description("Custom endpoint URL for testing or using DynamoDB-compatible services (e.g., DynamoDB Local).")
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {

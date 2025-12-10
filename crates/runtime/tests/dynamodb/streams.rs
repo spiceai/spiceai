@@ -1,6 +1,21 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 use crate::utils::{runtime_ready_check, test_request_context};
-use crate::{ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results};
+use crate::{configure_test_datafusion, init_tracing, run_query_and_check_results};
 use app::AppBuilder;
 use async_graphql::futures_util::TryStreamExt;
 use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
@@ -14,7 +29,7 @@ use aws_sdk_dynamodb::{
 };
 use bollard::secret::HealthConfig;
 use runtime::Runtime;
-use spicepod::acceleration::{Mode, OnConflictBehavior, RefreshMode};
+use spicepod::acceleration::RefreshMode;
 use spicepod::component::caching::ResultsCache;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
@@ -25,8 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::instrument;
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{RetryError, retry};
+use util::retry;
 
 const DYNAMODB_DOCKER_CONTAINER: &str = "runtime-integration-test-dynamodb";
 const PORT: u16 = 8001;
@@ -102,7 +116,7 @@ async fn create_table(client: &Client, table_name: &str) {
                 .attribute_name("id")
                 .attribute_type(ScalarAttributeType::S)
                 .build()
-                .unwrap(),
+                .expect("Attribute definition created"),
         )
         .table_name(table_name)
         .key_schema(
@@ -110,7 +124,7 @@ async fn create_table(client: &Client, table_name: &str) {
                 .attribute_name("id")
                 .key_type(KeyType::Hash)
                 .build()
-                .unwrap(),
+                .expect("Key schema element created"),
         )
         .billing_mode(BillingMode::PayPerRequest)
         .stream_specification(
@@ -118,7 +132,7 @@ async fn create_table(client: &Client, table_name: &str) {
                 .stream_enabled(true)
                 .stream_view_type(StreamViewType::NewAndOldImages)
                 .build()
-                .unwrap(),
+                .expect("Stream specification created"),
         )
         .send()
         .await
@@ -227,10 +241,10 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             )
             .await?;
 
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
+            // running_container.remove().await.map_err(|e| {
+            //     tracing::error!("running_container.remove: {e}");
+            //     anyhow::Error::msg(e.to_string())
+            // })?;
 
             Ok(())
         })
