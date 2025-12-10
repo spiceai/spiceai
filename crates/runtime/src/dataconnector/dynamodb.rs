@@ -98,6 +98,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("ready_lag")
         .description("When using Streams, once tables reaches this lag, it will be reported as Ready")
         .default("2s"),
+    ParameterSpec::runtime("endpoint_url")
+        .description("")
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -140,7 +142,7 @@ impl DataConnector for DynamoDB {
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let table_name = dataset.path();
 
-        let config = initiate_config_with_credentials(
+        let mut config_loader = initiate_config_with_credentials(
             "DynamoDBTableProvider",
             "aws_region",
             "aws_access_key_id",
@@ -153,9 +155,13 @@ impl DataConnector for DynamoDB {
             dataconnector: "dynamodb".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: message.to_string(),
-        })?
-        .load()
-        .await;
+        })?;
+
+        if let Some(endpoint_url) = self.params.get("endpoint_url").expose().ok() {
+            config_loader = config_loader.endpoint_url(endpoint_url.to_string());
+        }
+
+        let config = config_loader.load().await;
 
         let schema_infer_max_records = self
             .params
@@ -288,7 +294,11 @@ impl DataConnector for DynamoDB {
                 let dataset_name_3 = dataset_name.clone();
                 let dataset_name_4 = dataset_name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
-                let dynamodb_sys = initialize_dynamodb_sys(&dataset).await?;
+                let dynamodb_sys = Arc::new(if dataset.is_file_accelerated() {
+                    initialize_dynamodb_sys(&dataset).await
+                } else {
+                    None
+                });
 
                 let (should_bootstrap, checkpoint) =
                     load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys, &dataset_name).await?;
@@ -369,9 +379,9 @@ impl DataConnector for DynamoDB {
     }
 }
 
-async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<Arc<DynamoDBSys>> {
+async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
     match DynamoDBSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(sys) => Some(Arc::new(sys)),
+        Ok(sys) => Some(sys),
         Err(err) => {
             tracing::error!(
                 "Failed to initialize DynamoDBSys for checkpoint persistence: table={} - {:?}",
@@ -386,24 +396,28 @@ async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<Arc<DynamoDBSys>> 
 /// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
-    dynamodb_sys: &Arc<DynamoDBSys>,
+    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
     dataset_name: &TableReference,
 ) -> Option<(bool, Checkpoint)> {
-    let existing_checkpoint = dynamodb_sys.get().await;
-
-    if let Some(metadata) = existing_checkpoint {
-        match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
-            Ok(checkpoint) => Some((false, checkpoint)),
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
-                    dataset_name,
-                    err
-                );
-                get_latest_checkpoint(dynamodb, dataset_name)
-                    .await
-                    .map(|cp| (true, cp))
+    if let Some(ref dynamodb_sys) = **dynamodb_sys {
+        if let Some(metadata) = dynamodb_sys.get().await {
+            match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
+                Ok(checkpoint) => Some((false, checkpoint)),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
+                        dataset_name,
+                        err
+                    );
+                    get_latest_checkpoint(dynamodb, dataset_name)
+                        .await
+                        .map(|cp| (true, cp))
+                }
             }
+        } else {
+            get_latest_checkpoint(dynamodb, dataset_name)
+                .await
+                .map(|cp| (true, cp))
         }
     } else {
         get_latest_checkpoint(dynamodb, dataset_name)
@@ -436,7 +450,7 @@ async fn get_latest_checkpoint(
 
 async fn changes_stream_from_checkpoint(
     dynamodb: Arc<DynamoDBTableProvider>,
-    dynamodb_sys: Arc<DynamoDBSys>,
+    dynamodb_sys: Arc<Option<DynamoDBSys>>,
     checkpoint: Checkpoint,
     acceptable_lag: Duration,
     dataset_name: TableReference,
@@ -563,13 +577,13 @@ impl CommitChange for NoOpCommitter {
 }
 
 pub struct DynamoDBStreamCommitter {
-    dynamodb_sys: Arc<DynamoDBSys>,
+    dynamodb_sys: Arc<Option<DynamoDBSys>>,
     checkpoint: Checkpoint,
 }
 
 impl DynamoDBStreamCommitter {
     #[must_use]
-    pub fn new(dynamodb_sys: Arc<DynamoDBSys>, checkpoint: Checkpoint) -> Self {
+    pub fn new(dynamodb_sys: Arc<Option<DynamoDBSys>>, checkpoint: Checkpoint) -> Self {
         Self {
             dynamodb_sys,
             checkpoint,
@@ -591,15 +605,18 @@ impl CommitChange for DynamoDBStreamCommitter {
             checkpoint_data: checkpoint_json,
         };
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.dynamodb_sys.upsert(&metadata).await.map_err(|e| {
-                    CommitError::UnableToCommitChange {
-                        source: Box::new(e),
-                    }
+        match self.dynamodb_sys.as_ref() {
+            Some(dynamodb_sys) => tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    dynamodb_sys.upsert(&metadata).await.map_err(|e| {
+                        CommitError::UnableToCommitChange {
+                            source: Box::new(e),
+                        }
+                    })
                 })
-            })
-        })
+            }),
+            None => Ok(()),
+        }
     }
 }
 
