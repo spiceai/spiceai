@@ -490,10 +490,10 @@ impl CayenneAccelerator {
                     .data_redundancy(DataRedundancy::SingleAvailabilityZone)
                     .build(),
             )
-            .set_location_constraint(if region != "us-east-1" {
-                Some(BucketLocationConstraint::from(region))
-            } else {
+            .set_location_constraint(if region == "us-east-1" {
                 None
+            } else {
+                Some(BucketLocationConstraint::from(region))
             })
             .build();
 
@@ -538,7 +538,13 @@ impl CayenneAccelerator {
     /// If `cayenne_file_path` is provided as an S3 Express path, extracts info from that.
     /// Otherwise, generates a bucket name from the app name and dataset name using `s3_zone_id`.
     ///
-    /// Returns a tuple of (bucket_name, zone_id, region, access_key, secret_key, session_token)
+    /// # Returns
+    ///
+    /// A tuple of (bucket name, zone ID, region, access key, secret key, session token)
+    #[expect(
+        clippy::type_complexity,
+        reason = "Return type represents distinct S3 configuration fields"
+    )]
     fn get_s3_bucket_info(
         source: &dyn AccelerationSource,
         data_path: &str,
