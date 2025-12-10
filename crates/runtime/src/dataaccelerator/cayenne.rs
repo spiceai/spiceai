@@ -307,7 +307,10 @@ impl CayenneAccelerator {
 
     /// Parse Vortex encoding configuration from acceleration parameters.
     /// This allows fine-grained control over which SIMD-optimized encodings to use.
-    fn get_vortex_config(source: &dyn AccelerationSource) -> cayenne::metadata::VortexConfig {
+    fn get_vortex_config(
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig::default();
 
         if let Some(acceleration) = source.acceleration() {
@@ -330,6 +333,24 @@ impl CayenneAccelerator {
                 config.target_vortex_file_size_mb,
             );
 
+            // Parse compression strategy
+            if let Some(strategy_str) = acceleration.params.get("cayenne_compression_strategy") {
+                match strategy_str.to_lowercase().as_str() {
+                    "btrblocks" => {
+                        config.compression_strategy =
+                            cayenne::metadata::CompressionStrategy::Btrblocks;
+                    }
+                    "zstd" => {
+                        config.compression_strategy = cayenne::metadata::CompressionStrategy::Zstd;
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Dataset '{table_name}' contains an invalid `cayenne_compression_strategy` - '{strategy_str}'. Only options of 'btrblocks' or 'zstd' are supported. Defaulting to 'btrblocks'",
+                        );
+                    }
+                }
+            }
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
                 config.sort_columns = sort_cols_str
@@ -340,11 +361,12 @@ impl CayenneAccelerator {
             }
 
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}, compression_strategy={:?}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
-                config.sort_columns
+                config.sort_columns,
+                config.compression_strategy
             );
         }
 
@@ -453,7 +475,7 @@ impl CayenneAccelerator {
             .get_or_create_catalog(&metadata_dir, &metastore_type)
             .await?;
 
-        let vortex_config = Self::get_vortex_config(source);
+        let vortex_config = Self::get_vortex_config(table_name, source);
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -496,6 +518,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("256"),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+    ParameterSpec::component("compression_strategy")
+        .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
+        .default("btrblocks"),
 ];
 
 #[async_trait]
@@ -784,7 +809,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
-            let vortex_config = Self::get_vortex_config(source);
+            let vortex_config = Self::get_vortex_config(&table_name, source);
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
