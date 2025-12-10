@@ -149,25 +149,28 @@ impl<T: BuildHasher + Clone + Send + Sync + 'static> PassthroughHashBuilder<T> {
     }
 }
 
-impl<T: BuildHasher + Clone + Send + Sync + 'static> BuildHasher for PassthroughHashBuilder<T> {
-    type Hasher = PassthroughHasher<T>;
+impl<T: BuildHasher + Clone + Send + Sync + 'static> BuildHasher for PassthroughHashBuilder<T>
+where
+    <T as BuildHasher>::Hasher: Send + Sync + 'static,
+{
+    type Hasher = PassthroughHasher<T::Hasher>;
 
     fn build_hasher(&self) -> Self::Hasher {
         PassthroughHasher {
-            hash: 0,
-            hasher: self.hasher.clone(),
+            hash: None,
+            hasher: self.hasher.build_hasher(),
         }
     }
 }
 
-pub(crate) struct PassthroughHasher<T: BuildHasher + Clone + Send + Sync + 'static> {
-    hash: u64,
+pub(crate) struct PassthroughHasher<T: Hasher + Send + Sync + 'static> {
+    hash: Option<u64>,
     hasher: T,
 }
 
-impl<T: BuildHasher + Clone + Send + Sync + 'static> Hasher for PassthroughHasher<T> {
+impl<T: Hasher + Send + Sync + 'static> Hasher for PassthroughHasher<T> {
     fn finish(&self) -> u64 {
-        self.hash
+        self.hash.unwrap_or_else(|| self.hasher.finish())
     }
 
     // moka generates an internal UUID v4 for bucket IDs, which is a string
@@ -176,13 +179,11 @@ impl<T: BuildHasher + Clone + Send + Sync + 'static> Hasher for PassthroughHashe
     //
     // to support this need, we fallback to the hash builder from the generic type for non-u64 inputs
     fn write(&mut self, bytes: &[u8]) {
-        let mut hasher = self.hasher.build_hasher();
-        hasher.write(bytes);
-        self.hash = hasher.finish();
+        self.hasher.write(bytes);
     }
 
     fn write_u64(&mut self, i: u64) {
-        self.hash = i;
+        self.hash = Some(i);
     }
 }
 
