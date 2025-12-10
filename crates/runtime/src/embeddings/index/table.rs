@@ -54,6 +54,16 @@ pub async fn wrap_table_as_index(
     inner_table_provider: Arc<dyn TableProvider>,
     vector_store: &VectorStore,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    let schema = inner_table_provider.schema();
+    for c in columns {
+        if schema.column_with_name(&c.name).is_none() {
+            tracing::warn!(
+                "The table {} is configured with column {} in the spicepod, but the column is not in the table's schema",
+                tbl.to_string(),
+                c.name
+            );
+        }
+    }
     #[cfg(not(feature = "s3_vectors"))]
     let _ = (
         ctx,
