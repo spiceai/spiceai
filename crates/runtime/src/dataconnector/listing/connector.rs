@@ -1081,8 +1081,7 @@ pub trait ListingTableConnector: DataConnector {
             schema
                 .fields
                 .iter()
-                .map(|f| idents.remove(f.name()).cloned())
-                .flatten()
+                .filter_map(|f| idents.remove(f.name()).cloned())
                 .collect::<Vec<_>>(),
         )
         .with_metadata(schema.metadata.clone());
