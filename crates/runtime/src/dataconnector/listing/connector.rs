@@ -1078,9 +1078,11 @@ pub trait ListingTableConnector: DataConnector {
         }
 
         let new_schema = Schema::new(
-            idents
-                .values()
-                .map(|f| f.as_ref().clone())
+            schema
+                .fields
+                .iter()
+                .map(|f| idents.remove(f.name()).cloned())
+                .flatten()
                 .collect::<Vec<_>>(),
         )
         .with_metadata(schema.metadata.clone());
