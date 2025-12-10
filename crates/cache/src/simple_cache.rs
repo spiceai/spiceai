@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::key::PassthroughHashBuilder;
 use crate::{
     AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, Result,
     TabledCacheProvider,
@@ -33,7 +34,7 @@ pub struct SimpleCache<
     V: Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, T>,
+    cache: Cache<u64, V, PassthroughHashBuilder>,
     hasher: T,
     max_size: u64,
     ttl: Duration,
@@ -67,11 +68,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     SimpleCache<V, T>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
-        let cache: Cache<u64, V, T> = Cache::builder()
+        let cache: Cache<u64, V, PassthroughHashBuilder> = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
-            .build_with_hasher(hasher.clone());
+            .build_with_hasher(PassthroughHashBuilder);
 
         SimpleCache {
             cache,

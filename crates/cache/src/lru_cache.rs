@@ -21,6 +21,7 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
+use crate::key::PassthroughHashBuilder;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
@@ -42,7 +43,7 @@ pub struct LruCache<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, T>,
+    cache: Cache<u64, V, PassthroughHashBuilder>,
     hasher: T,
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
@@ -135,7 +136,7 @@ impl<
             CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
         };
 
-        let cache: Cache<u64, V, T> = Cache::builder()
+        let cache: Cache<u64, V, PassthroughHashBuilder> = Cache::builder()
             .time_to_live(ttl)
             .weigher(|_key, value: &V| -> u32 {
                 let val: usize = value.get_memory_size();
@@ -161,7 +162,7 @@ impl<
                     V::record_eviction();
                 }
             })
-            .build_with_hasher(hasher.clone());
+            .build_with_hasher(PassthroughHashBuilder);
 
         LruCache {
             cache,

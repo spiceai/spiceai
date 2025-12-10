@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -132,5 +133,63 @@ impl RawCacheKey {
     #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.0
+    }
+}
+
+/// A hasher that simply passes through u64 values as-is.
+/// This is useful to reduce hashing overhead when we already have a u64 hash key, as returned from `CacheKey::as_raw_key()`.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct PassthroughHashBuilder;
+impl BuildHasher for PassthroughHashBuilder {
+    type Hasher = PassthroughHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PassthroughHasher { hash: 0 }
+    }
+}
+
+pub(crate) struct PassthroughHasher {
+    hash: u64,
+}
+
+impl Hasher for PassthroughHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // support .write() for implementations that still use `v.hash()` from the build hasher
+        // assume the input is always a u64 in bytes
+        if bytes.len() == 8 {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(bytes);
+            self.hash = u64::from_ne_bytes(arr);
+        } else {
+            unimplemented!("PassthroughHasher only supports writing u64 values");
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.hash = i;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_passthrough_hasher() {
+        // validate that `write_u64` and `write` produce the same hash result from a u64 input
+        let mut hasher1 = PassthroughHashBuilder::default().build_hasher();
+        hasher1.write_u64(42);
+        let hash1 = hasher1.finish();
+        assert_eq!(hash1, 42);
+
+        let mut hasher2 = PassthroughHashBuilder::default().build_hasher();
+        hasher2.write(&42u64.to_ne_bytes());
+        let hash2 = hasher2.finish();
+
+        assert_eq!(hash1, hash2);
     }
 }
