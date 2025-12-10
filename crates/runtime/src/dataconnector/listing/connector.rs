@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
@@ -44,6 +44,7 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{PartitionedFile, metadata::MetadataColumn};
 use futures::TryStreamExt;
+use itertools::Itertools;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
@@ -59,6 +60,7 @@ use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
 use super::DelimitedFormat;
+use crate::dataconnector::DataConnectorError::SchemaMismatch;
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
@@ -971,9 +973,21 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
+        let final_schema = if dataset.get_param("hive_partitioning_enabled", false)
+            && table_path.is_collection()
+        {
+            self.deduplicate_partition_columns_expressed_in_file(
+                dataset,
+                expanded_schema,
+                &options.table_partition_cols,
+            )?
+        } else {
+            expanded_schema
+        };
+
         let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
-            .with_schema(expanded_schema);
+            .with_schema(final_schema);
 
         // This shouldn't error because we're passing the schema and options correctly.
         let table =
@@ -1022,6 +1036,56 @@ pub trait ListingTableConnector: DataConnector {
         } else {
             Ok(table_arc)
         }
+    }
+
+    fn deduplicate_partition_columns_expressed_in_file(
+        &self,
+        dataset: &Dataset,
+        schema: SchemaRef,
+        partition_cols: &[(String, DataType)],
+    ) -> DataConnectorResult<SchemaRef> {
+        if partition_cols.is_empty() {
+            return Ok(schema);
+        }
+
+        let mut idents = schema
+            .fields
+            .iter()
+            .chunk_by(|f| f.name())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.collect::<Vec<_>>()[0]))
+            .collect::<HashMap<_, _>>();
+
+        for (name, partition_type) in partition_cols {
+            if let Some(field) = idents.remove(name) {
+                let types_match = match (partition_type, field.data_type()) {
+                    (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View) => true,
+                    (pt, ft) => pt == ft,
+                };
+
+                if !types_match {
+                    return Err(SchemaMismatch {
+                        dataset_name: dataset.name.to_string(),
+                        differences: format!(
+                            "Field {name} cannot be deduplicated as its field types differ:\
+                            (partition column): {}, (file column): {}",
+                            partition_type,
+                            field.data_type()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let new_schema = Schema::new(
+            idents
+                .values()
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>(),
+        )
+        .with_metadata(schema.metadata.clone());
+
+        Ok(Arc::new(new_schema))
     }
 }
 
