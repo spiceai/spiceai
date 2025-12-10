@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 use crate::utils::{runtime_ready_check, test_request_context};
-use crate::{configure_test_datafusion, init_tracing, run_query_and_check_results};
+use crate::{configure_test_datafusion, init_tracing};
 use app::AppBuilder;
 use async_graphql::futures_util::TryStreamExt;
 use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
@@ -40,7 +40,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::instrument;
-use util::retry;
 
 const DYNAMODB_DOCKER_CONTAINER: &str = "runtime-integration-test-dynamodb";
 const PORT: u16 = 8001;
