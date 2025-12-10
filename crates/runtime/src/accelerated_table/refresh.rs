@@ -926,14 +926,14 @@ fn create_periodic_snapshot_callback(
 ) -> Option<SnapshotCallback> {
     let threshold = snapshots_trigger_threshold.unwrap_or(300i64);
 
-    tracing::info!(
-        "Snapshots for dataset {dataset_name} will be created every {threshold} batch updates"
-    );
-
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
             let snapshot_manager = Arc::new(snapshot_manager);
             let dataset_name = dataset_name.clone();
+
+            tracing::info!(
+                "Snapshots for dataset {dataset_name} will be created every {threshold} batch updates"
+            );
 
             // Track number of processed batches since last snapshot
             let batches_processed = Arc::new(RwLock::new(0i64));
