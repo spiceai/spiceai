@@ -24,8 +24,8 @@ limitations under the License.
 //!
 //! In combination with, for each source of data (currently only `./megascience`):
 //!   - Search tables, in `megascience/tables.yaml`. Either a [`spicepod::component::View`] or
-//!    [`spicepod::component::Dataset`] component. A data source might require multiple (e.g. a view atop a dataset),
-//!    but tests are run on one table (`.[].table_name` in YAML).
+//!     [`spicepod::component::Dataset`] component. A data source might require multiple (e.g. a view atop a dataset),
+//!     but tests are run on one table (`.[].table_name` in YAML).
 //!   - Column configurations, in `megascience/columns.yaml`.
 //!   - Test cases, in `megascience/tests.yaml`
 //!
@@ -171,18 +171,18 @@ impl SearchSpicepodConfiguration {
         };
 
         // Update vector store params with dynamic values as needed.
-        if let Some("s3_vectors") = vector_store.engine.as_deref() {
-            if let Some(params) = vector_store.params.as_mut() {
-                params.data.insert(
-                    "s3_vectors_index".to_string(),
-                    ParamValue::String(format!(
-                        "{engine}-{}-{}-{}",
-                        table_component.replace('_', "-"),
-                        column_configuration.replace('_', "-"),
-                        rand::random::<u8>() % 11
-                    )),
-                );
-            }
+        if let Some("s3_vectors") = vector_store.engine.as_deref()
+            && let Some(params) = vector_store.params.as_mut()
+        {
+            params.data.insert(
+                "s3_vectors_index".to_string(),
+                ParamValue::String(format!(
+                    "{engine}-{}-{}-{}",
+                    table_component.replace('_', "-"),
+                    column_configuration.replace('_', "-"),
+                    rand::random::<u8>() % 11
+                )),
+            );
         }
 
         let Some(columns) = column_configs.get(column_configuration).cloned() else {

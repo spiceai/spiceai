@@ -57,9 +57,6 @@ text_search_metadata:
     full_text_search:
       enabled: true
       row_id: id
-    metadata:
-      searchable_fields:
-        - subject
   - name: subject
     metadata:
       vectors: non-filterable

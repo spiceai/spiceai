@@ -8,9 +8,10 @@ arrow:
   enabled: true
   engine: arrow
 
-duckdb:
+cayenne:
   enabled: true
-  engine: duckdb
+  engine: cayenne
+  mode: file
 
 duckdb_file:
   enabled: true

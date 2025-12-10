@@ -23,7 +23,7 @@ use spicepod::{
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(super) struct SearchTable {
+pub(crate) struct SearchTable {
     // The name of the table (either dataset or view) to test search queries against.
     table_name: &'static str,
     datasets: Vec<Dataset>,
