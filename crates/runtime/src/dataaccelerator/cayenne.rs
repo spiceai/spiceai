@@ -297,13 +297,6 @@ impl CayenneAccelerator {
                 // Validate the path - reject standard S3, only allow S3 Express One Zone or local
                 Self::validate_file_path(custom_path)?;
 
-                // Check if it's an S3 Express One Zone path
-                if Self::is_s3_express_path(custom_path) {
-                    tracing::info!(
-                        "Using S3 Express One Zone storage for Cayenne data files: {}",
-                        custom_path
-                    );
-                }
                 // Add dataset name as a suffix for isolation
                 let base = custom_path.trim_end_matches('/');
                 format!("{base}/{dataset_name}/")
@@ -317,15 +310,8 @@ impl CayenneAccelerator {
                 // Generate bucket name
                 let bucket_name = Self::generate_bucket_name(&app_name, &dataset_name, zone_id);
 
-                let s3_path = format!("s3://{bucket_name}/{dataset_name}/");
-                tracing::info!(
-                    "Using S3 Express One Zone storage for Cayenne data files (auto-generated from cayenne_s3_zone_id '{}'): {}",
-                    zone_id,
-                    s3_path
-                );
-
                 // Return S3 Express path with dataset subdirectory
-                s3_path
+                format!("s3://{bucket_name}/{dataset_name}/")
             } else {
                 format!("{}/{dataset_name}/", spice_data_base_path())
             };
@@ -358,11 +344,22 @@ impl CayenneAccelerator {
     }
 
     /// Returns true if the data path for this source is an S3 Express One Zone path.
+    ///
+    /// This returns true if either:
+    /// - `cayenne_file_path` is set to an S3 Express path, or
+    /// - `cayenne_s3_zone_id` is set (which means we'll auto-generate an S3 Express path)
     fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
-        source
-            .acceleration()
-            .and_then(|a| a.params.get("cayenne_file_path"))
-            .is_some_and(|path| Self::is_s3_express_path(path))
+        source.acceleration().is_some_and(|a| {
+            // Check for explicit S3 Express path
+            if a.params
+                .get("cayenne_file_path")
+                .is_some_and(|path| Self::is_s3_express_path(path))
+            {
+                return true;
+            }
+            // Check for auto-generated path via zone_id
+            a.params.contains_key("cayenne_s3_zone_id")
+        })
     }
 
     /// Extracts the zone ID from an S3 Express One Zone bucket name.
@@ -425,8 +422,12 @@ impl CayenneAccelerator {
     /// Uses `initiate_config_with_credentials` from `aws_sdk_credential_bridge` for credential handling,
     /// supporting both explicit credentials and IAM role-based authentication.
     ///
-    /// Returns `Ok(())` if the bucket was created or already exists.
-    /// Returns `Err` if the bucket creation fails for other reasons.
+    /// Returns `Ok(true)` if a new bucket was created, `Ok(false)` if the bucket already existed.
+    /// Returns `Err` if the bucket creation or verification fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "S3 Express bucket creation requires extensive setup, creation, and verification steps"
+    )]
     async fn create_s3_express_bucket_if_needed(
         bucket_name: &str,
         zone_id: &str,
@@ -434,18 +435,12 @@ impl CayenneAccelerator {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        use aws_sdk_s3::primitives::ByteStream;
         use aws_sdk_s3::types::{
             BucketInfo, BucketLocationConstraint, BucketType, CreateBucketConfiguration,
             DataRedundancy, LocationInfo, LocationType,
         };
-
-        tracing::info!(
-            "Initializing S3 Express One Zone bucket '{}' in zone '{}' (region: {})",
-            bucket_name,
-            zone_id,
-            region
-        );
 
         // Use the credential bridge to build config with proper credential handling
         let config_loader = aws_sdk_credential_bridge::initiate_config_with_credentials(
@@ -463,11 +458,7 @@ impl CayenneAccelerator {
         // Check if bucket already exists by trying to head it
         match s3_client.head_bucket().bucket(bucket_name).send().await {
             Ok(_) => {
-                tracing::info!(
-                    "S3 Express One Zone bucket '{}' already exists, using existing bucket",
-                    bucket_name
-                );
-                return Ok(());
+                return Ok(false); // Bucket already exists
             }
             Err(e) => {
                 // Check if it's a "not found" error vs. a permissions error
@@ -481,6 +472,13 @@ impl CayenneAccelerator {
                 }
             }
         }
+
+        tracing::info!(
+            "Creating S3 Express One Zone bucket '{}' in zone '{}' (region: {})",
+            bucket_name,
+            zone_id,
+            region
+        );
 
         // Create the bucket configuration for S3 Express One Zone (directory bucket)
         let bucket_config = CreateBucketConfiguration::builder()
@@ -504,20 +502,14 @@ impl CayenneAccelerator {
             .build();
 
         // Attempt to create the bucket
-        match s3_client
+        let bucket_created = match s3_client
             .create_bucket()
             .bucket(bucket_name)
             .create_bucket_configuration(bucket_config)
             .send()
             .await
         {
-            Ok(_) => {
-                tracing::info!(
-                    "Successfully created S3 Express One Zone bucket: {}",
-                    bucket_name
-                );
-                Ok(())
-            }
+            Ok(_) => true,
             Err(e) => {
                 let service_error = e.into_service_error();
                 // Check if bucket already exists (race condition or created by another process)
@@ -528,15 +520,78 @@ impl CayenneAccelerator {
                         "S3 Express bucket '{}' already exists (concurrent creation)",
                         bucket_name
                     );
-                    Ok(())
+                    false
                 } else {
-                    Err(Error::S3DirectoryBucketCreation {
+                    return Err(Error::S3DirectoryBucketCreation {
                         bucket: bucket_name.to_string(),
                         source: Box::new(service_error),
-                    })
+                    });
                 }
             }
+        };
+
+        // Verify bucket access with a write/read test
+        let test_key = ".cayenne_write_test";
+        let test_content = b"cayenne_s3_express_verification";
+
+        // Write test object
+        s3_client
+            .put_object()
+            .bucket(bucket_name)
+            .key(test_key)
+            .body(ByteStream::from_static(test_content))
+            .send()
+            .await
+            .map_err(|e| Error::S3DirectoryBucketCreation {
+                bucket: bucket_name.to_string(),
+                source: Box::new(e.into_service_error()),
+            })?;
+
+        // Read test object back
+        let get_result = s3_client
+            .get_object()
+            .bucket(bucket_name)
+            .key(test_key)
+            .send()
+            .await
+            .map_err(|e| Error::S3DirectoryBucketCreation {
+                bucket: bucket_name.to_string(),
+                source: Box::new(e.into_service_error()),
+            })?;
+
+        let body =
+            get_result
+                .body
+                .collect()
+                .await
+                .map_err(|e| Error::S3DirectoryBucketCreation {
+                    bucket: bucket_name.to_string(),
+                    source: Box::new(e),
+                })?;
+
+        if body.into_bytes().as_ref() != test_content {
+            return Err(Error::S3DirectoryBucketCreation {
+                bucket: bucket_name.to_string(),
+                source: "S3 write/read verification failed: content mismatch".into(),
+            });
         }
+
+        // Clean up test object
+        let _ = s3_client
+            .delete_object()
+            .bucket(bucket_name)
+            .key(test_key)
+            .send()
+            .await;
+
+        if bucket_created {
+            tracing::info!(
+                "Created and verified S3 Express One Zone bucket: {}",
+                bucket_name
+            );
+        }
+
+        Ok(bucket_created)
     }
 
     /// Extracts S3 bucket information (bucket name, zone ID, region, credentials) from the source configuration.
@@ -687,20 +742,20 @@ impl CayenneAccelerator {
     async fn build_s3_object_store(
         source: &dyn AccelerationSource,
     ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
-        let data_path = match source.acceleration() {
-            Some(a) => a.params.get("cayenne_file_path").cloned(),
-            None => None,
-        };
-
-        let Some(data_path) = data_path else {
+        // Check if this is S3 Express One Zone storage
+        if !Self::is_s3_express_data_path(source) {
             return Ok(None);
-        };
+        }
+
+        // Get the computed data path (handles both explicit cayenne_file_path and auto-generated from zone_id)
+        let accelerator = CayenneAccelerator::new();
+        let data_path = accelerator.cayenne_data_dir(source)?;
 
         if !Self::is_s3_express_path(&data_path) {
             return Ok(None);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Building S3 Express One Zone object store for path: {}",
             data_path
         );
@@ -1187,6 +1242,10 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Initialization requires extensive validation, S3 bucket setup, and directory management"
+    )]
     async fn init(
         &self,
         source: &dyn AccelerationSource,
@@ -1204,6 +1263,21 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
+            // Validate S3 Express One Zone configuration - only one method allowed
+            let has_s3_zone_id = acceleration.params.contains_key("cayenne_s3_zone_id");
+            let has_s3_express_file_path = acceleration
+                .params
+                .get("cayenne_file_path")
+                .is_some_and(|path| Self::is_s3_express_path(path));
+
+            if has_s3_zone_id && has_s3_express_file_path {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "Cannot specify both 'cayenne_s3_zone_id' and 'cayenne_file_path' with an S3 Express path. Use either 'cayenne_s3_zone_id' for auto-generated bucket names, or 'cayenne_file_path' for explicit bucket paths.",
+                    ),
+                }));
+            }
+
             // Validate refresh_mode - append and full are supported
             if let Some(refresh_mode) = acceleration.refresh_mode
                 && refresh_mode != RefreshMode::Append
@@ -1238,19 +1312,12 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.file_path(source)?;
         let is_s3_express = Self::is_s3_express_data_path(source);
 
-        // Log S3 Express One Zone configuration
+        // Handle S3 Express One Zone configuration
         if is_s3_express {
-            tracing::info!(
-                "Cayenne S3 Express One Zone storage enabled for data files at: {}",
-                dir_path
-            );
-
             // Automatically create the bucket if it doesn't exist and we have the required info
             match Self::get_s3_bucket_info(source, &dir_path) {
                 Ok((bucket_name, zone_id, region, access_key, secret_key, session_token)) => {
-                    // Attempt to create the bucket - if it already exists or we lack permissions,
-                    // the operation will be skipped or fail gracefully
-                    if let Err(e) = Self::create_s3_express_bucket_if_needed(
+                    match Self::create_s3_express_bucket_if_needed(
                         &bucket_name,
                         &zone_id,
                         &region,
@@ -1260,26 +1327,31 @@ impl DataAccelerator for CayenneAccelerator {
                     )
                     .await
                     {
-                        // Log warning but don't fail - bucket may already exist or be created externally
-                        tracing::warn!(
-                            "Could not auto-create S3 Express bucket '{}': {}. Assuming bucket exists.",
-                            bucket_name,
-                            e
-                        );
+                        Ok(created) => {
+                            if created {
+                                tracing::info!(
+                                    "Using S3 Express One Zone storage: {} (bucket created)",
+                                    dir_path
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Using S3 Express One Zone storage: {} (bucket exists)",
+                                    dir_path
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // Bucket creation/verification failed - this is a hard error
+                            return Err(Box::new(e));
+                        }
                     }
                 }
                 Err(e) => {
-                    // Could not determine bucket info - log and continue, assuming bucket exists
-                    tracing::debug!(
-                        "Could not determine S3 bucket info for auto-creation: {}. Assuming bucket exists.",
-                        e
-                    );
+                    // Could not determine bucket info - this is a configuration error
+                    return Err(Box::new(e));
                 }
             }
 
-            tracing::info!(
-                "S3 Express One Zone storage initialized. Metadata will be stored locally, data files in S3."
-            );
             return Ok(());
         }
 
