@@ -1387,7 +1387,7 @@
           "General"
         ],
         "summary": "List Spicepods",
-        "description": "Get a list of spicepods and their details. In CSV format, it will return a summarised form.",
+        "description": "Get a list of spicepods and their summary details.",
         "operationId": "get_spicepods",
         "parameters": [
           {
@@ -1407,7 +1407,9 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": {}
+                  "items": {
+                    "$ref": "#/components/schemas/SpicepodSummary"
+                  }
                 },
                 "example": [
                   {
@@ -4491,6 +4493,38 @@
           "flex",
           "priority"
         ]
+      },
+      "SpicepodSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "version"
+        ],
+        "properties": {
+          "datasets_count": {
+            "type": "integer",
+            "description": "The number of datasets in this spicepod",
+            "minimum": 0
+          },
+          "dependencies_count": {
+            "type": "integer",
+            "description": "The number of dependencies in this spicepod",
+            "minimum": 0
+          },
+          "models_count": {
+            "type": "integer",
+            "description": "The number of models in this spicepod",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the spicepod"
+          },
+          "version": {
+            "type": "string",
+            "description": "The version of the spicepod"
+          }
+        }
       },
       "Stop": {
         "oneOf": [
