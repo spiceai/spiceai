@@ -87,11 +87,7 @@ pub fn make_dynamodb_dataset(
     if accelerated {
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            // engine: Some("duckdb".to_string()),
-            // mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
-            // refresh_mode: Some(RefreshMode::Full),
-            // on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
             ..Acceleration::default()
         });
     }
@@ -176,6 +172,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             create_table(&client, table_name).await;
             insert_rows(&client, "test_table", 0..5).await;
+            sleep(Duration::from_secs(2)).await;
 
             let app = AppBuilder::new("dynamodb_integration_test")
                 .with_dataset(make_dynamodb_dataset(
@@ -205,40 +202,30 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             runtime_ready_check(&rt).await;
             sleep(Duration::from_secs(2)).await;
-
-            let query_result = rt
-                .datafusion()
-                .query_builder(&format!("SELECT * FROM {table_name} ORDER BY id"))
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let data = query_result.data.try_collect::<Vec<_>>().await?;
-            println!("Result: {data:#?}");
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                "test1",
+            )
+            .await?;
 
             insert_rows(&client, "test_table", 5..7).await;
             sleep(Duration::from_secs(2)).await;
-            let query_result = rt
-                .datafusion()
-                .query_builder(&format!("SELECT * FROM {table_name} ORDER BY id"))
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let data = query_result.data.try_collect::<Vec<_>>().await?;
-            println!("Result2: {data:#?}");
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                "test2",
+            )
+            .await?;
 
             insert_rows(&client, "test_table", 7..10).await;
             sleep(Duration::from_secs(2)).await;
-            let query_result = rt
-                .datafusion()
-                .query_builder(&format!("SELECT * FROM {table_name} ORDER BY id"))
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let data = query_result.data.try_collect::<Vec<_>>().await?;
-            println!("Result3: {data:#?}");
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                "test3",
+            )
+            .await?;
 
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
@@ -248,4 +235,25 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             Ok(())
         })
         .await
+}
+
+async fn run_and_snapshot_query(
+    rt: &Runtime,
+    query: &str,
+    test_name: &str,
+) -> Result<(), anyhow::Error> {
+    let query_result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let data = query_result.data.try_collect::<Vec<_>>().await?;
+
+    let formatted = arrow::util::pretty::pretty_format_batches(&data)
+        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    insta::assert_snapshot!(test_name, formatted);
+    Ok(())
 }
