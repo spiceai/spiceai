@@ -138,7 +138,7 @@ impl RawCacheKey {
 
 /// A hash builder that builds a hasher which simply passes through u64 values as-is.
 /// This is useful to reduce hashing overhead when we already have a u64 hash key, as returned from `CacheKey::as_raw_key()`.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub(crate) struct PassthroughHashBuilder<T: BuildHasher + Clone + Send + Sync + 'static> {
     hasher: T,
 }
