@@ -110,7 +110,7 @@ pub enum Error {
 
     #[snafu(display(
         "Cannot determine S3 Express One Zone bucket info: {reason}. \
-        Either provide a valid 'cayenne_file_path' with an S3 Express bucket, or specify 's3_zone_id' to auto-generate the bucket name."
+        Either provide a valid 'cayenne_file_path' with an S3 Express bucket, or specify 'cayenne_s3_zone_id' to auto-generate the bucket name."
     ))]
     CannotAutoCreateBucket { reason: String },
 }
@@ -275,12 +275,12 @@ impl CayenneAccelerator {
     /// If `cayenne_file_path` is an S3 Express One Zone path (e.g., `s3://{bucket}--{zone-id}--x-s3/`),
     /// data files will be stored exclusively in S3 Express One Zone while metadata remains on local disk.
     ///
-    /// If `s3_zone_id` is specified (without `cayenne_file_path`), a bucket name will be
+    /// If `cayenne_s3_zone_id` is specified (without `cayenne_file_path`), a bucket name will be
     /// auto-generated from the spicepod name and dataset name, and created if it doesn't exist.
     ///
     /// Order:
     /// 1. `cayenne_file_path` - Custom path (local or S3 Express One Zone)
-    /// 2. Auto-generated S3 Express path if `s3_zone_id` is specified
+    /// 2. Auto-generated S3 Express path if `cayenne_s3_zone_id` is specified
     /// 3. Default: `spice_data_base_path()/{dataset_name}/`
     pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
@@ -307,9 +307,9 @@ impl CayenneAccelerator {
                 // Add dataset name as a suffix for isolation
                 let base = custom_path.trim_end_matches('/');
                 format!("{base}/{dataset_name}/")
-            } else if let Some(zone_id) = acceleration_params.get("s3_zone_id") {
+            } else if let Some(zone_id) = acceleration_params.get("cayenne_s3_zone_id") {
                 // Auto-generate S3 Express One Zone path from app name and dataset name
-                // when s3_zone_id is specified
+                // when cayenne_s3_zone_id is specified
 
                 // Get app name from the source
                 let app_name = source.app().name.clone();
@@ -317,14 +317,15 @@ impl CayenneAccelerator {
                 // Generate bucket name
                 let bucket_name = Self::generate_bucket_name(&app_name, &dataset_name, zone_id);
 
+                let s3_path = format!("s3://{bucket_name}/{dataset_name}/");
                 tracing::info!(
-                    "Auto-generating S3 Express One Zone path for dataset '{}': s3://{}/",
-                    source.name(),
-                    bucket_name
+                    "Using S3 Express One Zone storage for Cayenne data files (auto-generated from cayenne_s3_zone_id '{}'): {}",
+                    zone_id,
+                    s3_path
                 );
 
                 // Return S3 Express path with dataset subdirectory
-                format!("s3://{bucket_name}/{dataset_name}/")
+                s3_path
             } else {
                 format!("{}/{dataset_name}/", spice_data_base_path())
             };
@@ -440,8 +441,10 @@ impl CayenneAccelerator {
         };
 
         tracing::info!(
-            "Checking/creating S3 Express One Zone directory bucket: {}",
-            bucket_name
+            "Initializing S3 Express One Zone bucket '{}' in zone '{}' (region: {})",
+            bucket_name,
+            zone_id,
+            region
         );
 
         // Use the credential bridge to build config with proper credential handling
@@ -460,7 +463,10 @@ impl CayenneAccelerator {
         // Check if bucket already exists by trying to head it
         match s3_client.head_bucket().bucket(bucket_name).send().await {
             Ok(_) => {
-                tracing::debug!("S3 Express bucket '{}' already exists", bucket_name);
+                tracing::info!(
+                    "S3 Express One Zone bucket '{}' already exists, using existing bucket",
+                    bucket_name
+                );
                 return Ok(());
             }
             Err(e) => {
@@ -536,7 +542,7 @@ impl CayenneAccelerator {
     /// Extracts S3 bucket information (bucket name, zone ID, region, credentials) from the source configuration.
     ///
     /// If `cayenne_file_path` is provided as an S3 Express path, extracts info from that.
-    /// Otherwise, generates a bucket name from the app name and dataset name using `s3_zone_id`.
+    /// Otherwise, generates a bucket name from the app name and dataset name using `cayenne_s3_zone_id`.
     ///
     /// # Returns
     ///
@@ -577,35 +583,35 @@ impl CayenneAccelerator {
 
         // Extract zone ID from bucket name (e.g., "mybucket--usw2-az1--x-s3" -> "usw2-az1")
         let zone_id = Self::extract_zone_id_from_bucket(&bucket_name)
-            .or_else(|| acceleration.params.get("s3_zone_id").map(String::as_str))
+            .or_else(|| acceleration.params.get("cayenne_s3_zone_id").map(String::as_str))
             .ok_or_else(|| Error::CannotAutoCreateBucket {
-                reason: "Could not determine zone ID. Either use a valid S3 Express bucket name format (bucket--zone-id--x-s3) or specify 's3_zone_id' parameter".to_string(),
+                reason: "Could not determine zone ID. Either use a valid S3 Express bucket name format (bucket--zone-id--x-s3) or specify 'cayenne_s3_zone_id' parameter".to_string(),
             })?
             .to_string();
 
         // Get region from params or derive from zone ID
         let region = acceleration
             .params
-            .get("s3_region")
+            .get("cayenne_s3_region")
             .cloned()
             .or_else(|| Self::derive_region_from_zone(&zone_id))
             .ok_or_else(|| Error::CannotAutoCreateBucket {
                 reason: format!(
-                    "Could not determine region. Specify 's3_region' parameter. Zone ID: {zone_id}"
+                    "Could not determine region. Specify 'cayenne_s3_region' parameter. Zone ID: {zone_id}"
                 ),
             })?;
 
         // Get optional credentials from params
         let s3_auth = acceleration
             .params
-            .get("s3_auth")
+            .get("cayenne_s3_auth")
             .map_or("iam_role", String::as_str);
 
         let (access_key, secret_key, session_token) = if s3_auth == "key" {
             (
-                acceleration.params.get("s3_key").cloned(),
-                acceleration.params.get("s3_secret").cloned(),
-                acceleration.params.get("s3_session_token").cloned(),
+                acceleration.params.get("cayenne_s3_key").cloned(),
+                acceleration.params.get("cayenne_s3_secret").cloned(),
+                acceleration.params.get("cayenne_s3_session_token").cloned(),
             )
         } else {
             (None, None, None)
@@ -724,15 +730,15 @@ impl CayenneAccelerator {
             params.get(key).map(|v| v.expose_secret().to_string())
         };
 
-        let s3_region = get_param("s3_region");
-        let s3_endpoint = get_param("s3_endpoint");
-        let s3_key = get_param("s3_key");
-        let s3_secret = get_param("s3_secret");
-        let s3_session_token = get_param("s3_session_token");
-        let s3_auth = get_param("s3_auth").unwrap_or_else(|| "iam_role".to_string());
-        let s3_client_timeout = get_param("s3_client_timeout");
+        let s3_region = get_param("cayenne_s3_region");
+        let s3_endpoint = get_param("cayenne_s3_endpoint");
+        let s3_key = get_param("cayenne_s3_key");
+        let s3_secret = get_param("cayenne_s3_secret");
+        let s3_session_token = get_param("cayenne_s3_session_token");
+        let s3_auth = get_param("cayenne_s3_auth").unwrap_or_else(|| "iam_role".to_string());
+        let s3_client_timeout = get_param("cayenne_s3_client_timeout");
         let s3_allow_http =
-            get_param("s3_allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            get_param("cayenne_s3_allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
         // Build the S3 object store
         let io_runtime = tokio::runtime::Handle::current();
@@ -1078,9 +1084,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("string"),
     // S3 Express One Zone authentication parameters (used when file_path is an S3 Express path)
     ParameterSpec::component("s3_region")
-        .description("AWS region for S3 Express One Zone storage. If not specified, uses AWS SDK default."),
+        .description("AWS region for S3 Express One Zone storage. If not specified, derived from s3_zone_id."),
     ParameterSpec::component("s3_endpoint")
-        .description("Custom S3 endpoint URL. Required for S3 Express One Zone (format: 's3express-{zone-id}.{region}.amazonaws.com')."),
+        .description("Custom S3 endpoint URL for S3 Express One Zone."),
     ParameterSpec::component("s3_key")
         .description("AWS access key ID for S3 authentication.")
         .secret(),
@@ -1091,20 +1097,17 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("AWS session token for temporary credentials (optional).")
         .secret(),
     ParameterSpec::component("s3_auth")
-        .description("Authentication method for S3 Express One Zone. Options: 'iam_role' (default, uses environment credentials), 'key' (uses explicit s3_key/s3_secret).")
+        .description("Authentication method for S3 Express One Zone. Options: 'iam_role' (default, uses environment credentials), 'key' (uses explicit cayenne_s3_key/cayenne_s3_secret).")
         .default("iam_role")
         .one_of(&["iam_role", "key"]),
-    ParameterSpec::runtime("s3_client_timeout")
+    ParameterSpec::component("s3_client_timeout")
         .description("Timeout for S3 client operations (e.g., '30s', '5m')."),
-    ParameterSpec::runtime("s3_allow_http")
+    ParameterSpec::component("s3_allow_http")
         .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
         .default("false"),
-    // S3 Express auto-creation parameters
-    ParameterSpec::component("s3_auto_create_bucket")
-        .description("Automatically create the S3 Express One Zone directory bucket if it doesn't exist. Requires 's3_zone_id' and 's3_region' to be specified. Default: false.")
-        .default("false"),
+    // S3 Express One Zone auto-generation parameter
     ParameterSpec::component("s3_zone_id")
-        .description("Availability Zone ID for auto-creating S3 Express One Zone buckets (e.g., 'usw2-az1', 'use1-az4'). Required when 's3_auto_create_bucket' is enabled and 'cayenne_file_path' is not specified."),
+        .description("Availability Zone ID for S3 Express One Zone storage (e.g., 'usw2-az1', 'use1-az4'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed."),
     // Vortex encoding configuration for hardware acceleration
     ParameterSpec::component("cayenne_alp")
         .description("Enable Adaptive Lossless Precision (ALP) encoding for numeric columns. Provides 5-10x compression with SIMD decompression on ARM64 (NEON) and x86_64 (AVX2/AVX-512). Options: 'enabled' (default), 'disabled'")
@@ -1237,8 +1240,9 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Log S3 Express One Zone configuration
         if is_s3_express {
-            tracing::warn!(
-                "Cayenne S3 Express One Zone storage (Alpha) is experimental and may not be fully functional."
+            tracing::info!(
+                "Cayenne S3 Express One Zone storage enabled for data files at: {}",
+                dir_path
             );
 
             // Automatically create the bucket if it doesn't exist and we have the required info
@@ -1273,9 +1277,8 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             }
 
-            tracing::debug!(
-                "Skipping local directory initialization for S3 Express One Zone path: {}",
-                dir_path
+            tracing::info!(
+                "S3 Express One Zone storage initialized. Metadata will be stored locally, data files in S3."
             );
             return Ok(());
         }
