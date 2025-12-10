@@ -36,11 +36,19 @@ use datafusion::physical_plan::{
 use datafusion::physical_plan::{Distribution, Partitioning, PlanProperties};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
+use std::collections::HashSet;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
+
+/// Type alias for tracking in-flight revalidation requests.
+/// The key is a cache key derived from the filter expressions (`request_path`, `request_query`, `request_body`).
+/// When a revalidation is in progress for a cache key, other requests for the same key will skip
+/// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
+pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
 
@@ -68,14 +76,14 @@ pub enum CacheFreshness {
     /// Data is past `max_age` but within `stale_while_revalidate` - serve but trigger background refresh
     Stale,
     /// Data is past both TTLs - treat as cache miss
-    Rotten,
+    Expired,
 }
 
 /// Check the freshness state of cached data based on `max_age` and `stale_while_revalidate` TTLs
 ///
 /// - `Fresh`: Data was fetched within `max_age` duration
 /// - `Stale`: Data was fetched more than `max_age` ago but within `max_age + stale_while_revalidate`
-/// - `Rotten`: Data was fetched more than `max_age + stale_while_revalidate` ago (or has no timestamp)
+/// - `Expired`: Data was fetched more than `max_age + stale_while_revalidate` ago (or has no timestamp)
 fn check_cache_freshness(
     batches: &[RecordBatch],
     max_age: Duration,
@@ -88,8 +96,8 @@ fn check_cache_freshness(
     // Check the first batch for schema information
     let schema = batches[0].schema();
     if schema.column_with_name(CACHE_REFRESHED_AT_COLUMN).is_none() {
-        // No metadata column means data was never refreshed in cache mode - treat as rotten
-        return Ok(CacheFreshness::Rotten);
+        // No metadata column means data was never refreshed in cache mode - treat as expired
+        return Ok(CacheFreshness::Expired);
     }
 
     #[expect(clippy::cast_possible_truncation)] // Safe: nanoseconds won't exceed i64::MAX
@@ -103,13 +111,13 @@ fn check_cache_freshness(
     let max_age_nanos = max_age.as_nanos() as i64;
     let fresh_threshold = now_nanos - max_age_nanos;
 
-    // Calculate rotten threshold (max_age + stale_while_revalidate)
-    let rotten_threshold = if let Some(swr) = stale_while_revalidate {
+    // Calculate expired threshold (max_age + stale_while_revalidate)
+    let expired_threshold = if let Some(swr) = stale_while_revalidate {
         #[expect(clippy::cast_possible_truncation)]
         let swr_nanos = swr.as_nanos() as i64;
         now_nanos - max_age_nanos - swr_nanos
     } else {
-        // If no stale_while_revalidate, stale items become rotten immediately
+        // If no stale_while_revalidate, stale items become expired immediately
         fresh_threshold
     };
 
@@ -133,22 +141,31 @@ fn check_cache_freshness(
             })?;
         for i in 0..ts_array.len() {
             if !ts_array.is_valid(i) {
-                // Null value = rotten, return immediately (can't get worse)
-                return Ok(CacheFreshness::Rotten);
+                // Null value = expired, return immediately (can't get worse)
+                return Ok(CacheFreshness::Expired);
             }
             let ts = ts_array.value(i);
-            if ts < rotten_threshold {
-                // Rotten is the worst, return immediately
-                return Ok(CacheFreshness::Rotten);
+            if ts < expired_threshold {
+                // Expired is the worst, return immediately
+                return Ok(CacheFreshness::Expired);
             }
             if ts < fresh_threshold && worst_freshness == CacheFreshness::Fresh {
-                // Found a stale row - update worst status but continue checking for rotten
+                // Found a stale row - update worst status but continue checking for expired
                 worst_freshness = CacheFreshness::Stale;
             }
         }
     }
 
     Ok(worst_freshness)
+}
+
+/// Compute a cache key from filter expressions.
+/// The cache key is a string representation of the filter values for `request_path`, `request_query`, and `request_body`.
+fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
+    // Sort and join filter expressions to create a consistent cache key
+    let mut parts: Vec<String> = filters.iter().map(ToString::to_string).collect();
+    parts.sort();
+    parts.join("|")
 }
 
 /// Helper functions for cache refresh operations
@@ -441,11 +458,11 @@ impl CacheRefreshHelper {
     }
 
     /// Upsert data into the accelerator by removing rows matching the filters and inserting new data.
-    /// This is used when cached data exists but is rotten (expired).
+    /// This is used when cached data exists but is expired.
     ///
     /// The process:
     /// 1. Scan all data from the accelerator
-    /// 2. Filter out rows that match the provided filters (these are the rotten rows to replace)
+    /// 2. Filter out rows that match the provided filters (these are the expired rows to replace)
     /// 3. Combine remaining rows with new data
     /// 4. Overwrite the accelerator with the combined data
     async fn upsert_into_accelerator(
@@ -591,8 +608,12 @@ impl CacheRefreshHelper {
     /// Returns a `SendableRecordBatchStream` containing the fetched data, empty stream, or error stream.
     ///
     /// # Arguments
-    /// * `is_rotten` - If `true`, data exists in the cache but is expired (rotten), so we use upsert.
+    /// * `is_expired` - If `true`, data exists in the cache but is expired, so we use upsert.
     ///   If `false`, no data exists in the cache, so we use insert (append).
+    /// * `stale_if_error` - If `true` and `expired_batches` is provided, serve the expired cached data
+    ///   when the upstream source returns an error instead of propagating the error.
+    /// * `expired_batches` - The expired cached data to serve if `stale_if_error` is enabled and
+    ///   the source returns an error.
     /// * `accelerator_mutex` - Mutex to protect concurrent access to the accelerator.
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
@@ -602,7 +623,9 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         limit: Option<usize>,
         fallback_schema: SchemaRef,
-        is_rotten: bool,
+        is_expired: bool,
+        stale_if_error: bool,
+        expired_batches: Option<Vec<RecordBatch>>,
         accelerator_mutex: Arc<Mutex<()>>,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
@@ -619,9 +642,9 @@ impl CacheRefreshHelper {
                 let lock_guard = accelerator_mutex.lock().await;
 
                 // Store in accelerator for future queries
-                let store_result = if is_rotten {
+                let store_result = if is_expired {
                     // Data exists but is expired - upsert (remove matching rows, add new)
-                    tracing::debug!("Upserting rotten cache entry for dataset={dataset_name}");
+                    tracing::debug!("Upserting expired cache entry for dataset={dataset_name}");
                     Self::upsert_into_accelerator(
                         &accelerator,
                         dataset_name,
@@ -663,6 +686,22 @@ impl CacheRefreshHelper {
                 Box::pin(empty_stream)
             }
             Err(e) => {
+                // Check if we should serve stale (expired) data on error
+                if stale_if_error
+                    && let Some(batches) = expired_batches
+                    && !batches.is_empty()
+                {
+                    tracing::warn!(
+                        "Cache miss fetch failed for dataset {}, serving stale data due to stale_if_error: {}",
+                        dataset_name,
+                        e
+                    );
+                    let batch_schema = batches[0].schema();
+                    let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                    let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
+                    return Box::pin(adapter);
+                }
+
                 tracing::error!(
                     "Cache miss fetch failed for dataset {}: {}",
                     dataset_name,
@@ -682,10 +721,10 @@ impl CacheRefreshHelper {
     ///
     /// Cache behavior based on freshness:
     /// - `Fresh`: Return cached data immediately, no refresh needed
-    /// - `Stale`: Return cached data immediately, trigger background refresh
-    /// - `Rotten`: This should not be called for rotten data (handled as cache miss)
+    /// - `Stale`: Return cached data immediately, trigger background refresh (if not already in-flight)
+    /// - `Expired`: This should not be called for expired data (handled as cache miss)
     #[expect(clippy::too_many_arguments)]
-    fn handle_cache_hit(
+    async fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
         accelerator: &Arc<dyn TableProvider>,
@@ -695,6 +734,8 @@ impl CacheRefreshHelper {
         io_runtime: &Handle,
         schema: SchemaRef,
         accelerator_mutex: &Arc<Mutex<()>>,
+        filters: &[Expr],
+        in_flight_revalidations: &InFlightRevalidations,
     ) -> SendableRecordBatchStream {
         let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
@@ -710,7 +751,7 @@ impl CacheRefreshHelper {
         // Check freshness and trigger background refresh if stale
         if let Some(max_age) = max_age {
             let freshness = check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
-                .unwrap_or(CacheFreshness::Rotten);
+                .unwrap_or(CacheFreshness::Expired);
 
             match freshness {
                 CacheFreshness::Fresh => {
@@ -719,48 +760,77 @@ impl CacheRefreshHelper {
                     );
                 }
                 CacheFreshness::Stale => {
-                    tracing::debug!(
-                        "Data is stale for dataset={dataset_name}, triggering background refresh"
-                    );
+                    // Compute cache key to check for in-flight revalidation
+                    let cache_key = compute_cache_key_from_filters(filters);
 
-                    // Log current fetched_at for debugging
-                    if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0]) {
-                        tracing::debug!(
-                            "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
-                        );
-                    }
-
-                    let federated_clone = Arc::clone(federated);
-                    let accelerator_clone = Arc::clone(accelerator);
-                    let dataset_name_clone = dataset_name.to_string();
-                    let accelerator_mutex_clone = Arc::clone(accelerator_mutex);
-
-                    io_runtime.spawn(async move {
-                        tracing::debug!(
-                            "Background refresh task started for dataset={dataset_name_clone}"
-                        );
-                        match Self::refresh_stale_rows(
-                            federated_clone,
-                            accelerator_clone,
-                            &dataset_name_clone,
-                            max_age,
-                            accelerator_mutex_clone,
-                        )
-                        .await
-                        {
-                            Ok(rows) => {
-                                tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
-                            }
-                            Err(e) => {
-                                tracing::error!("Background refresh task failed for dataset={dataset_name_clone}: {e}");
-                            }
+                    // Try to acquire the revalidation slot for this cache key
+                    // Use async lock since we're in an async context
+                    let should_revalidate = {
+                        let mut in_flight = in_flight_revalidations.lock().await;
+                        if in_flight.contains(&cache_key) {
+                            tracing::debug!(
+                                "Skipping background refresh for dataset={dataset_name}, cache_key={cache_key} - revalidation already in progress"
+                            );
+                            false
+                        } else {
+                            in_flight.insert(cache_key.clone());
+                            true
                         }
-                    });
+                    };
+
+                    if should_revalidate {
+                        tracing::debug!(
+                            "Data is stale for dataset={dataset_name}, triggering background refresh"
+                        );
+
+                        // Log current fetched_at for debugging
+                        if let Some(timestamp) = get_first_fetched_at_timestamp(&cached_batches[0])
+                        {
+                            tracing::debug!(
+                                "Current stale data has {CACHE_REFRESHED_AT_COLUMN} timestamp={timestamp}"
+                            );
+                        }
+
+                        let federated_clone = Arc::clone(federated);
+                        let accelerator_clone = Arc::clone(accelerator);
+                        let dataset_name_clone = dataset_name.to_string();
+                        let accelerator_mutex_clone = Arc::clone(accelerator_mutex);
+                        let in_flight_clone = Arc::clone(in_flight_revalidations);
+
+                        io_runtime.spawn(async move {
+                            tracing::debug!(
+                                "Background refresh task started for dataset={dataset_name_clone}"
+                            );
+                            let result = Self::refresh_stale_rows(
+                                federated_clone,
+                                accelerator_clone,
+                                &dataset_name_clone,
+                                max_age,
+                                accelerator_mutex_clone,
+                            )
+                            .await;
+
+                            // Remove the cache key from in-flight set when done
+                            {
+                                let mut in_flight = in_flight_clone.lock().await;
+                                in_flight.remove(&cache_key);
+                            }
+
+                            match result {
+                                Ok(rows) => {
+                                    tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows");
+                                }
+                                Err(e) => {
+                                    tracing::error!("Background refresh task failed for dataset={dataset_name_clone}: {e}");
+                                }
+                            }
+                        });
+                    }
                 }
-                CacheFreshness::Rotten => {
-                    // This shouldn't happen as rotten data should be handled as cache miss
+                CacheFreshness::Expired => {
+                    // This shouldn't happen as expired data should be handled as cache miss
                     tracing::warn!(
-                        "Unexpected rotten data in handle_cache_hit for dataset={dataset_name}"
+                        "Unexpected expired data in handle_cache_hit for dataset={dataset_name}"
                     );
                 }
             }
@@ -785,6 +855,8 @@ pub struct CachingAccelerationScanExec {
     max_age: Option<Duration>,
     /// Time window after `max_age` during which stale data can be served while revalidating
     stale_while_revalidate: Option<Duration>,
+    /// If true, serve expired cached data when upstream source returns an error
+    stale_if_error: bool,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
@@ -794,6 +866,8 @@ pub struct CachingAccelerationScanExec {
     limit: Option<usize>,
     /// Mutex to protect concurrent access to the accelerator during cache operations
     accelerator_mutex: Arc<Mutex<()>>,
+    /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
+    in_flight_revalidations: InFlightRevalidations,
 }
 
 impl CachingAccelerationScanExec {
@@ -802,6 +876,7 @@ impl CachingAccelerationScanExec {
         input: Arc<dyn ExecutionPlan>,
         max_age: Option<Duration>,
         stale_while_revalidate: Option<Duration>,
+        stale_if_error: bool,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: String,
@@ -810,6 +885,7 @@ impl CachingAccelerationScanExec {
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
         accelerator_mutex: Arc<Mutex<()>>,
+        in_flight_revalidations: InFlightRevalidations,
     ) -> Self {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
@@ -825,6 +901,7 @@ impl CachingAccelerationScanExec {
             plan_properties,
             max_age,
             stale_while_revalidate,
+            stale_if_error,
             federated,
             accelerator,
             dataset_name,
@@ -833,6 +910,7 @@ impl CachingAccelerationScanExec {
             projection,
             limit,
             accelerator_mutex,
+            in_flight_revalidations,
         }
     }
 }
@@ -882,6 +960,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             Arc::clone(&children[0]),
             self.max_age,
             self.stale_while_revalidate,
+            self.stale_if_error,
             Arc::clone(&self.federated),
             Arc::clone(&self.accelerator),
             self.dataset_name.clone(),
@@ -890,9 +969,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.projection.clone(),
             self.limit,
             Arc::clone(&self.accelerator_mutex),
+            Arc::clone(&self.in_flight_revalidations),
         )))
     }
 
+    #[expect(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,
@@ -915,8 +996,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let limit = self.limit;
         let max_age = self.max_age;
         let stale_while_revalidate = self.stale_while_revalidate;
+        let stale_if_error = self.stale_if_error;
         let io_runtime = self.io_runtime.clone();
         let accelerator_mutex = Arc::clone(&self.accelerator_mutex);
+        let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -934,7 +1017,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             tracing::debug!(
                 dataset = %dataset_name,
                 num_filters = filters.len(),
-                "About to read batches from accelerator stream"
+                "About to read batches from accelerator stream; filters: {}", ExprListDisplay::comma_separated(&filters)
             );
 
             let cached_batches: Vec<RecordBatch> = match accelerator_stream.try_collect().await {
@@ -957,17 +1040,23 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let total_cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
 
             if total_cached_rows > 0 {
-                // Check if data is rotten (past max_age + stale_while_revalidate)
-                // If rotten, treat as cache miss with is_rotten=true (will upsert)
+                // Check if data is expired (past max_age + stale_while_revalidate)
+                // If expired, treat as cache miss with is_expired=true (will upsert)
                 if let Some(max_age) = max_age {
                     let freshness =
                         check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
-                            .unwrap_or(CacheFreshness::Rotten);
+                            .unwrap_or(CacheFreshness::Expired);
 
-                    if freshness == CacheFreshness::Rotten {
+                    if freshness == CacheFreshness::Expired {
                         tracing::debug!(
-                            "Data is rotten for dataset={dataset_name}, treating as cache miss (upsert)"
+                            "Data is expired for dataset={dataset_name}, treating as cache miss (upsert)"
                         );
+                        // Pass the expired batches for stale_if_error fallback
+                        let expired_batches = if stale_if_error {
+                            Some(cached_batches)
+                        } else {
+                            None
+                        };
                         return CacheRefreshHelper::handle_cache_miss(
                             federated,
                             accelerator,
@@ -975,7 +1064,9 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             &filters,
                             limit,
                             Arc::clone(&schema_clone),
-                            true, // is_rotten = true, will upsert
+                            true, // is_expired = true, will upsert
+                            stale_if_error,
+                            expired_batches,
                             Arc::clone(&accelerator_mutex),
                         )
                         .await;
@@ -993,7 +1084,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &io_runtime,
                     Arc::clone(&schema_clone),
                     &accelerator_mutex,
+                    &filters,
+                    &in_flight_revalidations,
                 )
+                .await
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
                 tracing::debug!(
@@ -1006,7 +1100,9 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     &filters,
                     limit,
                     Arc::clone(&schema_clone),
-                    false, // is_rotten = false, will insert (append)
+                    false, // is_expired = false, will insert (append)
+                    false, // stale_if_error = false, no expired data to fall back to
+                    None,  // no expired batches
                     accelerator_mutex,
                 )
                 .await
@@ -1282,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_freshness_rotten_data() {
+    async fn test_cache_freshness_expired_data() {
         let schema = create_test_schema_with_refresh_timestamp();
         let id_array = Int32Array::from(vec![1, 2]);
         let name_array = StringArray::from(vec!["alice", "bob"]);
@@ -1316,13 +1412,13 @@ mod tests {
             .expect("Should check freshness");
         assert_eq!(
             freshness,
-            CacheFreshness::Rotten,
-            "Data past max_age + swr should be rotten"
+            CacheFreshness::Expired,
+            "Data past max_age + swr should be expired"
         );
     }
 
     #[tokio::test]
-    async fn test_cache_freshness_no_swr_stale_becomes_rotten() {
+    async fn test_cache_freshness_no_swr_stale_becomes_expired() {
         let schema = create_test_schema_with_refresh_timestamp();
         let id_array = Int32Array::from(vec![1, 2]);
         let name_array = StringArray::from(vec!["alice", "bob"]);
@@ -1356,13 +1452,13 @@ mod tests {
             .expect("Should check freshness");
         assert_eq!(
             freshness,
-            CacheFreshness::Rotten,
-            "Without swr, data past max_age should be rotten (not stale)"
+            CacheFreshness::Expired,
+            "Without swr, data past max_age should be expired (not stale)"
         );
     }
 
     #[tokio::test]
-    async fn test_cache_freshness_null_timestamps_are_rotten() {
+    async fn test_cache_freshness_null_timestamps_are_expired() {
         let schema = create_test_schema_with_refresh_timestamp();
         let id_array = Int32Array::from(vec![1, 2]);
         let name_array = StringArray::from(vec!["alice", "bob"]);
@@ -1386,13 +1482,13 @@ mod tests {
             .expect("Should check freshness");
         assert_eq!(
             freshness,
-            CacheFreshness::Rotten,
-            "Data with null timestamps should be rotten"
+            CacheFreshness::Expired,
+            "Data with null timestamps should be expired"
         );
     }
 
     #[tokio::test]
-    async fn test_cache_freshness_no_refresh_column_is_rotten() {
+    async fn test_cache_freshness_no_refresh_column_is_expired() {
         let schema = create_test_schema_without_refresh_timestamp();
         let id_array = Int32Array::from(vec![1, 2]);
         let name_array = StringArray::from(vec!["alice", "bob"]);
@@ -1410,8 +1506,8 @@ mod tests {
             .expect("Should check freshness");
         assert_eq!(
             freshness,
-            CacheFreshness::Rotten,
-            "Data without refresh column should be rotten"
+            CacheFreshness::Expired,
+            "Data without refresh column should be expired"
         );
     }
 
@@ -1427,11 +1523,11 @@ mod tests {
             .expect("Time went backwards")
             .as_nanos() as i64;
 
-        // Mix: fresh (10s), stale (70s), rotten (100s)
+        // Mix: fresh (10s), stale (70s), expired (100s)
         let refresh_timestamps = TimestampNanosecondArray::from(vec![
             Some(now - 10_000_000_000),  // Fresh
             Some(now - 70_000_000_000),  // Stale (past 60s, within 90s)
-            Some(now - 100_000_000_000), // Rotten (past 90s)
+            Some(now - 100_000_000_000), // Expired (past 90s)
         ]);
 
         let batch = RecordBatch::try_new(
@@ -1451,8 +1547,8 @@ mod tests {
             .expect("Should check freshness");
         assert_eq!(
             freshness,
-            CacheFreshness::Rotten,
-            "If any row is rotten, the whole batch should be considered rotten"
+            CacheFreshness::Expired,
+            "If any row is expired, the whole batch should be considered expired"
         );
     }
 
@@ -1514,24 +1610,28 @@ mod tests {
         assert_eq!(freshness, CacheFreshness::Stale, "Just past max_age");
 
         // Just past max_age + swr (91 seconds ago)
-        let refresh_timestamps_rotten = TimestampNanosecondArray::from(vec![Some(
+        let refresh_timestamps_expired = TimestampNanosecondArray::from(vec![Some(
             now - max_age_nanos - swr_nanos - 1_000_000_000,
         )]);
 
-        let batch_rotten = RecordBatch::try_new(
+        let batch_expired = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(id_array),
                 Arc::new(name_array),
-                Arc::new(refresh_timestamps_rotten),
+                Arc::new(refresh_timestamps_expired),
             ],
         )
         .expect("Failed to create batch");
 
         let freshness =
-            check_cache_freshness(&[batch_rotten], max_age, Some(stale_while_revalidate))
+            check_cache_freshness(&[batch_expired], max_age, Some(stale_while_revalidate))
                 .expect("Should check freshness");
-        assert_eq!(freshness, CacheFreshness::Rotten, "Just past max_age + swr");
+        assert_eq!(
+            freshness,
+            CacheFreshness::Expired,
+            "Just past max_age + swr"
+        );
     }
 
     #[tokio::test]

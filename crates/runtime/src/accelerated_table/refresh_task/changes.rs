@@ -22,6 +22,8 @@ use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::{DeletionTableProvider, get_deletion_provider};
+#[cfg(feature = "dynamodb")]
+use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
@@ -90,13 +92,12 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.as_ref() {
-                                ready_sender.notify_waiters();
-                            }
-                            initial_load_completed.store(true, Ordering::Relaxed);
-
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
+                                initial_load_completed.store(true, Ordering::Relaxed);
+                                if let Some(ready_sender) = ready_sender.as_ref() {
+                                    ready_sender.notify_waiters();
+                                }
                                 self.update_component_status(status::ComponentStatus::Ready)
                                     .await;
                             }
@@ -147,7 +148,9 @@ impl RefreshTask {
             }
         }
 
-        tracing::warn!("Changes stream ended for dataset {dataset_name}");
+        if !self.runtime_status.is_shutdown() {
+            tracing::warn!("Changes stream ended for dataset {dataset_name}");
+        }
 
         Ok(())
     }
@@ -162,8 +165,7 @@ impl RefreshTask {
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
-        // TODO: Should be trace
-        tracing::info!(
+        tracing::trace!(
             "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
             self.dataset_name,
             change_batch.record.num_rows(),
@@ -189,6 +191,12 @@ impl RefreshTask {
             }
         }
 
+        if let Some(ref callback) = self.on_stream_batch_process_callback {
+            let mut callback_guard = callback.lock().await;
+            let future = callback_guard();
+            future.await;
+        }
+
         Ok(())
     }
 
@@ -209,12 +217,7 @@ impl RefreshTask {
         let indices_array = UInt32Array::from(
             row_indices
                 .iter()
-                .map(|&i| {
-                    u32::try_from(i).unwrap_or_else(|_| {
-                        tracing::error!("Index {i} doesn't fit in u32, using 0");
-                        0
-                    })
-                })
+                .filter_map(|&i| u32::try_from(i).ok())
                 .collect::<Vec<_>>(),
         );
 
@@ -486,6 +489,19 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
                 );
             }
         }
+        return StreamErrorType::Fatal;
+    }
+
+    #[cfg(feature = "dynamodb")]
+    if matches!(
+        err,
+        cdc::StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage {
+            source: dynamodb_streams::Error::StreamBeyondRetention,
+        })
+    ) {
+        tracing::error!(
+            "DynamoDB Stream for dataset '{dataset_name}' is beyond 24 hour retention policy. Delete acceleration to initiate table bootstrapping"
+        );
         return StreamErrorType::Fatal;
     }
 

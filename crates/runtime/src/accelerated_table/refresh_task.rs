@@ -77,6 +77,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::{
@@ -91,6 +92,10 @@ use util::{RetryError, retry};
 mod changes;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
+
+// Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
+type StreamBatchProcessCallback =
+    Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
@@ -113,6 +118,7 @@ pub struct RefreshTaskBuilder {
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     /// Mutex to protect concurrent access to the accelerator during cache operations.
     accelerator_mutex: Arc<Mutex<()>>,
+    on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
 
 impl RefreshTaskBuilder {
@@ -139,6 +145,7 @@ impl RefreshTaskBuilder {
             io_runtime,
             resource_monitor: None,
             accelerator_mutex,
+            on_stream_batch_process_callback: None,
         }
     }
 
@@ -173,6 +180,15 @@ impl RefreshTaskBuilder {
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> RefreshTaskBuilder {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_on_stream_batch_process_callback(
+        mut self,
+        callback: Option<StreamBatchProcessCallback>,
+    ) -> RefreshTaskBuilder {
+        self.on_stream_batch_process_callback = callback;
         self
     }
 
@@ -223,11 +239,11 @@ impl RefreshTaskBuilder {
             io_runtime: self.io_runtime,
             resource_monitor: self.resource_monitor,
             accelerator_mutex: self.accelerator_mutex,
+            on_stream_batch_process_callback: self.on_stream_batch_process_callback,
         }
     }
 }
 
-#[derive(Debug)]
 pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -244,6 +260,26 @@ pub struct RefreshTask {
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     /// Mutex to protect concurrent access to the accelerator during cache operations.
     accelerator_mutex: Arc<Mutex<()>>,
+    on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+}
+
+impl std::fmt::Debug for RefreshTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshTask")
+            .field("runtime_status", &self.runtime_status)
+            .field("dataset_name", &self.dataset_name)
+            .field("federated", &self.federated)
+            .field("federated_source", &self.federated_source)
+            .field("accelerator", &self.accelerator)
+            .field("sink", &self.sink)
+            .field("disable_federation", &self.disable_federation)
+            .field("semaphore", &self.semaphore)
+            .field("enabled_metrics", &self.enabled_metrics)
+            .field("cpu_runtime", &self.cpu_runtime)
+            .field("io_runtime", &self.io_runtime)
+            .field("resource_monitor", &self.resource_monitor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RefreshTask {

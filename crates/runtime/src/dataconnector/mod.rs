@@ -566,7 +566,16 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
+    }
+
+    /// Returns whether the data connector should be initialized on startup or on trigger,
+    /// with dataset-specific logic.
+    ///
+    /// This method allows connectors to make initialization decisions based on the specific
+    /// dataset configuration. The default implementation delegates to `initialization()`.
+    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+        self.initialization()
     }
 }
 
@@ -621,11 +630,11 @@ pub async fn get_data(
         df = df.filter(filter).map_err(find_datafusion_root)?;
     }
 
-    if tracing::enabled!(Level::DEBUG)
+    if tracing::enabled!(Level::TRACE)
         && let Ok(explained) = df.clone().explain(false, false)
         && let Ok(explained) = explained.to_string().await
     {
-        tracing::debug!("Data refresh plan for {}:\n{}", table_name, explained);
+        tracing::trace!("Data refresh plan for {}:\n{}", table_name, explained);
     }
 
     let sql = Unparser::default()

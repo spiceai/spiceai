@@ -29,8 +29,6 @@ use crate::config::ClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
-#[cfg(not(windows))]
-use cayenne::optimizer_rules::CayenneJoinRewriter;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::{
@@ -294,11 +292,6 @@ impl DataFusionBuilder {
                 Arc::new(Box::new(track_bytes_processed)),
             )));
 
-        #[cfg(not(windows))]
-        {
-            state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
-        }
-
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -382,6 +375,7 @@ impl DataFusionBuilder {
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            refresh_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,

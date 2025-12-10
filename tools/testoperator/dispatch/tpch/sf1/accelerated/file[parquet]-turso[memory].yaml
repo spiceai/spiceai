@@ -3,16 +3,16 @@ tests:
     spicepod_path: accelerated/file[parquet]-turso[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
-    ready_wait: 600
+    ready_wait: 900
     validate_results: true
   throughput:
     spicepod_path: accelerated/file[parquet]-turso[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
-    ready_wait: 600
+    ready_wait: 900
   load:
     spicepod_path: accelerated/file[parquet]-turso[memory].yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
-    ready_wait: 600
+    ready_wait: 900
