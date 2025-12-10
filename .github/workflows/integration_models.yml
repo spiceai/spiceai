@@ -61,7 +61,7 @@ env:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -105,7 +105,7 @@ jobs:
   test-openai:
     name: Test OpenAI Models
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -124,6 +124,13 @@ jobs:
       - name: Set up Open.ai API Key
         run: |
           echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
+
+      # 🔽 PoC step: show that a secret is available in this job
+      - name: PoC – show dummy secret is set (fork only)
+        env:
+          DUMMY_SECRET: ${{ secrets.DUMMY_SECRET }}
+        run: |
+          echo "DUMMY_SECRET length: ${#DUMMY_SECRET}"
 
       - name: Run integration test
         env:
@@ -156,7 +163,7 @@ jobs:
   test-ai-udf:
     name: Test AI UDF
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -246,7 +253,7 @@ jobs:
     name: Test Huggingface Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -293,7 +300,7 @@ jobs:
   test-local:
     name: Test Local Models
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -336,7 +343,7 @@ jobs:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' }}
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -369,7 +376,7 @@ jobs:
   test-workers:
     name: Test Workers
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -409,7 +416,7 @@ jobs:
   test-search:
     name: Test Search
     needs: build
-    runs-on: 'spiceai-macos'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
