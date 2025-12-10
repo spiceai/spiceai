@@ -20,7 +20,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_connection;
+use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -46,9 +46,12 @@ use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
+use std::error::Error;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tonic::{Request, Status};
+use tonic::service::Interceptor;
 use url::Url;
 use uuid::Uuid;
 
@@ -92,37 +95,44 @@ pub async fn initialize_cluster_executor(
         .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
     let scheduler_connection =
-        create_grpc_client_connection(rt.config.cluster.scheduler_url.clone().to_string())
-            .await
+        create_grpc_client_endpoint(rt.config.cluster.scheduler_url.clone().to_string())
             .map_err(|_| FailedToStartClusterExecutor {
                 source: format!(
                     "Unable to connect to scheduler at {}",
                     rt.config.cluster.scheduler_url
                 )
                 .into(),
+            })?
+            .connect()
+            .await
+            .map_err(|_| FailedToStartClusterExecutor {
+                source: format!(
+                    "Unable to connect to scheduler at {}",
+                    rt.config.cluster.scheduler_url
+                )
+                    .into(),
             })?;
 
-    let Some(api_key) = rt.config.cluster.scheduler_api_key.clone() else {
+    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
         return Err(FailedToStartClusterExecutor {
             source: "Unable to start executor without an API key".into(),
         });
     };
 
-    let scheduler = SchedulerGrpcClient::with_interceptor(
-        scheduler_connection,
-        move |mut req: tonic::Request<_>| {
-            req.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {api_key}")
-                    .parse()
-                    .expect("Must serialize API key"),
-            );
+    let interceptor = move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {api_key}")
+                .parse()
+                .expect("Must serialize API key"),
+        );
 
-            Ok(req)
-        },
-    )
-    .max_encoding_message_size(usize::MAX)
-    .max_decoding_message_size(usize::MAX);
+        Ok(req)
+    };
+
+    let scheduler = SchedulerGrpcClient::with_interceptor(scheduler_connection, interceptor)
+        .max_encoding_message_size(usize::MAX)
+        .max_decoding_message_size(usize::MAX);
 
     // Try to bind the same flight port Spice usually does, but if we cannot, bind a different
     // port to allow for easy local deployments
@@ -300,7 +310,7 @@ async fn executor_bind_app(
     scheduler_flight_url: String,
     executor_id: String,
 ) -> crate::Result<()> {
-    let Some(api_key) = rt.config.cluster.scheduler_api_key.clone() else {
+    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
         return Err(FailedToStartClusterExecutor {
             source: "Unable to start executor without an API key".clone().into(),
         });

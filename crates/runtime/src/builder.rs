@@ -237,7 +237,7 @@ impl RuntimeBuilder {
                     }
                 })
             {
-                cluster_config.scheduler_api_key = match api_key {
+                cluster_config.cluster_api_key = match api_key {
                     ApiKey::ReadOnly { key } => Some(key),
                     ApiKey::ReadWrite { key } => Some(key),
                 };

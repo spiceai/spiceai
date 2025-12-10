@@ -60,7 +60,7 @@ use tonic_health::pb::health_server::HealthServer;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::dataupdate::UpdateType;
-use crate::tls::TlsConfig;
+use crate::tls::{TlsConfig, server_with_tls_config};
 use crate::{tracers::OnceTracer, warn_once};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -605,13 +605,7 @@ pub async fn start(
     let mut server = Server::builder();
 
     if let Some(ref tls_config) = tls_config {
-        let server_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
-            tls_config.cert.expose_secret(),
-            tls_config.key.expose_secret(),
-        ));
-        server = server
-            .tls_config(server_tls_config)
-            .context(UnableToConfigureTlsSnafu)?;
+        server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
     }
 
     let server = server

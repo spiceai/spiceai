@@ -122,8 +122,8 @@ pub struct ClusterConfig {
     pub scheduler_url: Url,
 
     /// Set the API key configured in the scheduler for secure RPC
-    #[arg(long = "scheduler-api-key", value_name = "SCHEDULER_API_KEY", action)]
-    pub scheduler_api_key: Option<String>,
+    #[arg(long = "cluster-api-key", value_name = "CLUSTER_API_KEY", action)]
+    pub cluster_api_key: Option<String>,
 
     #[arg(
         long = "allow-insecure-connections",
@@ -145,7 +145,7 @@ impl Default for ClusterConfig {
         Self {
             mode: None,
             scheduler_url: url,
-            scheduler_api_key: None,
+            cluster_api_key: None,
             allow_insecure_connections: false,
         }
     }

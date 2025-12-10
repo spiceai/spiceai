@@ -26,7 +26,8 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
-use crate::tls::TlsConfig;
+use crate::flight::Error::UnableToConfigureTls;
+use crate::tls::{TlsConfig, server_with_tls_config};
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -460,13 +461,7 @@ pub async fn start(
     let mut server = Server::builder();
 
     if let Some(ref tls_config) = tls_config {
-        let server_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
-            tls_config.cert.expose_secret(),
-            tls_config.key.expose_secret(),
-        ));
-        server = server
-            .tls_config(server_tls_config)
-            .context(UnableToConfigureTlsSnafu)?;
+        server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
     }
 
     #[cfg(feature = "cluster")]
@@ -481,19 +476,13 @@ pub async fn start(
         );
     }
 
-    // #[cfg(feature = "cluster")]
-    // if app
-    //     .as_ref()
-    //     .and_then(|app| app.runtime.auth.as_ref())
-    //     .and_then(|auth| auth.api_key.as_ref())
-    //     .map(|auth| !auth.enabled || auth.keys.is_empty())
-    //     .unwrap_or(true)
-    // {
-    //     panic!(
-    //         "Refusing to start in clustered mode without configuring API key authentication.\
-    //          Read the docs to learn how to declare one: https://spiceai.org/docs/api/auth"
-    //     );
-    // }
+    #[cfg(feature = "cluster")]
+    if rt.df.cluster_config.cluster_api_key.is_none() {
+        panic!(
+            "Refusing to start in clustered mode without configuring API key authentication.\
+             Read the docs to learn how to declare one: https://spiceai.org/docs/api/auth"
+        );
+    }
 
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))

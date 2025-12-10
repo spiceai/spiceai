@@ -429,6 +429,12 @@ pub enum Error {
     FailedToStartClusterExecutor {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Failed to configure gRPC interceptor: {source}"))]
+    FailedToBindClusterGRPCInterceptor {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 #[cfg(feature = "cluster")]

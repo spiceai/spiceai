@@ -83,6 +83,8 @@ use opentelemetry::KeyValue;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
+use tonic::{Request, Status};
+use crate::Error::FailedToStartClusterExecutor;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -171,7 +173,7 @@ impl Query {
             return Ok(self.df.ctx.state());
         }
 
-        let Some(ref api_key) = self.df.cluster_config.scheduler_api_key else {
+        let Some(ref api_key) = self.df.cluster_config.cluster_api_key else {
             return config_err!("API key is required for scheduler to perform planning")
                 .map_err(|e| UnableToExecuteQuery { source: e });
         };
@@ -180,17 +182,13 @@ impl Query {
             .df
             .ctx
             .copied_config()
-            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec());
-
-        let mut ballista_config = cfg.ballista_config();
-        ballista_config
-            .set("spice.api_key", api_key)
-            .context(UnableToExecuteQuerySnafu)?;
+            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
+            .with_ballista_grpc_metadata([("authorization".to_string(), format!("Bearer {api_key}"))].into_iter().collect());
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
                 self.df.cluster_config.scheduler_url.to_string(),
-                ballista_config,
+                cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
                 DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
             );

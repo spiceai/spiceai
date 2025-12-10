@@ -196,11 +196,6 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
-    use crate::physical_plan::cluster::distribute_file_scan::tests::create_partitioned_file;
-    use crate::physical_plan::cluster::distribute_file_scan::tests::{
-        DEFAULT_CONFIG_OPTIONS, create_data_source_exec,
-    };
 
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::DateTime;
