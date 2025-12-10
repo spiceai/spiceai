@@ -305,7 +305,10 @@ mod tests {
         #[test]
         fn test_stream_not_found_display() {
             let err = Error::StreamNotFound;
-            assert_eq!(format!("{err}"), "Stream not found");
+            assert_eq!(
+                format!("{err}"),
+                "DynamoDB Streams are not enabled on this table. Enable DynamoDB Streams and retry: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html#Streams.Enabling"
+            );
         }
 
         #[test]
