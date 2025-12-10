@@ -298,15 +298,6 @@ impl AcceleratorEngineRegistry {
         external_table_builder =
             external_table_builder.upsert_options(acceleration_settings.upsert_options());
 
-        println!(
-            "acceleration_settings.table_constraints: {:#?}",
-            acceleration_settings.table_constraints(Arc::clone(&schema))
-        );
-        println!(
-            "acceleration_settings.on_conflict: {:#?}",
-            acceleration_settings.on_conflict
-        );
-
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
                 if !constraints.is_empty() {
@@ -345,8 +336,6 @@ impl AcceleratorEngineRegistry {
             partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
                 .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?
         };
-
-        println!("external_table.options: {:#?}", external_table.options);
 
         let table_provider = accelerator
             .create_external_table(external_table, source, partition_by)
@@ -472,7 +461,6 @@ impl AcceleratorExternalTableBuilder {
 
     #[must_use]
     pub fn on_conflict(mut self, on_conflict: OnConflict) -> Self {
-        println!("on_conflict: {on_conflict:?}");
         self.on_conflict = Some(on_conflict);
         self
     }
@@ -491,7 +479,6 @@ impl AcceleratorExternalTableBuilder {
 
     #[must_use]
     pub fn constraints(mut self, constraints: Constraints) -> Self {
-        println!("constraints: {constraints:?}");
         self.constraints = Some(constraints);
         self
     }
@@ -543,8 +530,6 @@ impl AcceleratorExternalTableBuilder {
             let indexes_option_str = Acceleration::hashmap_to_option_string(&self.indexes);
             options.insert("indexes".to_string(), indexes_option_str);
         }
-
-        println!("self.on_conflict: {:?}", self.on_conflict);
 
         if let Some(on_conflict) = self.on_conflict {
             let on_conflict_str = on_conflict.to_string();

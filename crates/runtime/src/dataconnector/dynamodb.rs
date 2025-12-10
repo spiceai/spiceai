@@ -20,6 +20,7 @@ use super::{
 };
 use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
@@ -140,6 +141,17 @@ impl DataConnector for DynamoDB {
         &self,
         dataset: &Dataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
+        if let Some(acceleration) = &dataset.acceleration {
+            if let Some(refresh_mode) = acceleration.refresh_mode {
+                if matches!(refresh_mode, RefreshMode::Changes) && !acceleration.enabled {
+                    tracing::warn!(
+                        "DynamoDB dataset {} is configured for changes stream, but acceleration is disabled. Enable acceleration to use DynamoDB Streams",
+                        dataset.name
+                    );
+                }
+            }
+        }
+
         let table_name = dataset.path();
 
         let mut config_loader = initiate_config_with_credentials(
@@ -297,6 +309,7 @@ impl DataConnector for DynamoDB {
                 let dynamodb_sys = Arc::new(if dataset.is_file_accelerated() {
                     initialize_dynamodb_sys(&dataset).await
                 } else {
+                    tracing::warn!("Dataset {dataset_name} is not file-accelerated. DynamoDB Streams checkpoints will not be persisted.");
                     None
                 });
 
