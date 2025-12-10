@@ -9,7 +9,7 @@ fn main() {
 /// Function to programmatically generate all permutations of search test cases defined in [`crates/runtime/tests/search`].
 ///
 /// Cannot have any dependencies on [`crates/runtime/tests/search`] since this is built prior. Although search tests allow for the arbitrary defining of new test datasets, this currently just loads [`tests/search/megascience/`].
-#[allow(clippy::expect_used)] // Build script expects certain files to be present.
+#[expect(clippy::expect_used)] // Build script expects certain files to be present.
 fn build_search_test_cases() {
     println!("cargo:rerun-if-changed=build.rs");
     let dest_path = Path::new("tests/search/").join("generated_search_tests.rs");
@@ -62,9 +62,9 @@ generate_search_tests!([
 /// Panics if the file cannot be opened or parsed.
 fn parse_yaml_keys(s: &str) -> Vec<String> {
     let v = serde_yaml::from_reader::<_, HashMap<String, serde_yaml::Value>>(
-        fs::File::open(s).expect(format!("Failed to open YAML file {s}.").as_str()),
+        fs::File::open(s).unwrap_or_else(|_| panic!("Failed to open YAML file {s}.")),
     )
-    .expect(format!("Failed to parse YAML file {s}").as_str())
+    .unwrap_or_else(|_| panic!("Failed to parse YAML file {s}"))
     .keys()
     .cloned()
     .collect::<Vec<String>>();

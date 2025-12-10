@@ -172,7 +172,7 @@ impl SearchSpicepodConfiguration {
         };
 
         // Update vector store params with dynamic values as needed.
-        if let Some("s3_vectors") = vector_store.engine.as_deref()
+        if vector_store.engine.as_deref() == Some("s3_vectors")
             && let Some(params) = vector_store.params.as_mut()
         {
             params.data.insert(
@@ -234,7 +234,7 @@ macro_rules! generate_search_tests {
                     not(feature = "extended_tests"),
                     ignore = "Extended test - run with --features extended_tests"
                 )]
-                #[allow(non_snake_case)]
+                #[expect(non_snake_case)]
                 async fn [<test_search_ $slug:snake>]() {
                     megascience_search_test_case($slug).await;
                 }
