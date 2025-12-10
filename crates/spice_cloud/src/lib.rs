@@ -389,7 +389,7 @@ pub async fn create_synced_internal_accelerated_table(
         refresh,
         runtime.tokio_io_runtime(),
     );
-    builder.cpu_runtime(runtime.datafusion().cpu_runtime().cloned());
+    builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
 
