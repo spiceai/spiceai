@@ -174,7 +174,7 @@ impl<T: BuildHasher + Clone + Send + Sync + 'static> Hasher for PassthroughHashe
     // it re-uses the provided hash builder for hashing the value of the UUID, which is used to target a bucket segment
     // as a result, even though our keys are always u64, we also need to support hashing arbitrary byte slices (strings)
     //
-    // to support this need, we fallback to the generic hash builder for non-u64 inputs
+    // to support this need, we fallback to the hash builder from the generic type for non-u64 inputs
     fn write(&mut self, bytes: &[u8]) {
         let mut hasher = self.hasher.build_hasher();
         hasher.write(bytes);
