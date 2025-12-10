@@ -97,7 +97,7 @@ aws-sdk-cognitoidentity = "1.91.0"
 aws-sdk-cognitoidentityprovider = "1.104.0"
 aws-sdk-dynamodb = "1.100.0"
 aws-sdk-dynamodbstreams = "1.87.0"
-aws-sdk-glue = "1.131.0"
+aws-sdk-glue = "1.132.0"
 aws-sdk-s3 = "1.115.0"
 aws-sdk-s3vectors = "1.11"
 aws-sdk-secretsmanager = "1.95.0"
@@ -277,7 +277,7 @@ tonic = { version = "0.13", features = [
 tonic-health = { version = "0.13" }
 tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["cors", "limit"] }
-tracing = "0.1.41"
+tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

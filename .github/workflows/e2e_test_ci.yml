@@ -129,7 +129,7 @@ jobs:
         with:
           os: ${{ matrix.target.target_os }}
 
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -142,7 +142,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -216,12 +216,12 @@ jobs:
         with:
           os: darwin
 
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 

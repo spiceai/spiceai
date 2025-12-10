@@ -121,7 +121,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -198,7 +198,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -256,7 +256,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -321,7 +321,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
 
       - name: Start local registry
         run: |
@@ -423,7 +423,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
 
       - name: Start local registry
         run: |
