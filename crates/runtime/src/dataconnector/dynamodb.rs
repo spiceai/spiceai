@@ -295,8 +295,7 @@ impl DataConnector for DynamoDB {
 
                 if should_bootstrap {
                     tracing::info!(
-                        "No existing checkpoint found for table {}, starting from bootstrap",
-                        dataset_name
+                        "No existing checkpoint found for table {dataset_name}, starting from bootstrap"
                     );
                     // Initialize bootstrap stream
                     let bootstrap_stream = Arc::clone(&dynamodb)
@@ -348,8 +347,7 @@ impl DataConnector for DynamoDB {
                 } else {
                     // Resume reading from a checkpoint
                     tracing::info!(
-                        "Found existing checkpoint for DynamoDB table {}, resuming from checkpoint. Table will be marked as Ready once stream lag reaches < '{}'",
-                        dataset_name,
+                        "Found existing checkpoint for DynamoDB table {dataset_name}, resuming from checkpoint. Table will be marked as Ready once stream lag reaches < '{}'",
                         humantime::format_duration(acceptable_lag),
                     );
                     Some(

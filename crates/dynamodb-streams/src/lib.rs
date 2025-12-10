@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Table not found"))]
     TableNotFound,
 
-    #[snafu(display("Stream not found. Make sure the table is configured for streams"))]
+    #[snafu(display("DynamoDB Streams are not enabled on this table. Enable DynamoDB Streams and retry: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html#Streams.Enabling"))]
     StreamNotFound,
 
     #[snafu(display("Stream description not found: {stream_arn}"))]
