@@ -425,7 +425,7 @@ async fn get_latest_checkpoint(
                 );
             } else {
                 tracing::error!(
-                    "Failed to get latest global checkpoint for DynamoDB Stream for dataset {dataset_name}: {err}",
+                    "Failed to initialize DynamoDB Stream checkpoint for dataset {dataset_name}: {err}",
                 );
             }
 
