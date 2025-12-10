@@ -241,10 +241,10 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             )
             .await?;
 
-            // running_container.remove().await.map_err(|e| {
-            //     tracing::error!("running_container.remove: {e}");
-            //     anyhow::Error::msg(e.to_string())
-            // })?;
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
 
             Ok(())
         })
