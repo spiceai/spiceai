@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Table not found"))]
     TableNotFound,
 
-    #[snafu(display("Stream not found"))]
+    #[snafu(display("Stream not found. Make sure the table is configured for streams"))]
     StreamNotFound,
 
     #[snafu(display("Stream description not found: {stream_arn}"))]

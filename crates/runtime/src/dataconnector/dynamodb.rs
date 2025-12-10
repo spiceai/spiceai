@@ -402,37 +402,33 @@ async fn load_or_initialize_checkpoint(
                     dataset_name,
                     err
                 );
-                get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
+                get_latest_checkpoint(dynamodb, dataset_name)
+                    .await
+                    .map(|cp| (true, cp))
             }
         }
     } else {
-        get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
+        get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp))
     }
 }
 
-async fn get_latest_checkpoint(dynamodb: &Arc<DynamoDBTableProvider>) -> Option<Checkpoint> {
+async fn get_latest_checkpoint(
+    dynamodb: &Arc<DynamoDBTableProvider>,
+    dataset_name: &TableReference,
+) -> Option<Checkpoint> {
     match dynamodb.latest_global_checkpoint().await {
         Ok(checkpoint) => Some(checkpoint),
         Err(err) => {
-            match err {
-                Error::FailedToInitializeStream { source: e } => match e {
-                    dynamodb_streams::Error::StreamNotFound => {
-                        tracing::warn!(
-                            "Failed to initialize DynamoDB Stream Connector: Stream does not exist."
-                        );
-                        None
-                    }
-                    _ => {
-                        tracing::error!("Failed to initialize DynamoDB Stream: {e}",);
-                        None
-                    }
-                },
-                _ => {
-                    tracing::error!(
-                        "Failed to get latest global checkpoint for DynamoDB Stream: {err}",
-                    );
-                    None
-                }
+            if let Error::FailedToInitializeStream { source: e } = err {
+                tracing::error!(
+                    "Failed to initialize DynamoDB Stream for dataset {dataset_name}: {e}"
+                );
+            } else {
+                tracing::error!(
+                    "Failed to get latest global checkpoint for DynamoDB Stream for dataset {dataset_name}: {err}",
+                );
             }
 
             None
