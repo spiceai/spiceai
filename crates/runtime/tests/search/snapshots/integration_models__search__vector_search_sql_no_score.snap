@@ -5,19 +5,19 @@ snapshot_kind: text
 ---
 [
   {
-    "id": 468,
-    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+    "id": 6,
+    "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
   },
   {
-    "id": 1277,
-    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+    "id": 58,
+    "answer": "$\\frac{5}{6} < \\frac{5}{5}$ because $\\frac{5}{6}$ is less than 1, while $\\frac{5}{5}$ equals 1.  \n\nFinal answer: $\\boxed{<}$"
   },
   {
-    "id": 189,
-    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+    "id": 543,
+    "answer": "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
   },
   {
-    "id": 948,
-    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+    "id": 1318,
+    "answer": "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
   }
 ]
