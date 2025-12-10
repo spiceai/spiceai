@@ -141,15 +141,15 @@ impl DataConnector for DynamoDB {
         &self,
         dataset: &Dataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
-        if let Some(acceleration) = &dataset.acceleration {
-            if let Some(refresh_mode) = acceleration.refresh_mode {
-                if matches!(refresh_mode, RefreshMode::Changes) && !acceleration.enabled {
-                    tracing::warn!(
-                        "DynamoDB dataset {} is configured for changes stream, but acceleration is disabled. Enable acceleration to use DynamoDB Streams",
-                        dataset.name
-                    );
-                }
-            }
+        if let Some(acceleration) = &dataset.acceleration
+            && let Some(refresh_mode) = acceleration.refresh_mode
+            && matches!(refresh_mode, RefreshMode::Changes)
+            && !acceleration.enabled
+        {
+            tracing::warn!(
+                "DynamoDB dataset {} is configured for changes stream, but acceleration is disabled. Enable acceleration to use DynamoDB Streams",
+                dataset.name
+            );
         }
 
         let table_name = dataset.path();
