@@ -88,6 +88,8 @@ impl<
     }
 }
 
+type BuiltLruCache<V> = LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync + 'static>>;
+
 /// Builds an LRU cache provider from the given configuration.
 ///
 /// # Errors
@@ -96,7 +98,7 @@ impl<
 /// - If the specified `item_ttl` cannot be parsed as a valid duration.
 pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static>(
     cache_config: &CacheConfig,
-) -> Result<Arc<LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync + 'static>>>> {
+) -> Result<Arc<BuiltLruCache<V>>> {
     let cache_max_size: u64 = match &cache_config.max_size {
         Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
             .context(super::FailedToParseCacheMaxSizeSnafu)?
