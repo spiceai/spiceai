@@ -100,6 +100,97 @@ pub struct CayenneTableProvider {
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
 }
 
+/// Builder for constructing a `CayenneTableProvider` with optional configuration.
+///
+/// Use this builder to configure optional parameters before opening an existing table
+/// or creating a new one.
+///
+/// # Example
+///
+/// ```ignore
+/// // Open an existing table
+/// let provider = CayenneTableProviderBuilder::new(catalog)
+///     .with_retention_filters(filters)
+///     .with_object_store(config)
+///     .open("my_table").await?;
+///
+/// // Create a new table
+/// let provider = CayenneTableProviderBuilder::new(catalog)
+///     .with_retention_filters(filters)
+///     .create(options).await?;
+/// ```
+#[derive(Clone)]
+pub struct CayenneTableProviderBuilder {
+    catalog: Arc<dyn MetadataCatalog>,
+    retention_filters: Vec<Expr>,
+    object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+}
+
+impl CayenneTableProviderBuilder {
+    /// Create a new builder with the required catalog.
+    #[must_use]
+    pub fn new(catalog: Arc<dyn MetadataCatalog>) -> Self {
+        Self {
+            catalog,
+            retention_filters: Vec::new(),
+            object_store_config: None,
+        }
+    }
+
+    /// Set retention filters that will be applied after writes.
+    ///
+    /// These filters cause automatic deletion of rows matching the filter criteria
+    /// after each write operation.
+    #[must_use]
+    pub fn with_retention_filters(mut self, filters: Vec<Expr>) -> Self {
+        self.retention_filters = filters;
+        self
+    }
+
+    /// Set the object store configuration for remote storage.
+    ///
+    /// Used for S3 Express One Zone storage where data files are stored remotely
+    /// while metadata remains on local disk.
+    #[must_use]
+    pub fn with_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
+        self.object_store_config = Some(config);
+        self
+    }
+
+    /// Open an existing table by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be found in the catalog or if the listing
+    /// table cannot be created.
+    pub async fn open(self, table_name: &str) -> CatalogResult<CayenneTableProvider> {
+        CayenneTableProvider::new_internal(
+            table_name,
+            self.catalog,
+            self.retention_filters,
+            self.object_store_config,
+        )
+        .await
+    }
+
+    /// Create a new table with the given options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created in the catalog.
+    pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
+        let table_name = options.table_name.clone();
+        let _table_id = self.catalog.create_table(options).await?;
+        CayenneTableProvider::new_internal(
+            &table_name,
+            self.catalog,
+            self.retention_filters,
+            self.object_store_config,
+        )
+        .await
+    }
+}
+
 impl std::fmt::Debug for CayenneTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CayenneTableProvider")
@@ -245,7 +336,7 @@ impl CayenneTableProvider {
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
     fn snapshot_dir_url(table_path: &str, table_id: i64, snapshot_id: &str) -> String {
-        if table_path.starts_with("s3://") || table_path.starts_with("s3a://") {
+        if table_path.starts_with("s3://") {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
             format!("{base}/{table_id}/{snapshot_id}/")
@@ -364,18 +455,21 @@ impl CayenneTableProvider {
 
     /// Create a new Cayenne table provider.
     ///
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
     pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
-        Self::new_with_retention(table_name, catalog, Vec::new()).await
+        CayenneTableProviderBuilder::new(catalog)
+            .open(table_name)
+            .await
     }
 
     /// Create a new table provider with explicit retention filters.
     ///
-    /// This is primarily used by the runtime when datasets specify `retention_sql`
-    /// so that deletion vectors are written before a refresh completes.
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
     ///
     /// # Errors
     ///
@@ -386,27 +480,14 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
     ) -> CatalogResult<Self> {
-        Self::new_with_retention_and_object_store(table_name, catalog, retention_filters, None)
+        CayenneTableProviderBuilder::new(catalog)
+            .with_retention_filters(retention_filters)
+            .open(table_name)
             .await
     }
 
-    /// Create a new table provider with explicit retention filters and optional object store.
-    ///
-    /// This is primarily used by the runtime when datasets specify `retention_sql`
-    /// and/or use S3 Express One Zone storage for data files.
-    ///
-    /// # Arguments
-    ///
-    /// * `table_name` - The name of the table to open
-    /// * `catalog` - The metadata catalog
-    /// * `retention_filters` - Filters for automatic deletion on writes
-    /// * `object_store_config` - Optional object store for remote storage (S3)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table cannot be found in the catalog or if the listing
-    /// table cannot be created.
-    pub async fn new_with_retention_and_object_store(
+    /// Internal constructor used by the builder.
+    async fn new_internal(
         table_name: &str,
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
@@ -451,6 +532,8 @@ impl CayenneTableProvider {
 
     /// Create a new table in Cayenne.
     ///
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the table cannot be created in the catalog.
@@ -458,10 +541,14 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
     ) -> CatalogResult<Self> {
-        Self::create_table_with_retention_and_object_store(catalog, options, Vec::new(), None).await
+        CayenneTableProviderBuilder::new(catalog)
+            .create(options)
+            .await
     }
 
     /// Create a new table in Cayenne with retention filters applied to subsequent writes.
+    ///
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
     ///
     /// # Errors
     ///
@@ -471,42 +558,10 @@ impl CayenneTableProvider {
         options: CreateTableOptions,
         retention_filters: Vec<Expr>,
     ) -> CatalogResult<Self> {
-        Self::create_table_with_retention_and_object_store(
-            catalog,
-            options,
-            retention_filters,
-            None,
-        )
-        .await
-    }
-
-    /// Create a new table in Cayenne with retention filters and optional object store for S3.
-    ///
-    /// # Arguments
-    ///
-    /// * `catalog` - The metadata catalog
-    /// * `options` - Table creation options
-    /// * `retention_filters` - Filters for automatic deletion on writes
-    /// * `object_store_config` - Optional object store for remote storage (S3 Express One Zone)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table cannot be created in the catalog.
-    pub async fn create_table_with_retention_and_object_store(
-        catalog: Arc<dyn MetadataCatalog>,
-        options: CreateTableOptions,
-        retention_filters: Vec<Expr>,
-        object_store_config: Option<crate::metadata::ObjectStoreConfig>,
-    ) -> CatalogResult<Self> {
-        let table_name = options.table_name.clone();
-        let _table_id = catalog.create_table(options).await?;
-        Self::new_with_retention_and_object_store(
-            &table_name,
-            catalog,
-            retention_filters,
-            object_store_config,
-        )
-        .await
+        CayenneTableProviderBuilder::new(catalog)
+            .with_retention_filters(retention_filters)
+            .create(options)
+            .await
     }
 
     /// Get a reference to the catalog.
@@ -910,8 +965,7 @@ impl CayenneTableProvider {
 
         // Delete all existing Vortex files in the snapshot directory before rewriting
         // Note: For S3 paths, we skip deletion and let new files coexist (may need future cleanup)
-        let is_s3_path = self.table_metadata.path.starts_with("s3://")
-            || self.table_metadata.path.starts_with("s3a://");
+        let is_s3_path = self.table_metadata.path.starts_with("s3://");
 
         if is_s3_path {
             tracing::warn!(
@@ -1398,9 +1452,7 @@ impl TableProvider for CayenneTableProvider {
 
             // For local paths, ensure the directory exists
             // S3 doesn't require directory creation (object storage creates paths on write)
-            if !self.table_metadata.path.starts_with("s3://")
-                && !self.table_metadata.path.starts_with("s3a://")
-            {
+            if !self.table_metadata.path.starts_with("s3://") {
                 let snapshot_dir = Self::snapshot_dir_path(
                     &self.table_metadata.path,
                     self.table_metadata.table_id,
@@ -1467,9 +1519,7 @@ impl TableProvider for CayenneTableProvider {
 
         // For regular appends, use the existing snapshot and listing table
         // Ensure the snapshot directory exists for local paths (S3 creates paths on write)
-        if !self.table_metadata.path.starts_with("s3://")
-            && !self.table_metadata.path.starts_with("s3a://")
-        {
+        if !self.table_metadata.path.starts_with("s3://") {
             let snapshot_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
                 self.table_metadata.table_id,
