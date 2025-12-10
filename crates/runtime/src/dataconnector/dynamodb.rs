@@ -394,9 +394,7 @@ async fn load_or_initialize_checkpoint(
 
     if let Some(metadata) = existing_checkpoint {
         match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
-            Ok(checkpoint) => {
-                Some((false, checkpoint))
-            }
+            Ok(checkpoint) => Some((false, checkpoint)),
             Err(err) => {
                 tracing::warn!(
                     "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
