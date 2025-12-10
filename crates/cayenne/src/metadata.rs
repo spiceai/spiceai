@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use serde::{Deserialize, Serialize};
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -126,8 +127,18 @@ pub struct PartitionStats {
     pub file_size_bytes: i64,
 }
 
+/// Which compression strategy to use for the Vortex layout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum CompressionStrategy {
+    /// Uses the default Vortex Btrblocks compression.
+    #[default]
+    Btrblocks,
+    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    Zstd,
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
@@ -140,6 +151,9 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Compression strategy to use for Vortex files
+    /// Defaults to Btrblocks
+    pub compression_strategy: CompressionStrategy,
 }
 
 impl Default for VortexConfig {
@@ -152,6 +166,7 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 128,
             // No sort columns by default
             sort_columns: Vec::new(),
+            compression_strategy: CompressionStrategy::default(),
         }
     }
 }

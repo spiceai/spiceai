@@ -23,7 +23,7 @@ use super::constants::LISTING_TABLE_LOCK_POISONED;
 use super::delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CreateTableOptions, TableMetadata};
+use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -48,6 +48,8 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 use tokio::task;
+use vortex::compressor::CompactCompressor;
+use vortex::file::WriteStrategyBuilder;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
 use vortex_session::VortexSession;
@@ -159,6 +161,16 @@ impl CayenneTableProvider {
 
         // Create a configured Vortex session with selected encodings
         let vortex_session = VortexSession::default();
+
+        let vortex_session = if matches!(
+            vortex_config.compression_strategy,
+            CompressionStrategy::Zstd
+        ) {
+            vortex_session
+                .set(WriteStrategyBuilder::new().with_compressor(CompactCompressor::default()))
+        } else {
+            vortex_session
+        };
 
         // Configure VortexFormat with hardware-optimized settings
         let vortex_opts = vortex_datafusion::VortexOptions {
