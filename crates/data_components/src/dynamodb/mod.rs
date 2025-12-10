@@ -75,6 +75,6 @@ pub enum Error {
     #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
     FailedToInitializeStream { source: dynamodb_streams::Error },
 
-    #[snafu(display("Failed to initialize DynamoDB Stream: {source}"))]
+    #[snafu(display("Failed to Bootstrap DynamoDB Table: {source}"))]
     FailedToBootstrapTable { source: DataFusionError },
 }
