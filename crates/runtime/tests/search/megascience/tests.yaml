@@ -3,54 +3,54 @@
     text: second
     limit: 4
     datasets:
-     - qs
+      - qs
 
 - name: keywords
   input:
     text: second
     limit: 4
     datasets:
-     - qs
+      - qs
     keywords:
-     - number
+      - number
 
 - name: additional_columns
   input:
     text: second
     limit: 4
     datasets:
-     - qs
+      - qs
     additional_columns:
-     - question
+      - question
 
 - name: with_where
   input:
     text: secondary
     datasets:
-     - qs
+      - qs
     where: "subject!='math'"
     limit: 4
 
 - name: vector_search_sql_basic
   input: |
-    SELECT id, answer, trunc(score, 3) FROM vector_search({table_name}, 'second', answer) order by score desc, id LIMIT 4
+    SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4
 
 - name: vector_search_sql_projection
   input: |
-    SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search({table_name}, 'second', answer) order by score desc, id LIMIT 4
+    SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4
 
 - name: vector_search_sql_filters
   input: |
-    SELECT id, answer, trunc(score, 3) as score FROM vector_search({table_name}, 'secondary', answer) where subject!='math' order by score desc, id LIMIT 4
+    SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', answer) where subject!='math' order by score desc, id LIMIT 4
 
 - name: vector_search_sql_no_score
   input: |
-    SELECT id, answer FROM vector_search({table_name}, 'second', answer) order by score desc, id LIMIT 4
+    SELECT id, answer FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4
 
 - name: vector_search_sql_random
   input: |
-    SELECT subject FROM vector_search({table_name}, 'second', answer) order by score desc LIMIT 4
+    SELECT subject FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4
 
 - name: vector_search_sql_vectors
   input: |
-    SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search({table_name}, 'second', answer) order by score desc, id desc LIMIT 4;
+    SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;

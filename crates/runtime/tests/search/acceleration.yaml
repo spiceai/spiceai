@@ -8,16 +8,15 @@ arrow:
   enabled: true
   engine: arrow
 
-cayenne:
-  enabled: true
-  engine: cayenne
-  mode: file
-
-duckdb_file:
+duckdb:
   enabled: true
   engine: duckdb
-  mode: file
-## Cayenne Does not support FixedSizeArrays yet
+## Need to figure out separate filepaths for each `spiced` runtime.
+# duckdb_file:
+#   enabled: true
+#   engine: duckdb
+#   mode: file
+
 # cayenne:
 #   enabled: true
 #   engine: cayenne
