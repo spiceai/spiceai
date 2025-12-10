@@ -27,6 +27,7 @@ use crate::federated_table::FederatedTable;
 use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
+use data_components::dynamodb::Error;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -293,6 +294,9 @@ impl DataConnector for DynamoDB {
                     load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys, &dataset_name).await?;
 
                 if should_bootstrap {
+                    tracing::info!(
+                        "No existing checkpoint found for table {dataset_name}, starting from bootstrap"
+                    );
                     // Initialize bootstrap stream
                     let bootstrap_stream = Arc::clone(&dynamodb)
                         .bootstrap_stream()
@@ -342,6 +346,10 @@ impl DataConnector for DynamoDB {
                     )
                 } else {
                     // Resume reading from a checkpoint
+                    tracing::info!(
+                        "Found existing checkpoint for DynamoDB table {dataset_name}, resuming from checkpoint. Table will be marked as Ready once stream lag reaches < '{}'",
+                        humantime::format_duration(acceptable_lag),
+                    );
                     Some(
                         stream::once(changes_stream_from_checkpoint(
                             Arc::clone(&dynamodb),
@@ -385,39 +393,42 @@ async fn load_or_initialize_checkpoint(
 
     if let Some(metadata) = existing_checkpoint {
         match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
-            Ok(checkpoint) => {
-                tracing::info!(
-                    "Found existing checkpoint for DynamoDB table {}, resuming from checkpoint",
-                    dataset_name
-                );
-                Some((false, checkpoint))
-            }
+            Ok(checkpoint) => Some((false, checkpoint)),
             Err(err) => {
                 tracing::warn!(
                     "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
                     dataset_name,
                     err
                 );
-                get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
+                get_latest_checkpoint(dynamodb, dataset_name)
+                    .await
+                    .map(|cp| (true, cp))
             }
         }
     } else {
-        tracing::info!(
-            "No existing checkpoint found for table {}, starting from bootstrap",
-            dataset_name
-        );
-        get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
+        get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp))
     }
 }
 
-async fn get_latest_checkpoint(dynamodb: &Arc<DynamoDBTableProvider>) -> Option<Checkpoint> {
+async fn get_latest_checkpoint(
+    dynamodb: &Arc<DynamoDBTableProvider>,
+    dataset_name: &TableReference,
+) -> Option<Checkpoint> {
     match dynamodb.latest_global_checkpoint().await {
         Ok(checkpoint) => Some(checkpoint),
         Err(err) => {
-            tracing::error!(
-                "Failed to get latest global checkpoint for DynamoDB Stream: {:?}",
-                err
-            );
+            if let Error::FailedToInitializeStream { source: e } = err {
+                tracing::error!(
+                    "Failed to initialize DynamoDB Stream for dataset {dataset_name}: {e}"
+                );
+            } else {
+                tracing::error!(
+                    "Failed to initialize DynamoDB Stream checkpoint for dataset {dataset_name}: {err}",
+                );
+            }
+
             None
         }
     }
