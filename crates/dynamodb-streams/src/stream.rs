@@ -344,7 +344,10 @@ mod tests {
 
             assert!(batch.records.is_empty());
             assert!(batch.checkpoint.shards.is_empty());
-            assert!(batch.watermark.is_none());
+            let lag = SystemTime::now()
+                .duration_since(batch.watermark.expect("watermark"))
+                .expect("lag");
+            assert!(lag <= Duration::from_millis(100));
         }
 
         #[test]
@@ -379,8 +382,10 @@ mod tests {
 
             assert!(batch.records.is_empty());
             assert_eq!(batch.checkpoint.shards.len(), 1);
-            // Empty shards are not eligible for watermark
-            assert!(batch.watermark.is_none());
+            let lag = SystemTime::now()
+                .duration_since(batch.watermark.expect("watermark"))
+                .expect("lag");
+            assert!(lag <= Duration::from_millis(100));
         }
 
         #[test]
