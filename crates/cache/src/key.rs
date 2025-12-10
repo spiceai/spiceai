@@ -136,37 +136,49 @@ impl RawCacheKey {
     }
 }
 
-/// A hasher that simply passes through u64 values as-is.
+/// A hash builder that builds a hasher which simply passes through u64 values as-is.
 /// This is useful to reduce hashing overhead when we already have a u64 hash key, as returned from `CacheKey::as_raw_key()`.
-#[derive(Copy, Clone, Default)]
-pub(crate) struct PassthroughHashBuilder;
-impl BuildHasher for PassthroughHashBuilder {
-    type Hasher = PassthroughHasher;
+#[derive(Copy, Clone)]
+pub(crate) struct PassthroughHashBuilder<T: BuildHasher + Clone + Send + Sync + 'static> {
+    hasher: T,
+}
 
-    fn build_hasher(&self) -> Self::Hasher {
-        PassthroughHasher { hash: 0 }
+impl<T: BuildHasher + Clone + Send + Sync + 'static> PassthroughHashBuilder<T> {
+    pub(crate) fn new(hasher: T) -> Self {
+        Self { hasher }
     }
 }
 
-pub(crate) struct PassthroughHasher {
-    hash: u64,
+impl<T: BuildHasher + Clone + Send + Sync + 'static> BuildHasher for PassthroughHashBuilder<T> {
+    type Hasher = PassthroughHasher<T>;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PassthroughHasher {
+            hash: 0,
+            hasher: self.hasher.clone(),
+        }
+    }
 }
 
-impl Hasher for PassthroughHasher {
+pub(crate) struct PassthroughHasher<T: BuildHasher + Clone + Send + Sync + 'static> {
+    hash: u64,
+    hasher: T,
+}
+
+impl<T: BuildHasher + Clone + Send + Sync + 'static> Hasher for PassthroughHasher<T> {
     fn finish(&self) -> u64 {
         self.hash
     }
 
+    // moka generates an internal UUID v4 for bucket IDs, which is a string
+    // it re-uses the provided hash builder for hashing the value of the UUID, which is used to target a bucket segment
+    // as a result, even though our keys are always u64, we also need to support hashing arbitrary byte slices (strings)
+    //
+    // to support this need, we fallback to the generic hash builder for non-u64 inputs
     fn write(&mut self, bytes: &[u8]) {
-        // support .write() for implementations that still use `v.hash()` from the build hasher
-        // assume the input is always a u64 in bytes
-        if bytes.len() == 8 {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(bytes);
-            self.hash = u64::from_ne_bytes(arr);
-        } else {
-            unimplemented!("PassthroughHasher only supports writing u64 values");
-        }
+        let mut hasher = self.hasher.build_hasher();
+        hasher.write(bytes);
+        self.hash = hasher.finish();
     }
 
     fn write_u64(&mut self, i: u64) {
@@ -176,18 +188,20 @@ impl Hasher for PassthroughHasher {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::RandomState;
+
     use super::*;
 
     #[test]
     fn test_passthrough_hasher() {
         // validate that `write_u64` and `write` produce the same hash result from a u64 input
-        let mut hasher1 = PassthroughHashBuilder::default().build_hasher();
+        let mut hasher1 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
         hasher1.write_u64(42);
         let hash1 = hasher1.finish();
         assert_eq!(hash1, 42);
 
-        let mut hasher2 = PassthroughHashBuilder::default().build_hasher();
-        hasher2.write(&42u64.to_ne_bytes());
+        let mut hasher2 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
+        42.hash(&mut hasher2);
         let hash2 = hasher2.finish();
 
         assert_eq!(hash1, hash2);

@@ -34,7 +34,7 @@ pub struct SimpleCache<
     V: Clone + Send + Sync + 'static,
     T: BuildHasher + Clone + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, PassthroughHashBuilder>,
+    cache: Cache<u64, V, PassthroughHashBuilder<T>>,
     hasher: T,
     max_size: u64,
     ttl: Duration,
@@ -68,11 +68,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     SimpleCache<V, T>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
-        let cache: Cache<u64, V, PassthroughHashBuilder> = Cache::builder()
+        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
-            .build_with_hasher(PassthroughHashBuilder);
+            .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()));
 
         SimpleCache {
             cache,
