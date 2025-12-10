@@ -118,7 +118,8 @@ static TABLE_VECTOR_STORE_OPTIONS: LazyLock<HashMap<String, VectorStore>> = Lazy
 });
 
 static EMBEDDING_MODEL_OPTIONS: LazyLock<Vec<Embeddings>> = LazyLock::new(|| {
-    // `"embeddings.yaml"` has "embeddings" as the top-level key to match spicepod.yaml semantics (but is not full spicepod.yaml).
+    // HashMap<String, Vec<Embeddings>> is used, but only `embeddings` key is expected
+    //  Intended to match spicepod.yaml semantics.
     let yaml_format: HashMap<String, Vec<Embeddings>> =
         serde_yaml::from_str(include_str!("embeddings.yaml"))
             .expect("Failed to parse 'acceleration.yaml' configurations");

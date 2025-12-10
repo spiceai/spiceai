@@ -6,6 +6,9 @@ fn main() {
     build_search_test_cases();
 }
 
+/// Function to programmatically generate all permutations of search test cases defined in [`crates/runtime/tests/search`].
+///
+/// Cannot have any dependencies on [`crates/runtime/tests/search`] since this is built prior. Although search tests allow for the arbitrary defining of new test datasets, this currently just loads [`tests/search/megascience/`].
 #[allow(clippy::expect_used)] // Build script expects certain files to be present.
 fn build_search_test_cases() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -13,42 +16,12 @@ fn build_search_test_cases() {
 
     // Read YAML files to get available options
     // Generic
-    let accelerations = serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(include_str!(
-        "tests/search/acceleration.yaml"
-    ))
-    .expect("Failed to parse acceleration.yaml")
-    .keys()
-    .cloned()
-    .collect::<Vec<String>>();
-    println!("cargo:rerun-if-changed=tests/search/acceleration.yaml");
-
-    let vector_store: Vec<String> = serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
-        include_str!("tests/search/vector_store.yaml"),
-    )
-    .expect("Failed to parse mega_science.yaml")
-    .keys()
-    .cloned()
-    .collect();
-    println!("cargo:rerun-if-changed=tests/search/vector_store.yaml");
+    let accelerations = parse_yaml_keys("tests/search/acceleration.yaml");
+    let vector_store = parse_yaml_keys("tests/search/vector_store.yaml");
 
     // MegaScience specific
-    let column_configs: Vec<String> = serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
-        include_str!("tests/search/megascience/columns.yaml"),
-    )
-    .expect("Failed to parse megascience/columns.yaml")
-    .keys()
-    .cloned()
-    .collect::<Vec<String>>();
-    println!("cargo:rerun-if-changed=tests/search/megascience/columns.yaml");
-
-    let search_tables: Vec<String> = serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(
-        include_str!("tests/search/megascience/tables.yaml"),
-    )
-    .expect("Failed to parse megascience/tables.yaml")
-    .keys()
-    .cloned()
-    .collect::<Vec<String>>();
-    println!("cargo:rerun-if-changed=tests/search/megascience/tables.yaml");
+    let column_configs = parse_yaml_keys("tests/search/megascience/columns.yaml");
+    let search_tables = parse_yaml_keys("tests/search/megascience/tables.yaml");
 
     let mut test_cases = vec![];
     for v in &vector_store {
@@ -80,4 +53,21 @@ generate_search_tests!([
         )
     });
     println!("cargo:rerun-if-changed=tests/search/generated_search_tests.rs");
+}
+
+/// Return the YAML keys at the first level of depth.
+///
+/// Also adds a `cargo:rerun-if-changed=` directive for the given file path.
+///
+/// Panics if the file cannot be opened or parsed.
+fn parse_yaml_keys(s: &str) -> Vec<String> {
+    let v = serde_yaml::from_reader::<_, HashMap<String, serde_yaml::Value>>(
+        fs::File::open(s).expect(format!("Failed to open YAML file {s}.").as_str()),
+    )
+    .expect(format!("Failed to parse YAML file {s}").as_str())
+    .keys()
+    .cloned()
+    .collect::<Vec<String>>();
+    println!("cargo:rerun-if-changed={s}");
+    v
 }
