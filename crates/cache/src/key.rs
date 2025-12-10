@@ -193,20 +193,20 @@ mod tests {
 
     use super::*;
 
+    // explicitly allow this rule, because we're validating that the builtin u64 hash -> .write_u64() path works as expected
+    #[expect(clippy::manual_hash_one)]
     #[test]
     fn test_passthrough_hasher() {
         // validate that `write_u64` and `write` produce the same hash result from a u64 input
-        let hash1 = PassthroughHashBuilder::new(RandomState::default()).hash_one(42);
+        let mut hasher1 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
+        hasher1.write_u64(42);
+        let hash1 = hasher1.finish();
         assert_eq!(hash1, 42);
 
-        // explicitly allow this rule, because we're validating that the builtin u64 hash -> .write_u64() path works as expected
-        #[expect(clippy::manual_hash_one)]
-        {
-            let mut hasher2 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
-            42.hash(&mut hasher2);
-            let hash2 = hasher2.finish();
+        let mut hasher2 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
+        42u64.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
 
-            assert_eq!(hash1, hash2);
-        }
+        assert_eq!(hash1, hash2);
     }
 }
