@@ -345,7 +345,7 @@ impl CayenneAccelerator {
                     }
                     _ => {
                         tracing::warn!(
-                            "Datset '{table_name}' contains an invalid `cayenne_compression_strategy` - '{strategy_str}'. Only options of 'btrblocks' or 'zstd' are supported. Defaulting to 'btrblocks'",
+                            "Dataset '{table_name}' contains an invalid `cayenne_compression_strategy` - '{strategy_str}'. Only options of 'btrblocks' or 'zstd' are supported. Defaulting to 'btrblocks'",
                         );
                     }
                 }
