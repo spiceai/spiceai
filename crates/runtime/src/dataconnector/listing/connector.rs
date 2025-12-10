@@ -44,7 +44,6 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{PartitionedFile, metadata::MetadataColumn};
 use futures::TryStreamExt;
-use itertools::Itertools;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
@@ -1051,9 +1050,7 @@ pub trait ListingTableConnector: DataConnector {
         let mut idents = schema
             .fields
             .iter()
-            .chunk_by(|f| f.name())
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.collect::<Vec<_>>()[0]))
+            .map(|f| (f.name().to_string(), f.as_ref().clone()))
             .collect::<HashMap<_, _>>();
 
         for (name, partition_type) in partition_cols {
@@ -1081,7 +1078,7 @@ pub trait ListingTableConnector: DataConnector {
             schema
                 .fields
                 .iter()
-                .filter_map(|f| idents.remove(f.name()).cloned())
+                .filter_map(|f| idents.remove(f.name()))
                 .collect::<Vec<_>>(),
         )
         .with_metadata(schema.metadata.clone());
