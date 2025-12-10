@@ -27,6 +27,7 @@ use crate::federated_table::FederatedTable;
 use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
+use data_components::dynamodb::Error;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -413,10 +414,27 @@ async fn get_latest_checkpoint(dynamodb: &Arc<DynamoDBTableProvider>) -> Option<
     match dynamodb.latest_global_checkpoint().await {
         Ok(checkpoint) => Some(checkpoint),
         Err(err) => {
-            tracing::error!(
-                "Failed to get latest global checkpoint for DynamoDB Stream: {}",
-                err
-            );
+            match err {
+                Error::FailedToInitializeStream { source: e } => match e {
+                    dynamodb_streams::Error::StreamNotFound => {
+                        tracing::warn!(
+                            "Failed to initialize DynamoDB Stream Connector: Stream does not exist."
+                        );
+                        None
+                    }
+                    _ => {
+                        tracing::error!("Failed to initialize DynamoDB Stream: {e}",);
+                        None
+                    }
+                },
+                _ => {
+                    tracing::error!(
+                        "Failed to get latest global checkpoint for DynamoDB Stream: {err}",
+                    );
+                    None
+                }
+            }
+
             None
         }
     }
