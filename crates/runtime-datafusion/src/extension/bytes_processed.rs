@@ -258,9 +258,17 @@ impl ExecutionPlan for BytesProcessedExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        assert_eq!(children.len(), 1, "should have one input");
+        if children.len() != 1 {
+            return Err(DataFusionError::External(
+                crate::Error::InvalidChildrenCount {
+                    children_count: children.len(),
+                }
+                .into(),
+            ));
+        }
+
         let Some(input) = children.into_iter().next() else {
-            panic!("should have one input");
+            unreachable!("should have one input");
         };
         Ok(Arc::new(Self {
             input_exec: input,
@@ -319,7 +327,7 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         self.input_exec.statistics()
     }
 
@@ -402,7 +410,7 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
         let ctx = SessionContext::new();

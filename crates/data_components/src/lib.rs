@@ -53,6 +53,8 @@ pub mod odbc;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod refresh_skip;
+pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 

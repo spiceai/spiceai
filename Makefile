@@ -16,6 +16,10 @@ build-cli-dev:
 build-runtime:
 	make -C bin/spiced
 
+.PHONY: build-validator
+build-validator:
+	cargo build --release -p spicepod-validator
+
 .PHONY: build
 build: build-cli build-runtime
 
@@ -23,6 +27,7 @@ build: build-cli build-runtime
 build-dev:
 	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
+	cargo build --profile dev -p spicepod-validator
 
 .PHONY: ci
 ci:
@@ -74,25 +79,69 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
-		-Aclippy::large_futures
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,xxhash,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
 
 lint-go:
 	go vet ./...
@@ -154,6 +203,12 @@ install: build
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
+.PHONY: install-dev
+install-dev: build-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
+
 .PHONY: install-with-models
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
@@ -185,15 +240,6 @@ install-cli: build-cli
 install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
-
-################################################################################
-# Target: install-dev                                                          #
-################################################################################
-.PHONY: install-dev
-install-dev: build-dev
-	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev

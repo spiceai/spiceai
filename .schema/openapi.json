@@ -7,7 +7,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "1.9.0-unstable"
+    "version": "1.10.1-unstable"
   },
   "servers": [
     {
@@ -4212,7 +4212,8 @@
           "disabled",
           "full",
           "append",
-          "changes"
+          "changes",
+          "caching"
         ]
       },
       "RefreshOverrides": {
@@ -4261,7 +4262,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Names of datasets to sample from. If omitted, all datasets are used."
+            "description": "Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used."
           },
           "model": {
             "type": "string",
@@ -4396,7 +4397,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\nreturned within the response under `.primary_key`, not `.data`."
+            "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`."
           },
           "datasets": {
             "type": [

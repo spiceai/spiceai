@@ -47,10 +47,7 @@ use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 
 #[cfg(feature = "cluster")]
-use {
-    crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode,
-    crate::datafusion::cluster,
-};
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode};
 
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -59,8 +56,10 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    Stream, TryFutureExt,
+    future::{join_all, try_join_all},
+};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
@@ -105,6 +104,8 @@ mod metrics;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
+pub mod otel_push_exporter;
+pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
 
@@ -115,6 +116,8 @@ pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -446,7 +449,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
@@ -479,7 +482,8 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
 
-    #[allow(dead_code)] // used in "cluster" feature
+    resource_monitor: resource_monitor::ResourceMonitor,
+
     config: Arc<Config>,
 }
 
@@ -547,6 +551,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
+    }
+
+    #[must_use]
     pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
         Arc::clone(&self.token_provider_registry)
     }
@@ -559,6 +568,26 @@ impl Runtime {
     #[must_use]
     pub fn datasets_health_monitor(&self) -> Option<Arc<DatasetsHealthMonitor>> {
         self.datasets_health_monitor.clone()
+    }
+
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -596,7 +625,7 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
@@ -644,6 +673,13 @@ impl Runtime {
             _ => None,
         };
 
+        #[cfg(feature = "cluster")]
+        if self.config.cluster.mode.is_some() {
+            tracing::warn!(
+                "Distributed Query (Alpha) is in preview and should not be used in production."
+            );
+        }
+
         // Start Flight server
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
@@ -685,23 +721,24 @@ impl Runtime {
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let http_auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
-                    http_auth,
+                    auth,
                     Some(http_shutdown),
                 )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
+                .map_err(Error::from),
+            )
             .await;
 
         // Start Metrics server
@@ -824,9 +861,9 @@ impl Runtime {
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
     }
 
@@ -834,7 +871,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         Arc::clone(&self).set_components_initializing().await;
 
@@ -1149,16 +1186,22 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     make_spice_data_sub_directory(&[])?;
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
     let mut base_folder = PathBuf::from(spice_data_base_path());
     base_folder.extend(directory);
     std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
     Ok(base_folder)
+}
+
+impl From<http::Error> for Error {
+    fn from(err: http::Error) -> Self {
+        Error::UnableToStartHttpServer { source: err }
+    }
 }

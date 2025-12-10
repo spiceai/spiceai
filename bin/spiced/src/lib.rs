@@ -29,9 +29,11 @@ use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::runtime::Tokio;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
+#[cfg(feature = "cluster")]
+use runtime::config::ClusterMode;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
@@ -114,7 +116,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
@@ -181,7 +183,7 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -190,26 +192,7 @@ pub async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
 
-    let mut spicepod_load_error: Option<app::Error> = None;
-    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
-        Ok(mut app) => {
-            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-            Some(Arc::new(app))
-        }
-        Err(e) => {
-            // In pods watcher mode, allow runtime to start without a valid spicepod
-            // It will load the spicepod when it becomes available
-            if args.pods_watcher_enabled && args.spicepod.is_none() {
-                spicepod_load_error = Some(e);
-                None
-            } else {
-                // In normal mode, fail immediately if spicepod cannot be loaded
-                return Err(Error::UnableToConstructSpiceApp {
-                    source: Box::new(e),
-                });
-            }
-        }
-    };
+    let (app, spicepod_load_error) = build_app(&args).await?;
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(some_app) = &app
@@ -279,11 +262,20 @@ pub async fn run(args: Args) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let tokio_runtime = ManagedTokioRuntime::try_new()
+            let cpu_runtime = ManagedTokioRuntime::try_new()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cpu_runtime(tokio_runtime);
+            rt.datafusion().set_cpu_runtime(cpu_runtime);
+
+            // Create a dedicated refresh runtime for acceleration refresh workers.
+            // This isolates refresh workloads from query execution to prevent large refresh
+            // operations from impacting query latency.
+            let refresh_runtime = ManagedTokioRuntime::try_new()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_refresh_runtime(refresh_runtime);
         }
         Some("disabled") => {
             tracing::info!(
@@ -297,8 +289,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+    if let Some(ref metrics_registry) = prometheus_registry {
+        let otel_config = telemetry_config
+            .as_ref()
+            .and_then(|c| c.otel_exporter.as_ref())
+            .filter(|c| c.enabled);
+
+        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config)
+            .context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -308,6 +306,10 @@ pub async fn run(args: Args) -> Result<()> {
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
     let rt = Arc::new(rt);
+
+    if prometheus_registry.is_some() {
+        rt.init_cache_metrics();
+    }
 
     let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
@@ -342,11 +344,51 @@ pub async fn run(args: Args) -> Result<()> {
     result
 }
 
+async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
+    #[cfg(feature = "cluster")]
+    if matches!(args.runtime.cluster.mode, Some(ClusterMode::Executor)) {
+        tracing::info!(
+            "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
+        );
+        return Ok((Some(Arc::new(App::default())), None));
+    }
+
+    let spicepod_path = args
+        .spicepod
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+
+    let mut spicepod_load_error: Option<app::Error> = None;
+
+    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            Some(Arc::new(app))
+        }
+        Err(e) => {
+            // In pods watcher mode, allow runtime to start without a valid spicepod
+            // It will load the spicepod when it becomes available
+            if args.pods_watcher_enabled && args.spicepod.is_none() {
+                spicepod_load_error = Some(e);
+                None
+            } else {
+                // In normal mode, fail immediately if spicepod cannot be loaded
+                return Err(Error::UnableToConstructSpiceApp {
+                    source: Box::new(e),
+                });
+            }
+        }
+    };
+
+    Ok((app, spicepod_load_error))
+}
+
 fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
+    otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resource = Resource::default();
+    let resource = Resource::builder().build();
 
     let prometheus_exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry)
@@ -359,19 +401,46 @@ fn init_metrics(
     let spice_metrics_exporter =
         OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
 
-    let periodic_reader = PeriodicReader::builder(spice_metrics_exporter, Tokio)
-        .with_interval(Duration::from_secs(30))
-        .with_timeout(Duration::from_secs(10))
-        .build();
+    let spice_metrics_reader =
+        PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_interval(Duration::from_secs(30))
+            .build();
 
-    let provider = SdkMeterProvider::builder()
+    let mut provider_builder = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(prometheus_exporter)
-        .with_reader(periodic_reader)
-        .build();
+        .with_reader(spice_metrics_reader);
+
+    // Add OTEL push exporter if configured
+    if let Some(config) = otel_config {
+        match create_otel_reader(config) {
+            Ok(otel_reader) => {
+                provider_builder = provider_builder.with_reader(otel_reader);
+                let protocol = if config.is_http() { "http" } else { "grpc" };
+                tracing::info!(
+                    endpoint = %config.endpoint,
+                    protocol = protocol,
+                    push_interval = %config.push_interval,
+                    "OTEL metrics exporter enabled"
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize OTEL metrics exporter: {e}");
+            }
+        }
+    }
+
+    let provider = provider_builder.build();
     global::set_meter_provider(provider);
 
     Ok(())
+}
+
+/// Creates an OTEL periodic reader from the spicepod config
+fn create_otel_reader(
+    config: &app::spicepod::component::runtime::OtelExporterConfig,
+) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
+    runtime::otel_push_exporter::create_otel_periodic_reader(config)
 }
 
 async fn start_anonymous_telemetry(

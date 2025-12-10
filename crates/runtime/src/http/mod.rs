@@ -74,13 +74,8 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    let routes = routes::routes(
-        &rt,
-        config,
-        vsearch,
-        auth_provider.map(AuthLayer::new),
-        &cors_config,
-    );
+    let auth_layer = auth_provider.map(AuthLayer::new);
+    let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
     drop(app);
 
     let listener = TcpListener::bind(&bind_address)
@@ -242,7 +237,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("to accept connection");
             process_tcp_stream(stream, ok_router(), shutdown_rx);
         });
-        let client = reqwest::Client::new();
+        let client = build_test_http_client();
         let resp = timeout(
             Duration::from_secs(2),
             client.get(format!("http://{addr}/")).send(),
@@ -265,11 +260,9 @@ mod tests {
 
         // Verify that the shutdown does not fail if there are no active connections
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     #[tokio::test]
@@ -288,7 +281,7 @@ mod tests {
 
         // the request handler will hang until the connection is closed
         let request_completion_handle = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = build_test_http_client();
             client.get(format!("http://{addr}/")).send().await
         });
 
@@ -304,15 +297,19 @@ mod tests {
 
         // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(5), request_completion_handle)
-                .await
-                .is_ok()
-        );
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+            .await
+            .expect("should complete request after shutdown");
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
+    }
+
+    fn build_test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|err| panic!("failed to build test http client: {err}"))
     }
 }

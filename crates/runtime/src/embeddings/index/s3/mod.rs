@@ -88,7 +88,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn try_from_table(
     ds_name: &TableReference,
     column: String,
@@ -158,7 +158,7 @@ pub async fn try_from_table(
     ))
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 async fn embedding_vector_size(
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
@@ -171,7 +171,7 @@ async fn embedding_vector_size(
 // Attempt to construct a S3 vector table from user-provided parameters.
 //
 // If no index name provided (either explicitly, or in ARN), use `default_s3_index_name`.
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 async fn try_vector_table(
     columns: MetadataColumns,
     params: Parameters,

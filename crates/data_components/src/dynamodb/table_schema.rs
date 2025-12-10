@@ -25,9 +25,11 @@ use std::sync::Arc;
 pub struct DynamoDBTableSchema {
     table_name: Arc<str>,
     table_schema: SchemaRef,
+    primary_keys: Vec<String>,
     partition_key: String,
     sort_key: Option<String>,
     flattened_fields: HashSet<String>,
+    time_format: Arc<String>,
 }
 
 impl DynamoDBTableSchema {
@@ -37,13 +39,20 @@ impl DynamoDBTableSchema {
         partition_key: String,
         sort_key: Option<String>,
         flattened_fields: HashSet<String>,
+        time_format: &str,
     ) -> Self {
+        let mut primary_keys = vec![partition_key.clone()];
+        if let Some(sort_key) = &sort_key {
+            primary_keys.push(sort_key.clone());
+        }
         Self {
             table_name,
             table_schema,
+            primary_keys,
             partition_key,
             sort_key,
             flattened_fields,
+            time_format: Arc::from(time_format.to_string()),
         }
     }
 
@@ -53,6 +62,14 @@ impl DynamoDBTableSchema {
 
     pub fn schema(&self) -> &SchemaRef {
         &self.table_schema
+    }
+
+    pub fn primary_keys(&self) -> Vec<String> {
+        self.primary_keys.clone()
+    }
+
+    pub fn time_format(&self) -> Arc<String> {
+        Arc::clone(&self.time_format)
     }
 
     pub fn partition_key(&self) -> &str {
@@ -94,24 +111,36 @@ impl DynamoDBTableSchema {
             .collect()
     }
 
+    /// returns true for cases like:
+    /// `Column(created_at) > TimestampMillisecond(1_725_366_896_155, Some("+00:00"))`
+    fn is_timestamp_filter(&self, left: &Expr, op: Operator, right: &Expr) -> bool {
+        (self.is_timestamp_column(left)
+            && is_comparison_operator(op)
+            && is_timestamp_literal(right))
+            || (self.is_timestamp_column(right)
+                && is_comparison_operator(op)
+                && is_timestamp_literal(left))
+    }
+
+    fn is_timestamp_column(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(col) => {
+                let field = self.table_schema.field_with_name(&col.name);
+                field
+                    .map(|f| matches!(f.data_type(), &arrow::datatypes::DataType::Timestamp(_, _)))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
     fn is_filter_supported(&self, expr: &Expr, is_binary_expr_part: bool) -> bool {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                let op_supported = matches!(
-                    op,
-                    Operator::Eq
-                        | Operator::NotEq
-                        | Operator::Lt
-                        | Operator::LtEq
-                        | Operator::Gt
-                        | Operator::GtEq
-                        | Operator::And
-                        | Operator::Or
-                );
-
-                op_supported
-                    && self.is_filter_supported(left, true)
-                    && self.is_filter_supported(right, true)
+                self.is_timestamp_filter(left, *op, right)
+                    || (is_comparison_operator(*op)
+                        && self.is_filter_supported(left, true)
+                        && self.is_filter_supported(right, true))
             }
             Expr::Column(col) => self.table_schema.field_with_name(&col.name).is_ok(),
             Expr::Literal(scalar, _) => {
@@ -137,10 +166,31 @@ impl DynamoDBTableSchema {
     }
 }
 
+fn is_timestamp_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(scalar, _) => matches!(scalar, ScalarValue::TimestampMillisecond(_, _)),
+        _ => false,
+    }
+}
+
+fn is_comparison_operator(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::And
+            | Operator::Or
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::logical_expr::{Operator, col, lit};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -152,6 +202,11 @@ mod tests {
             Field::new("age", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
             Field::new("active", DataType::Boolean, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
         ]));
 
         DynamoDBTableSchema::new(
@@ -160,6 +215,7 @@ mod tests {
             "id".to_string(),
             Some("sort_key".to_string()),
             HashSet::new(),
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -179,6 +235,7 @@ mod tests {
             "id".to_string(),
             None,
             flattened,
+            "2006-01-02T15:04:05.000Z07:00",
         )
     }
 
@@ -189,7 +246,7 @@ mod tests {
         assert_eq!(schema.table_name(), "test_table");
         assert_eq!(schema.partition_key(), "id");
         assert_eq!(schema.sort_key(), Some("sort_key"));
-        assert_eq!(schema.schema().fields().len(), 5);
+        assert_eq!(schema.schema().fields().len(), 6);
     }
 
     #[test]
@@ -202,6 +259,7 @@ mod tests {
             "id".to_string(),
             None,
             HashSet::new(),
+            "2006-01-02T15:04:05.000Z07:00",
         );
 
         assert_eq!(table_schema.sort_key(), None);
@@ -361,6 +419,48 @@ mod tests {
         let filters = vec![&f1, &f2];
         let result = schema.supports_filters_pushdown(&filters);
 
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+        assert_eq!(result[1], TableProviderFilterPushDown::Exact);
+    }
+
+    #[test]
+    fn test_timestamp_filter_pushdown() {
+        let schema = create_test_schema();
+
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        )));
+        let filters = vec![&f1];
+        let result = schema.supports_filters_pushdown(&filters);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+
+        let f2 = lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        ))
+        .eq(col("created_at"));
+        let filters = vec![&f2];
+        let result = schema.supports_filters_pushdown(&filters);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], TableProviderFilterPushDown::Exact);
+    }
+
+    #[test]
+    fn test_timestamp_filter_pushdown_complex() {
+        let schema = create_test_schema();
+
+        let f1 = col("created_at").gt(lit(ScalarValue::TimestampMillisecond(
+            Some(1_725_366_896_155),
+            None,
+        )));
+        let f2 = col("age").eq(lit(25i64)).and(f1);
+        let f3 = col("name").eq(lit("John"));
+
+        let filters = vec![&f2, &f3];
+        let result = schema.supports_filters_pushdown(&filters);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], TableProviderFilterPushDown::Exact);
         assert_eq!(result[1], TableProviderFilterPushDown::Exact);

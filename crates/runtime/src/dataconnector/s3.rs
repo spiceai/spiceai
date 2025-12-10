@@ -26,6 +26,7 @@ use super::{
 
 use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    register_data_connector,
 };
 
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
@@ -235,7 +236,7 @@ impl std::fmt::Display for S3 {
 
 impl ListingTableConnector for S3 {
     fn object_versioning_type(&self) -> Option<ObjectVersionType> {
-        if let Some("disabled") = self.params.get("versioning").expose().ok() {
+        if self.params.get("versioning").expose().ok() == Some("disabled") {
             return None;
         }
 
@@ -322,3 +323,5 @@ impl ListingTableConnector for S3 {
         }
     }
 }
+
+register_data_connector!("s3", S3Factory);

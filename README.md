@@ -4,7 +4,7 @@
 <p align="center">
   <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a>
-  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a>
+  <a href="https://spiceai.org/slack"><img src="https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack" alt="Slack"/></a>
   <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
 </p>
 
@@ -177,6 +177,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mysql`                            | MySQL                                 | Stable            |                              |
 | `spice.ai`                         | [Spice.ai][spiceai]                   | Stable            | Arrow Flight                 |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
+| `dynamodb`                         | Amazon DynamoDB                       | Release Candidate |                              |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Beta              | Parquet                      |
@@ -189,7 +190,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
-| `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV, JSON           |

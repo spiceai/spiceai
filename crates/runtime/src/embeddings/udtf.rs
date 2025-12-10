@@ -64,10 +64,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{
-    SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex,
-    provider::SearchQueryProvider,
-};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -77,16 +74,17 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::{
-        find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
-        to_column_expr,
-    },
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
 
-use search::index::chunking::ChunkedSearchIndex;
+#[cfg(feature = "s3_vectors")]
+use {
+    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
+    search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector,
+    search::provider::SearchQueryProvider,
+};
+
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
@@ -332,7 +330,19 @@ impl VectorSearchTableFunc {
             find_index_in_table_provider::<S3Vector>(tbl),
             find_index_in_table_provider::<ChunkedSearchIndex>(tbl),
         ) {
-            (_, Some((chunked_index, _))) => chunked_index
+            (Some((vector_index, _)), Some((chunked_index, _))) => {
+                let mut indexes = chunked_index
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
+                    .collect::<Vec<_>>();
+                indexes.extend(
+                    vector_index
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+                indexes
+            }
+            (None, Some((chunked_index, _))) => chunked_index
                 .into_iter()
                 .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
                 .collect::<Vec<_>>(),
@@ -390,7 +400,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 

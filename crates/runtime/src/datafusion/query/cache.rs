@@ -24,7 +24,6 @@ use cache::{
     result::query::CachedStream,
     to_cached_record_batch_stream,
 };
-use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::{
     common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
@@ -33,7 +32,6 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
-use scopeguard;
 use snafu::ResultExt;
 use std::sync::OnceLock;
 use std::{collections::HashSet, hash::Hasher, sync::Arc};
@@ -209,7 +207,7 @@ impl Query {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
@@ -337,7 +335,18 @@ impl Query {
                 .results_cache_hit(true)
         });
 
-        let record_batch_stream = CachedStream::new(cached_result.records, cached_result.schema);
+        let records = match cached_result.records().await {
+            Ok(records) => Arc::new(records),
+            Err(e) => {
+                tracing::error!("Failed to decode cached query result: {e}");
+                return Ok(CacheResponse::from(
+                    CacheResult::MissOrSkipped,
+                    cache_status,
+                ));
+            }
+        };
+
+        let record_batch_stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
 
         Ok(CacheResponse::from(
             CacheResult::Hit(QueryResult::new(
@@ -451,29 +460,42 @@ impl Query {
         cache_key: &RawCacheKey,
         cache_key_u64: u64,
         batches: Vec<arrow::record_batch::RecordBatch>,
-        schema: arrow::datatypes::SchemaRef,
+        _schema: arrow::datatypes::SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
     ) {
         if let Some(cache_provider) = df.results_cache_provider() {
             let cached_at = std::time::Instant::now();
-            let cached_result = cache::result::query::CachedQueryResult::new(
-                Arc::new(batches),
-                schema,
+            let encoder = cache_provider.encoder();
+
+            match cache::result::query::CachedQueryResult::from_batches(
+                &batches,
                 input_tables,
                 cached_at,
-            );
-
-            if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Background revalidation failed to cache results: {}",
-                    e
-                );
-            } else {
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Background revalidation completed successfully and cached"
-                );
+                encoder,
+            )
+            .await
+            {
+                Ok(cached_result) => {
+                    if let Err(e) = cache_provider.put_raw_key(cache_key, cached_result).await {
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background revalidation failed to cache results: {}",
+                            e
+                        );
+                    } else {
+                        tracing::debug!(
+                            cache_key = cache_key_u64,
+                            "Background revalidation completed successfully and cached"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        cache_key = cache_key_u64,
+                        "Background revalidation failed to encode results: {}",
+                        e
+                    );
+                }
             }
         } else {
             tracing::debug!("Background revalidation completed but cache provider unavailable");
@@ -487,25 +509,19 @@ impl Query {
         plan: Option<&LogicalPlan>,
         cache_key: RawCacheKey,
     ) {
-        // Static map to track ongoing revalidation tasks by cache key
-        static REVALIDATION_TASKS: OnceLock<DashMap<RawCacheKey, ()>> = OnceLock::new();
-        let tasks = REVALIDATION_TASKS.get_or_init(DashMap::new);
+        // Static Moka cache to track ongoing revalidation tasks by cache key.
+        // This provides built-in single-in-flight semantics - if multiple requests
+        // trigger revalidation for the same key, only one task will run.
+        static REVALIDATION_LOCKS: OnceLock<moka::future::Cache<u64, (), std::hash::RandomState>> =
+            OnceLock::new();
+        let locks = REVALIDATION_LOCKS.get_or_init(|| {
+            moka::future::Cache::builder()
+                .max_capacity(10_000) // Track up to 10k concurrent revalidations
+                .time_to_live(std::time::Duration::from_secs(300)) // Auto-cleanup after 5min
+                .build()
+        });
 
-        let cache_key_u64 = cache_key.as_u64(); // Save for logging before moving cache_key
-
-        // Try to insert a marker for this cache key - if it already exists, another task is running
-        match tasks.entry(cache_key) {
-            Entry::Occupied(_) => {
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Background revalidation already in progress for this cache key, skipping duplicate"
-                );
-                return;
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(());
-            }
-        }
+        let cache_key_u64 = cache_key.as_u64();
 
         // Create a background request context that will cache results using the same cache key
         let background_context = Self::create_background_context(request_context, cache_key);
@@ -515,67 +531,91 @@ impl Query {
         let plan_owned = plan.cloned();
 
         // Spawn a detached task for background revalidation
+        // Use optionally_get_with to ensure only one revalidation per key runs concurrently
         tokio::spawn(async move {
-            tracing::debug!(
-                cache_key = cache_key_u64,
-                "Starting background revalidation task"
-            );
+            // optionally_get_with provides automatic single-in-flight: if another task
+            // is already running for this key, this will return None immediately
+            let result = locks
+                .optionally_get_with(cache_key_u64, async move {
+                    // Only count as a background query when this task actually runs the revalidation
+                    cache::metrics::sql_results::STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES
+                        .add(1, &[]);
 
-            let _guard = scopeguard::guard((), |()| {
-                tasks.remove(&cache_key);
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Removed revalidation task marker"
-                );
-            });
-
-            let (query, input_tables) =
-                Self::prepare_revalidation_query(&df, &sql_owned, plan_owned);
-
-            let result = background_context
-                .scope(async move { query.run().await })
-                .await;
-
-            match result {
-                Ok(query_result) => {
-                    let schema = query_result.data.schema();
                     tracing::debug!(
                         cache_key = cache_key_u64,
-                        "Background query execution succeeded, collecting batches"
+                        "Starting background revalidation task"
                     );
-                    match query_result.data.try_collect::<Vec<_>>().await {
-                        Ok(batches) => {
+
+                    let (query, input_tables) =
+                        Self::prepare_revalidation_query(&df, &sql_owned, plan_owned);
+
+                    let result = background_context
+                        .scope(async move { query.run().await })
+                        .await;
+
+                    match result {
+                        Ok(query_result) => {
+                            let schema = query_result.data.schema();
                             tracing::debug!(
                                 cache_key = cache_key_u64,
-                                num_batches = batches.len(),
-                                "Collected batches, now caching"
+                                "Background query execution succeeded, collecting batches"
                             );
-                            Self::cache_revalidation_result(
-                                &df,
-                                &cache_key,
-                                cache_key_u64,
-                                batches,
-                                schema,
-                                input_tables,
-                            )
-                            .await;
+                            match query_result.data.try_collect::<Vec<_>>().await {
+                                Ok(batches) => {
+                                    tracing::debug!(
+                                        cache_key = cache_key_u64,
+                                        num_batches = batches.len(),
+                                        "Collected batches, now caching"
+                                    );
+                                    Self::cache_revalidation_result(
+                                        &df,
+                                        &cache_key,
+                                        cache_key_u64,
+                                        batches,
+                                        schema,
+                                        input_tables,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        cache_key = cache_key_u64,
+                                        "Background revalidation failed during collection: {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(
                                 cache_key = cache_key_u64,
-                                "Background revalidation failed during collection: {}",
+                                "Background revalidation query failed: {}",
                                 e
                             );
                         }
                     }
-                }
-                Err(e) => {
+
                     tracing::debug!(
                         cache_key = cache_key_u64,
-                        "Background revalidation query failed: {}",
-                        e
+                        "Background revalidation task completed"
                     );
-                }
+
+                    // Return Some to indicate this task completed the revalidation
+                    Some(())
+                })
+                .await;
+
+            if result == Some(()) {
+                // This task was the one that ran the revalidation
+                // Remove the single-flight guard so future stale hits can trigger another refresh
+                locks.invalidate(&cache_key_u64).await;
+            } else {
+                // Another task is already revalidating this key
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation already in progress for this cache key, skipped"
+                );
+                cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             }
         });
     }
@@ -646,7 +686,7 @@ mod tests {
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
             Duration::from_secs(3600),
-            std::hash::RandomState::default(),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let runtime = RuntimeBuilder::new().build().await;
 
@@ -676,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
@@ -1099,7 +1139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_complete_lifecycle() {
         // This test validates the complete stale-while-revalidate lifecycle:
         // 1. Initial cache population
@@ -1231,7 +1271,7 @@ mod tests {
                 })
                 .await;
 
-            if let Some(2) = value {
+            if value == Some(2) {
                 tracing::info!(
                     "Background revalidation completed successfully after {} attempts ({}ms)",
                     attempt,
@@ -1329,7 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
         // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
@@ -1491,5 +1531,156 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn test_single_in_flight_revalidation() {
+        // This test validates that concurrent stale-while-revalidate requests
+        // for the same cache key only trigger ONE background revalidation,
+        // even when multiple requests arrive simultaneously.
+        //
+        // Expected behavior:
+        // 1. Multiple concurrent requests during stale window
+        // 2. All get stale data immediately (CacheStaleWhileRevalidate)
+        // 3. Only ONE background query executes (single-in-flight semantics)
+        // 4. STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES == total concurrent requests
+        // 5. STALE_WHILE_REVALIDATE_SKIPPED == (concurrent requests - 1)
+
+        // Configure cache with 1s TTL and 5s stale window
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("1s".to_string()),
+            stale_while_revalidate_ttl: Some("5s".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+
+        let request_context = create_test_request_context(
+            CacheControl::MaxStale(CacheKeyType::ClientSupplied, Some(Duration::from_secs(5))),
+            Some("single-in-flight-test".to_string()),
+        );
+
+        // Step 1: Populate cache with initial query
+        tracing::info!("Populating cache with initial query");
+        let query_builder = QueryBuilder::new("SELECT 100", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(result.cache_status, CacheStatus::CacheMiss);
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    100
+                );
+            })
+            .await;
+
+        // Step 2: Wait for entry to become stale (past TTL but within stale window)
+        tracing::info!("Waiting 1.5s for entry to become stale");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Step 3: Launch 10 concurrent requests with the SAME cache key
+        // All should get stale data, but only ONE should trigger actual background query
+        tracing::info!("Launching 10 concurrent stale requests");
+        let concurrent_requests = 10;
+        let mut handles = Vec::new();
+
+        for i in 0..concurrent_requests {
+            let df_clone = Arc::clone(&df);
+            let ctx_clone = Arc::clone(&request_context);
+            let handle = tokio::spawn(async move {
+                let query_builder = QueryBuilder::new("SELECT 200", df_clone); // Different query, same cache key
+                let query = query_builder.build();
+                ctx_clone
+                    .scope(async move {
+                        let result = query.run().await.expect("query should succeed");
+                        tracing::debug!("Request {i} got status: {:?}", result.cache_status);
+
+                        // All requests should get stale data
+                        assert_eq!(
+                            result.cache_status,
+                            CacheStatus::CacheStaleWhileRevalidate,
+                            "Request {i} should get stale data"
+                        );
+
+                        let records = result
+                            .data
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .expect("should collect");
+
+                        // Verify we got the STALE value (100 from initial query, not 200)
+                        assert_eq!(
+                            records[0]
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("must read i64 array")
+                                .value(0),
+                            100,
+                            "Request {i} should get stale value 100"
+                        );
+                    })
+                    .await;
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all concurrent requests to complete
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle
+                .await
+                .unwrap_or_else(|_| panic!("Request {i} should not panic"));
+        }
+
+        // Step 4: Wait for background revalidation to complete (single-in-flight ensures only ONE ran)
+        tracing::info!("Waiting for background revalidation to complete");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Step 5: Verify cache was updated with fresh data (from the ONE background query)
+        // This proves that despite 10 concurrent requests, only ONE background query executed
+        // and successfully updated the cache with the revalidated value (200)
+        let query_builder = QueryBuilder::new("SELECT 300", Arc::clone(&df));
+        let query = query_builder.build();
+        Arc::clone(&request_context)
+            .scope(async move {
+                let result = query.run().await.expect("query should succeed");
+                assert_eq!(
+                    result.cache_status,
+                    CacheStatus::CacheHit,
+                    "Cache should have been revalidated"
+                );
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("should collect");
+
+                // Verify cache now contains the revalidated value (200 from the single background query)
+                assert_eq!(
+                    records[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("must read i64 array")
+                        .value(0),
+                    200,
+                    "Cache should contain revalidated value 200 from the single background query"
+                );
+            })
+            .await;
+
+        tracing::info!("Single-in-flight test completed successfully");
     }
 }

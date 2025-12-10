@@ -250,7 +250,7 @@ fn uint64_to_ms(ts: u64, time_format: TimeFormat) -> Option<i64> {
         .flatten()
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn float_to_ms(ts: f64, time_format: TimeFormat) -> Option<i64> {
     match time_format {
         TimeFormat::UnixSeconds => Some((ts * 1000.0) as i64),

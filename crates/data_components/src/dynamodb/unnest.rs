@@ -36,7 +36,7 @@ pub fn unnest_dynamodb_items(
     Ok((all_items, all_flattened_fields))
 }
 
-fn unnest_dynamodb_item(
+pub fn unnest_dynamodb_item(
     item: &HashMap<String, AttributeValue>,
     depth: usize,
 ) -> Result<(HashMap<String, AttributeValue>, HashSet<String>)> {

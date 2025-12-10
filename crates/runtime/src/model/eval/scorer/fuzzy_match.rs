@@ -99,7 +99,7 @@ impl FuzzyMatch {
     }
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::FuzzyMatch;

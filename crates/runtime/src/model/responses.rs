@@ -43,7 +43,7 @@ macro_rules! extract_secret {
 }
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn try_to_responses_model(
     component: &Model,
     params: &HashMap<String, SecretString>,

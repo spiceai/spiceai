@@ -24,7 +24,7 @@ use test_framework::{
 
 use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     if !args.path.is_dir() && !args.path.is_file() {
         return Err(anyhow::anyhow!("Path must be a directory or a file"));
@@ -62,8 +62,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                 serde_json::json!(WorkflowArgs {
                     specific_args: bench
                         .clone()
-                        .with_update_snapshots(args.update_snapshots.into())
-                        .with_validate(args.validate),
+                        .with_update_snapshots(args.update_snapshots.into()),
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
@@ -114,6 +113,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
+            (
+                TestType::Append,
+                DispatchTests {
+                    append: Some(append),
+                    ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: append.clone(),
+                    spiced_commit: args.spiced_commit.clone(),
+                })
+            }
             (TestType::Benchmark, _) => {
                 println!(
                     "Test file {} does not contain a benchmark test",
@@ -142,6 +153,13 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             (TestType::HttpOverhead, _) => {
                 println!(
                     "Test file {} does not contain an HTTP overhead test",
+                    path.display()
+                );
+                continue;
+            }
+            (TestType::Append, _) => {
+                println!(
+                    "Test file {} does not contain an append test",
                     path.display()
                 );
                 continue;

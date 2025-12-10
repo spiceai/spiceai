@@ -123,7 +123,7 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
   fi
 
 # Minimal passwd & group for the nobody user
-RUN echo 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin' > /spice_sandbox/etc/passwd \
+RUN echo 'nobody:x:65534:65534:nobody:/app:/usr/sbin/nologin' > /spice_sandbox/etc/passwd \
     && echo 'nogroup:x:65534:' > /spice_sandbox/etc/group
 
 # Create DuckDB directory in sandbox
@@ -148,6 +148,7 @@ EXPOSE 8090 50051
 
 WORKDIR /app
 
+ENV HOME=/app
 ENV HF_HOME=/.cache/huggingface
 ENV HF_HUB_CACHE=/.cache/huggingface/hub
 

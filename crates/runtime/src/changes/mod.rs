@@ -43,7 +43,7 @@ pub async fn index_change_envelope(
         e
     })?;
 
-    let (change_committer, batch) = envelope.into_parts();
+    let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
     let mut batches = vec![batch.data_batch()];
 
     for index in &indexes.0 {
@@ -56,7 +56,11 @@ pub async fn index_change_envelope(
     let new_change_batch = replace_change_batch_data(&batches[0], &batch)
         .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-    Ok(ChangeEnvelope::new(change_committer, new_change_batch))
+    Ok(ChangeEnvelope::new(
+        change_committer,
+        new_change_batch,
+        is_dataset_ready,
+    ))
 }
 
 #[cfg(test)]
@@ -205,7 +209,7 @@ mod tests {
         let change_batch = wrap_data_as_change_batch(&data_batch.schema(), &data_batch)
             .expect("Failed to create change batch");
         let committer = Box::new(MockCommitChange);
-        ChangeEnvelope::new(committer, change_batch)
+        ChangeEnvelope::new(committer, change_batch, true)
     }
 
     #[tokio::test]
@@ -304,7 +308,7 @@ mod tests {
         let change_batch = wrap_data_as_change_batch(&data_batch.schema(), &data_batch)
             .expect("Failed to create change batch");
         let committer = Box::new(MockCommitChange);
-        let envelope = ChangeEnvelope::new(committer, change_batch);
+        let envelope = ChangeEnvelope::new(committer, change_batch, true);
 
         let table_provider = Arc::new(MockTableProvider);
         let index = Arc::new(MockIndex::new("test_index"));

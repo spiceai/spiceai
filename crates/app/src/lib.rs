@@ -89,6 +89,28 @@ impl App {
     }
 }
 
+impl Default for App {
+    fn default() -> Self {
+        App {
+            name: "DEFAULT".to_string(),
+            secrets: vec![],
+            extensions: HashMap::default(),
+            catalogs: vec![],
+            datasets: vec![],
+            views: vec![],
+            models: vec![],
+            embeddings: vec![],
+            evals: vec![],
+            tools: vec![],
+            workers: vec![],
+            spicepods: vec![],
+            runtime: Runtime::default(),
+            management: None,
+            snapshots: None,
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to load spicepod {}: {source}", path.display()))]
@@ -309,7 +331,7 @@ impl AppBuilder {
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();

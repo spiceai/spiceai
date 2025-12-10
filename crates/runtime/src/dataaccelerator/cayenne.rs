@@ -21,11 +21,14 @@ use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{CreateExternalTable, ExprSchemable, TableProviderFilterPushDown};
+use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
 use runtime_table_partition::Partition;
+use runtime_table_partition::creator::filename::{
+    encode_key, parse_partition_value, to_hive_partition_dir,
+};
 use runtime_table_partition::creator::{self, PartitionCreator};
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -36,9 +39,10 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use super::{AccelerationSource, DataAccelerator};
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
+use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 
@@ -105,9 +109,14 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::LargeBinary
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::List(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::LargeList(_)
+            | DataType::Struct(_)
     )
 }
 
@@ -217,6 +226,14 @@ impl Default for CayenneAccelerator {
     }
 }
 
+fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize {
+    acceleration
+        .params
+        .get(key)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -294,53 +311,40 @@ impl CayenneAccelerator {
         let mut config = cayenne::metadata::VortexConfig::default();
 
         if let Some(acceleration) = source.acceleration() {
-            // Helper to get enabled/disabled parameter with default
-            let get_enabled = |key: &str, default: bool| -> bool {
-                acceleration
-                    .params
-                    .get(key)
-                    .map_or(default, |v| util::parse_enabled(v))
-            };
-
-            // Helper to parse usize parameter
-            let parse_usize = |key: &str, default: usize| -> usize {
-                acceleration
-                    .params
-                    .get(key)
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(default)
-            };
-
-            // Parse encoding options
-            config.enable_alp = get_enabled("cayenne_alp", true);
-            config.enable_fsst = get_enabled("cayenne_fsst", true);
-            config.enable_bitpacking = get_enabled("cayenne_bitpacking", true);
-            config.enable_delta = get_enabled("cayenne_delta", true);
-            config.enable_rle = get_enabled("cayenne_rle", true);
-            config.enable_dict = get_enabled("cayenne_dict", true);
-            config.enable_for = get_enabled("cayenne_for", true);
-            config.enable_zigzag = get_enabled("cayenne_zigzag", true);
-
-            // Parse cache options
-            config.footer_cache_mb = parse_usize("cayenne_footer_cache_mb", 64);
-            config.segment_cache_mb = parse_usize("cayenne_segment_cache_mb", 0);
+            // Parse cache options - use VortexConfig defaults if not specified
+            config.footer_cache_mb = parse_usize(
+                acceleration,
+                "cayenne_footer_cache_mb",
+                config.footer_cache_mb,
+            );
+            config.segment_cache_mb = parse_usize(
+                acceleration,
+                "cayenne_segment_cache_mb",
+                config.segment_cache_mb,
+            );
 
             // Parse file size options
-            config.target_vortex_file_size_mb = parse_usize("cayenne_target_file_size_mb", 256);
+            config.target_vortex_file_size_mb = parse_usize(
+                acceleration,
+                "cayenne_target_file_size_mb",
+                config.target_vortex_file_size_mb,
+            );
+
+            // Parse sort columns
+            if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
+                config.sort_columns = sort_cols_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
 
             tracing::debug!(
-                "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB",
-                config.enable_alp,
-                config.enable_fsst,
-                config.enable_bitpacking,
-                config.enable_delta,
-                config.enable_rle,
-                config.enable_dict,
-                config.enable_for,
-                config.enable_zigzag,
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
-                config.target_vortex_file_size_mb
+                config.target_vortex_file_size_mb,
+                config.sort_columns
             );
         }
 
@@ -383,7 +387,7 @@ impl CayenneAccelerator {
 
         self.catalog
             .get_or_try_init(move || {
-                let connection_string = connection_string.clone();
+                let connection_string = connection_string;
                 async move {
                     let catalog = Arc::new(
                         cayenne::CayenneCatalog::new(connection_string).map_err(|e| {
@@ -484,37 +488,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("unsupported_type_action")
         .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
-    // Vortex encoding configuration for hardware acceleration
-    ParameterSpec::component("cayenne_alp")
-        .description("Enable Adaptive Lossless Precision (ALP) encoding for numeric columns. Provides 5-10x compression with SIMD decompression on ARM64 (NEON) and x86_64 (AVX2/AVX-512). Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_fsst")
-        .description("Enable Fast String Suffix Trie (FSST) encoding for string columns. Provides 2-5x compression with SIMD acceleration. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_bitpacking")
-        .description("Enable BitPacking encoding for integer columns. Provides SIMD-optimized integer unpacking, especially effective on ARM64 with NEON. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_delta")
-        .description("Enable Delta encoding for sorted/sequential numeric data. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_rle")
-        .description("Enable Run-Length Encoding (RLE) for data with repeated values. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_dict")
-        .description("Enable Dictionary encoding for low-cardinality columns. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_for")
-        .description("Enable Frame-of-Reference (FOR) encoding for integer columns with small ranges. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_zigzag")
-        .description("Enable ZigZag encoding for signed integers. Options: 'enabled' (default), 'disabled'")
-        .default("enabled"),
-    ParameterSpec::component("cayenne_footer_cache_mb")
-        .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 64 MB")
-        .default("64"),
-    ParameterSpec::component("cayenne_segment_cache_mb")
-        .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 0 (disabled)")
-        .default("0"),
+    ParameterSpec::component("footer_cache_mb")
+        .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB")
+        .default("128"),
+    ParameterSpec::component("segment_cache_mb")
+        .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
+        .default("256"),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
 
 #[async_trait]
@@ -594,7 +575,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             // Validate that snapshots are not enabled
-            if !matches!(acceleration.snapshots, SnapshotBehavior::Disabled) {
+            if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(
                         "Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: false' or remove the snapshots configuration",
@@ -604,6 +585,22 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         let dir_path = self.file_path(source)?;
+
+        // If mode is FileCreate, delete the existing directory to start fresh
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.mode == Mode::FileCreate
+        {
+            let path_buf = PathBuf::from(&dir_path);
+            if path_buf.exists() {
+                tracing::warn!(
+                    "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
+                    dir_path
+                );
+                std::fs::remove_dir_all(&path_buf).map_err(|err| {
+                    Error::AccelerationInitializationFailed { source: err.into() }
+                })?;
+            }
+        }
 
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
@@ -621,7 +618,7 @@ impl DataAccelerator for CayenneAccelerator {
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     /// Cayenne supports file mode and can optionally partition data.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -872,7 +869,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
 }
 
 impl CayennePartitionCreator {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         table_name: String,
         base_path: PathBuf,
@@ -908,34 +905,14 @@ impl CayennePartitionCreator {
         format!("{}_{}", self.table_name, partition_value)
     }
 
-    fn partition_data_type(&self) -> Result<DataType, creator::Error> {
-        if let Ok(field) = self.schema.field_with_name(self.partition_column_label()) {
-            return Ok(field.data_type().clone());
-        }
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).map_err(|e| {
-            creator::Error::InferringPartitions {
-                source: Box::new(e),
-            }
-        })?;
-
-        self.partition_by
-            .expression
-            .data_type_and_nullable(&df_schema)
-            .map(|(data_type, _)| data_type)
-            .map_err(|e| creator::Error::InferringPartitions {
-                source: Box::new(e),
-            })
-    }
-
     /// Generate partition directory path from partition value
-    fn partition_dir(&self, partition_value: &ScalarValue) -> PathBuf {
-        let partition_str = partition_value.to_string();
-        let partition_column_name = self.partition_column_label();
-
-        // Use Hive-style partitioning: partition_column=value
-        let partition_name = format!("{partition_column_name}={partition_str}");
-        self.base_path.join(partition_name)
+    fn partition_dir(&self, partition_value: &ScalarValue) -> Result<PathBuf, creator::Error> {
+        let partition_dir =
+            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])
+                .map_err(|e| creator::Error::CreatePartition {
+                    source: Box::new(e),
+                })?;
+        Ok(self.base_path.join(partition_dir))
     }
 }
 
@@ -945,7 +922,7 @@ impl PartitionCreator for CayennePartitionCreator {
         &self,
         partition_value: ScalarValue,
     ) -> Result<Partition, creator::Error> {
-        let partition_dir = self.partition_dir(&partition_value);
+        let partition_dir = self.partition_dir(&partition_value)?;
         let partition_path = partition_dir.to_string_lossy().to_string();
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
@@ -956,7 +933,10 @@ impl PartitionCreator for CayennePartitionCreator {
         })?;
 
         // Create partition metadata in catalog
-        let partition_value_str = partition_value.to_string();
+        let partition_value_str =
+            encode_key(&partition_value).map_err(|e| creator::Error::CreatePartition {
+                source: Box::new(e),
+            })?;
         let partition_column_name = self.partition_column_label().to_string();
 
         let partition_metadata = cayenne::PartitionMetadata {
@@ -1016,13 +996,18 @@ impl PartitionCreator for CayennePartitionCreator {
 
         let mut result = Vec::new();
 
-        let partition_data_type = self.partition_data_type()?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema)).map_err(|e| {
+            creator::Error::InferringPartitions {
+                source: Box::new(e),
+            }
+        })?;
 
         for partition_meta in partitions {
-            // Parse partition value
-            let partition_value = ScalarValue::try_from_string(
-                partition_meta.partition_value.clone(),
-                &partition_data_type,
+            // Parse partition value using proper NULL handling
+            let partition_value = parse_partition_value(
+                &df_schema,
+                &self.partition_by,
+                &partition_meta.partition_value,
             )
             .map_err(|e| creator::Error::InferringPartitions {
                 source: Box::new(e),
@@ -1053,13 +1038,39 @@ impl PartitionCreator for CayennePartitionCreator {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Cayenne doesn't support filter pushdown yet, but partition pruning works
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        // Partition pruning works for filters on partition columns, even though
+        // Cayenne doesn't have native filter pushdown to the storage layer
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+
+        let partition_columns = self.partition_by.expression.column_refs();
+
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                let filter_columns = filter.column_refs();
+
+                // Check if filter columns match partition columns (ignoring table qualifiers)
+                // Both `order_date` and `table.order_date` should match partition column `order_date`
+                let matches_partition_cols = filter_columns.is_empty()
+                    || filter_columns.iter().all(|filter_col| {
+                        partition_columns
+                            .iter()
+                            .any(|part_col| filter_col.name == part_col.name)
+                    });
+
+                // If filter references partition columns or contains the partition expression,
+                // it can be used for partition pruning
+                if matches_partition_cols {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 }
+
+register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {

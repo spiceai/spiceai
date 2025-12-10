@@ -361,7 +361,7 @@ impl ReciprocalRankFusion {
             // e^(-alpha * age units)
             RecencyDecay::Exponential => {
                 let decay_constant = args.decay_constant.unwrap_or(0.01);
-                #[allow(clippy::neg_multiply)]
+                #[expect(clippy::neg_multiply)]
                 exp(lit(-1.0f64 * decay_constant) * age_in_units)
             }
             // 1 - (age units / boost window)
@@ -842,7 +842,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "https://github.com/spiceai/spiceai/issues/7861"] // For some reason, BytesProcessedExec is failing to acquire a RequestContext even though the other RRF tests do fine
+    // #[ignore = "https://github.com/spiceai/spiceai/issues/7861"] // For some reason, BytesProcessedExec is failing to acquire a RequestContext even though the other RRF tests do fine
     // https://github.com/spiceai/spiceai/issues/7861
     async fn test_recency_scoring() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;

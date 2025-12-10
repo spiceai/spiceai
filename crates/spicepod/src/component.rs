@@ -181,7 +181,7 @@ pub(super) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
 }
 
-#[allow(clippy::ref_option)] // &Option<T> is required for serde
+#[expect(clippy::ref_option)] // &Option<T> is required for serde
 pub(super) fn is_default_or_none<T: Default + PartialEq>(value: &Option<T>) -> bool {
     match value {
         Some(v) => is_default(v),

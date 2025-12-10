@@ -20,9 +20,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use snafu::prelude::*;
-use twox_hash::XxHash64;
-
-const HASH_SEED: u64 = 7;
+use twox_hash::XxHash3_64;
 
 const INDEX_NAME_MAX_LENGTH: usize = 45;
 const COLUMN_NAME_MAX_LENGTH: usize = 5;
@@ -34,6 +32,8 @@ const _NUM_SEPARATORS: usize = 3; // 3 periods '.' separate the 4 parts
 const _S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
 
 // Check at compile time that we use the full amount allowed from S3
+#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
+#[allow(unfulfilled_lint_expectations)]
 const _: () = {
     assert!(
         INDEX_NAME_MAX_LENGTH
@@ -194,7 +194,7 @@ fn truncate(s: &str, len: usize) -> String {
 }
 
 fn hash_to_hex(input: &str) -> String {
-    let hash = XxHash64::oneshot(HASH_SEED, input.as_bytes());
+    let hash = XxHash3_64::oneshot(input.as_bytes());
     format!("{hash:x}")
 }
 
@@ -207,7 +207,7 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, Error> {
         .join(PARTS_SEPARATOR))
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
     Ok(match expr {
         Expr::Column(col) => {
@@ -347,8 +347,14 @@ mod tests {
         let index_name = "mydataset";
         let column_name = "_my.column";
         let partition_by = &[col(column_name)];
+        let partition_value = ScalarValue::from("blahh");
 
-        let this = PartitionedIndexName::from_index_name("mydataset.29d6f.7f7c5.blahh")?;
+        // Generate the partitioned index name using the actual hashing logic
+        let partitioned_name =
+            PartitionedIndexName::new(index_name, column_name, partition_by, &partition_value)?;
+        let generated_index = partitioned_name.to_index_name();
+
+        let this = PartitionedIndexName::from_index_name(&generated_index)?;
 
         assert_eq!(
             this.belongs_with(index_name, column_name, partition_by),
@@ -377,10 +383,8 @@ mod tests {
         let partition_value = ScalarValue::from("val");
         let partition_by = vec![col("col1")];
 
-        assert!(
-            PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
-                .is_err()
-        );
+        PartitionedIndexName::new(&index_name, column_name, &partition_by, &partition_value)
+            .expect_err("Should error on long index name");
     }
 
     #[test]
@@ -422,7 +426,7 @@ mod tests {
         let name = "test.index.col";
         let result = PartitionedIndexName::from_index_name(name);
 
-        assert!(result.is_err());
+        result.expect_err("Should error on invalid index name parts");
     }
 
     #[test]

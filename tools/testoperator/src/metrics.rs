@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::LazyLock;
 
-use test_framework::opentelemetry::metrics::Gauge;
+use test_framework::opentelemetry::metrics::{Gauge, Histogram};
 use test_framework::telemetry::METER;
 
 pub static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
@@ -55,6 +55,14 @@ pub static READY_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("ready_duration_ms")
         .with_description("Duration until the spicepod is ready.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static HEALTH_LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("health_latency_ms")
+        .with_description("Latency of /health and /v1/ready probes.")
         .with_unit("ms")
         .build()
 });
@@ -189,7 +197,7 @@ pub static SPICED_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub static SPICED_QUERY_DURATION_AVG: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("spiced_query_duration_avg_ms")

@@ -368,7 +368,7 @@ impl MistralLlama {
         Ok(Self::from_pipeline(pipeline).await)
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
         Self {
             pipeline: MistralRsBuilder::new(
@@ -416,7 +416,6 @@ impl MistralLlama {
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
-    #[allow(clippy::cast_possible_truncation)]
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
@@ -684,7 +683,7 @@ fn stream_from_response(
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn chunk_to_openai_stream(
     c: ChatCompletionChunkResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -711,11 +710,7 @@ fn chunk_to_openai_stream(
     Ok(response)
 }
 
-#[allow(
-    deprecated,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
     let ChunkChoice {
         index,

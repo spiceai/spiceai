@@ -1087,7 +1087,6 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
@@ -1176,7 +1175,6 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search_view() -> Result<(), anyhow::Error> {
     let (ds, views) = get_mega_science_view(
         Some("qs"),
@@ -1354,7 +1352,6 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
@@ -1436,7 +1433,6 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
     let mut ds = get_mega_science_dataset(
         Some("qs"),

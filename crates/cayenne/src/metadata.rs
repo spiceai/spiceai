@@ -128,24 +128,7 @@ pub struct PartitionStats {
 
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct VortexConfig {
-    /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
-    pub enable_alp: bool,
-    /// Enable FSST (Fast String Suffix Trie) encoding for string columns
-    pub enable_fsst: bool,
-    /// Enable `BitPacking` encoding for integer columns
-    pub enable_bitpacking: bool,
-    /// Enable Delta encoding for sequential data
-    pub enable_delta: bool,
-    /// Enable Run-Length Encoding (RLE)
-    pub enable_rle: bool,
-    /// Enable Dictionary encoding for low-cardinality columns
-    pub enable_dict: bool,
-    /// Enable Frame-of-Reference (FOR) encoding
-    pub enable_for: bool,
-    /// Enable `ZigZag` encoding for signed integers
-    pub enable_zigzag: bool,
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
     /// Segment cache size in MB
@@ -153,27 +136,22 @@ pub struct VortexConfig {
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 256 MB.
+    /// Defaults to 128 MB.
     pub target_vortex_file_size_mb: usize,
+    /// Columns to sort data by on refresh operations (empty = no sorting)
+    pub sort_columns: Vec<String>,
 }
 
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Enable all SIMD-optimized encodings by default
-            enable_alp: true,
-            enable_fsst: true,
-            enable_bitpacking: true,
-            enable_delta: true,
-            enable_rle: true,
-            enable_dict: true,
-            enable_for: true,
-            enable_zigzag: true,
-            // Cache configuration
+            // Larger caches improve read performance
             footer_cache_mb: 128,
-            segment_cache_mb: 32,
-            // Target file size: 256 MB
-            target_vortex_file_size_mb: 256,
+            segment_cache_mb: 256,
+            // Smaller files = better parallelism and predicate pushdown
+            target_vortex_file_size_mb: 128,
+            // No sort columns by default
+            sort_columns: Vec::new(),
         }
     }
 }

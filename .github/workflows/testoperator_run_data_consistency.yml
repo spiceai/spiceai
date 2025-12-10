@@ -39,6 +39,7 @@ on:
           - 'odbc-databricks'
           - 'duckdb'
           - 'duckdb-zero-results'
+          - 'duckdb-partitioned'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'
@@ -64,7 +65,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Validate spicepod files exist
         run: |
@@ -83,9 +84,21 @@ jobs:
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepods
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+          spicepod-validator "${{ github.event.inputs.compare_spicepod_path }}"
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced

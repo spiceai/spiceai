@@ -33,10 +33,11 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
 pub mod lru_cache;
-mod metrics;
+pub mod metrics;
 mod simple_cache;
 mod utils;
 
+pub mod encoding;
 pub mod key;
 pub mod result;
 
@@ -106,9 +107,9 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
-    fn invalidate_all(&self);
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
+    async fn invalidate_all(&self);
+    async fn size_bytes(&self) -> u64;
+    async fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
 }
@@ -129,13 +130,10 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
 pub enum HashBuilder {
     Ahash(ahash::RandomState),
     Siphash(std::hash::RandomState),
-    #[cfg(feature = "xxhash")]
+    Blake3,
     XxHash3(std::hash::BuildHasherDefault<twox_hash::XxHash3_64>),
-    #[cfg(feature = "xxhash")]
     XxHash32(std::hash::BuildHasherDefault<twox_hash::XxHash32>),
-    #[cfg(feature = "xxhash")]
     XxHash64(std::hash::BuildHasherDefault<twox_hash::XxHash64>),
-    #[cfg(feature = "xxhash")]
     XxHash128,
 }
 
@@ -146,13 +144,10 @@ impl std::hash::BuildHasher for HashBuilder {
         match self {
             HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
             HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
+            HashBuilder::Blake3 => Box::new(blake3_compat::Blake3Wrapper::new()),
             HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
         }
     }
@@ -166,26 +161,52 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
     match hashing_algorithm {
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
         HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
-        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::Blake3 => Ok(HashBuilder::Blake3),
         HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(std::hash::BuildHasherDefault::<
             twox_hash::XxHash3_64,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(std::hash::BuildHasherDefault::<
             twox_hash::XxHash32,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
             twox_hash::XxHash64,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128),
-        #[allow(unreachable_patterns)]
-        _ => Err(Error::InvalidHashingAlgorithm),
     }
 }
 
-#[cfg(feature = "xxhash")]
+mod blake3_compat {
+    use std::hash::Hasher;
+
+    pub struct Blake3Wrapper {
+        hasher: blake3::Hasher,
+    }
+
+    impl Blake3Wrapper {
+        pub fn new() -> Self {
+            Self {
+                hasher: blake3::Hasher::new(),
+            }
+        }
+    }
+
+    impl Hasher for Blake3Wrapper {
+        fn finish(&self) -> u64 {
+            // blake3::Hasher::finalize_xof() doesn't consume self, so we must clone
+            // to get the hash value while preserving the hasher state for potential reuse.
+            // This is the intended design of blake3's incremental API.
+            let mut xof = self.hasher.finalize_xof();
+            let mut bytes = [0u8; 8];
+            xof.fill(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.hasher.update(bytes);
+        }
+    }
+}
+
 mod xxhash_compat {
     use std::hash::Hasher;
 
@@ -202,7 +223,7 @@ mod xxhash_compat {
     }
 
     impl Hasher for XxHash3_128Wrapper {
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         fn finish(&self) -> u64 {
             let hasher_copy = self.hasher.clone();
             let hash128 = hasher_copy.finish_128();
@@ -305,6 +326,9 @@ pub struct QueryResultsCacheProvider {
     stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
+    encoder: Option<Arc<dyn encoding::Encoder>>,
+    encoding: spicepod::component::caching::Encoding,
+    hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -358,7 +382,14 @@ impl QueryResultsCacheProvider {
         // Cache TTL should be the base TTL plus the stale-while-revalidate window
         // so entries aren't evicted before they can be served as stale
         let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
-        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
+        let cache = Arc::new(LruCache::new(
+            cache_max_size,
+            cache_ttl,
+            hash_builder,
+            config.caching_policy,
+        ));
+
+        let encoder = encoding::get_encoder(config.encoding);
 
         let cache_provider = QueryResultsCacheProvider {
             cache,
@@ -366,6 +397,9 @@ impl QueryResultsCacheProvider {
             ttl,
             stale_while_revalidate_ttl,
             ignore_schemas,
+            encoder,
+            encoding: config.encoding,
+            hashing_algorithm: config.hashing_algorithm,
         };
 
         Ok(cache_provider)
@@ -427,13 +461,13 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn size(&self) -> u64 {
-        self.cache.size_bytes()
+    pub async fn size(&self) -> u64 {
+        self.cache.size_bytes().await
     }
 
     #[must_use]
-    pub fn item_count(&self) -> u64 {
-        self.cache.item_count()
+    pub async fn item_count(&self) -> u64 {
+        self.cache.item_count().await
     }
 
     /// Returns the base TTL for cache entries (used for staleness checks).
@@ -464,6 +498,20 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub fn stale_while_revalidate_ttl(&self) -> Option<std::time::Duration> {
         self.stale_while_revalidate_ttl
+    }
+
+    #[must_use]
+    pub fn encoder(&self) -> Option<Arc<dyn encoding::Encoder>> {
+        self.encoder.as_ref().map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        use spicepod::component::caching::Encoding;
+        match self.encoding {
+            Encoding::None => "none",
+            Encoding::Zstd => "zstd",
+        }
     }
 
     #[must_use]
@@ -504,9 +552,11 @@ impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item ttl: {:?}",
+            "max size: {:.2}, item ttl: {:?}, hashing algorithm: {:?}, encoding: {}",
             Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
-            self.ttl
+            self.ttl,
+            self.hashing_algorithm,
+            self.encoding_name(),
         )
     }
 }
@@ -539,7 +589,9 @@ mod tests {
         )
         .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for SHOW TABLES");
     }
 
     #[tokio::test]
@@ -551,7 +603,10 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        cache_provider
+            .cache_is_enabled_for_plan(&logical_plan)
+            .then_some(())
+            .expect("cache should be enabled for simple SELECT");
     }
 
     #[tokio::test]
@@ -563,7 +618,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for INSERT INTO");
     }
 
     #[tokio::test]
@@ -575,7 +632,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for UPDATE");
     }
 
     #[tokio::test]
@@ -587,7 +646,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for DELETE");
     }
 
     #[tokio::test]
@@ -599,7 +660,36 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for CREATE TABLE");
+    }
+
+    #[test]
+    fn test_display_includes_encoding() {
+        let config_none = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::None,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_none = QueryResultsCacheProvider::try_new(&config_none, Box::new([]))
+            .expect("valid cache provider");
+        let display_none = format!("{cache_none}");
+        assert!(
+            display_none.contains("encoding: none"),
+            "Display should include encoding: none, got: {display_none}"
+        );
+
+        let config_zstd = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::Zstd,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_zstd = QueryResultsCacheProvider::try_new(&config_zstd, Box::new([]))
+            .expect("valid cache provider");
+        let display_zstd = format!("{cache_zstd}");
+        assert!(
+            display_zstd.contains("encoding: zstd"),
+            "Display should include encoding: zstd, got: {display_zstd}"
+        );
     }
 
     #[tokio::test]
@@ -611,6 +701,8 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for COPY");
     }
 }

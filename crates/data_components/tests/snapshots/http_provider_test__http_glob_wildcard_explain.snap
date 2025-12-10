@@ -1,0 +1,17 @@
+---
+source: crates/data_components/tests/http_provider_test.rs
+description: HTTP provider - glob pattern with wildcard
+---
++---------------+----------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                 |
++---------------+----------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: tvmaze.content                                                                                           |
+|               |   Filter: tvmaze.request_path = Utf8("/shows/169")                                                                   |
+|               |     TableScan: tvmaze projection=[request_path, content], partial_filters=[tvmaze.request_path = Utf8("/shows/169")] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                          |
+|               |   FilterExec: request_path@0 = /shows/169, projection=[content@1]                                                    |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                            |
+|               |       CooperativeExec                                                                                                |
+|               |         HttpExec: base_url=https://api.tvmaze.com/, format=json, partitions=[(path="/shows/169", query="", body="")] |
+|               |                                                                                                                      |
++---------------+----------------------------------------------------------------------------------------------------------------------+

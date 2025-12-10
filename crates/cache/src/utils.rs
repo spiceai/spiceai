@@ -29,7 +29,7 @@ use async_stream::stream;
 use futures::StreamExt;
 
 #[must_use]
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
@@ -37,7 +37,6 @@ pub fn to_cached_record_batch_stream(
     input_tables: Arc<HashSet<TableReference>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
-    let schema_copy = Arc::clone(&schema);
 
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
@@ -56,15 +55,24 @@ pub fn to_cached_record_batch_stream(
 
         if records_size < cache_max_size {
             let cached_at = std::time::Instant::now();
-            let cached_result = CachedQueryResult::new(
-                Arc::new(records),
-                schema_copy,
+            let encoder = cache_provider.encoder();
+
+            match CachedQueryResult::from_batches(
+                &records,
                 input_tables,
                 cached_at,
-            );
-
-            if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
-                tracing::error!("Failed to cache query results: {e}");
+                encoder,
+            )
+            .await
+            {
+                Ok(cached_result) => {
+                    if let Err(e) = cache_provider.put_raw_key(&raw_cache_key, cached_result).await {
+                        tracing::error!("Failed to cache query results: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to encode query results for caching: {e}");
+                }
             }
         }
     };
@@ -121,7 +129,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::new();
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for DESCRIBE query");
     }
 
     #[tokio::test]
@@ -132,7 +142,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["information_schema.tables".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for SHOW TABLES query");
     }
 
     #[tokio::test]
@@ -143,7 +155,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for simple SELECT query");
     }
 
     #[tokio::test]
@@ -155,7 +169,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for JOIN query");
     }
 
     #[tokio::test]
@@ -166,7 +182,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["state".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for subquery");
     }
 
     #[tokio::test]
@@ -184,7 +202,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for nested subqueries with aliases");
     }
 
     #[tokio::test]
@@ -203,7 +223,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for UNION with subqueries");
     }
 
     #[tokio::test]
@@ -221,7 +243,9 @@ pub(crate) mod tests {
         let table_names = get_logical_plan_input_tables(&logical_plan);
 
         let expected: HashSet<TableReference> = HashSet::from(["customer".into(), "orders".into()]);
-        assert_eq!(table_names, expected);
+        (table_names == expected)
+            .then_some(())
+            .expect("table_names should match expected for JOIN with subquery in FROM clause");
     }
 
     fn create_session_context() -> SessionContext {

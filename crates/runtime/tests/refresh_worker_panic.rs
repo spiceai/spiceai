@@ -36,7 +36,7 @@ use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::federated_table::FederatedTable;
 use runtime::status;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, timeout};
 
 #[derive(Debug)]
@@ -158,10 +158,12 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
         refresh_state,
         accelerator_provider,
         Handle::current(),
+        Arc::new(Mutex::new(())),
     )
     .build();
 
-    let (start_refresh, mut on_refresh_complete) = runner.start();
+    let (start_refresh, mut on_refresh_complete) =
+        runner.start().expect("Should start refresh task");
 
     start_refresh.send(None).await.map_err(|e| e.to_string())?;
 

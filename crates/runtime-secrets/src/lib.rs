@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use crate::stores::scheduler_rpc::SchedulerRPCSecretStore;
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use lexer::SecretReplacementMatcher;
@@ -81,6 +83,19 @@ impl Secrets {
         Self {
             stores: IndexMap::new(),
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn new_for_cluster_executor(scheduler_url: String, executor_id: String) -> Self {
+        let mut stores = IndexMap::new();
+        stores.insert(
+            "scheduler_rpc".to_string(),
+            Arc::new(SchedulerRPCSecretStore::new(scheduler_url, executor_id))
+                as Arc<dyn SecretStore>,
+        );
+
+        Self { stores }
     }
 
     /// Initializes the runtime secrets based on the provided secret store configuration.
@@ -233,9 +248,11 @@ pub enum SecretStoreType {
     Kubernetes(String),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(String),
+    #[cfg(feature = "cluster")]
+    SchedulerRPC,
 }
 
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn get_params_with_secrets(
     secrets: Arc<RwLock<Secrets>>,
     params: &HashMap<String, String>,
@@ -254,7 +271,6 @@ pub async fn get_params_with_secrets(
     params_with_secrets
 }
 
-#[allow(clippy::result_large_err)]
 fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType> {
     let provider = secret_store_provider(&store.from);
     let selector = secret_selector(&store.from);
@@ -281,6 +297,11 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
         "aws_secrets_manager" => Ok(SecretStoreType::AwsSecretsManager(require_selector(
             provider, selector,
         )?)),
+        #[cfg(feature = "cluster")]
+        "scheduler_rpc" => {
+            require_no_selector(provider, selector)?;
+            Ok(SecretStoreType::SchedulerRPC)
+        }
         other => UnknownSecretStoreSnafu {
             store: other.to_string(),
         }
@@ -288,7 +309,6 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     let Some(selector) = selector else {
         return SecretStoreRequiresSecretSelectorSnafu {
@@ -300,7 +320,6 @@ fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {
     Ok(selector.to_string())
 }
 
-#[allow(clippy::result_large_err)]
 fn require_no_selector(provider: &str, selector: Option<&str>) -> Result<()> {
     if selector.is_some() {
         SecretStoreInvalidSecretSelectorSnafu {
@@ -377,6 +396,12 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
                 })?;
 
             Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
+        },
+        #[cfg(feature = "cluster")]
+        SecretStoreType::SchedulerRPC => {
+            Err(Error::UnableToLoadSecrets {
+                source: "The `scheduler_rpc` is automatically configured for cluster mode, and should not be specified in the Spicepod.".into()
+            })
         }
     }
 }

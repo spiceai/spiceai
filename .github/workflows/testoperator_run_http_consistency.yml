@@ -70,7 +70,7 @@ jobs:
           echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Validate spicepod file exists
         run: |
@@ -86,6 +86,17 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced

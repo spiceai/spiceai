@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     panic,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -49,10 +49,16 @@ pub(crate) struct SpiceTestQueryWorker {
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
-    spice_client: Arc<SpiceClient>,
+    spice_client: Option<Arc<SpiceClient>>,
     http_client: Option<reqwest::Client>,
     /// Optional custom validation data for scenario queries
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    /// Optional reference schema for validating against known good tables
+    reference_schema: Option<String>,
+    /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
+    skip_row_count_validation: HashSet<String>,
+    /// Whether to validate row counts between HTTP and Flight endpoints, and check for zero rows
+    validate_row_counts: bool,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -96,14 +102,13 @@ impl SpiceTestQueryWorker {
         id: usize,
         query_set: Vec<Query>,
         end_condition: EndCondition,
-        spice_client: SpiceClient,
         name: String,
     ) -> Self {
         Self {
             id,
             query_set,
             end_condition,
-            spice_client: Arc::new(spice_client),
+            spice_client: None,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
@@ -112,11 +117,19 @@ impl SpiceTestQueryWorker {
             scale_factor: 1.0,
             http_client: None,
             validation_data: None,
+            reference_schema: None,
+            skip_row_count_validation: default_row_count_validation_skip_queries(),
+            validate_row_counts: true,
         }
     }
 
     pub fn with_http_client(mut self, http_client: reqwest::Client) -> Self {
         self.http_client = Some(http_client);
+        self
+    }
+
+    pub fn with_flight_client(mut self, spice_client: SpiceClient) -> Self {
+        self.spice_client = Some(Arc::new(spice_client));
         self
     }
 
@@ -156,6 +169,16 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
+        self
+    }
+
+    pub fn with_validate_row_counts(mut self, validate_row_counts: bool) -> Self {
+        self.validate_row_counts = validate_row_counts;
+        self
+    }
+
     /// Validate query results against expected data
     /// Uses TPCH validation for TPCH queries, custom validation data for scenario queries
     fn validate_query_results(
@@ -178,7 +201,7 @@ impl SpiceTestQueryWorker {
         validation::validate_tpch_query(query, actual_batches)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
@@ -265,10 +288,13 @@ impl SpiceTestQueryWorker {
                             ));
                         }
 
-                        if self.explain_plan_snapshot && self.id == 0 {
+                        if self.explain_plan_snapshot
+                            && self.id == 0
+                            && let Some(client) = &self.spice_client
+                        {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
-                                Arc::clone(&self.spice_client),
+                                Arc::clone(client),
                                 self.name.as_str(),
                                 query,
                                 self.scale_factor,
@@ -448,7 +474,7 @@ impl SpiceTestQueryWorker {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn execute_flight(
         &self,
         query: &Query,
@@ -457,10 +483,13 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        let Some(spice_client) = self.spice_client.as_ref() else {
+            return Ok(());
+        };
+
         let query_start = Instant::now();
 
-        let mut result_stream = self
-            .spice_client
+        let mut result_stream = spice_client
             .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
             .await?;
 
@@ -517,15 +546,100 @@ impl SpiceTestQueryWorker {
         }
 
         if validate {
-            // Validate the query results
+            // Execute reference query if reference_schema is provided
+            let reference_batches = if let Some(ref_schema) = &self.reference_schema {
+                let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
+                println!(
+                    "Worker {} - Query '{}' - Executing reference query against {}.* tables",
+                    self.id, query.name, ref_schema
+                );
+
+                let mut ref_result_stream = spice_client
+                    .query_with_params(
+                        &reference_query.sql,
+                        reference_query.get_parameters_batch().transpose()?,
+                    )
+                    .await?;
+
+                let mut ref_batches = vec![];
+                while let Some(batch) = ref_result_stream.try_next().await? {
+                    ref_batches.push(batch);
+                }
+                Some(ref_batches)
+            } else {
+                None
+            };
+
+            // Validate against reference query results if available
+            if let Some(ref_batches) = reference_batches {
+                let validation_result = validation::validate_with_expected_batches(
+                    &query.name,
+                    &validation_records,
+                    &ref_batches,
+                )?;
+
+                if let QueryValidationResult::Fail(validation_reason) = validation_result {
+                    eprintln!(
+                        "\n{} FAIL - Worker {} - Query '{}' reference validation failed",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name
+                    );
+                    eprintln!("Query SQL: {}", query.sql);
+                    eprintln!("Validation failure reason: {validation_reason:?}");
+                    eprintln!("\nExpected results (from reference schema):");
+                    match arrow::util::pretty::pretty_format_batches(&ref_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                    eprintln!("\nActual results:");
+                    match arrow::util::pretty::pretty_format_batches(&validation_records) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                    }
+                    eprintln!();
+                    return Err(anyhow::anyhow!(
+                        "Query reference validation failed: {validation_reason:?}"
+                    ));
+                }
+            }
+
+            // Also validate using existing validation logic (TPCH or custom validation data)
             let validation_result = self.validate_query_results(query, &validation_records)?;
+
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
+                    "\n{} FAIL - Worker {} - Query '{}' validation failed",
                     chrono::Utc::now(),
                     self.id,
                     query.name
                 );
+                eprintln!("Query SQL: {}", query.sql);
+                eprintln!("Validation failure reason: {validation_reason:?}");
+
+                // Print expected results based on validation source
+                if let Some(validation_data) = &self.validation_data
+                    && let Some(expected_batches) = validation_data.get(&query.name)
+                {
+                    eprintln!("\nExpected results (from custom validation data):");
+                    match arrow::util::pretty::pretty_format_batches(expected_batches) {
+                        Ok(pretty) => eprintln!("{pretty}"),
+                        Err(e) => eprintln!("Failed to format expected batches: {e}"),
+                    }
+                } else {
+                    eprintln!(
+                        "\nExpected results: See TPCH specification for query {}",
+                        query.name
+                    );
+                }
+
+                eprintln!("\nActual results:");
+                match arrow::util::pretty::pretty_format_batches(&validation_records) {
+                    Ok(pretty) => eprintln!("{pretty}"),
+                    Err(e) => eprintln!("Failed to format actual batches: {e}"),
+                }
+                eprintln!();
+
                 return Err(anyhow::anyhow!(
                     "Query validation failed: {validation_reason:?}"
                 ));
@@ -616,7 +730,7 @@ impl SpiceTestQueryWorker {
                     .get("row_count")
                     .and_then(serde_json::Value::as_u64)
                 {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let row_count_usize = row_count as usize;
                     http_row_counts
                         .entry(Arc::clone(&query.name))
@@ -665,6 +779,15 @@ impl SpiceTestQueryWorker {
             self.execute_http(query, Arc::clone(&query_durations), &mut http_row_counts),
         )
         .await?;
+
+        // Skip row count validation if disabled or for specific queries that legitimately return 0 rows
+        if !self.validate_row_counts
+            || self
+                .skip_row_count_validation
+                .contains(&query.name.to_string())
+        {
+            return Ok(());
+        }
 
         // Validate row counts if both HTTP and Flight are available
         if let Some(http_counts) = http_row_counts.get(&query.name) {
@@ -729,4 +852,19 @@ impl SpiceTestQueryWorker {
 
         Ok(())
     }
+}
+
+fn default_row_count_validation_skip_queries() -> HashSet<String> {
+    [
+        "tpcds_q8",
+        "tpcds_q29",
+        "tpcds_q37",
+        "tpcds_q41",
+        "tpcds_q44",
+        "tpcds_q54",
+        "tpcds_q58",
+    ]
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect()
 }

@@ -261,7 +261,7 @@ impl SpiceObjectStoreRegistry {
     }
 
     // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn prepare_azure_object_store(
         &self,
         url: &Url,
@@ -488,7 +488,6 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
         self.inner.get_store(url).or_else(|_| {
             let store = self.get_feature_store(url)?;
             self.inner.register_store(url, Arc::clone(&store));
-
             Ok(store)
         })
     }

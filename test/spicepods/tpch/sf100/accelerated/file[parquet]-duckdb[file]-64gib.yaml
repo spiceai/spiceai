@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-duckdb[file]-64gib
 datasets:
-  - from: s3://benchmarks/tpch_sf100/customer/
+  - from: s3://benchmarks/tpch_sf100/customer.parquet
     name: customer
     params: &s3_params
       file_format: parquet
@@ -17,31 +17,31 @@ datasets:
       mode: file
       params:
         duckdb_memory_limit: 64GiB
-  - from: s3://benchmarks/tpch_sf100/lineitem/
+  - from: s3://benchmarks/tpch_sf100/lineitem.parquet
     name: lineitem
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf100/nation/
+  - from: s3://benchmarks/tpch_sf100/nation.parquet
     name: nation
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf100/orders/
+  - from: s3://benchmarks/tpch_sf100/orders.parquet
     name: orders
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf100/part/
+  - from: s3://benchmarks/tpch_sf100/part.parquet
     name: part
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf100/partsupp/
+  - from: s3://benchmarks/tpch_sf100/partsupp.parquet
     name: partsupp
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf100/region/
+  - from: s3://benchmarks/tpch_sf100/region.parquet
     name: region
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf100/supplier/
+  - from: s3://benchmarks/tpch_sf100/supplier.parquet
     name: supplier
     params: *s3_params
     acceleration: *acceleration

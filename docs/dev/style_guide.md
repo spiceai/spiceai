@@ -254,6 +254,6 @@ Rust can make some compiler optimisations that result in more stack operations w
 
 ### Notes
 
-**Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[allow(...)]` is acceptable when the lint is not applicable in certain contexts.
+**Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[expect(...)]` is acceptable when the lint is not applicable in certain contexts.
 
 **API Guidelines**: The [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/about.html) are followed for all public interfaces.
