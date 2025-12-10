@@ -293,6 +293,10 @@ impl DataConnector for DynamoDB {
                     load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys, &dataset_name).await?;
 
                 if should_bootstrap {
+                    tracing::info!(
+                        "No existing checkpoint found for table {}, starting from bootstrap",
+                        dataset_name
+                    );
                     // Initialize bootstrap stream
                     let bootstrap_stream = Arc::clone(&dynamodb)
                         .bootstrap_stream()
@@ -342,6 +346,11 @@ impl DataConnector for DynamoDB {
                     )
                 } else {
                     // Resume reading from a checkpoint
+                    tracing::info!(
+                        "Found existing checkpoint for DynamoDB table {}, resuming from checkpoint. Table will be marked as Ready once stream lag reaches < '{}'",
+                        dataset_name,
+                        humantime::format_duration(acceptable_lag),
+                    );
                     Some(
                         stream::once(changes_stream_from_checkpoint(
                             Arc::clone(&dynamodb),
@@ -386,10 +395,6 @@ async fn load_or_initialize_checkpoint(
     if let Some(metadata) = existing_checkpoint {
         match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
             Ok(checkpoint) => {
-                tracing::info!(
-                    "Found existing checkpoint for DynamoDB table {}, resuming from checkpoint",
-                    dataset_name
-                );
                 Some((false, checkpoint))
             }
             Err(err) => {
@@ -402,10 +407,6 @@ async fn load_or_initialize_checkpoint(
             }
         }
     } else {
-        tracing::info!(
-            "No existing checkpoint found for table {}, starting from bootstrap",
-            dataset_name
-        );
         get_latest_checkpoint(dynamodb).await.map(|cp| (true, cp))
     }
 }
@@ -415,7 +416,7 @@ async fn get_latest_checkpoint(dynamodb: &Arc<DynamoDBTableProvider>) -> Option<
         Ok(checkpoint) => Some(checkpoint),
         Err(err) => {
             tracing::error!(
-                "Failed to get latest global checkpoint for DynamoDB Stream: {:?}",
+                "Failed to get latest global checkpoint for DynamoDB Stream: {}",
                 err
             );
             None
