@@ -3013,6 +3013,7 @@ dependencies = [
  "tracing",
  "turso",
  "url",
+ "util",
  "uuid 1.18.1",
  "vortex",
  "vortex-datafusion",
