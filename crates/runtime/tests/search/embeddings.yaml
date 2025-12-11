@@ -1,8 +1,0 @@
-embeddings:
-  - name: hf_minilm # For historical reasons, Moved from using a HF model to a model2vec.
-    from: model2vec:minishlab/potion-base-2M
-
-  - name: openai_embeddings
-    from: openai:text-embedding-3-small
-    params:
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
