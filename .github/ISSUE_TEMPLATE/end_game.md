@@ -108,7 +108,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
-     - [ ] [Caching Mode Accelerator](https://github.com/spiceai/cookbook/tree/trunk/caching/accelerator/README.md)
+     - [ ] [Caching Mode Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
