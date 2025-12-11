@@ -1,5 +1,5 @@
 # Vector store configurations.
-# Each key represents a vector store confuration for use in `.views[].vectors` or `.datasets[].vectors`.
+# Each key represents a vector store configuration for use in `.views[].vectors` or `.datasets[].vectors`.
 # Some `.params` will be overriden per test case (e.g. index/bucket for s3_vectors), per `engine` type.
 
 no_vector_engine:
