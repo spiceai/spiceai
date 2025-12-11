@@ -13415,6 +13415,7 @@ dependencies = [
  "indexmap 2.12.1",
  "keyring",
  "logos",
+ "percent-encoding",
  "prost 0.13.5",
  "rand 0.9.2",
  "reqwest",

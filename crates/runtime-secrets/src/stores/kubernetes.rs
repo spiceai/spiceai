@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest;
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
@@ -123,8 +124,10 @@ impl KubernetesClient {
             return Err(Error::UnableToReadKubernetesCredentials {});
         };
 
-        let url =
-            format!("{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{secret_name}");
+        let encoded_secret_name = utf8_percent_encode(secret_name, NON_ALPHANUMERIC);
+        let url = format!(
+            "{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{encoded_secret_name}"
+        );
 
         let kubernetes_secret = client
             .get(url.clone())
