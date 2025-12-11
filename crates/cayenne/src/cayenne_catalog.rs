@@ -17,10 +17,7 @@ limitations under the License.
 //! Metadata catalog implementation for Cayenne.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use super::metadata::{
-    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
-    TableStats,
-};
+use super::metadata::{CreateTableOptions, DeleteFile, PartitionMetadata, TableMetadata};
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
@@ -454,28 +451,6 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
-    async fn get_table_by_id(&self, table_id: i64) -> CatalogResult<TableMetadata> {
-        // Implementation would query cayenne_table by ID
-        Err(CatalogError::TableNotFound {
-            table_name: format!("id:{table_id}"),
-        })
-    }
-
-    async fn get_current_snapshot(&self, table_id: i64) -> CatalogResult<String> {
-        self.metastore
-            .query_row_helper(
-                QueryRowParams {
-                    sql: "SELECT current_snapshot_id FROM cayenne_table WHERE table_id = ?1",
-                    params: vec![MetastoreValue::Integer(table_id)],
-                },
-                |row| row.get_string(0),
-            )
-            .await
-            .map_err(|e| CatalogError::FailedToGetCurrentSnapshot {
-                source: Box::new(e),
-            })
-    }
-
     async fn set_current_snapshot(&self, table_id: i64, snapshot_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
@@ -489,34 +464,6 @@ impl MetadataCatalog for CayenneCatalog {
             .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
             })
-    }
-
-    async fn list_tables(&self) -> CatalogResult<Vec<TableMetadata>> {
-        // Implementation would query all active tables
-        Err(CatalogError::NotImplemented {
-            function: "list_tables".to_string(),
-        })
-    }
-
-    async fn drop_table(&self, _table_name: &str) -> CatalogResult<()> {
-        // Implementation would delete table from catalog
-        Err(CatalogError::NotImplemented {
-            function: "drop_table".to_string(),
-        })
-    }
-
-    async fn add_data_file(&self, _data_file: DataFile) -> CatalogResult<i64> {
-        // Implementation would insert into cayenne_data_file
-        Err(CatalogError::NotImplemented {
-            function: "add_data_file".to_string(),
-        })
-    }
-
-    async fn get_data_files(&self, _table_id: i64) -> CatalogResult<Vec<DataFile>> {
-        // Implementation would query active data files for table
-        Err(CatalogError::NotImplemented {
-            function: "get_data_files".to_string(),
-        })
     }
 
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64> {
@@ -575,13 +522,6 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(delete_file_id)
     }
 
-    async fn get_delete_files(&self, _data_file_id: i64) -> CatalogResult<Vec<DeleteFile>> {
-        // Implementation would query delete files for specific data file
-        Err(CatalogError::NotImplemented {
-            function: "get_delete_files".to_string(),
-        })
-    }
-
     async fn get_table_delete_files(&self, table_id: i64) -> CatalogResult<Vec<DeleteFile>> {
         self.metastore
             .query_helper(
@@ -609,13 +549,6 @@ impl MetadataCatalog for CayenneCatalog {
             .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
                 source: Box::new(e),
             })
-    }
-
-    async fn get_table_stats(&self, _table_id: i64) -> CatalogResult<TableStats> {
-        // Implementation would aggregate stats from data and delete files
-        Err(CatalogError::NotImplemented {
-            function: "get_table_stats".to_string(),
-        })
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64> {
@@ -712,136 +645,6 @@ impl MetadataCatalog for CayenneCatalog {
         .await.map_err(|e| CatalogError::FailedToGetPartitions {
             source: Box::new(e),
         })
-    }
-
-    async fn get_partition(
-        &self,
-        table_id: i64,
-        partition_value: &str,
-    ) -> CatalogResult<Option<PartitionMetadata>> {
-        let partitions = self.metastore.query_helper(
-                QueryParams {
-                    sql: r"
-                        SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
-                        FROM cayenne_partition
-                        WHERE table_id = ?1 AND partition_value = ?2
-                        LIMIT 1
-                    ",
-                    params: vec![
-                        MetastoreValue::Integer(table_id),
-                        MetastoreValue::Text(partition_value.to_string()),
-                    ],
-                },
-                |row| {
-                    Ok(PartitionMetadata {
-                        partition_id: row.get_i64(0)?,
-                        table_id: row.get_i64(1)?,
-                        partition_column: row.get_string(2)?,
-                        partition_value: row.get_string(3)?,
-                        path: row.get_string(4)?,
-                        path_is_relative: row.get_bool(5)?,
-                        record_count: row.get_i64(6)?,
-                        file_size_bytes: row.get_i64(7)?,
-                    })
-                },
-            )
-            .await.map_err(|e| CatalogError::FailedToGetPartition {
-                source: Box::new(e),
-            })?;
-
-        if partitions.is_empty() {
-            return Ok(None);
-        } else if partitions.len() > 1 {
-            return Err(CatalogError::InvalidPartitionCount {
-                table_id,
-                partition_value: partition_value.to_string(),
-            });
-        }
-
-        Ok(Some(partitions[0].clone()))
-    }
-
-    async fn update_partition_stats(
-        &self,
-        partition_id: i64,
-        record_count: i64,
-        file_size_bytes: i64,
-    ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: r"
-                UPDATE cayenne_partition 
-                SET record_count = ?1, file_size_bytes = ?2
-                WHERE partition_id = ?3
-            ",
-                params: vec![
-                    MetastoreValue::Integer(record_count),
-                    MetastoreValue::Integer(file_size_bytes),
-                    MetastoreValue::Integer(partition_id),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::FailedToUpdatePartitionStats {
-                source: Box::new(e),
-            })
-    }
-
-    async fn get_partition_stats(&self, partition_id: i64) -> CatalogResult<PartitionStats> {
-        self.metastore
-            .query_row_helper(
-                QueryRowParams {
-                    sql: r"
-                    SELECT record_count, file_size_bytes
-                    FROM cayenne_partition
-                    WHERE partition_id = ?1
-                ",
-                    params: vec![MetastoreValue::Integer(partition_id)],
-                },
-                |row| {
-                    Ok(PartitionStats {
-                        record_count: row.get_i64(0)?,
-                        file_size_bytes: row.get_i64(1)?,
-                    })
-                },
-            )
-            .await
-            .map_err(|e| CatalogError::FailedToGetPartitionStats {
-                source: Box::new(e),
-            })
-    }
-
-    async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>> {
-        self.metastore
-            .query_helper(
-                QueryParams {
-                    sql: r"
-                    SELECT data_file_id, table_id, partition_id, file_order, path, path_is_relative,
-                           file_format, record_count, file_size_bytes, row_id_start
-                    FROM cayenne_data_file
-                    WHERE partition_id = ?1
-                    ORDER BY file_order
-                ",
-                    params: vec![MetastoreValue::Integer(partition_id)],
-                },
-                |row| {
-                    Ok(DataFile {
-                        data_file_id: row.get_i64(0)?,
-                        table_id: row.get_i64(1)?,
-                        partition_id: row.get_optional_i64(2)?,
-                        file_order: row.get_i64(3)?,
-                        path: row.get_string(4)?,
-                        path_is_relative: row.get_bool(5)?,
-                        file_format: row.get_string(6)?,
-                        record_count: row.get_i64(7)?,
-                        file_size_bytes: row.get_i64(8)?,
-                        row_id_start: row.get_i64(9)?,
-                    })
-                },
-            )
-            .await
-            .map_err(|e| CatalogError::FailedToGetPartitionDataFiles {
-                source: Box::new(e),
-            })
     }
 }
 

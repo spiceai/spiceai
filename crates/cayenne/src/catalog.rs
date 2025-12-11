@@ -20,10 +20,7 @@ limitations under the License.
 //! and file references. It can be implemented by different RDBMS backends
 //! (`SQLite`, `PostgreSQL`, etc.).
 
-use super::metadata::{
-    CreateTableOptions, DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata,
-    TableStats,
-};
+use super::metadata::{CreateTableOptions, DeleteFile, PartitionMetadata, TableMetadata};
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::sync::Arc;
@@ -99,7 +96,7 @@ pub enum CatalogError {
     #[snafu(display("Invalid database path: {path}."))]
     InvalidDatabasePath { path: String },
 
-    #[snafu(display("Not implemented"))]
+    #[snafu(display("The function '{function}' is not implemented"))]
     NotImplemented { function: String },
 
     #[snafu(display(
@@ -176,33 +173,8 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get table metadata by name.
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
 
-    /// Get table metadata by ID.
-    async fn get_table_by_id(&self, table_id: i64) -> CatalogResult<TableMetadata>;
-
-    /// Get the current snapshot ID for a table (`UUIDv7` string).
-    /// All tables have a snapshot (created on table initialization).
-    async fn get_current_snapshot(&self, table_id: i64) -> CatalogResult<String>;
-
     /// Set the current snapshot ID for a table (`UUIDv7` string).
     async fn set_current_snapshot(&self, table_id: i64, snapshot_id: &str) -> CatalogResult<()>;
-
-    /// List all active tables.
-    async fn list_tables(&self) -> CatalogResult<Vec<TableMetadata>>;
-
-    /// Drop a table.
-    async fn drop_table(&self, table_name: &str) -> CatalogResult<()>;
-
-    /// Add a data file (virtual file/`ListingTable`) to a table.
-    ///
-    /// Creates metadata for a new virtual file. The `data_file.path` should point
-    /// to a unique directory where the `ListingTable`'s Vortex files will be stored.
-    async fn add_data_file(&self, data_file: DataFile) -> CatalogResult<i64>;
-
-    /// Get all active data files (virtual files/`ListingTables`) for a table.
-    ///
-    /// Returns metadata for all virtual files that make up this table. Each `DataFile`
-    /// represents a separate `ListingTable` at its own directory.
-    async fn get_data_files(&self, table_id: i64) -> CatalogResult<Vec<DataFile>>;
 
     /// Add a delete file (deletion vector) for a data file.
     ///
@@ -210,41 +182,14 @@ pub trait MetadataCatalog: Send + Sync {
     /// virtual file (`ListingTable`).
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64>;
 
-    /// Get all active delete files for a specific data file (virtual file).
-    async fn get_delete_files(&self, data_file_id: i64) -> CatalogResult<Vec<DeleteFile>>;
-
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: i64) -> CatalogResult<Vec<DeleteFile>>;
-
-    /// Get statistics for a table.
-    async fn get_table_stats(&self, table_id: i64) -> CatalogResult<TableStats>;
 
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64>;
 
     /// Get all partitions for a table.
     async fn get_partitions(&self, table_id: i64) -> CatalogResult<Vec<PartitionMetadata>>;
-
-    /// Get a specific partition by table ID and partition value.
-    async fn get_partition(
-        &self,
-        table_id: i64,
-        partition_value: &str,
-    ) -> CatalogResult<Option<PartitionMetadata>>;
-
-    /// Update partition statistics (record count and file size).
-    async fn update_partition_stats(
-        &self,
-        partition_id: i64,
-        record_count: i64,
-        file_size_bytes: i64,
-    ) -> CatalogResult<()>;
-
-    /// Get partition statistics.
-    async fn get_partition_stats(&self, partition_id: i64) -> CatalogResult<PartitionStats>;
-
-    /// Get data files belonging to a specific partition.
-    async fn get_partition_data_files(&self, partition_id: i64) -> CatalogResult<Vec<DataFile>>;
 
     /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
     /// Default implementation does nothing.
