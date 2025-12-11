@@ -512,7 +512,8 @@ impl CayenneDeletionSink {
                 .map_err(|source| catalog_error_to_box(CatalogError::TaskJoin { source }))?
                 .map_err(|err| {
                     catalog_error_to_box(CatalogError::InvalidOperation {
-                        message: format!("Failed to read existing deletion vectors: {err}"),
+                        message: format!("Failed to read existing deletion vectors"),
+                        source: Box::new(err),
                     })
                 })?;
 

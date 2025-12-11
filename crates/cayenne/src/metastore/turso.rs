@@ -61,11 +61,12 @@ impl TursoMetastore {
         let db_path = self.db_path();
 
         // Create parent directory if it doesn't exist
-        let db_dir = Path::new(db_path)
-            .parent()
-            .ok_or_else(|| CatalogError::InvalidOperation {
-                message: "Invalid database path".to_string(),
-            })?;
+        let db_dir =
+            Path::new(db_path)
+                .parent()
+                .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                    path: db_path.to_string(),
+                })?;
 
         if !db_dir.exists() {
             tokio::fs::create_dir_all(db_dir).await?;
@@ -159,10 +160,13 @@ impl TursoMetastore {
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
+            partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            row_count BIGINT NOT NULL
+            path TEXT NOT NULL,
+            path_is_relative BOOLEAN NOT NULL,
+            record_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (partition_id, table_id, partition_column, partition_value)
         )
     ";
 }

@@ -29,6 +29,7 @@ use snafu::Snafu;
 use std::sync::Arc;
 
 /// Error type for catalog operations.
+#[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum CatalogError {
     /// Database error
@@ -53,10 +54,11 @@ pub enum CatalogError {
     },
 
     /// Invalid operation
-    #[snafu(display("Invalid operation: {message}"))]
+    #[snafu(display("Invalid operation: {message}. {source}"))]
     InvalidOperation {
         /// Description of the invalid operation
         message: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// IO error
@@ -93,6 +95,61 @@ pub enum CatalogError {
         /// The operation that failed due to lock poisoning
         operation: String,
     },
+
+    #[snafu(display("Invalid database path: {path}."))]
+    InvalidDatabasePath { path: String },
+
+    #[snafu(display("Not implemented"))]
+    NotImplemented { function: String },
+
+    #[snafu(display(
+        "Deletion vectors require non-negative row IDs, found negative values: {row_ids}"
+    ))]
+    NegativeRowId { row_ids: String },
+
+    #[snafu(display("Failed to get catalog table. {source}"))]
+    FailedToGetTable { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to get current snapshot. {source}"))]
+    FailedToGetCurrentSnapshot { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to set current snapshot. {source}"))]
+    FailedToSetCurrentSnapshot { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to create catalog table. {source}"))]
+    FailedToCreateTable { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to add delete file. {source}"))]
+    FailedToAddDeleteFile { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to get delete files for table. {source}"))]
+    FailedToGetTableDeleteFiles { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to add partition. {source}"))]
+    FailedToAddPartition { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to get partitions. {source}"))]
+    FailedToGetPartitions { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to get partition. {source}"))]
+    FailedToGetPartition { source: Box<CatalogError> },
+
+    #[snafu(display(
+        "Multiple partitions found for table ID {table_id} and partition value '{partition_value}'"
+    ))]
+    InvalidPartitionCount {
+        table_id: i64,
+        partition_value: String,
+    },
+
+    #[snafu(display("Failed to update partition stats. {source}"))]
+    FailedToUpdatePartitionStats { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to get partition stats. {source}"))]
+    FailedToGetPartitionStats { source: Box<CatalogError> },
+
+    #[snafu(display("Failed to get partition data files. {source}"))]
+    FailedToGetPartitionDataFiles { source: Box<CatalogError> },
 }
 
 /// Result type for catalog operations.

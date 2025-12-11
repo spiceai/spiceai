@@ -97,7 +97,10 @@ impl SqliteMetastore {
             } else {
                 format!("{operation} task failed: {err}")
             };
-            CatalogError::InvalidOperation { message }
+            CatalogError::InvalidOperation {
+                message,
+                source: Box::new(err),
+            }
         })?
     }
 
@@ -157,9 +160,10 @@ impl SqliteMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    /// Composite primary key on (partition_id, table_id, partition_column, partition_value).
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT PRIMARY KEY,
+            partition_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
             partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
@@ -167,7 +171,7 @@ impl SqliteMetastore {
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            UNIQUE(table_id, partition_value)
+            PRIMARY KEY (partition_id, table_id, partition_column, partition_value)
         )
     ";
 }
@@ -263,11 +267,12 @@ impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         // Create database file if it doesn't exist
         let db_path = self.db_path();
-        let db_dir = Path::new(db_path)
-            .parent()
-            .ok_or_else(|| CatalogError::InvalidOperation {
-                message: "Invalid database path".to_string(),
-            })?;
+        let db_dir =
+            Path::new(db_path)
+                .parent()
+                .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                    path: db_path.to_string(),
+                })?;
 
         if !db_dir.exists() {
             tokio::fs::create_dir_all(db_dir).await?;

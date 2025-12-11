@@ -116,10 +116,14 @@ impl<'a> DeletionVectorWriter<'a> {
             }
 
             if spec.row_ids.iter().any(|row_id| *row_id < 0) {
-                return Err(CatalogError::InvalidOperation {
-                    message: format!(
-                        "Deletion vectors require non-negative row IDs, table: {}",
-                        self.table.table_name
+                return Err(CatalogError::NegativeRowId {
+                    row_ids: format!(
+                        "{:?}",
+                        spec.row_ids
+                            .iter()
+                            .filter(|row_id| **row_id < 0)
+                            .cloned()
+                            .collect::<Vec<_>>()
                     ),
                 });
             }
@@ -184,7 +188,8 @@ fn build_deletion_batch(schema: &SchemaRef, row_ids: &[i64]) -> CatalogResult<Re
         ],
     )
     .map_err(|err| CatalogError::InvalidOperation {
-        message: format!("Failed to build deletion-vector batch: {err}"),
+        message: format!("Failed to build deletion-vector batch."),
+        source: Box::new(err),
     })
 }
 
@@ -204,18 +209,21 @@ async fn write_deletion_file(
             .map_err(|source| CatalogError::IoError { source })?;
         let mut writer = FileWriter::try_new(file, &schema_for_write).map_err(|err| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to initialize deletion vector writer: {err}"),
+                message: format!("Failed to initialize deletion vector writer."),
+                source: Box::new(err),
             }
         })?;
         writer
             .write(&batch_for_write)
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to write deletion vector batch: {err}"),
+                message: format!("Failed to write deletion vector batch."),
+                source: Box::new(err),
             })?;
         writer
             .finish()
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to finish deletion vector file: {err}"),
+                message: format!("Failed to finish deletion vector file."),
+                source: Box::new(err),
             })?;
 
         let metadata =
@@ -236,11 +244,13 @@ fn build_delete_file(
 ) -> CatalogResult<DeleteFile> {
     let delete_count_i64 =
         i64::try_from(delete_count).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion count overflow ({delete_count}): {err}"),
+            message: format!("Deletion count overflow ({delete_count})."),
+            source: Box::new(err),
         })?;
     let file_size_i64 =
         i64::try_from(file_size_bytes).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion vector file too large ({file_size_bytes} bytes): {err}"),
+            message: format!("Deletion vector file too large ({file_size_bytes} bytes)."),
+            source: Box::new(err),
         })?;
 
     Ok(DeleteFile {

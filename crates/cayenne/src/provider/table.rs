@@ -156,7 +156,8 @@ impl CayenneTableProvider {
 
         let table_url =
             ListingTableUrl::parse(&dir_url_str).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to parse table URL: {e}"),
+                message: format!("Failed to parse table URL."),
+                source: Box::new(e),
             })?;
 
         // Create a configured Vortex session with selected encodings
@@ -188,7 +189,8 @@ impl CayenneTableProvider {
 
         let listing_table =
             ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to create listing table: {e}"),
+                message: format!("Failed to create listing table."),
+                source: Box::new(e),
             })?;
 
         Ok(Arc::new(listing_table))
@@ -514,7 +516,8 @@ impl CayenneTableProvider {
                 }
                 Err(err) => {
                     return Err(CatalogError::InvalidOperation {
-                        message: format!("Failed to apply retention filters after insert: {err}"),
+                        message: format!("Failed to apply retention filters after insert."),
+                        source: Box::new(err),
                     });
                 }
             }
@@ -580,7 +583,8 @@ impl CayenneTableProvider {
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to read batch from stream: {e}"),
+                message: format!("Failed to read batch from stream."),
+                source: Box::new(e),
             })?;
 
             let batch_size = batch.get_array_memory_size();
@@ -590,7 +594,8 @@ impl CayenneTableProvider {
                 // Acquire semaphore permit before spawning write task
                 let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
                     CatalogError::InvalidOperation {
-                        message: format!("Failed to acquire write permit: {e}"),
+                        message: format!("Failed to acquire write permit."),
+                        source: Box::new(e),
                     }
                 })?;
 
@@ -619,7 +624,8 @@ impl CayenneTableProvider {
         if !current_chunk.is_empty() {
             let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
                 CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire write permit for final chunk: {e}"),
+                    message: format!("Failed to acquire write permit for final chunk."),
+                    source: Box::new(e),
                 }
             })?;
 
@@ -636,7 +642,8 @@ impl CayenneTableProvider {
         // Wait for all writes to complete and collect row counts
         while let Some(result) = write_tasks.join_next().await {
             let row_count = result.map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Write task panicked: {e}"),
+                message: format!("Write task panicked."),
+                source: Box::new(e),
             })??;
             total_rows += row_count;
         }
@@ -728,7 +735,8 @@ impl CayenneTableProvider {
         let sorted_stream =
             util::stream_utils::sort_stream(stream, &self.vortex_config.sort_columns, &task_ctx)
                 .map_err(|e| CatalogError::InvalidOperation {
-                    message: format!("Failed to execute sort: {e}"),
+                    message: format!("Failed to execute sort."),
+                    source: Box::new(e),
                 })?;
 
         Ok(sorted_stream)
@@ -770,7 +778,8 @@ impl CayenneTableProvider {
         let df = ctx
             .read_table(listing_table)
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to read listing table for sorting: {e}"),
+                message: format!("Failed to read listing table for sorting."),
+                source: Box::new(e),
             })?;
 
         // Get the data as a stream
@@ -778,7 +787,8 @@ impl CayenneTableProvider {
             .execute_stream()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to get stream from listing table: {e}"),
+                message: format!("Failed to get stream from listing table."),
+                source: Box::new(e),
             })?;
 
         // Sort the stream using our existing sort logic
@@ -888,13 +898,15 @@ impl CayenneTableProvider {
             .insert_into(&state, stream_exec, InsertOp::Append)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to create insert plan for chunk: {e}"),
+                message: format!("Failed to create insert plan for chunk."),
+                source: Box::new(e),
             })?;
 
         // Execute the insert plan
         collect(insert_plan, state.task_ctx()).await.map_err(|e| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to execute insert for chunk: {e}"),
+                message: format!("Failed to execute insert for chunk."),
+                source: Box::new(e),
             }
         })?;
 
@@ -924,7 +936,8 @@ impl CayenneTableProvider {
             sink.delete_from()
                 .await
                 .map_err(|err| CatalogError::InvalidOperation {
-                    message: format!("Failed to execute retention filters: {err}"),
+                    message: format!("Failed to execute retention filters."),
+                    source: err,
                 })?;
 
         // Refresh deletion cache after applying retention filters
@@ -981,8 +994,8 @@ impl CayenneTableProvider {
         // 3. Write deletion vector files
         // 4. Add delete file entries to catalog
         // 5. Return number of rows deleted
-        Err(CatalogError::InvalidOperation {
-            message: "Delete not yet implemented".to_string(),
+        Err(CatalogError::NotImplemented {
+            function: "delete_by_primary_key".to_string(),
         })
     }
 
@@ -1000,8 +1013,8 @@ impl CayenneTableProvider {
         // 1. Delete old rows using deletion vectors
         // 2. Insert new rows
         // 3. Return number of rows updated
-        Err(CatalogError::InvalidOperation {
-            message: "Update not yet implemented".to_string(),
+        Err(CatalogError::NotImplemented {
+            function: "update_by_primary_key".to_string(),
         })
     }
 
@@ -1084,7 +1097,8 @@ impl CayenneTableProvider {
             .get_table_delete_files(table_id)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to load deletion vectors from catalog: {e}"),
+                message: format!("Failed to load deletion vectors from catalog."),
+                source: Box::new(e),
             })?;
 
         if delete_files.is_empty() {
@@ -1095,19 +1109,20 @@ impl CayenneTableProvider {
         let deleted_row_ids = task::spawn_blocking(move || read_deletion_vectors(delete_files))
             .await
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Deletion vector reader task panicked or was cancelled: {err}"),
+                message: format!("Deletion vector reader task panicked or was cancelled."),
+                source: Box::new(err),
             })
             .and_then(|result| {
                 result.map_err(|err| CatalogError::InvalidOperation {
-                    message: format!("Failed to read deletion vectors: {err}"),
+                    message: format!("Failed to read deletion vectors."),
+                    source: Box::new(err),
                 })
             })?;
 
         tracing::debug!(
-            "Cached {} deletion vectors ({} deleted rows) for table_id {}",
+            "Cached {} deletion vectors ({} deleted rows) for table_id {table_id}",
             deleted_row_ids.len(),
             deleted_row_ids.len(),
-            table_id
         );
 
         Ok(deleted_row_ids)
