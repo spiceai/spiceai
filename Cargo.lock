@@ -13136,6 +13136,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmcp",
+ "rstest 0.26.1",
  "runtime-acceleration",
  "runtime-async",
  "runtime-auth",

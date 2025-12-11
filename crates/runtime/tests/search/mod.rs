@@ -31,13 +31,6 @@ limitations under the License.
 //!
 //! All tests are run only with the `extended_tests` feature flag.
 
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    sync::{Arc, LazyLock},
-};
-
 use anyhow::Context;
 use app::{App, AppBuilder};
 use arrow::array::RecordBatch;
@@ -46,14 +39,22 @@ use http::{
     HeaderValue,
     header::{ACCEPT, CONTENT_TYPE},
 };
-use itertools::Itertools;
 use reqwest::header::HeaderMap;
+use rstest::rstest;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spicepod::{
-    acceleration::Acceleration, component::embeddings::Embeddings, param::ParamValue,
-    semantic::Column, vector::VectorStore,
+    acceleration::{Acceleration, Mode},
+    component::embeddings::Embeddings,
+    param::ParamValue,
+    vector::VectorStore,
+};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    fmt::{self, Display},
+    sync::Arc,
 };
 
 use super::models::sort_json_keys;
@@ -67,6 +68,7 @@ use crate::{
     utils::{init_tracing_with_task_history, runtime_ready_check, test_request_context},
 };
 
+pub mod megascience;
 mod s3_vectors;
 mod tables;
 
@@ -99,179 +101,208 @@ pub struct SearchTestCase {
     pub skip: bool,
 }
 
-// The spicepod fields important in testing search
-pub struct SearchSpicepodConfiguration {
-    acceleration: Acceleration,
-    vector: Option<VectorStore>,
-    table_component: SearchTable,
-    columns: Vec<Column>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccelerationOptions {
+    NoAcceleration,
+    Arrow,
+    DuckDb,
+    DuckDbFile,
+    Cayenne,
 }
 
-static TABLE_ACCELERATION_OPTIONS: LazyLock<HashMap<String, Acceleration>> = LazyLock::new(|| {
-    serde_yaml::from_str(include_str!("acceleration.yaml"))
-        .expect("Failed to parse 'acceleration.yaml' configurations")
-});
-
-static TABLE_VECTOR_STORE_OPTIONS: LazyLock<HashMap<String, VectorStore>> = LazyLock::new(|| {
-    serde_yaml::from_str(include_str!("vector_store.yaml"))
-        .expect("Failed to parse 'vector_store.yaml' configurations")
-});
-
-static EMBEDDING_MODEL_OPTIONS: LazyLock<Vec<Embeddings>> = LazyLock::new(|| {
-    // HashMap<String, Vec<Embeddings>> is used, but only `embeddings` key is expected
-    //  Intended to match spicepod.yaml semantics.
-    let yaml_format: HashMap<String, Vec<Embeddings>> =
-        serde_yaml::from_str(include_str!("embeddings.yaml"))
-            .expect("Failed to parse 'embeddings.yaml' configurations");
-
-    yaml_format.get("embeddings").cloned().unwrap_or_default()
-});
-
-static MEGA_SCIENCE_COLUMN_CONFIGS: LazyLock<HashMap<String, Vec<Column>>> = LazyLock::new(|| {
-    serde_yaml::from_str(include_str!("megascience/columns.yaml"))
-        .expect("Failed to parse 'mega_science/columns.yaml' column configurations")
-});
-
-static MEGA_SCIENCE_TABLES: LazyLock<HashMap<String, SearchTable>> = LazyLock::new(|| {
-    serde_yaml::from_str(include_str!("megascience/tables.yaml"))
-        .expect("Failed to parse 'mega_science/tables.yaml' column configurations")
-});
-
-static MEGA_SCIENCE_TESTS: LazyLock<Vec<SearchTestCase>> = LazyLock::new(|| {
-    serde_yaml::from_str(include_str!("megascience/tests.yaml"))
-        .expect("Failed to parse 'mega_science/tests.yaml' test cases")
-});
-
-impl SearchSpicepodConfiguration {
-    pub(super) fn from_str(
-        id: &str,
-        column_configs: &HashMap<String, Vec<Column>>,
-        search_tables: &HashMap<String, SearchTable>,
-    ) -> Result<Self, anyhow::Error> {
-        let Some([engine, vector, table_component, column_configuration]) =
-            id.split('-').collect_array()
-        else {
-            return Err(anyhow::anyhow!("Invalid search spicepod slug: '{id}'."));
+impl fmt::Display for AccelerationOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            AccelerationOptions::NoAcceleration => "no_acceleration",
+            AccelerationOptions::Arrow => "arrow",
+            AccelerationOptions::DuckDb => "duckdb",
+            AccelerationOptions::DuckDbFile => "duckdb_file",
+            AccelerationOptions::Cayenne => "cayenne",
         };
-        let Some(acceleration) = TABLE_ACCELERATION_OPTIONS.get(engine).cloned() else {
-            return Err(anyhow::anyhow!(
-                "Invalid acceleration option '{engine}' in search spicepod slug."
-            ));
-        };
-
-        let Some(mut vector_store) = TABLE_VECTOR_STORE_OPTIONS.get(vector).cloned() else {
-            return Err(anyhow::anyhow!(
-                "Invalid vector store option '{vector}' in search spicepod slug."
-            ));
-        };
-
-        let Some(search_table) = search_tables.get(table_component) else {
-            return Err(anyhow::anyhow!(
-                "Invalid table component option '{table_component}' in search spicepod slug."
-            ));
-        };
-
-        // Update vector store params with dynamic values as needed.
-        if vector_store.engine.as_deref() == Some("s3_vectors")
-            && let Some(params) = vector_store.params.as_mut()
-        {
-            params.data.insert(
-                "s3_vectors_index".to_string(),
-                ParamValue::String(format!(
-                    "{engine}-{}-{}-{}",
-                    table_component.replace('_', "-"),
-                    column_configuration.replace('_', "-"),
-                    rand::random::<u8>() % 11
-                )),
-            );
-        }
-
-        let Some(columns) = column_configs.get(column_configuration).cloned() else {
-            return Err(anyhow::anyhow!(
-                "Invalid column configuration field '{column_configuration}' in search spicepod slug."
-            ));
-        };
-
-        Ok(SearchSpicepodConfiguration {
-            acceleration,
-            vector: Some(vector_store),
-            table_component: search_table.clone(),
-            columns,
-        })
+        write!(f, "{s}")
     }
+}
 
-    pub fn embedding_models_used(
-        &self,
-        models_available: &[Embeddings],
-    ) -> Result<Vec<Embeddings>, anyhow::Error> {
-        let mut embedding_names = HashSet::new();
+impl AccelerationOptions {
+    fn to_acceleration(&self) -> Acceleration {
+        match self {
+            AccelerationOptions::NoAcceleration => Acceleration {
+                enabled: false,
+                ..Default::default()
+            },
+            AccelerationOptions::Arrow => Acceleration {
+                enabled: true,
+                engine: Some("arrow".to_string()),
+                ..Default::default()
+            },
+            AccelerationOptions::DuckDb => Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                ..Default::default()
+            },
+            AccelerationOptions::DuckDbFile => Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::File,
+                ..Default::default()
+            },
+            AccelerationOptions::Cayenne => Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::File,
+                ..Default::default()
+            },
+        }
+    }
+}
 
-        for col in &self.columns {
-            for clec in &col.embeddings {
-                embedding_names.insert(clec.model.clone());
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VectorEngineOptions {
+    NoVectorEngine,
+    S3Vectors,
+}
+
+impl fmt::Display for VectorEngineOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            VectorEngineOptions::NoVectorEngine => "no_vector_engine",
+            VectorEngineOptions::S3Vectors => "s3_vectors",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl VectorEngineOptions {
+    fn to_vector_store(&self) -> VectorStore {
+        match self {
+            VectorEngineOptions::NoVectorEngine => VectorStore {
+                enabled: false,
+                ..Default::default()
+            },
+            VectorEngineOptions::S3Vectors => VectorStore {
+                enabled: true,
+                engine: Some("s3_vectors".to_string()),
+                params: Some(spicepod::param::Params::from_string_map(HashMap::from([
+                    ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
+                    (
+                        "s3_vectors_bucket".to_string(),
+                        "spice-ci-tests-s3-vectors".to_string(),
+                    ),
+                    (
+                        "s3_vectors_aws_access_key_id".to_string(),
+                        "${ env:AWS_S3_VECTORS_KEY }".to_string(),
+                    ),
+                    (
+                        "s3_vectors_aws_secret_access_key".to_string(),
+                        "${ env:AWS_S3_VECTORS_SECRET }".to_string(),
+                    ),
+                ]))),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+enum EmbeddingModels {
+    OpenAI,
+    Model2Vec,
+}
+
+impl EmbeddingModels {
+    fn all() -> Vec<Self> {
+        vec![EmbeddingModels::OpenAI, EmbeddingModels::Model2Vec]
+    }
+    fn to_app_embedding(&self) -> Embeddings {
+        match self {
+            EmbeddingModels::OpenAI => {
+                Embeddings::new("openai:text-embedding-3-small", "openai_embeddings").with_params(
+                    HashMap::from([(
+                        "openai_api_key".to_string(),
+                        Value::String("${ secrets:SPICE_OPENAI_API_KEY }".to_string()),
+                    )]),
+                )
+            }
+            EmbeddingModels::Model2Vec => {
+                Embeddings::new("model2vec:minishlab/potion-base-2M", "hf_minilm")
             }
         }
-        embedding_names
-            .iter()
-            .map(|name| {
-                let Some(model) = models_available.iter().find(|m| m.name == *name) else {
-                    return Err(anyhow::anyhow!(
-                        "Embedding model '{name}' not found among available models."
-                    ));
-                };
-                Ok(model.clone())
-            })
-            .collect()
     }
 }
 
-macro_rules! generate_search_tests {
-    ([$($slug:expr),* $(,)?]) => {
-        paste::paste! {
-            $(
-                #[tokio::test]
-                #[cfg_attr(
-                    not(feature = "extended_tests"),
-                    ignore = "Extended test - run with --features extended_tests"
-                )]
-                #[expect(non_snake_case)]
-                async fn [<test_search_ $slug:snake>]() {
-                    megascience_search_test_case($slug).await;
-                }
-            )*
-        }
-    };
-}
+#[rstest]
+#[tokio::test]
+async fn test_megascience_permutations(
+    #[values(VectorEngineOptions::NoVectorEngine)] vector_engine: VectorEngineOptions,
+    #[values(
+        AccelerationOptions::NoAcceleration,
+        AccelerationOptions::Arrow,
+        AccelerationOptions::DuckDb
+    )]
+    acceleration_opt: AccelerationOptions,
+    #[values(
+        megascience::TableOptions::Dataset,
+        megascience::TableOptions::ViewUnionAllJoin
+    )]
+    table_option: megascience::TableOptions,
 
-async fn megascience_search_test_case(slug: &'static str) {
+    #[values(
+        megascience::ColumnConfigOptions::Basic,
+        megascience::ColumnConfigOptions::MultiColumn,
+        megascience::ColumnConfigOptions::HybridSingleColumn,
+        megascience::ColumnConfigOptions::HybridMultipleColumn,
+        megascience::ColumnConfigOptions::TextSearch,
+        megascience::ColumnConfigOptions::MultiTextColumn,
+        megascience::ColumnConfigOptions::TextSearchMetadata,
+        megascience::ColumnConfigOptions::MultiEmbeddings
+    )]
+    column_config: megascience::ColumnConfigOptions,
+) {
+    let slug =
+        format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
+    let columns = column_config.to_columns();
+    let acceleration = acceleration_opt.to_acceleration();
+
     let mut app = AppBuilder::new(slug);
-    let cfg = SearchSpicepodConfiguration::from_str(
-        slug,
-        &MEGA_SCIENCE_COLUMN_CONFIGS,
-        &MEGA_SCIENCE_TABLES,
-    )
-    .expect("could not initialise configuration");
+    let (views, datasets) = table_option.to_tables();
 
-    for emb in cfg
-        .embedding_models_used(&EMBEDDING_MODEL_OPTIONS)
-        .expect("could not find embedding models")
+    // Prepare vector store for AWS tests if needed.
+    let mut vector_store = vector_engine.to_vector_store();
+    prepare_for_aws_tests(&vector_store, vector_store.enabled)
+        .await
+        .expect("could not prepare vector store for tests");
+
+    // Update vector store params with dynamic values as needed.
+    if vector_store.engine.as_deref() == Some("s3_vectors")
+        && let Some(params) = vector_store.params.as_mut()
     {
-        app = app.with_embedding(emb);
+        params.data.insert(
+            "s3_vectors_index".to_string(),
+            ParamValue::String(format!(
+                "{}-{}-{}-{}",
+                acceleration_opt,
+                table_option.to_string().replace('_', "-"),
+                column_config.to_string().replace('_', "-"),
+                rand::random::<u8>() % 11
+            )),
+        );
     }
-    let SearchSpicepodConfiguration {
+
+    let (views, datasets) = enrich_table(
+        SearchTable {
+            table_name: table_option.table_to_search_on().to_string(),
+            datasets,
+            views,
+        },
         columns,
-        acceleration,
-        table_component,
-        vector,
-    } = cfg;
+        Some(vector_store),
+        &acceleration,
+    );
 
-    if let Some(v) = vector.as_ref() {
-        prepare_for_aws_tests(v, v.enabled)
-            .await
-            .expect("could not prepare vector store for tests");
+    for model in EmbeddingModels::all() {
+        app = app.with_embedding(model.to_app_embedding());
     }
-
-    let (views, datasets) = enrich_table(table_component, columns, vector, &acceleration);
 
     for ds in datasets {
         app = app.with_dataset(ds);
@@ -281,9 +312,20 @@ async fn megascience_search_test_case(slug: &'static str) {
         app = app.with_view(v);
     }
 
-    run_search(app.build(), MEGA_SCIENCE_TESTS.clone())
-        .await
-        .expect("failed to run search tests");
+    run_search(
+        app.build(),
+        megascience::TestCases::all()
+            .into_iter()
+            .map(|tc| SearchTestCase {
+                name: format!("{tc}"),
+                body: tc.to_input(),
+                should_fail: false,
+                skip: false,
+            })
+            .collect(),
+    )
+    .await
+    .expect("failed to run search tests");
 }
 
 async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
@@ -328,7 +370,7 @@ pub async fn run_search_test(
 
         let err = resp.err().context("Test was expected to fail")?;
         insta::assert_snapshot!(
-            format!("{app_name}_megascience_{}_error_response", ts.name),
+            format!("{app_name}_{}_error_response", ts.name),
             err.to_string()
         );
         return Ok(());
@@ -336,7 +378,7 @@ pub async fn run_search_test(
 
     let resp = serde_json::from_str(&resp?).context("Failed to parse HTTP response")?;
     insta::assert_snapshot!(
-        format!("{}_megascience_{}_response", app_name, ts.name),
+        format!("{app_name}_{}_response", ts.name),
         normalize_search_response(resp)
     );
 
@@ -469,7 +511,7 @@ pub(crate) async fn run_search(
 
                             let err = resp.err().context("Test was expected to fail")?;
                             insta::assert_snapshot!(
-                                format!("{app_name}_megascience_{test_name}_error_response"),
+                                format!("{app_name}_{test_name}_error_response"),
                                 err.to_string()
                             );
                             continue;
@@ -488,7 +530,7 @@ pub(crate) async fn run_search(
                         insta::with_settings!({
                             omit_expression => true,
                             description => sql
-                        }, {insta::assert_snapshot!(format!("{app_name}_megascience_{test_name}_explain"), disp)});
+                        }, {insta::assert_snapshot!(format!("{app_name}_{test_name}_explain"), disp)});
                     }
                 }
             }
@@ -496,7 +538,3 @@ pub(crate) async fn run_search(
         })
         .await
 }
-
-// Test patterns are expanded at build time by `build.rs` (see `build_search_test_cases`).
-// Requires the existance of `generate_search_tests` macro wherever it is included.
-include!("generated_search_tests.rs");

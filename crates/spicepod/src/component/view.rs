@@ -83,6 +83,16 @@ impl View {
         }
     }
 
+    pub fn with_acceleration(mut self, acceleration: Acceleration) -> Self {
+        self.acceleration = Some(acceleration);
+        self
+    }
+
+    pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
+        self.sql = Some(sql.into());
+        self
+    }
+
     #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();

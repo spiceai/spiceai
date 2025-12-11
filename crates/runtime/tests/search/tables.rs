@@ -25,9 +25,9 @@ use spicepod::{
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct SearchTable {
     // The name of the table (either dataset or view) to test search queries against.
-    table_name: &'static str,
-    datasets: Vec<Dataset>,
-    views: Vec<View>,
+    pub table_name: String,
+    pub datasets: Vec<Dataset>,
+    pub views: Vec<View>,
 }
 
 // Enrich the `table_name` [`View`]/[`Dataset`] in the `SearchTable` with the given columns and acceleration.
