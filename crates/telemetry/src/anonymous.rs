@@ -73,15 +73,15 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
             KeyValue::new("spicepod.id", spicepod_id),
             KeyValue::new(
                 "host.cpu.count",
-                i64::try_from(hardware_info.vcpu_count).unwrap_or(0),
+                i64::try_from(hardware_info.vcpu_count).unwrap_or(i64::MAX),
             ),
             KeyValue::new(
                 "host.gpu.count",
-                i64::try_from(hardware_info.gpu_count).unwrap_or(0),
+                i64::try_from(hardware_info.gpu_count).unwrap_or(i64::MAX),
             ),
             KeyValue::new(
                 "host.memory.bytes",
-                i64::try_from(hardware_info.total_memory_bytes).unwrap_or(0),
+                i64::try_from(hardware_info.total_memory_bytes).unwrap_or(i64::MAX),
             ),
         ]))
         .build()
