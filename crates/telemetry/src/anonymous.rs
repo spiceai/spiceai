@@ -42,7 +42,7 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 /// How often to send telemetry data to the endpoint
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
 
-fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
+async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
@@ -58,8 +58,11 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
-    // Detect hardware info (vCPUs, GPUs, and memory)
-    let hardware_info = HardwareInfo::detect();
+    // Detect hardware info (vCPUs, GPUs, and memory) using async version
+    // to avoid blocking the async runtime
+    let hardware_info = HardwareInfo::detect_async()
+        .await
+        .unwrap_or_else(|_| HardwareInfo::detect());
 
     Resource::builder_empty()
         .with_attributes(telemetry_properties.into_iter().chain(vec![
@@ -85,7 +88,7 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
 }
 
 pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
-    let resource = resource(spicepod_name, telemetry_properties);
+    let resource = resource(spicepod_name, telemetry_properties).await;
 
     let Ok(exporter) = TelemetryExporterBuilder::new()
         .with_endpoint(Arc::clone(&ENDPOINT))

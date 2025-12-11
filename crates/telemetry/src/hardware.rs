@@ -68,8 +68,9 @@ impl HardwareInfo {
     /// For containerized deployments, this attempts to detect container resource limits
     /// from cgroup v1/v2 before falling back to host system values.
     ///
-    /// This function is designed to be fast and should not significantly impact
-    /// runtime startup time.
+    /// This function performs blocking I/O operations (filesystem reads) and should
+    /// only be called from synchronous contexts. For async contexts, use
+    /// [`detect_async`](Self::detect_async) instead.
     #[must_use]
     pub fn detect() -> Self {
         let vcpu_count = detect_vcpu_count();
@@ -81,6 +82,20 @@ impl HardwareInfo {
             gpu_count,
             total_memory_bytes,
         }
+    }
+
+    /// Async version of [`detect`](Self::detect) that runs hardware detection
+    /// in a blocking thread pool.
+    ///
+    /// This should be used when calling from async contexts to avoid blocking
+    /// the async runtime. The actual detection is offloaded to a blocking thread
+    /// via `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task fails to execute (e.g., runtime shutdown).
+    pub async fn detect_async() -> Result<Self, tokio::task::JoinError> {
+        tokio::task::spawn_blocking(Self::detect).await
     }
 
     /// Logs the detected hardware information at debug level.
