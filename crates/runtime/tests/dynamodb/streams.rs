@@ -153,13 +153,11 @@ fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
 
 async fn insert_rows(client: &Client, table_name: &str, range: Range<usize>) {
     for i in range {
-        let id = format!("id-{}", i);
-
         client
             .put_item()
             .table_name(table_name)
-            .item("id", AttributeValue::S(id))
-            .item("name", AttributeValue::S(format!("Item {}", i)))
+            .item("id", AttributeValue::S(format!("id-{i}")))
+            .item("name", AttributeValue::S(format!("Item {i}")))
             .item("version", AttributeValue::N(i.to_string()))
             .send()
             .await
@@ -181,7 +179,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
         .scope(async {
             let running_container = start_dynamodb_docker_container(PORT).await?;
 
-            let client = get_client(PORT, &access_key, &secret_key);
+            let client = get_client(PORT, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, "test_table", 0..5).await;
@@ -191,8 +189,8 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset(
                     table_name,
                     PORT,
-                    &access_key,
-                    &secret_key,
+                    access_key,
+                    secret_key,
                     true,
                 ))
                 .with_results_cache(ResultsCache {
@@ -202,7 +200,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
                 .build();
 
             configure_test_datafusion();
-            let mut rt = Runtime::builder().with_app(app).build().await;
+            let rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
