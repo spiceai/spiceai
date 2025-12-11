@@ -9,7 +9,6 @@ fn main() {
 /// Function to programmatically generate all permutations of search test cases defined in [`crates/runtime/tests/search`].
 ///
 /// Cannot have any dependencies on [`crates/runtime/tests/search`] since this is built prior. Although search tests allow for the arbitrary defining of new test datasets, this currently just loads [`tests/search/megascience/`].
-#[expect(clippy::expect_used)] // Build script expects certain files to be present.
 fn build_search_test_cases() {
     println!("cargo:rerun-if-changed=build.rs");
     let dest_path = Path::new("tests/search/").join("generated_search_tests.rs");
