@@ -99,7 +99,7 @@ impl TursoMetastore {
     /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id BIGINT NOT NULL,
+            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_uuid TEXT NOT NULL,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -116,9 +116,8 @@ impl TursoMetastore {
     /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
-            data_file_id BIGINT NOT NULL,
+            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -131,8 +130,8 @@ impl TursoMetastore {
     /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
+            partition_id INTEGER NOT NULL,
+            table_id INTEGER NOT NULL,
             partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
             path TEXT NOT NULL,

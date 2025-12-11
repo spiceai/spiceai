@@ -470,15 +470,14 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
-                    table_id, data_file_id, path, path_is_relative,
+                    table_id, path, path_is_relative,
                     format, delete_count, file_size_bytes
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                    ?1, ?2, ?3, ?4, ?5, ?6
                 )
             ",
                 params: vec![
                     MetastoreValue::Integer(delete_file.table_id),
-                    MetastoreValue::Integer(delete_file.data_file_id),
                     MetastoreValue::Text(delete_file.path.clone()),
                     MetastoreValue::Bool(delete_file.path_is_relative),
                     MetastoreValue::Text(delete_file.format.clone()),
@@ -499,13 +498,12 @@ impl MetadataCatalog for CayenneCatalog {
                     sql: r"
                     SELECT delete_file_id
                     FROM cayenne_delete_file
-                    WHERE table_id = ?1 AND data_file_id = ?2 AND path = ?3
+                    WHERE table_id = ?1 AND path = ?2
                     ORDER BY delete_file_id DESC
                     LIMIT 1
                 ",
                     params: vec![
                         MetastoreValue::Integer(delete_file.table_id),
-                        MetastoreValue::Integer(delete_file.data_file_id),
                         MetastoreValue::Text(delete_file.path.clone()),
                     ],
                 },
@@ -523,7 +521,7 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT delete_file_id, table_id, data_file_id, path, path_is_relative, 
+                    sql: "SELECT delete_file_id, table_id, path, path_is_relative, 
                         format, delete_count, file_size_bytes 
                  FROM cayenne_delete_file 
                  WHERE table_id = ?1",
@@ -533,7 +531,6 @@ impl MetadataCatalog for CayenneCatalog {
                     Ok(DeleteFile {
                         delete_file_id: row.get_i64(0)?,
                         table_id: row.get_i64(1)?,
-                        data_file_id: row.get_i64(2)?,
                         path: row.get_string(3)?,
                         path_is_relative: row.get_bool(4)?,
                         format: row.get_string(5)?,
@@ -831,7 +828,6 @@ mod tests {
         catalog.init().await.expect("Failed to initialize catalog");
 
         let table_id = 1;
-        let data_file_id = 1;
 
         // Spawn multiple tasks that all try to create delete files concurrently
         let mut handles = vec![];
@@ -842,7 +838,6 @@ mod tests {
                 let delete_file = DeleteFile {
                     delete_file_id: 0, // Will be assigned by catalog
                     table_id,
-                    data_file_id,
                     path: format!("/tmp/delete_file_{i}.parquet"),
                     path_is_relative: false,
                     format: "parquet".to_string(),

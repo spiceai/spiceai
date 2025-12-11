@@ -105,9 +105,11 @@ impl SqliteMetastore {
     }
 
     /// Schema for the `cayenne_table` table.
+    /// Using INTEGER for AUTOINCREMENT is required
+    /// It is unlikely someone will have more than `9223372036854775807` tables (SQLite INTEGER max)
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id BIGINT PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_uuid TEXT NOT NULL,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -123,9 +125,8 @@ impl SqliteMetastore {
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id BIGINT PRIMARY KEY AUTOINCREMENT,
-            table_id BIGINT NOT NULL,
-            data_file_id BIGINT NOT NULL,
+            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -138,8 +139,8 @@ impl SqliteMetastore {
     /// Composite primary key on (`partition_id`, `table_id`, `partition_column`, `partition_value`).
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
+            partition_id INTEGER NOT NULL,
+            table_id INTEGER NOT NULL,
             partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
             path TEXT NOT NULL,

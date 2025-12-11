@@ -83,8 +83,6 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
-    /// Data file this delete file applies to
-    pub data_file_id: i64,
     /// Path to the delete file (Parquet format)
     pub path: String,
     /// Whether the path is relative
