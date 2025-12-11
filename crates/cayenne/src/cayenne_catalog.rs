@@ -531,11 +531,11 @@ impl MetadataCatalog for CayenneCatalog {
                     Ok(DeleteFile {
                         delete_file_id: row.get_i64(0)?,
                         table_id: row.get_i64(1)?,
-                        path: row.get_string(3)?,
-                        path_is_relative: row.get_bool(4)?,
-                        format: row.get_string(5)?,
-                        delete_count: row.get_i64(6)?,
-                        file_size_bytes: row.get_i64(7)?,
+                        path: row.get_string(2)?,
+                        path_is_relative: row.get_bool(3)?,
+                        format: row.get_string(4)?,
+                        delete_count: row.get_i64(5)?,
+                        file_size_bytes: row.get_i64(6)?,
                     })
                 },
             )
