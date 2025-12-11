@@ -106,7 +106,7 @@ impl SqliteMetastore {
 
     /// Schema for the `cayenne_table` table.
     /// Using INTEGER for AUTOINCREMENT is required
-    /// It is unlikely someone will have more than `9223372036854775807` tables (SQLite INTEGER max)
+    /// It is unlikely someone will have more than `9223372036854775807` tables (`SQLite` INTEGER max)
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
             table_id INTEGER PRIMARY KEY AUTOINCREMENT,
