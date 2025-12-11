@@ -25,7 +25,7 @@ use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Result as DFResult, ScalarValue};
+use datafusion::common::{Constraints, DFSchema, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::file_format::{
@@ -1057,7 +1057,7 @@ pub trait ListingTableConnector: DataConnector {
             if let Some(field) = idents.remove(name) {
                 let types_match = match (partition_type, field.data_type()) {
                     (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View) => true,
-                    (pt, ft) => pt == ft,
+                    (pt, ft) => DFSchema::datatype_is_semantically_equal(pt, ft),
                 };
 
                 if !types_match {
