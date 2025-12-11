@@ -114,7 +114,7 @@ static TABLE_ACCELERATION_OPTIONS: LazyLock<HashMap<String, Acceleration>> = Laz
 
 static TABLE_VECTOR_STORE_OPTIONS: LazyLock<HashMap<String, VectorStore>> = LazyLock::new(|| {
     serde_yaml::from_str(include_str!("vector_store.yaml"))
-        .expect("Failed to parse 'acceleration.yaml' configurations")
+        .expect("Failed to parse 'vector_store.yaml' configurations")
 });
 
 static EMBEDDING_MODEL_OPTIONS: LazyLock<Vec<Embeddings>> = LazyLock::new(|| {
@@ -122,7 +122,7 @@ static EMBEDDING_MODEL_OPTIONS: LazyLock<Vec<Embeddings>> = LazyLock::new(|| {
     //  Intended to match spicepod.yaml semantics.
     let yaml_format: HashMap<String, Vec<Embeddings>> =
         serde_yaml::from_str(include_str!("embeddings.yaml"))
-            .expect("Failed to parse 'acceleration.yaml' configurations");
+            .expect("Failed to parse 'embeddings.yaml' configurations");
 
     yaml_format.get("embeddings").cloned().unwrap_or_default()
 });
@@ -155,19 +155,19 @@ impl SearchSpicepodConfiguration {
         };
         let Some(acceleration) = TABLE_ACCELERATION_OPTIONS.get(engine).cloned() else {
             return Err(anyhow::anyhow!(
-                "Invalid acceleration option '{column_configuration}' in search spicepod slug."
+                "Invalid acceleration option '{engine}' in search spicepod slug."
             ));
         };
 
         let Some(mut vector_store) = TABLE_VECTOR_STORE_OPTIONS.get(vector).cloned() else {
             return Err(anyhow::anyhow!(
-                "Invalid acceleration option '{column_configuration}' in search spicepod slug."
+                "Invalid vector store option '{vector}' in search spicepod slug."
             ));
         };
 
         let Some(search_table) = search_tables.get(table_component) else {
             return Err(anyhow::anyhow!(
-                "Invalid acceleration option '{column_configuration}' in search spicepod slug."
+                "Invalid table component option '{table_component}' in search spicepod slug."
             ));
         };
 
