@@ -160,7 +160,7 @@ impl SqliteMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
-    /// Composite primary key on (partition_id, table_id, partition_column, partition_value).
+    /// Composite primary key on (`partition_id`, `table_id`, `partition_column`, `partition_value`).
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id BIGINT NOT NULL,

@@ -196,7 +196,7 @@ impl CayenneCatalog {
                 })
                 .await
                 .map_err(|e| CatalogError::InvalidOperation {
-                    message: format!("Catalog shutdown task panicked."),
+                    message: "Catalog shutdown task panicked.".to_string(),
                     source: Box::new(e),
                 })??;
             }
@@ -237,7 +237,6 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<i64> {
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
@@ -269,7 +268,7 @@ impl MetadataCatalog for CayenneCatalog {
                     .try_into()
                     .map_err(
                         |e: arrow_schema::ArrowError| CatalogError::InvalidOperation {
-                            message: format!("Failed to serialize schema."),
+                            message: "Failed to serialize schema.".to_string(),
                             source: Box::new(e),
                         },
                     )?;
@@ -286,7 +285,7 @@ impl MetadataCatalog for CayenneCatalog {
         } else {
             Some(serde_json::to_string(&options.primary_key).map_err(|e| {
                 CatalogError::InvalidOperation {
-                    message: format!("Failed to serialize primary key."),
+                    message: "Failed to serialize primary key.".to_string(),
                     source: Box::new(e),
                 }
             })?)
@@ -303,7 +302,7 @@ impl MetadataCatalog for CayenneCatalog {
         // Serialize Vortex config to JSON
         let vortex_config_json = serde_json::to_string(&options.vortex_config).map_err(|e| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to serialize vortex config."),
+                message: "Failed to serialize vortex config.".to_string(),
                 source: Box::new(e),
             }
         })?;
@@ -415,7 +414,7 @@ impl MetadataCatalog for CayenneCatalog {
                     let primary_key = if let Some(pk_json) = primary_key_json {
                         serde_json::from_str(&pk_json).map_err(|e| {
                             CatalogError::InvalidOperation {
-                                message: format!("Failed to deserialize primary key"),
+                                message: "Failed to deserialize primary key".to_string(),
                                 source: Box::new(e),
                             }
                         })?
@@ -427,7 +426,7 @@ impl MetadataCatalog for CayenneCatalog {
                     let vortex_config = if let Some(config_json) = vortex_config_json {
                         serde_json::from_str(&config_json).map_err(|e| {
                             CatalogError::InvalidOperation {
-                                message: format!("Failed to deserialize vortex config."),
+                                message: "Failed to deserialize vortex config.".to_string(),
                                 source: Box::new(e),
                             }
                         })?
@@ -754,7 +753,7 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(None);
         } else if partitions.len() > 1 {
             return Err(CatalogError::InvalidPartitionCount {
-                table_id: table_id,
+                table_id,
                 partition_value: partition_value.to_string(),
             });
         }

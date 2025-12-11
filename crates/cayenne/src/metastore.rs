@@ -73,9 +73,9 @@ pub enum MetastoreValue {
 impl Display for MetastoreValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MetastoreValue::Integer(v) => write!(f, "integer {}", v),
-            MetastoreValue::Text(v) => write!(f, "text '{}'", v),
-            MetastoreValue::Bool(v) => write!(f, "bool {}", v),
+            MetastoreValue::Integer(v) => write!(f, "integer {v}"),
+            MetastoreValue::Text(v) => write!(f, "text '{v}'"),
+            MetastoreValue::Bool(v) => write!(f, "bool {v}"),
             MetastoreValue::Null => write!(f, "NULL"),
         }
     }

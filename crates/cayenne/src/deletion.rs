@@ -122,7 +122,7 @@ impl<'a> DeletionVectorWriter<'a> {
                         spec.row_ids
                             .iter()
                             .filter(|row_id| **row_id < 0)
-                            .cloned()
+                            .copied()
                             .collect::<Vec<_>>()
                     ),
                 });
@@ -188,7 +188,7 @@ fn build_deletion_batch(schema: &SchemaRef, row_ids: &[i64]) -> CatalogResult<Re
         ],
     )
     .map_err(|err| CatalogError::InvalidOperation {
-        message: format!("Failed to build deletion-vector batch."),
+        message: "Failed to build deletion-vector batch.".to_string(),
         source: Box::new(err),
     })
 }
@@ -209,20 +209,20 @@ async fn write_deletion_file(
             .map_err(|source| CatalogError::IoError { source })?;
         let mut writer = FileWriter::try_new(file, &schema_for_write).map_err(|err| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to initialize deletion vector writer."),
+                message: "Failed to initialize deletion vector writer.".to_string(),
                 source: Box::new(err),
             }
         })?;
         writer
             .write(&batch_for_write)
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to write deletion vector batch."),
+                message: "Failed to write deletion vector batch.".to_string(),
                 source: Box::new(err),
             })?;
         writer
             .finish()
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to finish deletion vector file."),
+                message: "Failed to finish deletion vector file.".to_string(),
                 source: Box::new(err),
             })?;
 

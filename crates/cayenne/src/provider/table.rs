@@ -156,7 +156,7 @@ impl CayenneTableProvider {
 
         let table_url =
             ListingTableUrl::parse(&dir_url_str).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to parse table URL."),
+                message: "Failed to parse table URL.".to_string(),
                 source: Box::new(e),
             })?;
 
@@ -189,7 +189,7 @@ impl CayenneTableProvider {
 
         let listing_table =
             ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to create listing table."),
+                message: "Failed to create listing table.".to_string(),
                 source: Box::new(e),
             })?;
 
@@ -516,7 +516,7 @@ impl CayenneTableProvider {
                 }
                 Err(err) => {
                     return Err(CatalogError::InvalidOperation {
-                        message: format!("Failed to apply retention filters after insert."),
+                        message: "Failed to apply retention filters after insert.".to_string(),
                         source: Box::new(err),
                     });
                 }
@@ -583,7 +583,7 @@ impl CayenneTableProvider {
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to read batch from stream."),
+                message: "Failed to read batch from stream.".to_string(),
                 source: Box::new(e),
             })?;
 
@@ -594,7 +594,7 @@ impl CayenneTableProvider {
                 // Acquire semaphore permit before spawning write task
                 let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
                     CatalogError::InvalidOperation {
-                        message: format!("Failed to acquire write permit."),
+                        message: "Failed to acquire write permit.".to_string(),
                         source: Box::new(e),
                     }
                 })?;
@@ -624,7 +624,7 @@ impl CayenneTableProvider {
         if !current_chunk.is_empty() {
             let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
                 CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire write permit for final chunk."),
+                    message: "Failed to acquire write permit for final chunk.".to_string(),
                     source: Box::new(e),
                 }
             })?;
@@ -642,7 +642,7 @@ impl CayenneTableProvider {
         // Wait for all writes to complete and collect row counts
         while let Some(result) = write_tasks.join_next().await {
             let row_count = result.map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Write task panicked."),
+                message: "Write task panicked.".to_string(),
                 source: Box::new(e),
             })??;
             total_rows += row_count;
@@ -735,7 +735,7 @@ impl CayenneTableProvider {
         let sorted_stream =
             util::stream_utils::sort_stream(stream, &self.vortex_config.sort_columns, &task_ctx)
                 .map_err(|e| CatalogError::InvalidOperation {
-                    message: format!("Failed to execute sort."),
+                    message: "Failed to execute sort.".to_string(),
                     source: Box::new(e),
                 })?;
 
@@ -778,7 +778,7 @@ impl CayenneTableProvider {
         let df = ctx
             .read_table(listing_table)
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to read listing table for sorting."),
+                message: "Failed to read listing table for sorting.".to_string(),
                 source: Box::new(e),
             })?;
 
@@ -787,7 +787,7 @@ impl CayenneTableProvider {
             .execute_stream()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to get stream from listing table."),
+                message: "Failed to get stream from listing table.".to_string(),
                 source: Box::new(e),
             })?;
 
@@ -898,14 +898,14 @@ impl CayenneTableProvider {
             .insert_into(&state, stream_exec, InsertOp::Append)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to create insert plan for chunk."),
+                message: "Failed to create insert plan for chunk.".to_string(),
                 source: Box::new(e),
             })?;
 
         // Execute the insert plan
         collect(insert_plan, state.task_ctx()).await.map_err(|e| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to execute insert for chunk."),
+                message: "Failed to execute insert for chunk.".to_string(),
                 source: Box::new(e),
             }
         })?;
@@ -936,7 +936,7 @@ impl CayenneTableProvider {
             sink.delete_from()
                 .await
                 .map_err(|err| CatalogError::InvalidOperation {
-                    message: format!("Failed to execute retention filters."),
+                    message: "Failed to execute retention filters.".to_string(),
                     source: err,
                 })?;
 
@@ -1097,7 +1097,7 @@ impl CayenneTableProvider {
             .get_table_delete_files(table_id)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to load deletion vectors from catalog."),
+                message: "Failed to load deletion vectors from catalog.".to_string(),
                 source: Box::new(e),
             })?;
 
@@ -1109,12 +1109,12 @@ impl CayenneTableProvider {
         let deleted_row_ids = task::spawn_blocking(move || read_deletion_vectors(delete_files))
             .await
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Deletion vector reader task panicked or was cancelled."),
+                message: "Deletion vector reader task panicked or was cancelled.".to_string(),
                 source: Box::new(err),
             })
             .and_then(|result| {
                 result.map_err(|err| CatalogError::InvalidOperation {
-                    message: format!("Failed to read deletion vectors."),
+                    message: "Failed to read deletion vectors.".to_string(),
                     source: Box::new(err),
                 })
             })?;

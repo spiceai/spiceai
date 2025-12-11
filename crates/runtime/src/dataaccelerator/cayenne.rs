@@ -117,6 +117,7 @@ fn is_vortex_supported_type(data_type: &DataType) -> bool {
             | DataType::FixedSizeList(_, _)
             | DataType::LargeList(_)
             | DataType::Struct(_)
+            | DataType::Time64(_)
     )
 }
 
