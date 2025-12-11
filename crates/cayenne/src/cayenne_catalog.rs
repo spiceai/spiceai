@@ -498,7 +498,7 @@ impl MetadataCatalog for CayenneCatalog {
                     source: Box::new(e),
                 })
             }
-            Ok(_) => {}
+            Ok(()) => {}
         }
 
         // Retrieve the assigned delete_file_id
@@ -608,8 +608,8 @@ impl MetadataCatalog for CayenneCatalog {
                     source: Box::new(e),
                 })
             }
-            Ok(_) => {}
-        };
+            Ok(()) => {}
+        }
 
         // Retrieve the assigned partition ID
         let partition_id: i64 = self.metastore
