@@ -68,6 +68,11 @@ struct KubernetesClient {
     namespace: Option<String>,
 }
 
+fn secret_url(namespace: &str, secret_name: &str) -> String {
+    let encoded_secret_name = utf8_percent_encode(secret_name, NON_ALPHANUMERIC);
+    format!("{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{encoded_secret_name}")
+}
+
 impl KubernetesClient {
     fn new() -> Self {
         Self {
@@ -124,10 +129,7 @@ impl KubernetesClient {
             return Err(Error::UnableToReadKubernetesCredentials {});
         };
 
-        let encoded_secret_name = utf8_percent_encode(secret_name, NON_ALPHANUMERIC);
-        let url = format!(
-            "{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{encoded_secret_name}"
-        );
+        let url = secret_url(namespace, secret_name);
 
         let kubernetes_secret = client
             .get(url.clone())
@@ -213,5 +215,22 @@ impl SecretStore for KubernetesSecretStore {
             }
             Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secret_url;
+
+    #[test]
+    fn secret_url_encodes_secret_name() {
+        let url = secret_url("default", "../configmaps/sensitive");
+        assert!(url.ends_with("secrets/..%2Fconfigmaps%2Fsensitive"));
+    }
+
+    #[test]
+    fn secret_url_handles_regular_name_without_changes() {
+        let url = secret_url("default", "my-secret");
+        assert!(url.ends_with("secrets/my-secret"));
     }
 }
