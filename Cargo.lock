@@ -310,7 +310,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "serde",
  "snafu",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1350,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-glue"
-version = "1.131.0"
+version = "1.132.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18883254f61f4049f310d37de3d30456f1cdaed49341ff59285e1e44c5a42cd7"
+checksum = "35638d8e6ef97adb7f3154ffc618bbe1d631a503b6d8328b94af77b7615fbeb2"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3016,19 +3016,8 @@ dependencies = [
  "util",
  "uuid 1.18.1",
  "vortex",
- "vortex-alp",
- "vortex-array",
- "vortex-bytebool",
  "vortex-datafusion",
- "vortex-datetime-parts",
- "vortex-decimal-byte-parts",
- "vortex-fastlanes",
- "vortex-fsst",
- "vortex-runend",
- "vortex-sequence",
  "vortex-session",
- "vortex-sparse",
- "vortex-zigzag",
 ]
 
 [[package]]
@@ -3176,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
@@ -4088,7 +4077,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4173,7 +4162,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4684,7 +4673,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "async-stream",
@@ -4973,7 +4962,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5353,7 +5342,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -5490,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "dynamodb-streams"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
@@ -5498,6 +5487,7 @@ dependencies = [
  "futures",
  "humantime",
  "serde",
+ "serde_json",
  "snafu",
  "tokio",
  "tracing",
@@ -5760,7 +5750,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "futures",
  "snafu",
@@ -6037,7 +6027,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6052,7 +6042,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6065,7 +6055,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -6089,7 +6079,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6677,7 +6667,7 @@ dependencies = [
 
 [[package]]
 name = "google-genai"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -7182,13 +7172,13 @@ dependencies = [
 
 [[package]]
 name = "hostname"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a56f203cd1c76362b69e3863fd987520ac36cf70a8c92627449b2f64a8cf7d65"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
 dependencies = [
  "cfg-if",
  "libc",
- "windows-link 0.1.3",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -7479,9 +7469,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-util"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52e9a2a24dc5c6821e71a7030e1e14b7b632acac55c40e9d2e082c621261bb56"
+checksum = "727805d60e7938b76b826a6ef209eb70eaa1812794f9424d4a4e2d740662df5f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8707,7 +8697,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -9516,7 +9506,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10016,7 +10006,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "hickory-resolver",
  "snafu",
@@ -10947,7 +10937,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -10958,7 +10948,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "clap",
  "opentelemetry-proto 0.30.0",
@@ -11027,7 +11017,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -11151,7 +11141,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "bytes",
  "chunking",
@@ -13031,7 +13021,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -13216,7 +13206,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -13245,7 +13235,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "futures",
  "num_cpus",
@@ -13256,7 +13246,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "app",
  "axum",
@@ -13271,7 +13261,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -13298,7 +13288,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -13311,7 +13301,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -13334,7 +13324,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13358,7 +13348,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -13370,7 +13360,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -13383,7 +13373,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "futures",
  "governor",
@@ -13394,7 +13384,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "app",
  "async-trait",
@@ -13414,7 +13404,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -13442,7 +13432,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -13792,7 +13782,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13804,7 +13794,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -13906,7 +13896,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14058,7 +14048,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14762,7 +14752,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14806,7 +14796,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14842,7 +14832,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -14865,7 +14855,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14875,7 +14865,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "schemars 1.1.0",
  "serde_json",
@@ -14884,7 +14874,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "clap",
  "runtime",
@@ -15635,12 +15625,12 @@ checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
 name = "telemetry"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "async-trait",
  "flight_client",
- "hostname 0.4.1",
+ "hostname 0.4.2",
  "opentelemetry 0.29.1",
  "opentelemetry_sdk 0.29.0",
  "otel-arrow",
@@ -15722,7 +15712,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -15765,7 +15755,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow-json",
  "clap",
@@ -16104,7 +16094,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "secrecy",
  "snafu",
@@ -16497,7 +16487,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -16577,7 +16567,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -16599,9 +16589,9 @@ dependencies = [
 
 [[package]]
 name = "tracing"
-version = "0.1.41"
+version = "0.1.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
+checksum = "2d15d90a0b5c19378952d479dc858407149d7bb45a14de0142f6c534b16fc647"
 dependencies = [
  "log",
  "pin-project-lite",
@@ -17363,7 +17353,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -17497,7 +17487,7 @@ dependencies = [
 [[package]]
 name = "vortex"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "fastlanes",
  "rand 0.9.2",
@@ -17535,7 +17525,7 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -17554,7 +17544,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arcref",
  "arrow-arith",
@@ -17607,7 +17597,7 @@ dependencies = [
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "getrandom 0.3.4",
  "itertools 0.14.0",
@@ -17636,7 +17626,7 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-buffer",
  "bitvec",
@@ -17651,7 +17641,7 @@ dependencies = [
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "num-traits",
  "vortex-array",
@@ -17665,7 +17655,7 @@ dependencies = [
 [[package]]
 name = "vortex-compute"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -17681,7 +17671,7 @@ dependencies = [
 [[package]]
 name = "vortex-datafusion"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -17714,7 +17704,7 @@ dependencies = [
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "num-traits",
  "prost 0.14.1",
@@ -17729,7 +17719,7 @@ dependencies = [
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "num-traits",
  "prost 0.14.1",
@@ -17744,7 +17734,7 @@ dependencies = [
 [[package]]
 name = "vortex-dtype"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -17768,7 +17758,7 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -17782,7 +17772,7 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrayref",
  "arrow-buffer",
@@ -17807,7 +17797,7 @@ dependencies = [
 [[package]]
 name = "vortex-file"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "async-trait",
  "bytes",
@@ -17850,7 +17840,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "flatbuffers",
  "vortex-buffer",
@@ -17859,7 +17849,7 @@ dependencies = [
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "async-trait",
  "fsst-rs",
@@ -17876,7 +17866,7 @@ dependencies = [
 [[package]]
 name = "vortex-io"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "async-compat",
  "async-fs",
@@ -17906,7 +17896,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -17923,7 +17913,7 @@ dependencies = [
 [[package]]
 name = "vortex-layout"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arcref",
  "arrow-buffer",
@@ -17967,7 +17957,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "itertools 0.14.0",
  "vortex-buffer",
@@ -17977,7 +17967,7 @@ dependencies = [
 [[package]]
 name = "vortex-metrics"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "getrandom 0.3.4",
  "parking_lot 0.12.5",
@@ -17988,7 +17978,7 @@ dependencies = [
 [[package]]
 name = "vortex-pco"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "itertools 0.14.0",
  "pco",
@@ -18006,7 +17996,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "prost 0.14.1",
  "prost-types 0.14.1",
@@ -18015,7 +18005,7 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -18033,7 +18023,7 @@ dependencies = [
 [[package]]
 name = "vortex-scalar"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-array",
  "bytes",
@@ -18053,7 +18043,7 @@ dependencies = [
 [[package]]
 name = "vortex-scan"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -18078,7 +18068,7 @@ dependencies = [
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "num-traits",
  "prost 0.14.1",
@@ -18096,7 +18086,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "dashmap",
  "vortex-error",
@@ -18106,7 +18096,7 @@ dependencies = [
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -18123,7 +18113,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "dashmap",
  "hashbrown 0.16.1",
@@ -18132,7 +18122,7 @@ dependencies = [
 [[package]]
 name = "vortex-vector"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "paste",
  "static_assertions",
@@ -18145,7 +18135,7 @@ dependencies = [
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "itertools 0.14.0",
  "vortex-array",
@@ -18160,7 +18150,7 @@ dependencies = [
 [[package]]
 name = "vortex-zstd"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=c279ace2ebe54eee109c760930621979cff6372f#c279ace2ebe54eee109c760930621979cff6372f"
+source = "git+https://github.com/spiceai/vortex?rev=b701e1ef4d291a034b2f4595272cc0e9d431ae29#b701e1ef4d291a034b2f4595272cc0e9d431ae29"
 dependencies = [
  "itertools 0.14.0",
  "prost 0.14.1",
@@ -19007,7 +18997,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.10.0-unstable"
+version = "1.10.1-unstable"
 dependencies = [
  "async-openai",
  "async-trait",
