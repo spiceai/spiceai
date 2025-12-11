@@ -73,10 +73,7 @@ impl TursoMetastore {
         }
 
         let db = Builder::new_local(db_path)
-            // Note: Turso doesn't support indexes with MVCC, and PRIMARY KEY automatically creates
-            // indexes. All PRIMARY KEY constraints have been replaced with NOT NULL to enable
-            // MVCC for better concurrent read performance. Once Turso supports indexes with MVCC, we can re-add indexes.
-            .with_mvcc(true)
+            .with_mvcc(false) // Enable MVCC when Turso supports it with indexes: https://github.com/spiceai/spiceai/issues/8526
             .build()
             .await
             .map_err(|e| CatalogError::Database {
@@ -96,7 +93,6 @@ impl TursoMetastore {
     }
 
     /// Schema for the `cayenne_table` table.
-    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
             table_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +109,6 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_delete_file` table.
-    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
             delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,12 +117,12 @@ impl TursoMetastore {
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL
+            file_size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 
     /// Schema for the `cayenne_partition` table.
-    /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id INTEGER NOT NULL,
@@ -138,7 +133,8 @@ impl TursoMetastore {
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (partition_id, table_id, partition_column, partition_value)
+            PRIMARY KEY (partition_id, table_id, partition_column, partition_value),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 }
@@ -231,10 +227,6 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
-
-        // Note: Foreign keys are NOT enabled because FOREIGN KEY constraints create indexes
-        // that are incompatible with MVCC mode. All foreign key constraints have been removed
-        // from the schema to enable MVCC for better concurrent read performance.
 
         // NORMAL synchronous mode: safe with WAL, more performant than FULL
         // With WAL mode, NORMAL only syncs at checkpoints, not on every commit

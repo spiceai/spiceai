@@ -131,7 +131,8 @@ impl SqliteMetastore {
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL
+            file_size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 
@@ -147,7 +148,8 @@ impl SqliteMetastore {
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (partition_id, table_id, partition_column, partition_value)
+            PRIMARY KEY (partition_id, table_id, partition_column, partition_value),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 }
