@@ -95,15 +95,6 @@ impl TursoMetastore {
         })
     }
 
-    /// Schema for the `cayenne_metadata` table that tracks next IDs.
-    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
-    const METADATA_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_metadata (
-            key TEXT NOT NULL,
-            value BIGINT NOT NULL
-        )
-    ";
-
     /// Schema for the `cayenne_table` table.
     /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const TABLE_TABLE_DDL: &'static str = r"
@@ -118,24 +109,6 @@ impl TursoMetastore {
             current_snapshot_id TEXT NOT NULL DEFAULT '',
             partition_column TEXT,
             vortex_config_json TEXT
-        )
-    ";
-
-    /// Schema for the `cayenne_data_file` table.
-    /// Note: PRIMARY KEY and FOREIGN KEY constraints removed to enable MVCC mode in libSQL.
-    /// MVCC is incompatible with any indexes, including those created by constraints.
-    const DATA_FILE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_data_file (
-            data_file_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
-            partition_id BIGINT,
-            file_order BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_format TEXT NOT NULL,
-            record_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL
         )
     ";
 
@@ -282,10 +255,8 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {};",
-            Self::METADATA_TABLE_DDL,
+            "{}; {}; {};",
             Self::TABLE_TABLE_DDL,
-            Self::DATA_FILE_TABLE_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL
         );
@@ -295,34 +266,6 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
             })?;
-
-        // Initialize metadata with next IDs if not exists
-        conn.execute(
-            "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_catalog_id', 1)",
-            (),
-        )
-        .await
-        .map_err(|e| CatalogError::Database {
-            message: format!("Failed to initialize metadata: {e}"),
-        })?;
-
-        conn.execute(
-            "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_file_id', 1)",
-            (),
-        )
-        .await
-        .map_err(|e| CatalogError::Database {
-            message: format!("Failed to initialize metadata: {e}"),
-        })?;
-
-        conn.execute(
-            "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_partition_id', 1)",
-            (),
-        )
-        .await
-        .map_err(|e| CatalogError::Database {
-            message: format!("Failed to initialize metadata: {e}"),
-        })?;
 
         Ok(())
     }

@@ -309,11 +309,9 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: r"
                     INSERT INTO cayenne_table (
-                        table_id, table_uuid,
-                        table_name, path, path_is_relative, schema_json, primary_key_json,
+                        table_uuid, table_name, path, path_is_relative, schema_json, primary_key_json,
                         current_snapshot_id, partition_column, vortex_config_json
                     ) VALUES (
-                     (SELECT COALESCE(MAX(table_id) + 1, 1) FROM cayenne_table),
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
                     )
                 ",
@@ -472,10 +470,9 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
-                    delete_file_id, table_id, data_file_id, path, path_is_relative,
+                    table_id, data_file_id, path, path_is_relative,
                     format, delete_count, file_size_bytes
                 ) VALUES (
-                    (SELECT COALESCE(MAX(delete_file_id), 0) + 1 FROM cayenne_delete_file),
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7
                 )
             ",
@@ -577,9 +574,7 @@ impl MetadataCatalog for CayenneCatalog {
                 INSERT INTO cayenne_partition (
                     partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
                 ) VALUES (
-                    (SELECT COALESCE(MAX(partition_id) + 1, 1)
-                        FROM cayenne_partition
-                        WHERE table_id = ?1 AND partition_column = ?2),
+                    (SELECT COALESCE(MAX(partition_id) + 1, 1) FROM cayenne_partition),
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7
                 )",
                 params: vec![

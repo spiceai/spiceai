@@ -104,18 +104,10 @@ impl SqliteMetastore {
         })?
     }
 
-    /// Schema for the `cayenne_metadata` table that tracks next IDs.
-    const METADATA_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_metadata (
-            key TEXT PRIMARY KEY,
-            value BIGINT NOT NULL
-        )
-    ";
-
     /// Schema for the `cayenne_table` table.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id BIGINT PRIMARY KEY,
+            table_id BIGINT PRIMARY KEY AUTOINCREMENT,
             table_uuid TEXT NOT NULL,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -128,27 +120,10 @@ impl SqliteMetastore {
         )
     ";
 
-    /// Schema for the `cayenne_data_file` table.
-    const DATA_FILE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_data_file (
-            data_file_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            partition_id BIGINT,
-            file_order BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_format TEXT NOT NULL,
-            record_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL,
-            FOREIGN KEY(partition_id) REFERENCES cayenne_partition(partition_id) ON DELETE SET NULL
-        )
-    ";
-
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id BIGINT PRIMARY KEY,
+            delete_file_id BIGINT PRIMARY KEY AUTOINCREMENT,
             table_id BIGINT NOT NULL,
             data_file_id BIGINT NOT NULL,
             path TEXT NOT NULL,
@@ -285,27 +260,11 @@ impl MetastoreBackend for SqliteMetastore {
 
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {};",
-                Self::METADATA_TABLE_DDL,
+                "{}; {}; {};",
                 Self::TABLE_TABLE_DDL,
-                Self::DATA_FILE_TABLE_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
                 Self::PARTITION_TABLE_DDL
             ))?;
-
-            // Initialize metadata with next IDs if not exists
-            conn.execute(
-                "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_catalog_id', 1)",
-                [],
-            )?;
-            conn.execute(
-                "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_file_id', 1)",
-                [],
-            )?;
-            conn.execute(
-                "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_partition_id', 1)",
-                [],
-            )?;
 
             Ok::<(), CatalogError>(())
         })
