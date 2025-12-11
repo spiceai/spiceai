@@ -72,6 +72,7 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
 use crate::Error::FailedToStartClusterExecutor;
+use crate::FailedToStartClusterSchedulerSnafu;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::query::Error::UnableToExecuteQuery;
@@ -84,6 +85,7 @@ use opentelemetry::KeyValue;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
+use tonic::transport::{Certificate, ClientTlsConfig};
 use tonic::{Request, Status};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -178,6 +180,19 @@ impl Query {
                 .map_err(|e| UnableToExecuteQuery { source: e });
         };
 
+        let maybe_client_tls_config =
+            if let Some(ref ca_path) = self.df.cluster_config.cluster_ca_certificate_file {
+                let ca_certificate =
+                    std::fs::read(ca_path)
+                        .boxed()
+                        .map_err(|e| Error::UnableToExecuteQuery {
+                            source: DataFusionError::External(e),
+                        })?;
+                Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)))
+            } else {
+                None
+            };
+
         let cfg = self
             .df
             .ctx
@@ -187,7 +202,14 @@ impl Query {
                 [("authorization".to_string(), format!("Bearer {api_key}"))]
                     .into_iter()
                     .collect(),
-            );
+            )
+            .with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
+                if let Some(tls_config) = maybe_client_tls_config.as_ref() {
+                    ep.tls_config(tls_config.clone()).boxed()
+                } else {
+                    Ok(ep)
+                }
+            }));
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
