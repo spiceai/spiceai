@@ -7,7 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
       },
@@ -17,7 +17,7 @@ snapshot_kind: text
       "score": 0.63
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "The mode is $\\boxed{16}$ because it appears three times, which is more frequently than any other number in the data set."
       },
@@ -27,7 +27,7 @@ snapshot_kind: text
       "score": 0.61
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "Since 5,067,322 is divisible by 2 (its last digit is even), it is a $\\boxed{\\text{composite}}$ number."
       },
@@ -37,7 +37,7 @@ snapshot_kind: text
       "score": 0.6
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "When dividing a number by 10, the decimal point moves one place to the left. Therefore, \\(0.023 \\div 10 = \\boxed{0.0023}\\)."
       },

@@ -7,7 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "$\\boxed{\\text{True}}$, because severe post-treatment cardiopulmonary complications sometimes occur."
       },
@@ -17,7 +17,7 @@ snapshot_kind: text
       "score": 0.63
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
       },
@@ -27,7 +27,7 @@ snapshot_kind: text
       "score": 0.63
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "Consequential late effects are late effects that develop as a consequence of severe early effects."
       },
@@ -37,7 +37,7 @@ snapshot_kind: text
       "score": 0.62
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
       },

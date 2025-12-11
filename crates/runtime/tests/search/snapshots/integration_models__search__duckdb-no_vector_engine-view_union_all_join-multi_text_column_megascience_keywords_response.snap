@@ -7,7 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },

@@ -7,7 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
       },

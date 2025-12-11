@@ -7,7 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
       },
@@ -17,7 +17,7 @@ snapshot_kind: text
       "score": 0.01
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "question": "How is microsporidia infection typically acquired?"
       },
@@ -27,7 +27,7 @@ snapshot_kind: text
       "score": 0.01
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "question": "Which of the following is an intensive property of a system?"
       },
@@ -37,7 +37,7 @@ snapshot_kind: text
       "score": 0.01
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "question": "Which compound is not an intermediate of the TCA cycle?"
       },

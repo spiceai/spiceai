@@ -7,7 +7,7 @@ snapshot_kind: text
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
@@ -17,7 +17,7 @@ snapshot_kind: text
       "score": 0.76
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
       },
@@ -27,7 +27,7 @@ snapshot_kind: text
       "score": 0.75
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
       },
@@ -37,7 +37,7 @@ snapshot_kind: text
       "score": 0.75
     },
     {
-      "dataset": "qs",
+      "dataset": "spice.public.qs",
       "matches": {
         "answer": "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
       },
