@@ -187,11 +187,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_integration_test")
                 .with_dataset(make_dynamodb_dataset(
-                    table_name,
-                    PORT,
-                    access_key,
-                    secret_key,
-                    true,
+                    table_name, PORT, access_key, secret_key, true,
                 ))
                 .with_results_cache(ResultsCache {
                     enabled: false,
