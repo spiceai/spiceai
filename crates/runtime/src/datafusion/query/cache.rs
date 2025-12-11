@@ -320,12 +320,7 @@ impl Query {
                     CacheKey::LogicalPlan(p) => Some(*p),
                     _ => None,
                 };
-                Self::trigger_background_query_revalidation(
-                    Arc::clone(df),
-                    sql,
-                    plan,
-                    raw_key,
-                );
+                Self::trigger_background_query_revalidation(Arc::clone(df), sql, plan, raw_key);
             }
         }
 
