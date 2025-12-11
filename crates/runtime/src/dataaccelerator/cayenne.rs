@@ -438,8 +438,8 @@ impl CayenneAccelerator {
     ) -> Result<bool> {
         use aws_sdk_s3::primitives::ByteStream;
         use aws_sdk_s3::types::{
-            BucketInfo, BucketLocationConstraint, BucketType, CreateBucketConfiguration,
-            DataRedundancy, LocationInfo, LocationType,
+            BucketInfo, BucketType, CreateBucketConfiguration, DataRedundancy, LocationInfo,
+            LocationType,
         };
 
         // Use the credential bridge to build config with proper credential handling
@@ -481,6 +481,7 @@ impl CayenneAccelerator {
         );
 
         // Create the bucket configuration for S3 Express One Zone (directory bucket)
+        // Note: LocationConstraint is NOT supported for directory buckets - only Location and Bucket are used
         let bucket_config = CreateBucketConfiguration::builder()
             .location(
                 LocationInfo::builder()
@@ -494,11 +495,6 @@ impl CayenneAccelerator {
                     .data_redundancy(DataRedundancy::SingleAvailabilityZone)
                     .build(),
             )
-            .set_location_constraint(if region == "us-east-1" {
-                None
-            } else {
-                Some(BucketLocationConstraint::from(region))
-            })
             .build();
 
         // Attempt to create the bucket

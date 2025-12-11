@@ -1500,19 +1500,24 @@ impl TableProvider for CayenneTableProvider {
 
             // Trigger cleanup of old snapshot directories after successful full refresh
             // This is fire-and-forget using spawn_blocking to avoid blocking the async runtime
-            let table_path = self.table_metadata.path.clone();
-            let table_id = self.table_metadata.table_id;
-            let current_snapshot = new_snapshot_id.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
-                {
-                    tracing::warn!(
-                        "Failed to cleanup old snapshots for table {}: {e}",
-                        table_id
-                    );
-                }
-            });
+            // Skip for S3 paths - S3 cleanup requires object store operations, not local filesystem
+            if !self.table_metadata.path.starts_with("s3://") {
+                let table_path = self.table_metadata.path.clone();
+                let table_id = self.table_metadata.table_id;
+                let current_snapshot = new_snapshot_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                        &table_path,
+                        table_id,
+                        &current_snapshot,
+                    ) {
+                        tracing::warn!(
+                            "Failed to cleanup old snapshots for table {}: {e}",
+                            table_id
+                        );
+                    }
+                });
+            }
 
             return Ok(result);
         }
