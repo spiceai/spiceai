@@ -81,7 +81,7 @@ impl Embeddings {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn with_params(self, params: HashMap<String, Value>) -> Self {
         Self { params, ..self }
     }

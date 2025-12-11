@@ -9,42 +9,42 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
       "primary_key": {
-        "id": 6
+        "id": 189
       },
-      "score": 0.65
+      "score": 0.7
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "$\\frac{5}{6} < \\frac{5}{5}$ because $\\frac{5}{6}$ is less than 1, while $\\frac{5}{5}$ equals 1.  \n\nFinal answer: $\\boxed{<}$"
+        "answer": "\\[\n(2y)^2 = (2 \\times 2)^2 = 4^2 = \\boxed{16}\n\\]"
       },
       "primary_key": {
-        "id": 58
+        "id": 212
       },
-      "score": 0.64
+      "score": 0.68
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 543
+        "id": 1277
       },
-      "score": 0.63
+      "score": 0.68
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+        "answer": "\\[\n2x^2 = 2(-3)^2 = 2(9) = \\boxed{18}\n\\]"
       },
       "primary_key": {
-        "id": 1318
+        "id": 195
       },
-      "score": 0.63
+      "score": 0.67
     }
   ]
 }

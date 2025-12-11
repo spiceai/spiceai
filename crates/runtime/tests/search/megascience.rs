@@ -142,8 +142,7 @@ impl fmt::Display for TableOptions {
 impl TableOptions {
     pub(crate) fn table_to_search_on(&self) -> &str {
         match self {
-            TableOptions::ViewUnionAllJoin => "qs",
-            TableOptions::Dataset => "qs",
+            TableOptions::Dataset | TableOptions::ViewUnionAllJoin => "qs",
         }
     }
 

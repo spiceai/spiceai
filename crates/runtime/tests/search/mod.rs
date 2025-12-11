@@ -206,23 +206,18 @@ impl VectorEngineOptions {
 }
 
 enum EmbeddingModels {
-    OpenAI,
+    Model2Vec_8m,
     Model2Vec,
 }
 
 impl EmbeddingModels {
     fn all() -> Vec<Self> {
-        vec![EmbeddingModels::OpenAI, EmbeddingModels::Model2Vec]
+        vec![EmbeddingModels::Model2Vec_8m, EmbeddingModels::Model2Vec]
     }
     fn to_app_embedding(&self) -> Embeddings {
         match self {
-            EmbeddingModels::OpenAI => {
-                Embeddings::new("openai:text-embedding-3-small", "openai_embeddings").with_params(
-                    HashMap::from([(
-                        "openai_api_key".to_string(),
-                        Value::String("${ secrets:SPICE_OPENAI_API_KEY }".to_string()),
-                    )]),
-                )
+            EmbeddingModels::Model2Vec_8m => {
+                Embeddings::new("model2vec:minishlab/potion-base-8M", "openai_embeddings")
             }
             EmbeddingModels::Model2Vec => {
                 Embeddings::new("model2vec:minishlab/potion-base-2M", "hf_minilm")
