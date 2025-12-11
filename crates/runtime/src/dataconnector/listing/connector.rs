@@ -40,6 +40,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
+#[cfg(feature = "vortex")]
+use datafusion_datasource::file_format::FileFormatFactory;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{PartitionedFile, metadata::MetadataColumn};
@@ -47,6 +49,8 @@ use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
+#[cfg(feature = "vortex")]
+use vortex_datafusion::VortexFormatFactory;
 
 use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
@@ -535,6 +539,11 @@ pub trait ListingTableConnector: DataConnector {
             (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
+            )),
+            #[cfg(feature = "vortex")]
+            (Some("vortex"), _) | (None, Some("vortex")) => Ok((
+                Some(VortexFormatFactory::new().default()),
+                extension.unwrap_or(".vortex".to_string()),
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(

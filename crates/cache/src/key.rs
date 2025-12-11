@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::hash::BuildHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -132,5 +133,80 @@ impl RawCacheKey {
     #[must_use]
     pub fn as_u64(&self) -> u64 {
         self.0
+    }
+}
+
+/// A hash builder that builds a hasher which simply passes through u64 values as-is.
+/// This is useful to reduce hashing overhead when we already have a u64 hash key, as returned from `CacheKey::as_raw_key()`.
+#[derive(Clone)]
+pub(crate) struct PassthroughHashBuilder<T: BuildHasher + Clone + Send + Sync + 'static> {
+    hasher: T,
+}
+
+impl<T: BuildHasher + Clone + Send + Sync + 'static> PassthroughHashBuilder<T> {
+    pub(crate) fn new(hasher: T) -> Self {
+        Self { hasher }
+    }
+}
+
+impl<T: BuildHasher + Clone + Send + Sync + 'static> BuildHasher for PassthroughHashBuilder<T>
+where
+    <T as BuildHasher>::Hasher: Send + Sync + 'static,
+{
+    type Hasher = PassthroughHasher<T::Hasher>;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        PassthroughHasher {
+            hash: None,
+            hasher: self.hasher.build_hasher(),
+        }
+    }
+}
+
+pub(crate) struct PassthroughHasher<T: Hasher + Send + Sync + 'static> {
+    hash: Option<u64>,
+    hasher: T,
+}
+
+impl<T: Hasher + Send + Sync + 'static> Hasher for PassthroughHasher<T> {
+    fn finish(&self) -> u64 {
+        self.hash.unwrap_or_else(|| self.hasher.finish())
+    }
+
+    // moka generates an internal UUID v4 for bucket IDs, which is a string
+    // it re-uses the provided hash builder for hashing the value of the UUID, which is used to target a bucket segment
+    // as a result, even though our keys are always u64, we also need to support hashing arbitrary byte slices (strings)
+    //
+    // to support this need, we fallback to the hash builder from the generic type for non-u64 inputs
+    fn write(&mut self, bytes: &[u8]) {
+        self.hasher.write(bytes);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.hash = Some(i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::RandomState;
+
+    use super::*;
+
+    // explicitly allow this rule, because we're validating that the builtin u64 hash -> .write_u64() path works as expected
+    #[expect(clippy::manual_hash_one)]
+    #[test]
+    fn test_passthrough_hasher() {
+        // validate that `write_u64` and `write` produce the same hash result from a u64 input
+        let mut hasher1 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
+        hasher1.write_u64(42);
+        let hash1 = hasher1.finish();
+        assert_eq!(hash1, 42);
+
+        let mut hasher2 = PassthroughHashBuilder::new(RandomState::default()).build_hasher();
+        42u64.hash(&mut hasher2);
+        let hash2 = hasher2.finish();
+
+        assert_eq!(hash1, hash2);
     }
 }
