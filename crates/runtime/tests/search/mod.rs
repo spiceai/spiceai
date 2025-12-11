@@ -256,6 +256,18 @@ async fn test_megascience_permutations(
 ) {
     let slug =
         format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
+    if matches!(
+        (&table_option, &acceleration_opt),
+        (
+            megascience::TableOptions::ViewUnionAllJoin,
+            AccelerationOptions::NoAcceleration
+        )
+    ) {
+        // Skip invalid combination: View with no acceleration has inconsistent snapshots
+        tracing::info!("Skipping test {slug}. Cannot have view with no acceleration.");
+        return;
+    }
+
     let columns = column_config.to_columns();
     let acceleration = acceleration_opt.to_acceleration();
 

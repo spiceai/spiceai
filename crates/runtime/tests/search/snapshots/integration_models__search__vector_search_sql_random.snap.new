@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/search/mod.rs
+assertion_line: 515
+expression: resp?
+---
+[
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  }
+]
