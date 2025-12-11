@@ -108,7 +108,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
-     - [ ] [Caching Mode Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
+     - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
@@ -150,7 +150,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Cron Dataset Schedules](https://github.com/spiceai/cookbook/blob/trunk/acceleration/cron/README.md)
      - [ ] [Acceleration Snapshots](https://github.com/spiceai/cookbook/blob/trunk/acceleration/snapshots/README.md)
      - [ ] [SQL Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/sql_results/README.md)
-     - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] [Encryption in transit via TLS](https://github.com/spiceai/cookbook/blob/trunk/tls/README.md)
      - [ ] [TPC-H Benchmarking](https://github.com/spiceai/cookbook/blob/trunk/tpc-h/README.md)
      - [ ] [API Key Authentication](https://github.com/spiceai/cookbook/blob/trunk/api_key/README.md)
