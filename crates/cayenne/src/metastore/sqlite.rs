@@ -137,10 +137,9 @@ impl SqliteMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
-    /// Composite primary key on (`partition_id`, `table_id`, `partition_column`, `partition_value`).
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id INTEGER NOT NULL,
+            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_id INTEGER NOT NULL,
             partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
@@ -148,8 +147,8 @@ impl SqliteMetastore {
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (partition_id, table_id, partition_column, partition_value),
-            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            UNIQUE(table_id, partition_column, partition_value)
         )
     ";
 }

@@ -124,9 +124,7 @@ impl CayenneCatalog {
             }
             #[cfg(not(feature = "turso"))]
             {
-                return Err(CatalogError::InvalidOperation {
-                    message: "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso".to_string(),
-                });
+                return Err(CatalogError::TursoNotEnabled);
             }
         } else {
             MetastoreImpl::Sqlite(SqliteMetastore::new(&connection_string))
@@ -466,7 +464,8 @@ impl MetadataCatalog for CayenneCatalog {
 
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<i64> {
         // Insert delete file record
-        self.metastore
+        let insert_result = self
+            .metastore
             .execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
@@ -485,10 +484,22 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(delete_file.file_size_bytes),
                 ],
             })
-            .await
-            .map_err(|e| CatalogError::FailedToAddDeleteFile {
-                source: Box::new(e),
-            })?;
+            .await;
+
+        match insert_result {
+            Err(CatalogError::Sqlite {
+                source: rusqlite::Error::SqliteFailure(err, _),
+            }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                // Another concurrent operation inserted the same delete file
+                // Retrieve the existing delete_file_id by falling through
+            }
+            Err(e) => {
+                return Err(CatalogError::FailedToAddDeleteFile {
+                    source: Box::new(e),
+                })
+            }
+            Ok(_) => {}
+        }
 
         // Retrieve the assigned delete_file_id
         let delete_file_id: i64 = self
@@ -566,12 +577,11 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Insert partition metadata
-        self.metastore.execute_helper(ExecuteParams {
+        let insert_result = self.metastore.execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_partition (
-                    partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                    table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
                 ) VALUES (
-                    (SELECT COALESCE(MAX(partition_id) + 1, 1) FROM cayenne_partition),
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7
                 )",
                 params: vec![
@@ -584,10 +594,22 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Integer(partition.file_size_bytes),
                 ],
             })
-            .await
-            .map_err(|e| CatalogError::FailedToAddPartition {
-                source: Box::new(e),
-            })?;
+            .await;
+
+        match insert_result {
+            Err(CatalogError::Sqlite {
+                source: rusqlite::Error::SqliteFailure(err, _),
+            }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                // Another concurrent operation inserted the same partition
+                // Retrieve the existing partition ID by falling through
+            }
+            Err(e) => {
+                return Err(CatalogError::FailedToAddPartition {
+                    source: Box::new(e),
+                })
+            }
+            Ok(_) => {}
+        };
 
         // Retrieve the assigned partition ID
         let partition_id: i64 = self.metastore
@@ -828,6 +850,33 @@ mod tests {
         catalog.init().await.expect("Failed to initialize catalog");
 
         let table_id = 1;
+
+        // Insert the required table entry for the foreign key constraint
+        catalog
+            .metastore
+            .execute_helper(ExecuteParams {
+                sql: r"
+                INSERT INTO cayenne_table (
+                    table_uuid, table_name, path, path_is_relative, schema_json, primary_key_json,
+                    current_snapshot_id, partition_column, vortex_config_json
+                ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                )
+            ",
+                params: vec![
+                    MetastoreValue::Text(uuid::Uuid::now_v7().to_string()),
+                    MetastoreValue::Text("test_table".to_string()),
+                    MetastoreValue::Text("/tmp/cayenne_test".to_string()),
+                    MetastoreValue::Bool(false), // path_is_relative
+                    MetastoreValue::Text("{}".to_string()), // empty schema
+                    MetastoreValue::Null,        // primary_key_json
+                    MetastoreValue::Text(uuid::Uuid::now_v7().to_string()), // current_snapshot_id
+                    MetastoreValue::Null,        // partition_column
+                    MetastoreValue::Text("{}".to_string()), // empty vortex_config_json
+                ],
+            })
+            .await
+            .expect("Failed to insert test table");
 
         // Spawn multiple tasks that all try to create delete files concurrently
         let mut handles = vec![];

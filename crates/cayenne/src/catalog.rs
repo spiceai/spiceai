@@ -147,6 +147,11 @@ pub enum CatalogError {
 
     #[snafu(display("Failed to get partition data files. {source}"))]
     FailedToGetPartitionDataFiles { source: Box<CatalogError> },
+
+    #[snafu(display(
+        "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso"
+    ))]
+    TursoNotEnabled,
 }
 
 /// Result type for catalog operations.
