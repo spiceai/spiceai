@@ -40,6 +40,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
+#[cfg(feature = "vortex")]
 use datafusion_datasource::file_format::FileFormatFactory;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -540,7 +541,7 @@ pub trait ListingTableConnector: DataConnector {
                 extension.unwrap_or(".jsonl".to_string()),
             )),
             #[cfg(feature = "vortex")]
-            (Some("vortex"), _) | (None, Some("vortex"))=> Ok((
+            (Some("vortex"), _) | (None, Some("vortex")) => Ok((
                 Some(VortexFormatFactory::new().default()),
                 extension.unwrap_or(".vortex".to_string()),
             )),
@@ -552,7 +553,6 @@ pub trait ListingTableConnector: DataConnector {
             )),
             (Some(format), _) => Ok((None, format!(".{format}"))),
             (_, _) => Err(
-
                     crate::dataconnector::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
                         message: "The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again.".to_string(),
