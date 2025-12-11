@@ -71,6 +71,7 @@ use futures::StreamExt;
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
+use crate::Error::FailedToStartClusterExecutor;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::query::Error::UnableToExecuteQuery;
@@ -84,7 +85,6 @@ use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 use tonic::{Request, Status};
-use crate::Error::FailedToStartClusterExecutor;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -183,7 +183,11 @@ impl Query {
             .ctx
             .copied_config()
             .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_grpc_metadata([("authorization".to_string(), format!("Bearer {api_key}"))].into_iter().collect());
+            .with_ballista_grpc_metadata(
+                [("authorization".to_string(), format!("Bearer {api_key}"))]
+                    .into_iter()
+                    .collect(),
+            );
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(

@@ -1,4 +1,5 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
+use crate::auth::EndpointAuth;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
@@ -43,6 +44,7 @@ use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
+use s3_vectors::Client;
 use snafu::ResultExt;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
@@ -50,8 +52,9 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tonic::{Request, Status};
 use tonic::service::Interceptor;
+use tonic::transport::{Certificate, ClientTlsConfig};
+use tonic::{Request, Status};
 use url::Url;
 use uuid::Uuid;
 
@@ -94,15 +97,31 @@ pub async fn initialize_cluster_executor(
         .clone()
         .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
-    let scheduler_connection =
+    let mut scheduler_endpoint =
         create_grpc_client_endpoint(rt.config.cluster.scheduler_url.clone().to_string())
-            .map_err(|_| FailedToStartClusterExecutor {
-                source: format!(
-                    "Unable to connect to scheduler at {}",
-                    rt.config.cluster.scheduler_url
-                )
-                .into(),
-            })?
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+    let maybe_client_tls_config =
+        if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
+            let ca_certificate = tokio::fs::read(ca_path)
+                .await
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?;
+            Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)))
+        } else {
+            None
+        };
+
+    if let Some(tls_config) = &maybe_client_tls_config {
+        scheduler_endpoint = scheduler_endpoint
+            .tls_config(tls_config.clone())
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+    }
+
+    let scheduler_connection =
+        scheduler_endpoint
             .connect()
             .await
             .map_err(|_| FailedToStartClusterExecutor {
@@ -110,7 +129,7 @@ pub async fn initialize_cluster_executor(
                     "Unable to connect to scheduler at {}",
                     rt.config.cluster.scheduler_url
                 )
-                    .into(),
+                .into(),
             })?;
 
     let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
@@ -231,6 +250,7 @@ pub async fn initialize_cluster_executor(
             &rt,
             rt.config.cluster.scheduler_url.to_string(),
             executor_id,
+            maybe_client_tls_config,
         )
         .await?;
 
@@ -253,6 +273,17 @@ async fn create_scheduler_server(
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
+
+    let maybe_client_tls_config =
+        if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
+            let ca_certificate = tokio::fs::read(ca_path)
+                .await
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?;
+            Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)))
+        } else {
+            None
+        };
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -280,6 +311,13 @@ async fn create_scheduler_server(
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
                     .build(),
             )
+        })),
+        override_create_grpc_client_endpoint: Some(Arc::new(move |ep| {
+            if let Some(ref tls_config) = maybe_client_tls_config {
+                ep.tls_config(tls_config.clone())
+            } else {
+                Ok(ep)
+            }
         })),
         ..Default::default()
     };
@@ -309,17 +347,22 @@ async fn executor_bind_app(
     rt: &Arc<Runtime>,
     scheduler_flight_url: String,
     executor_id: String,
+    client_tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<()> {
     let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
         return Err(FailedToStartClusterExecutor {
-            source: "Unable to start executor without an API key".clone().into(),
+            source: "Unable to start executor without an API key".into(),
         });
     };
 
-    let mut flight_client = make_arrow_flight_client(&scheduler_flight_url, Some(api_key.clone()))
-        .await
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
+    let mut flight_client = make_arrow_flight_client(
+        &scheduler_flight_url,
+        Some(api_key.clone()),
+        client_tls_config,
+    )
+    .await
+    .boxed()
+    .context(FailedToStartClusterExecutorSnafu)?;
 
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
