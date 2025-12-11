@@ -189,6 +189,7 @@ impl Dataset {
         }
     }
 
+    #[must_use] 
     pub fn with_params(self, params: Params) -> Self {
         Self {
             params: Some(params),
