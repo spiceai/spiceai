@@ -208,7 +208,7 @@ fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
         attributes.push(KeyValue::new("model", e.from.clone()));
     } else {
         attributes.push(KeyValue::new("vector_search", "false"));
-    };
+    }
 
     attributes.push(KeyValue::new(
         "full_text_search",
