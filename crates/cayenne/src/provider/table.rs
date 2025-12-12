@@ -1381,8 +1381,9 @@ impl DeletionTableProvider for CayenneTableProvider {
 }
 
 /// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
+// Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
 #[derive(Debug)]
-#[expect(dead_code, clippy::allow_attributes)] // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
+#[expect(dead_code, clippy::allow_attributes)]
 #[allow(unfulfilled_lint_expectations)]
 pub struct CayenneTableProviderFactory {}
 
@@ -1407,7 +1408,7 @@ impl TableProviderFactory for CayenneTableProviderFactory {
                 ))?;
 
         // Ensure metadata directory exists
-        std::fs::create_dir_all(&metadata_dir).map_err(|e| DataFusionError::IoError(e))?;
+        std::fs::create_dir_all(&metadata_dir).map_err(DataFusionError::IoError)?;
 
         let connection_string = match metastore_type {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
@@ -1419,7 +1420,6 @@ impl TableProviderFactory for CayenneTableProviderFactory {
             }
         };
 
-        let connection_string = connection_string;
         let catalog = async move {
             let catalog = Arc::new(
                 CayenneCatalog::new(connection_string)
