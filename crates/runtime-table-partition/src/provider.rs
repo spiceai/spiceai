@@ -113,6 +113,12 @@ impl PartitionTableProvider {
         schema: SchemaRef,
     ) -> Result<Self, Error> {
         let num_partition_by = partition_by.len();
+        if num_partition_by > 1 {
+            tracing::warn!(
+                "Multiple 'partition_by' expressions are not yet supported. Only the last expression will be used for partitioning."
+            );
+        }
+
         let partition_by = partition_by
             .pop()
             .context(PartitionByViolationSnafu { num_partition_by })?;
