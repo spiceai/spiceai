@@ -23,6 +23,8 @@ mod docker;
 mod kafka;
 #[cfg(feature = "models")]
 mod models;
+#[cfg(feature = "models")]
+mod search;
 mod utils;
 #[cfg(feature = "models")]
 mod workers;

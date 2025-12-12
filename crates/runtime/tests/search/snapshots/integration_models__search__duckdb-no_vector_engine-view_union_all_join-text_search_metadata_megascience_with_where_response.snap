@@ -1,0 +1,20 @@
+---
+source: crates/runtime/tests/search/mod.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+      },
+      "primary_key": {
+        "id": 890
+      },
+      "score": 7.52
+    }
+  ]
+}
