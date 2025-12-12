@@ -120,7 +120,7 @@ impl PartitionTableProvider {
         }
 
         let partition_by = partition_by
-            .pop()
+            .first()
             .context(PartitionByViolationSnafu { num_partition_by })?;
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
