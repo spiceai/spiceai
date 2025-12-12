@@ -1,5 +1,6 @@
 use chrono::NaiveDate;
 use datafusion::arrow::array::RecordBatch;
+#[expect(clippy::wildcard_imports)]
 use datafusion::arrow::{
     array::*,
     datatypes::{
@@ -55,8 +56,8 @@ pub fn get_arrow_large_binary_record_batch() -> (RecordBatch, SchemaRef) {
 pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
     // FixedSizeBinary Array
     let input_arg = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
-    let fixed_size_binary_array =
-        FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap();
+    let fixed_size_binary_array = FixedSizeBinaryArray::try_from_iter(input_arg.into_iter())
+        .expect("should create fixed size binary array");
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         "fixed_size_binary",
@@ -428,7 +429,7 @@ pub fn get_arrow_struct_record_batch() -> (RecordBatch, SchemaRef) {
 
     let struct_array = struct_builder.finish();
 
-    let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array)])
+    let record_batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(struct_array)])
         .expect("Failed to created arrow struct record batch");
 
     (record_batch, schema)
