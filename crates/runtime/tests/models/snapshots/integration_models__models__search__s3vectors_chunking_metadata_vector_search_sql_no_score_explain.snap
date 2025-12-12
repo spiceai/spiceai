@@ -21,6 +21,6 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                          |
 |               |                     BytesProcessedExec                                                                                                                          |
 |               |                       CooperativeExec                                                                                                                           |
-|               |                         S3VectorsQueryExec: limit=30                                                                                                            |
+|               |                         S3VectorsQueryExec: limit=100                                                                                                           |
 |               |                                                                                                                                                                 |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::imap::{
     ImapTableProvider,
@@ -294,3 +294,5 @@ impl DataConnector for Imap {
         )))
     }
 }
+
+register_data_connector!("imap", ImapFactory);

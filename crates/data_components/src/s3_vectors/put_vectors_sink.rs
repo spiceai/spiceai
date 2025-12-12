@@ -39,6 +39,12 @@ const PUT_VECTORS_MAX_PAYLOAD_BYTES: usize = 1_048_576;
 // Estimate overhead per vector: vector_id, metadata, JSON structure (~200 bytes)
 const ESTIMATED_OVERHEAD_PER_VECTOR: usize = 200;
 
+/// Maximum number of metadata keys per vector. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
+const MAX_METADATA_KEYS_PER_VECTOR: usize = 50;
+
+/// Maximum vector dimension. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
+const MAX_VECTOR_DIMENSION: usize = 4096;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     // This means we didn't provide required fields when constructing.
@@ -61,6 +67,18 @@ pub enum Error {
         key: String,
         row: usize,
         reason: String,
+    },
+    #[snafu(display("Too many metadata keys at row {row}: {count} keys exceeds maximum of {max}"))]
+    TooManyMetadataKeys {
+        row: usize,
+        count: usize,
+        max: usize,
+    },
+    #[snafu(display("Vector dimension {dimension} at row {row} exceeds maximum of {max}"))]
+    VectorDimensionTooLarge {
+        row: usize,
+        dimension: usize,
+        max: usize,
     },
 }
 
@@ -252,6 +270,15 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             .values()
             .to_vec();
 
+        // Validate vector dimension
+        if vector.len() > MAX_VECTOR_DIMENSION {
+            return Err(Error::VectorDimensionTooLarge {
+                row,
+                dimension: vector.len(),
+                max: MAX_VECTOR_DIMENSION,
+            });
+        }
+
         if vector.iter().any(|&x| x.is_nan() || x.is_infinite()) {
             tracing::debug!("Disregarding a vector that contains NaN or Inf");
             continue;
@@ -260,6 +287,15 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
         if vector.iter().all(|&x| x == 0.0) {
             tracing::debug!("Disregarding a zero vector");
             continue;
+        }
+
+        // Validate metadata keys count
+        if fields.len() > MAX_METADATA_KEYS_PER_VECTOR {
+            return Err(Error::TooManyMetadataKeys {
+                row,
+                count: fields.len(),
+                max: MAX_METADATA_KEYS_PER_VECTOR,
+            });
         }
 
         let mut metadata = HashMap::new();
@@ -543,5 +579,130 @@ mod tests {
         // Only the second vector should be included (1 valid vector)
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].key(), "key2");
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_too_many_metadata_keys() {
+        // Create a schema with more than MAX_METADATA_KEYS_PER_VECTOR metadata fields
+        let mut fields = vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new_list(
+                S3_VECTOR_EMBEDDING_NAME,
+                Field::new("item", DataType::Float32, true),
+                true,
+            ),
+        ];
+
+        // Add 51 metadata fields (exceeds MAX_METADATA_KEYS_PER_VECTOR = 50)
+        for i in 0..51 {
+            fields.push(Field::new(format!("meta_{i}"), DataType::Utf8, false));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+
+        let keys = StringArray::from(vec!["key1"]);
+        let vectors = build_vectors(&[&[1.0, 2.0, 3.0]]);
+
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> =
+            vec![Arc::new(keys), Arc::new(vectors)];
+
+        // Add 51 metadata columns
+        for _ in 0..51 {
+            columns.push(Arc::new(StringArray::from(vec!["value"])));
+        }
+
+        let batch = RecordBatch::try_new(schema, columns).expect("try_new");
+
+        let result = create_put_input_vectors(&batch);
+        assert!(result.is_err());
+        let err_msg = result.expect_err("expected error").to_string();
+        assert!(
+            err_msg.contains("Too many metadata keys"),
+            "Expected 'Too many metadata keys' error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_max_metadata_keys_allowed() {
+        // Create a schema with exactly MAX_METADATA_KEYS_PER_VECTOR metadata fields
+        let mut fields = vec![
+            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
+            Field::new_list(
+                S3_VECTOR_EMBEDDING_NAME,
+                Field::new("item", DataType::Float32, true),
+                true,
+            ),
+        ];
+
+        // Add exactly 50 metadata fields (equals MAX_METADATA_KEYS_PER_VECTOR)
+        for i in 0..50 {
+            fields.push(Field::new(format!("meta_{i}"), DataType::Utf8, false));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+
+        let keys = StringArray::from(vec!["key1"]);
+        let vectors = build_vectors(&[&[1.0, 2.0, 3.0]]);
+
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> =
+            vec![Arc::new(keys), Arc::new(vectors)];
+
+        // Add 50 metadata columns
+        for _ in 0..50 {
+            columns.push(Arc::new(StringArray::from(vec!["value"])));
+        }
+
+        let batch = RecordBatch::try_new(schema, columns).expect("try_new");
+
+        let result = create_put_input_vectors(&batch);
+        assert!(result.is_ok(), "Expected success with 50 metadata keys");
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_vector_dimension_too_large() {
+        let keys = StringArray::from(vec!["key1"]);
+        let metadata = StringArray::from(vec!["meta1"]);
+
+        // Create a vector with dimension > MAX_VECTOR_DIMENSION (4096)
+        let large_vector: Vec<f32> = (0..4097).map(|i| i as f32).collect();
+        let vectors = build_vectors(&[large_vector.as_slice()]);
+
+        let schema = schema_ref();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
+        )
+        .expect("try_new");
+
+        let result = create_put_input_vectors(&batch);
+        assert!(result.is_err());
+        let err_msg = result.expect_err("expected error").to_string();
+        assert!(
+            err_msg.contains("dimension") && err_msg.contains("exceeds maximum"),
+            "Expected vector dimension error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_put_input_vectors_max_vector_dimension_allowed() {
+        let keys = StringArray::from(vec!["key1"]);
+        let metadata = StringArray::from(vec!["meta1"]);
+
+        // Create a vector with exactly MAX_VECTOR_DIMENSION (4096)
+        let max_vector: Vec<f32> = (0..4096).map(|i| (i as f32) * 0.001).collect();
+        let vectors = build_vectors(&[max_vector.as_slice()]);
+
+        let schema = schema_ref();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
+        )
+        .expect("try_new");
+
+        let result = create_put_input_vectors(&batch);
+        assert!(
+            result.is_ok(),
+            "Expected success with 4096-dimension vector"
+        );
     }
 }

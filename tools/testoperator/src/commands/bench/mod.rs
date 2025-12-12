@@ -36,7 +36,6 @@ use test_framework::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
-    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::{observe_memory, recursively_get_dir_size},
 };
@@ -45,7 +44,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
-            accel.mode == Mode::File
+            matches!(accel.mode, Mode::File | Mode::FileCreate)
                 && accel.enabled
                 && matches!(
                     accel.engine.as_deref(),
@@ -81,6 +80,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .await?;
 
     let ready_wait_duration = ready_wait_start.elapsed();
+
+    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
+    // Resource will be set later with set_resource() before emit()
+    let mut telemetry = super::create_telemetry(&args.common);
+
     let health_monitor = HealthMonitor::spawn()?;
 
     // Start metrics scraper if enabled
@@ -138,7 +142,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         ])
         .build();
 
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    telemetry.set_resource(benchmark_resource);
 
     let mut failures = Vec::new();
     for query in &metrics.metrics {

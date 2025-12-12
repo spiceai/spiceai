@@ -54,7 +54,7 @@ use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
-    component::dataset::acceleration::Engine,
+    component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -483,6 +483,20 @@ impl DataAccelerator for TursoAccelerator {
                 .into());
             }
 
+            // If mode is FileCreate, delete the existing file to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    tracing::warn!(
+                        "Turso acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
             download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
 
             // Initialize the database file using the shared pool
@@ -674,13 +688,15 @@ impl DataAccelerator for TursoAccelerator {
 
         // Wrap in PolyTableProvider for proper read/write separation
         // This allows the table to support both reading and writing operations
-        let write_provider = Arc::clone(&turso_provider);
-        let delete_provider = Arc::clone(&turso_provider);
         let fed_provider = Arc::new(
             Arc::clone(&turso_provider)
                 .create_federated_table_provider()
                 .boxed()?,
         ) as Arc<dyn TableProvider>;
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) =
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(turso_provider, &cmd.options);
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,

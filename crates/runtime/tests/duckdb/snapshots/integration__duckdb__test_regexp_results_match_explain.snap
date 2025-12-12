@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/duckdb/mod.rs
 expression: pretty
-snapshot_kind: text
 ---
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                                             |
@@ -17,7 +16,7 @@ snapshot_kind: text
 |               |     SubqueryAlias: arrow_regexp_like                                                                                                                                                                                                                             |
 |               |       Filter: regexp_like(csv_test_arrow.region, Utf8("america"), Utf8("i"))                                                                                                                                                                                     |
 |               |         TableScan: csv_test_arrow projection=[region]                                                                                                                                                                                                            |
-| physical_plan | HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(region@0, region@0)]                                                                                                                                                                                       |
+| physical_plan | HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(region@0, region@0)]                                                                                                                                                    |
 |               |   SchemaCastScanExec                                                                                                                                                                                                                                             |
 |               |     CooperativeExec                                                                                                                                                                                                                                              |
 |               |       BytesProcessedExec                                                                                                                                                                                                                                         |

@@ -4,5 +4,6 @@ expression: sanitized_plan
 ---
 FilterExec: bucket(4, score@4) = 1
   SchemaCastScanExec
-    BytesProcessedExec
-      DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex
+    CayenneAccelerationExec
+      BytesProcessedExec
+        DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex

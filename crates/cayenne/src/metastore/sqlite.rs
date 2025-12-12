@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use std::path::Path;
 
 /// `SQLite`-based metastore backend.
+#[derive(Debug)]
 pub struct SqliteMetastore {
     connection_string: String,
 }
@@ -97,22 +98,19 @@ impl SqliteMetastore {
             } else {
                 format!("{operation} task failed: {err}")
             };
-            CatalogError::InvalidOperation { message }
+            CatalogError::InvalidOperation {
+                message,
+                source: Box::new(err),
+            }
         })?
     }
 
-    /// Schema for the `cayenne_metadata` table that tracks next IDs.
-    const METADATA_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_metadata (
-            key TEXT PRIMARY KEY,
-            value BIGINT NOT NULL
-        )
-    ";
-
     /// Schema for the `cayenne_table` table.
+    /// Using INTEGER for AUTOINCREMENT is required
+    /// It is unlikely someone will have more than `9223372036854775807` tables (`SQLite` INTEGER max)
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id BIGINT PRIMARY KEY,
+            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_uuid TEXT NOT NULL,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -125,49 +123,33 @@ impl SqliteMetastore {
         )
     ";
 
-    /// Schema for the `cayenne_data_file` table.
-    const DATA_FILE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_data_file (
-            data_file_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            partition_id BIGINT,
-            file_order BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_format TEXT NOT NULL,
-            record_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL,
-            FOREIGN KEY(partition_id) REFERENCES cayenne_partition(partition_id) ON DELETE SET NULL
-        )
-    ";
-
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            data_file_id BIGINT NOT NULL,
+            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL
+            file_size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 
     /// Schema for the `cayenne_partition` table.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
+            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
             partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
-            UNIQUE(table_id, partition_value)
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            UNIQUE(table_id, partition_column, partition_value)
         )
     ";
 }
@@ -263,11 +245,12 @@ impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         // Create database file if it doesn't exist
         let db_path = self.db_path();
-        let db_dir = Path::new(db_path)
-            .parent()
-            .ok_or_else(|| CatalogError::InvalidOperation {
-                message: "Invalid database path".to_string(),
-            })?;
+        let db_dir =
+            Path::new(db_path)
+                .parent()
+                .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                    path: db_path.to_string(),
+                })?;
 
         if !db_dir.exists() {
             tokio::fs::create_dir_all(db_dir).await?;
@@ -280,27 +263,11 @@ impl MetastoreBackend for SqliteMetastore {
 
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {};",
-                Self::METADATA_TABLE_DDL,
+                "{}; {}; {};",
                 Self::TABLE_TABLE_DDL,
-                Self::DATA_FILE_TABLE_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
                 Self::PARTITION_TABLE_DDL
             ))?;
-
-            // Initialize metadata with next IDs if not exists
-            conn.execute(
-                "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_catalog_id', 1)",
-                [],
-            )?;
-            conn.execute(
-                "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_file_id', 1)",
-                [],
-            )?;
-            conn.execute(
-                "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_partition_id', 1)",
-                [],
-            )?;
 
             Ok::<(), CatalogError>(())
         })

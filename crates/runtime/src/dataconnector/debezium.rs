@@ -21,6 +21,7 @@ use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::Debezi
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
+use crate::register_data_connector;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -231,6 +232,8 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 }
 
+register_data_connector!("debezium", DebeziumFactory);
+
 #[async_trait]
 impl DataConnector for Debezium {
     fn as_any(&self) -> &dyn Any {
@@ -356,7 +359,11 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
