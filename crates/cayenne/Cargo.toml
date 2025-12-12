@@ -53,9 +53,13 @@ turso = ["dep:turso"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
+datafusion-federation.workspace = true
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
+rstest = "0.26.1"
 tempfile = { workspace = true }
+test-framework = { path = "../test-framework" }
+test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 
 [[bench]]

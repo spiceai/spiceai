@@ -136,6 +136,9 @@ pub fn process_batch(
             (Some(event_name), Some(dynamodb)) => match event_name {
                 OperationType::Insert | OperationType::Modify => {
                     let Some(item) = &dynamodb.new_image else {
+                        tracing::warn!(
+                            "No new_image in DynamoDB Streams record. Make sure stream is configured with either NewImage or NewAndOldImages. https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html#Streams.Enabling"
+                        );
                         continue;
                     };
                     let streams_item = streams_to_dynamodb_item(item.clone());

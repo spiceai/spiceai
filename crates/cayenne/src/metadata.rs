@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use serde::{Deserialize, Serialize};
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -82,8 +83,6 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
-    /// Data file this delete file applies to
-    pub data_file_id: i64,
     /// Path to the delete file (Parquet format)
     pub path: String,
     /// Whether the path is relative
@@ -117,17 +116,18 @@ pub struct PartitionMetadata {
     pub file_size_bytes: i64,
 }
 
-/// Statistics about a partition for query optimization.
-#[derive(Debug, Clone, Default)]
-pub struct PartitionStats {
-    /// Total number of records
-    pub record_count: i64,
-    /// Total file size in bytes
-    pub file_size_bytes: i64,
+/// Which compression strategy to use for the Vortex layout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum CompressionStrategy {
+    /// Uses the default Vortex Btrblocks compression.
+    #[default]
+    Btrblocks,
+    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    Zstd,
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
@@ -140,6 +140,9 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Compression strategy to use for Vortex files
+    /// Defaults to Btrblocks
+    pub compression_strategy: CompressionStrategy,
 }
 
 impl Default for VortexConfig {
@@ -152,6 +155,7 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 128,
             // No sort columns by default
             sort_columns: Vec::new(),
+            compression_strategy: CompressionStrategy::default(),
         }
     }
 }
@@ -171,19 +175,4 @@ pub struct CreateTableOptions {
     pub partition_column: Option<String>,
     /// Vortex encoding configuration
     pub vortex_config: VortexConfig,
-}
-
-/// Statistics about a table.
-#[derive(Debug, Clone, Default)]
-pub struct TableStats {
-    /// Total number of records (including deleted ones)
-    pub total_records: i64,
-    /// Number of deleted records
-    pub deleted_records: i64,
-    /// Total size in bytes of all data files
-    pub total_size_bytes: i64,
-    /// Number of active data files
-    pub active_data_files: i64,
-    /// Number of delete files
-    pub delete_files: i64,
 }

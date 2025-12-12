@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 mod mteb_quora;
-
 use super::get_app_and_start_request;
 use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
 use std::time::{Duration, SystemTime};
 use test_framework::{
-    TestType, anyhow, git,
+    TestType, anyhow,
+    app::App,
+    git,
     metrics::{MetricCollector, QueryMetrics},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
@@ -125,24 +126,27 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or(git::get_commit_sha());
 
     // Record benchmark results
-    let benchmark_resource = Resource::builder_empty()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "testoperator"),
-            KeyValue::new("type", "search"),
-            KeyValue::new("name", app.name.clone()),
-            KeyValue::new("spiced_version", spiced_instance.version().to_string()),
-            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-            KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
-            KeyValue::new("branch_name", git::get_branch_name()),
-            KeyValue::new("config_name", app.name), // use app name as search configuration
-            KeyValue::new(
-                "benchmark_dataset",
-                args.benchmark_dataset.clone().unwrap_or_default(),
-            ),
-        ])
-        .build();
-
-    telemetry.set_resource(benchmark_resource);
+    let mut attributes = vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "search"),
+        KeyValue::new("name", app.name.clone()),
+        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+        KeyValue::new("branch_name", git::get_branch_name()),
+        KeyValue::new("config_name", app.name.clone()), // use app name as search configuration
+        KeyValue::new(
+            "benchmark_dataset",
+            args.benchmark_dataset.clone().unwrap_or_default(),
+        ),
+    ];
+    // Add mteb_quora specific attributes
+    attributes.extend(quora_mteb_attributes(&app));
+    telemetry.set_resource(
+        Resource::builder_empty()
+            .with_attributes(attributes)
+            .build(),
+    );
 
     crate::metrics::TEST_DURATION
         .record(u64::try_from((finished_at - started_at).as_millis())?, &[]);
@@ -174,4 +178,46 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     println!("Benchmark completed successfully!");
 
     Ok(())
+}
+
+fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
+    let Some(ds) = app.datasets.iter().find(|ds| ds.name == "corpus") else {
+        return vec![];
+    };
+    let mut attributes = vec![];
+    if let Some(engine) = ds
+        .acceleration
+        .as_ref()
+        .map(|acc| acc.engine.clone().unwrap_or("arrow".to_string()))
+    {
+        attributes.push(KeyValue::new("engine", engine));
+    }
+
+    if let Some(acc) = ds.acceleration.as_ref() {
+        attributes.push(KeyValue::new("engine_mode", acc.mode.to_string()));
+    }
+
+    let Some(text_col) = ds.columns.iter().find(|c| c.name == "text") else {
+        return attributes;
+    };
+
+    if let Some(embed) = text_col.embeddings.first()
+        && let Some(e) = app.embeddings.iter().find(|e| e.name == embed.model)
+    {
+        attributes.push(KeyValue::new("vector_search", "true"));
+        attributes.push(KeyValue::new("model", e.from.clone()));
+    } else {
+        attributes.push(KeyValue::new("vector_search", "false"));
+    }
+
+    attributes.push(KeyValue::new(
+        "full_text_search",
+        text_col
+            .full_text_search
+            .as_ref()
+            .is_some_and(|fts| fts.enabled)
+            .to_string(),
+    ));
+
+    attributes
 }

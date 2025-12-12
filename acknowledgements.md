@@ -7,7 +7,9 @@ Spice.ai acknowledges the following open source projects for making this project
 ## Go Modules
 
 github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.6.0/LICENSE, MIT
-github.com/apache/arrow/go/v17, https://github.com/apache/arrow/blob/go/v17.0.0/go/LICENSE.txt, Apache-2.0
+github.com/apache/arrow-adbc/go/adbc, https://github.com/apache/arrow-adbc/blob/v1.4.0/go/adbc/LICENSE.txt, Apache-2.0
+github.com/apache/arrow-go/v18, https://github.com/apache/arrow-go/blob/v18.4.1/LICENSE.txt, Apache-2.0
+github.com/bradleyjkemp/cupaloy, https://github.com/bradleyjkemp/cupaloy/blob/v2.3.0/LICENCE, MIT
 github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/v4.3.0/LICENSE, MIT
 github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
 github.com/clipperhouse/displaywidth, https://github.com/clipperhouse/displaywidth/blob/v0.3.1/LICENSE, MIT
@@ -51,7 +53,7 @@ github.com/spf13/cast, https://github.com/spf13/cast/blob/v1.10.0/LICENSE, MIT
 github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.10.1/LICENSE.txt, Apache-2.0
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.10/LICENSE, BSD-3-Clause
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.21.0/LICENSE, MIT
-github.com/spiceai/gospice/v7, https://github.com/spiceai/gospice/blob/v7.0.0/LICENSE, Apache-2.0
+github.com/spiceai/gospice/v8, https://github.com/spiceai/gospice/blob/v8.0.0/LICENSE, Apache-2.0
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
 github.com/zeebo/xxh3, https://github.com/zeebo/xxh3/blob/v1.0.2/LICENSE, BSD-2-Clause
 go.opentelemetry.io/otel, https://github.com/open-telemetry/opentelemetry-go/blob/v1.31.0/LICENSE, Apache-2.0
