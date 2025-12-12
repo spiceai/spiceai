@@ -18,7 +18,12 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+
+/// Characters that must be percent-encoded in Kubernetes secret names to prevent path traversal.
+/// This encodes control characters plus `/` and `\` to prevent path traversal attacks,
+/// while preserving safe characters like `-`, `_`, and `.` that are valid in secret names.
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/').add(b'\\');
 use reqwest;
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
@@ -69,7 +74,7 @@ struct KubernetesClient {
 }
 
 fn secret_url(namespace: &str, secret_name: &str) -> String {
-    let encoded_secret_name = utf8_percent_encode(secret_name, NON_ALPHANUMERIC);
+    let encoded_secret_name = utf8_percent_encode(secret_name, PATH_SEGMENT_ENCODE_SET);
     format!("{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{encoded_secret_name}")
 }
 
