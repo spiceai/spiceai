@@ -91,16 +91,7 @@ pub async fn initialize_cluster_executor(
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
 
-    let maybe_client_tls_config =
-        if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
-            let ca_certificate = tokio::fs::read(ca_path)
-                .await
-                .boxed()
-                .context(FailedToStartClusterSchedulerSnafu)?;
-            Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)))
-        } else {
-            None
-        };
+    let maybe_client_tls_config = runtime_tls_configuration(&rt).await?;
 
     if let Some(tls_config) = &maybe_client_tls_config {
         scheduler_endpoint = scheduler_endpoint
@@ -265,16 +256,7 @@ async fn create_scheduler_server(
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
-    let maybe_client_tls_config =
-        if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
-            let ca_certificate = tokio::fs::read(ca_path)
-                .await
-                .boxed()
-                .context(FailedToStartClusterSchedulerSnafu)?;
-            Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)))
-        } else {
-            None
-        };
+    let maybe_client_tls_config = runtime_tls_configuration(&rt).await?;
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -462,4 +444,16 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     }
 
     Ok(())
+}
+
+async fn runtime_tls_configuration(rt: &Arc<Runtime>) -> crate::Result<Option<ClientTlsConfig>> {
+    if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
+        let ca_certificate = tokio::fs::read(ca_path)
+            .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+        Ok(Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate))))
+    } else {
+        Ok(None)
+    }
 }
