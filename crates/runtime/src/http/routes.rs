@@ -82,6 +82,8 @@ use tower_http::limit::RequestBodyLimitLayer;
     paths(
         // Order here will be preserved in sidebar at https://spiceai.org/docs/api/http/runtime.
         v1::query::post,
+        v1::prepared::prepare,
+        v1::prepared::execute,
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
@@ -208,6 +210,8 @@ pub(crate) fn routes(
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
+        .route("/v1/sql/prepare", post(v1::prepared::prepare))
+        .route("/v1/sql/execute", post(v1::prepared::execute))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))

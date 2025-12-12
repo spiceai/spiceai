@@ -103,6 +103,7 @@ mod tls;
 mod utils;
 mod view;
 
+mod http_prepared_statements;
 mod management;
 // MySQL is required for the rehydration tests
 mod podswatcher;
