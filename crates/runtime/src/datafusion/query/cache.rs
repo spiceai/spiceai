@@ -530,9 +530,11 @@ impl Query {
         let sql_owned = sql.to_string();
         let plan_owned = plan.cloned();
 
-        // Spawn a detached task for background revalidation
-        // Use optionally_get_with to ensure only one revalidation per key runs concurrently
-        tokio::spawn(async move {
+        // Get optional dedicated refresh runtime, fall back to current runtime if not configured
+        let refresh_runtime = df.refresh_runtime().cloned();
+
+        // Build the background task
+        let background_task = async move {
             // optionally_get_with provides automatic single-in-flight: if another task
             // is already running for this key, this will return None immediately
             let result = locks
@@ -617,7 +619,16 @@ impl Query {
                 );
                 cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             }
-        });
+        };
+
+        // Spawn on dedicated refresh runtime if configured, otherwise use current runtime.
+        // Using the dedicated refresh runtime isolates SWR background work from user-facing
+        // query processing, preventing latency spikes when many cache entries become stale.
+        if let Some(runtime) = refresh_runtime {
+            runtime.spawn(background_task);
+        } else {
+            tokio::spawn(background_task);
+        }
     }
 
     pub(super) fn wrap_stream_with_cache(
