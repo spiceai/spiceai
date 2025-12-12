@@ -23,9 +23,8 @@ use super::constants::LISTING_TABLE_LOCK_POISONED;
 use super::delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata, VortexConfig};
+use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
-use crate::CayenneCatalog;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -35,14 +34,12 @@ use datafusion::datasource::listing::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_catalog::{Session, TableProvider, TableProviderFactory};
-use datafusion_common::{Constraints, DataFusionError};
+use datafusion_catalog::{Session, TableProvider};
+use datafusion_common::Constraints;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::{
-    CreateExternalTable, Expr, LogicalPlan, TableProviderFilterPushDown, TableType,
-};
+use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::ExecutionPlan;
 use futures::StreamExt;
@@ -1380,99 +1377,11 @@ impl DeletionTableProvider for CayenneTableProvider {
     }
 }
 
-/// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
-// Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
-#[derive(Debug)]
-#[expect(dead_code, clippy::allow_attributes)]
-#[allow(unfulfilled_lint_expectations)]
-pub struct CayenneTableProviderFactory {}
-
-#[async_trait]
-impl TableProviderFactory for CayenneTableProviderFactory {
-    async fn create(
-        &self,
-        _state: &dyn Session,
-        cmd: &CreateExternalTable,
-    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
-        let metastore_type = cmd
-            .options
-            .get("cayenne_metastore")
-            .map_or("sqlite", String::as_str);
-
-        let metadata_dir =
-            cmd.options
-                .get("cayenne_metadata_dir")
-                .cloned()
-                .ok_or(DataFusionError::Execution(
-                    "cayenne_metadata_dir option is required".to_string(),
-                ))?;
-
-        // Ensure metadata directory exists
-        std::fs::create_dir_all(&metadata_dir).map_err(DataFusionError::IoError)?;
-
-        let connection_string = match metastore_type {
-            "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
-            "sqlite" => format!("sqlite://{metadata_dir}/cayenne.db"),
-            _ => {
-                return Err(DataFusionError::Execution(format!(
-                    "Unsupported cayenne_metastore type: {metastore_type}"
-                )))
-            }
-        };
-
-        let catalog = async move {
-            let catalog = Arc::new(
-                CayenneCatalog::new(connection_string)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
-            ) as Arc<dyn MetadataCatalog>;
-
-            catalog
-                .init()
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            Ok::<Arc<dyn MetadataCatalog>, DataFusionError>(catalog)
-        }
-        .await?;
-
-        // Support vortex configuration via options: https://github.com/spiceai/spiceai/issues/8533
-        let vortex_config = VortexConfig::default();
-
-        // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
-        let dir_path =
-            cmd.options
-                .get("cayenne_data_dir")
-                .cloned()
-                .ok_or(DataFusionError::Execution(
-                    "cayenne_metadata_dir option is required".to_string(),
-                ))?;
-
-        let table_options = CreateTableOptions {
-            table_name: cmd.name.to_string(),
-            schema: Arc::clone(cmd.schema.inner()),
-            primary_key: vec![], // No PK by default, can be set by caller
-            base_path: dir_path,
-            partition_column: None, // Non-partitioned table
-            vortex_config,
-        };
-
-        let retention_filters = Vec::new();
-
-        // Create CayenneTableProvider
-        let cayenne_table = CayenneTableProvider::create_table_with_retention(
-            catalog,
-            table_options,
-            retention_filters,
-        )
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        Ok(Arc::new(cayenne_table) as Arc<dyn TableProvider>)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::metadata::VortexConfig;
+    use crate::CayenneCatalog;
+
     use super::*;
 
     use datafusion::arrow::array::RecordBatch;
@@ -1484,11 +1393,97 @@ mod tests {
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::CreateExternalTable;
     use datafusion::physical_plan::collect;
+    use datafusion_common::DataFusionError;
     use datafusion_federation::schema_cast::record_convert::try_cast_to;
     use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
     use test_framework::arrow_record_batch_gen::*;
+
+    /// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
+    // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
+    #[derive(Debug)]
+    pub struct CayenneTableProviderFactory {}
+
+    #[async_trait]
+    impl TableProviderFactory for CayenneTableProviderFactory {
+        async fn create(
+            &self,
+            _state: &dyn Session,
+            cmd: &CreateExternalTable,
+        ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+            let metastore_type = cmd
+                .options
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            let metadata_dir = cmd.options.get("cayenne_metadata_dir").cloned().ok_or(
+                DataFusionError::Execution("cayenne_metadata_dir option is required".to_string()),
+            )?;
+
+            // Ensure metadata directory exists
+            std::fs::create_dir_all(&metadata_dir).map_err(DataFusionError::IoError)?;
+
+            let connection_string = match metastore_type {
+                "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
+                "sqlite" => format!("sqlite://{metadata_dir}/cayenne.db"),
+                _ => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Unsupported cayenne_metastore type: {metastore_type}"
+                    )))
+                }
+            };
+
+            let catalog = async move {
+                let catalog = Arc::new(
+                    CayenneCatalog::new(connection_string)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                ) as Arc<dyn MetadataCatalog>;
+
+                catalog
+                    .init()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                Ok::<Arc<dyn MetadataCatalog>, DataFusionError>(catalog)
+            }
+            .await?;
+
+            // Support vortex configuration via options: https://github.com/spiceai/spiceai/issues/8533
+            let vortex_config = VortexConfig::default();
+
+            // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
+            let dir_path =
+                cmd.options
+                    .get("cayenne_data_dir")
+                    .cloned()
+                    .ok_or(DataFusionError::Execution(
+                        "cayenne_metadata_dir option is required".to_string(),
+                    ))?;
+
+            let table_options = CreateTableOptions {
+                table_name: cmd.name.to_string(),
+                schema: Arc::clone(cmd.schema.inner()),
+                primary_key: vec![], // No PK by default, can be set by caller
+                base_path: dir_path,
+                partition_column: None, // Non-partitioned table
+                vortex_config,
+            };
+
+            let retention_filters = Vec::new();
+
+            // Create CayenneTableProvider
+            let cayenne_table = CayenneTableProvider::create_table_with_retention(
+                catalog,
+                table_options,
+                retention_filters,
+            )
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            Ok(Arc::new(cayenne_table) as Arc<dyn TableProvider>)
+        }
+    }
 
     async fn arrow_cayenne_round_trip(
         arrow_record: RecordBatch,
@@ -1601,7 +1596,7 @@ mod tests {
     #[case::map(get_arrow_map_record_batch(), "map")]
     #[case::dictionary(get_arrow_dictionary_array_record_batch(), "dictionary")]
     #[test_log::test(tokio::test)]
-    async fn test_arrow_duckdb_roundtrip(
+    async fn test_arrow_cayenne_roundtrip(
         #[case] arrow_result: (RecordBatch, SchemaRef),
         #[case] table_name: &str,
     ) {

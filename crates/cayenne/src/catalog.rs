@@ -51,7 +51,7 @@ pub enum CatalogError {
     },
 
     /// Invalid operation
-    #[snafu(display("Invalid operation: {message}. {source}"))]
+    #[snafu(display("Invalid operation: {message} {source}"))]
     InvalidOperation {
         /// Description of the invalid operation
         message: String,
@@ -93,7 +93,7 @@ pub enum CatalogError {
         operation: String,
     },
 
-    #[snafu(display("Invalid database path: {path}."))]
+    #[snafu(display("Invalid database path: {path}"))]
     InvalidDatabasePath { path: String },
 
     #[snafu(display("The function '{function}' is not implemented"))]
