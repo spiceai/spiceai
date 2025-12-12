@@ -52,9 +52,7 @@ use headers_accept::Accept;
 use serde::{Deserialize, Serialize};
 
 use crate::datafusion::{
-    param_utils,
-    query::QueryBuilder,
-    request_context_extension::get_current_datafusion,
+    param_utils, query::QueryBuilder, request_context_extension::get_current_datafusion,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -159,9 +157,16 @@ enum PreparedStatementDecodeError {
 impl std::fmt::Display for PreparedStatementDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidBase64 => write!(f, "Invalid prepared statement handle: malformed encoding"),
-            Self::InvalidHandle => write!(f, "Invalid prepared statement handle: corrupted or expired"),
-            Self::TrailingBytes => write!(f, "Invalid prepared statement handle: tampered or malformed"),
+            Self::InvalidBase64 => {
+                write!(f, "Invalid prepared statement handle: malformed encoding")
+            }
+            Self::InvalidHandle => {
+                write!(f, "Invalid prepared statement handle: corrupted or expired")
+            }
+            Self::TrailingBytes => write!(
+                f,
+                "Invalid prepared statement handle: tampered or malformed"
+            ),
         }
     }
 }
@@ -243,9 +248,7 @@ pub(crate) async fn prepare(Json(request): Json<PrepareRequest>) -> Response {
         }
     };
 
-    let handle = PreparedStatementHandle {
-        sql: request.sql,
-    };
+    let handle = PreparedStatementHandle { sql: request.sql };
 
     let encoded_handle = match handle.encode() {
         Ok(h) => h,
@@ -337,10 +340,7 @@ pub(crate) async fn execute(
     // Convert parameters
     let parameters: Option<ParamValues> = if request.parameters.is_null()
         || (request.parameters.is_array()
-            && request
-                .parameters
-                .as_array()
-                .map_or(true, Vec::is_empty))
+            && request.parameters.as_array().map_or(true, Vec::is_empty))
         || (request.parameters.is_object()
             && request
                 .parameters
@@ -353,7 +353,8 @@ pub(crate) async fn execute(
             Ok(p) => Some(p),
             Err(e) => {
                 tracing::debug!("Error converting parameters: {e}");
-                return (StatusCode::BAD_REQUEST, format!("Invalid parameters: {e}")).into_response();
+                return (StatusCode::BAD_REQUEST, format!("Invalid parameters: {e}"))
+                    .into_response();
             }
         }
     };
@@ -404,10 +405,13 @@ mod tests {
             sql: "SELECT 1".to_string(),
         };
         let mut bytes = postcard::to_stdvec(&handle).expect("encode");
-        bytes.extend_from_slice(b"TAMPERED");  // Append garbage bytes
+        bytes.extend_from_slice(b"TAMPERED"); // Append garbage bytes
         let tampered_encoded = URL_SAFE_NO_PAD.encode(&bytes);
 
         let result = PreparedStatementHandle::decode(&tampered_encoded);
-        assert!(result.is_err(), "Tampered handle with trailing bytes should be rejected");
+        assert!(
+            result.is_err(),
+            "Tampered handle with trailing bytes should be rejected"
+        );
     }
 }
