@@ -452,7 +452,9 @@ async fn runtime_tls_configuration(rt: &Arc<Runtime>) -> crate::Result<Option<Cl
             .await
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
-        Ok(Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate))))
+        Ok(Some(
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)),
+        ))
     } else {
         Ok(None)
     }
