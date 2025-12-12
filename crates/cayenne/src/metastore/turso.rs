@@ -22,8 +22,8 @@ use super::{
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
-use std::path::Path;
 use std::sync::Arc;
+use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 
@@ -31,6 +31,14 @@ use turso::{Builder, Connection, Database, Value as TursoValue};
 pub struct TursoMetastore {
     db: Arc<Mutex<Option<Database>>>,
     connection_string: String,
+}
+
+impl Debug for TursoMetastore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TursoMetastore")
+            .field("connection_string", &self.connection_string)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TursoMetastore {

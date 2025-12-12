@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 pub mod app_utils;
+pub mod arrow_record_batch_gen;
 pub mod constants;
 pub mod flight;
 pub mod gh_utils;

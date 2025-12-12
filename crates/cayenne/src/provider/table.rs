@@ -23,8 +23,9 @@ use super::constants::LISTING_TABLE_LOCK_POISONED;
 use super::delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
+use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata, VortexConfig};
 use crate::provider::scan::CayenneAccelerationExec;
+use crate::CayenneCatalog;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -34,12 +35,14 @@ use datafusion::datasource::listing::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::Constraints;
+use datafusion_catalog::{Session, TableProvider, TableProviderFactory};
+use datafusion_common::{Constraints, DataFusionError};
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_expr::{
+    CreateExternalTable, Expr, LogicalPlan, TableProviderFilterPushDown, TableType,
+};
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::ExecutionPlan;
 use futures::StreamExt;
@@ -1374,5 +1377,239 @@ impl DeletionTableProvider for CayenneTableProvider {
             )),
             &self.table_metadata.schema,
         )))
+    }
+}
+
+/// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
+#[derive(Debug)]
+#[expect(dead_code, clippy::allow_attributes)] // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
+#[allow(unfulfilled_lint_expectations)]
+pub struct CayenneTableProviderFactory {}
+
+#[async_trait]
+impl TableProviderFactory for CayenneTableProviderFactory {
+    async fn create(
+        &self,
+        _state: &dyn Session,
+        cmd: &CreateExternalTable,
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        let metastore_type = cmd
+            .options
+            .get("cayenne_metastore")
+            .map_or("sqlite", String::as_str);
+
+        let metadata_dir =
+            cmd.options
+                .get("cayenne_metadata_dir")
+                .cloned()
+                .ok_or(DataFusionError::Execution(
+                    "cayenne_metadata_dir option is required".to_string(),
+                ))?;
+
+        // Ensure metadata directory exists
+        std::fs::create_dir_all(&metadata_dir).map_err(|e| DataFusionError::IoError(e))?;
+
+        let connection_string = match metastore_type {
+            "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
+            "sqlite" => format!("sqlite://{metadata_dir}/cayenne.db"),
+            _ => {
+                return Err(DataFusionError::Execution(format!(
+                    "Unsupported cayenne_metastore type: {metastore_type}"
+                )))
+            }
+        };
+
+        let connection_string = connection_string;
+        let catalog = async move {
+            let catalog = Arc::new(
+                CayenneCatalog::new(connection_string)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            ) as Arc<dyn MetadataCatalog>;
+
+            catalog
+                .init()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            Ok::<Arc<dyn MetadataCatalog>, DataFusionError>(catalog)
+        }
+        .await?;
+
+        // Support vortex configuration via options: https://github.com/spiceai/spiceai/issues/8533
+        let vortex_config = VortexConfig::default();
+
+        // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
+        let dir_path =
+            cmd.options
+                .get("cayenne_data_dir")
+                .cloned()
+                .ok_or(DataFusionError::Execution(
+                    "cayenne_metadata_dir option is required".to_string(),
+                ))?;
+
+        let table_options = CreateTableOptions {
+            table_name: cmd.name.to_string(),
+            schema: Arc::clone(cmd.schema.inner()),
+            primary_key: vec![], // No PK by default, can be set by caller
+            base_path: dir_path,
+            partition_column: None, // Non-partitioned table
+            vortex_config,
+        };
+
+        let retention_filters = Vec::new();
+
+        // Create CayenneTableProvider
+        let cayenne_table = CayenneTableProvider::create_table_with_retention(
+            catalog,
+            table_options,
+            retention_filters,
+        )
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(Arc::new(cayenne_table) as Arc<dyn TableProvider>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use datafusion::arrow::array::RecordBatch;
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::catalog::TableProviderFactory;
+    use datafusion::common::{Constraints, ToDFSchema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::logical_expr::CreateExternalTable;
+    use datafusion::physical_plan::collect;
+    use datafusion_federation::schema_cast::record_convert::try_cast_to;
+    use rstest::rstest;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use test_framework::arrow_record_batch_gen::*;
+
+    async fn arrow_cayenne_round_trip(
+        arrow_record: RecordBatch,
+        source_schema: SchemaRef,
+        table_name: &str,
+    ) {
+        let factory = CayenneTableProviderFactory {};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+
+        let cmd_options = HashMap::from([
+            (
+                "cayenne_metadata_dir".to_string(),
+                format!("{}/metadata", temp_dir.path().to_str().unwrap()),
+            ),
+            (
+                "cayenne_data_dir".to_string(),
+                format!("{}/data", temp_dir.path().to_str().unwrap()),
+            ),
+        ]);
+
+        let ctx = SessionContext::new();
+        let cmd = CreateExternalTable {
+            schema: Arc::new(arrow_record.schema().to_dfschema().expect("to df schema")),
+            name: table_name.into(),
+            location: "".to_string(),
+            file_type: "".to_string(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: cmd_options,
+            constraints: Constraints::default(),
+            column_defaults: HashMap::new(),
+            temporary: false,
+        };
+        let table_provider = factory
+            .create(&ctx.state(), &cmd)
+            .await
+            .expect("table provider created");
+
+        let ctx = SessionContext::new();
+
+        let mem_exec = MemorySourceConfig::try_new_exec(
+            &[vec![arrow_record.clone()]],
+            arrow_record.schema(),
+            None,
+        )
+        .expect("memory exec created");
+        let insert_plan = table_provider
+            .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
+            .await
+            .expect("insert plan created");
+
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert done");
+
+        ctx.register_table(table_name, table_provider)
+            .expect("Table should be registered");
+        let sql = format!("SELECT * FROM {table_name}");
+        let df = ctx
+            .sql(&sql)
+            .await
+            .expect("DataFrame should be created from query");
+
+        let record_batch = df.collect().await.expect("RecordBatch should be collected");
+        let casted_record = try_cast_to(record_batch[0].clone(), source_schema).unwrap();
+
+        tracing::debug!("Original Arrow Record Batch: {:?}", arrow_record.columns());
+        tracing::debug!(
+            "Duckdb returned Record Batch: {:?}",
+            record_batch[0].columns()
+        );
+
+        // Check results
+        assert_eq!(record_batch.len(), 1);
+        assert_eq!(record_batch[0].num_rows(), arrow_record.num_rows());
+        assert_eq!(record_batch[0].num_columns(), arrow_record.num_columns());
+        assert_eq!(casted_record, arrow_record);
+    }
+
+    #[rstest]
+    #[case::binary(get_arrow_binary_record_batch(), "binary")]
+    #[case::binary(get_arrow_large_binary_record_batch(), "large_binary")]
+    #[ignore] // Vortex does not support fixed size binary yet
+    #[case::binary(get_arrow_fixed_sized_binary_record_batch(), "fixed_size_binary")]
+    #[case::int(get_arrow_int_record_batch(), "int")]
+    #[case::float(get_arrow_float_record_batch(), "float")]
+    #[case::utf8(get_arrow_utf8_record_batch(), "utf8")]
+    #[case::time(get_arrow_time_record_batch(), "time")]
+    #[case::timestamp(get_arrow_timestamp_record_batch(), "timestamp")]
+    #[case::date(get_arrow_date_record_batch(), "date")]
+    #[case::struct_type(get_arrow_struct_record_batch(), "struct")]
+    #[case::decimal(get_arrow_decimal_record_batch(), "decimal")]
+    #[ignore] // Vortex does not support interval yet
+    #[case::interval(get_arrow_interval_record_batch(), "interval")]
+    #[ignore] // Vortex does not support duration yet
+    #[case::duration(get_arrow_duration_record_batch(), "duration")]
+    #[case::list(get_arrow_list_record_batch(), "list")]
+    #[case::null(get_arrow_null_record_batch(), "null")]
+    #[case::list_of_structs(get_arrow_list_of_structs_record_batch(), "list_of_structs")]
+    #[case::list_of_fixed_size_lists(
+        get_arrow_list_of_fixed_size_lists_record_batch(),
+        "list_of_fixed_size_lists"
+    )]
+    #[case::list_of_lists(get_arrow_list_of_lists_record_batch(), "list_of_lists")]
+    #[ignore] // Vortex does not support map yet
+    #[case::map(get_arrow_map_record_batch(), "map")]
+    #[case::dictionary(get_arrow_dictionary_array_record_batch(), "dictionary")]
+    #[test_log::test(tokio::test)]
+    async fn test_arrow_duckdb_roundtrip(
+        #[case] arrow_result: (RecordBatch, SchemaRef),
+        #[case] table_name: &str,
+    ) {
+        arrow_cayenne_round_trip(
+            arrow_result.0,
+            arrow_result.1,
+            &format!("{table_name}_types"),
+        )
+        .await;
     }
 }

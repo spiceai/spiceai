@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Metastore backend enum to support different implementations.
+#[derive(Debug)]
 pub(crate) enum MetastoreImpl {
     Sqlite(SqliteMetastore),
     #[cfg(feature = "turso")]
