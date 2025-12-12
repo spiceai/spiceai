@@ -33,10 +33,15 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
-use opentelemetry_sdk::metrics::{
-    PeriodicReader, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
+use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::{
+    metrics::{
+        Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
+        periodic_reader_with_async_runtime::PeriodicReader,
+    },
+    runtime::Tokio,
 };
+use reqwest::Client;
 use snafu::prelude::*;
 
 /// Type alias for the OTEL periodic reader with filtering support
@@ -188,7 +193,7 @@ pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPe
     // Wrap with filtering exporter
     let exporter = FilteringExporter::new(inner_exporter, &config.metrics);
 
-    let reader = PeriodicReader::builder(exporter)
+    let reader = PeriodicReader::builder(exporter, Tokio)
         .with_interval(push_interval)
         .build();
 
@@ -214,8 +219,15 @@ fn create_http_exporter(endpoint: &str) -> Result<MetricExporter> {
         format!("{}/v1/metrics", endpoint.trim_end_matches('/'))
     };
 
+    let http_client = Client::builder()
+        .build()
+        .map_err(|e| Error::ExporterCreationFailed {
+            message: format!("Failed to build OTEL HTTP client: {e}"),
+        })?;
+
     MetricExporter::builder()
         .with_http()
+        .with_http_client(http_client)
         .with_endpoint(full_endpoint)
         .with_protocol(Protocol::HttpBinary)
         .build()

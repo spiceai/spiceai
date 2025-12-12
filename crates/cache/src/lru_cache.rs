@@ -21,6 +21,7 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
+use crate::key::PassthroughHashBuilder;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
@@ -40,9 +41,10 @@ use std::time::{Duration, Instant};
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, T>,
+    cache: Cache<u64, V, PassthroughHashBuilder<T>>,
     hasher: T,
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
@@ -54,8 +56,9 @@ pub struct LruCache<
 
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> Display for LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> Display for LruCache<V, T, H>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -69,8 +72,9 @@ impl<
 
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> std::fmt::Debug for LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> std::fmt::Debug for LruCache<V, T, H>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruCache")
@@ -84,6 +88,8 @@ impl<
     }
 }
 
+type BuiltLruCache<V> = LruCache<V, HashBuilder, Box<dyn Hasher + Send + Sync + 'static>>;
+
 /// Builds an LRU cache provider from the given configuration.
 ///
 /// # Errors
@@ -92,7 +98,7 @@ impl<
 /// - If the specified `item_ttl` cannot be parsed as a valid duration.
 pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static>(
     cache_config: &CacheConfig,
-) -> Result<Arc<LruCache<V, HashBuilder>>> {
+) -> Result<Arc<BuiltLruCache<V>>> {
     let cache_max_size: u64 = match &cache_config.max_size {
         Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
             .context(super::FailedToParseCacheMaxSizeSnafu)?
@@ -120,22 +126,21 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
 
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> LruCache<V, T, H>
 {
     #[must_use]
-    pub fn new(
-        cache_max_size: u64,
-        ttl: Duration,
-        hasher: T,
-        caching_policy: CachingPolicy,
-    ) -> Self {
+    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T, caching_policy: CachingPolicy) -> Self
+    where
+        <T as BuildHasher>::Hasher: Send + Sync + 'static,
+    {
         let moka_eviction_policy = match caching_policy {
             CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
             CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
         };
 
-        let cache: Cache<u64, V, T> = Cache::builder()
+        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
             .time_to_live(ttl)
             .weigher(|_key, value: &V| -> u32 {
                 let val: usize = value.get_memory_size();
@@ -161,7 +166,7 @@ impl<
                     V::record_eviction();
                 }
             })
-            .build_with_hasher(hasher.clone());
+            .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()));
 
         LruCache {
             cache,
@@ -182,8 +187,9 @@ impl<
 
 impl<
     V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> LruCache<V, T, H>
 {
     pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
         self
@@ -192,8 +198,9 @@ impl<
 
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> HashProvider for LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> HashProvider for LruCache<V, T, H>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
         Box::new(self.hasher.build_hasher())
@@ -203,8 +210,9 @@ impl<
 #[async_trait]
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> CacheProvider<V> for LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> CacheProvider<V> for LruCache<V, T, H>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
         V::record_request();
@@ -295,8 +303,9 @@ impl<
 #[async_trait]
 impl<
     V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
-> TabledCacheProvider<V> for LruCache<V, T>
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> TabledCacheProvider<V> for LruCache<V, T, H>
 {
     fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = match &table_ref {
@@ -384,11 +393,15 @@ mod tests {
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
+    #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_put_and_get<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _> =
+        let cache: LruCache<CachedQueryResult, _, _> =
             LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
@@ -411,9 +424,15 @@ mod tests {
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
+    #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: LruCache<CachedQueryResult, _> =
+    async fn test_cache_miss<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
+        #[case] hasher: T,
+    ) {
+        let cache: LruCache<CachedQueryResult, _, _> =
             LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
@@ -428,11 +447,15 @@ mod tests {
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
+    #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_invalidate_for_table<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_invalidate_for_table<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _> =
+        let cache: LruCache<CachedQueryResult, _, _> =
             LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
@@ -467,13 +490,15 @@ mod tests {
     #[rstest]
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
+    #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
     #[tokio::test]
     async fn test_search_cache_invalidate_for_table<
-        T: BuildHasher + Clone + Send + Sync + 'static,
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedSearchResult, _> =
+        let cache: LruCache<CachedSearchResult, _, _> =
             LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
@@ -513,7 +538,7 @@ mod tests {
     async fn test_cache_ttl(#[case] hashing_algo: HashingAlgorithm) {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
-        let cache: LruCache<CachedQueryResult, _> =
+        let cache: LruCache<CachedQueryResult, _, _> =
             LruCache::new(10, Duration::from_millis(100), hasher, CachingPolicy::Lru);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
@@ -548,7 +573,7 @@ mod tests {
     async fn test_cache_ttl_xhash(#[case] hashing_algo: HashingAlgorithm) {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
-        let cache: LruCache<CachedQueryResult, _> =
+        let cache: LruCache<CachedQueryResult, _, _> =
             LruCache::new(10, Duration::from_millis(100), hasher, CachingPolicy::Lru);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
@@ -580,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_with_caching_policy(#[case] caching_policy: CachingPolicy) {
         let hasher = RandomState::default();
-        let cache: LruCache<CachedQueryResult, _> =
+        let cache: LruCache<CachedQueryResult, _, _> =
             LruCache::new(10, Duration::from_secs(60), hasher, caching_policy);
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
