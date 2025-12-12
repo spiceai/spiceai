@@ -26,7 +26,7 @@ pub fn get_arrow_binary_record_batch() -> (RecordBatch, SchemaRef) {
     )]));
 
     let record_batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(binary_array)])
-        .expect("Failed to created arrow binary record batch");
+        .expect("failed to create arrow binary record batch");
 
     (record_batch, schema)
 }
@@ -46,7 +46,7 @@ pub fn get_arrow_large_binary_record_batch() -> (RecordBatch, SchemaRef) {
 
     let record_batch =
         RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(large_binary_array)])
-            .expect("Failed to created arrow binary record batch");
+            .expect("failed to create arrow binary record batch");
 
     (record_batch, schema)
 }
@@ -67,7 +67,7 @@ pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
 
     let record_batch =
         RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(fixed_size_binary_array)])
-            .expect("Failed to created arrow binary record batch");
+            .expect("failed to create arrow binary record batch");
 
     (record_batch, schema)
 }
@@ -109,7 +109,7 @@ pub fn get_arrow_int_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(uint64_arr),
         ],
     )
-    .expect("Failed to created arrow binary record batch");
+    .expect("failed to create arrow binary record batch");
 
     (record_batch, schema)
 }
@@ -130,7 +130,7 @@ pub fn get_arrow_float_record_batch() -> (RecordBatch, SchemaRef) {
         Arc::clone(&schema),
         vec![Arc::new(float32_arr), Arc::new(float64_arr)],
     )
-    .expect("Failed to created arrow float record batch");
+    .expect("failed to create arrow float record batch");
 
     (record_batch, schema)
 }
@@ -157,7 +157,7 @@ pub fn get_arrow_utf8_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(bool_arr),
         ],
     )
-    .expect("Failed to created arrow utf8 record batch");
+    .expect("failed to create arrow utf8 record batch");
 
     (record_batch, schema)
 }
@@ -217,7 +217,7 @@ pub fn get_arrow_time_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(time64_nano_array),
         ],
     )
-    .expect("Failed to created arrow time record batch");
+    .expect("failed to create arrow time record batch");
 
     (record_batch, schema)
 }
@@ -279,7 +279,7 @@ pub fn get_arrow_timestamp_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(timestamp_nano_array),
         ],
     )
-    .expect("Failed to created arrow timestamp record batch");
+    .expect("failed to create arrow timestamp record batch");
 
     (record_batch, schema)
 }
@@ -337,7 +337,7 @@ pub fn get_arrow_timestamp_record_batch_without_timezone() -> (RecordBatch, Sche
             Arc::new(timestamp_nano_array),
         ],
     )
-    .expect("Failed to created arrow timestamp record batch");
+    .expect("failed to create arrow timestamp record batch");
 
     (record_batch, schema)
 }
@@ -365,7 +365,7 @@ pub fn get_arrow_date_record_batch() -> (RecordBatch, SchemaRef) {
         Arc::clone(&schema),
         vec![Arc::new(date32_array), Arc::new(date64_array)],
     )
-    .expect("Failed to created arrow date record batch");
+    .expect("failed to create arrow date record batch");
 
     (record_batch, schema)
 }
@@ -430,7 +430,7 @@ pub fn get_arrow_struct_record_batch() -> (RecordBatch, SchemaRef) {
     let struct_array = struct_builder.finish();
 
     let record_batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(struct_array)])
-        .expect("Failed to created arrow struct record batch");
+        .expect("failed to create arrow struct record batch");
 
     (record_batch, schema)
 }
@@ -452,7 +452,7 @@ pub fn get_arrow_decimal_record_batch() -> (RecordBatch, SchemaRef) {
         Arc::clone(&schema),
         vec![Arc::new(decimal128_array), Arc::new(decimal256_array)],
     )
-    .expect("Failed to created arrow decimal record batch");
+    .expect("failed to create arrow decimal record batch");
 
     (record_batch, schema)
 }
@@ -493,7 +493,7 @@ pub fn get_arrow_duration_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(duration_sec_array),
         ],
     )
-    .expect("Failed to created arrow duration record batch");
+    .expect("failed to create arrow duration record batch");
 
     (record_batch, schema)
 }
@@ -539,7 +539,7 @@ pub fn get_arrow_interval_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(interval_yearmonth_array),
         ],
     )
-    .expect("Failed to created arrow interval record batch");
+    .expect("failed to create arrow interval record batch");
 
     (record_batch, schema)
 }
@@ -600,7 +600,7 @@ pub fn get_arrow_list_record_batch() -> (RecordBatch, SchemaRef) {
             Arc::new(fixed_size_list_array),
         ],
     )
-    .expect("Failed to created arrow list record batch");
+    .expect("failed to create arrow list record batch");
 
     (record_batch, schema)
 }
@@ -747,7 +747,7 @@ pub fn get_arrow_null_record_batch() -> (RecordBatch, SchemaRef) {
     let null_arr = Int8Array::from(vec![Some(1), None, Some(3)]);
     let schema = Arc::new(Schema::new(vec![Field::new("int8", DataType::Int8, true)]));
     let record_batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(null_arr)])
-        .expect("Failed to created arrow null record batch");
+        .expect("failed to create arrow null record batch");
     (record_batch, schema)
 }
 
@@ -768,7 +768,7 @@ pub fn get_arrow_bytea_array_record_batch() -> (RecordBatch, SchemaRef) {
 
     let record_batch =
         RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(bytea_array_builder)])
-            .expect("Failed to created arrow bytea array record batch");
+            .expect("failed to create arrow bytea array record batch");
 
     (record_batch, schema)
 }
@@ -789,7 +789,7 @@ pub fn get_arrow_dictionary_array_record_batch() -> (RecordBatch, SchemaRef) {
     )]));
 
     let record_batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)])
-        .expect("Failed to created arrow dictionary array record batch");
+        .expect("failed to create arrow dictionary array record batch");
 
     (record_batch, schema)
 }
@@ -819,7 +819,7 @@ pub fn get_arrow_map_record_batch() -> (RecordBatch, SchemaRef) {
         true,
     )]));
     let rb = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(map_array)])
-        .expect("Failed to created arrow Map array record batch");
+        .expect("failed to create arrow Map array record batch");
     (rb, schema)
 }
 
