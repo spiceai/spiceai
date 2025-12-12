@@ -226,9 +226,12 @@ impl EmbeddingModels {
     }
 }
 
-#[cfg(feature = "extended_tests")]
 #[rstest]
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn test_megascience_permutations(
     #[values(VectorEngineOptions::NoVectorEngine)] vector_engine: VectorEngineOptions,
     #[values(
@@ -558,7 +561,7 @@ pub(crate) async fn run_search(
                             omit_expression => true,
                             description => sql.clone()
                         }, {
-                            insta::assert_json_snapshot!(format!("{app_name}_{test_name}"), resp)
+                            insta::assert_json_snapshot!(format!("{app_name}_{test_name}"), resp);
                         });
 
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
@@ -574,7 +577,7 @@ pub(crate) async fn run_search(
                             omit_expression => true,
                             description => sql
                         }, {
-                            insta::assert_snapshot!(format!("{app_name}_{test_name}_explain"), disp)
+                            insta::assert_snapshot!(format!("{app_name}_{test_name}_explain"), disp);
                         });
                     }
                 }
