@@ -40,6 +40,8 @@ jobs:
       - name: Resolve run metadata
         id: resolve
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          INPUT_RUN_ID: ${{ inputs.run_id }}
         with:
           script: |
             let run;

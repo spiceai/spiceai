@@ -34,12 +34,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/dustin/go-humanize"
 	"github.com/klauspost/compress/zstd"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/gospice/v7"
+	"github.com/spiceai/gospice/v8"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	rtcontext "github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
@@ -306,7 +306,7 @@ func runCloudREPL(cmd *cobra.Command, apiKey string) error {
 
 		var results []string
 		for reader.Next() {
-			record := reader.Record()
+			record := reader.RecordBatch()
 			if record.NumCols() == 0 {
 				continue
 			}
@@ -419,7 +419,7 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 
 		var results []string
 		for reader.Next() {
-			record := reader.Record()
+			record := reader.RecordBatch()
 			if record.NumCols() == 0 {
 				continue
 			}
@@ -962,7 +962,7 @@ func displayArrowResults(reader array.RecordReader) (int, uint64, error) {
 
 	// Read all records and collect data
 	for reader.Next() {
-		record := reader.Record()
+		record := reader.RecordBatch()
 
 		// Calculate size of this record batch
 		for i := 0; i < int(record.NumCols()); i++ {

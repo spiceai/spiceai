@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use serde::{Deserialize, Serialize};
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -126,26 +127,19 @@ pub struct PartitionStats {
     pub file_size_bytes: i64,
 }
 
+/// Which compression strategy to use for the Vortex layout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum CompressionStrategy {
+    /// Uses the default Vortex Btrblocks compression.
+    #[default]
+    Btrblocks,
+    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    Zstd,
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[expect(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
-    /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
-    pub enable_alp: bool,
-    /// Enable FSST (Fast String Suffix Trie) encoding for string columns
-    pub enable_fsst: bool,
-    /// Enable `BitPacking` encoding for integer columns
-    pub enable_bitpacking: bool,
-    /// Enable Delta encoding for sequential data
-    pub enable_delta: bool,
-    /// Enable Run-Length Encoding (RLE)
-    pub enable_rle: bool,
-    /// Enable Dictionary encoding for low-cardinality columns
-    pub enable_dict: bool,
-    /// Enable Frame-of-Reference (FOR) encoding
-    pub enable_for: bool,
-    /// Enable `ZigZag` encoding for signed integers
-    pub enable_zigzag: bool,
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
     /// Segment cache size in MB
@@ -157,28 +151,14 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Compression strategy to use for Vortex files
+    /// Defaults to Btrblocks
+    pub compression_strategy: CompressionStrategy,
 }
 
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Enable encodings optimized for read performance
-            // ALP: Excellent for floating-point queries (SIMD-friendly decompression)
-            enable_alp: true,
-            // FSST: Fast string decompression, good for string-heavy workloads
-            enable_fsst: true,
-            // BitPacking: Very fast SIMD decompression for integers
-            enable_bitpacking: true,
-            // Delta: Disable for reads - requires sequential decompression
-            enable_delta: false,
-            // RLE: Enable for low-cardinality/repeated values (very fast scans)
-            enable_rle: true,
-            // Dictionary: Enable for low-cardinality columns (fast lookups)
-            enable_dict: true,
-            // FOR: Fast integer decompression, SIMD-friendly
-            enable_for: true,
-            // ZigZag: Minimal overhead, keep enabled for signed integers
-            enable_zigzag: true,
             // Larger caches improve read performance
             footer_cache_mb: 128,
             segment_cache_mb: 256,
@@ -186,6 +166,7 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 128,
             // No sort columns by default
             sort_columns: Vec::new(),
+            compression_strategy: CompressionStrategy::default(),
         }
     }
 }

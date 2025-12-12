@@ -470,10 +470,24 @@ fn add_all_descendants_to_blocked(
     Ok(())
 }
 
+#[expect(clippy::cast_sign_loss, reason = "Negative case handled above")]
 pub fn datetime_to_system_time(dt: DateTime) -> SystemTime {
     let secs = dt.secs();
     let subsec_nanos = dt.subsec_nanos();
-    UNIX_EPOCH + Duration::new(secs.try_into().unwrap_or(0), subsec_nanos)
+
+    // Handle negative timestamps (pre-1970) by subtracting from UNIX_EPOCH
+    if secs < 0 {
+        let abs_secs = secs.unsigned_abs();
+        // For negative times, we need to handle subsec_nanos properly:
+        // If we have -1.5 seconds, that's UNIX_EPOCH - 2 seconds + 500ms
+        if subsec_nanos > 0 {
+            UNIX_EPOCH - Duration::new(abs_secs - 1, 1_000_000_000 - subsec_nanos)
+        } else {
+            UNIX_EPOCH - Duration::new(abs_secs, 0)
+        }
+    } else {
+        UNIX_EPOCH + Duration::new(secs as u64, subsec_nanos)
+    }
 }
 
 #[cfg(test)]
@@ -1130,6 +1144,310 @@ mod tests {
                         .build(),
                 )
                 .build()
+        }
+    }
+
+    // ========================================
+    // Tests for handle_poll_error()
+    // ========================================
+    mod handle_poll_error {
+        use super::*;
+
+        #[test]
+        fn test_handle_poll_error_shard_not_found() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let result = state.handle_poll_error("nonexistent-shard", Error::Timeout);
+
+            assert!(result.is_err());
+            if let Err(Error::UnexpectedShardId { shard_id }) = result {
+                assert_eq!(shard_id, "nonexistent-shard");
+            } else {
+                panic!("Expected UnexpectedShardId error");
+            }
+        }
+
+        #[test]
+        fn test_handle_poll_error_retriable_timeout_keeps_shard_active() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "100".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: None,
+                },
+            );
+
+            let result = state.handle_poll_error("shard-1", Error::Timeout);
+
+            assert!(result.is_ok());
+            let poll_result = result.expect("result");
+            assert_eq!(poll_result.shard_id, "shard-1");
+            assert!(matches!(poll_result.outcome, PollOutcome::Failed));
+            assert_eq!(poll_result.last_checkpoint.sequence_number, "100");
+
+            // Shard should still be active
+            assert!(state.active.contains_key("shard-1"));
+            assert_eq!(state.initializing.len(), 0);
+        }
+
+        #[test]
+        fn test_handle_poll_error_retriable_connection_failure_keeps_shard_active() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "200".to_string(),
+                        parent_id: Some("parent".to_string()),
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: None,
+                },
+            );
+
+            let result = state.handle_poll_error("shard-1", Error::ConnectionFailure);
+
+            result.expect("should be ok");
+            assert!(state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_handle_poll_error_retriable_throttled_keeps_shard_active() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "300".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: None,
+                },
+            );
+
+            let result = state.handle_poll_error("shard-1", Error::Throttled);
+
+            result.expect("should be ok");
+            assert!(state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_handle_poll_error_iterator_expired_moves_to_initializing() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let checkpoint_time = SystemTime::now();
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "old-iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "500".to_string(),
+                        parent_id: Some("parent".to_string()),
+                        updated_at: checkpoint_time,
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: Some(checkpoint_time),
+                },
+            );
+
+            let result = state.handle_poll_error("shard-1", Error::IteratorExpired);
+
+            assert!(result.is_ok());
+            let poll_result = result.expect("result");
+            assert_eq!(poll_result.shard_id, "shard-1");
+            assert!(matches!(poll_result.outcome, PollOutcome::Failed));
+            assert_eq!(poll_result.last_checkpoint.sequence_number, "500");
+
+            // Shard should be moved to initializing
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(state.initializing.contains_key("shard-1"));
+
+            let init_shard = state
+                .initializing
+                .get("shard-1")
+                .expect("shard in initializing");
+            assert_eq!(init_shard.shard_id, "shard-1");
+            assert_eq!(init_shard.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(init_shard.last_checkpoint.sequence_number, "500");
+            assert_eq!(init_shard.current_watermark, Some(checkpoint_time));
+        }
+
+        #[test]
+        fn test_handle_poll_error_permanent_error_returns_error() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "100".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: None,
+                },
+            );
+
+            let result = state.handle_poll_error("shard-1", Error::StreamBeyondRetention);
+
+            assert!(result.is_err());
+            assert!(matches!(result, Err(Error::StreamBeyondRetention)));
+
+            // Shard should still be active (error is propagated, not handled)
+            assert!(state.active.contains_key("shard-1"));
+        }
+
+        #[test]
+        fn test_handle_poll_error_preserves_watermark_in_result() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let watermark = SystemTime::now();
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "100".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: Some(watermark),
+                },
+            );
+
+            let result = state.handle_poll_error("shard-1", Error::Timeout);
+
+            assert!(result.is_ok());
+            let poll_result = result.expect("result");
+            assert_eq!(poll_result.current_watermark, Some(watermark));
+        }
+    }
+
+    // ========================================
+    // Tests for reinitialize_shard_with_checkpoint()
+    // ========================================
+    mod reinitialize_shard {
+        use super::*;
+
+        #[test]
+        fn test_reinitialize_active_shard() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+            let checkpoint_time = SystemTime::now();
+            let watermark = SystemTime::now();
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: Some("parent".to_string()),
+                    iterator: "old-iter".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "12345".to_string(),
+                        parent_id: Some("parent".to_string()),
+                        updated_at: checkpoint_time,
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: Some(watermark),
+                },
+            );
+
+            state.reinitialize_shard_with_checkpoint("shard-1");
+
+            // Shard should be moved from active to initializing
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(state.initializing.contains_key("shard-1"));
+
+            let init_shard = state
+                .initializing
+                .get("shard-1")
+                .expect("shard in initializing");
+            assert_eq!(init_shard.shard_id, "shard-1");
+            assert_eq!(init_shard.parent_shard_id, Some("parent".to_string()));
+            assert_eq!(init_shard.last_checkpoint.sequence_number, "12345");
+            assert_eq!(
+                init_shard.last_checkpoint.position,
+                CheckpointPosition::After
+            );
+            assert_eq!(init_shard.current_watermark, Some(watermark));
+        }
+
+        #[test]
+        fn test_reinitialize_nonexistent_shard_does_nothing() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.reinitialize_shard_with_checkpoint("nonexistent");
+
+            assert!(state.active.is_empty());
+            assert!(state.initializing.is_empty());
+        }
+
+        #[test]
+        fn test_reinitialize_preserves_other_shards() {
+            let mut state = StreamState::new("arn:aws:stream:test".to_string());
+
+            state.active.insert(
+                "shard-1".to_string(),
+                ActiveShard {
+                    shard_id: "shard-1".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-1".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "100".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: None,
+                },
+            );
+            state.active.insert(
+                "shard-2".to_string(),
+                ActiveShard {
+                    shard_id: "shard-2".to_string(),
+                    parent_shard_id: None,
+                    iterator: "iter-2".to_string(),
+                    last_checkpoint: ShardCheckpoint {
+                        sequence_number: "200".to_string(),
+                        parent_id: None,
+                        updated_at: SystemTime::now(),
+                        position: CheckpointPosition::After,
+                    },
+                    current_watermark: None,
+                },
+            );
+
+            state.reinitialize_shard_with_checkpoint("shard-1");
+
+            // shard-1 should be in initializing
+            assert!(!state.active.contains_key("shard-1"));
+            assert!(state.initializing.contains_key("shard-1"));
+
+            // shard-2 should still be active
+            assert!(state.active.contains_key("shard-2"));
+            assert!(!state.initializing.contains_key("shard-2"));
         }
     }
 
@@ -2651,6 +2969,83 @@ mod tests {
             assert_eq!(parent2.shard_id, "parent-2");
             assert_eq!(parent2.parent_shard_id, None);
             assert_eq!(parent2.iterator, "iter2");
+        }
+    }
+
+    // ========================================
+    // BUG: datetime_to_system_time handles negative timestamps incorrectly
+    // The current implementation uses unwrap_or(0) which silently converts
+    // negative seconds (pre-1970 timestamps) to 0 (Jan 1, 1970).
+    // ========================================
+    mod datetime_to_system_time_tests {
+        use super::*;
+
+        #[test]
+        fn test_datetime_positive_seconds() {
+            let dt = DateTime::from_secs(1_000_000);
+            let result = datetime_to_system_time(dt);
+
+            let expected = UNIX_EPOCH + Duration::from_secs(1_000_000);
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_datetime_zero_seconds() {
+            let dt = DateTime::from_secs(0);
+            let result = datetime_to_system_time(dt);
+
+            assert_eq!(result, UNIX_EPOCH);
+        }
+
+        #[test]
+        fn test_datetime_with_subsec_nanos() {
+            let dt = DateTime::from_secs_and_nanos(100, 500_000_000); // 100.5 seconds
+            let result = datetime_to_system_time(dt);
+
+            let expected = UNIX_EPOCH + Duration::new(100, 500_000_000);
+            assert_eq!(result, expected);
+        }
+
+        /// Verifies that negative timestamps (pre-1970) are correctly handled.
+        /// The implementation subtracts from `UNIX_EPOCH` to get the correct time.
+        #[test]
+        fn test_datetime_negative_seconds_handled_correctly() {
+            // -315_619_200 seconds = approximately 1960-01-01
+            let dt = DateTime::from_secs(-315_619_200);
+            let result = datetime_to_system_time(dt);
+
+            // Negative timestamps should be before UNIX_EPOCH
+            let expected = UNIX_EPOCH - Duration::from_secs(315_619_200);
+            assert_eq!(
+                result, expected,
+                "Pre-1970 timestamps should be correctly represented"
+            );
+
+            // And definitely NOT equal to UNIX_EPOCH
+            assert_ne!(
+                result, UNIX_EPOCH,
+                "Negative seconds should not be silently converted to UNIX_EPOCH"
+            );
+        }
+
+        #[test]
+        fn test_datetime_negative_one_second() {
+            // Test simple case: -1 second should be 1 second before epoch
+            let dt = DateTime::from_secs(-1);
+            let result = datetime_to_system_time(dt);
+
+            let expected = UNIX_EPOCH - Duration::from_secs(1);
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_datetime_negative_with_subsec_nanos() {
+            // -1.5 seconds should be 1.5 seconds before epoch
+            let dt = DateTime::from_secs_and_nanos(-2, 500_000_000); // -1.5 seconds
+            let result = datetime_to_system_time(dt);
+
+            let expected = UNIX_EPOCH - Duration::new(1, 500_000_000);
+            assert_eq!(result, expected);
         }
     }
 }
