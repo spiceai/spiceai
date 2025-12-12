@@ -132,7 +132,7 @@ pub async fn initialize_cluster_executor(
             "authorization",
             format!("Bearer {api_key}")
                 .parse()
-                .map_err(|e| tonic::Status::invalid_argument("Invalid API key"))?,
+                .map_err(|_| tonic::Status::invalid_argument("Invalid API key"))?,
         );
 
         Ok(req)
