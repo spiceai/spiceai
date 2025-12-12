@@ -268,10 +268,15 @@ pub async fn run(args: Args) -> Result<()> {
 
             rt.datafusion().set_cpu_runtime(cpu_runtime);
 
-            // Create a dedicated refresh runtime for acceleration refresh workers.
-            // This isolates refresh workloads from query execution to prevent large refresh
-            // operations from impacting query latency.
-            let refresh_runtime = ManagedTokioRuntime::try_new()
+            // Create a dedicated refresh runtime for acceleration refresh workers and
+            // stale-while-revalidate background cache refresh tasks. This isolates refresh
+            // workloads from query execution to prevent large refresh operations from
+            // impacting query latency.
+            // Uses low thread priority to minimize impact on latency-sensitive operations.
+            let refresh_runtime = ManagedTokioRuntime::builder()
+                .with_low_priority()
+                .with_thread_name("refresh-worker")
+                .build()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
