@@ -48,13 +48,13 @@ fn make_s3_tpch_dataset(name: &str, partition_by: Option<String>) -> Dataset {
         ..Acceleration::default()
     });
 
-    if let Some(partition_by) = partition_by {
-        dataset.acceleration.as_mut().map(|accel| {
-            accel.partition_by = vec![PartitionedBy {
-                name: "expr0".to_string(),
-                expression: partition_by,
-            }];
-        });
+    if let Some(partition_by) = partition_by
+        && let Some(accel) = dataset.acceleration.as_mut()
+    {
+        accel.partition_by = vec![PartitionedBy {
+            name: "expr0".to_string(),
+            expression: partition_by,
+        }];
     }
 
     dataset
