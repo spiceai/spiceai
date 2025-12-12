@@ -1561,7 +1561,7 @@ mod tests {
 
         tracing::debug!("Original Arrow Record Batch: {:?}", arrow_record.columns());
         tracing::debug!(
-            "Duckdb returned Record Batch: {:?}",
+            "Cayenne returned Record Batch: {:?}",
             record_batch[0].columns()
         );
 
