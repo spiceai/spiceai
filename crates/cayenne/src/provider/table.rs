@@ -1497,11 +1497,14 @@ mod tests {
         let cmd_options = HashMap::from([
             (
                 "cayenne_metadata_dir".to_string(),
-                format!("{}/metadata", temp_dir.path().to_str().unwrap()),
+                format!(
+                    "{}/metadata",
+                    temp_dir.path().to_str().expect("should be str")
+                ),
             ),
             (
                 "cayenne_data_dir".to_string(),
-                format!("{}/data", temp_dir.path().to_str().unwrap()),
+                format!("{}/data", temp_dir.path().to_str().expect("should be str")),
             ),
         ]);
 
@@ -1509,8 +1512,8 @@ mod tests {
         let cmd = CreateExternalTable {
             schema: Arc::new(arrow_record.schema().to_dfschema().expect("to df schema")),
             name: table_name.into(),
-            location: "".to_string(),
-            file_type: "".to_string(),
+            location: String::new(),
+            file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
             definition: None,
@@ -1552,7 +1555,8 @@ mod tests {
             .expect("DataFrame should be created from query");
 
         let record_batch = df.collect().await.expect("RecordBatch should be collected");
-        let casted_record = try_cast_to(record_batch[0].clone(), source_schema).unwrap();
+        let casted_record =
+            try_cast_to(record_batch[0].clone(), source_schema).expect("should cast record batch");
 
         tracing::debug!("Original Arrow Record Batch: {:?}", arrow_record.columns());
         tracing::debug!(
@@ -1570,7 +1574,7 @@ mod tests {
     #[rstest]
     #[case::binary(get_arrow_binary_record_batch(), "binary")]
     #[case::binary(get_arrow_large_binary_record_batch(), "large_binary")]
-    #[ignore] // Vortex does not support fixed size binary yet
+    #[ignore = "Vortex does not support fixed size binary yet"]
     #[case::binary(get_arrow_fixed_sized_binary_record_batch(), "fixed_size_binary")]
     #[case::int(get_arrow_int_record_batch(), "int")]
     #[case::float(get_arrow_float_record_batch(), "float")]
@@ -1580,9 +1584,9 @@ mod tests {
     #[case::date(get_arrow_date_record_batch(), "date")]
     #[case::struct_type(get_arrow_struct_record_batch(), "struct")]
     #[case::decimal(get_arrow_decimal_record_batch(), "decimal")]
-    #[ignore] // Vortex does not support interval yet
+    #[ignore = "Vortex does not support interval yet"]
     #[case::interval(get_arrow_interval_record_batch(), "interval")]
-    #[ignore] // Vortex does not support duration yet
+    #[ignore = "Vortex does not support duration yet"]
     #[case::duration(get_arrow_duration_record_batch(), "duration")]
     #[case::list(get_arrow_list_record_batch(), "list")]
     #[case::null(get_arrow_null_record_batch(), "null")]
@@ -1592,7 +1596,7 @@ mod tests {
         "list_of_fixed_size_lists"
     )]
     #[case::list_of_lists(get_arrow_list_of_lists_record_batch(), "list_of_lists")]
-    #[ignore] // Vortex does not support map yet
+    #[ignore = "Vortex does not support map yet"]
     #[case::map(get_arrow_map_record_batch(), "map")]
     #[case::dictionary(get_arrow_dictionary_array_record_batch(), "dictionary")]
     #[test_log::test(tokio::test)]
