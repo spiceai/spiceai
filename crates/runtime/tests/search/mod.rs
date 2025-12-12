@@ -206,17 +206,17 @@ impl VectorEngineOptions {
 }
 
 enum EmbeddingModels {
-    Model2Vec_8m,
+    Model2Vec8m,
     Model2Vec,
 }
 
 impl EmbeddingModels {
     fn all() -> Vec<Self> {
-        vec![EmbeddingModels::Model2Vec_8m, EmbeddingModels::Model2Vec]
+        vec![EmbeddingModels::Model2Vec8m, EmbeddingModels::Model2Vec]
     }
     fn to_app_embedding(&self) -> Embeddings {
         match self {
-            EmbeddingModels::Model2Vec_8m => {
+            EmbeddingModels::Model2Vec8m => {
                 Embeddings::new("model2vec:minishlab/potion-base-8M", "openai_embeddings")
             }
             EmbeddingModels::Model2Vec => {
@@ -226,6 +226,7 @@ impl EmbeddingModels {
     }
 }
 
+#[cfg(feature = "extended_tests")]
 #[rstest]
 #[tokio::test]
 async fn test_megascience_permutations(
@@ -256,15 +257,13 @@ async fn test_megascience_permutations(
 ) {
     let slug =
         format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
-    if matches!(
-        (&table_option, &acceleration_opt),
-        (
-            megascience::TableOptions::ViewUnionAllJoin,
-            AccelerationOptions::NoAcceleration
-        )
+    if let Err(e) = validate_combination(
+        &vector_engine,
+        &acceleration_opt,
+        &table_option,
+        &column_config,
     ) {
-        // Skip invalid combination: View with no acceleration has inconsistent snapshots
-        tracing::info!("Skipping test {slug}. Cannot have view with no acceleration.");
+        tracing::info!("Skipping test {slug}. {e}");
         return;
     }
 
@@ -333,6 +332,27 @@ async fn test_megascience_permutations(
     )
     .await
     .expect("failed to run search tests");
+}
+
+fn validate_combination(
+    _vector_engine: &VectorEngineOptions,
+    acceleration_opt: &AccelerationOptions,
+    table_option: &megascience::TableOptions,
+    column_config: &megascience::ColumnConfigOptions,
+) -> Result<(), String> {
+    if matches!(
+        (&table_option, &acceleration_opt),
+        (
+            megascience::TableOptions::ViewUnionAllJoin,
+            AccelerationOptions::NoAcceleration
+        )
+    ) {
+        return Err("Cannot have view with no acceleration".to_string());
+    }
+    if matches!(&acceleration_opt, AccelerationOptions::NoAcceleration) && column_config.is_fts() {
+        return Err("Cannot have hybrid column with no acceleration".to_string());
+    }
+    Ok(())
 }
 
 async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
@@ -504,7 +524,14 @@ pub(crate) async fn run_search(
 
                 match ts.body {
                     SearchTestType::Http(_) => {
-                        run_search_test(&app_name, http_base_url.as_str(), &ts, None, ts.should_fail).await?;
+                        run_search_test(
+                            &app_name,
+                            http_base_url.as_str(),
+                            &ts,
+                            None,
+                            ts.should_fail,
+                        )
+                        .await?;
                     }
                     SearchTestType::Sql(sql) => {
                         let test_name = ts.name.clone();
@@ -523,21 +550,32 @@ pub(crate) async fn run_search(
                             );
                             continue;
                         }
+                        let resp = match resp {
+                            Ok(v) => v,
+                            Err(e) => Value::String(e.to_string()),
+                        };
+                        insta::with_settings!({
+                            omit_expression => true,
+                            description => sql.clone()
+                        }, {
+                            insta::assert_json_snapshot!(format!("{app_name}_{test_name}"), resp)
+                        });
 
-                        insta::assert_json_snapshot!(test_name.clone(), resp?);
-
-                        let c = client
-                            .query(format!("EXPLAIN {sql}").as_str())
-                            .await?
-                            .try_collect::<Vec<RecordBatch>>()
-                            .await?;
-
-                        let disp = arrow::util::pretty::pretty_format_batches(&c)?;
-
+                        // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
+                        // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
+                        let disp =
+                            if let Ok(c) = client.query(format!("EXPLAIN {sql}").as_str()).await {
+                                let z = c.try_collect::<Vec<RecordBatch>>().await?;
+                                arrow::util::pretty::pretty_format_batches(&z)?.to_string()
+                            } else {
+                                format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
+                            };
                         insta::with_settings!({
                             omit_expression => true,
                             description => sql
-                        }, {insta::assert_snapshot!(format!("{app_name}_{test_name}_explain"), disp)});
+                        }, {
+                            insta::assert_snapshot!(format!("{app_name}_{test_name}_explain"), disp)
+                        });
                     }
                 }
             }

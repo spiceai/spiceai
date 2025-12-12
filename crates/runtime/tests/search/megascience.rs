@@ -57,6 +57,16 @@ impl fmt::Display for ColumnConfigOptions {
 }
 
 impl ColumnConfigOptions {
+    pub(crate) fn is_fts(&self) -> bool {
+        matches!(
+            self,
+            ColumnConfigOptions::HybridSingleColumn
+                | ColumnConfigOptions::HybridMultipleColumn
+                | ColumnConfigOptions::TextSearch
+                | ColumnConfigOptions::MultiTextColumn
+                | ColumnConfigOptions::TextSearchMetadata
+        )
+    }
     pub(crate) fn to_columns(&self) -> Vec<Column> {
         match self {
             ColumnConfigOptions::Basic => {
