@@ -74,6 +74,7 @@ mod projects;
 mod pull_requests;
 mod rate_limit;
 mod stargazers;
+mod workflow_runs;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -595,6 +596,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("include_commits")
         .description("Whether to fetch commit information (created_at, updated_at) for files. Set to 'true' to enable.")
         .default("false"),
+    ParameterSpec::component("workflow_logs")
+        .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run.")
+        .default("disabled"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -741,6 +745,7 @@ const REPO_LEVEL_RESOURCES: &[&str] = &[
     "stargazers",
     "projects",
     "files",
+    "workflows",
 ];
 
 /// Parsed GitHub path components
@@ -955,6 +960,51 @@ impl DataConnector for Github {
                     dataset,
                 )
                 .await
+            }
+            ("workflows", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "workflows", &component);
+                
+                // Parse the remaining path: should be workflow_file.yml/runs
+                let remaining = parsed.remaining.as_deref().ok_or_else(|| {
+                    DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "github".to_string(),
+                        source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
+                        connector_component: component.clone(),
+                    }
+                })?;
+
+                let parts: Vec<&str> = remaining.split('/').collect();
+                if parts.len() != 2 || parts[1] != "runs" {
+                    return Err(DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "github".to_string(),
+                        source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
+                        connector_component: component,
+                    });
+                }
+
+                let workflow_id = parts[0];
+                
+                let fetch_logs = dataset
+                    .params
+                    .get("github_workflow_logs")
+                    .is_some_and(|value| value.as_str() == "enabled");
+                
+                let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                    connector_component: component.clone(),
+                })?;
+
+                Ok(Arc::new(
+                    workflow_runs::WorkflowRunsTableProvider::new(
+                        client,
+                        parsed.owner,
+                        repo,
+                        workflow_id,
+                        fetch_logs,
+                        dataset,
+                    )
+                    .await?,
+                ) as Arc<dyn TableProvider>)
             }
             ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);

@@ -723,6 +723,374 @@ impl GithubRestClient {
             Ok(Vec::new())
         }
     }
+
+    #[expect(clippy::too_many_arguments)]
+    pub async fn fetch_workflow_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        workflow_id: &str,
+        query_params: Option<&std::collections::HashMap<String, String>>,
+        limit: Option<usize>,
+        fetch_logs: bool,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rate_limiter.check_rate_limit().await?;
+
+        let endpoint = format!(
+            "https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs"
+        );
+
+        let client = &self.client;
+        let token = &self.token;
+        let rate_limiter = &self.rate_limiter;
+
+        let mut all_runs = Vec::new();
+        let mut page = 1;
+        let per_page = 100; // Maximum allowed by GitHub API
+
+        loop {
+            let mut url = url::Url::parse(&endpoint)?;
+            url.query_pairs_mut()
+                .append_pair("per_page", &per_page.to_string())
+                .append_pair("page", &page.to_string());
+
+            // Add query parameters if provided
+            if let Some(params) = query_params {
+                for (key, value) in params {
+                    url.query_pairs_mut().append_pair(key, value);
+                }
+            }
+
+            let url = url.to_string();
+
+            let response = retry_with_adaptive_backoff(3, rate_limiter, || async {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+                headers.insert(
+                    ACCEPT,
+                    HeaderValue::from_static("application/vnd.github.v3+json"),
+                );
+
+                if let Ok(header) = HeaderValue::from_str(&format!("token {}", token.get_token()))
+                {
+                    headers.insert(AUTHORIZATION, header);
+                }
+
+                tracing::debug!("fetch_workflow_runs: endpoint: {}", url);
+
+                client.get(&url).headers(headers).send().await
+            })
+            .await
+            .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
+                if let Some(status) = e.status() {
+                    let code = status.as_u16();
+                    if (500..600).contains(&code) {
+                        format!(
+                            "GitHub API returned server error ({code}) for endpoint: {endpoint}. Spice automatically retried with fibonacci backoff.",
+                        )
+                        .into()
+                    } else if code == 408 || code == 429 {
+                        format!(
+                            "GitHub API returned rate limit/timeout error ({code}) for endpoint: {endpoint}. Spice automatically retried with exponential backoff.",
+                        )
+                        .into()
+                    } else {
+                        e.into()
+                    }
+                } else {
+                    e.into()
+                }
+            })?;
+
+            rate_limiter.update_from_headers(response.headers()).await;
+
+            if !response.status().is_success() {
+                let response_headers = response.headers().clone();
+                let response_status = response.status().as_u16();
+                let response_json: Value = response.json().await?;
+
+                error_checker(&response_headers, &response_json).map_err(|e| {
+                    if let graphql::Error::RateLimited { message } = e {
+                        Error::RateLimited { message }
+                    } else {
+                        Error::GithubApiError { source: e.into() }
+                    }
+                })?;
+
+                match response_status {
+                    404 => {
+                        return Err(format!(
+                            "The Github API ({endpoint}) failed with status code {response_status}. Verify that org `{owner}`, repo `{repo}` and workflow `{workflow_id}` are correct.",
+                        ).into());
+                    }
+                    401 => {
+                        return Err(format!(
+                            "The Github API ({endpoint}) failed with status code {response_status}. Verify the token is correct.",
+                        ).into());
+                    }
+                    403 => {
+                        return Err(format!(
+                            "The Github API ({endpoint}) failed with status code {response_status}. Verify the token has the necessary permissions.",
+                        ).into());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "The Github API ({endpoint}) failed with status code {response_status}",
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            let runs_response: WorkflowRunsResponse = response.json().await?;
+
+            if runs_response.workflow_runs.is_empty() {
+                break;
+            }
+
+            let num_runs = runs_response.workflow_runs.len();
+            all_runs.extend(runs_response.workflow_runs);
+
+            // Check if we've reached the limit
+            if let Some(limit) = limit {
+                if all_runs.len() >= limit {
+                    all_runs.truncate(limit);
+                    break;
+                }
+            }
+
+            // If we got fewer than per_page results, we've reached the end
+            if num_runs < per_page {
+                break;
+            }
+
+            page += 1;
+        }
+
+        // Fetch logs for each run if requested
+        let run_logs = if fetch_logs {
+            let mut logs_map = std::collections::HashMap::new();
+            for run in &all_runs {
+                match self.fetch_workflow_run_logs(owner, repo, run.id).await {
+                    Ok(logs) => {
+                        logs_map.insert(run.id, logs);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch logs for workflow run {}: {}", run.id, e);
+                        logs_map.insert(run.id, std::collections::HashMap::new());
+                    }
+                }
+            }
+            Some(logs_map)
+        } else {
+            None
+        };
+
+        // Build the RecordBatch from the collected runs
+        let mut id_builder = arrow::array::Int64Builder::new();
+        let mut name_builder = arrow::array::StringBuilder::new();
+        let mut head_branch_builder = arrow::array::StringBuilder::new();
+        let mut head_sha_builder = arrow::array::StringBuilder::new();
+        let mut run_number_builder = arrow::array::Int64Builder::new();
+        let mut display_title_builder = arrow::array::StringBuilder::new();
+        let mut event_builder = arrow::array::StringBuilder::new();
+        let mut status_builder = arrow::array::StringBuilder::new();
+        let mut conclusion_builder = arrow::array::StringBuilder::new();
+        let mut workflow_id_builder = arrow::array::Int64Builder::new();
+        let mut run_started_at_builder = arrow::array::TimestampMillisecondBuilder::new();
+        let mut jobs_url_builder = arrow::array::StringBuilder::new();
+
+        for run in &all_runs {
+            id_builder.append_value(run.id);
+            match &run.name {
+                Some(name) => name_builder.append_value(name),
+                None => name_builder.append_null(),
+            }
+            match &run.head_branch {
+                Some(branch) => head_branch_builder.append_value(branch),
+                None => head_branch_builder.append_null(),
+            }
+            head_sha_builder.append_value(&run.head_sha);
+            run_number_builder.append_value(run.run_number);
+            display_title_builder.append_value(&run.display_title);
+            event_builder.append_value(&run.event);
+            match &run.status {
+                Some(status) => status_builder.append_value(status),
+                None => status_builder.append_null(),
+            }
+            match &run.conclusion {
+                Some(conclusion) => conclusion_builder.append_value(conclusion),
+                None => conclusion_builder.append_null(),
+            }
+            workflow_id_builder.append_value(run.workflow_id);
+            match &run.run_started_at {
+                Some(timestamp) => {
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp) {
+                        run_started_at_builder.append_value(dt.timestamp_millis());
+                    } else {
+                        run_started_at_builder.append_null();
+                    }
+                }
+                None => run_started_at_builder.append_null(),
+            }
+            jobs_url_builder.append_value(&run.jobs_url);
+        }
+
+        let mut fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("head_branch", DataType::Utf8, true),
+            Field::new("head_sha", DataType::Utf8, false),
+            Field::new("run_number", DataType::Int64, false),
+            Field::new("display_title", DataType::Utf8, false),
+            Field::new("event", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("conclusion", DataType::Utf8, true),
+            Field::new("workflow_id", DataType::Int64, false),
+            Field::new(
+                "run_started_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("jobs_url", DataType::Utf8, false),
+        ];
+
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(name_builder.finish()),
+            Arc::new(head_branch_builder.finish()),
+            Arc::new(head_sha_builder.finish()),
+            Arc::new(run_number_builder.finish()),
+            Arc::new(display_title_builder.finish()),
+            Arc::new(event_builder.finish()),
+            Arc::new(status_builder.finish()),
+            Arc::new(conclusion_builder.finish()),
+            Arc::new(workflow_id_builder.finish()),
+            Arc::new(run_started_at_builder.finish()),
+            Arc::new(jobs_url_builder.finish()),
+        ];
+
+        if let Some(logs_map) = run_logs {
+            use arrow::array::{MapBuilder, StringBuilder as MapStringBuilder};
+
+            fields.push(Field::new(
+                "logs",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("keys", DataType::Utf8, false),
+                                Field::new("values", DataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ));
+
+            let mut map_builder =
+                MapBuilder::new(None, MapStringBuilder::new(), MapStringBuilder::new());
+
+            for run in &all_runs {
+                if let Some(logs) = logs_map.get(&run.id) {
+                    for (key, value) in logs {
+                        map_builder.keys().append_value(key);
+                        map_builder.values().append_value(value);
+                    }
+                    map_builder.append(true)?;
+                } else {
+                    map_builder.append(false)?;
+                }
+            }
+
+            columns.push(Arc::new(map_builder.finish()));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+
+        let record_batch =
+            RecordBatch::try_new(schema, columns).context(UnableToConstructRecordBatchSnafu)?;
+
+        Ok(vec![record_batch])
+    }
+
+    pub async fn fetch_workflow_run_logs(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: i64,
+    ) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        self.rate_limiter.check_rate_limit().await?;
+
+        let endpoint =
+            format!("https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/logs");
+
+        let client = &self.client;
+        let token = &self.token;
+        let rate_limiter = &self.rate_limiter;
+
+        // GitHub returns a redirect to the actual ZIP file location
+        let response = retry_with_adaptive_backoff(3, rate_limiter, || async {
+            let mut headers = HeaderMap::new();
+            headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/vnd.github.v3+json"),
+            );
+
+            if let Ok(header) = HeaderValue::from_str(&format!("token {}", token.get_token())) {
+                headers.insert(AUTHORIZATION, header);
+            }
+
+            tracing::debug!("fetch_workflow_run_logs: endpoint: {}", endpoint);
+
+            // Don't follow redirects automatically - we need to handle them manually
+            client.get(&endpoint).headers(headers).send().await
+        })
+        .await
+        .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+        rate_limiter.update_from_headers(response.headers()).await;
+
+        if !response.status().is_success() {
+            tracing::debug!(
+                "Failed to fetch logs for run {}: status {}",
+                run_id,
+                response.status()
+            );
+            // Return empty map if logs aren't available
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Download the ZIP file
+        let zip_bytes = response.bytes().await?;
+
+        // Parse the ZIP file
+        let cursor = std::io::Cursor::new(zip_bytes);
+        let mut zip = zip::ZipArchive::new(cursor)?;
+
+        let mut logs = std::collections::HashMap::new();
+
+        // Extract only .txt files from the root of the ZIP
+        for i in 0..zip.len() {
+            let mut file = zip.by_index(i)?;
+            let file_name = file.name().to_string();
+
+            // Only process .txt files in the root (no directory separator)
+            if file_name.ends_with(".txt") && !file_name.contains('/') {
+                let mut content = String::new();
+                std::io::Read::read_to_string(&mut file, &mut content)?;
+                logs.insert(file_name, content);
+            }
+        }
+
+        Ok(logs)
+    }
 }
 
 fn extract_name_from_path(path: &str) -> Option<&str> {
@@ -768,6 +1136,28 @@ struct GitCommitDetails {
 #[derive(Debug, Deserialize)]
 struct GitCommitAuthor {
     date: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRunsResponse {
+    pub total_count: i64,
+    pub workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRun {
+    pub id: i64,
+    pub name: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+    pub run_number: i64,
+    pub display_title: String,
+    pub event: String,
+    pub status: Option<String>,
+    pub conclusion: Option<String>,
+    pub workflow_id: i64,
+    pub run_started_at: Option<String>,
+    pub jobs_url: String,
 }
 
 // For GitHub, first checks if an explicit rate limit error was returned, then checks the headers
