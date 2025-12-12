@@ -202,21 +202,22 @@ fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
     };
 
     if let Some(embed) = text_col.embeddings.first() {
-        app.embeddings
-            .iter()
-            .find(|e| e.name == embed.model)
-            .map(|e| {
-                attributes.push(KeyValue::new("vector_search", "true"));
-                attributes.push(KeyValue::new("model", e.from.clone()));
-            });
+        if let Some(e) = app.embeddings.iter().find(|e| e.name == embed.model) {
+            attributes.push(KeyValue::new("vector_search", "true"));
+            attributes.push(KeyValue::new("model", e.from.clone()));
+        } else {
+            attributes.push(KeyValue::new("vector_search", "false"));
+        };
     }
-    if text_col
-        .full_text_search
-        .as_ref()
-        .is_some_and(|fts| fts.enabled)
-    {
-        attributes.push(KeyValue::new("full_text_search", "true"));
-    }
+
+    attributes.push(KeyValue::new(
+        "full_text_search",
+        text_col
+            .full_text_search
+            .as_ref()
+            .is_some_and(|fts| fts.enabled)
+            .to_string(),
+    ));
 
     attributes
 }
