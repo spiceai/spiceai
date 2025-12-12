@@ -735,7 +735,7 @@ impl DataAccelerator for CayenneAccelerator {
             // Non-partitioned table - return base provider directly
             Ok(cayenne_table)
         } else {
-            let partition_by_first = partition_by.first().cloned().ok_or_else(|| {
+            let partition_by_last = partition_by.last().cloned().ok_or_else(|| {
                 Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
             })?;
 
@@ -786,7 +786,7 @@ impl DataAccelerator for CayenneAccelerator {
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
-                partition_by_first,
+                partition_by_last,
                 Arc::clone(&arrow_schema),
                 catalog,
                 table_metadata.table_id,
