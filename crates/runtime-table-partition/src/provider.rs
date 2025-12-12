@@ -115,12 +115,12 @@ impl PartitionTableProvider {
         let num_partition_by = partition_by.len();
         if num_partition_by > 1 {
             tracing::warn!(
-                "Multiple 'partition_by' expressions are not yet supported. Only the first expression will be used for partitioning."
+                "Multiple 'partition_by' expressions are not yet supported. Only the last expression will be used for partitioning."
             );
         }
 
         let partition_by = partition_by
-            .first()
+            .pop()
             .context(PartitionByViolationSnafu { num_partition_by })?;
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
