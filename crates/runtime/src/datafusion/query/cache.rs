@@ -320,13 +320,7 @@ impl Query {
                     CacheKey::LogicalPlan(p) => Some(*p),
                     _ => None,
                 };
-                Self::trigger_background_query_revalidation(
-                    Arc::clone(df),
-                    sql,
-                    request_context,
-                    plan,
-                    raw_key,
-                );
+                Self::trigger_background_query_revalidation(Arc::clone(df), sql, plan, raw_key);
             }
         }
 
@@ -393,37 +387,16 @@ impl Query {
     /// - The `DataFusion` context is dropped (runtime shutdown)
     /// - The query execution is interrupted via the session context
     ///
-    /// Creates a background request context for cache revalidation
+    /// Creates a background request context for cache revalidation.
     ///
-    /// Takes the original request context and cache key to create a new background context
-    /// that uses a client-supplied cache key. This ensures the revalidation query uses the
-    /// exact same cache key as the original query.
-    fn create_background_context(
-        request_context: &Arc<RequestContext>,
-        cache_key: RawCacheKey,
-    ) -> Arc<RequestContext> {
-        // Create a background request context with a client-supplied cache key to ensure
-        // the revalidation query uses the exact same cache key as the original query.
-        // This allows the query to go through the normal caching pipeline and naturally
-        // update the cache entry that served stale data.
-        let cache_key_str = cache_key.as_u64().to_string();
-
-        // Convert the original cache control to use ClientSupplied cache key type
-        // For background revalidation, we want to STORE fresh results, so convert
-        // MaxStale to Cache to avoid serving stale data during revalidation
-        let background_cache_control = match request_context.cache_control() {
-            CacheControl::MaxStale(_, _) | CacheControl::Cache(_) => {
-                CacheControl::Cache(CacheKeyType::ClientSupplied)
-            }
-            other @ (CacheControl::NoCache
-            | CacheControl::MinFresh(_, _)
-            | CacheControl::OnlyIfCached(_)) => other,
-        };
-
+    /// Uses `NoCache` to prevent the background query from going through the normal
+    /// cache lookup/store path. This avoids false cache misses and duplicate storage.
+    /// The `cache_revalidation_result` function handles storing results under the correct
+    /// original cache key that triggered the stale-while-revalidate.
+    fn create_background_context() -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
-                .with_cache_control(background_cache_control)
-                .with_client_supplied_cache_key(Some(cache_key_str))
+                .with_cache_control(CacheControl::NoCache)
                 .build(),
         )
     }
@@ -505,7 +478,6 @@ impl Query {
     fn trigger_background_query_revalidation(
         df: Arc<DataFusion>,
         sql: &str,
-        request_context: &Arc<RequestContext>,
         plan: Option<&LogicalPlan>,
         cache_key: RawCacheKey,
     ) {
@@ -523,8 +495,8 @@ impl Query {
 
         let cache_key_u64 = cache_key.as_u64();
 
-        // Create a background request context that will cache results using the same cache key
-        let background_context = Self::create_background_context(request_context, cache_key);
+        // Create a background request context with NoCache to bypass cache lookup
+        let background_context = Self::create_background_context();
 
         // Clone sql and plan for the async block
         let sql_owned = sql.to_string();
