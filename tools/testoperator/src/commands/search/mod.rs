@@ -201,14 +201,14 @@ fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
         return attributes;
     };
 
-    if let Some(embed) = text_col.embeddings.first() {
-        if let Some(e) = app.embeddings.iter().find(|e| e.name == embed.model) {
-            attributes.push(KeyValue::new("vector_search", "true"));
-            attributes.push(KeyValue::new("model", e.from.clone()));
-        } else {
-            attributes.push(KeyValue::new("vector_search", "false"));
-        };
-    }
+    if let Some(embed) = text_col.embeddings.first()
+        && let Some(e) = app.embeddings.iter().find(|e| e.name == embed.model)
+    {
+        attributes.push(KeyValue::new("vector_search", "true"));
+        attributes.push(KeyValue::new("model", e.from.clone()));
+    } else {
+        attributes.push(KeyValue::new("vector_search", "false"));
+    };
 
     attributes.push(KeyValue::new(
         "full_text_search",
