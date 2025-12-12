@@ -16,6 +16,8 @@ runtime:
     captured_plan: explain
     min_plan_duration: 50ms
 
+refresh_check_interval: &refresh_check_interval 3m
+
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
     name: number_info
@@ -30,6 +32,7 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
       enabled: true
+      refresh_check_interval: *refresh_check_interval
       engine: duckdb
       mode: file
       refresh_mode: append
@@ -41,6 +44,7 @@ datasets:
     params: *params_s3
     acceleration:
       enabled: true
+      refresh_check_interval: *refresh_check_interval
       engine: duckdb
       mode: file
       params:
@@ -51,6 +55,7 @@ datasets:
     params: *params_s3
     acceleration:
       enabled: true
+      refresh_check_interval: *refresh_check_interval
       engine: duckdb
       mode: file
       params:
@@ -75,6 +80,7 @@ views:
       order by AccountSid, NumberPoolSid
     acceleration:
       enabled: true
+      refresh_check_interval: *refresh_check_interval
       engine: duckdb
       mode: file
       refresh_on_startup: auto
@@ -115,6 +121,7 @@ views:
       order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
     acceleration:
       enabled: true
+      refresh_check_interval: *refresh_check_interval
       engine: duckdb
       mode: file
       refresh_on_startup: auto
