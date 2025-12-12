@@ -81,11 +81,14 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Databricks](https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md)
      - [ ] [Dremio](https://github.com/spiceai/cookbook/blob/trunk/dremio/README.md)
      - [ ] [DuckDB](https://github.com/spiceai/cookbook/blob/trunk/duckdb/connector/README.md)
+     - [ ] [DynamoDB](https://github.com/spiceai/cookbook/blob/trunk/dynamodb/README.md)
+     - [ ] [DynamoDB (Stream)](https://github.com/spiceai/cookbook/blob/trunk/dynamodb/streams/README.md)
      - [ ] [FTP](https://github.com/spiceai/cookbook/blob/trunk/ftp/README.md)
      - [ ] [File Connector](https://github.com/spiceai/cookbook/blob/trunk/file/README.md)
      - [ ] [GitHub](https://github.com/spiceai/cookbook/blob/trunk/github/README.md)
      - [ ] [Glue](https://github.com/spiceai/cookbook/tree/trunk/glue/README.md)
      - [ ] [GraphQL](https://github.com/spiceai/cookbook/blob/trunk/graphql/README.md)
+     - [ ] [HTTP](https://github.com/spiceai/cookbook/blob/trunk/http/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
      - [ ] [ODBC](https://github.com/spiceai/cookbook/blob/trunk/odbc/README.md)
@@ -105,6 +108,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
+     - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
@@ -123,6 +127,8 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Nvidia NIM](https://github.com/spiceai/cookbook/tree/trunk/nvidia-nim)
      - [ ] [LLM Memory](https://github.com/spiceai/cookbook/tree/trunk/llm-memory)
      - [ ] [Model-Context-Protocol (MCP)](https://github.com/spiceai/cookbook/tree/trunk/mcp)
+     - [ ] [AI SQL Function](https://github.com/spiceai/cookbook/blob/trunk/ai/README.md)
+     - [ ] [Hybrid Search & Real Time Indexing](https://github.com/spiceai/cookbook/blob/trunk/search/README.md)
 
    - **SDK Samples**
      - [ ] [Spice with gospice SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
@@ -144,7 +150,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Cron Dataset Schedules](https://github.com/spiceai/cookbook/blob/trunk/acceleration/cron/README.md)
      - [ ] [Acceleration Snapshots](https://github.com/spiceai/cookbook/blob/trunk/acceleration/snapshots/README.md)
      - [ ] [SQL Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/sql_results/README.md)
-     - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
      - [ ] [Encryption in transit via TLS](https://github.com/spiceai/cookbook/blob/trunk/tls/README.md)
      - [ ] [TPC-H Benchmarking](https://github.com/spiceai/cookbook/blob/trunk/tpc-h/README.md)
      - [ ] [API Key Authentication](https://github.com/spiceai/cookbook/blob/trunk/api_key/README.md)
@@ -152,6 +157,21 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Python ADBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/adbc/README.md)
      - [ ] [Java JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/java/README.md)
      - [ ] [Scala JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/scala/README.md)
+
+## Focus Areas
+
+Based on the [milestone](https://github.com/spiceai/spiceai/milestones) for this release, create testing focus areas and assign 1-2 DRIs responsible for each testing focus area.
+
+Testing focus DRIs are responsible for:
+
+* Reviewing or creating cookbooks for the focus area component
+* Reviewing or creating documentation for the focus area component
+* Running the cookbook for the focus area component
+* Performing additional ad-hoc testing for the focus area component
+
+* Focus area #1:
+  * [ ] DRI
+  * [ ] DRI
 
 ## Final Updates
 

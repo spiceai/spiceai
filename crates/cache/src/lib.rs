@@ -138,7 +138,7 @@ pub enum HashBuilder {
 }
 
 impl std::hash::BuildHasher for HashBuilder {
-    type Hasher = Box<dyn Hasher>;
+    type Hasher = Box<dyn Hasher + Send + Sync + 'static>;
 
     fn build_hasher(&self) -> Self::Hasher {
         match self {
