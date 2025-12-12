@@ -48,8 +48,6 @@ const DELETION_FILE_FORMAT: &str = "arrow_ipc";
 /// `data_file_id`) and contains the logical row IDs to mark as deleted.
 #[derive(Debug)]
 pub struct DeletionVectorWriteSpec {
-    /// Catalog identifier for the virtual data file the deletion vector applies to.
-    pub data_file_id: i64,
     /// Logical row IDs that should be marked as deleted.
     pub row_ids: Vec<i64>,
 }
@@ -57,11 +55,8 @@ pub struct DeletionVectorWriteSpec {
 impl DeletionVectorWriteSpec {
     /// Create a new specification.
     #[must_use]
-    pub fn new(data_file_id: i64, row_ids: Vec<i64>) -> Self {
-        Self {
-            data_file_id,
-            row_ids,
-        }
+    pub fn new(row_ids: Vec<i64>) -> Self {
+        Self { row_ids }
     }
 
     /// Returns `true` if there are no row IDs to write.
@@ -116,10 +111,14 @@ impl<'a> DeletionVectorWriter<'a> {
             }
 
             if spec.row_ids.iter().any(|row_id| *row_id < 0) {
-                return Err(CatalogError::InvalidOperation {
-                    message: format!(
-                        "Deletion vectors require non-negative row IDs, table: {}",
-                        self.table.table_name
+                return Err(CatalogError::NegativeRowId {
+                    row_ids: format!(
+                        "{:?}",
+                        spec.row_ids
+                            .iter()
+                            .filter(|row_id| **row_id < 0)
+                            .copied()
+                            .collect::<Vec<_>>()
                     ),
                 });
             }
@@ -139,13 +138,8 @@ impl<'a> DeletionVectorWriter<'a> {
             let file_size_bytes =
                 write_deletion_file(&file_path, Arc::clone(&schema), batch).await?;
 
-            let delete_file = build_delete_file(
-                self.table,
-                &file_path,
-                spec.data_file_id,
-                spec.row_ids.len(),
-                file_size_bytes,
-            )?;
+            let delete_file =
+                build_delete_file(self.table, &file_path, spec.row_ids.len(), file_size_bytes)?;
 
             results.push(DeletionVectorWriteResult {
                 delete_file,
@@ -184,7 +178,8 @@ fn build_deletion_batch(schema: &SchemaRef, row_ids: &[i64]) -> CatalogResult<Re
         ],
     )
     .map_err(|err| CatalogError::InvalidOperation {
-        message: format!("Failed to build deletion-vector batch: {err}"),
+        message: "Failed to build deletion-vector batch.".to_string(),
+        source: Box::new(err),
     })
 }
 
@@ -204,18 +199,21 @@ async fn write_deletion_file(
             .map_err(|source| CatalogError::IoError { source })?;
         let mut writer = FileWriter::try_new(file, &schema_for_write).map_err(|err| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to initialize deletion vector writer: {err}"),
+                message: "Failed to initialize deletion vector writer.".to_string(),
+                source: Box::new(err),
             }
         })?;
         writer
             .write(&batch_for_write)
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to write deletion vector batch: {err}"),
+                message: "Failed to write deletion vector batch.".to_string(),
+                source: Box::new(err),
             })?;
         writer
             .finish()
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Failed to finish deletion vector file: {err}"),
+                message: "Failed to finish deletion vector file.".to_string(),
+                source: Box::new(err),
             })?;
 
         let metadata =
@@ -230,23 +228,23 @@ async fn write_deletion_file(
 fn build_delete_file(
     table: &TableMetadata,
     file_path: &Path,
-    data_file_id: i64,
     delete_count: usize,
     file_size_bytes: u64,
 ) -> CatalogResult<DeleteFile> {
     let delete_count_i64 =
         i64::try_from(delete_count).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion count overflow ({delete_count}): {err}"),
+            message: format!("Deletion count overflow ({delete_count})."),
+            source: Box::new(err),
         })?;
     let file_size_i64 =
         i64::try_from(file_size_bytes).map_err(|err| CatalogError::InvalidOperation {
-            message: format!("Deletion vector file too large ({file_size_bytes} bytes): {err}"),
+            message: format!("Deletion vector file too large ({file_size_bytes} bytes)."),
+            source: Box::new(err),
         })?;
 
     Ok(DeleteFile {
         delete_file_id: 0,
         table_id: table.table_id,
-        data_file_id,
         path: file_path.to_string_lossy().to_string(),
         path_is_relative: false,
         format: DELETION_FILE_FORMAT.to_string(),
@@ -293,14 +291,13 @@ mod tests {
         let table_metadata = build_table_metadata(&temp_dir);
         let writer = DeletionVectorWriter::new(&table_metadata);
 
-        let specs = vec![DeletionVectorWriteSpec::new(0, vec![3, 1, 3, 2])];
+        let specs = vec![DeletionVectorWriteSpec::new(vec![3, 1, 3, 2])];
         let results = writer.write(specs).await.expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
         let result = &results[0];
         assert_eq!(result.row_ids, vec![1, 2, 3]);
         assert_eq!(result.delete_file.table_id, table_metadata.table_id);
-        assert_eq!(result.delete_file.data_file_id, 0);
         assert_eq!(
             result.delete_file.delete_count,
             i64::try_from(result.row_ids.len()).expect("convert delete count")
@@ -336,14 +333,13 @@ mod tests {
 
         let results = writer
             .write(vec![
-                DeletionVectorWriteSpec::new(0, vec![]),
-                DeletionVectorWriteSpec::new(1, vec![0]),
+                DeletionVectorWriteSpec::new(vec![]),
+                DeletionVectorWriteSpec::new(vec![0]),
             ])
             .await
             .expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].delete_file.data_file_id, 1);
     }
 
     #[tokio::test]
@@ -353,7 +349,7 @@ mod tests {
         let writer = DeletionVectorWriter::new(&table_metadata);
 
         let err = writer
-            .write(vec![DeletionVectorWriteSpec::new(0, vec![1, -5])])
+            .write(vec![DeletionVectorWriteSpec::new(vec![1, -5])])
             .await
             .expect_err("negative row ids should fail");
 

@@ -84,39 +84,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Check if a data type is supported by Vortex natively
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
-    matches!(
+    !matches!(
         data_type,
-        // Vortex requires Microsecond timestamps but we accept all timestamp types and convert them.
-        DataType::Timestamp(_, _)
-            // Float16 will be converted to Float32.
-            | DataType::Float16
-            // Most other basic types are supported as-is.
-            | DataType::Null
-            | DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::List(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::LargeList(_)
-            | DataType::Struct(_)
+        DataType::Interval(_)
+            | DataType::Duration(_)
+            | DataType::Map(_, _)
+            | DataType::FixedSizeBinary(_)
     )
 }
 

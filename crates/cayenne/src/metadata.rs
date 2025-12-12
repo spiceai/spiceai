@@ -83,8 +83,6 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
-    /// Data file this delete file applies to
-    pub data_file_id: i64,
     /// Path to the delete file (Parquet format)
     pub path: String,
     /// Whether the path is relative
@@ -115,15 +113,6 @@ pub struct PartitionMetadata {
     /// Total number of records in this partition
     pub record_count: i64,
     /// Total size of data files in this partition (bytes)
-    pub file_size_bytes: i64,
-}
-
-/// Statistics about a partition for query optimization.
-#[derive(Debug, Clone, Default)]
-pub struct PartitionStats {
-    /// Total number of records
-    pub record_count: i64,
-    /// Total file size in bytes
     pub file_size_bytes: i64,
 }
 
@@ -186,19 +175,4 @@ pub struct CreateTableOptions {
     pub partition_column: Option<String>,
     /// Vortex encoding configuration
     pub vortex_config: VortexConfig,
-}
-
-/// Statistics about a table.
-#[derive(Debug, Clone, Default)]
-pub struct TableStats {
-    /// Total number of records (including deleted ones)
-    pub total_records: i64,
-    /// Number of deleted records
-    pub deleted_records: i64,
-    /// Total size in bytes of all data files
-    pub total_size_bytes: i64,
-    /// Number of active data files
-    pub active_data_files: i64,
-    /// Number of delete files
-    pub delete_files: i64,
 }

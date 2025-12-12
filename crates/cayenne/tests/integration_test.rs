@@ -440,27 +440,7 @@ fn verify_sqlite_metadata(
 
     let conn = Connection::open(db_path)?;
 
-    // 1. Verify cayenne_metadata table has initial metadata
-    let next_catalog_id: i64 = conn.query_row(
-        "SELECT value FROM cayenne_metadata WHERE key = 'next_catalog_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    let next_file_id: i64 = conn.query_row(
-        "SELECT value FROM cayenne_metadata WHERE key = 'next_file_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert!(
-        next_catalog_id >= 2,
-        "Expected next_catalog_id to be at least 2"
-    );
-    assert_eq!(next_file_id, 1, "Expected next_file_id to be 1");
-    println!(
-        "  • Metadata verified: next_catalog_id={next_catalog_id}, next_file_id={next_file_id}"
-    );
-
-    // 2. Verify cayenne_table has the test_table entry
+    // 1. Verify cayenne_table has the test_table entry
     let table_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM cayenne_table", [], |row| row.get(0))?;
     assert_eq!(table_count, 1, "Expected 1 table in cayenne_table");
@@ -516,13 +496,6 @@ fn verify_sqlite_metadata(
         "  • Schema JSON is valid base64 ({} chars)",
         schema_json.len()
     );
-
-    // 4. Verify cayenne_data_file table exists (may be empty if no data files created yet)
-    let data_file_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM cayenne_data_file", [], |row| {
-            row.get(0)
-        })?;
-    println!("  • Data files tracked: {data_file_count}");
 
     // 5. Verify cayenne_delete_file table exists (should be empty for this test)
     let delete_file_count: i64 =
