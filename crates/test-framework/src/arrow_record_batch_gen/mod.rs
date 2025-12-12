@@ -12,6 +12,7 @@ use std::sync::Arc;
 // Helper functions to create arrow record batches of different types
 
 // Binary
+#[must_use]
 pub fn get_arrow_binary_record_batch() -> (RecordBatch, SchemaRef) {
     // Binary Array
     let values: Vec<&[u8]> = vec![b"one", b"two", b""];
@@ -30,6 +31,7 @@ pub fn get_arrow_binary_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // LargeBinary
+#[must_use]
 pub fn get_arrow_large_binary_record_batch() -> (RecordBatch, SchemaRef) {
     // LargeBinary Array
     let values: Vec<&[u8]> = vec![b"one", b"two", b""];
@@ -49,6 +51,7 @@ pub fn get_arrow_large_binary_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // FixedSizeBinary
+#[must_use]
 pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
     // FixedSizeBinary Array
     let input_arg = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
@@ -69,6 +72,7 @@ pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // All Int types
+#[must_use]
 pub fn get_arrow_int_record_batch() -> (RecordBatch, SchemaRef) {
     // Arrow Integer Types
     let int8_arr = Int8Array::from(vec![1, 2, 3]);
@@ -110,6 +114,7 @@ pub fn get_arrow_int_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // All Float Types
+#[must_use]
 pub fn get_arrow_float_record_batch() -> (RecordBatch, SchemaRef) {
     // Arrow Float Types
     let float32_arr = Float32Array::from(vec![1.0, 2.0, 3.0]);
@@ -130,6 +135,7 @@ pub fn get_arrow_float_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // Utf8/LargeUtf8
+#[must_use]
 pub fn get_arrow_utf8_record_batch() -> (RecordBatch, SchemaRef) {
     // Utf8, LargeUtf8 Types
     let string_arr = StringArray::from(vec!["foo", "bar", "baz"]);
@@ -156,8 +162,9 @@ pub fn get_arrow_utf8_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // Time32, Time64
-#[allow(clippy::identity_op)]
-#[allow(clippy::erasing_op)]
+#[expect(clippy::identity_op)]
+#[expect(clippy::erasing_op)]
+#[must_use]
 pub fn get_arrow_time_record_batch() -> (RecordBatch, SchemaRef) {
     // Time32, Time64 Types
     let time32_milli_array: Time32MillisecondArray = vec![
@@ -215,6 +222,7 @@ pub fn get_arrow_time_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // Timestamp (with/without TZ),
+#[must_use]
 pub fn get_arrow_timestamp_record_batch() -> (RecordBatch, SchemaRef) {
     // Timestamp Types
     let timestamp_second_array =
@@ -275,6 +283,7 @@ pub fn get_arrow_timestamp_record_batch() -> (RecordBatch, SchemaRef) {
     (record_batch, schema)
 }
 
+#[must_use]
 pub fn get_arrow_timestamp_record_batch_without_timezone() -> (RecordBatch, SchemaRef) {
     // Timestamp Types
     let timestamp_second_array =
@@ -333,6 +342,7 @@ pub fn get_arrow_timestamp_record_batch_without_timezone() -> (RecordBatch, Sche
 }
 
 // Date32, Date64
+#[must_use]
 pub fn get_arrow_date_record_batch() -> (RecordBatch, SchemaRef) {
     let date32_array = Date32Array::from(vec![
         Date32Type::from_naive_date(NaiveDate::from_ymd_opt(2015, 3, 14).unwrap_or_default()),
@@ -360,6 +370,7 @@ pub fn get_arrow_date_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // struct
+#[must_use]
 pub fn get_arrow_struct_record_batch() -> (RecordBatch, SchemaRef) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "struct",
@@ -424,6 +435,7 @@ pub fn get_arrow_struct_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // Decimal128/Decimal256
+#[must_use]
 pub fn get_arrow_decimal_record_batch() -> (RecordBatch, SchemaRef) {
     let decimal128_array =
         Decimal128Array::from(vec![i128::from(123), i128::from(222), i128::from(321)]);
@@ -444,29 +456,8 @@ pub fn get_arrow_decimal_record_batch() -> (RecordBatch, SchemaRef) {
     (record_batch, schema)
 }
 
-pub fn get_mysql_arrow_decimal_record() -> (RecordBatch, SchemaRef) {
-    let decimal128_array =
-        Decimal128Array::from(vec![i128::from(123), i128::from(222), i128::from(321)]);
-    let decimal256_array =
-        Decimal256Array::from(vec![i256::from(-123), i256::from(222), i256::from(0)])
-            .with_precision_and_scale(65, 10)
-            .expect("Fail to create Decimal256(65, 10) array");
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("decimal128", DataType::Decimal128(38, 10), false),
-        Field::new("decimal256", DataType::Decimal256(65, 10), false), // Maximum is 65.
-    ]));
-
-    let record_batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(decimal128_array), Arc::new(decimal256_array)],
-    )
-    .expect("Failed to created arrow decimal record batch");
-
-    (record_batch, schema)
-}
-
 // Duration
+#[must_use]
 pub fn get_arrow_duration_record_batch() -> (RecordBatch, SchemaRef) {
     let duration_nano_array = DurationNanosecondArray::from(vec![1, 2, 3]);
     let duration_micro_array = DurationMicrosecondArray::from(vec![1, 2, 3]);
@@ -507,6 +498,7 @@ pub fn get_arrow_duration_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // Interval
+#[must_use]
 pub fn get_arrow_interval_record_batch() -> (RecordBatch, SchemaRef) {
     let interval_daytime_array = IntervalDayTimeArray::from(vec![
         IntervalDayTime::new(1, 1000),
@@ -552,6 +544,7 @@ pub fn get_arrow_interval_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 //  List/FixedSizeList/LargeList
+#[must_use]
 pub fn get_arrow_list_record_batch() -> (RecordBatch, SchemaRef) {
     let mut list_builder = ListBuilder::new(Int32Builder::new());
     list_builder.append_value([Some(1), Some(2), Some(3)]);
@@ -611,6 +604,7 @@ pub fn get_arrow_list_record_batch() -> (RecordBatch, SchemaRef) {
     (record_batch, schema)
 }
 
+#[must_use]
 pub fn get_arrow_list_of_structs_record_batch() -> (RecordBatch, SchemaRef) {
     let input_batch_json_data = r#"
             {"labels": [{"id": 1}, {"id": 2}]}
@@ -646,6 +640,7 @@ pub fn get_arrow_list_of_structs_record_batch() -> (RecordBatch, SchemaRef) {
     (record_batch, schema)
 }
 
+#[must_use]
 pub fn get_arrow_list_of_lists_record_batch() -> (RecordBatch, Arc<Schema>) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "list",
@@ -682,6 +677,7 @@ pub fn get_arrow_list_of_lists_record_batch() -> (RecordBatch, Arc<Schema>) {
     (record_batch, schema)
 }
 
+#[must_use]
 pub fn get_arrow_list_of_fixed_size_lists_record_batch() -> (RecordBatch, Arc<Schema>) {
     // Define FixedSizeList field schema
     let fixed_size_list_field = Field::new(
@@ -745,6 +741,7 @@ pub fn get_arrow_list_of_fixed_size_lists_record_batch() -> (RecordBatch, Arc<Sc
 }
 
 // Null
+#[must_use]
 pub fn get_arrow_null_record_batch() -> (RecordBatch, SchemaRef) {
     let null_arr = Int8Array::from(vec![Some(1), None, Some(3)]);
     let schema = Arc::new(Schema::new(vec![Field::new("int8", DataType::Int8, true)]));
@@ -754,6 +751,7 @@ pub fn get_arrow_null_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // BYTEA_ARRAY
+#[must_use]
 pub fn get_arrow_bytea_array_record_batch() -> (RecordBatch, SchemaRef) {
     let mut bytea_array_builder = ListBuilder::new(BinaryBuilder::new());
     bytea_array_builder.append_value([Some(b"1"), Some(b"2"), Some(b"3")]);
@@ -775,6 +773,7 @@ pub fn get_arrow_bytea_array_record_batch() -> (RecordBatch, SchemaRef) {
 }
 
 // DICTIONARY_ARRAY
+#[must_use]
 pub fn get_arrow_dictionary_array_record_batch() -> (RecordBatch, SchemaRef) {
     let mut builder = StringDictionaryBuilder::<Int8Type>::new();
     builder.append_value("happy");
@@ -794,6 +793,7 @@ pub fn get_arrow_dictionary_array_record_batch() -> (RecordBatch, SchemaRef) {
     (record_batch, schema)
 }
 
+#[must_use]
 pub fn get_arrow_map_record_batch() -> (RecordBatch, SchemaRef) {
     let keys = vec!["a", "b", "c", "d", "e", "f", "g", "h"];
     let values_data = UInt32Array::from(vec![
@@ -822,6 +822,7 @@ pub fn get_arrow_map_record_batch() -> (RecordBatch, SchemaRef) {
     (rb, schema)
 }
 
+#[must_use]
 pub fn parse_json_to_batch(json_data: &str, schema: SchemaRef) -> RecordBatch {
     let reader = arrow_json::ReaderBuilder::new(schema)
         .build(std::io::Cursor::new(json_data))
