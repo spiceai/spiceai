@@ -236,6 +236,7 @@ pub async fn initialize_cluster_executor(
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
 
+        // Initialize secrets first so they're available for object store configuration
         executor_bind_app(
             &rt,
             rt.config.cluster.scheduler_url.to_string(),

@@ -287,8 +287,8 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 
-        let partition_by_first = partition_by
-            .first()
+        let partition_by_last = partition_by
+            .last()
             .context(PartitionByRequiredSnafu)?
             .clone();
 
@@ -302,7 +302,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         let creator = Arc::new(DuckDBPartitionCreator::new(
             partition_dir(source),
             cmd,
-            partition_by_first,
+            partition_by_last,
             Arc::clone(&schema),
         ));
         let table_provider =

@@ -352,7 +352,10 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
+    refresh_runtime: OnceLock<ManagedTokioRuntime>,
     io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -628,7 +631,7 @@ impl DataFusion {
         if self.cpu_runtime.set(handle).is_err() {
             // Failure to set means this was already set - that shouldn't happen.
             tracing::error!(
-                "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
+                "Failed to set cpu tokio runtime on the Datafusion struct, this is an unexpected internal error"
             );
         }
     }
@@ -636,6 +639,27 @@ impl DataFusion {
     #[must_use]
     pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
         self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
+    }
+
+    /// Set the dedicated refresh runtime for acceleration refresh workers.
+    /// This runtime is isolated from the query runtime to prevent refresh workloads from impacting query latency.
+    pub fn set_refresh_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.refresh_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set refresh tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// Returns the dedicated refresh runtime for acceleration refresh workers.
+    /// Falls back to `cpu_runtime()` if no dedicated refresh runtime is set.
+    #[must_use]
+    pub fn refresh_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.refresh_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+            .or_else(|| self.cpu_runtime())
     }
 
     async fn get_table_provider(
@@ -1120,7 +1144,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
-        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
+        accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1716,7 +1740,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
-        builder.cpu_runtime(self.cpu_runtime().cloned());
+        builder.cpu_runtime(self.refresh_runtime().cloned());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(

@@ -36,7 +36,6 @@ use test_framework::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
-    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::{observe_memory, recursively_get_dir_size},
 };
@@ -84,7 +83,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     // Create telemetry early before any metrics calls (e.g., HealthMonitor)
     // Resource will be set later with set_resource() before emit()
-    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+    let mut telemetry = super::create_telemetry(&args.common);
 
     let health_monitor = HealthMonitor::spawn()?;
 

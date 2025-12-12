@@ -15,23 +15,26 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{
-    args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper, wait_test_and_memory,
-};
+use crate::{args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
+    app::AppBuilder,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
+    spicepod::Spicepod,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
-    tokio_util::sync::CancellationToken,
+    telemetry::streaming::StreamingOtlpExporter,
     utils::observe_memory,
 };
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 #[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
@@ -41,12 +44,32 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ));
     }
 
-    let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
-    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    // Check if connecting to an external instance or starting a new one
+    let (app, mut spiced_instance) = if args.test_args.common.is_external_instance() {
+        println!(
+            "Connecting to external spiced instance at: {}",
+            args.test_args.common.spiced_path
+        );
+        let spicepod = Spicepod::load_exact(args.test_args.common.spicepod_path.clone()).await?;
+        let app = AppBuilder::new(spicepod.name.clone())
+            .with_spicepod(spicepod)
+            .build();
+        let instance = SpicedInstance::external(&args.test_args.common.spiced_path);
+        (app, instance)
+    } else {
+        let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
+        let instance = SpicedInstance::start(start_request).await?;
+        (app, instance)
+    };
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+
+    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
+    // Resource will be set later with set_resource() before emit()
+    let mut telemetry = super::create_telemetry(&args.test_args.common);
+
     let health_monitor = HealthMonitor::spawn()?;
 
     // Start metrics scraper if enabled
@@ -109,21 +132,43 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     print_batches(&records)?;
     let spiced_instance = test.end()?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    // Memory monitoring is only available for owned spiced instances (not external)
+    let memory_readings = spiced_instance
+        .process()
+        .ok()
+        .map(|p| p.watch_memory(&memory_token));
 
     // load test
     println!("Running load test");
 
-    let (query_set, test_builder) = super::build_test_with_validation(
-        &args.test_args,
-        NotStarted::new()
-            .with_parallel_count(args.test_args.common.concurrency)
-            .with_end_condition(EndCondition::Duration(Duration::from_secs(
-                args.test_args.common.duration,
-            )))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
-    )?;
+    let load_end_condition = if args.run_until_stopped {
+        EndCondition::Unlimited
+    } else {
+        EndCondition::Duration(Duration::from_secs(args.test_args.common.duration))
+    };
+
+    // Create streaming OTLP exporter if OTLP endpoint is configured
+    let streaming_exporter = args
+        .test_args
+        .common
+        .otlp_endpoint
+        .as_ref()
+        .map(|endpoint| StreamingOtlpExporter::spawn(endpoint.clone()));
+
+    let mut test_builder = NotStarted::new()
+        .with_parallel_count(args.test_args.common.concurrency)
+        .with_end_condition(load_end_condition)
+        .with_disable_caching(args.test_args.disable_caching)
+        .with_http_client(args.test_args.http_clients)
+        .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
+
+    // Add streaming metrics sender if exporter is configured
+    if let Some(exporter) = &streaming_exporter {
+        test_builder = test_builder.with_streaming_metrics(exporter.sender());
+    }
+
+    let (query_set, test_builder) =
+        super::build_test_with_validation(&args.test_args, test_builder)?;
 
     // Use the same query overrides that were applied in build_test_with_validation
     let query_overrides = args
@@ -138,12 +183,59 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;
+    let shutdown_token = throughput_test.cancellation_token();
+    let test_future = throughput_test.wait();
+    tokio::pin!(test_future);
+    let test = match tokio::select! {
+        res = &mut test_future => res,
+        _ = signal::ctrl_c() => {
+            println!("Interrupt received, stopping load test...");
+            shutdown_token.cancel();
+            test_future.await
+        }
+    } {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(readings) = memory_readings {
+                let _ = observe_memory(memory_token, readings).await;
+            }
+            return Err(e);
+        }
+    };
+    let _test_durations = test.get_query_durations().statistical_set()?;
 
-    let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
-    let test_durations = test.get_query_durations().clone();
+    // Get all query durations for overall statistics before ending the test
+    let all_durations = test.get_query_durations().clone();
+
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end()?;
-    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
+    let (max_memory, _median_memory) = if let Some(readings) = memory_readings {
+        observe_memory(memory_token, readings).await?
+    } else {
+        println!("Memory monitoring not available for external spiced instances");
+        (0.0, 0.0)
+    };
+
+    // Set up telemetry for load test metrics
+    let commit_sha = metrics.commit_sha.clone();
+    let spiced_version = metrics.spiced_version.clone();
+    let spicepod = args.test_args.common.spicepod_path.display().to_string();
+
+    telemetry.set_resource(
+        Resource::builder()
+            .with_attribute(KeyValue::new("test", "load"))
+            .with_attribute(KeyValue::new("commit_sha", commit_sha.clone()))
+            .with_attribute(KeyValue::new("spiced_version", spiced_version.clone()))
+            .with_attribute(KeyValue::new("spicepod", spicepod.clone()))
+            .build(),
+    );
+
+    let attributes = [
+        KeyValue::new("test", "load"),
+        KeyValue::new("commit_sha", commit_sha),
+        KeyValue::new("spiced_version", spiced_version),
+        KeyValue::new("spicepod", spicepod),
+    ];
 
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;
@@ -156,9 +248,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let health_report = health_monitor.stop().await;
 
     // Stop and process metrics scraper if enabled
-    let attributes = vec![KeyValue::new("test", "load")];
     super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
         .await;
+
+    // Shutdown streaming exporter before emitting final telemetry
+    if let Some(exporter) = streaming_exporter {
+        exporter.shutdown().await;
+    }
+
+    telemetry.emit().await?;
 
     spiced_instance.stop()?;
     let health_report = health_report?;
@@ -171,7 +269,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             continue;
         };
 
-        let Some(duration) = test_durations.get(&query.name) else {
+        let Some(duration) = all_durations.get(&query.name) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
                 query.name
