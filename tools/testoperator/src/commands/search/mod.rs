@@ -134,7 +134,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("spiced_commit_sha", spiced_commit_sha),
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
-        KeyValue::new("config_name", app.name), // use app name as search configuration
+        KeyValue::new("config_name", app.name.clone()), // use app name as search configuration
         KeyValue::new(
             "benchmark_dataset",
             args.benchmark_dataset.clone().unwrap_or_default(),
@@ -181,16 +181,20 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 }
 
 fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
-    let Some(ds) = app.datasets.iter().find(|ds| ds.name() == "corpus") else {
+    let Some(ds) = app.datasets.iter().find(|ds| ds.name == "corpus") else {
         return vec![];
     };
     let mut attributes = vec![];
-    if let Some(engine) = ds.acceleration.map(|acc| acc.engine.unwrap_or("arrow")) {
+    if let Some(engine) = ds
+        .acceleration
+        .as_ref()
+        .map(|acc| acc.engine.clone().unwrap_or("arrow".to_string()))
+    {
         attributes.push(KeyValue::new("engine", engine));
     }
 
-    if let Some(engine_mode) = ds.acceleration.map(|acc| acc.mode) {
-        attributes.push(KeyValue::new("engine_mode", engine_mode));
+    if let Some(acc) = ds.acceleration.as_ref() {
+        attributes.push(KeyValue::new("engine_mode", acc.mode.to_string()));
     }
 
     let Some(text_col) = ds.columns.iter().find(|c| c.name == "text") else {
@@ -198,12 +202,19 @@ fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
     };
 
     if let Some(embed) = text_col.embeddings.first() {
-        app.embeddings.iter().find(|e| e.name == embed).map(|e| {
-            attributes.push(KeyValue::new("vector_search", "true"));
-            attributes.push(KeyValue::new("model", e.from.clone()));
-        });
+        app.embeddings
+            .iter()
+            .find(|e| e.name == embed.model)
+            .map(|e| {
+                attributes.push(KeyValue::new("vector_search", "true"));
+                attributes.push(KeyValue::new("model", e.from.clone()));
+            });
     }
-    if text_col.full_text_search.is_some_and(|fts| fts.enabled) {
+    if text_col
+        .full_text_search
+        .as_ref()
+        .is_some_and(|fts| fts.enabled)
+    {
         attributes.push(KeyValue::new("full_text_search", "true"));
     }
 
