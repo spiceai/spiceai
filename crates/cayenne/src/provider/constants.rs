@@ -16,9 +16,6 @@ limitations under the License.
 
 //! Constants used throughout the Cayenne provider module.
 
-/// Default data file ID used when no specific file is referenced.
-pub const DEFAULT_DATA_FILE_ID: i64 = 0;
-
 /// Error message for poisoned `RwLock` on the listing table.
 ///
 /// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an

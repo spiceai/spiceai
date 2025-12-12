@@ -2997,18 +2997,22 @@ dependencies = [
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
+ "datafusion-federation",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "futures",
  "insta",
  "paste",
  "roaring",
+ "rstest 0.26.1",
  "runtime-datafusion",
  "rusqlite",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
+ "test-framework",
+ "test-log",
  "tokio",
  "tracing",
  "turso",
@@ -15736,6 +15740,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow",
+ "arrow-json",
  "async-openai",
  "async-trait",
  "chrono",
@@ -15771,6 +15776,28 @@ dependencies = [
  "tonic 0.13.1",
  "util",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "test-log"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37d53ac171c92a39e4769491c4b4dde7022c60042254b5fc044ae409d34a24d4"
+dependencies = [
+ "env_logger",
+ "test-log-macros",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "test-log-macros"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be35209fd0781c5401458ab66e4f98accf63553e8fae7425503e92fdd319783b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
 ]
 
 [[package]]

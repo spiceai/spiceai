@@ -28,6 +28,7 @@ mod abfs;
 mod acceleration;
 mod cache;
 mod catalog;
+mod cayenne;
 #[cfg(feature = "duckdb")]
 mod clickbench;
 mod cors;
