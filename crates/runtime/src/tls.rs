@@ -20,7 +20,6 @@ use rustls::{
 };
 use rustls_pemfile::{certs, private_key};
 use secrecy::{ExposeSecret, SecretBox};
-use snafu::ResultExt;
 use std::{
     io::{self, Cursor},
     sync::Arc,

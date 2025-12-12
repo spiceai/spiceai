@@ -1,10 +1,18 @@
 use crate::tls::Error;
-use crate::{ArrowFlightSnafu, UnableToConnectToServerSnafu, tls};
+use crate::{ArrowFlightSnafu, UnableToConnectToServerSnafu};
 use snafu::ResultExt;
 use std::str::FromStr;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
 /// Makes an `arrow_flight::FlightClient` with optional authorization header
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The endpoint string cannot be parsed as a valid URI
+/// - The TLS configuration cannot be applied
+/// - The connection to the server fails
+/// - The authorization header cannot be added
 pub async fn make_arrow_flight_client(
     endpoint: &str,
     api_key: Option<String>,

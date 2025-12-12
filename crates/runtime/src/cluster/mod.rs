@@ -1,5 +1,4 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
-use crate::auth::EndpointAuth;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
@@ -8,11 +7,8 @@ use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
 };
 use ::datafusion::execution::SessionStateBuilder;
-use ::datafusion::physical_optimizer::PhysicalOptimizerRule;
-use ::datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use ::datafusion::prelude::SessionConfig;
 use app::App;
-use arrow_flight::FlightClient;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
@@ -33,10 +29,7 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
-use datafusion_optimizer_rules::physical_plan::cluster::ensure_supported_file_scan::EnsureSupportedFileScan;
-use datafusion_optimizer_rules::physical_plan::cluster::union_projection_pushdown::UnionProjectionPushdownOptimizer;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use flight_client::Credentials;
 use flight_client::arrow_flight_factory::make_arrow_flight_client;
 use futures::{StreamExt, TryFutureExt};
 use prost::Message;
@@ -44,17 +37,13 @@ use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
-use s3_vectors::Client;
 use snafu::ResultExt;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
-use std::error::Error;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tonic::service::Interceptor;
 use tonic::transport::{Certificate, ClientTlsConfig};
-use tonic::{Request, Status};
 use url::Url;
 use uuid::Uuid;
 
@@ -143,7 +132,7 @@ pub async fn initialize_cluster_executor(
             "authorization",
             format!("Bearer {api_key}")
                 .parse()
-                .expect("Must serialize API key"),
+                .map_err(|e| tonic::Status::invalid_argument("Invalid API key"))?,
         );
 
         Ok(req)
@@ -205,6 +194,7 @@ pub async fn initialize_cluster_executor(
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),
             }],
         }),
+        use_tls: maybe_client_tls_config.is_some(),
     };
 
     let executor = Arc::new(Executor::new(

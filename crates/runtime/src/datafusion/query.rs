@@ -65,14 +65,11 @@ use async_stream::stream;
 use datafusion::common::config_err;
 #[cfg(feature = "cluster")]
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::config::ExtensionOptions;
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
-use crate::Error::FailedToStartClusterExecutor;
-use crate::FailedToStartClusterSchedulerSnafu;
 #[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::query::Error::UnableToExecuteQuery;
@@ -86,7 +83,6 @@ use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 use tonic::transport::{Certificate, ClientTlsConfig};
-use tonic::{Request, Status};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

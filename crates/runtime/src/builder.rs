@@ -237,10 +237,8 @@ impl RuntimeBuilder {
                     }
                 })
             {
-                cluster_config.cluster_api_key = match api_key {
-                    ApiKey::ReadOnly { key } => Some(key),
-                    ApiKey::ReadWrite { key } => Some(key),
-                };
+                let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
+                cluster_config.cluster_api_key = Some(key);
             }
 
             let cluster_config = Arc::new(cluster_config);

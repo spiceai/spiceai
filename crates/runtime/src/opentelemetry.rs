@@ -44,7 +44,6 @@ use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use runtime_auth::GrpcAuth;
 use runtime_auth::layer::grpc::make_interceptor;
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
@@ -53,7 +52,7 @@ use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 use tonic::service::InterceptorLayer;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 use tonic_health::pb::health_server::Health;
 use tonic_health::pb::health_server::HealthServer;
 
