@@ -15727,6 +15727,7 @@ dependencies = [
  "nix",
  "octocrab",
  "opentelemetry 0.29.1",
+ "opentelemetry-otlp",
  "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "rand 0.9.2",
@@ -15764,6 +15765,7 @@ dependencies = [
  "spiceai",
  "test-framework",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -29,6 +29,7 @@ indicatif = "0.18.0"
 insta.workspace = true
 octocrab = "0.47.0"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 rand.workspace = true
