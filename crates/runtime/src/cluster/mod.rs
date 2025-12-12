@@ -191,14 +191,16 @@ pub async fn initialize_cluster_executor(
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
         rt.status.update_cluster("executor", ComponentStatus::Ready);
-        executor_bind_object_stores(Arc::clone(&rt)).await?;
 
+        // Initialize secrets first so they're available for object store configuration
         executor_bind_app(
             &rt,
             rt.config.cluster.scheduler_url.to_string(),
             executor_id,
         )
         .await?;
+
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
 
         executor_poll_loop
             .await
