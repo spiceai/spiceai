@@ -29,7 +29,7 @@ use spicepod::{
 
 use crate::models::search::{SearchTestCase, SearchTestType, vectors_nonfilterable_col};
 
-mod search {
+pub(crate) mod search {
     use crate::{
         configure_test_datafusion,
         models::{
@@ -862,25 +862,43 @@ mod search {
         .await
     }
 
-    async fn init_vector_store_w_index_name(
-        bucket_name: &str,
-        index_name: &str,
+    pub(crate) async fn prepare_for_aws_tests(
+        store: &VectorStore,
         predelete_index: bool,
-    ) -> Result<VectorStore, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
         for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
             verify_env_secret_exists(env_var)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
 
+        let bucket_name = store
+            .params
+            .as_ref()
+            .and_then(|p| p.as_string_map().get("s3_vectors_bucket").cloned())
+            .unwrap_or_default();
+        let index_name = store
+            .params
+            .as_ref()
+            .and_then(|p| p.as_string_map().get("s3_vectors_index").cloned())
+            .unwrap_or_default();
+
         if predelete_index {
-            let _ = delete_index(bucket_name, index_name)
+            return delete_index(bucket_name.as_str(), index_name.as_str())
                 .await
-                .inspect_err(|e| {
+                .map_err(|e| {
                     tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
+                    anyhow::anyhow!(e)
                 });
         }
+        Ok(())
+    }
 
+    pub(crate) async fn init_vector_store_w_index_name(
+        bucket_name: &str,
+        index_name: &str,
+        predelete_index: bool,
+    ) -> Result<VectorStore, anyhow::Error> {
         let params = spicepod::param::Params::from_string_map(
             vec![
                 ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -899,12 +917,14 @@ mod search {
             .collect(),
         );
 
-        Ok(VectorStore {
+        let store = VectorStore {
             enabled: true,
             engine: Some("s3_vectors".to_string()),
             params: Some(params),
             partition_by: vec![],
-        })
+        };
+        let () = prepare_for_aws_tests(&store, predelete_index).await?;
+        Ok(store)
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
