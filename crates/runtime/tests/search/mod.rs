@@ -250,7 +250,7 @@ async fn test_megascience_permutations(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
         AccelerationOptions::DuckDb,
-        AccelerationOptions::DuckDbFile,
+        AccelerationOptions::DuckDbFile
     )]
     acceleration_opt: AccelerationOptions,
     #[values(
