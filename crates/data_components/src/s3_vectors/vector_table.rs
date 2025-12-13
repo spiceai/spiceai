@@ -15,16 +15,15 @@ limitations under the License.
 */
 use crate::s3_vectors::{
     MetadataColumn, MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    S3VectorBuildSnafu, query_provider::S3_VECTOR_DISTANCE_NAME, spill::MAX_SPILL_SEQUENCE,
+    S3VectorBuildSnafu,
+    query_provider::S3_VECTOR_DISTANCE_NAME,
+    spill::{current_index, next_index},
 };
 use arrow_tools::record_batch::replace_column_in_record;
 use std::{
     collections::HashMap,
     error::Error as StdError,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::{Arc, atomic::AtomicU8},
 };
 
 use super::{Error, Result, S3VectorIdentifier};
@@ -58,7 +57,6 @@ use tokio::sync::mpsc::Sender;
 #[derive(Clone)]
 pub struct S3VectorsTable {
     pub idx: Arc<S3VectorIdentifier>,
-    pub spill_index: Arc<AtomicU8>,
     pub client: Arc<dyn S3Vectors + Send + Sync>,
 
     // The SQL schema of the index. Expects to have:
@@ -79,7 +77,7 @@ impl std::fmt::Debug for S3VectorsTable {
         f.debug_struct("S3VectorsListTable")
             .field("schema", &self.schema)
             .field("constraints", &self.constraints)
-            .field("index_identifier", &self.current_index())
+            .field("index_identifier", &self.idx)
             .finish_non_exhaustive()
     }
 }
@@ -101,52 +99,6 @@ impl S3VectorTableResult {
 }
 
 impl S3VectorsTable {
-    /// Returns the current index identifier, accounting for spilling.
-    #[must_use]
-    pub fn current_index(&self) -> S3VectorIdentifier {
-        let spill_num = self.spill_index.load(Ordering::SeqCst);
-        if spill_num == 0 {
-            (*self.idx).clone()
-        } else {
-            match &*self.idx {
-                S3VectorIdentifier::Index {
-                    bucket_name,
-                    index_name,
-                } => {
-                    let spill_name = format!("{index_name}.{spill_num:02}");
-                    S3VectorIdentifier::Index {
-                        bucket_name: bucket_name.clone(),
-                        index_name: spill_name,
-                    }
-                }
-                S3VectorIdentifier::IndexArn(_) => (*self.idx).clone(),
-            }
-        }
-    }
-
-    /// Returns the next index identifier, incrementing the spill index
-    ///
-    /// # Errors
-    /// Returns an error if there is no next index
-    pub fn next_index(&self) -> Result<S3VectorIdentifier> {
-        let old_spill_index =
-            self.spill_index
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-                    if x >= MAX_SPILL_SEQUENCE {
-                        None
-                    } else {
-                        Some(x + 1)
-                    }
-                });
-
-        let max_exceeded = old_spill_index.is_err();
-        if max_exceeded {
-            return Err(Error::MaxSpillAttemptsReached);
-        }
-
-        Ok(self.current_index())
-    }
-
     // Returns an [`S3VectorTableResult`] if the [`S3VectorIdentifier`] does not exist. Use [`Self::try_create_new_identifier`].
     pub async fn try_new_table(
         id: S3VectorIdentifier,
@@ -172,7 +124,6 @@ impl S3VectorsTable {
                 let constraints = Self::primary_key(&schema);
                 Ok(S3VectorTableResult::Table(Self {
                     idx: Arc::new(id),
-                    spill_index: Arc::new(AtomicU8::new(0)),
                     client,
                     schema,
                     constraints,
@@ -185,6 +136,11 @@ impl S3VectorsTable {
                 Ok(S3VectorTableResult::IndexDoesNotExist)
             }
         }
+    }
+
+    pub fn with_new_id(mut self, id: S3VectorIdentifier) -> Self {
+        self.idx = Arc::new(id);
+        self
     }
 
     pub async fn try_create_new_table(
@@ -518,14 +474,13 @@ impl S3VectorsTable {
             .collect();
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-            self.write_chunk_with_spilling(chunk).await?;
+            // TODO: add spill index.
+            self.write_chunk_with_spilling(chunk, None).await?;
         }
-
-        let current_index = self.current_index();
 
         tracing::info!(
             "S3 Vectors Index {index_name} updated; records={records}, duration={duration:?}",
-            index_name = &current_index,
+            index_name = &self.idx,
             records = vectors.len(),
             duration = start.elapsed()
         );
@@ -534,8 +489,16 @@ impl S3VectorsTable {
     }
 
     /// Writes a chunk of vectors, handling spilling to additional indexes when capacity is exceeded.
-    async fn write_chunk_with_spilling(&self, chunk: &[PutInputVector]) -> Result<()> {
-        let mut current_index = self.current_index();
+    async fn write_chunk_with_spilling(
+        &self,
+        chunk: &[PutInputVector],
+        spill_index: Option<Arc<AtomicU8>>,
+    ) -> Result<()> {
+        let mut current_index = if let Some(ref spill) = spill_index {
+            current_index(&self.idx, Arc::clone(spill))
+        } else {
+            Arc::unwrap_or_clone(Arc::clone(&self.idx))
+        };
 
         loop {
             let (index_arn, vector_bucket_name, index_name) =
@@ -561,7 +524,9 @@ impl S3VectorsTable {
                 Err(SdkError::ServiceError(service_error)) => {
                     if Self::is_capacity_exceeded_error(service_error.err()) {
                         // Increment spill index and try to create a new index
-                        current_index = self.next_index()?;
+                        if let Some(ref spill) = spill_index {
+                            current_index = next_index(&current_index, Arc::clone(&spill))?;
+                        };
                         Self::create_index(
                             &self.client,
                             self.dimension,
@@ -700,7 +665,6 @@ mod tests {
                 bucket_name: "test-bucket".to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             client,
             schema: Arc::new(Schema::new(vec![
                 Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
@@ -762,7 +726,7 @@ mod tests {
             .await?;
 
         let vectors = create_test_vectors(5);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        let result = table.write_chunk_with_spilling(&vectors, None).await;
 
         result.expect("Should write without error");
         assert_eq!(mock_client.get_vector_count("test-index"), 5);
@@ -807,13 +771,13 @@ mod tests {
             .await?;
 
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        let result = table.write_chunk_with_spilling(&vectors, None).await;
         result.expect("Should write without error");
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        let result = table.write_chunk_with_spilling(&vectors, None).await;
         result.expect("Should write without error");
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        let result = table.write_chunk_with_spilling(&vectors, None).await;
         result.expect("Should write without error");
 
         assert_eq!(mock_client.get_vector_count("test-index"), 3);
@@ -862,11 +826,11 @@ mod tests {
 
         for _ in 0..100 {
             let vectors = create_test_vectors(1);
-            table.write_chunk_with_spilling(&vectors).await?;
+            table.write_chunk_with_spilling(&vectors, None).await?;
         }
 
         let vectors = create_test_vectors(1);
-        let result = table.write_chunk_with_spilling(&vectors).await;
+        let result = table.write_chunk_with_spilling(&vectors, None).await;
 
         assert!(result.is_err());
 

@@ -193,6 +193,7 @@ async fn process_single_batch(
     }
 
     // Update the embedding column in the batch with computed embeddings
+    // Ideally, we can just do `S3VectorPartitionedTable::insert_into` (or similar) with this big boy
     let updated_record = update_embedding_column_in_batch(
         &record,
         &index.embedded_column,

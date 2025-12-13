@@ -14,7 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod list_provider;
+pub mod query_provider;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
+use datafusion::error::DataFusionError;
 use snafu::prelude::*;
+
+use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, fetch_all_index_names};
 
 /// The separator used between the base index name and spill sequence number.
 const SPILL_SEPARATOR: &str = "-";
@@ -139,6 +149,79 @@ impl SpillIndex {
 
         result
     }
+}
+
+/// Returns the current index identifier, accounting for spilling.
+#[must_use]
+pub fn current_index(idx: &S3VectorIdentifier, spill_index: Arc<AtomicU8>) -> S3VectorIdentifier {
+    let spill_num = spill_index.load(Ordering::SeqCst);
+    if spill_num == 0 {
+        idx.clone()
+    } else {
+        match &*idx {
+            S3VectorIdentifier::Index {
+                bucket_name,
+                index_name,
+            } => S3VectorIdentifier::Index {
+                bucket_name: bucket_name.clone(),
+                index_name: format!("{index_name}.{spill_num:02}"),
+            },
+            S3VectorIdentifier::IndexArn(_) => idx.clone(),
+        }
+    }
+}
+
+/// Returns the next index identifier, incrementing the spill index
+///
+/// # Errors
+/// Returns an error if there is no next index
+pub fn next_index(
+    idx: &S3VectorIdentifier,
+    spill_index: Arc<AtomicU8>,
+) -> Result<S3VectorIdentifier, super::Error> {
+    let old_spill_index = spill_index.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+        if x >= MAX_SPILL_SEQUENCE {
+            None
+        } else {
+            Some(x + 1)
+        }
+    });
+
+    let max_exceeded = old_spill_index.is_err();
+    if max_exceeded {
+        return Err(super::Error::MaxSpillAttemptsReached);
+    }
+
+    Ok(current_index(idx, spill_index))
+}
+
+pub(super) async fn all_spill_tables(
+    table: &S3VectorsTable,
+    spill_index: &Arc<AtomicU8>,
+) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+    let current_index = current_index(&table.idx, Arc::clone(&spill_index));
+    let (_, Some(bucket_name), Some(index_name)) = current_index.index_identifier_variables()
+    else {
+        // This should never happen
+        return Ok(vec![]);
+    };
+
+    let all_index_names =
+        fetch_all_index_names(&table.client, Some(&bucket_name), Some(&index_name))
+            .await?
+            .unwrap_or_default();
+
+    Ok(
+        SpillIndex::get_all_indexes_for_virtual_index(&index_name, &all_index_names)
+            .iter()
+            .map(|spill_index_name| {
+                table.clone().with_new_id(S3VectorIdentifier::Index {
+                    bucket_name: bucket_name.to_string(),
+                    index_name: spill_index_name.clone(),
+                })
+            })
+            .collect::<Vec<S3VectorsTable>>(),
+    )
 }
 
 #[cfg(test)]

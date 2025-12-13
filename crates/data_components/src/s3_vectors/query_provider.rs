@@ -13,17 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicU8},
-};
+use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
     vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
-use super::{Error, S3VectorIdentifier, SpillIndex, compute_query::ComputeQueryVector};
+use super::{Error, S3VectorIdentifier, compute_query::ComputeQueryVector};
 use arrow::{array::RecordBatch, datatypes::SchemaRef, json::ReaderBuilder};
 use async_trait::async_trait;
 use datafusion::{
@@ -37,9 +34,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
-        limit::GlobalLimitExec,
         stream::RecordBatchReceiverStream,
-        union::UnionExec,
     },
     prelude::Expr,
 };
@@ -67,80 +62,6 @@ pub struct S3VectorsQueryTable {
     table: S3VectorsTable,
     compute_vector: Arc<dyn ComputeQueryVector>,
     query: String,
-}
-
-#[expect(clippy::too_many_arguments)]
-fn create_spill_plan_query(
-    client: &Arc<dyn S3Vectors + Send + Sync>,
-    bucket_name: &str,
-    index_name: &str,
-    table: &S3VectorsQueryTable,
-    projection: Option<&Vec<usize>>,
-    filters: &[Expr],
-    limit: Option<usize>,
-    query_vector: &[f32],
-    all_index_names: &[String],
-) -> Option<Arc<dyn ExecutionPlan>> {
-    let virtual_index_names =
-        SpillIndex::get_all_indexes_for_virtual_index(index_name, all_index_names);
-
-    if virtual_index_names.len() <= 1 {
-        return None;
-    }
-    let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-    for spill_index_name in virtual_index_names {
-        let index_table_identifier = S3VectorIdentifier::Index {
-            bucket_name: bucket_name.to_string(),
-            index_name: spill_index_name.clone(),
-        };
-
-        let index_table = S3VectorsTable {
-            client: Arc::clone(client),
-            schema: Arc::clone(&table.table.schema),
-            constraints: table.table.constraints.clone(),
-            idx: Arc::new(index_table_identifier),
-            spill_index: Arc::new(AtomicU8::new(0)),
-            dimension: table.table.dimension,
-            columns: table.table.columns.clone(),
-            distance_metric: table.table.distance_metric.clone(),
-        };
-
-        let query_table = S3VectorsQueryTable::new(
-            index_table,
-            Arc::clone(&table.compute_vector),
-            table.query.clone(),
-        );
-
-        let limit_i32: i32 = match limit {
-            Some(l) => {
-                // Safe conversion: check against i32::MAX first, then compare with limit
-                let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
-                if l_i32 > S3_VECTOR_MAX_TOPK {
-                    tracing::warn!(
-                        "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                    );
-                    S3_VECTOR_MAX_TOPK
-                } else {
-                    l_i32
-                }
-            }
-            None => S3_VECTOR_MAX_TOPK,
-        };
-        let index_plan = Arc::new(S3VectorsQueryExec::new(
-            &query_table.table,
-            projection,
-            i64::from(limit_i32),
-            query_vector.to_owned(),
-            filters.to_vec(),
-        ));
-        index_plans.push(index_plan);
-    }
-
-    Some(Arc::new(GlobalLimitExec::new(
-        Arc::new(UnionExec::new(index_plans)),
-        0,
-        limit,
-    )))
 }
 
 impl S3VectorsQueryTable {
@@ -196,33 +117,6 @@ impl TableProvider for S3VectorsQueryTable {
             .await
             .map_err(DataFusionError::External)?;
 
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-
-        let all_index_names = super::fetch_all_index_names(
-            &self.table.client,
-            bucket_name.as_deref(),
-            index_name.as_deref(),
-        )
-        .await?;
-
-        if let (Some(bucket_name), Some(index_name), Some(all_index_names)) =
-            (bucket_name, index_name, all_index_names.as_ref())
-            && let Some(plan) = create_spill_plan_query(
-                &self.table.client,
-                &bucket_name,
-                &index_name,
-                self,
-                projection,
-                filters,
-                limit,
-                &query_vector,
-                all_index_names,
-            )
-        {
-            return Ok(plan);
-        }
-
         let limit_i32: i32 = match limit.map(i32::try_from) {
             Some(Ok(l)) if l > S3_VECTOR_MAX_TOPK => {
                 tracing::warn!(
@@ -265,8 +159,7 @@ impl DisplayAs for S3VectorsQueryExec {
         if let Ok(Some(filter)) = convert_datafusion_filters_to_s3_vectors(&self.filters) {
             write!(f, "filter={filter} ")?;
         }
-        write!(f, "limit={}", self.limit)?;
-        Ok(())
+        write!(f, "limit={}", self.limit)
     }
 }
 
@@ -282,7 +175,7 @@ impl S3VectorsQueryExec {
             project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
 
         Self {
-            idx: table.current_index(),
+            idx: Arc::unwrap_or_clone(Arc::clone(&table.idx)),
             client: Arc::clone(&table.client),
             plan_properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -613,6 +506,8 @@ mod tests {
     use super::*;
 
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::limit::GlobalLimitExec;
+    use datafusion::physical_plan::union::UnionExec;
     use datafusion::{
         prelude::{SessionContext, col},
         scalar::ScalarValue,
@@ -718,7 +613,6 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: virtual_index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -821,7 +715,6 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: "virtual-index-01".to_string(), // Access via spill name
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -948,7 +841,6 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: base_index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -1027,7 +919,6 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
@@ -1105,20 +996,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
 
@@ -1183,20 +1068,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
 
@@ -1260,20 +1139,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
 

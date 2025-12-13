@@ -129,9 +129,8 @@ impl SearchIndex for S3Vector {
 
                 let mut data = vec![];
                 for (partition_value, partition_record) in partitions.into_values() {
-                    let id = self.table.current_index();
                     // change the index name to a partition name
-                    let id = match &id {
+                    let id = match Arc::unwrap_or_clone(Arc::clone(&self.table.idx)) {
                         S3VectorIdentifier::IndexArn(_) => {
                             tracing::warn!(
                                 "Partitioning is not supported when index ARN is provided. Please provide the bucket and index name instead."
@@ -153,7 +152,7 @@ impl SearchIndex for S3Vector {
                             index_name,
                         } => {
                             let partitioned_index_name = PartitionedIndexName::new(
-                                index_name,
+                                &index_name,
                                 &self.embedded_column,
                                 &self.partition_by,
                                 &partition_value,
@@ -215,7 +214,6 @@ impl SearchIndex for S3Vector {
                 self.table.clone(),
                 compute_vector,
                 query.to_string(),
-                self.embedded_column.clone(),
             )),
             _ => Arc::new(S3VectorsPartitionedQueryTable::new(
                 self.table.clone(),
@@ -264,12 +262,11 @@ impl VectorIndex for S3Vector {
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
+        // check on self.partition_by.len()
         LogicalPlanBuilder::scan(
             "tbl",
             Arc::new(DefaultTableSource::new(Arc::new(S3VectorsListTable::new(
                 self.table.clone(),
-                self.search_column(),
-                self.partition_by.clone(),
             )))),
             None,
         )?

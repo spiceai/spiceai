@@ -13,31 +13,24 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicU8},
-};
+use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3VectorIdentifier, compute_query::ComputeQueryVector, fetch_all_index_names,
-    partition::PartitionedIndexName, query_provider::S3VectorsQueryTable,
-    vector_table::S3VectorsTable,
+    compute_query::ComputeQueryVector, partition::all_indexes_in_partition,
+    query_provider::S3VectorsQueryTable, vector_table::S3VectorsTable,
 };
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, exec_err, project_schema},
+    common::{Constraints, project_schema},
     datasource::TableType,
     error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
     physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
     prelude::Expr,
 };
-
-/// The JSON key within a `QueryVector` response that contains the distance to the query vector.
-pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
 /// An S3 Vector index that implements [`TableProvider`] as a `QueryVector` API operation for a given query vector.
 #[derive(Debug)]
@@ -100,61 +93,22 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-
-        let all_index_names = fetch_all_index_names(
-            &self.table.client,
-            bucket_name.as_deref(),
-            index_name.as_deref(),
-        )
-        .await?;
-
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-        let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
-            return exec_err!("No bucket name or index name for bucket query");
-        };
-
-        // Filter out any index that has `index_name` as prefix, but is not apart of this partitioning.
-        let index_names: Vec<_> = all_index_names
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|idx_name| {
-                PartitionedIndexName::from_and_check_index_name(
-                    idx_name,
-                    &index_name,
-                    &self.column_name,
-                    &self.partition_by,
-                )?;
-                Some(idx_name.clone())
-            })
-            .collect();
+        let query_tables =
+            all_indexes_in_partition(&self.table, &self.column_name, &self.partition_by)
+                .await?
+                .into_iter()
+                .map(|t| {
+                    S3VectorsQueryTable::new(
+                        t,
+                        Arc::clone(&self.compute_vector),
+                        self.query.clone(),
+                    )
+                })
+                .collect::<Vec<S3VectorsQueryTable>>();
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for index_name in index_names {
-            let index_table = S3VectorsTable {
-                client: Arc::clone(&self.table.client),
-                schema: self.schema(),
-                constraints: self.table.constraints.clone(),
-                idx: Arc::new(S3VectorIdentifier::Index {
-                    bucket_name: bucket_name.to_string(),
-                    index_name,
-                }),
-                spill_index: Arc::new(AtomicU8::new(0)),
-                dimension: self.table.dimension,
-                columns: self.table.columns.clone(),
-                distance_metric: self.table.distance_metric.clone(),
-            };
-
-            let query_table = S3VectorsQueryTable::new(
-                index_table,
-                Arc::clone(&self.compute_vector),
-                self.query.clone(),
-            );
-
-            let index_plan = query_table.scan(state, projection, filters, limit).await?;
-            index_plans.push(index_plan);
+        for table in query_tables {
+            index_plans.push(table.scan(state, projection, filters, limit).await?);
         }
 
         let union_plan = match index_plans.len() {
@@ -178,7 +132,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::s3_vectors::{
-        MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+        MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier,
+        partition::PartitionedIndexName, query_provider::S3_VECTOR_DISTANCE_NAME,
     };
 
     use super::*;
@@ -305,7 +260,6 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: base_index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,

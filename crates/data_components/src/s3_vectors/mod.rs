@@ -29,6 +29,7 @@ use std::sync::Arc;
 pub mod compute_query;
 pub mod list_provider;
 pub mod partition;
+pub mod put_vectors_sink;
 pub mod query_provider;
 mod spill;
 pub use spill::{Error as SpillIndexError, SpillIndex};

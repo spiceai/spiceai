@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use datafusion::{
+    common::exec_err,
+    error::DataFusionError,
     logical_expr::{Case, expr::ScalarFunction},
     prelude::Expr,
     scalar::ScalarValue,
@@ -50,6 +52,8 @@ pub use list_provider::S3VectorsPartitionedListTable;
 
 pub mod query_provider;
 pub use query_provider::S3VectorsPartitionedQueryTable;
+
+use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, fetch_all_index_names};
 
 static PARTS_SEPARATOR: &str = ".";
 
@@ -191,6 +195,43 @@ impl PartitionedIndexName {
             BelongsWith::ThisDataset
         }
     }
+}
+
+// TODO: handle spilling inside paritions
+pub async fn all_indexes_in_partition(
+    table: &S3VectorsTable,
+    column_name: &str,
+    partition_by: &[Expr],
+) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+    let (_, bucket_name, index_name) = table.idx.index_identifier_variables();
+
+    let all_index_names =
+        fetch_all_index_names(&table.client, bucket_name.as_deref(), index_name.as_deref()).await?;
+
+    let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
+        return exec_err!("No bucket name or index name for bucket query");
+    };
+
+    // Filter out any index that has `index_name` as prefix, but is not apart of this partitioning.
+    let vector_tables: Vec<S3VectorsTable> = all_index_names
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|idx_name| {
+            PartitionedIndexName::from_and_check_index_name(
+                &idx_name,
+                &index_name,
+                column_name,
+                partition_by,
+            )?;
+            let idx = S3VectorIdentifier::Index {
+                bucket_name: bucket_name.clone(),
+                index_name: idx_name,
+            };
+            Some(table.clone().with_new_id(idx))
+        })
+        .collect();
+
+    Ok(vector_tables)
 }
 
 fn sanitize_column(s: &str) -> String {

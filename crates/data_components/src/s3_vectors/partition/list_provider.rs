@@ -13,15 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicU8},
-};
+use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3VectorIdentifier, fetch_all_index_names,
-    list_provider::{S3VectorsListExec, S3VectorsListTable},
-    partition::PartitionedIndexName,
+    list_provider::S3VectorsListTable, partition::all_indexes_in_partition,
     vector_table::S3VectorsTable,
 };
 
@@ -29,7 +24,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, exec_err, project_schema},
+    common::{Constraints, project_schema},
     datasource::TableType,
     error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
@@ -99,66 +94,39 @@ impl TableProvider for S3VectorsPartitionedListTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-
-        let all_index_names = fetch_all_index_names(
-            &self.table.client,
-            bucket_name.as_deref(),
-            index_name.as_deref(),
-        )
-        .await?;
-
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-        let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
-            return exec_err!("No bucket name or index name for bucket query");
-        };
+        let query_tables =
+            all_indexes_in_partition(&self.table, &self.column_name, &self.partition_by)
+                .await?
+                .into_iter()
+                .map(S3VectorsListTable::new)
+                .collect::<Vec<S3VectorsListTable>>();
 
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for idx_name in all_index_names.unwrap_or_default() {
-            if PartitionedIndexName::from_and_check_index_name(
-                &idx_name,
-                &index_name,
-                &self.column_name,
-                &self.partition_by,
-            )
-            .is_some()
-            {
-                let index_table_identifier = S3VectorIdentifier::Index {
-                    bucket_name: bucket_name.to_string(),
-                    index_name: idx_name.clone(),
-                };
-
-                let index_table = S3VectorsTable {
-                    client: Arc::clone(&self.table.client),
-                    schema: Arc::clone(&self.table.schema),
-                    constraints: self.table.constraints.clone(),
-                    idx: Arc::new(index_table_identifier),
-                    spill_index: Arc::new(AtomicU8::new(0)),
-                    dimension: self.table.dimension,
-                    columns: self.table.columns.clone(),
-                    distance_metric: self.table.distance_metric.clone(),
-                };
-                index_plans.push(
-                    S3VectorsListTable::new(index_table)
-                        .scan(state, projection, filters, limit)
-                        .await?,
-                );
-            }
+        for table in query_tables {
+            index_plans.push(table.scan(state, projection, filters, limit).await?);
         }
 
-        let scan_plan = match index_plans.len() {
-            0 => Arc::new(EmptyExec::new(project_schema(
-                &self.table.schema,
-                projection,
-            )?)),
-            1 => Arc::clone(&index_plans[0]),
+        let union_plan = match index_plans.len() {
+            0 => {
+                return Ok(Arc::new(EmptyExec::new(project_schema(
+                    &self.schema(),
+                    projection,
+                )?)));
+            }
+            1 => return Ok(Arc::clone(&index_plans[0])),
             _ => Arc::new(UnionExec::new(index_plans)),
         };
 
-        Ok(Arc::new(GlobalLimitExec::new(scan_plan, 0, limit)))
+        Ok(Arc::new(GlobalLimitExec::new(union_plan, 0, limit)))
     }
+    // async fn insert_into(
+    //     &self,
+    //     _state: &dyn Session,
+    //     _input: Arc<dyn ExecutionPlan>,
+    //     _insert_op: InsertOp,
+    // ) -> Result<Arc<dyn ExecutionPlan>> {
+
+    // }
 }
 
 #[cfg(test)]
@@ -166,7 +134,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::s3_vectors::{
-        MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+        MetadataColumns, S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier,
+        partition::PartitionedIndexName,
     };
 
     use super::*;
@@ -252,7 +221,6 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name_prefix.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
