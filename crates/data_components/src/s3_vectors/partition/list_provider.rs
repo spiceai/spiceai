@@ -16,19 +16,19 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    list_provider::S3VectorsListTable, partition::all_indexes_in_partition,
-    vector_table::S3VectorsTable,
+    gather_and_limit_providers, list_provider::S3VectorsListTable,
+    partition::all_indexes_in_partition, vector_table::S3VectorsTable,
 };
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, project_schema},
+    common::Constraints,
     datasource::TableType,
     error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
-    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
+    physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
@@ -98,35 +98,11 @@ impl TableProvider for S3VectorsPartitionedListTable {
             all_indexes_in_partition(&self.table, &self.column_name, &self.partition_by)
                 .await?
                 .into_iter()
-                .map(S3VectorsListTable::new)
-                .collect::<Vec<S3VectorsListTable>>();
+                .map(|t| Arc::new(S3VectorsListTable::new(t)) as Arc<dyn TableProvider>)
+                .collect();
 
-        let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for table in query_tables {
-            index_plans.push(table.scan(state, projection, filters, limit).await?);
-        }
-
-        let union_plan = match index_plans.len() {
-            0 => {
-                return Ok(Arc::new(EmptyExec::new(project_schema(
-                    &self.schema(),
-                    projection,
-                )?)));
-            }
-            1 => return Ok(Arc::clone(&index_plans[0])),
-            _ => Arc::new(UnionExec::new(index_plans)),
-        };
-
-        Ok(Arc::new(GlobalLimitExec::new(union_plan, 0, limit)))
+        gather_and_limit_providers(query_tables, state, projection, filters, limit).await
     }
-    // async fn insert_into(
-    //     &self,
-    //     _state: &dyn Session,
-    //     _input: Arc<dyn ExecutionPlan>,
-    //     _insert_op: InsertOp,
-    // ) -> Result<Arc<dyn ExecutionPlan>> {
-
-    // }
 }
 
 #[cfg(test)]
@@ -141,7 +117,10 @@ mod tests {
     use super::*;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::{logical_expr::col, prelude::SessionContext, scalar::ScalarValue};
+    use datafusion::{
+        logical_expr::col, physical_plan::union::UnionExec, prelude::SessionContext,
+        scalar::ScalarValue,
+    };
     use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
     #[tokio::test]

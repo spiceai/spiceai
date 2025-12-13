@@ -16,19 +16,20 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    compute_query::ComputeQueryVector, partition::all_indexes_in_partition,
-    query_provider::S3VectorsQueryTable, vector_table::S3VectorsTable,
+    compute_query::ComputeQueryVector, gather_and_limit_providers,
+    partition::all_indexes_in_partition, query_provider::S3VectorsQueryTable,
+    vector_table::S3VectorsTable,
 };
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, project_schema},
+    common::Constraints,
     datasource::TableType,
     error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
-    physical_plan::{ExecutionPlan, empty::EmptyExec, limit::GlobalLimitExec, union::UnionExec},
+    physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
@@ -98,31 +99,15 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
                 .await?
                 .into_iter()
                 .map(|t| {
-                    S3VectorsQueryTable::new(
+                    Arc::new(S3VectorsQueryTable::new(
                         t,
                         Arc::clone(&self.compute_vector),
                         self.query.clone(),
-                    )
+                    )) as Arc<dyn TableProvider>
                 })
-                .collect::<Vec<S3VectorsQueryTable>>();
+                .collect();
 
-        let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for table in query_tables {
-            index_plans.push(table.scan(state, projection, filters, limit).await?);
-        }
-
-        let union_plan = match index_plans.len() {
-            0 => {
-                return Ok(Arc::new(EmptyExec::new(project_schema(
-                    &self.schema(),
-                    projection,
-                )?)));
-            }
-            1 => return Ok(Arc::clone(&index_plans[0])),
-            _ => Arc::new(UnionExec::new(index_plans)),
-        };
-
-        Ok(Arc::new(GlobalLimitExec::new(union_plan, 0, limit)))
+        gather_and_limit_providers(query_tables, state, projection, filters, limit).await
     }
 }
 
@@ -140,6 +125,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
+        physical_plan::{limit::GlobalLimitExec, union::UnionExec},
         prelude::{SessionContext, col},
         scalar::ScalarValue,
     };

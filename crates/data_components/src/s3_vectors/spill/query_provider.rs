@@ -19,8 +19,8 @@ use std::{
 };
 
 use crate::s3_vectors::{
-    compute_query::ComputeQueryVector, query_provider::S3VectorsQueryTable,
-    spill::all_spill_tables, vector_table::S3VectorsTable,
+    compute_query::ComputeQueryVector, gather_and_limit_providers,
+    query_provider::S3VectorsQueryTable, spill::all_spill_tables, vector_table::S3VectorsTable,
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ use datafusion::{
     datasource::TableType,
     error::Result as DataFusionResult,
     logical_expr::TableProviderFilterPushDown,
-    physical_plan::{ExecutionPlan, limit::GlobalLimitExec, union::UnionExec},
+    physical_plan::ExecutionPlan,
     prelude::Expr,
 };
 
@@ -90,24 +90,18 @@ impl TableProvider for S3VectorsSpillQueryTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let query_tables = all_spill_tables(&self.table, &self.spill_index)
+            .await?
+            .into_iter()
+            .map(|table| {
+                Arc::new(S3VectorsQueryTable::new(
+                    table,
+                    Arc::clone(&self.compute_vector),
+                    self.query.clone(),
+                )) as Arc<dyn TableProvider>
+            })
+            .collect();
 
-        for table in all_spill_tables(&self.table, &self.spill_index).await? {
-            let table_query = S3VectorsQueryTable::new(
-                table,
-                Arc::clone(&self.compute_vector),
-                self.query.clone(),
-            )
-            .scan(state, projection, filters, limit)
-            .await?;
-
-            index_plans.push(table_query);
-        }
-
-        Ok(Arc::new(GlobalLimitExec::new(
-            Arc::new(UnionExec::new(index_plans)),
-            0,
-            limit,
-        )))
+        gather_and_limit_providers(query_tables, state, projection, filters, limit).await
     }
 }

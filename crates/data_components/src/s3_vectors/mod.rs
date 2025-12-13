@@ -15,7 +15,12 @@ limitations under the License.
 */
 
 use arrow::error::ArrowError;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::prelude::Expr;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
     GetVectorBucketError, GetVectorsError, ListIndexesError, ListIndexesInput, PutVectorsError,
@@ -231,4 +236,27 @@ async fn fetch_all_index_names(
     } else {
         Ok(None)
     }
+}
+
+/// Scans multiple table providers and combines their execution plans with a UnionExec.
+///
+/// Both pushes down `limit`, but also ensures it is global limit.
+async fn gather_and_limit_providers(
+    providers: Vec<Arc<dyn TableProvider>>,
+    state: &dyn Session,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let mut physical_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(providers.len());
+
+    for provider in providers {
+        physical_plans.push(provider.scan(state, projection, filters, limit).await?);
+    }
+
+    Ok(Arc::new(GlobalLimitExec::new(
+        Arc::new(UnionExec::new(physical_plans)),
+        0,
+        limit,
+    )))
 }
