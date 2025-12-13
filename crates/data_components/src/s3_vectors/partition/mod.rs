@@ -157,6 +157,7 @@ impl PartitionedIndexName {
     // Checks if a given index name is valid and belongs to the partitioned index (base on the encoding scheme of the column and parition [`Expr`]).
     //
     // Does not delineate between an invalid `index_name` and one that is not apart of the partition.
+    #[must_use]
     pub fn from_and_check_index_name(
         index_name: &str,
         base_index_name: &str,

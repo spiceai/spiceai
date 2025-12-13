@@ -101,7 +101,7 @@ impl TableProvider for S3VectorsQueryTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.table.query_provider_supports_filters_pushdown(filters)
+        Ok(self.table.query_provider_supports_filters_pushdown(filters))
     }
 
     async fn scan(
@@ -132,7 +132,7 @@ impl TableProvider for S3VectorsQueryTable {
             &self.table,
             projection,
             i64::from(limit_i32),
-            query_vector.clone(),
+            query_vector,
             filters.to_vec(),
         )));
     }

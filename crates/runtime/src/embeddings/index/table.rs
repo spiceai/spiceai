@@ -119,7 +119,7 @@ async fn wrap_table_as_index_s3(
         tracing::debug!("[S3Vectors][table={tbl}] partitioned by expression: {partition_expr:?}");
     } else {
         tracing::debug!("[S3Vectors][table={tbl}] No partitioning");
-    };
+    }
 
     let embedding_columns: Vec<_> = columns
         .iter()

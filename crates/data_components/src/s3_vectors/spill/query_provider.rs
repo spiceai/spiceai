@@ -80,7 +80,7 @@ impl TableProvider for S3VectorsSpillQueryTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.table.query_provider_supports_filters_pushdown(filters)
+        Ok(self.table.query_provider_supports_filters_pushdown(filters))
     }
 
     async fn scan(
@@ -93,10 +93,13 @@ impl TableProvider for S3VectorsSpillQueryTable {
         let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
 
         for table in all_spill_tables(&self.table, &self.spill_index).await? {
-            let table_query =
-                S3VectorsQueryTable::new(table, self.compute_vector.clone(), self.query.clone())
-                    .scan(state, projection, filters, limit)
-                    .await?;
+            let table_query = S3VectorsQueryTable::new(
+                table,
+                Arc::clone(&self.compute_vector),
+                self.query.clone(),
+            )
+            .scan(state, projection, filters, limit)
+            .await?;
 
             index_plans.push(table_query);
         }

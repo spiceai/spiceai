@@ -138,6 +138,7 @@ impl S3VectorsTable {
         }
     }
 
+    #[must_use]
     pub fn with_new_id(mut self, id: S3VectorIdentifier) -> Self {
         self.idx = Arc::new(id);
         self
@@ -495,7 +496,7 @@ impl S3VectorsTable {
         spill_index: Option<Arc<AtomicU8>>,
     ) -> Result<()> {
         let mut current_index = if let Some(ref spill) = spill_index {
-            current_index(&self.idx, Arc::clone(spill))
+            current_index(&self.idx, spill)
         } else {
             Arc::unwrap_or_clone(Arc::clone(&self.idx))
         };
@@ -528,8 +529,8 @@ impl S3VectorsTable {
                     ) {
                         // Increment spill index and try to create a new index
                         if let Some(ref spill) = spill_index {
-                            current_index = next_index(&current_index, Arc::clone(&spill))?;
-                        };
+                            current_index = next_index(&current_index, spill)?;
+                        }
                         Self::create_index(
                             &self.client,
                             self.dimension,
@@ -568,7 +569,7 @@ impl S3VectorsTable {
     pub(super) fn query_provider_supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+    ) -> Vec<TableProviderFilterPushDown> {
         // Filters can only possibly be pushed down for columns in underlying metadata (i.e. not derived columns like `S3_VECTOR_DISTANCE_NAME`).
         let columns: Vec<_> = self
             .schema
@@ -578,7 +579,7 @@ impl S3VectorsTable {
             .filter(|c| self.is_filterable_column(c.as_str()))
             .collect();
 
-        Ok(filters
+        filters
             .iter()
             .map(|f| {
                 if s3_vectors_metadata_filter::supports_filter_expr(columns.as_slice(), f) {
@@ -587,7 +588,7 @@ impl S3VectorsTable {
                     TableProviderFilterPushDown::Unsupported
                 }
             })
-            .collect())
+            .collect()
     }
 }
 

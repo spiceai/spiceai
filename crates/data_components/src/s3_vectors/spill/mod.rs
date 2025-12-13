@@ -153,12 +153,12 @@ impl SpillIndex {
 
 /// Returns the current index identifier, accounting for spilling.
 #[must_use]
-pub fn current_index(idx: &S3VectorIdentifier, spill_index: Arc<AtomicU8>) -> S3VectorIdentifier {
+pub fn current_index(idx: &S3VectorIdentifier, spill_index: &Arc<AtomicU8>) -> S3VectorIdentifier {
     let spill_num = spill_index.load(Ordering::SeqCst);
     if spill_num == 0 {
         idx.clone()
     } else {
-        match &*idx {
+        match idx {
             S3VectorIdentifier::Index {
                 bucket_name,
                 index_name,
@@ -177,18 +177,18 @@ pub fn current_index(idx: &S3VectorIdentifier, spill_index: Arc<AtomicU8>) -> S3
 /// Returns an error if there is no next index
 pub fn next_index(
     idx: &S3VectorIdentifier,
-    spill_index: Arc<AtomicU8>,
+    spill_index: &Arc<AtomicU8>,
 ) -> Result<S3VectorIdentifier, super::Error> {
-    let old_spill_index = spill_index.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-        if x >= MAX_SPILL_SEQUENCE {
-            None
-        } else {
-            Some(x + 1)
-        }
-    });
-
-    let max_exceeded = old_spill_index.is_err();
-    if max_exceeded {
+    if spill_index
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+            if x >= MAX_SPILL_SEQUENCE {
+                None
+            } else {
+                Some(x + 1)
+            }
+        })
+        .is_err()
+    {
         return Err(super::Error::MaxSpillAttemptsReached);
     }
 
@@ -199,7 +199,7 @@ pub(super) async fn all_spill_tables(
     table: &S3VectorsTable,
     spill_index: &Arc<AtomicU8>,
 ) -> Result<Vec<S3VectorsTable>, DataFusionError> {
-    let current_index = current_index(&table.idx, Arc::clone(&spill_index));
+    let current_index = current_index(&table.idx, spill_index);
     let (_, Some(bucket_name), Some(index_name)) = current_index.index_identifier_variables()
     else {
         // This should never happen

@@ -83,7 +83,7 @@ impl TableProvider for S3VectorsPartitionedQueryTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.table.query_provider_supports_filters_pushdown(filters)
+        Ok(self.table.query_provider_supports_filters_pushdown(filters))
     }
 
     async fn scan(

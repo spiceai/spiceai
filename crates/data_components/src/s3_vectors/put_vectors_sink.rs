@@ -147,7 +147,7 @@ impl DataSink for PutVectorsSink {
 /// Calculate optimal batch size based on vector dimensions to stay under 1MB payload limit
 ///
 /// Each vector consumes: (dimensions * 4 bytes for f32) + overhead (~200 bytes)
-/// We conservatively cap at PUT_VECTORS_MAX_ITEMS (500) to avoid API limits
+/// We conservatively cap at `PUT_VECTORS_MAX_ITEMS` (500) to avoid API limits
 fn calculate_batch_size(vector_dimensions: usize) -> usize {
     if vector_dimensions == 0 {
         return PUT_VECTORS_MAX_ITEMS;
@@ -160,9 +160,10 @@ fn calculate_batch_size(vector_dimensions: usize) -> usize {
     let max_by_size = (PUT_VECTORS_MAX_PAYLOAD_BYTES * 9) / (bytes_per_vector * 10);
 
     // Take the minimum of size-based limit and API item limit
-    max_by_size.min(PUT_VECTORS_MAX_ITEMS).max(1) // At least 1 vector per batch
+    max_by_size.clamp(1, PUT_VECTORS_MAX_ITEMS)
 }
 
+#[expect(clippy::too_many_lines)]
 fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
     let name = S3_VECTOR_PRIMARY_KEY_NAME.to_string();
     let keys = record_batch
@@ -218,7 +219,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             });
         }
         // S3 Vectors keys should not contain control characters
-        if key.chars().any(|c| c.is_control()) {
+        if key.chars().any(char::is_control) {
             return Err(Error::InvalidPrimaryKey {
                 row,
                 reason: "Primary key contains invalid control characters".to_string(),
@@ -252,14 +253,14 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             // Validate metadata key
             if name.is_empty() {
                 return Err(Error::InvalidMetadataKey {
-                    key: name.to_string(),
+                    key: (*name).to_string(),
                     row,
                     reason: "Metadata key cannot be empty".to_string(),
                 });
             }
             if name.len() > 256 {
                 return Err(Error::InvalidMetadataKey {
-                    key: name.to_string(),
+                    key: (*name).to_string(),
                     row,
                     reason: format!(
                         "Metadata key exceeds maximum length of 256 characters (got {})",
@@ -270,7 +271,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             // Metadata keys should not contain control characters or special chars
             if name.chars().any(|c| c.is_control() || c == '\0') {
                 return Err(Error::InvalidMetadataKey {
-                    key: name.to_string(),
+                    key: (*name).to_string(),
                     row,
                     reason: "Metadata key contains invalid characters".to_string(),
                 });

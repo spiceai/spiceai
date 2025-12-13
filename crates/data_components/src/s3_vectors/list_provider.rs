@@ -178,7 +178,7 @@ impl ExecutionPlan for S3VectorsListExec {
         let tx: Sender<DataFusionResult<RecordBatch, DataFusionError>> = builder.tx();
 
         let client = Arc::clone(&self.client);
-        let idx = self.idx.clone();
+        let idx = Arc::clone(&self.idx);
         let limit = self.limit.unwrap_or(usize::MAX);
 
         builder.spawn(async move {
@@ -229,7 +229,7 @@ async fn list_vector_stream(
 
         let task = list_vector_segment(
             Arc::clone(&client),
-            idx.clone(),
+            Arc::clone(&idx),
             Arc::clone(&schema),
             segment_limit,
             segment_idx,
