@@ -22,6 +22,7 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
 use data_components::s3_vectors::partition::S3VectorsPartitionedQueryTable;
+use data_components::s3_vectors::query_provider::S3_VECTOR_DISTANCE_NAME;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
     list_provider::S3VectorsListTable, partition::PartitionedIndexName,
@@ -232,7 +233,7 @@ impl SearchIndex for S3Vector {
                         vec![
                             col(S3_VECTOR_EMBEDDING_NAME)
                                 .alias(embedding_col(&self.search_column())),
-                            binary_expr(lit(1.0), Operator::Minus, col("distance"))
+                            binary_expr(lit(1.0), Operator::Minus, col(S3_VECTOR_DISTANCE_NAME))
                                 .alias(SEARCH_SCORE_COLUMN_NAME),
                         ],
                     ]

@@ -171,8 +171,9 @@ impl S3VectorsQueryExec {
         query: Vec<f32>,
         filters: Vec<Expr>,
     ) -> Self {
+        let schema = table.query_provider_schema();
         let projected_schema =
-            project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
+            project_schema(&schema, projection).unwrap_or_else(|_| Arc::clone(&schema));
 
         Self {
             idx: Arc::unwrap_or_clone(Arc::clone(&table.idx)),

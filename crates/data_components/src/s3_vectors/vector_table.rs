@@ -522,7 +522,10 @@ impl S3VectorsTable {
                     return Ok(());
                 }
                 Err(SdkError::ServiceError(service_error)) => {
-                    if Self::is_capacity_exceeded_error(service_error.err()) {
+                    if matches!(
+                        service_error.err(),
+                        PutVectorsError::ServiceQuotaExceededException(_)
+                    ) {
                         // Increment spill index and try to create a new index
                         if let Some(ref spill) = spill_index {
                             current_index = next_index(&current_index, Arc::clone(&spill))?;
@@ -585,10 +588,6 @@ impl S3VectorsTable {
                 }
             })
             .collect())
-    }
-
-    fn is_capacity_exceeded_error(error: &PutVectorsError) -> bool {
-        matches!(error, PutVectorsError::ServiceQuotaExceededException(_))
     }
 }
 
