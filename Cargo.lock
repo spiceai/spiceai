@@ -14872,7 +14872,11 @@ dependencies = [
 name = "spicepodschema"
 version = "1.10.1-unstable"
 dependencies = [
+ "regex",
+ "runtime",
+ "runtime-parameters",
  "schemars 1.1.0",
+ "serde",
  "serde_json",
  "spicepod",
 ]

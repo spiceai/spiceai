@@ -10,5 +10,30 @@ version.workspace = true
 
 [dependencies]
 schemars.workspace = true
+serde.workspace = true
 serde_json = "1"
+regex = "1"
 spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
+
+# Runtime for accessing connector/accelerator registrations
+# Enable features required for runtime compilation plus connectors for schema generation
+runtime = { path = "../../crates/runtime", default-features = false, features = [
+    # Required for runtime to compile
+    "aws-secrets-manager",
+    "bedrock",
+    "cluster",
+    # Core connectors for schema generation
+    "duckdb",
+    "postgres",
+    "sqlite",
+    "databricks",
+    "delta_lake",
+] }
+
+runtime-parameters = { path = "../../crates/runtime-parameters" }
+
+[features]
+default = ["databricks", "delta_lake"]
+# Enable these features to include conditional catalog connectors in the schema
+databricks = []
+delta_lake = []

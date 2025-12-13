@@ -1,0 +1,872 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Enricher module for merging connector-specific parameter schemas into the base Spicepod schema.
+
+use crate::collector::{CatalogConnectorSchema, ConnectorSchema};
+use crate::transform::{connector_params_to_schema, to_pascal_case};
+use schemars::Schema;
+use serde_json::{Map, Value};
+
+/// Enriches the root schema with connector-specific parameter definitions.
+///
+/// This function adds connector parameter schemas to the `$defs` section of the root schema
+/// and creates a combined schema that documents all available connector parameters.
+pub fn enrich_params_schema(
+    root_schema: &mut Schema,
+    data_connectors: &[ConnectorSchema],
+    data_accelerators: &[ConnectorSchema],
+    catalog_connectors: &[CatalogConnectorSchema],
+) {
+    // Get the schema as a mutable JSON object
+    let Some(schema_obj) = root_schema.as_object_mut() else {
+        return;
+    };
+
+    // Ensure $defs exists
+    let defs = schema_obj
+        .entry("$defs")
+        .or_insert_with(|| Value::Object(Map::new()));
+
+    let Some(defs_obj) = defs.as_object_mut() else {
+        return;
+    };
+
+    // Add data connector parameter schemas
+    for connector in data_connectors {
+        let schema_name = format!("{}DataConnectorParams", to_pascal_case(&connector.name));
+        let schema = connector_params_to_schema(connector);
+        defs_obj.insert(schema_name, schema);
+    }
+
+    // Add data accelerator parameter schemas
+    for accelerator in data_accelerators {
+        let schema_name = format!("{}AcceleratorParams", to_pascal_case(&accelerator.name));
+        let schema = connector_params_to_schema(accelerator);
+        defs_obj.insert(schema_name, schema);
+    }
+
+    // Add catalog connector parameter schemas
+    for catalog in catalog_connectors {
+        let connector_schema = ConnectorSchema {
+            name: catalog.name.to_string(),
+            prefix: catalog.prefix,
+            parameters: catalog.parameters,
+        };
+        let schema_name = format!("{}CatalogParams", to_pascal_case(catalog.name));
+        let schema = connector_params_to_schema(&connector_schema);
+        defs_obj.insert(schema_name, schema);
+    }
+
+    // Add connector-specific Dataset definitions with conditional params
+    add_connector_specific_definitions(defs_obj, data_connectors, data_accelerators);
+
+    // Add catalog-specific Catalog definitions with conditional params
+    add_catalog_specific_definitions(defs_obj, catalog_connectors);
+
+    // Update the Dataset, Catalog definitions to use oneOf with connector-specific schemas
+    update_dataset_to_use_conditional_schemas(defs_obj, data_connectors);
+    update_catalog_to_use_conditional_schemas(defs_obj, catalog_connectors);
+
+    // Update Acceleration params field
+    update_acceleration_params(defs_obj, data_accelerators);
+
+    // Add connector metadata as extension
+    add_connector_metadata_extension(
+        schema_obj,
+        data_connectors,
+        data_accelerators,
+        catalog_connectors,
+    );
+}
+
+/// Creates connector-specific Dataset definitions that enforce the correct params schema
+/// based on the `from` field pattern.
+fn add_connector_specific_definitions(
+    defs_obj: &mut Map<String, Value>,
+    data_connectors: &[ConnectorSchema],
+    data_accelerators: &[ConnectorSchema],
+) {
+    // Get the base Dataset schema to clone properties from
+    let base_dataset = defs_obj.get("Dataset").cloned();
+
+    for connector in data_connectors {
+        let def_name = format!("{}Dataset", to_pascal_case(&connector.name));
+        let params_ref = format!(
+            "#/$defs/{}DataConnectorParams",
+            to_pascal_case(&connector.name)
+        );
+
+        let schema =
+            create_connector_specific_component_schema(&base_dataset, connector, &params_ref);
+        defs_obj.insert(def_name, schema);
+    }
+
+    // Also create connector-specific Dataset definitions for accelerators
+    // These are used when acceleration.engine is specified
+    for accelerator in data_accelerators {
+        let def_name = format!("{}AcceleratedDataset", to_pascal_case(&accelerator.name));
+        let accel_params_ref = format!(
+            "#/$defs/{}AcceleratorParams",
+            to_pascal_case(&accelerator.name)
+        );
+
+        let schema =
+            create_accelerated_dataset_schema(&base_dataset, accelerator, &accel_params_ref);
+        defs_obj.insert(def_name, schema);
+    }
+}
+
+/// Creates catalog-specific Catalog definitions that enforce the correct params schema
+/// based on the `from` field pattern.
+fn add_catalog_specific_definitions(
+    defs_obj: &mut Map<String, Value>,
+    catalog_connectors: &[CatalogConnectorSchema],
+) {
+    // Get the base Catalog schema to clone properties from
+    let base_catalog = defs_obj.get("Catalog").cloned();
+
+    for catalog in catalog_connectors {
+        let def_name = format!("{}Catalog", to_pascal_case(catalog.name));
+        let params_ref = format!("#/$defs/{}CatalogParams", to_pascal_case(catalog.name));
+
+        let connector_schema = ConnectorSchema {
+            name: catalog.name.to_string(),
+            prefix: catalog.prefix,
+            parameters: catalog.parameters,
+        };
+
+        let schema = create_catalog_specific_schema(&base_catalog, &connector_schema, &params_ref);
+        defs_obj.insert(def_name, schema);
+    }
+}
+
+/// Creates a connector-specific component schema (Dataset or Catalog) that:
+/// 1. Requires `from` to match a specific pattern
+/// 2. Restricts `params` to only the connector-specific parameters
+fn create_connector_specific_component_schema(
+    base_schema: &Option<Value>,
+    connector: &ConnectorSchema,
+    params_ref: &str,
+) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    // Build the from pattern - connector name followed by colon
+    let from_pattern = format!("^{}:", regex::escape(&connector.name));
+
+    let mut properties = Map::new();
+
+    // from field with pattern constraint
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    from_schema.insert("pattern".to_string(), Value::String(from_pattern.clone()));
+    from_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Data source path for {} connector. Format: {}:<path>",
+            connector.name, connector.name
+        )),
+    );
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // params field with connector-specific reference
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Connection parameters for the {} data connector.",
+            connector.name
+        )),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert("$ref".to_string(), Value::String(params_ref.to_string()));
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
+/// Creates a catalog-specific schema that:
+/// 1. Requires `from` to match a specific pattern
+/// 2. Restricts `params` to only the catalog-specific parameters
+fn create_catalog_specific_schema(
+    base_schema: &Option<Value>,
+    connector: &ConnectorSchema,
+    params_ref: &str,
+) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    // Build the from pattern - connector name followed by colon
+    let from_pattern = format!("^{}:", regex::escape(&connector.name));
+
+    let mut properties = Map::new();
+
+    // from field with pattern constraint
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    from_schema.insert("pattern".to_string(), Value::String(from_pattern.clone()));
+    from_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Catalog source for {} connector. Format: {}:<catalog_path>",
+            connector.name, connector.name
+        )),
+    );
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // params field with catalog-specific reference
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Connection parameters for the {} catalog connector.",
+            connector.name
+        )),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert("$ref".to_string(), Value::String(params_ref.to_string()));
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
+/// Creates an accelerated dataset schema that includes acceleration params
+fn create_accelerated_dataset_schema(
+    base_schema: &Option<Value>,
+    accelerator: &ConnectorSchema,
+    accel_params_ref: &str,
+) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Dataset with {} acceleration engine.",
+            accelerator.name
+        )),
+    );
+
+    let mut properties = Map::new();
+
+    // from field - any string for accelerated datasets
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // acceleration field with engine-specific params
+    let mut accel_schema = Map::new();
+    accel_schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    let mut accel_properties = Map::new();
+
+    // engine field with const value
+    let mut engine_schema = Map::new();
+    engine_schema.insert("type".to_string(), Value::String("string".to_string()));
+    engine_schema.insert("const".to_string(), Value::String(accelerator.name.clone()));
+    accel_properties.insert("engine".to_string(), Value::Object(engine_schema));
+
+    // params field for acceleration
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Configuration parameters for the {} acceleration engine.",
+            accelerator.name
+        )),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert(
+        "$ref".to_string(),
+        Value::String(accel_params_ref.to_string()),
+    );
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    accel_properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other acceleration properties from base Acceleration schema
+    accel_schema.insert("properties".to_string(), Value::Object(accel_properties));
+    accel_schema.insert("additionalProperties".to_string(), Value::Bool(true));
+
+    properties.insert("acceleration".to_string(), Value::Object(accel_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "acceleration" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
+/// Updates the Dataset definition to use `oneOf` with connector-specific schemas
+/// selected by the `from` field pattern.
+fn update_dataset_to_use_conditional_schemas(
+    defs_obj: &mut Map<String, Value>,
+    data_connectors: &[ConnectorSchema],
+) {
+    // Build oneOf array referencing all connector-specific Dataset schemas
+    let mut one_of_refs: Vec<Value> = data_connectors
+        .iter()
+        .map(|c| {
+            let mut ref_obj = Map::new();
+            ref_obj.insert(
+                "$ref".to_string(),
+                Value::String(format!("#/$defs/{}Dataset", to_pascal_case(&c.name))),
+            );
+            Value::Object(ref_obj)
+        })
+        .collect();
+
+    // Add a fallback generic Dataset schema for unknown connectors
+    let generic_dataset = create_generic_dataset_schema(defs_obj.get("Dataset"));
+    defs_obj.insert("GenericDataset".to_string(), generic_dataset);
+
+    let mut generic_ref = Map::new();
+    generic_ref.insert(
+        "$ref".to_string(),
+        Value::String("#/$defs/GenericDataset".to_string()),
+    );
+    one_of_refs.push(Value::Object(generic_ref));
+
+    // Replace Dataset with a schema that uses oneOf
+    let mut new_dataset = Map::new();
+    new_dataset.insert(
+        "description".to_string(),
+        Value::String(
+            "A dataset definition. The params field is validated based on the connector type specified in 'from'.".to_string()
+        ),
+    );
+    new_dataset.insert("oneOf".to_string(), Value::Array(one_of_refs));
+
+    defs_obj.insert("Dataset".to_string(), Value::Object(new_dataset));
+}
+
+/// Updates the Catalog definition to use `oneOf` with catalog-specific schemas
+/// selected by the `from` field pattern.
+fn update_catalog_to_use_conditional_schemas(
+    defs_obj: &mut Map<String, Value>,
+    catalog_connectors: &[CatalogConnectorSchema],
+) {
+    // Build oneOf array referencing all catalog-specific schemas
+    let mut one_of_refs: Vec<Value> = catalog_connectors
+        .iter()
+        .map(|c| {
+            let mut ref_obj = Map::new();
+            ref_obj.insert(
+                "$ref".to_string(),
+                Value::String(format!("#/$defs/{}Catalog", to_pascal_case(c.name))),
+            );
+            Value::Object(ref_obj)
+        })
+        .collect();
+
+    // Add a fallback generic Catalog schema for unknown connectors
+    let generic_catalog = create_generic_catalog_schema(defs_obj.get("Catalog"));
+    defs_obj.insert("GenericCatalog".to_string(), generic_catalog);
+
+    let mut generic_ref = Map::new();
+    generic_ref.insert(
+        "$ref".to_string(),
+        Value::String("#/$defs/GenericCatalog".to_string()),
+    );
+    one_of_refs.push(Value::Object(generic_ref));
+
+    // Replace Catalog with a schema that uses oneOf
+    let mut new_catalog = Map::new();
+    new_catalog.insert(
+        "description".to_string(),
+        Value::String(
+            "A catalog definition. The params field is validated based on the connector type specified in 'from'.".to_string()
+        ),
+    );
+    new_catalog.insert("oneOf".to_string(), Value::Array(one_of_refs));
+
+    defs_obj.insert("Catalog".to_string(), Value::Object(new_catalog));
+}
+
+/// Creates a generic Dataset schema for unknown/custom connectors
+fn create_generic_dataset_schema(base_schema: Option<&Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert(
+        "description".to_string(),
+        Value::String("Generic dataset for custom or unknown connectors.".to_string()),
+    );
+
+    let mut properties = Map::new();
+
+    // from field - any string
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // params field - generic object
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String("Connection parameters for the data connector.".to_string()),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert(
+        "$ref".to_string(),
+        Value::String("#/$defs/Params".to_string()),
+    );
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" && key != "name" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
+/// Creates a generic Catalog schema for unknown/custom connectors
+fn create_generic_catalog_schema(base_schema: Option<&Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert(
+        "description".to_string(),
+        Value::String("Generic catalog for custom or unknown connectors.".to_string()),
+    );
+
+    let mut properties = Map::new();
+
+    // from field - any string
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // params field - generic object
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String("Connection parameters for the catalog connector.".to_string()),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert(
+        "$ref".to_string(),
+        Value::String("#/$defs/Params".to_string()),
+    );
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" && key != "name" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
+/// Updates the Acceleration params field with anyOf referencing all accelerator schemas
+fn update_acceleration_params(
+    defs_obj: &mut Map<String, Value>,
+    data_accelerators: &[ConnectorSchema],
+) {
+    // Build anyOf array for Acceleration params (data accelerators)
+    let acceleration_params_refs: Vec<Value> = data_accelerators
+        .iter()
+        .map(|a| {
+            let mut ref_obj = Map::new();
+            ref_obj.insert(
+                "$ref".to_string(),
+                Value::String(format!(
+                    "#/$defs/{}AcceleratorParams",
+                    to_pascal_case(&a.name)
+                )),
+            );
+            Value::Object(ref_obj)
+        })
+        .collect();
+
+    // Update Acceleration params field
+    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration") {
+        if let Some(Value::Object(properties)) = accel_def.get_mut("properties") {
+            if !acceleration_params_refs.is_empty() {
+                let accelerator_names: Vec<&str> =
+                    data_accelerators.iter().map(|a| a.name.as_str()).collect();
+                let description = format!(
+                    "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine'. Available engines: {}. See $defs for engine-specific parameter schemas (e.g., DuckdbAcceleratorParams, PostgresAcceleratorParams).",
+                    accelerator_names.join(", ")
+                );
+                update_params_property(
+                    properties,
+                    "params",
+                    &acceleration_params_refs,
+                    &description,
+                );
+            }
+        }
+    }
+}
+
+/// Updates a params property to use anyOf with the given schema references.
+fn update_params_property(
+    properties: &mut Map<String, Value>,
+    field_name: &str,
+    refs: &[Value],
+    description: &str,
+) {
+    let mut any_of = refs.to_vec();
+
+    // Add null option
+    let mut null_type = Map::new();
+    null_type.insert("type".to_string(), Value::String("null".to_string()));
+    any_of.push(Value::Object(null_type));
+
+    // Also keep the generic Params reference for flexibility
+    let mut generic_ref = Map::new();
+    generic_ref.insert(
+        "$ref".to_string(),
+        Value::String("#/$defs/Params".to_string()),
+    );
+    any_of.push(Value::Object(generic_ref));
+
+    let mut new_params = Map::new();
+    new_params.insert(
+        "description".to_string(),
+        Value::String(description.to_string()),
+    );
+    new_params.insert("anyOf".to_string(), Value::Array(any_of));
+
+    properties.insert(field_name.to_string(), Value::Object(new_params));
+}
+
+/// Adds connector metadata as a JSON Schema extension (`x-spice-connectors`).
+///
+/// This extension provides a machine-readable list of all available connectors
+/// with their names and prefixes for tooling integration.
+fn add_connector_metadata_extension(
+    schema_obj: &mut Map<String, Value>,
+    data_connectors: &[ConnectorSchema],
+    data_accelerators: &[ConnectorSchema],
+    catalog_connectors: &[CatalogConnectorSchema],
+) {
+    let mut connectors_metadata = Map::new();
+
+    // Data connectors metadata
+    let data_connector_list: Vec<Value> = data_connectors
+        .iter()
+        .map(|c| {
+            let mut obj = Map::new();
+            obj.insert("name".to_string(), Value::String(c.name.clone()));
+            obj.insert("prefix".to_string(), Value::String(c.prefix.to_string()));
+            obj.insert(
+                "paramsRef".to_string(),
+                Value::String(format!(
+                    "#/$defs/{}DataConnectorParams",
+                    to_pascal_case(&c.name)
+                )),
+            );
+            obj.insert(
+                "schemaRef".to_string(),
+                Value::String(format!("#/$defs/{}Dataset", to_pascal_case(&c.name))),
+            );
+            Value::Object(obj)
+        })
+        .collect();
+    connectors_metadata.insert(
+        "dataConnectors".to_string(),
+        Value::Array(data_connector_list),
+    );
+
+    // Data accelerators metadata
+    let accelerator_list: Vec<Value> = data_accelerators
+        .iter()
+        .map(|a| {
+            let mut obj = Map::new();
+            obj.insert("name".to_string(), Value::String(a.name.clone()));
+            obj.insert("prefix".to_string(), Value::String(a.prefix.to_string()));
+            obj.insert(
+                "paramsRef".to_string(),
+                Value::String(format!(
+                    "#/$defs/{}AcceleratorParams",
+                    to_pascal_case(&a.name)
+                )),
+            );
+            Value::Object(obj)
+        })
+        .collect();
+    connectors_metadata.insert(
+        "dataAccelerators".to_string(),
+        Value::Array(accelerator_list),
+    );
+
+    // Catalog connectors metadata
+    let catalog_list: Vec<Value> = catalog_connectors
+        .iter()
+        .map(|c| {
+            let mut obj = Map::new();
+            obj.insert("name".to_string(), Value::String(c.name.to_string()));
+            obj.insert("prefix".to_string(), Value::String(c.prefix.to_string()));
+            obj.insert(
+                "paramsRef".to_string(),
+                Value::String(format!("#/$defs/{}CatalogParams", to_pascal_case(c.name))),
+            );
+            obj.insert(
+                "schemaRef".to_string(),
+                Value::String(format!("#/$defs/{}Catalog", to_pascal_case(c.name))),
+            );
+            Value::Object(obj)
+        })
+        .collect();
+    connectors_metadata.insert("catalogConnectors".to_string(), Value::Array(catalog_list));
+
+    // Add the extension to the root schema
+    schema_obj.insert(
+        "x-spice-connectors".to_string(),
+        Value::Object(connectors_metadata),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime_parameters::ParameterSpec;
+    use schemars::schema_for;
+
+    fn create_test_connector() -> ConnectorSchema {
+        static TEST_PARAMS: &[ParameterSpec] = &[
+            ParameterSpec::component("host").description("The database host"),
+            ParameterSpec::component("port").default("5432"),
+        ];
+
+        ConnectorSchema {
+            name: "test_db".to_string(),
+            prefix: "test",
+            parameters: TEST_PARAMS,
+        }
+    }
+
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct TestSchema {
+        name: String,
+    }
+
+    #[test]
+    fn test_enrich_params_schema_adds_definitions() {
+        // Create a minimal root schema
+        let mut root_schema = schema_for!(TestSchema);
+
+        let connectors = vec![create_test_connector()];
+        let accelerators: Vec<ConnectorSchema> = vec![];
+        let catalogs: Vec<CatalogConnectorSchema> = vec![];
+
+        enrich_params_schema(&mut root_schema, &connectors, &accelerators, &catalogs);
+
+        // Check that the definition was added
+        let schema_obj = root_schema.as_object().expect("should be object schema");
+        let defs = schema_obj.get("$defs").expect("should have $defs");
+        let defs_obj = defs.as_object().expect("$defs should be object");
+        assert!(defs_obj.contains_key("TestDbDataConnectorParams"));
+        assert!(defs_obj.contains_key("TestDbDataset"));
+    }
+
+    #[test]
+    fn test_connector_specific_schema_has_pattern() {
+        let connector = create_test_connector();
+        let schema = create_connector_specific_component_schema(
+            &None,
+            &connector,
+            "#/$defs/TestDbDataConnectorParams",
+        );
+
+        let obj = schema.as_object().expect("should be object");
+        let props = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("should have properties");
+        let from_prop = props
+            .get("from")
+            .and_then(|v| v.as_object())
+            .expect("should have from property");
+
+        assert!(from_prop.contains_key("pattern"));
+        let pattern = from_prop
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .expect("pattern should be string");
+        assert!(pattern.starts_with("^test_db:"));
+    }
+}

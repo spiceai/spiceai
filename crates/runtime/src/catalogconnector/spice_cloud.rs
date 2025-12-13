@@ -252,7 +252,7 @@ impl SpiceCloudPlatformCatalog {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("api_key").secret(),
     ParameterSpec::component("flight_endpoint"),
     ParameterSpec::component("http_endpoint"),

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
 version: v1
 kind: Spicepod
 name: tpch-spicepod
@@ -93,7 +94,7 @@ datasets:
       pg_user: postgres
       pg_pass: postgres
       pg_sslmode: prefer
-  
+
   - from: postgres:supplier
     name: supplier
     acceleration:
