@@ -4390,16 +4390,7 @@
           "type": "string"
         },
         "pg_sslmode": {
-          "description": "SSL connection mode.",
-          "type": "string",
-          "enum": [
-            "disable",
-            "allow",
-            "prefer",
-            "require",
-            "verify-ca",
-            "verify-full"
-          ]
+          "type": "string"
         },
         "pg_sslrootcert": {
           "type": "string"

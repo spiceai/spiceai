@@ -76,16 +76,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("host"),
     ParameterSpec::component("port"),
     ParameterSpec::component("db"),
-    ParameterSpec::component("sslmode")
-        .description("SSL connection mode.")
-        .one_of(&[
-            "disable",
-            "allow",
-            "prefer",
-            "require",
-            "verify-ca",
-            "verify-full",
-        ]),
+    ParameterSpec::component("sslmode"),
     ParameterSpec::component("sslrootcert"),
     ParameterSpec::component("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
