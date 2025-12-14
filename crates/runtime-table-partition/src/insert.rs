@@ -139,7 +139,6 @@ impl ExecutionPlan for PartitionerExec {
         )))
     }
 
-    #[expect(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,

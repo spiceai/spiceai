@@ -33,7 +33,6 @@ use crate::{
 };
 
 #[cfg(feature = "duckdb")]
-#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -476,7 +475,6 @@ async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
         .await
 }
 
-#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

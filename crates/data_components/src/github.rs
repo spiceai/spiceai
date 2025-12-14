@@ -325,7 +325,6 @@ impl GithubRestClient {
     }
 
     #[expect(clippy::too_many_arguments)]
-    #[expect(clippy::too_many_lines)]
     #[expect(clippy::missing_panics_doc)]
     #[expect(clippy::expect_used)]
     pub async fn fetch_files(
