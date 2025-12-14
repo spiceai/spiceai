@@ -216,6 +216,87 @@ The schema uses `allOf` with `if/then` conditionals to provide connector-specifi
 
 This design allows multiple datasets of the same connector type in a single spicepod while providing connector-specific parameter validation and IDE support.
 
+## Schema Coverage
+
+The schema generator enriches the base Spicepod schema with connector-specific parameter validation. This section documents which Spicepod components have connector/source-specific parameter schemas.
+
+### Coverage Status
+
+| Component | Has `from` Field | Has Connectors/Sources | Has `params` | Schema Coverage |
+|-----------|------------------|------------------------|--------------|-----------------|
+| **Datasets** | ✅ | Data Connectors | ✅ | ✅ **Covered** |
+| **Datasets.acceleration** | - | Data Accelerators | ✅ | ✅ **Covered** |
+| **Catalogs** | ✅ | Catalog Connectors | ✅ | ✅ **Covered** |
+| **Models** | ✅ | Model Sources | ✅ | ❌ Not yet covered |
+| **Embeddings** | ✅ | Embedding Sources | ✅ | ❌ Not yet covered |
+| **Tools** | ✅ | Tool Types | ✅ | ❌ Not yet covered |
+| **Secrets** | ✅ | Secret Stores | ✅ | ❌ Not yet covered |
+| **Views** | ❌ | None (SQL-based) | ❌ | N/A |
+| **Workers** | ❌ | None | ✅ (generic) | N/A |
+| **Evals** | ❌ | None | ❌ | N/A |
+
+### Currently Covered
+
+#### Data Connectors (Datasets)
+Location: `crates/runtime/src/dataconnector/*.rs`
+
+Connectors are registered via `DATA_CONNECTOR_REGISTRATIONS` distributed slice. Each connector implements `DataConnectorFactory` trait with `parameters()` method.
+
+#### Data Accelerators (Datasets.acceleration)
+Location: `crates/runtime-acceleration/src/*.rs`
+
+Accelerators are registered via `DATA_ACCELERATOR_REGISTRATIONS` distributed slice. Each accelerator implements `DataAccelerator` trait with `parameters()` method.
+
+#### Catalog Connectors (Catalogs)
+Location: `crates/runtime/src/catalogconnector/*.rs`
+
+Catalog connectors define `PARAMETERS` constants. Currently includes:
+- `unity_catalog` (requires `delta_lake` feature)
+- `databricks` (requires `databricks` feature)
+- `iceberg`
+- `spice.ai`
+
+### Not Yet Covered
+
+#### Model Sources (Models)
+Location: `crates/runtime/src/model/params/*.rs`
+
+Model sources define parameters in separate modules:
+- `openai` - OpenAI API parameters
+- `azure` - Azure OpenAI parameters
+- `anthropic` - Anthropic API parameters
+- `perplexity` - Perplexity API parameters
+- `xai` - xAI API parameters
+- `bedrock` - AWS Bedrock parameters
+- `databricks` - Databricks model parameters
+- `huggingface` - Hugging Face parameters
+- `file` - Local file model parameters
+
+Access pattern: `get_params_spec(ModelSource) -> Option<&'static [ParameterSpec]>`
+
+#### Embedding Sources (Embeddings)
+Location: Uses similar parameters to models
+
+Embedding prefixes (from `EmbeddingPrefix` enum):
+- `openai`, `azure`, `huggingface`, `file`, `databricks`, `bedrock`, `model2vec`
+
+#### Tool Types (Tools)
+Location: `crates/runtime/src/tools/`
+
+Tool types:
+- `auto` - Builtin tools (get_readiness, list_datasets, sql, search, etc.)
+- `mcp` - Model Context Protocol tools
+- `memory` - Memory tools (store, load)
+
+#### Secret Stores (Secrets)
+Location: `crates/runtime-secrets/src/stores/`
+
+Secret store types (from `SecretStoreType` enum):
+- `env` - Environment variables (optional `file_path` param)
+- `keyring` - System keyring (feature-gated)
+- `kubernetes` - Kubernetes secrets
+- `aws_secrets_manager` - AWS Secrets Manager (feature-gated)
+
 ## Adding New Connectors to Schema
 
 1. Ensure the connector has a `PARAMETERS` constant with `ParameterSpec` definitions
@@ -232,3 +313,19 @@ This design allows multiple datasets of the same connector type in a single spic
 3. **Platform-specific connectors**: Some connectors are platform-specific and may not be included in all builds
 
 4. **Custom deserializers**: Types with custom `Deserialize` impl may have schema that doesn't fully reflect runtime behavior
+
+5. **Incomplete component coverage**: Models, Embeddings, Tools, and Secrets components have connector-specific parameters that are not yet included in the schema. See [Schema Coverage](#schema-coverage) section for details.
+
+## Future Work
+
+To achieve full schema coverage, the following components need to be added:
+
+1. **Models** - Add model source parameter collection from `crates/runtime/src/model/params/`
+2. **Embeddings** - Add embedding source parameter collection (similar to models)
+3. **Tools** - Add tool type parameter collection from `crates/runtime/src/tools/`
+4. **Secrets** - Add secret store parameter collection from `crates/runtime-secrets/src/stores/`
+
+Each would follow the same pattern as data connectors:
+1. Add collector function in `collector.rs`
+2. Add enrichment logic in `enricher.rs`
+3. Update `main.rs` to collect and process the new schemas
