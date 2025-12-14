@@ -37,6 +37,7 @@ pub(crate) enum ColumnConfigOptions {
     TextSearch,
     MultiTextColumn,
     TextSearchMetadata,
+    VectorSearchMetadata,
     MultiEmbeddings,
 }
 
@@ -50,6 +51,7 @@ impl fmt::Display for ColumnConfigOptions {
             ColumnConfigOptions::TextSearch => "text_search",
             ColumnConfigOptions::MultiTextColumn => "multi_text_column",
             ColumnConfigOptions::TextSearchMetadata => "text_search_metadata",
+            ColumnConfigOptions::VectorSearchMetadata => "vector_search_metadata",
             ColumnConfigOptions::MultiEmbeddings => "multi_embeddings",
         };
         write!(f, "{s}")
@@ -114,6 +116,15 @@ impl ColumnConfigOptions {
                 Column::new("subject").with_metadata(HashMap::from([(
                     "vectors".to_string(),
                     serde_json::Value::String("non-filterable".to_string()),
+                )])),
+            ],
+            ColumnConfigOptions::VectorSearchMetadata => vec![
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                ),
+                Column::new("subject").with_metadata(HashMap::from([(
+                    "vectors".to_string(),
+                    serde_json::Value::String("filterable".to_string()),
                 )])),
             ],
             ColumnConfigOptions::MultiEmbeddings => {

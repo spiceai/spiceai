@@ -268,7 +268,8 @@ async fn test_megascience_permutations(
         megascience::ColumnConfigOptions::TextSearch,
         megascience::ColumnConfigOptions::MultiTextColumn,
         megascience::ColumnConfigOptions::TextSearchMetadata,
-        megascience::ColumnConfigOptions::MultiEmbeddings
+        megascience::ColumnConfigOptions::MultiEmbeddings,
+        megascience::ColumnConfigOptions::VectorSearchMetadata
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
