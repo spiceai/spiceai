@@ -855,7 +855,7 @@ async fn test_github_workflow_runs() -> Result<(), String> {
 
             run_query_and_check_results(
                 &mut rt,
-                "test_github_workflows_list",
+                "test_github_workflow_runs",
                 "describe spiceai_workflow_runs_auto;",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
