@@ -494,7 +494,6 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_tables_mode_partitioned_duckdb_accelerator() {
         // Ensure no previous database version exists
         let test_db_path = "./test_table.db";

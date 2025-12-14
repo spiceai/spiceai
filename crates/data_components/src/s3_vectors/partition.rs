@@ -207,7 +207,6 @@ fn to_stable_string(exprs: &[Expr]) -> Result<String, Error> {
         .join(PARTS_SEPARATOR))
 }
 
-#[expect(clippy::too_many_lines)]
 fn stable_expr_string(expr: &Expr) -> Result<String, Error> {
     Ok(match expr {
         Expr::Column(col) => {

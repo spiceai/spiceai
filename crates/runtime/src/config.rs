@@ -40,15 +40,6 @@ pub struct Config {
     )]
     pub flight_bind_address: SocketAddr,
 
-    /// Configure runtime OpenTelemetry address.
-    #[arg(
-        long = "open_telemetry",
-        value_name = "OPEN_TELEMETRY_BIND_ADDRESS",
-        default_value = "127.0.0.1:50052",
-        action
-    )]
-    pub open_telemetry_bind_address: SocketAddr,
-
     /// All cluster related arguments
     #[cfg(feature = "cluster")]
     #[clap(flatten)]
@@ -67,7 +58,6 @@ impl Config {
         Self {
             http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090),
             flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
-            open_telemetry_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
             #[cfg(feature = "cluster")]
             cluster: ClusterConfig::default(),
         }
@@ -82,12 +72,6 @@ impl Config {
     #[must_use]
     pub fn with_flight_bind_address(mut self, bind_addr: SocketAddr) -> Self {
         self.flight_bind_address = bind_addr;
-        self
-    }
-
-    #[must_use]
-    pub fn with_open_telemetry_bind_address(mut self, bind_addr: SocketAddr) -> Self {
-        self.open_telemetry_bind_address = bind_addr;
         self
     }
 }

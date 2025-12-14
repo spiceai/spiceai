@@ -493,7 +493,6 @@ pub(super) fn get_vectors_in_process(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
-#[expect(clippy::too_many_lines)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,

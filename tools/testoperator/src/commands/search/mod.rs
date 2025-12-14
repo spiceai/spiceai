@@ -36,7 +36,6 @@ use test_framework::{
 };
 use tokio::time::sleep;
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
 

@@ -142,7 +142,6 @@ pub(crate) mod search {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
@@ -541,7 +540,6 @@ pub(crate) mod search {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",

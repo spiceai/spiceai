@@ -54,6 +54,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Display},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
 };
 
@@ -125,7 +126,10 @@ impl fmt::Display for AccelerationOptions {
 }
 
 impl AccelerationOptions {
-    fn to_acceleration(&self) -> Acceleration {
+    /// Converts to Spicepod [`Acceleration`] configuration.
+    ///
+    /// `unique_id` enables accelerations to set unique filepaths, when needed.
+    fn to_acceleration(&self, unique_id: &str) -> Acceleration {
         match self {
             AccelerationOptions::NoAcceleration => Acceleration {
                 enabled: false,
@@ -145,12 +149,20 @@ impl AccelerationOptions {
                 enabled: true,
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
+                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
+                    "duckdb_file_path".to_string(),
+                    format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
+                )]))),
                 ..Default::default()
             },
             AccelerationOptions::Cayenne => Acceleration {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
                 mode: Mode::File,
+                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
+                    "cayenne_file_path".to_string(),
+                    format!(".spice/data/cayenne_acceleration_{unique_id}/"),
+                )]))),
                 ..Default::default()
             },
         }
@@ -237,7 +249,8 @@ async fn test_megascience_permutations(
     #[values(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
-        AccelerationOptions::DuckDb
+        AccelerationOptions::DuckDb,
+        AccelerationOptions::DuckDbFile
     )]
     acceleration_opt: AccelerationOptions,
     #[values(
@@ -271,7 +284,11 @@ async fn test_megascience_permutations(
     }
 
     let columns = column_config.to_columns();
-    let acceleration = acceleration_opt.to_acceleration();
+
+    // use some hash of slug
+    let mut z = DefaultHasher::new();
+    slug.hash(&mut z);
+    let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
 
     let mut app = AppBuilder::new(slug);
     let (views, datasets) = table_option.to_tables();

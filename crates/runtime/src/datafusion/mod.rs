@@ -974,7 +974,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
