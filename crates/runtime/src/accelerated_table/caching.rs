@@ -1091,7 +1091,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         )))
     }
 
-    #[expect(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,

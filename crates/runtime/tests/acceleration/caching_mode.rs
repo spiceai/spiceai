@@ -66,7 +66,6 @@ use crate::{
 ///
 /// Also verifies:
 /// - Cache hit: subsequent queries with same filters are served from cache
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -199,7 +198,6 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
 ///
 /// For production use with `DuckDB` or Cayenne accelerators, multi-filter caching
 /// works correctly with upsert behavior.
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -413,7 +411,6 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
 /// 4. Query with filter B → cache hit → served from cache (no HTTP fetch)
 ///
 /// Uses `DuckDB` accelerator which supports upsert-based multi-filter caching.
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -630,7 +627,6 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
 ///
 /// NOTE: Currently SQLite/Cayenne caching mode has similar issues to `DuckDB` - queries return empty results.
 /// Investigation needed. Test runs when sqlite feature is enabled but is currently failing.
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "sqlite")]
 async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
@@ -1251,7 +1247,6 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
 /// Test background refresh triggered on cache miss.
 /// Verifies that when data is not in the cache, a background refresh is triggered
 /// to populate the cache asynchronously after returning the federated data.
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
@@ -1402,7 +1397,6 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
 /// the test can query stale data, it overwrites with fresh data. The proper fix would
 /// be to implement "delete-where + insert" for background refresh to only update
 /// specific rows.
-#[expect(clippy::too_many_lines)]
 #[ignore = "Background refresh uses InsertOp::Overwrite which replaces all data - needs delete-where + insert for row-level updates"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::Error> {
@@ -1595,7 +1589,6 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 /// 2. Data becomes stale after TTL
 /// 3. Periodic refresh task (based on `refresh_check_interval`) updates stale data automatically
 /// 4. Old data beyond `retention_period` is evicted from cache
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(

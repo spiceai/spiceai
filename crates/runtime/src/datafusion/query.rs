@@ -266,7 +266,6 @@ impl Query {
         Ok(QueryResult::new(stream, cache_status))
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 

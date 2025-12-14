@@ -207,7 +207,6 @@ impl Query {
         )
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
@@ -716,7 +715,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
@@ -1139,7 +1137,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_complete_lifecycle() {
         // This test validates the complete stale-while-revalidate lifecycle:
         // 1. Initial cache population
@@ -1369,7 +1366,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
         // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
@@ -1533,7 +1529,6 @@ mod tests {
             .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_single_in_flight_revalidation() {
         // This test validates that concurrent stale-while-revalidate requests

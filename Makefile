@@ -87,6 +87,7 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \
@@ -101,6 +102,7 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \
@@ -119,12 +121,31 @@ lint-rust-fix:
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
 
 lint-go:
 	go vet ./...

@@ -512,7 +512,6 @@ impl QueryOverrides {
     }
 }
 
-#[expect(clippy::too_many_lines)]
 #[must_use]
 pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let queries = generate_tpch_queries!(
