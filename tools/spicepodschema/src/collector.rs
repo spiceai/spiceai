@@ -19,7 +19,9 @@ limitations under the License.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
-use runtime::model::params::all_model_params;
+use runtime::model::params::{
+    anthropic, azure, bedrock, databricks, file, huggingface, openai, perplexity, xai,
+};
 use runtime_parameters::ParameterSpec;
 
 /// Schema information for a connector or accelerator.
@@ -137,14 +139,55 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
 /// Collects schema information from all model sources.
 ///
 /// Model sources define their parameters in `crates/runtime/src/model/params/`.
+/// This function enumerates them directly to avoid adding schema-generation-only
+/// code to the runtime.
 #[must_use]
 pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
-    all_model_params()
-        .into_iter()
-        .map(|(name, parameters)| ModelSourceSchema {
-            name,
-            prefix: name,
-            parameters,
-        })
-        .collect()
+    vec![
+        ModelSourceSchema {
+            name: "openai",
+            prefix: "openai",
+            parameters: openai::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "azure",
+            prefix: "azure",
+            parameters: azure::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "file",
+            prefix: "file",
+            parameters: file::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "databricks",
+            prefix: "databricks",
+            parameters: databricks::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "huggingface",
+            prefix: "huggingface",
+            parameters: huggingface::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "anthropic",
+            prefix: "anthropic",
+            parameters: anthropic::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "perplexity",
+            prefix: "perplexity",
+            parameters: perplexity::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "xai",
+            prefix: "xai",
+            parameters: xai::PARAMETERS,
+        },
+        ModelSourceSchema {
+            name: "bedrock",
+            prefix: "bedrock",
+            parameters: bedrock::PARAMETERS,
+        },
+    ]
 }

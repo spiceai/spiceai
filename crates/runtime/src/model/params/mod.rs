@@ -49,24 +49,6 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
     }
 }
 
-/// Returns all model sources and their parameter specifications.
-///
-/// This function is used by the schema generator to enumerate all available model sources.
-#[must_use]
-pub fn all_model_params() -> Vec<(&'static str, &'static [ParameterSpec])> {
-    vec![
-        ("openai", openai::PARAMETERS),
-        ("azure", azure::PARAMETERS),
-        ("file", file::PARAMETERS),
-        ("databricks", databricks::PARAMETERS),
-        ("huggingface", huggingface::PARAMETERS),
-        ("anthropic", anthropic::PARAMETERS),
-        ("perplexity", perplexity::PARAMETERS),
-        ("xai", xai::PARAMETERS),
-        ("bedrock", bedrock::PARAMETERS),
-    ]
-}
-
 // Use the const function to reduce the duplicated common model parameters definition in each model provider param spec.
 pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
     a: [T; N],
