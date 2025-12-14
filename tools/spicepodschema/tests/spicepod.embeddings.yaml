@@ -33,15 +33,15 @@ embeddings:
       endpoint: https://myresource.openai.azure.com
 
   # ---------------------------------------------------------------------------
-  # Huggingface Embeddings (if enabled)
+  # Huggingface Embeddings
   # ---------------------------------------------------------------------------
-  # - name: hf_embeddings
-  #   from: huggingface:sentence-transformers/all-MiniLM-L6-v2
-  #   params:
-  #     huggingface_token: hf_xxx
+  - name: hf_embeddings
+    from: huggingface:sentence-transformers/all-MiniLM-L6-v2
+    params:
+      huggingface_token: hf_xxx
 
   # ---------------------------------------------------------------------------
-  # File-based Embeddings (if enabled)
+  # File-based Embeddings
   # ---------------------------------------------------------------------------
-  # - name: local_embeddings
-  #   from: file:models/my_embeddings.gguf
+  - name: local_embeddings
+    from: file:models/my_embeddings.gguf

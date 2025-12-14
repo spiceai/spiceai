@@ -306,7 +306,7 @@ datasets:
     from: localpod:other_dataset
 
   # ---------------------------------------------------------------------------
-  # ClickHouse connector (if enabled)
+  # ClickHouse connector
   # Runtime params: connection_timeout
   # ---------------------------------------------------------------------------
   - name: test_clickhouse
@@ -316,105 +316,105 @@ datasets:
       connection_timeout: "30000"
 
   # ---------------------------------------------------------------------------
-  # ODBC connector (if enabled)
+  # ODBC connector
   # Runtime params: sql_dialect
   # ---------------------------------------------------------------------------
-  # - name: test_odbc
-  #   from: odbc:table
-  #   params:
-  #     odbc_connection_string: "Driver={SQL Server};Server=localhost;Database=test"
-  #     sql_dialect: mssql
+  - name: test_odbc
+    from: odbc:table
+    params:
+      odbc_connection_string: "Driver={SQL Server};Server=localhost;Database=test"
+      sql_dialect: mssql
 
   # ---------------------------------------------------------------------------
-  # DynamoDB connector (if enabled)
+  # DynamoDB connector
   # Runtime params: unnest_depth, schema_infer_max_records, scan_segments,
   #                 scan_interval, time_format, ready_lag, endpoint_url
   # ---------------------------------------------------------------------------
-  # - name: test_dynamodb
-  #   from: dynamodb:my_table
-  #   params:
-  #     dynamodb_aws_region: us-east-1
-  #     dynamodb_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
-  #     dynamodb_aws_secret_access_key: secret
-  #     unnest_depth: "3"
-  #     schema_infer_max_records: "100"
-  #     scan_segments: auto
-  #     scan_interval: "1s"
-  #     time_format: "2006-01-02T15:04:05Z07:00"
-  #     ready_lag: "5s"
-  #     endpoint_url: http://localhost:8000
+  - name: test_dynamodb
+    from: dynamodb:my_table
+    params:
+      dynamodb_aws_region: us-east-1
+      dynamodb_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      dynamodb_aws_secret_access_key: secret
+      unnest_depth: "3"
+      schema_infer_max_records: "100"
+      scan_segments: auto
+      scan_interval: "1s"
+      time_format: "2006-01-02T15:04:05Z07:00"
+      ready_lag: "5s"
+      endpoint_url: http://localhost:8000
 
   # ---------------------------------------------------------------------------
-  # FTP connector (if enabled)
+  # FTP connector
   # Runtime params: client_timeout
   # ---------------------------------------------------------------------------
-  # - name: test_ftp
-  #   from: ftp://ftp.example.com/data/
-  #   params:
-  #     ftp_user: anonymous
-  #     ftp_pass: guest
-  #     ftp_port: "21"
-  #     client_timeout: "30s"
-  #     file_format: csv
+  - name: test_ftp
+    from: ftp://ftp.example.com/data/
+    params:
+      ftp_user: anonymous
+      ftp_pass: guest
+      ftp_port: "21"
+      client_timeout: "30s"
+      file_format: csv
 
   # ---------------------------------------------------------------------------
-  # SFTP connector (if enabled)
+  # SFTP connector
   # Runtime params: client_timeout
   # ---------------------------------------------------------------------------
-  # - name: test_sftp
-  #   from: sftp://sftp.example.com/data/
-  #   params:
-  #     sftp_user: user
-  #     sftp_pass: password
-  #     sftp_port: "22"
-  #     client_timeout: "30s"
-  #     file_format: parquet
+  - name: test_sftp
+    from: sftp://sftp.example.com/data/
+    params:
+      sftp_user: user
+      sftp_pass: password
+      sftp_port: "22"
+      client_timeout: "30s"
+      file_format: parquet
 
   # ---------------------------------------------------------------------------
-  # SharePoint connector (if enabled)
+  # SharePoint connector
   # Runtime params: file_format
   # ---------------------------------------------------------------------------
-  # - name: test_sharepoint
-  #   from: sharepoint:sites/MySite/Shared Documents/data.xlsx
-  #   params:
-  #     sharepoint_client_id: client-id
-  #     sharepoint_tenant_id: tenant-id
-  #     sharepoint_client_secret: client-secret
-  #     file_format: xlsx
+  - name: test_sharepoint
+    from: sharepoint:sites/MySite/Shared Documents/data.xlsx
+    params:
+      sharepoint_client_id: client-id
+      sharepoint_tenant_id: tenant-id
+      sharepoint_client_secret: client-secret
+      file_format: xlsx
 
   # ---------------------------------------------------------------------------
-  # Kafka connector (if enabled)
+  # Kafka connector
   # Runtime params: schema_infer_max_records, flatten_json, kafka_* params
   # ---------------------------------------------------------------------------
-  # - name: test_kafka
-  #   from: kafka:my_topic
-  #   params:
-  #     kafka_bootstrap_servers: localhost:9092
-  #     kafka_security_protocol: sasl_ssl
-  #     kafka_sasl_mechanism: SCRAM-SHA-512
-  #     kafka_sasl_username: user
-  #     kafka_sasl_password: password
-  #     kafka_ssl_endpoint_identification_algorithm: https
-  #     schema_infer_max_records: "10"
-  #     flatten_json: "true"
+  - name: test_kafka
+    from: kafka:my_topic
+    params:
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: sasl_ssl
+      kafka_sasl_mechanism: SCRAM-SHA-512
+      kafka_sasl_username: user
+      kafka_sasl_password: password
+      kafka_ssl_endpoint_identification_algorithm: https
+      schema_infer_max_records: "10"
+      flatten_json: "true"
 
   # ---------------------------------------------------------------------------
-  # Debezium connector (if enabled)
+  # Debezium connector
   # Runtime params: kafka_bootstrap_servers, kafka_security_protocol,
   #                 kafka_sasl_mechanism, kafka_sasl_username, kafka_sasl_password,
   #                 kafka_ssl_ca_location, kafka_enable_ssl_certificate_verification,
   #                 kafka_ssl_endpoint_identification_algorithm, kafka_consumer_group_id
   # ---------------------------------------------------------------------------
-  # - name: test_debezium
-  #   from: debezium:my_table
-  #   params:
-  #     debezium_transport: kafka
-  #     debezium_message_format: json
-  #     kafka_bootstrap_servers: localhost:9092
-  #     kafka_security_protocol: sasl_ssl
-  #     kafka_sasl_mechanism: SCRAM-SHA-512
-  #     kafka_sasl_username: debezium
-  #     kafka_sasl_password: secret
-  #     kafka_enable_ssl_certificate_verification: "true"
-  #     kafka_ssl_endpoint_identification_algorithm: https
-  #     kafka_consumer_group_id: spice-debezium-consumer
+  - name: test_debezium
+    from: debezium:my_table
+    params:
+      debezium_transport: kafka
+      debezium_message_format: json
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: sasl_ssl
+      kafka_sasl_mechanism: SCRAM-SHA-512
+      kafka_sasl_username: debezium
+      kafka_sasl_password: secret
+      kafka_enable_ssl_certificate_verification: "true"
+      kafka_ssl_endpoint_identification_algorithm: https
+      kafka_consumer_group_id: spice-debezium-consumer
