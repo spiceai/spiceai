@@ -1141,22 +1141,117 @@
       ]
     },
     "Catalog": {
-      "description": "A catalog definition. The params field is validated based on the connector type specified in 'from'.",
-      "anyOf": [
+      "description": "A catalog definition. The params field is validated based on the catalog connector type specified in 'from'.",
+      "allOf": [
         {
-          "$ref": "#/$defs/UnityCatalogCatalog"
+          "type": "object",
+          "properties": {
+            "from": {
+              "description": "Catalog source identifier in the format: <connector>:<path>",
+              "type": "string"
+            },
+            "name": {
+              "description": "The unique name for this catalog.",
+              "type": "string"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "metadata": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "access": {
+              "$ref": "#/$defs/AccessMode"
+            },
+            "include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "dataset_params": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Params"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "dependsOn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "metrics": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Metrics"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "from",
+            "name"
+          ]
         },
         {
-          "$ref": "#/$defs/DatabricksCatalog"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^unity_catalog:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/UnityCatalogCatalog"
+          }
         },
         {
-          "$ref": "#/$defs/IcebergCatalog"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^databricks:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DatabricksCatalog"
+          }
         },
         {
-          "$ref": "#/$defs/SpiceAiCatalog"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^iceberg:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/IcebergCatalog"
+          }
         },
         {
-          "$ref": "#/$defs/GenericCatalog"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^spice\\.ai:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/SpiceAiCatalog"
+          }
         }
       ]
     },
@@ -1196,63 +1291,375 @@
     },
     "Dataset": {
       "description": "A dataset definition. The params field is validated based on the connector type specified in 'from'.",
-      "anyOf": [
+      "allOf": [
         {
-          "$ref": "#/$defs/S3Dataset"
+          "type": "object",
+          "properties": {
+            "from": {
+              "description": "Data source identifier in the format: <connector>:<path>",
+              "type": "string"
+            },
+            "name": {
+              "description": "The unique name for this dataset.",
+              "type": "string"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "metadata": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "columns": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Column"
+              }
+            },
+            "access": {
+              "$ref": "#/$defs/AccessMode"
+            },
+            "has_metadata_table": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "replication": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Replication"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "time_column": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "time_format": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TimeFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "time_partition_column": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "time_partition_format": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TimeFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "acceleration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Acceleration"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "embeddings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ColumnEmbeddingConfig"
+              }
+            },
+            "dependsOn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "invalid_type_action": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InvalidTypeAction"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "deprecated": true
+            },
+            "unsupported_type_action": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/UnsupportedTypeAction"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ready_state": {
+              "$ref": "#/$defs/ReadyState"
+            },
+            "metrics": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Metrics"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "vectors": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/VectorStore"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "check_availability": {
+              "$ref": "#/$defs/CheckAvailability"
+            }
+          },
+          "required": [
+            "from",
+            "name"
+          ]
         },
         {
-          "$ref": "#/$defs/DeltaLakeDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^s3:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/S3Dataset"
+          }
         },
         {
-          "$ref": "#/$defs/DatabricksDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^delta_lake:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DeltaLakeDataset"
+          }
         },
         {
-          "$ref": "#/$defs/MemoryDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^databricks:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DatabricksDataset"
+          }
         },
         {
-          "$ref": "#/$defs/LocalpodDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^memory:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/MemoryDataset"
+          }
         },
         {
-          "$ref": "#/$defs/FileDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^localpod:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/LocalpodDataset"
+          }
         },
         {
-          "$ref": "#/$defs/GraphqlDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^file:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/FileDataset"
+          }
         },
         {
-          "$ref": "#/$defs/PostgresDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^graphql:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/GraphqlDataset"
+          }
         },
         {
-          "$ref": "#/$defs/AbfsDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^postgres:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/PostgresDataset"
+          }
         },
         {
-          "$ref": "#/$defs/GithubDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^abfs:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/AbfsDataset"
+          }
         },
         {
-          "$ref": "#/$defs/GlueDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^github:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/GithubDataset"
+          }
         },
         {
-          "$ref": "#/$defs/DuckdbDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^glue:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/GlueDataset"
+          }
         },
         {
-          "$ref": "#/$defs/IcebergDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^duckdb:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DuckdbDataset"
+          }
         },
         {
-          "$ref": "#/$defs/GitDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^iceberg:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/IcebergDataset"
+          }
         },
         {
-          "$ref": "#/$defs/HttpsDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^git:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/GitDataset"
+          }
         },
         {
-          "$ref": "#/$defs/HttpDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^https:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/HttpsDataset"
+          }
         },
         {
-          "$ref": "#/$defs/SpiceAiDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^http:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/HttpDataset"
+          }
         },
         {
-          "$ref": "#/$defs/SinkDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^spice\\.ai:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/SpiceAiDataset"
+          }
         },
         {
-          "$ref": "#/$defs/GenericDataset"
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^sink:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/SinkDataset"
+          }
         }
       ]
     },
