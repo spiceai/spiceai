@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Collector module for gathering ParameterSpecs from all registered connectors and accelerators.
+//! Collector module for gathering ParameterSpecs from all registered connectors, accelerators,
+//! and model sources.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
+use runtime::model::params::all_model_params;
 use runtime_parameters::ParameterSpec;
 
 /// Schema information for a connector or accelerator.
@@ -39,6 +41,17 @@ pub struct CatalogConnectorSchema {
     /// The prefix used for component parameters.
     pub prefix: &'static str,
     /// The parameter specifications for this catalog connector.
+    pub parameters: &'static [ParameterSpec],
+}
+
+/// Schema information for a model source.
+#[derive(Debug, Clone)]
+pub struct ModelSourceSchema {
+    /// The name of the model source (e.g., "openai", "anthropic").
+    pub name: &'static str,
+    /// The prefix used for component parameters.
+    pub prefix: &'static str,
+    /// The parameter specifications for this model source.
     pub parameters: &'static [ParameterSpec],
 }
 
@@ -120,4 +133,19 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
     });
 
     catalogs
+}
+
+/// Collects schema information from all model sources.
+///
+/// Model sources define their parameters in `crates/runtime/src/model/params/`.
+#[must_use]
+pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
+    all_model_params()
+        .into_iter()
+        .map(|(name, parameters)| ModelSourceSchema {
+            name,
+            prefix: name,
+            parameters,
+        })
+        .collect()
 }
