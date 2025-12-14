@@ -558,7 +558,7 @@ fn append_null(
     }
 }
 
-/// Creates the OpenTelemetry MetricsService server that can be added to a gRPC server.
+/// Creates the OpenTelemetry `MetricsService` server that can be added to a gRPC server.
 ///
 /// This is used to add OpenTelemetry metrics ingestion to the Flight gRPC server.
 #[must_use]

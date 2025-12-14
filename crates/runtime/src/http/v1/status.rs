@@ -112,7 +112,7 @@ pub(crate) async fn get(
         },
         ConnectionDetails {
             name: "flight",
-            status: flight_status.clone(),
+            status: flight_status,
             endpoint: flight_url.clone(),
         },
         ConnectionDetails {
