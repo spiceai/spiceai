@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Enricher module for merging connector-specific parameter schemas into the base Spicepod schema.
 
-use crate::collector::{CatalogConnectorSchema, ConnectorSchema};
+use crate::collector::{CatalogConnectorSchema, ConnectorSchema, ModelSourceSchema};
 use crate::transform::{connector_params_to_schema, to_pascal_case};
 use schemars::Schema;
 use serde_json::{Map, Value};
@@ -30,6 +30,7 @@ pub fn enrich_params_schema(
     data_connectors: &[ConnectorSchema],
     data_accelerators: &[ConnectorSchema],
     catalog_connectors: &[CatalogConnectorSchema],
+    model_sources: &[ModelSourceSchema],
 ) {
     // Get the schema as a mutable JSON object
     let Some(schema_obj) = root_schema.as_object_mut() else {
@@ -71,15 +72,31 @@ pub fn enrich_params_schema(
         defs_obj.insert(schema_name, schema);
     }
 
+    // Add model source parameter schemas
+    for model_source in model_sources {
+        let connector_schema = ConnectorSchema {
+            name: model_source.name.to_string(),
+            prefix: model_source.prefix,
+            parameters: model_source.parameters,
+        };
+        let schema_name = format!("{}ModelParams", to_pascal_case(model_source.name));
+        let schema = connector_params_to_schema(&connector_schema);
+        defs_obj.insert(schema_name, schema);
+    }
+
     // Add connector-specific Dataset definitions with conditional params
     add_connector_specific_definitions(defs_obj, data_connectors, data_accelerators);
 
     // Add catalog-specific Catalog definitions with conditional params
     add_catalog_specific_definitions(defs_obj, catalog_connectors);
 
-    // Update the Dataset, Catalog definitions to use oneOf with connector-specific schemas
+    // Add model-specific Model definitions with conditional params
+    add_model_specific_definitions(defs_obj, model_sources);
+
+    // Update the Dataset, Catalog, Model definitions to use conditional schemas
     update_dataset_to_use_conditional_schemas(defs_obj, data_connectors);
     update_catalog_to_use_conditional_schemas(defs_obj, catalog_connectors);
+    update_model_to_use_conditional_schemas(defs_obj, model_sources);
 
     // Update Acceleration params field
     update_acceleration_params(defs_obj, data_accelerators);
@@ -90,6 +107,7 @@ pub fn enrich_params_schema(
         data_connectors,
         data_accelerators,
         catalog_connectors,
+        model_sources,
     );
 }
 
@@ -150,6 +168,24 @@ fn add_catalog_specific_definitions(
         };
 
         let schema = create_catalog_specific_schema(&base_catalog, &connector_schema, &params_ref);
+        defs_obj.insert(def_name, schema);
+    }
+}
+
+/// Creates model-specific Model definitions that enforce the correct params schema
+/// based on the `from` field pattern.
+fn add_model_specific_definitions(
+    defs_obj: &mut Map<String, Value>,
+    model_sources: &[ModelSourceSchema],
+) {
+    // Get the base Model schema to clone properties from
+    let base_model = defs_obj.get("Model").cloned();
+
+    for model_source in model_sources {
+        let def_name = format!("{}Model", to_pascal_case(model_source.name));
+        let params_ref = format!("#/$defs/{}ModelParams", to_pascal_case(model_source.name));
+
+        let schema = create_model_specific_schema(&base_model, model_source, &params_ref);
         defs_obj.insert(def_name, schema);
     }
 }
@@ -277,6 +313,88 @@ fn create_catalog_specific_schema(
         Value::String(format!(
             "Connection parameters for the {} catalog connector.",
             connector.name
+        )),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert("$ref".to_string(), Value::String(params_ref.to_string()));
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
+/// Creates a model-specific schema that:
+/// 1. Requires `from` to match a specific pattern
+/// 2. Restricts `params` to only the model source-specific parameters
+fn create_model_specific_schema(
+    base_schema: &Option<Value>,
+    model_source: &ModelSourceSchema,
+    params_ref: &str,
+) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    // Build the from pattern - model source name followed by colon
+    let from_pattern = format!("^{}:", regex::escape(model_source.name));
+
+    let mut properties = Map::new();
+
+    // from field with pattern constraint
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    from_schema.insert("pattern".to_string(), Value::String(from_pattern.clone()));
+    from_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Model source for {} provider. Format: {}:<model_id>",
+            model_source.name, model_source.name
+        )),
+    );
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // params field with model source-specific reference
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String(format!(
+            "Configuration parameters for the {} model provider.",
+            model_source.name
         )),
     );
     let mut ref_obj = Map::new();
@@ -772,6 +890,184 @@ fn create_generic_catalog_schema(base_schema: Option<&Value>) -> Value {
     Value::Object(schema)
 }
 
+/// Updates the Model definition to use `allOf` with conditional schemas
+/// selected by the `from` field pattern.
+fn update_model_to_use_conditional_schemas(
+    defs_obj: &mut Map<String, Value>,
+    model_sources: &[ModelSourceSchema],
+) {
+    // Build if/then conditionals for each model source
+    let conditionals: Vec<Value> = model_sources
+        .iter()
+        .map(|m| {
+            let from_pattern = format!("^{}:", regex::escape(m.name));
+
+            // Build the "if" condition - matches when "from" starts with model source prefix
+            let mut if_props = Map::new();
+            let mut from_pattern_obj = Map::new();
+            from_pattern_obj.insert("pattern".to_string(), Value::String(from_pattern));
+            if_props.insert("from".to_string(), Value::Object(from_pattern_obj));
+
+            let mut if_obj = Map::new();
+            if_obj.insert("properties".to_string(), Value::Object(if_props));
+
+            // Build the "then" clause - reference the model-specific schema
+            let mut then_ref = Map::new();
+            then_ref.insert(
+                "$ref".to_string(),
+                Value::String(format!("#/$defs/{}Model", to_pascal_case(m.name))),
+            );
+
+            // Combine into if/then object
+            let mut conditional = Map::new();
+            conditional.insert("if".to_string(), Value::Object(if_obj));
+            conditional.insert("then".to_string(), Value::Object(then_ref));
+
+            Value::Object(conditional)
+        })
+        .collect();
+
+    // Add a fallback generic Model schema for unknown model sources
+    let generic_model = create_generic_model_schema(defs_obj.get("Model"));
+    defs_obj.insert("GenericModel".to_string(), generic_model);
+
+    // Create base model schema
+    let base_model = create_base_model_schema(defs_obj.get("Model"));
+
+    // Build allOf array: base schema + all conditionals
+    let mut all_of: Vec<Value> = vec![base_model];
+    all_of.extend(conditionals);
+
+    // Replace Model with a schema that uses allOf with if/then conditionals
+    let mut new_model = Map::new();
+    new_model.insert(
+        "description".to_string(),
+        Value::String(
+            "A model definition. The params field is validated based on the model source type specified in 'from'.".to_string()
+        ),
+    );
+    new_model.insert("allOf".to_string(), Value::Array(all_of));
+
+    defs_obj.insert("Model".to_string(), Value::Object(new_model));
+}
+
+/// Creates a base model schema with common properties (without params validation)
+fn create_base_model_schema(base_schema: Option<&Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    let mut properties = Map::new();
+
+    // from field - required string
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    from_schema.insert(
+        "description".to_string(),
+        Value::String("Model source identifier in the format: <provider>:<model_id>".to_string()),
+    );
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field - required string
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    name_schema.insert(
+        "description".to_string(),
+        Value::String("The unique name for this model.".to_string()),
+    );
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // Copy other properties from base schema if available (excluding from, name, params)
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" && key != "name" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+
+    Value::Object(schema)
+}
+
+/// Creates a generic Model schema for unknown/custom model sources
+fn create_generic_model_schema(base_schema: Option<&Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert(
+        "description".to_string(),
+        Value::String("Generic model for custom or unknown model sources.".to_string()),
+    );
+
+    let mut properties = Map::new();
+
+    // from field - any string
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // params field - generic object
+    let mut params_schema = Map::new();
+    params_schema.insert(
+        "description".to_string(),
+        Value::String("Configuration parameters for the model provider.".to_string()),
+    );
+    let mut ref_obj = Map::new();
+    ref_obj.insert(
+        "$ref".to_string(),
+        Value::String("#/$defs/Params".to_string()),
+    );
+    params_schema.insert(
+        "anyOf".to_string(),
+        Value::Array(vec![
+            Value::Object(ref_obj),
+            Value::Object({
+                let mut null_obj = Map::new();
+                null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                null_obj
+            }),
+        ]),
+    );
+    properties.insert("params".to_string(), Value::Object(params_schema));
+
+    // Copy other properties from base schema if available
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" && key != "name" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+    schema.insert("additionalProperties".to_string(), Value::Bool(false));
+
+    Value::Object(schema)
+}
+
 /// Updates the Acceleration params field with anyOf referencing all accelerator schemas
 fn update_acceleration_params(
     defs_obj: &mut Map<String, Value>,
@@ -855,6 +1151,7 @@ fn add_connector_metadata_extension(
     data_connectors: &[ConnectorSchema],
     data_accelerators: &[ConnectorSchema],
     catalog_connectors: &[CatalogConnectorSchema],
+    model_sources: &[ModelSourceSchema],
 ) {
     let mut connectors_metadata = Map::new();
 
@@ -926,6 +1223,26 @@ fn add_connector_metadata_extension(
         .collect();
     connectors_metadata.insert("catalogConnectors".to_string(), Value::Array(catalog_list));
 
+    // Model sources metadata
+    let model_list: Vec<Value> = model_sources
+        .iter()
+        .map(|m| {
+            let mut obj = Map::new();
+            obj.insert("name".to_string(), Value::String(m.name.to_string()));
+            obj.insert("prefix".to_string(), Value::String(m.prefix.to_string()));
+            obj.insert(
+                "paramsRef".to_string(),
+                Value::String(format!("#/$defs/{}ModelParams", to_pascal_case(m.name))),
+            );
+            obj.insert(
+                "schemaRef".to_string(),
+                Value::String(format!("#/$defs/{}Model", to_pascal_case(m.name))),
+            );
+            Value::Object(obj)
+        })
+        .collect();
+    connectors_metadata.insert("modelSources".to_string(), Value::Array(model_list));
+
     // Add the extension to the root schema
     schema_obj.insert(
         "x-spice-connectors".to_string(),
@@ -966,7 +1283,15 @@ mod tests {
         let accelerators: Vec<ConnectorSchema> = vec![];
         let catalogs: Vec<CatalogConnectorSchema> = vec![];
 
-        enrich_params_schema(&mut root_schema, &connectors, &accelerators, &catalogs);
+        let models: Vec<ModelSourceSchema> = vec![];
+
+        enrich_params_schema(
+            &mut root_schema,
+            &connectors,
+            &accelerators,
+            &catalogs,
+            &models,
+        );
 
         // Check that the definition was added
         let schema_obj = root_schema.as_object().expect("should be object schema");

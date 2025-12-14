@@ -227,7 +227,7 @@ The schema generator enriches the base Spicepod schema with connector-specific p
 | **Datasets** | ✅ | Data Connectors | ✅ | ✅ **Covered** |
 | **Datasets.acceleration** | - | Data Accelerators | ✅ | ✅ **Covered** |
 | **Catalogs** | ✅ | Catalog Connectors | ✅ | ✅ **Covered** |
-| **Models** | ✅ | Model Sources | ✅ | ❌ Not yet covered |
+| **Models** | ✅ | Model Sources | ✅ | ✅ **Covered** |
 | **Embeddings** | ✅ | Embedding Sources | ✅ | ⚠️ No `ParameterSpec` defined |
 | **Tools** | ✅ | Tool Types | ✅ | ⚠️ No `ParameterSpec` defined |
 | **Secrets** | ✅ | Secret Stores | ✅ | ⚠️ No `ParameterSpec` defined |
@@ -256,8 +256,6 @@ Catalog connectors define `PARAMETERS` constants. Currently includes:
 - `iceberg`
 - `spice.ai`
 
-### Not Yet Covered
-
 #### Model Sources (Models)
 Location: `crates/runtime/src/model/params/*.rs`
 
@@ -273,6 +271,8 @@ Model sources define `ParameterSpec` arrays in separate modules:
 - `file` - Local file model parameters
 
 Access pattern: `runtime::model::params::all_model_params() -> Vec<(&'static str, &'static [ParameterSpec])>`
+
+### Not Yet Covered
 
 #### Embedding Sources (Embeddings)
 **Status**: No `ParameterSpec` definitions exist yet.
@@ -320,23 +320,15 @@ Parameters are currently handled in `crates/runtime-secrets/src/lib.rs`.
 
 4. **Custom deserializers**: Types with custom `Deserialize` impl may have schema that doesn't fully reflect runtime behavior
 
-5. **Incomplete component coverage**: Some components have connector-specific parameters that are not yet included in the schema. See [Schema Coverage](#schema-coverage) section for details.
+5. **Incomplete component coverage**: Embeddings, Tools, and Secrets components do not have `ParameterSpec` definitions yet. See [Schema Coverage](#schema-coverage) section for details.
 
 ## Future Work
 
-To achieve full schema coverage, the following components need to be added:
+To achieve full schema coverage, the following components need `ParameterSpec` definitions:
 
-### Ready to Add (has `ParameterSpec` definitions)
-
-1. **Models** - Add model source parameter collection from `crates/runtime/src/model/params/`
-   - Already has `all_model_params()` function exposed
-   - Follow the same pattern as data connectors in `collector.rs` and `enricher.rs`
-
-### Requires `ParameterSpec` Definitions First
-
-2. **Embeddings** - Need to define `ParameterSpec` arrays for each embedding source
-3. **Tools** - Need to define `ParameterSpec` arrays for each tool type  
-4. **Secrets** - Need to define `ParameterSpec` arrays for each secret store
+1. **Embeddings** - Need to define `ParameterSpec` arrays for each embedding source
+2. **Tools** - Need to define `ParameterSpec` arrays for each tool type  
+3. **Secrets** - Need to define `ParameterSpec` arrays for each secret store
 
 For components without `ParameterSpec`, the pattern would be:
 1. Add `ParameterSpec` constants in appropriate runtime module

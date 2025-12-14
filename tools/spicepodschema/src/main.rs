@@ -24,7 +24,10 @@ mod collector;
 mod enricher;
 mod transform;
 
-use collector::{collect_catalog_connectors, collect_data_accelerators, collect_data_connectors};
+use collector::{
+    collect_catalog_connectors, collect_data_accelerators, collect_data_connectors,
+    collect_model_sources,
+};
 use enricher::enrich_params_schema;
 use schemars::schema_for;
 use spicepod::spec::SpicepodDefinition;
@@ -45,17 +48,19 @@ fn main() {
     // Generate base schema from SpicepodDefinition
     let mut schema = schema_for!(SpicepodDefinition);
 
-    // Collect parameter specs from all registered connectors and accelerators
+    // Collect parameter specs from all registered connectors, accelerators, and model sources
     let data_connectors = collect_data_connectors();
     let data_accelerators = collect_data_accelerators();
     let catalog_connectors = collect_catalog_connectors();
+    let model_sources = collect_model_sources();
 
     // Log what we collected
     eprintln!(
-        "Collected {} data connectors, {} data accelerators, {} catalog connectors",
+        "Collected {} data connectors, {} data accelerators, {} catalog connectors, {} model sources",
         data_connectors.len(),
         data_accelerators.len(),
-        catalog_connectors.len()
+        catalog_connectors.len(),
+        model_sources.len()
     );
 
     // Enrich the schema with connector-specific parameter definitions
@@ -64,6 +69,7 @@ fn main() {
         &data_connectors,
         &data_accelerators,
         &catalog_connectors,
+        &model_sources,
     );
 
     // Serialize to JSON
