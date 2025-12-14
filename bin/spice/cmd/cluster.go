@@ -201,7 +201,7 @@ spice cluster tls add my-spice-instance
 
 		// Validate client name (alphanumeric, hyphens, underscores)
 		for _, c := range clientName {
-			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '_' {
 				slog.Error("client name can only contain letters, numbers, hyphens, and underscores")
 				os.Exit(1)
 			}
