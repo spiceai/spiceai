@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Collector module for gathering ParameterSpecs from all registered connectors, accelerators,
+//! Collector module for gathering `ParameterSpecs` from all registered connectors, accelerators,
 //! and model sources.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
@@ -100,7 +100,20 @@ pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
 /// we access their PARAMETERS constants directly.
 #[must_use]
 pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
-    let mut catalogs = Vec::new();
+    let mut catalogs = vec![
+        // Iceberg (always available)
+        CatalogConnectorSchema {
+            name: "iceberg",
+            prefix: "iceberg",
+            parameters: &runtime::catalogconnector::iceberg::PARAMETERS,
+        },
+        // Spice Cloud (always available)
+        CatalogConnectorSchema {
+            name: "spice.ai",
+            prefix: "spiceai",
+            parameters: runtime::catalogconnector::spice_cloud::PARAMETERS,
+        },
+    ];
 
     // Unity Catalog (requires delta_lake feature in runtime)
     #[cfg(feature = "delta_lake")]
@@ -116,20 +129,6 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
         name: "databricks",
         prefix: "databricks",
         parameters: runtime::catalogconnector::databricks::PARAMETERS,
-    });
-
-    // Iceberg (always available)
-    catalogs.push(CatalogConnectorSchema {
-        name: "iceberg",
-        prefix: "iceberg",
-        parameters: &runtime::catalogconnector::iceberg::PARAMETERS,
-    });
-
-    // Spice Cloud (always available)
-    catalogs.push(CatalogConnectorSchema {
-        name: "spice.ai",
-        prefix: "spiceai",
-        parameters: runtime::catalogconnector::spice_cloud::PARAMETERS,
     });
 
     catalogs

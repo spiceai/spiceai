@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Transform module for converting ParameterSpec to JSON Schema.
+//! Transform module for converting `ParameterSpec` to JSON Schema.
 
 use crate::collector::ConnectorSchema;
 use runtime_parameters::{ParameterSpec, ParameterType};
@@ -155,10 +155,10 @@ pub fn connector_params_to_schema(connector: &ConnectorSchema) -> Value {
     Value::Object(schema)
 }
 
-/// Converts a snake_case or kebab-case string to `PascalCase`.
+/// Converts a `snake_case` or kebab-case string to `PascalCase`.
 #[must_use]
 pub fn to_pascal_case(s: &str) -> String {
-    s.split(|c| c == '_' || c == '-' || c == '.')
+    s.split(['_', '-', '.'])
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();

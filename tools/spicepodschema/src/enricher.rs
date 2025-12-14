@@ -128,8 +128,11 @@ fn add_connector_specific_definitions(
             to_pascal_case(&connector.name)
         );
 
-        let schema =
-            create_connector_specific_component_schema(&base_dataset, connector, &params_ref);
+        let schema = create_connector_specific_component_schema(
+            base_dataset.as_ref(),
+            connector,
+            &params_ref,
+        );
         defs_obj.insert(def_name, schema);
     }
 
@@ -142,8 +145,11 @@ fn add_connector_specific_definitions(
             to_pascal_case(&accelerator.name)
         );
 
-        let schema =
-            create_accelerated_dataset_schema(&base_dataset, accelerator, &accel_params_ref);
+        let schema = create_accelerated_dataset_schema(
+            base_dataset.as_ref(),
+            accelerator,
+            &accel_params_ref,
+        );
         defs_obj.insert(def_name, schema);
     }
 }
@@ -167,7 +173,8 @@ fn add_catalog_specific_definitions(
             parameters: catalog.parameters,
         };
 
-        let schema = create_catalog_specific_schema(&base_catalog, &connector_schema, &params_ref);
+        let schema =
+            create_catalog_specific_schema(base_catalog.as_ref(), &connector_schema, &params_ref);
         defs_obj.insert(def_name, schema);
     }
 }
@@ -185,7 +192,7 @@ fn add_model_specific_definitions(
         let def_name = format!("{}Model", to_pascal_case(model_source.name));
         let params_ref = format!("#/$defs/{}ModelParams", to_pascal_case(model_source.name));
 
-        let schema = create_model_specific_schema(&base_model, model_source, &params_ref);
+        let schema = create_model_specific_schema(base_model.as_ref(), model_source, &params_ref);
         defs_obj.insert(def_name, schema);
     }
 }
@@ -194,7 +201,7 @@ fn add_model_specific_definitions(
 /// 1. Requires `from` to match a specific pattern
 /// 2. Restricts `params` to only the connector-specific parameters
 fn create_connector_specific_component_schema(
-    base_schema: &Option<Value>,
+    base_schema: Option<&Value>,
     connector: &ConnectorSchema,
     params_ref: &str,
 ) -> Value {
@@ -249,7 +256,7 @@ fn create_connector_specific_component_schema(
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
+    if let Some(Value::Object(base)) = base_schema.as_ref() {
         if let Some(Value::Object(base_props)) = base.get("properties") {
             for (key, value) in base_props {
                 if key != "from" && key != "params" {
@@ -276,7 +283,7 @@ fn create_connector_specific_component_schema(
 /// 1. Requires `from` to match a specific pattern
 /// 2. Restricts `params` to only the catalog-specific parameters
 fn create_catalog_specific_schema(
-    base_schema: &Option<Value>,
+    base_schema: Option<&Value>,
     connector: &ConnectorSchema,
     params_ref: &str,
 ) -> Value {
@@ -331,7 +338,7 @@ fn create_catalog_specific_schema(
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
+    if let Some(Value::Object(base)) = base_schema.as_ref() {
         if let Some(Value::Object(base_props)) = base.get("properties") {
             for (key, value) in base_props {
                 if key != "from" && key != "params" {
@@ -358,7 +365,7 @@ fn create_catalog_specific_schema(
 /// 1. Requires `from` to match a specific pattern
 /// 2. Restricts `params` to only the model source-specific parameters
 fn create_model_specific_schema(
-    base_schema: &Option<Value>,
+    base_schema: Option<&Value>,
     model_source: &ModelSourceSchema,
     params_ref: &str,
 ) -> Value {
@@ -413,7 +420,7 @@ fn create_model_specific_schema(
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
+    if let Some(Value::Object(base)) = base_schema.as_ref() {
         if let Some(Value::Object(base_props)) = base.get("properties") {
             for (key, value) in base_props {
                 if key != "from" && key != "params" {
@@ -438,7 +445,7 @@ fn create_model_specific_schema(
 
 /// Creates an accelerated dataset schema that includes acceleration params
 fn create_accelerated_dataset_schema(
-    base_schema: &Option<Value>,
+    base_schema: Option<&Value>,
     accelerator: &ConnectorSchema,
     accel_params_ref: &str,
 ) -> Value {
@@ -510,7 +517,7 @@ fn create_accelerated_dataset_schema(
     properties.insert("acceleration".to_string(), Value::Object(accel_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
+    if let Some(Value::Object(base)) = base_schema.as_ref() {
         if let Some(Value::Object(base_props)) = base.get("properties") {
             for (key, value) in base_props {
                 if key != "from" && key != "acceleration" {
@@ -1090,23 +1097,22 @@ fn update_acceleration_params(
         .collect();
 
     // Update Acceleration params field
-    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration") {
-        if let Some(Value::Object(properties)) = accel_def.get_mut("properties") {
-            if !acceleration_params_refs.is_empty() {
-                let accelerator_names: Vec<&str> =
-                    data_accelerators.iter().map(|a| a.name.as_str()).collect();
-                let description = format!(
-                    "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine'. Available engines: {}. See $defs for engine-specific parameter schemas (e.g., DuckdbAcceleratorParams, PostgresAcceleratorParams).",
-                    accelerator_names.join(", ")
-                );
-                update_params_property(
-                    properties,
-                    "params",
-                    &acceleration_params_refs,
-                    &description,
-                );
-            }
-        }
+    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration")
+        && let Some(Value::Object(properties)) = accel_def.get_mut("properties")
+        && !acceleration_params_refs.is_empty()
+    {
+        let accelerator_names: Vec<&str> =
+            data_accelerators.iter().map(|a| a.name.as_str()).collect();
+        let description = format!(
+            "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine'. Available engines: {}. See $defs for engine-specific parameter schemas (e.g., DuckdbAcceleratorParams, PostgresAcceleratorParams).",
+            accelerator_names.join(", ")
+        );
+        update_params_property(
+            properties,
+            "params",
+            &acceleration_params_refs,
+            &description,
+        );
     }
 }
 
@@ -1305,7 +1311,7 @@ mod tests {
     fn test_connector_specific_schema_has_pattern() {
         let connector = create_test_connector();
         let schema = create_connector_specific_component_schema(
-            &None,
+            None,
             &connector,
             "#/$defs/TestDbDataConnectorParams",
         );
