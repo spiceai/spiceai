@@ -189,6 +189,8 @@ impl Query {
                 None
             };
 
+        let use_tls = maybe_client_tls_config.is_some();
+
         let cfg = self
             .df
             .ctx
@@ -205,7 +207,8 @@ impl Query {
                 } else {
                     Ok(ep)
                 }
-            }));
+            }))
+            .with_ballista_use_tls(use_tls);
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(

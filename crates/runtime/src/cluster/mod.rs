@@ -185,7 +185,6 @@ pub async fn initialize_cluster_executor(
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),
             }],
         }),
-        use_tls: maybe_client_tls_config.is_some(),
     };
 
     let executor = Arc::new(Executor::new(
