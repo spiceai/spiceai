@@ -217,6 +217,7 @@ pub(crate) enum TestCases {
     VectorSearchSqlNoScore,
     VectorSearchSqlRandom,
     VectorSearchSqlVectors,
+    VectorSearchSqlIndexOnly,
 }
 
 impl fmt::Display for TestCases {
@@ -232,6 +233,7 @@ impl fmt::Display for TestCases {
             TestCases::VectorSearchSqlNoScore => "vector_search_sql_no_score",
             TestCases::VectorSearchSqlRandom => "vector_search_sql_random",
             TestCases::VectorSearchSqlVectors => "vector_search_sql_vectors",
+            TestCases::VectorSearchSqlIndexOnly => "vector_search_sql_index_only",
         };
         write!(f, "{s}")
     }
@@ -250,6 +252,7 @@ impl TestCases {
             TestCases::VectorSearchSqlNoScore,
             TestCases::VectorSearchSqlRandom,
             TestCases::VectorSearchSqlVectors,
+            TestCases::VectorSearchSqlIndexOnly,
         ]
     }
 
@@ -291,6 +294,9 @@ impl TestCases {
             ),
             Self::VectorSearchSqlVectors => SearchTestType::Sql(
                 "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;".to_string()
+            ),
+            Self::VectorSearchSqlIndexOnly => SearchTestType::Sql(
+                "SELECT id, trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;".to_string()
             ),
        }
     }
