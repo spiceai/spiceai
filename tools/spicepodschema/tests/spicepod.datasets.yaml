@@ -309,11 +309,11 @@ datasets:
   # ClickHouse connector (if enabled)
   # Runtime params: connection_timeout
   # ---------------------------------------------------------------------------
-  # - name: test_clickhouse
-  #   from: clickhouse:database.table
-  #   params:
-  #     clickhouse_connection_string: tcp://localhost:9000
-  #     connection_timeout: "30000"
+  - name: test_clickhouse
+    from: clickhouse:database.table
+    params:
+      clickhouse_connection_string: tcp://localhost:9000
+      connection_timeout: "30000"
 
   # ---------------------------------------------------------------------------
   # ODBC connector (if enabled)

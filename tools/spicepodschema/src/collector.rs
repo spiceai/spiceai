@@ -16,6 +16,9 @@ limitations under the License.
 
 //! Collector module for gathering `ParameterSpecs` from all registered connectors, accelerators,
 //! and model sources.
+//!
+//! This module explicitly references all connector modules to ensure they are linked into the
+//! binary and their `linkme` distributed slice registrations are included.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
@@ -23,6 +26,54 @@ use runtime::model::params::{
     anthropic, azure, bedrock, databricks, file, huggingface, openai, perplexity, xai,
 };
 use runtime_parameters::ParameterSpec;
+
+// Force linkage of all data connector modules by referencing their factory types.
+// Without these references, the linker may not include the modules and their
+// `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
+use runtime::dataconnector::abfs as _;
+use runtime::dataconnector::clickhouse as _;
+use runtime::dataconnector::databricks as _;
+use runtime::dataconnector::debezium as _;
+use runtime::dataconnector::delta_lake as _;
+use runtime::dataconnector::dremio as _;
+use runtime::dataconnector::duckdb as _;
+use runtime::dataconnector::dynamodb as _;
+use runtime::dataconnector::file as _;
+use runtime::dataconnector::flightsql as _;
+use runtime::dataconnector::ftp as _;
+use runtime::dataconnector::git as _;
+use runtime::dataconnector::github as _;
+use runtime::dataconnector::glue as _;
+use runtime::dataconnector::graphql as _;
+use runtime::dataconnector::https as _;
+use runtime::dataconnector::iceberg as _;
+use runtime::dataconnector::imap as _;
+use runtime::dataconnector::kafka as _;
+use runtime::dataconnector::localpod as _;
+use runtime::dataconnector::memory as _;
+use runtime::dataconnector::mongodb as _;
+use runtime::dataconnector::mssql as _;
+use runtime::dataconnector::mysql as _;
+use runtime::dataconnector::odbc as _;
+use runtime::dataconnector::oracle as _;
+use runtime::dataconnector::postgres as _;
+use runtime::dataconnector::s3 as _;
+use runtime::dataconnector::sftp as _;
+use runtime::dataconnector::sharepoint as _;
+use runtime::dataconnector::sink as _;
+use runtime::dataconnector::snowflake as _;
+use runtime::dataconnector::spark as _;
+use runtime::dataconnector::spiceai as _;
+
+// Force linkage of all data accelerator modules
+use runtime::dataaccelerator::arrow as _;
+#[cfg(not(windows))]
+use runtime::dataaccelerator::cayenne as _;
+use runtime::dataaccelerator::duckdb as _;
+use runtime::dataaccelerator::partitioned_duckdb as _;
+use runtime::dataaccelerator::postgres as _;
+use runtime::dataaccelerator::sqlite as _;
+use runtime::dataaccelerator::turso as _;
 
 /// Schema information for a connector or accelerator.
 #[derive(Debug, Clone)]
@@ -102,7 +153,7 @@ pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
 /// we access their PARAMETERS constants directly.
 #[must_use]
 pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
-    let mut catalogs = vec![
+    vec![
         // Iceberg (always available)
         CatalogConnectorSchema {
             name: "iceberg",
@@ -115,25 +166,19 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
             prefix: "spiceai",
             parameters: runtime::catalogconnector::spice_cloud::PARAMETERS,
         },
-    ];
-
-    // Unity Catalog (requires delta_lake feature in runtime)
-    #[cfg(feature = "delta_lake")]
-    catalogs.push(CatalogConnectorSchema {
-        name: "unity_catalog",
-        prefix: "unity_catalog",
-        parameters: runtime::catalogconnector::unity_catalog::PARAMETERS,
-    });
-
-    // Databricks (requires databricks feature in runtime)
-    #[cfg(feature = "databricks")]
-    catalogs.push(CatalogConnectorSchema {
-        name: "databricks",
-        prefix: "databricks",
-        parameters: runtime::catalogconnector::databricks::PARAMETERS,
-    });
-
-    catalogs
+        // Unity Catalog
+        CatalogConnectorSchema {
+            name: "unity_catalog",
+            prefix: "unity_catalog",
+            parameters: runtime::catalogconnector::unity_catalog::PARAMETERS,
+        },
+        // Databricks
+        CatalogConnectorSchema {
+            name: "databricks",
+            prefix: "databricks",
+            parameters: runtime::catalogconnector::databricks::PARAMETERS,
+        },
+    ]
 }
 
 /// Collects schema information from all model sources.
