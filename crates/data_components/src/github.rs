@@ -820,22 +820,22 @@ impl GithubRestClient {
                 match response_status {
                     404 => {
                         return Err(format!(
-                            "The Github API ({endpoint}) failed with status code {response_status}. Verify that org `{owner}`, repo `{repo}` and workflow `{workflow_id}` are correct.",
+                            "The GitHub API ({endpoint}) failed with status code {response_status}. Verify that org `{owner}`, repo `{repo}` and workflow `{workflow_id}` are correct.",
                         ).into());
                     }
                     401 => {
                         return Err(format!(
-                            "The Github API ({endpoint}) failed with status code {response_status}. Verify the token is correct.",
+                            "The GitHub API ({endpoint}) failed with status code {response_status}. Verify the token is correct.",
                         ).into());
                     }
                     403 => {
                         return Err(format!(
-                            "The Github API ({endpoint}) failed with status code {response_status}. Verify the token has the necessary permissions.",
+                            "The GitHub API ({endpoint}) failed with status code {response_status}. Verify the token has the necessary permissions.",
                         ).into());
                     }
                     _ => {
                         return Err(format!(
-                            "The Github API ({endpoint}) failed with status code {response_status}",
+                            "The GitHub API ({endpoint}) failed with status code {response_status}",
                         )
                         .into());
                     }
