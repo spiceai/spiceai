@@ -93,7 +93,7 @@ datasets:
       pg_user: postgres
       pg_pass: postgres
       pg_sslmode: prefer
-
+  
   - from: postgres:supplier
     name: supplier
     acceleration:
