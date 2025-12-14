@@ -95,6 +95,5 @@ func init() {
 	runCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://127.0.0.1:50051")
 	runCmd.Flags().String(constants.HttpEndpointKeyFlag, "", "Specifies the runtime HTTP endpoint. Defaults to http://127.0.0.1:8090")
 	runCmd.Flags().String("metrics-endpoint", "", "Specifies the runtime Prometheus metrics endpoint. Defaults to http://127.0.0.1:9090")
-	runCmd.Flags().String("open-telemetry-endpoint", "", "Specifies the runtime OpenTelemetry endpoint. Defaults to http://127.0.0.1:50052")
 	sqlCmd.Flags().String("captured-output", "truncated", "Specifies the captured output setting for task history. [possible values: truncated, none]. Default: truncated")
 }
