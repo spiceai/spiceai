@@ -163,8 +163,8 @@ datasets:
   - name: test_databricks_warehouse
     from: databricks:catalog.schema.warehouse_table
     params:
-      endpoint: https://my-workspace.databricks.com
-      token: dapi123
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
       mode: sql_warehouse
       databricks_http_path: /sql/1.0/warehouses/abc123
 

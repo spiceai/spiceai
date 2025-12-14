@@ -421,16 +421,36 @@ fn update_dataset_to_use_conditional_schemas(
     defs_obj: &mut Map<String, Value>,
     data_connectors: &[ConnectorSchema],
 ) {
-    // Build oneOf array referencing all connector-specific Dataset schemas
-    let mut one_of_refs: Vec<Value> = data_connectors
+    // Build if/then conditionals for each connector
+    // This provides better IDE support than anyOf - the IDE will only show
+    // the relevant params schema based on the 'from' field pattern
+    let conditionals: Vec<Value> = data_connectors
         .iter()
         .map(|c| {
-            let mut ref_obj = Map::new();
-            ref_obj.insert(
+            let from_pattern = format!("^{}:", regex::escape(&c.name));
+
+            // Build the "if" condition - matches when "from" starts with connector prefix
+            let mut if_props = Map::new();
+            let mut from_pattern_obj = Map::new();
+            from_pattern_obj.insert("pattern".to_string(), Value::String(from_pattern));
+            if_props.insert("from".to_string(), Value::Object(from_pattern_obj));
+
+            let mut if_obj = Map::new();
+            if_obj.insert("properties".to_string(), Value::Object(if_props));
+
+            // Build the "then" clause - reference the connector-specific dataset schema
+            let mut then_ref = Map::new();
+            then_ref.insert(
                 "$ref".to_string(),
                 Value::String(format!("#/$defs/{}Dataset", to_pascal_case(&c.name))),
             );
-            Value::Object(ref_obj)
+
+            // Combine into if/then object
+            let mut conditional = Map::new();
+            conditional.insert("if".to_string(), Value::Object(if_obj));
+            conditional.insert("then".to_string(), Value::Object(then_ref));
+
+            Value::Object(conditional)
         })
         .collect();
 
@@ -438,14 +458,14 @@ fn update_dataset_to_use_conditional_schemas(
     let generic_dataset = create_generic_dataset_schema(defs_obj.get("Dataset"));
     defs_obj.insert("GenericDataset".to_string(), generic_dataset);
 
-    let mut generic_ref = Map::new();
-    generic_ref.insert(
-        "$ref".to_string(),
-        Value::String("#/$defs/GenericDataset".to_string()),
-    );
-    one_of_refs.push(Value::Object(generic_ref));
+    // Create base dataset schema with common properties
+    let base_dataset = create_base_dataset_schema(defs_obj.get("Dataset"));
 
-    // Replace Dataset with a schema that uses oneOf
+    // Build allOf array: base schema + all conditionals
+    let mut all_of: Vec<Value> = vec![base_dataset];
+    all_of.extend(conditionals);
+
+    // Replace Dataset with a schema that uses allOf with if/then conditionals
     let mut new_dataset = Map::new();
     new_dataset.insert(
         "description".to_string(),
@@ -453,9 +473,57 @@ fn update_dataset_to_use_conditional_schemas(
             "A dataset definition. The params field is validated based on the connector type specified in 'from'.".to_string()
         ),
     );
-    new_dataset.insert("anyOf".to_string(), Value::Array(one_of_refs));
+    new_dataset.insert("allOf".to_string(), Value::Array(all_of));
 
     defs_obj.insert("Dataset".to_string(), Value::Object(new_dataset));
+}
+
+/// Creates a base dataset schema with common properties (without params validation)
+fn create_base_dataset_schema(base_schema: Option<&Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    let mut properties = Map::new();
+
+    // from field - required string
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    from_schema.insert(
+        "description".to_string(),
+        Value::String("Data source identifier in the format: <connector>:<path>".to_string()),
+    );
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field - required string
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    name_schema.insert(
+        "description".to_string(),
+        Value::String("The unique name for this dataset.".to_string()),
+    );
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // Copy other properties from base schema if available (excluding from, name, params)
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" && key != "name" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+
+    Value::Object(schema)
 }
 
 /// Updates the Catalog definition to use `oneOf` with catalog-specific schemas
@@ -464,16 +532,33 @@ fn update_catalog_to_use_conditional_schemas(
     defs_obj: &mut Map<String, Value>,
     catalog_connectors: &[CatalogConnectorSchema],
 ) {
-    // Build oneOf array referencing all catalog-specific schemas
-    let mut one_of_refs: Vec<Value> = catalog_connectors
+    // Build if/then conditionals for each catalog connector
+    let conditionals: Vec<Value> = catalog_connectors
         .iter()
         .map(|c| {
-            let mut ref_obj = Map::new();
-            ref_obj.insert(
+            let from_pattern = format!("^{}:", regex::escape(c.name));
+
+            // Build the "if" condition
+            let mut if_props = Map::new();
+            let mut from_pattern_obj = Map::new();
+            from_pattern_obj.insert("pattern".to_string(), Value::String(from_pattern));
+            if_props.insert("from".to_string(), Value::Object(from_pattern_obj));
+
+            let mut if_obj = Map::new();
+            if_obj.insert("properties".to_string(), Value::Object(if_props));
+
+            // Build the "then" clause
+            let mut then_ref = Map::new();
+            then_ref.insert(
                 "$ref".to_string(),
                 Value::String(format!("#/$defs/{}Catalog", to_pascal_case(c.name))),
             );
-            Value::Object(ref_obj)
+
+            let mut conditional = Map::new();
+            conditional.insert("if".to_string(), Value::Object(if_obj));
+            conditional.insert("then".to_string(), Value::Object(then_ref));
+
+            Value::Object(conditional)
         })
         .collect();
 
@@ -481,24 +566,72 @@ fn update_catalog_to_use_conditional_schemas(
     let generic_catalog = create_generic_catalog_schema(defs_obj.get("Catalog"));
     defs_obj.insert("GenericCatalog".to_string(), generic_catalog);
 
-    let mut generic_ref = Map::new();
-    generic_ref.insert(
-        "$ref".to_string(),
-        Value::String("#/$defs/GenericCatalog".to_string()),
-    );
-    one_of_refs.push(Value::Object(generic_ref));
+    // Create base catalog schema
+    let base_catalog = create_base_catalog_schema(defs_obj.get("Catalog"));
 
-    // Replace Catalog with a schema that uses oneOf
+    // Build allOf array: base schema + all conditionals
+    let mut all_of: Vec<Value> = vec![base_catalog];
+    all_of.extend(conditionals);
+
+    // Replace Catalog with a schema that uses allOf with if/then conditionals
     let mut new_catalog = Map::new();
     new_catalog.insert(
         "description".to_string(),
         Value::String(
-            "A catalog definition. The params field is validated based on the connector type specified in 'from'.".to_string()
+            "A catalog definition. The params field is validated based on the catalog connector type specified in 'from'.".to_string()
         ),
     );
-    new_catalog.insert("anyOf".to_string(), Value::Array(one_of_refs));
+    new_catalog.insert("allOf".to_string(), Value::Array(all_of));
 
     defs_obj.insert("Catalog".to_string(), Value::Object(new_catalog));
+}
+
+/// Creates a base catalog schema with common properties (without params validation)
+fn create_base_catalog_schema(base_schema: Option<&Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+
+    let mut properties = Map::new();
+
+    // from field - required string
+    let mut from_schema = Map::new();
+    from_schema.insert("type".to_string(), Value::String("string".to_string()));
+    from_schema.insert(
+        "description".to_string(),
+        Value::String("Catalog source identifier in the format: <connector>:<path>".to_string()),
+    );
+    properties.insert("from".to_string(), Value::Object(from_schema));
+
+    // name field - required string
+    let mut name_schema = Map::new();
+    name_schema.insert("type".to_string(), Value::String("string".to_string()));
+    name_schema.insert(
+        "description".to_string(),
+        Value::String("The unique name for this catalog.".to_string()),
+    );
+    properties.insert("name".to_string(), Value::Object(name_schema));
+
+    // Copy other properties from base schema if available (excluding from, name, params)
+    if let Some(Value::Object(base)) = base_schema {
+        if let Some(Value::Object(base_props)) = base.get("properties") {
+            for (key, value) in base_props {
+                if key != "from" && key != "params" && key != "name" {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert(
+        "required".to_string(),
+        Value::Array(vec![
+            Value::String("from".to_string()),
+            Value::String("name".to_string()),
+        ]),
+    );
+
+    Value::Object(schema)
 }
 
 /// Creates a generic Dataset schema for unknown/custom connectors

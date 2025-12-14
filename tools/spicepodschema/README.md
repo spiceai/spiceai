@@ -185,15 +185,36 @@ Runtime features in `Cargo.toml` determine which connectors' `ParameterSpec` def
 }
 ```
 
-### Connector Discrimination with `anyOf`
+### Connector Discrimination with `if/then/else`
 
-The schema uses `anyOf` (not `oneOf`) to combine connector-specific schemas for Dataset and Catalog definitions. Each connector-specific schema uses a `pattern` constraint on the `from` field (e.g., `^postgres:`) to match its connector type.
+The schema uses `allOf` with `if/then` conditionals to provide connector-specific parameter validation based on the `from` field pattern. This approach provides excellent IDE support - when you specify a `from` value like `github:...`, the IDE will only show the GitHub-specific parameters.
 
-**Why `anyOf` instead of `oneOf`:**
-- `oneOf` requires **exactly one** schema to match, which fails when a dataset matches both a connector-specific schema (via pattern) and the generic fallback schema
-- `anyOf` requires **at least one** schema to match, allowing the more specific connector schema to provide validation while the generic schema serves as a fallback for unknown connectors
+**Schema Structure:**
+```json
+{
+  "Dataset": {
+    "allOf": [
+      { /* base schema with common properties */ },
+      {
+        "if": { "properties": { "from": { "pattern": "^github:" } } },
+        "then": { "$ref": "#/$defs/GithubDataset" }
+      },
+      {
+        "if": { "properties": { "from": { "pattern": "^postgres:" } } },
+        "then": { "$ref": "#/$defs/PostgresDataset" }
+      }
+      // ... more connectors
+    ]
+  }
+}
+```
 
-This design allows multiple datasets of the same connector type in a single spicepod while still providing connector-specific parameter validation.
+**Why `if/then` instead of `anyOf`:**
+- `anyOf` shows **all possible schemas** in IDE tooltips, making it hard to find relevant parameters
+- `if/then` conditionals allow the IDE to narrow down to the **specific connector schema** based on the `from` field pattern
+- This provides a much better developer experience with context-aware autocomplete and documentation
+
+This design allows multiple datasets of the same connector type in a single spicepod while providing connector-specific parameter validation and IDE support.
 
 ## Adding New Connectors to Schema
 
@@ -206,7 +227,7 @@ This design allows multiple datasets of the same connector type in a single spic
 
 1. **Generic ComponentOrReference**: Generates numbered refs (`ComponentOrReference`, `ComponentOrReference2`, etc.) instead of descriptive names
 
-2. **Params schema**: The `params` field type depends on the runtime `from` field value, which JSON Schema cannot express dynamically without complex `if/then/else`
+2. **Params schema**: The `params` field validation uses `if/then` conditionals based on the `from` field pattern, which provides good IDE support but may not work with all JSON Schema validators
 
 3. **Platform-specific connectors**: Some connectors are platform-specific and may not be included in all builds
 
