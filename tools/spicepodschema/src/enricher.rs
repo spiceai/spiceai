@@ -216,7 +216,7 @@ fn create_connector_specific_component_schema(
     // from field with pattern constraint
     let mut from_schema = Map::new();
     from_schema.insert("type".to_string(), Value::String("string".to_string()));
-    from_schema.insert("pattern".to_string(), Value::String(from_pattern.clone()));
+    from_schema.insert("pattern".to_string(), Value::String(from_pattern));
     from_schema.insert(
         "description".to_string(),
         Value::String(format!(
@@ -256,12 +256,12 @@ fn create_connector_specific_component_schema(
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema.as_ref() {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema.as_ref()
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -1052,12 +1052,12 @@ fn create_generic_model_schema(base_schema: Option<&Value>) -> Value {
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" && key != "name" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" && key != "name" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
