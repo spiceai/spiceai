@@ -159,10 +159,16 @@ impl AccelerationOptions {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
                 mode: Mode::File,
-                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
-                    "cayenne_file_path".to_string(),
-                    format!(".spice/data/cayenne_acceleration_{unique_id}/"),
-                )]))),
+                params: Some(spicepod::param::Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        format!(".spice/metadata/cayenne_acceleration_{unique_id}/"),
+                    ),
+                    (
+                        "cayenne_file_path".to_string(),
+                        format!(".spice/data/cayenne_acceleration_{unique_id}/"),
+                    ),
+                ]))),
                 ..Default::default()
             },
         }
@@ -250,7 +256,8 @@ async fn test_megascience_permutations(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
         AccelerationOptions::DuckDb,
-        AccelerationOptions::DuckDbFile
+        AccelerationOptions::DuckDbFile,
+        AccelerationOptions::Cayenne
     )]
     acceleration_opt: AccelerationOptions,
     #[values(
