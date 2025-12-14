@@ -133,7 +133,6 @@ impl CatalogConnector for Databricks {
         self
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: Arc<Runtime>,

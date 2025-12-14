@@ -146,7 +146,6 @@ impl RuntimeBuilder {
         self
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {

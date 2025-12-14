@@ -491,7 +491,6 @@ fn get_federated_dataset(
     dataset
 }
 
-#[expect(clippy::too_many_lines)]
 async fn run_ready_state_test(
     is_native: bool,
     ready_state: ReadyState,

@@ -743,7 +743,7 @@ fn to_flat_value(output: QueryOutputVector) -> serde_json::Value {
         distance,
         ..
     } = output;
-    let mut result = document_to_json_map(metadata.unwrap_or_default());
+    let mut result = document_to_json_map(metadata.unwrap_or_default()).unwrap_or_default();
     if let Some(VectorData::Float32(vec)) = data {
         result.insert(
             S3_VECTOR_EMBEDDING_NAME.into(),
@@ -1034,7 +1034,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn scan_plan_with_partitioned_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
         let bucket_name = "test-bucket";

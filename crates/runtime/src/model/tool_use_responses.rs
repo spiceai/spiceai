@@ -427,7 +427,6 @@ impl Stream for CustomResponseStream {
     }
 }
 
-#[expect(clippy::too_many_lines)]
 fn make_responses_stream(
     span: Span,
     request_context: Arc<RequestContext>,

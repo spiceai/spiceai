@@ -67,7 +67,6 @@ fn sanitize_file_paths(plan: &str) -> String {
 /// 2. Inserts data across multiple partitions
 /// 3. Queries with partition filters and validates EXPLAIN plan shows pruning
 /// 4. Validates that only relevant partitions are scanned
-#[expect(clippy::too_many_lines)]
 async fn test_cayenne_partition_pruning_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -365,7 +364,6 @@ test_with_backends!(test_cayenne_bucket_partitioning_impl);
 /// 1. Bucket partitioning works correctly
 /// 2. Filters are still pushed down to partitions (since each bucket contains multiple values)
 /// 3. Partition pruning works for filters on the bucketed column
-#[expect(clippy::too_many_lines)]
 async fn test_cayenne_bucket_partitioning_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
