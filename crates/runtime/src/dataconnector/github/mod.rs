@@ -75,6 +75,7 @@ mod pull_requests;
 mod rate_limit;
 mod stargazers;
 mod workflow_runs;
+mod workflows;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -964,47 +965,69 @@ impl DataConnector for Github {
             ("workflows", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "workflows", &component);
                 
-                // Parse the remaining path: should be workflow_file.yml/runs
-                let remaining = parsed.remaining.as_deref().ok_or_else(|| {
-                    DataConnectorError::UnableToGetReadProvider {
-                        dataconnector: "github".to_string(),
-                        source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
-                        connector_component: component.clone(),
-                    }
-                })?;
-
-                let parts: Vec<&str> = remaining.split('/').collect();
-                if parts.len() != 2 || parts[1] != "runs" {
-                    return Err(DataConnectorError::UnableToGetReadProvider {
-                        dataconnector: "github".to_string(),
-                        source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
-                        connector_component: component,
-                    });
-                }
-
-                let workflow_id = parts[0];
-                
-                let fetch_logs = dataset
-                    .params
-                    .get("github_workflow_logs")
-                    .is_some_and(|value| value.as_str() == "enabled");
-                
                 let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
                 })?;
 
-                Ok(Arc::new(
-                    workflow_runs::WorkflowRunsTableProvider::new(
-                        client,
-                        parsed.owner,
-                        repo,
-                        workflow_id,
-                        fetch_logs,
-                        dataset,
-                    )
-                    .await?,
-                ) as Arc<dyn TableProvider>)
+                // Check if there's a remaining path (workflow_id/runs)
+                match parsed.remaining.as_deref() {
+                    None | Some("") => {
+                        // No workflow ID specified - list all workflows
+                        // Warn if github_workflow_logs is set since it's not applicable
+                        if dataset
+                            .params
+                            .get("github_workflow_logs")
+                            .is_some_and(|value| value.as_str() == "enabled")
+                        {
+                            tracing::warn!(
+                                "The 'github_workflow_logs' parameter is only supported when retrieving workflow runs (e.g., github.com/{}/{}/workflows/workflow.yml/runs), not when listing workflows. It will be ignored for {component}.",
+                                parsed.owner,
+                                repo
+                            );
+                        }
+
+                        Ok(Arc::new(
+                            workflows::WorkflowsTableProvider::new(
+                                client,
+                                parsed.owner,
+                                repo,
+                                dataset,
+                            )
+                            .await?,
+                        ) as Arc<dyn TableProvider>)
+                    }
+                    Some(remaining) => {
+                        // Workflow ID specified - parse workflow_id/runs
+                        let parts: Vec<&str> = remaining.split('/').collect();
+                        if parts.len() != 2 || parts[1] != "runs" {
+                            return Err(DataConnectorError::UnableToGetReadProvider {
+                                dataconnector: "github".to_string(),
+                                source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
+                                connector_component: component,
+                            });
+                        }
+
+                        let workflow_id = parts[0];
+                        
+                        let fetch_logs = dataset
+                            .params
+                            .get("github_workflow_logs")
+                            .is_some_and(|value| value.as_str() == "enabled");
+
+                        Ok(Arc::new(
+                            workflow_runs::WorkflowRunsTableProvider::new(
+                                client,
+                                parsed.owner,
+                                repo,
+                                workflow_id,
+                                fetch_logs,
+                                dataset,
+                            )
+                            .await?,
+                        ) as Arc<dyn TableProvider>)
+                    }
+                }
             }
             ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);

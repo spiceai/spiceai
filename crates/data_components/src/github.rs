@@ -23,7 +23,7 @@ use snafu::{ResultExt, Snafu};
 use crate::{arrow::write::MemTable, graphql, rate_limit::RateLimiter};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
 };
 use datafusion::{
     catalog::Session,
@@ -1091,6 +1091,154 @@ impl GithubRestClient {
 
         Ok(logs)
     }
+
+    pub async fn fetch_workflows(
+        &self,
+        owner: &str,
+        repo: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rate_limiter.check_rate_limit().await?;
+
+        let endpoint = format!("https://api.github.com/repos/{owner}/{repo}/actions/workflows");
+
+        let client = &self.client;
+        let token = &self.token;
+        let rate_limiter = &self.rate_limiter;
+
+        let mut all_workflows = Vec::new();
+        let mut page = 1;
+        let per_page = 100; // Maximum allowed by GitHub API
+
+        loop {
+            let mut url = format!("{endpoint}?per_page={per_page}&page={page}");
+            if let Some(limit) = limit {
+                let remaining_items = limit.saturating_sub(all_workflows.len());
+                if remaining_items == 0 {
+                    break;
+                }
+                let current_per_page = std::cmp::min(per_page, remaining_items);
+                url = format!("{endpoint}?per_page={current_per_page}&page={page}");
+            }
+
+            tracing::debug!("fetch_workflows: endpoint: {}", url);
+
+            let response = retry_with_adaptive_backoff(3, rate_limiter, || async {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+
+                if let Ok(header) = HeaderValue::from_str(&format!("token {}", token.get_token())) {
+                    headers.insert(AUTHORIZATION, header);
+                }
+
+                client.get(&url).headers(headers).send().await
+            })
+            .await
+            .map_err(
+                |e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> { e.into() },
+            )?;
+
+            rate_limiter.update_from_headers(response.headers()).await;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Failed to fetch workflows from GitHub API. Status: {status}, Error: {error_body}"
+                )
+                .into());
+            }
+
+            let workflows_response: WorkflowsResponse = response.json().await?;
+
+            if workflows_response.workflows.is_empty() {
+                break;
+            }
+
+            all_workflows.extend(workflows_response.workflows);
+
+            if let Some(limit) = limit {
+                if all_workflows.len() >= limit {
+                    all_workflows.truncate(limit);
+                    break;
+                }
+            }
+
+            if all_workflows.len() >= workflows_response.total_count as usize {
+                break;
+            }
+
+            page += 1;
+        }
+
+        // Build the RecordBatch from the collected workflows
+        let mut id_builder = arrow::array::Int64Builder::new();
+        let mut name_builder = arrow::array::StringBuilder::new();
+        let mut path_builder = arrow::array::StringBuilder::new();
+        let mut state_builder = arrow::array::StringBuilder::new();
+        let mut created_at_builder = arrow::array::TimestampMillisecondBuilder::new();
+        let mut updated_at_builder = arrow::array::TimestampMillisecondBuilder::new();
+        let mut badge_url_builder = arrow::array::StringBuilder::new();
+
+        for workflow in &all_workflows {
+            id_builder.append_value(workflow.id);
+            name_builder.append_value(&workflow.name);
+            path_builder.append_value(&workflow.path);
+            state_builder.append_value(&workflow.state);
+
+            // Parse created_at timestamp
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&workflow.created_at) {
+                created_at_builder.append_value(dt.timestamp_millis());
+            } else {
+                created_at_builder.append_null();
+            }
+
+            // Parse updated_at timestamp
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&workflow.updated_at) {
+                updated_at_builder.append_value(dt.timestamp_millis());
+            } else {
+                updated_at_builder.append_null();
+            }
+
+            badge_url_builder.append_value(&workflow.badge_url);
+        }
+
+        let fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("path", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new("badge_url", DataType::Utf8, false),
+        ];
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(name_builder.finish()),
+            Arc::new(path_builder.finish()),
+            Arc::new(state_builder.finish()),
+            Arc::new(created_at_builder.finish()),
+            Arc::new(updated_at_builder.finish()),
+            Arc::new(badge_url_builder.finish()),
+        ];
+
+        let schema = Arc::new(Schema::new(fields));
+
+        let record_batch =
+            RecordBatch::try_new(schema, columns).context(UnableToConstructRecordBatchSnafu)?;
+
+        Ok(vec![record_batch])
+    }
 }
 
 fn extract_name_from_path(path: &str) -> Option<&str> {
@@ -1136,6 +1284,23 @@ struct GitCommitDetails {
 #[derive(Debug, Deserialize)]
 struct GitCommitAuthor {
     date: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowsResponse {
+    pub total_count: i64,
+    pub workflows: Vec<Workflow>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Workflow {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub badge_url: String,
 }
 
 #[derive(Debug, Deserialize)]
