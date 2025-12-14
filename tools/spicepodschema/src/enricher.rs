@@ -298,7 +298,7 @@ fn create_catalog_specific_schema(
     // from field with pattern constraint
     let mut from_schema = Map::new();
     from_schema.insert("type".to_string(), Value::String("string".to_string()));
-    from_schema.insert("pattern".to_string(), Value::String(from_pattern.clone()));
+    from_schema.insert("pattern".to_string(), Value::String(from_pattern));
     from_schema.insert(
         "description".to_string(),
         Value::String(format!(
@@ -338,12 +338,12 @@ fn create_catalog_specific_schema(
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema.as_ref() {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema.as_ref()
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -380,7 +380,7 @@ fn create_model_specific_schema(
     // from field with pattern constraint
     let mut from_schema = Map::new();
     from_schema.insert("type".to_string(), Value::String("string".to_string()));
-    from_schema.insert("pattern".to_string(), Value::String(from_pattern.clone()));
+    from_schema.insert("pattern".to_string(), Value::String(from_pattern));
     from_schema.insert(
         "description".to_string(),
         Value::String(format!(
@@ -420,12 +420,12 @@ fn create_model_specific_schema(
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema.as_ref() {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema.as_ref()
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -517,12 +517,12 @@ fn create_accelerated_dataset_schema(
     properties.insert("acceleration".to_string(), Value::Object(accel_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema.as_ref() {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "acceleration" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema.as_ref()
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "acceleration" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -629,12 +629,12 @@ fn create_base_dataset_schema(base_schema: Option<&Value>) -> Value {
     properties.insert("name".to_string(), Value::Object(name_schema));
 
     // Copy other properties from base schema if available (excluding from, name, params)
-    if let Some(Value::Object(base)) = base_schema {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" && key != "name" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" && key != "name" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -737,12 +737,12 @@ fn create_base_catalog_schema(base_schema: Option<&Value>) -> Value {
     properties.insert("name".to_string(), Value::Object(name_schema));
 
     // Copy other properties from base schema if available (excluding from, name, params)
-    if let Some(Value::Object(base)) = base_schema {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" && key != "name" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" && key != "name" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -805,12 +805,12 @@ fn create_generic_dataset_schema(base_schema: Option<&Value>) -> Value {
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" && key != "name" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" && key != "name" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -874,12 +874,12 @@ fn create_generic_catalog_schema(base_schema: Option<&Value>) -> Value {
     properties.insert("params".to_string(), Value::Object(params_schema));
 
     // Copy other properties from base schema if available
-    if let Some(Value::Object(base)) = base_schema {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" && key != "name" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" && key != "name" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
@@ -984,12 +984,12 @@ fn create_base_model_schema(base_schema: Option<&Value>) -> Value {
     properties.insert("name".to_string(), Value::Object(name_schema));
 
     // Copy other properties from base schema if available (excluding from, name, params)
-    if let Some(Value::Object(base)) = base_schema {
-        if let Some(Value::Object(base_props)) = base.get("properties") {
-            for (key, value) in base_props {
-                if key != "from" && key != "params" && key != "name" {
-                    properties.insert(key.clone(), value.clone());
-                }
+    if let Some(Value::Object(base)) = base_schema
+        && let Some(Value::Object(base_props)) = base.get("properties")
+    {
+        for (key, value) in base_props {
+            if key != "from" && key != "params" && key != "name" {
+                properties.insert(key.clone(), value.clone());
             }
         }
     }
