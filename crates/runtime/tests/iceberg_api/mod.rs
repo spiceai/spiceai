@@ -53,16 +53,14 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
             let mut rng = rand::rng();
             let http_port: u16 = rng.random_range(50000..60000);
             let flight_port: u16 = http_port + 1;
-            let otel_port: u16 = http_port + 2;
 
             tracing::debug!(
-                "Iceberg API Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}"
+                "Iceberg API Ports: http: {http_port}, flight: {flight_port}"
             );
 
             let api_config = Config::new()
                 .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-                .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
             let app = app::AppBuilder::new("test_app")
                 .with_dataset(get_s3_dictionary_dataset("dictionary_example"))

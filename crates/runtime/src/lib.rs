@@ -148,9 +148,6 @@ pub enum Error {
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
 
-    #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
-    UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
-
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
@@ -436,7 +433,6 @@ const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
-const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
@@ -753,30 +749,6 @@ impl Runtime {
             })
             .await;
 
-        // Start OpenTelemetry server
-        let opentelemetry_graceful_shutdown = CancellationToken::new();
-        let df_ref = Arc::clone(&self.df);
-        let cloned_tls_config = tls_config.clone();
-        let grpc_auth = endpoint_auth.grpc_auth.clone();
-
-        let opentelemetry_future = self
-            .start_runtime_task(
-                OPENTELEMETRY_SERVER,
-                Some(opentelemetry_graceful_shutdown.clone()),
-                async move {
-                    opentelemetry::start(
-                        config.open_telemetry_bind_address,
-                        df_ref,
-                        cloned_tls_config,
-                        grpc_auth,
-                        Some(opentelemetry_graceful_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartOpenTelemetryServerSnafu)
-                },
-            )
-            .await;
-
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
                 Some(subject_name) => {
@@ -804,7 +776,6 @@ impl Runtime {
             http_future,
             flight_future,
             metrics_future,
-            opentelemetry_future,
             pods_watcher_future,
             shutdown_signal_future
         ) {

@@ -26,6 +26,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
+use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
@@ -484,6 +485,9 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
+    // Create the OpenTelemetry MetricsService
+    let otel_service = create_metrics_service(rt.datafusion());
+
     let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion(), rt.secrets()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
@@ -492,7 +496,9 @@ pub async fn start(
         .layer(auth_layer);
 
     #[cfg(not(feature = "cluster"))]
-    let server = server.add_service(spice_flight_service);
+    let server = server
+        .add_service(spice_flight_service)
+        .add_service(otel_service);
 
     #[cfg(feature = "cluster")]
     let server = match rt.config.cluster.mode {
@@ -511,15 +517,20 @@ pub async fn start(
             server
                 .add_service(spice_flight_service)
                 .add_service(scheduler_grpc_server)
+                .add_service(otel_service)
         }
         Some(ClusterMode::Executor) => {
             let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
                 .max_decoding_message_size(usize::MAX)
                 .max_encoding_message_size(usize::MAX);
 
-            server.add_service(executor_flight)
+            server
+                .add_service(executor_flight)
+                .add_service(otel_service)
         }
-        _ => server.add_service(spice_flight_service),
+        _ => server
+            .add_service(spice_flight_service)
+            .add_service(otel_service),
     };
 
     // If running an executor, we may have resolved another port to bind if 50051 is taken
