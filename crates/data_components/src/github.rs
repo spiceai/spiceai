@@ -724,7 +724,7 @@ impl GithubRestClient {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_lines)]
     pub async fn fetch_workflow_runs(
         &self,
         owner: &str,
@@ -852,11 +852,11 @@ impl GithubRestClient {
             all_runs.extend(runs_response.workflow_runs);
 
             // Check if we've reached the limit
-            if let Some(limit) = limit {
-                if all_runs.len() >= limit {
-                    all_runs.truncate(limit);
-                    break;
-                }
+            if let Some(limit) = limit
+                && all_runs.len() >= limit
+            {
+                all_runs.truncate(limit);
+                break;
             }
 
             // If we got fewer than per_page results, we've reached the end
@@ -1082,7 +1082,11 @@ impl GithubRestClient {
             let file_name = file.name().to_string();
 
             // Only process .txt files in the root (no directory separator)
-            if file_name.ends_with(".txt") && !file_name.contains('/') {
+            if std::path::Path::new(&file_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                && !file_name.contains('/')
+            {
                 let mut content = String::new();
                 std::io::Read::read_to_string(&mut file, &mut content)?;
                 logs.insert(file_name, content);
@@ -1092,6 +1096,7 @@ impl GithubRestClient {
         Ok(logs)
     }
 
+    #[expect(clippy::too_many_lines)]
     pub async fn fetch_workflows(
         &self,
         owner: &str,
@@ -1158,14 +1163,16 @@ impl GithubRestClient {
 
             all_workflows.extend(workflows_response.workflows);
 
-            if let Some(limit) = limit {
-                if all_workflows.len() >= limit {
-                    all_workflows.truncate(limit);
-                    break;
-                }
+            if let Some(limit) = limit
+                && all_workflows.len() >= limit
+            {
+                all_workflows.truncate(limit);
+                break;
             }
 
-            if all_workflows.len() >= workflows_response.total_count as usize {
+            if all_workflows.len()
+                >= usize::try_from(workflows_response.total_count).map_err(Box::new)?
+            {
                 break;
             }
 

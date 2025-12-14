@@ -120,7 +120,7 @@ impl TableProvider for WorkflowsTableProvider {
             .client
             .fetch_workflows(&self.owner, &self.repo, limit)
             .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
+            .map_err(DataFusionError::External)?;
 
         let table = data_components::arrow::write::MemTable::try_new(
             Arc::clone(&self.schema),

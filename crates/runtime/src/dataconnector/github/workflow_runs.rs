@@ -70,7 +70,7 @@ impl WorkflowRunFilters {
                         "run_started_at",
                         Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
                     ) => {
-                        if let Some(val) = format_created_filter(&value, &op) {
+                        if let Some(val) = format_created_filter(&value, op) {
                             workflow_filters.created = Some(val);
                             continue;
                         }
@@ -138,7 +138,7 @@ fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
     }
 }
 
-fn format_created_filter(scalar: &ScalarValue, op: &Operator) -> Option<String> {
+fn format_created_filter(scalar: &ScalarValue, op: Operator) -> Option<String> {
     // Extract timestamp and convert to ISO 8601 format with operator
     let timestamp_ms = match scalar {
         ScalarValue::TimestampMillisecond(Some(ts), _) => *ts,
@@ -160,7 +160,7 @@ fn format_created_filter(scalar: &ScalarValue, op: &Operator) -> Option<String> 
         _ => return None,
     };
 
-    Some(format!("{}{}", operator_str, iso_string))
+    Some(format!("{operator_str}{iso_string}"))
 }
 
 #[derive(Debug)]
@@ -268,10 +268,8 @@ impl TableProvider for WorkflowRunsTableProvider {
         for filter in filters {
             if let Some((column, _, op)) = extract_filter_column_value_op(filter) {
                 let support = match (column.name.as_str(), op) {
-                    ("head_branch", Operator::Eq) => TableProviderFilterPushDown::Exact,
-                    ("status", Operator::Eq) => TableProviderFilterPushDown::Exact,
-                    ("head_sha", Operator::Eq) => TableProviderFilterPushDown::Exact,
-                    (
+                    ("head_branch" | "status" | "head_sha", Operator::Eq)
+                    | (
                         "run_started_at",
                         Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
                     ) => TableProviderFilterPushDown::Exact,
@@ -310,7 +308,7 @@ impl TableProvider for WorkflowRunsTableProvider {
                 self.fetch_logs,
             )
             .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
+            .map_err(DataFusionError::External)?;
 
         let table = data_components::arrow::write::MemTable::try_new(
             Arc::clone(&self.schema),

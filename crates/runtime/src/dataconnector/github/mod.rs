@@ -598,7 +598,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Whether to fetch commit information (created_at, updated_at) for files. Set to 'true' to enable.")
         .default("false"),
     ParameterSpec::component("workflow_logs")
-        .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run.")
+        .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
         .default("disabled"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
@@ -964,7 +964,7 @@ impl DataConnector for Github {
             }
             ("workflows", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "workflows", &component);
-                
+
                 let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
@@ -1009,7 +1009,7 @@ impl DataConnector for Github {
                         }
 
                         let workflow_id = parts[0];
-                        
+
                         let fetch_logs = dataset
                             .params
                             .get("github_workflow_logs")
