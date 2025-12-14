@@ -146,26 +146,26 @@ datasets:
   - name: test_databricks_spark
     from: databricks:catalog.schema.table
     params:
-      endpoint: https://my-workspace.databricks.com
-      token: dapi123
-      mode: spark_connect
-      client_timeout: "120s"
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: spark_connect
+      databricks_client_timeout: "120s"
       databricks_cluster_id: cluster-123
 
   - name: test_databricks_delta
     from: databricks:catalog.schema.delta_table
     params:
-      endpoint: https://my-workspace.databricks.com
-      token: dapi123
-      mode: delta_lake
-      client_timeout: "60s"
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: delta_lake
+      databricks_client_timeout: "60s"
 
   - name: test_databricks_warehouse
     from: databricks:catalog.schema.warehouse_table
     params:
       databricks_endpoint: https://my-workspace.databricks.com
       databricks_token: dapi123
-      mode: sql_warehouse
+      databricks_mode: sql_warehouse
       databricks_http_path: /sql/1.0/warehouses/abc123
 
   # ---------------------------------------------------------------------------
@@ -536,17 +536,17 @@ catalogs:
   - name: databricks_catalog
     from: databricks:my_catalog
     params:
-      endpoint: https://my-workspace.databricks.com
-      token: dapi123
-      mode: spark_connect
-      client_timeout: "60s"
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: spark_connect
+      databricks_client_timeout: "60s"
 
   # Unity Catalog
   - name: unity_catalog
     from: unity_catalog:another_catalog
     params:
-      endpoint: https://unity.databricks.com
-      token: dapi456
+      databricks_endpoint: https://unity.databricks.com
+      databricks_token: dapi456
 
   # Iceberg catalog
   - name: iceberg_catalog
