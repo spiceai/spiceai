@@ -1142,7 +1142,7 @@
     },
     "Catalog": {
       "description": "A catalog definition. The params field is validated based on the connector type specified in 'from'.",
-      "oneOf": [
+      "anyOf": [
         {
           "$ref": "#/$defs/UnityCatalogCatalog"
         },
@@ -1196,7 +1196,7 @@
     },
     "Dataset": {
       "description": "A dataset definition. The params field is validated based on the connector type specified in 'from'.",
-      "oneOf": [
+      "anyOf": [
         {
           "$ref": "#/$defs/S3Dataset"
         },
@@ -2854,7 +2854,16 @@
           "type": "string"
         },
         "pg_sslmode": {
-          "type": "string"
+          "description": "SSL connection mode.",
+          "type": "string",
+          "enum": [
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full"
+          ]
         },
         "pg_sslrootcert": {
           "type": "string"

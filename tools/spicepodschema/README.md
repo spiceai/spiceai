@@ -185,6 +185,16 @@ Runtime features in `Cargo.toml` determine which connectors' `ParameterSpec` def
 }
 ```
 
+### Connector Discrimination with `anyOf`
+
+The schema uses `anyOf` (not `oneOf`) to combine connector-specific schemas for Dataset and Catalog definitions. Each connector-specific schema uses a `pattern` constraint on the `from` field (e.g., `^postgres:`) to match its connector type.
+
+**Why `anyOf` instead of `oneOf`:**
+- `oneOf` requires **exactly one** schema to match, which fails when a dataset matches both a connector-specific schema (via pattern) and the generic fallback schema
+- `anyOf` requires **at least one** schema to match, allowing the more specific connector schema to provide validation while the generic schema serves as a fallback for unknown connectors
+
+This design allows multiple datasets of the same connector type in a single spicepod while still providing connector-specific parameter validation.
+
 ## Adding New Connectors to Schema
 
 1. Ensure the connector has a `PARAMETERS` constant with `ParameterSpec` definitions

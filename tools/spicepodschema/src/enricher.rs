@@ -453,7 +453,7 @@ fn update_dataset_to_use_conditional_schemas(
             "A dataset definition. The params field is validated based on the connector type specified in 'from'.".to_string()
         ),
     );
-    new_dataset.insert("oneOf".to_string(), Value::Array(one_of_refs));
+    new_dataset.insert("anyOf".to_string(), Value::Array(one_of_refs));
 
     defs_obj.insert("Dataset".to_string(), Value::Object(new_dataset));
 }
@@ -496,7 +496,7 @@ fn update_catalog_to_use_conditional_schemas(
             "A catalog definition. The params field is validated based on the connector type specified in 'from'.".to_string()
         ),
     );
-    new_catalog.insert("oneOf".to_string(), Value::Array(one_of_refs));
+    new_catalog.insert("anyOf".to_string(), Value::Array(one_of_refs));
 
     defs_obj.insert("Catalog".to_string(), Value::Object(new_catalog));
 }

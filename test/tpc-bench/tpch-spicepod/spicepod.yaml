@@ -1,4 +1,3 @@
-# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
 version: v1
 kind: Spicepod
 name: tpch-spicepod
