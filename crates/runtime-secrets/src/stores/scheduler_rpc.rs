@@ -17,7 +17,6 @@ limitations under the License.
 use crate::{AnyErrorResult, SecretStore};
 use async_trait::async_trait;
 use secrecy::SecretString;
-use snafu::ResultExt;
 
 /// Trait for expanding secrets via the cluster service.
 /// This abstracts over the different channel types that may be used.
@@ -40,14 +39,6 @@ impl SchedulerRPCSecretStore {
             executor_id,
             expander,
         }
-    }
-
-    fn client(&self) -> arrow_flight::FlightClient {
-        let meta = self.flight_client.metadata().clone();
-        let mut client =
-            arrow_flight::FlightClient::new_from_inner(self.flight_client.inner().clone());
-        *client.metadata_mut() = meta;
-        client
     }
 }
 

@@ -100,20 +100,10 @@ pub struct ClusterConfig {
     #[arg(
         long = "scheduler-url",
         value_name = "SCHEDULER_URL",
-        default_value = "http://localhost:50052",
+        default_value = "https://127.0.0.1:50052",
         action
     )]
     pub scheduler_url: Url,
-
-    /// Configure the internal cluster gRPC bind address.
-    /// Used by scheduler to expose internal services (`SchedulerGrpc`, `ClusterService`).
-    #[arg(
-        long = "cluster-bind-address",
-        value_name = "CLUSTER_BIND_ADDRESS",
-        default_value = "127.0.0.1:50052",
-        action
-    )]
-    pub cluster_bind_address: SocketAddr,
 
     #[arg(
         long = "allow-insecure-connections",
@@ -134,15 +124,14 @@ pub struct ClusterConfig {
 #[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
-        let url = match Url::parse("http://localhost:50052") {
+        let url = match Url::parse("https://127.0.0.1:50052") {
             Ok(url) => url,
-            Err(e) => unreachable!("The default URI could not be parsed: {}", e),
+            Err(e) => unreachable!("The default URI could not be parsed: {e}"),
         };
 
         Self {
             mode: None,
             scheduler_url: url,
-            cluster_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
             allow_insecure_connections: false,
             cluster_ca_certificate_file: None,
         }
@@ -160,12 +149,6 @@ impl ClusterConfig {
     #[must_use]
     pub fn with_scheduler_url(mut self, url: Url) -> Self {
         self.scheduler_url = url;
-        self
-    }
-
-    #[must_use]
-    pub fn with_cluster_bind_address(mut self, addr: SocketAddr) -> Self {
-        self.cluster_bind_address = addr;
         self
     }
 }
