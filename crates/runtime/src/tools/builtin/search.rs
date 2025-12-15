@@ -89,7 +89,6 @@ impl SpiceModelTool for SearchTool {
             let mut search_request = SearchRequest::try_from(req)?;
             let allowed_tables = match (search_request.datasets, self.table_allowlist.as_ref()) {
                 (tables, None) => tables,
-                // TODO confirm that we should filter or error.
                 (Some(ds), Some(allowlist)) => Some(
                     ds.into_iter()
                         .filter(|d| allowlist.table_is_allowed(&TableReference::parse_str(d)))

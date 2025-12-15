@@ -129,7 +129,7 @@ impl TableSchemaTool {
                         !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
                     }) {
                         return Err(crate::datafusion::Error::UnableToGetTable {
-                            source: DataFusionError::Plan(format!(": No table named {t}")),
+                            source: DataFusionError::Plan(format!("No table named {t}")),
                         })
                         .boxed();
                     }
