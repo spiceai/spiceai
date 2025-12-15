@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/search/mod.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 468,
+    "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer).score,Int64(3))": 0.77
+  },
+  {
+    "id": 1277,
+    "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer).score,Int64(3))": 0.769
+  },
+  {
+    "id": 189,
+    "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer).score,Int64(3))": 0.769
+  },
+  {
+    "id": 948,
+    "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
+    "trunc(vector_search(qs, Utf8(\"second\"), answer).score,Int64(3))": 0.765
+  }
+]

@@ -622,7 +622,6 @@ pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::E
     Ok(client)
 }
 
-#[expect(clippy::too_many_lines)]
 #[expect(dead_code)]
 async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     let client = get_dynamodb_client().await?;

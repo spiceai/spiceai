@@ -26,7 +26,6 @@ use test_framework::{
 
 use crate::args::dispatch::{DispatchArgs, DispatchTestFile, WorkflowArgs};
 
-#[expect(clippy::too_many_lines)]
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     if !args.path.is_dir() && !args.path.is_file() {
         return Err(anyhow::anyhow!("Path must be a directory or a file"));

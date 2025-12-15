@@ -25,6 +25,8 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
+use std::fmt::Display;
+
 use super::catalog::CatalogResult;
 use async_trait::async_trait;
 
@@ -66,6 +68,17 @@ pub enum MetastoreValue {
     Bool(bool),
     /// Null value
     Null,
+}
+
+impl Display for MetastoreValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetastoreValue::Integer(v) => write!(f, "integer {v}"),
+            MetastoreValue::Text(v) => write!(f, "text '{v}'"),
+            MetastoreValue::Bool(v) => write!(f, "bool {v}"),
+            MetastoreValue::Null => write!(f, "NULL"),
+        }
+    }
 }
 
 impl From<i64> for MetastoreValue {
@@ -157,7 +170,7 @@ impl MetastoreGetValue for i64 {
         match value {
             MetastoreValue::Integer(v) => Ok(*v),
             _ => Err(super::catalog::CatalogError::Database {
-                message: "Expected integer value".to_string(),
+                message: format!("Expected integer value, found {value}"),
             }),
         }
     }
@@ -168,7 +181,7 @@ impl MetastoreGetValue for String {
         match value {
             MetastoreValue::Text(v) => Ok(v.clone()),
             _ => Err(super::catalog::CatalogError::Database {
-                message: "Expected text value".to_string(),
+                message: format!("Expected text value, found {value}"),
             }),
         }
     }
@@ -180,7 +193,7 @@ impl MetastoreGetValue for bool {
             MetastoreValue::Bool(v) => Ok(*v),
             MetastoreValue::Integer(v) => Ok(*v != 0),
             _ => Err(super::catalog::CatalogError::Database {
-                message: "Expected boolean value".to_string(),
+                message: format!("Expected boolean value, found {value}"),
             }),
         }
     }

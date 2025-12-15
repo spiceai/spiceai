@@ -5,17 +5,37 @@ option java_multiple_files = true;
 option java_package = "com.spiceai";
 option java_outer_classname = "SpiceProto";
 
-// RPC
+// Internal cluster gRPC service for scheduler-executor communication.
+// This service is only exposed on the internal cluster port.
+service ClusterService {
+    // Get the app definition (Spicepod) from the scheduler.
+    // Called by executors during initialization.
+    rpc GetAppDefinition(GetAppDefinitionRequest) returns (GetAppDefinitionResponse);
+
+    // Expand a secret value from the scheduler's secret store.
+    // Called by executors when they need to resolve secrets.
+    rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
+}
+
+// Request message for GetAppDefinition RPC.
 message GetAppDefinitionRequest {
     string executor_id = 1;
 }
 
-message ExecutorExpandSecretRequest {
+// Response message for GetAppDefinition RPC.
+message GetAppDefinitionResponse {
+    // JSON-serialized app definition.
+    string app_json = 1;
+}
+
+// Request message for ExpandSecret RPC.
+message ExpandSecretRequest {
     string executor_id = 1;
     string key = 2;
 }
 
-message ExecutorExpandSecretResponse {
+// Response message for ExpandSecret RPC.
+message ExpandSecretResponse {
     string key = 1;
     string value = 2;
 }

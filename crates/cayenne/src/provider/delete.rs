@@ -21,7 +21,7 @@ limitations under the License.
 //! - `DeletionFilterStream`: A stream that applies deletion filtering
 //! - `CayenneDeletionSink`: Handles writing deletion vectors to storage
 
-use super::constants::{DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED};
+use super::constants::DELETION_CACHE_LOCK_POISONED;
 use super::utils::{convert_to_i64, convert_to_i64_box, convert_to_u64_box};
 use crate::catalog::{CatalogError, MetadataCatalog};
 use crate::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
@@ -328,7 +328,7 @@ impl CayenneDeletionSink {
 
         let row_ids: Vec<i64> = (0..total_rows_i64).collect();
 
-        self.persist_deletions(row_ids, DEFAULT_DATA_FILE_ID).await
+        self.persist_deletions(row_ids).await
     }
 
     async fn delete_filtered_rows(
@@ -402,13 +402,12 @@ impl CayenneDeletionSink {
             }
         }
 
-        self.persist_deletions(row_ids, DEFAULT_DATA_FILE_ID).await
+        self.persist_deletions(row_ids).await
     }
 
     async fn persist_deletions(
         &self,
         row_ids: Vec<i64>,
-        data_file_id: i64,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let filtered_row_ids = self.filter_existing_deletions(row_ids).await?;
 
@@ -418,10 +417,7 @@ impl CayenneDeletionSink {
 
         let writer = DeletionVectorWriter::new(&self.table_metadata);
         let mut results = writer
-            .write(vec![DeletionVectorWriteSpec::new(
-                data_file_id,
-                filtered_row_ids,
-            )])
+            .write(vec![DeletionVectorWriteSpec::new(filtered_row_ids)])
             .await
             .map_err(catalog_error_to_box)?;
 
@@ -512,7 +508,8 @@ impl CayenneDeletionSink {
                 .map_err(|source| catalog_error_to_box(CatalogError::TaskJoin { source }))?
                 .map_err(|err| {
                     catalog_error_to_box(CatalogError::InvalidOperation {
-                        message: format!("Failed to read existing deletion vectors: {err}"),
+                        message: "Failed to read existing deletion vectors".to_string(),
+                        source: Box::new(err),
                     })
                 })?;
 

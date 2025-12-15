@@ -154,17 +154,13 @@ async fn create_data_export_endpoint() -> Result<DataExportEndpoint, anyhow::Err
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
-    tracing::debug!(
-        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+    tracing::debug!("Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}");
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
     let app = AppBuilder::new("management_sink_app").build();
 

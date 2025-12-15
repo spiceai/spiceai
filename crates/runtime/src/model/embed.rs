@@ -186,7 +186,6 @@ fn model2vec(
 }
 
 #[cfg(feature = "bedrock")]
-#[expect(clippy::too_many_lines)]
 async fn bedrock(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,

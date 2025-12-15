@@ -188,6 +188,9 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 gethostname.workspace = true
 
+[build-dependencies]
+serde_yaml.workspace = true
+
 [dev-dependencies]
 anyhow.workspace = true
 async-graphql = "7.0.17"
@@ -206,8 +209,10 @@ jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
+rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
+serde_yaml.workspace = true
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tempfile.workspace = true
