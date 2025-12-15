@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,10 +29,11 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
+    execution::SendableRecordBatchStream,
     logical_expr::{Expr, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
+    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
 };
-use std::{any::Any, path::Path, sync::Arc, time::Duration};
+use std::{any::Any, collections::HashMap, path::Path, sync::Arc, time::Duration};
 use token_provider::TokenProvider;
 use util::ExponentialBackoff;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
@@ -185,6 +186,7 @@ impl TableProvider for GithubFilesTableProvider {
     }
 }
 
+#[derive(Clone)]
 pub struct GithubRestClient {
     client: reqwest::Client,
     token: Arc<dyn TokenProvider>,
@@ -288,9 +290,7 @@ where
                         // Use fibonacci backoff for server errors and network issues
                         if let Some(duration) = Backoff::next_backoff(&mut fibonacci_backoff) {
                             tracing::warn!(
-                                "GitHub API server/network error, retrying with fibonacci backoff in {:?}: {}",
-                                duration,
-                                e
+                                "GitHub API server/network error, retrying with fibonacci backoff in {duration:?}: {e}",
                             );
                             tokio::time::sleep(duration).await;
                         } else {
@@ -529,7 +529,7 @@ impl GithubRestClient {
                 headers.insert(AUTHORIZATION, header);
             }
 
-            tracing::debug!("fetch_git_tree: endpoint: {}", endpoint);
+            tracing::debug!("fetch_git_tree: endpoint: {endpoint}");
 
             client.get(&endpoint).headers(headers).send().await
         })
@@ -725,14 +725,14 @@ impl GithubRestClient {
 
     #[expect(clippy::too_many_lines)]
     pub async fn fetch_workflow_runs(
-        &self,
-        owner: &str,
-        repo: &str,
-        workflow_id: &str,
-        query_params: Option<&std::collections::HashMap<String, String>>,
+        self: Arc<Self>,
+        owner: Arc<str>,
+        repo: Arc<str>,
+        workflow_id: Arc<str>,
+        query_params: Option<HashMap<String, String>>,
         limit: Option<usize>,
         fetch_logs: bool,
-    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         self.rate_limiter.check_rate_limit().await?;
 
         let endpoint = format!(
@@ -754,8 +754,8 @@ impl GithubRestClient {
                 .append_pair("page", &page.to_string());
 
             // Add query parameters if provided
-            if let Some(params) = query_params {
-                for (key, value) in params {
+            if let Some(ref params) = query_params {
+                for (key, value) in params.iter() {
                     url.query_pairs_mut().append_pair(key, value);
                 }
             }
@@ -775,7 +775,7 @@ impl GithubRestClient {
                     headers.insert(AUTHORIZATION, header);
                 }
 
-                tracing::debug!("fetch_workflow_runs: endpoint: {}", url);
+                tracing::debug!("fetch_workflow_runs: endpoint: {url}");
 
                 client.get(&url).headers(headers).send().await
             })
@@ -870,12 +870,12 @@ impl GithubRestClient {
         let run_logs = if fetch_logs {
             let mut logs_map = std::collections::HashMap::new();
             for run in &all_runs {
-                match self.fetch_workflow_run_logs(owner, repo, run.id).await {
+                match self.fetch_workflow_run_logs(&owner, &repo, run.id).await {
                     Ok(logs) => {
                         logs_map.insert(run.id, logs);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to fetch logs for workflow run {}: {}", run.id, e);
+                        tracing::warn!("Failed to fetch logs for workflow run {}: {e}", run.id);
                         logs_map.insert(run.id, std::collections::HashMap::new());
                     }
                 }
@@ -1011,10 +1011,15 @@ impl GithubRestClient {
 
         let schema = Arc::new(Schema::new(fields));
 
-        let record_batch =
-            RecordBatch::try_new(schema, columns).context(UnableToConstructRecordBatchSnafu)?;
+        let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+            .context(UnableToConstructRecordBatchSnafu)?;
 
-        Ok(vec![record_batch])
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(record_batch.clone())]),
+        );
+
+        Ok(Box::pin(stream_adapter))
     }
 
     pub async fn fetch_workflow_run_logs(
@@ -1046,7 +1051,7 @@ impl GithubRestClient {
                 headers.insert(AUTHORIZATION, header);
             }
 
-            tracing::debug!("fetch_workflow_run_logs: endpoint: {}", endpoint);
+            tracing::debug!("fetch_workflow_run_logs: endpoint: {endpoint}");
 
             // Don't follow redirects automatically - we need to handle them manually
             client.get(&endpoint).headers(headers).send().await
@@ -1058,8 +1063,7 @@ impl GithubRestClient {
 
         if !response.status().is_success() {
             tracing::debug!(
-                "Failed to fetch logs for run {}: status {}",
-                run_id,
+                "Failed to fetch logs for run {run_id}: status {}",
                 response.status()
             );
             // Return empty map if logs aren't available
@@ -1069,28 +1073,34 @@ impl GithubRestClient {
         // Download the ZIP file
         let zip_bytes = response.bytes().await?;
 
-        // Parse the ZIP file
-        let cursor = std::io::Cursor::new(zip_bytes);
-        let mut zip = zip::ZipArchive::new(cursor)?;
+        // Offload ZIP parsing to another thread to avoid blocking async runtime
+        let logs = tokio::task::spawn_blocking(move || {
+            // Parse the ZIP file
+            let cursor = std::io::Cursor::new(zip_bytes);
+            let mut zip = zip::ZipArchive::new(cursor)?;
 
-        let mut logs = std::collections::HashMap::new();
+            let mut logs = std::collections::HashMap::new();
 
-        // Extract only .txt files from the root of the ZIP
-        for i in 0..zip.len() {
-            let mut file = zip.by_index(i)?;
-            let file_name = file.name().to_string();
+            // Extract only .txt files from the root of the ZIP
+            for i in 0..zip.len() {
+                let mut file = zip.by_index(i)?;
+                let file_name = file.name().to_string();
 
-            // Only process .txt files in the root (no directory separator)
-            if std::path::Path::new(&file_name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
-                && !file_name.contains('/')
-            {
-                let mut content = String::new();
-                std::io::Read::read_to_string(&mut file, &mut content)?;
-                logs.insert(file_name, content);
+                // Only process .txt files in the root (no directory separator)
+                if std::path::Path::new(&file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+                    && !file_name.contains('/')
+                {
+                    let mut content = String::new();
+                    std::io::Read::read_to_string(&mut file, &mut content)?;
+                    logs.insert(file_name, content);
+                }
             }
-        }
+
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(logs)
+        })
+        .await??;
 
         Ok(logs)
     }
@@ -1125,7 +1135,7 @@ impl GithubRestClient {
                 url = format!("{endpoint}?per_page={current_per_page}&page={page}");
             }
 
-            tracing::debug!("fetch_workflows: endpoint: {}", url);
+            tracing::debug!("fetch_workflows: endpoint: {url}");
 
             let response = retry_with_adaptive_backoff(3, rate_limiter, || async {
                 let mut headers = HeaderMap::new();

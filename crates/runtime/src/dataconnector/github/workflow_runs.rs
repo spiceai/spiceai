@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,13 +19,27 @@ use async_trait::async_trait;
 use data_components::github::GithubRestClient;
 use datafusion::{
     catalog::Session,
-    common::Column,
+    common::{Column, Statistics},
+    config::ConfigOptions,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, Operator, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
+        execution_plan::{
+            Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
+        },
+        filter_pushdown::{
+            ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+        },
+        projection::ProjectionExec,
+        stream::RecordBatchStreamAdapter,
+    },
     scalar::ScalarValue,
 };
+use futures::{TryFutureExt, TryStreamExt};
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -49,19 +63,25 @@ impl WorkflowRunFilters {
             if let Some((column, value, op)) = extract_filter_column_value_op(filter) {
                 match (column.name.as_str(), op) {
                     ("head_branch", Operator::Eq) => {
-                        if let Some(val) = scalar_to_string(&value) {
+                        if let Some(val) = scalar_to_string(&value)
+                            && workflow_filters.branch.is_none()
+                        {
                             workflow_filters.branch = Some(val);
                             continue;
                         }
                     }
                     ("status", Operator::Eq) => {
-                        if let Some(val) = scalar_to_string(&value) {
+                        if let Some(val) = scalar_to_string(&value)
+                            && workflow_filters.status.is_none()
+                        {
                             workflow_filters.status = Some(val);
                             continue;
                         }
                     }
                     ("head_sha", Operator::Eq) => {
-                        if let Some(val) = scalar_to_string(&value) {
+                        if let Some(val) = scalar_to_string(&value)
+                            && workflow_filters.head_sha.is_none()
+                        {
                             workflow_filters.head_sha = Some(val);
                             continue;
                         }
@@ -70,7 +90,9 @@ impl WorkflowRunFilters {
                         "run_started_at",
                         Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
                     ) => {
-                        if let Some(val) = format_created_filter(&value, op) {
+                        if let Some(val) = format_created_filter(&value, op)
+                            && workflow_filters.created.is_none()
+                        {
                             workflow_filters.created = Some(val);
                             continue;
                         }
@@ -165,7 +187,7 @@ fn format_created_filter(scalar: &ScalarValue, op: Operator) -> Option<String> {
 
 #[derive(Debug)]
 pub struct WorkflowRunsTableProvider {
-    client: GithubRestClient,
+    client: Arc<GithubRestClient>,
     owner: Arc<str>,
     repo: Arc<str>,
     workflow_id: Arc<str>,
@@ -225,8 +247,16 @@ impl WorkflowRunsTableProvider {
         let schema = Arc::new(Schema::new(fields));
 
         // Validate access by fetching a limited set of workflow runs
-        client
-            .fetch_workflow_runs(owner, repo, workflow_id, None, Some(1), false)
+        let client = Arc::new(client);
+        Arc::clone(&client)
+            .fetch_workflow_runs(
+                owner.into(),
+                repo.into(),
+                workflow_id.into(),
+                None,
+                Some(1),
+                false,
+            )
             .await
             .map_err(|e| super::DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
@@ -272,7 +302,7 @@ impl TableProvider for WorkflowRunsTableProvider {
                     | (
                         "run_started_at",
                         Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq,
-                    ) => TableProviderFilterPushDown::Exact,
+                    ) => TableProviderFilterPushDown::Inexact, // Inexact, because a user could specify multiple values but the REST API only supports single value filtering
                     _ => TableProviderFilterPushDown::Unsupported,
                 };
                 pushdown_support.push(support);
@@ -286,8 +316,8 @@ impl TableProvider for WorkflowRunsTableProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -295,28 +325,217 @@ impl TableProvider for WorkflowRunsTableProvider {
 
         let query_params = workflow_filters.to_query_params();
 
-        tracing::debug!("Pushing down filters to GitHub API: {:?}", query_params);
+        tracing::debug!("Pushing down filters to GitHub API: {query_params:?}");
+        tracing::debug!("Remaining filters after pushdown: {remaining_filters:?}");
 
-        let batches = self
-            .client
-            .fetch_workflow_runs(
-                &self.owner,
-                &self.repo,
-                &self.workflow_id,
-                Some(&query_params),
-                limit,
-                self.fetch_logs,
-            )
-            .await
-            .map_err(DataFusionError::External)?;
+        Ok(Arc::new(WorkflowRunsExecutionPlan {
+            owner: Arc::clone(&self.owner),
+            repo: Arc::clone(&self.repo),
+            workflow_id: Arc::clone(&self.workflow_id),
+            query_params: if query_params.is_empty() {
+                None
+            } else {
+                Some(query_params)
+            },
+            limit,
+            fetch_logs: self.fetch_logs,
+            schema: Arc::clone(&self.schema),
+            client: Arc::clone(&self.client),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&self.schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        }))
+    }
+}
 
-        let table = data_components::arrow::write::MemTable::try_new(
-            Arc::clone(&self.schema),
-            vec![batches],
-        )?;
+#[derive(Debug)]
+struct WorkflowRunsExecutionPlan {
+    owner: Arc<str>,
+    repo: Arc<str>,
+    workflow_id: Arc<str>,
+    query_params: Option<HashMap<String, String>>,
+    limit: Option<usize>,
+    fetch_logs: bool,
+    schema: SchemaRef,
+    client: Arc<GithubRestClient>,
+    properties: PlanProperties,
+}
 
-        table
-            .scan(state, projection, &remaining_filters, limit)
-            .await
+impl DisplayAs for WorkflowRunsExecutionPlan {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(
+            f,
+            "GitHubWorkflowRunsExecutionPlan: {}/{} workflow_id={} fetch_logs={} limit={:?} query_params={:?}",
+            self.owner, self.repo, self.workflow_id, self.fetch_logs, self.limit, self.query_params
+        )
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+impl ExecutionPlan for WorkflowRunsExecutionPlan {
+    fn name(&self) -> &str {
+        "GitHubWorkflowRunsExecutionPlan"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "GitHubWorkflowRunsExecutionPlan"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn check_invariants(&self, check: InvariantLevel) -> datafusion::error::Result<()> {
+        check_default_invariants(self, check)
+    }
+
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![]
+    }
+
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
+        vec![]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![]
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // this plan has no children
+        Ok(self)
+    }
+
+    fn reset_state(self: Arc<Self>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let owner = Arc::clone(&self.owner);
+        let repo = Arc::clone(&self.repo);
+        let workflow_id = Arc::clone(&self.workflow_id);
+        let query_params = self.query_params.clone();
+        let limit = self.limit;
+        let fetch_logs = self.fetch_logs;
+        let client = Arc::clone(&self.client);
+
+        let stream = futures::stream::once(
+            client
+                .fetch_workflow_runs(owner, repo, workflow_id, query_params, limit, fetch_logs)
+                .map_err(DataFusionError::External),
+        )
+        .try_flatten();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
+    }
+
+    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+        None
+    }
+
+    #[expect(deprecated)]
+    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> datafusion::error::Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema()))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Unknown // this plan has no inputs
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExec,
+    ) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> datafusion::error::Result<FilterDescription> {
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> datafusion::error::Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
+        None
     }
 }
