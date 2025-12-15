@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::{arrow::write::MemTable, github::GithubRestClient};
+use data_components::github::GithubRestClient;
 use datafusion::{
     catalog::Session,
     common::Statistics,
@@ -191,7 +191,7 @@ impl DisplayAs for WorkflowsExecutionPlan {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for WorkflowsExecutionPlan {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "GitHubWorkflowsExecutionPlan"
     }
 
@@ -287,7 +287,6 @@ impl ExecutionPlan for WorkflowsExecutionPlan {
         None
     }
 
-    #[expect(deprecated)]
     fn statistics(&self) -> datafusion::error::Result<Statistics> {
         Ok(Statistics::new_unknown(&self.schema()))
     }

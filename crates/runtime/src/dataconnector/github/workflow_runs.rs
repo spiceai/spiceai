@@ -397,7 +397,7 @@ impl DisplayAs for WorkflowRunsExecutionPlan {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for WorkflowRunsExecutionPlan {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "GitHubWorkflowRunsExecutionPlan"
     }
 
@@ -496,7 +496,6 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         None
     }
 
-    #[expect(deprecated)]
     fn statistics(&self) -> datafusion::error::Result<Statistics> {
         Ok(Statistics::new_unknown(&self.schema()))
     }
