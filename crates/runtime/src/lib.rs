@@ -430,6 +430,8 @@ pub enum Error {
 
 #[cfg(feature = "cluster")]
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
+#[cfg(feature = "cluster")]
+const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -649,22 +651,52 @@ impl Runtime {
             }
         };
 
-        // - Scheduler: does some init, but all requests handled by Flight RPC stack
+        // - Scheduler: does some init, starts internal cluster gRPC server on separate port
         // - Executor: does some init, but has a polling loop to fetch work from scheduler
         #[cfg(feature = "cluster")]
-        let maybe_cluster_future = match self.config.cluster.mode {
+        #[expect(
+            clippy::items_after_statements,
+            reason = "type alias scoped to cluster feature"
+        )]
+        type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+        #[cfg(feature = "cluster")]
+        let maybe_cluster_future: Option<BoxedClusterFuture> = match self.config.cluster.mode {
             Some(ClusterMode::Scheduler) => {
                 cluster::initialize_cluster_scheduler(&self).await?;
-                None
+                // Start internal cluster server for scheduler on separate port
+                let internal_server_shutdown = CancellationToken::new();
+                let self_ref = Arc::clone(&self);
+                let cloned_tls_config = tls_config.clone();
+                let cloned_shutdown = internal_server_shutdown.clone();
+                let internal_server_fut = async move {
+                    flight::start_internal_cluster_server(
+                        Arc::clone(&self_ref),
+                        cloned_tls_config,
+                        Some(cloned_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartFlightServerSnafu)
+                };
+                let self_for_task = Arc::clone(&self);
+                Some(Box::pin(
+                    self_for_task
+                        .start_runtime_task(
+                            CLUSTER_INTERNAL_SERVER,
+                            Some(internal_server_shutdown),
+                            internal_server_fut,
+                        )
+                        .await,
+                ))
             }
-            Some(ClusterMode::Executor) => Some(
-                self.start_runtime_task(
-                    CLUSTER_EXECUTOR,
-                    None,
-                    cluster::initialize_cluster_executor(Arc::clone(&self)).await?,
-                )
-                .await,
-            ),
+            Some(ClusterMode::Executor) => {
+                let executor_fut = cluster::initialize_cluster_executor(Arc::clone(&self)).await?;
+                let self_ref = Arc::clone(&self);
+                Some(Box::pin(
+                    self_ref
+                        .start_runtime_task(CLUSTER_EXECUTOR, None, executor_fut)
+                        .await,
+                ))
+            }
             _ => None,
         };
 
@@ -772,6 +804,21 @@ impl Runtime {
             .await;
 
         // wait for all servers to shut down or if any of the servers fail to start
+        #[cfg(feature = "cluster")]
+        if let Some(cluster_future) = maybe_cluster_future {
+            return match tokio::try_join!(
+                http_future,
+                flight_future,
+                metrics_future,
+                pods_watcher_future,
+                cluster_future,
+                shutdown_signal_future
+            ) {
+                Err(err) => Err(err),
+                _ => Ok(()),
+            };
+        }
+
         match tokio::try_join!(
             http_future,
             flight_future,
@@ -1079,7 +1126,7 @@ impl Runtime {
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
         task_fn: F,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + use<F>
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {

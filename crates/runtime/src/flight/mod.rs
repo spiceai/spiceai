@@ -16,9 +16,10 @@ limitations under the License.
 
 #[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterMode,
+    crate::cluster::ClusterServiceImpl, crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    ballista_executor::flight_service::BallistaFlightService, std::net::ToSocketAddrs,
+    ballista_executor::flight_service::BallistaFlightService,
+    runtime_proto::cluster_service_server::ClusterServiceServer, std::net::ToSocketAddrs,
 };
 
 use crate::auth::EndpointAuth;
@@ -508,36 +509,20 @@ pub async fn start(
         .add_service(otel_service);
 
     #[cfg(feature = "cluster")]
-    let server = match rt.config.cluster.mode {
-        Some(ClusterMode::Scheduler) => {
-            let Some(scheduler) = rt
-                .df
-                .scheduler_server
-                .read()
-                .ok()
-                .and_then(|r| r.iter().next().cloned())
-            else {
-                return Err(Error::ClusterSchedulerNotInitialized {});
-            };
+    let server = if rt.config.cluster.mode == Some(ClusterMode::Executor) {
+        // Executor: serve only BallistaFlightService for receiving query fragments.
+        // No OTel service needed on executors.
+        let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX);
 
-            let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
-            server
-                .add_service(spice_flight_service)
-                .add_service(scheduler_grpc_server)
-                .add_service(otel_service)
-        }
-        Some(ClusterMode::Executor) => {
-            let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
-                .max_decoding_message_size(usize::MAX)
-                .max_encoding_message_size(usize::MAX);
-
-            server
-                .add_service(executor_flight)
-                .add_service(otel_service)
-        }
-        _ => server
+        server.add_service(executor_flight)
+    } else {
+        // Scheduler or non-cluster mode: serve user-facing Flight + OTel on this port.
+        // Internal cluster services (`SchedulerGrpc`, `ClusterService`) are on a separate port.
+        server
             .add_service(spice_flight_service)
-            .add_service(otel_service),
+            .add_service(otel_service)
     };
 
     // If running an executor, we may have resolved another port to bind if 50051 is taken
@@ -618,4 +603,73 @@ impl Default for RateLimits {
             ),
         }
     }
+}
+
+/// Starts the internal cluster gRPC server for scheduler mode.
+///
+/// This server handles internal cluster communication:
+/// - `SchedulerGrpcServer`: Ballista task scheduling protocol (executor registration, task dispatch)
+/// - `ClusterServiceServer`: Spice-specific RPCs (`GetAppDefinition`, `ExpandSecret`)
+///
+/// This server should only be started when running in scheduler mode.
+#[cfg(feature = "cluster")]
+pub async fn start_internal_cluster_server(
+    rt: Arc<Runtime>,
+    tls_config: Option<Arc<TlsConfig>>,
+    shutdown_signal: Option<CancellationToken>,
+) -> Result<()> {
+    let bind_address = rt.df.cluster_config.cluster_bind_address();
+
+    let Some(scheduler) = rt
+        .df
+        .scheduler_server
+        .read()
+        .ok()
+        .and_then(|r| r.iter().next().cloned())
+    else {
+        return Err(Error::ClusterSchedulerNotInitialized {});
+    };
+
+    let mut server = Server::builder();
+
+    if let Some(ref tls_config) = tls_config {
+        server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
+    }
+
+    let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
+
+    let cluster_service = ClusterServiceImpl::new(
+        Arc::clone(&rt.app),
+        Arc::clone(&rt.df),
+        Arc::clone(&rt.secrets),
+    );
+    let cluster_service_server = ClusterServiceServer::new(cluster_service);
+
+    let server = server
+        .add_service(scheduler_grpc_server)
+        .add_service(cluster_service_server);
+
+    tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
+
+    if let Some(token) = shutdown_signal {
+        server
+            .serve_with_shutdown(bind_address, token.cancelled())
+            .await
+    } else {
+        server.serve(bind_address).await
+    }
+    .map_err(|e| {
+        if is_address_in_use_error(&e) {
+            return Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
+            };
+        }
+        Error::UnableToStartFlightServer { source: e }
+    })?;
+
+    tracing::debug!("Spice Runtime internal cluster server stopped");
+
+    Ok(())
 }

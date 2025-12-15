@@ -1,33 +1,44 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::{AnyErrorResult, SecretStore};
 use async_trait::async_trait;
-use futures::StreamExt;
-use prost::{Message, bytes};
-use runtime_proto::{ExecutorExpandSecretRequest, ExecutorExpandSecretResponse};
 use secrecy::SecretString;
-use snafu::ResultExt;
+
+/// Trait for expanding secrets via the cluster service.
+/// This abstracts over the different channel types that may be used.
+#[async_trait]
+pub trait ClusterSecretExpander: Send + Sync {
+    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String>;
+}
 
 /// Used by cluster mode to resolve secrets declared in the scheduler
-/// via flight RPC
+/// via the internal cluster gRPC service.
 pub struct SchedulerRPCSecretStore {
     executor_id: String,
-    flight_client: arrow_flight::FlightClient,
+    expander: Box<dyn ClusterSecretExpander>,
 }
 
 impl SchedulerRPCSecretStore {
     #[must_use]
-    pub fn new(flight_client: arrow_flight::FlightClient, executor_id: String) -> Self {
+    pub fn new(expander: Box<dyn ClusterSecretExpander>, executor_id: String) -> Self {
         Self {
             executor_id,
-            flight_client,
+            expander,
         }
-    }
-
-    fn client(&self) -> arrow_flight::FlightClient {
-        let meta = self.flight_client.metadata().clone();
-        let mut client =
-            arrow_flight::FlightClient::new_from_inner(self.flight_client.inner().clone());
-        *client.metadata_mut() = meta;
-        client
     }
 }
 
@@ -36,24 +47,12 @@ impl SecretStore for SchedulerRPCSecretStore {
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
         tracing::trace!("SchedulerRPCSecretStore: Requesting secret {}", key);
 
-        let request = ExecutorExpandSecretRequest {
-            executor_id: self.executor_id.clone(),
-            key: key.to_string(),
-        };
+        let value = self
+            .expander
+            .expand_secret(&self.executor_id, key)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        let action = arrow_flight::Action {
-            r#type: "ExpandSecret".to_string(),
-            body: bytes::Bytes::from(request.encode_to_vec()),
-        };
-
-        let response = self.client().do_action(action).await.boxed()?.next().await;
-
-        match response {
-            Some(Ok(mut bytes)) => Ok(Some(SecretString::from(
-                ExecutorExpandSecretResponse::decode(&mut bytes)?.value,
-            ))),
-            Some(Err(e)) => Err(e.into()),
-            None => Err("Secrets RPC returned no response".into()),
-        }
+        Ok(Some(SecretString::from(value)))
     }
 }

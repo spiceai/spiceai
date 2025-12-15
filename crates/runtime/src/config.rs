@@ -46,7 +46,7 @@ pub struct Config {
     pub cluster: ClusterConfig,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
 pub enum ClusterMode {
     Scheduler,
     Executor,
@@ -105,6 +105,26 @@ pub struct ClusterConfig {
     )]
     pub scheduler_url: Url,
 
+    /// Configure the internal cluster gRPC bind address.
+    /// Used by scheduler to expose internal services (`SchedulerGrpc`, `ClusterService`).
+    #[arg(
+        long = "cluster-bind-address",
+        value_name = "CLUSTER_BIND_ADDRESS",
+        default_value = "127.0.0.1:50052",
+        action
+    )]
+    pub cluster_bind_address: SocketAddr,
+
+    /// Configure the scheduler's internal cluster service URL.
+    /// Used by executors to connect for task polling and app/secrets RPCs.
+    /// Defaults to scheduler-url with port 50052.
+    #[arg(
+        long = "scheduler-cluster-url",
+        value_name = "SCHEDULER_CLUSTER_URL",
+        action
+    )]
+    pub scheduler_cluster_url: Option<Url>,
+
     /// Set the API key configured in the scheduler for secure RPC
     #[arg(long = "cluster-api-key", value_name = "CLUSTER_API_KEY", action)]
     pub cluster_api_key: Option<String>,
@@ -136,6 +156,8 @@ impl Default for ClusterConfig {
         Self {
             mode: None,
             scheduler_url: url,
+            cluster_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
+            scheduler_cluster_url: None,
             cluster_api_key: None,
             allow_insecure_connections: false,
             cluster_ca_certificate_file: None,
@@ -154,6 +176,12 @@ impl ClusterConfig {
     #[must_use]
     pub fn with_scheduler_url(mut self, url: Url) -> Self {
         self.scheduler_url = url;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cluster_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.cluster_bind_address = addr;
         self
     }
 }
