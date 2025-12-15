@@ -2006,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=12957e480d1433b97bbb5de328e6bc0387d8551a#12957e480d1433b97bbb5de328e6bc0387d8551a"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=9c17685db62a1511ecf2e90aa72b19feabdea1cb#9c17685db62a1511ecf2e90aa72b19feabdea1cb"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2040,7 +2040,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=12957e480d1433b97bbb5de328e6bc0387d8551a#12957e480d1433b97bbb5de328e6bc0387d8551a"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=9c17685db62a1511ecf2e90aa72b19feabdea1cb#9c17685db62a1511ecf2e90aa72b19feabdea1cb"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2069,7 +2069,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=12957e480d1433b97bbb5de328e6bc0387d8551a#12957e480d1433b97bbb5de328e6bc0387d8551a"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=9c17685db62a1511ecf2e90aa72b19feabdea1cb#9c17685db62a1511ecf2e90aa72b19feabdea1cb"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2996,18 +2996,22 @@ dependencies = [
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
+ "datafusion-federation",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "futures",
  "insta",
  "paste",
  "roaring",
+ "rstest 0.26.1",
  "runtime-datafusion",
  "rusqlite",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
+ "test-framework",
+ "test-log",
  "tokio",
  "tracing",
  "turso",
@@ -4156,6 +4160,7 @@ dependencies = [
  "url",
  "util",
  "uuid 1.18.1",
+ "zip 3.0.0",
 ]
 
 [[package]]
@@ -13136,6 +13141,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmcp",
+ "rstest 0.26.1",
  "runtime-acceleration",
  "runtime-async",
  "runtime-auth",
@@ -13160,6 +13166,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_yaml",
  "snafu",
  "snowflake-api",
  "spice-cloud",
@@ -13366,7 +13373,8 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-proto",
  "prost 0.13.5",
- "prost-build",
+ "tonic 0.13.1",
+ "tonic-build",
 ]
 
 [[package]]
@@ -13413,9 +13421,11 @@ dependencies = [
  "base64 0.22.1",
  "dotenvy",
  "flight_client",
+ "futures",
  "indexmap 2.12.1",
  "keyring",
  "logos",
+ "percent-encoding",
  "prost 0.13.5",
  "rand 0.9.2",
  "reqwest",
@@ -13425,6 +13435,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tokio",
+ "tonic 0.13.1",
  "tracing",
 ]
 
@@ -15634,7 +15645,10 @@ dependencies = [
  "otel-arrow",
  "sha2",
  "snafu",
+ "sysinfo 0.35.2",
+ "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -15715,6 +15729,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow",
+ "arrow-json",
  "async-openai",
  "async-trait",
  "chrono",
@@ -15728,6 +15743,7 @@ dependencies = [
  "nix",
  "octocrab",
  "opentelemetry 0.29.1",
+ "opentelemetry-otlp",
  "opentelemetry_sdk 0.29.0",
  "otel-arrow",
  "rand 0.9.2",
@@ -15752,6 +15768,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-log"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37d53ac171c92a39e4769491c4b4dde7022c60042254b5fc044ae409d34a24d4"
+dependencies = [
+ "env_logger",
+ "test-log-macros",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "test-log-macros"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be35209fd0781c5401458ab66e4f98accf63553e8fae7425503e92fdd319783b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
 name = "testoperator"
 version = "1.10.1-enterprise-beta"
 dependencies = [
@@ -15765,6 +15803,7 @@ dependencies = [
  "spiceai",
  "test-framework",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

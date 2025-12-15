@@ -140,7 +140,6 @@ async fn test_acceleration_turso_checkpoint() -> Result<(), anyhow::Error> {
 }
 
 /// Helper function to convert libsql query results to Arrow `RecordBatches`
-#[expect(clippy::too_many_lines)]
 async fn query_to_record_batches(
     conn: &Connection,
     query: &str,

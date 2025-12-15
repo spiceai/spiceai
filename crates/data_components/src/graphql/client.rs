@@ -814,7 +814,6 @@ impl GraphQLClient {
         })
     }
 
-    #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &mut GraphQLQuery,

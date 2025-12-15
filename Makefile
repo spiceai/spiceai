@@ -87,6 +87,7 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \
@@ -101,6 +102,7 @@ lint-rust:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \
@@ -120,6 +122,7 @@ lint-rust-fix:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \
@@ -134,6 +137,7 @@ lint-rust-fix:
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
 		-Dclippy::equatable_if_let \
 		-Dclippy::needless_collect \
 		-Dclippy::redundant_clone \

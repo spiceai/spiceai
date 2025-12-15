@@ -503,6 +503,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -688,6 +689,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -1088,6 +1090,7 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             # { engine: turso, mode: memory },
             # { engine: turso, mode: file },
             # { engine: postgres},

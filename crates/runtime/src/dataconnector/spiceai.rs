@@ -446,7 +446,6 @@ mod tests {
     use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_spice_dataset_path() {
         let tests = vec![
             (

@@ -164,19 +164,43 @@ impl Query {
 
     #[cfg(feature = "cluster")]
     fn get_session_state(&self) -> Result<SessionState> {
-        if !matches!(self.df.cluster_config.mode, Some(ClusterMode::Scheduler)) {
+        if !matches!(self.df.cluster_config.mode(), Some(ClusterMode::Scheduler)) {
             return Ok(self.df.ctx.state());
         }
+
+        let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
+            return Err(Error::UnableToExecuteQuery {
+                source: datafusion::error::DataFusionError::Configuration(
+                    "Scheduler mode requires --cluster-advertise-address".to_string(),
+                ),
+            });
+        };
+
+        // TLS is always required for cluster mode
+        let client_tls_config = self
+            .df
+            .cluster_config
+            .client_tls_config()
+            .cloned()
+            .ok_or_else(|| Error::UnableToExecuteQuery {
+                source: datafusion::error::DataFusionError::Configuration(
+                    "Cluster mode requires mTLS configuration".to_string(),
+                ),
+            })?;
 
         let cfg = self
             .df
             .ctx
             .copied_config()
-            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec());
+            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
+            .with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
+                ep.tls_config(client_tls_config.clone()).boxed()
+            }))
+            .with_ballista_use_tls(true);
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
-                self.df.cluster_config.scheduler_url.to_string(),
+                scheduler_url.to_string(),
                 cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
                 DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
@@ -188,7 +212,7 @@ impl Query {
                     .with_option_extension(SpiceClusterConfig::default()),
             )
             .build()
-            .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
+            .upgrade_for_ballista(scheduler_url.to_string())
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
     }
 
@@ -266,7 +290,6 @@ impl Query {
         Ok(QueryResult::new(stream, cache_status))
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
         crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 

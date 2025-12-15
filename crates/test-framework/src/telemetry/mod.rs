@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod streaming;
+
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -27,6 +30,7 @@ use opentelemetry_sdk::{
     metrics::{SdkMeterProvider, data::ResourceMetrics},
 };
 
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use secrecy::SecretString;
 use telemetry::exporter::TelemetryExporterBuilder;
 pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
@@ -42,11 +46,23 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 
 pub static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
 
+#[derive(Debug, Clone)]
+pub struct OtlpExporterConfig {
+    pub endpoint: Arc<str>,
+    pub headers: Vec<(String, String)>,
+    pub timeout: Duration,
+}
+
+enum TelemetryBackend {
+    Arrow { api_key: Option<SecretString> },
+    Otlp(OtlpExporterConfig),
+}
+
 pub struct Telemetry {
     reader: InitialReader,
     resource: Resource,
     setup: bool,
-    api_key: Option<SecretString>,
+    backend: TelemetryBackend,
 }
 
 impl Telemetry {
@@ -77,14 +93,39 @@ impl Telemetry {
             println!("Telemetry disabled");
         }
 
+        let api_key = std::env::var(api_key_name)
+            .ok()
+            .as_deref()
+            .map(|key| SecretString::new(key.into()));
+
         Self {
             reader,
             resource: resource.clone(),
             setup,
-            api_key: std::env::var(api_key_name)
-                .ok()
-                .as_deref()
-                .map(|key| SecretString::new(key.into())),
+            backend: TelemetryBackend::Arrow { api_key },
+        }
+    }
+
+    #[must_use]
+    pub fn with_otlp(config: OtlpExporterConfig) -> Self {
+        let resource = Resource::builder_empty().build();
+        let reader = InitialReader::default();
+
+        let provider = SdkMeterProvider::builder()
+            .with_resource(resource.clone())
+            .with_reader(reader.clone())
+            .build();
+
+        let setup = METER_PROVIDER_ONCE.set(Arc::new(provider)).is_ok();
+        if !setup {
+            println!("Telemetry disabled");
+        }
+
+        Self {
+            reader,
+            resource,
+            setup,
+            backend: TelemetryBackend::Otlp(config),
         }
     }
 
@@ -101,40 +142,62 @@ impl Telemetry {
             return Ok(());
         }
 
-        if let Some(api_key) = &self.api_key {
-            println!("Emitting to exporter at {}", *ENDPOINT);
-            let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
-                TelemetryExporterBuilder::new()
-                    .with_credentials(flight_client::Credentials::Bearer {
-                        token: api_key.clone().into(),
-                        prefix: false,
-                    })
-                    .with_service_name("benchmarks_telemetry".into())
-                    .with_endpoint(Arc::clone(&ENDPOINT))
-                    .build()
-                    .await?,
-            );
+        match &self.backend {
+            TelemetryBackend::Arrow { api_key } => {
+                if let Some(api_key) = api_key {
+                    println!("Emitting to exporter at {}", *ENDPOINT);
+                    let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
+                        TelemetryExporterBuilder::new()
+                            .with_credentials(flight_client::Credentials::Bearer {
+                                token: api_key.clone().into(),
+                                prefix: false,
+                            })
+                            .with_service_name("benchmarks_telemetry".into())
+                            .with_endpoint(Arc::clone(&ENDPOINT))
+                            .build()
+                            .await?,
+                    );
 
-            let mut rm = ResourceMetrics {
-                resource: self.resource.clone(),
-                scope_metrics: vec![],
-            };
+                    let mut rm = ResourceMetrics {
+                        resource: self.resource.clone(),
+                        scope_metrics: vec![],
+                    };
 
-            self.reader.collect(&mut rm)?;
+                    self.reader.collect(&mut rm)?;
 
-            // Replace the resource from the provider with our potentially deferred resource.
-            // The provider was initialized with an empty resource, but we set the
-            // actual resource later via set_resource() once all attributes are known.
-            rm.resource = self.resource.clone();
+                    // Replace the resource from the provider with our potentially deferred resource.
+                    // The provider was initialized with an empty resource, but we set the
+                    // actual resource later via set_resource() once all attributes are known.
+                    rm.resource = self.resource.clone();
 
-            telemetry_exporter
-                .export(&mut rm)
-                .await
-                .unwrap_or_else(|err| {
-                    println!("Failed to export initial telemetry: {err:?}");
-                });
-        } else {
-            println!("No API key provided, telemetry is disabled");
+                    telemetry_exporter
+                        .export(&mut rm)
+                        .await
+                        .unwrap_or_else(|err| {
+                            println!("Failed to export initial telemetry: {err:?}");
+                        });
+                } else {
+                    println!("No API key provided, telemetry is disabled");
+                }
+            }
+            TelemetryBackend::Otlp(config) => {
+                let mut rm = ResourceMetrics {
+                    resource: self.resource.clone(),
+                    scope_metrics: vec![],
+                };
+                self.reader.collect(&mut rm)?;
+                rm.resource = self.resource.clone();
+
+                let exporter = MetricExporter::builder()
+                    .with_tonic()
+                    .with_timeout(config.timeout)
+                    .with_endpoint(config.endpoint.as_ref())
+                    .build()?;
+                exporter
+                    .export(&mut rm)
+                    .await
+                    .unwrap_or_else(|err| println!("Failed to export OTLP telemetry: {err:?}"));
+            }
         }
 
         Ok(())

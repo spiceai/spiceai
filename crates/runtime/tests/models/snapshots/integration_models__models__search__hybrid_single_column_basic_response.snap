@@ -22,10 +22,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 3 are in 18?"
+        "question": "How many groups of 2 are in 14?"
       },
       "primary_key": {
-        "id": 463
+        "id": 462
       },
       "score": 0.01
     },
@@ -42,10 +42,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "How many groups of 3 are in 18?"
       },
       "primary_key": {
-        "id": 462
+        "id": 463
       },
       "score": 0.01
     }

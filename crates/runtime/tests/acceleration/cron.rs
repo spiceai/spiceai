@@ -71,7 +71,6 @@ async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -154,7 +153,6 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -301,7 +299,6 @@ datasets:
       refresh_cron: \"* * * * * *\" # every minute
 ";
 
-#[expect(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_reload() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -436,7 +433,6 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
 const NAMES_TIMESTAMPED_CSV: &str = include_str!("data/names_timestamped.csv");
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -536,7 +532,6 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_cron_view() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
