@@ -4159,7 +4159,6 @@ dependencies = [
  "url",
  "util",
  "uuid 1.18.1",
- "zip 3.0.0",
 ]
 
 [[package]]
