@@ -261,7 +261,6 @@ impl SpiceObjectStoreRegistry {
     }
 
     // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
-    #[expect(clippy::too_many_lines)]
     fn prepare_azure_object_store(
         &self,
         url: &Url,

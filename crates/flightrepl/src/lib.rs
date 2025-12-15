@@ -233,7 +233,6 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[expect(clippy::too_many_lines)]
 #[expect(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;

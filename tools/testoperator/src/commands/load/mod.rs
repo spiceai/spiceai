@@ -36,7 +36,6 @@ use test_framework::{
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     if args.test_args.common.concurrency < 2 {
         return Err(anyhow::anyhow!(

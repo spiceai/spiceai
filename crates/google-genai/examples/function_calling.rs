@@ -33,7 +33,6 @@ fn get_current_weather(location: &str, unit: Option<&str>) -> String {
     )
 }
 
-#[expect(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key =

@@ -54,6 +54,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Display},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::Arc,
 };
 
@@ -125,7 +126,10 @@ impl fmt::Display for AccelerationOptions {
 }
 
 impl AccelerationOptions {
-    fn to_acceleration(&self) -> Acceleration {
+    /// Converts to Spicepod [`Acceleration`] configuration.
+    ///
+    /// `unique_id` enables accelerations to set unique filepaths, when needed.
+    fn to_acceleration(&self, unique_id: &str) -> Acceleration {
         match self {
             AccelerationOptions::NoAcceleration => Acceleration {
                 enabled: false,
@@ -145,12 +149,20 @@ impl AccelerationOptions {
                 enabled: true,
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
+                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
+                    "duckdb_file_path".to_string(),
+                    format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
+                )]))),
                 ..Default::default()
             },
             AccelerationOptions::Cayenne => Acceleration {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
                 mode: Mode::File,
+                params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
+                    "cayenne_file_path".to_string(),
+                    format!(".spice/data/cayenne_acceleration_{unique_id}/"),
+                )]))),
                 ..Default::default()
             },
         }
@@ -233,11 +245,13 @@ impl EmbeddingModels {
     ignore = "Extended test - run with --features extended_tests"
 )]
 async fn test_megascience_permutations(
-    #[values(VectorEngineOptions::NoVectorEngine)] vector_engine: VectorEngineOptions,
+    #[values(VectorEngineOptions::NoVectorEngine, VectorEngineOptions::S3Vectors)]
+    vector_engine: VectorEngineOptions,
     #[values(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
-        AccelerationOptions::DuckDb
+        AccelerationOptions::DuckDb,
+        AccelerationOptions::DuckDbFile
     )]
     acceleration_opt: AccelerationOptions,
     #[values(
@@ -254,7 +268,8 @@ async fn test_megascience_permutations(
         megascience::ColumnConfigOptions::TextSearch,
         megascience::ColumnConfigOptions::MultiTextColumn,
         megascience::ColumnConfigOptions::TextSearchMetadata,
-        megascience::ColumnConfigOptions::MultiEmbeddings
+        megascience::ColumnConfigOptions::MultiEmbeddings,
+        megascience::ColumnConfigOptions::VectorSearchMetadata
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
@@ -271,16 +286,17 @@ async fn test_megascience_permutations(
     }
 
     let columns = column_config.to_columns();
-    let acceleration = acceleration_opt.to_acceleration();
+
+    // use some hash of slug
+    let mut z = DefaultHasher::new();
+    slug.hash(&mut z);
+    let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
 
     let mut app = AppBuilder::new(slug);
     let (views, datasets) = table_option.to_tables();
 
     // Prepare vector store for AWS tests if needed.
     let mut vector_store = vector_engine.to_vector_store();
-    prepare_for_aws_tests(&vector_store, vector_store.enabled)
-        .await
-        .expect("could not prepare vector store for tests");
 
     // Update vector store params with dynamic values as needed.
     if vector_store.engine.as_deref() == Some("s3_vectors")
@@ -297,6 +313,9 @@ async fn test_megascience_permutations(
             )),
         );
     }
+    prepare_for_aws_tests(&vector_store, vector_store.enabled)
+        .await
+        .expect("could not prepare vector store for tests");
 
     let (views, datasets) = enrich_table(
         SearchTable {
@@ -338,7 +357,7 @@ async fn test_megascience_permutations(
 }
 
 fn validate_combination(
-    _vector_engine: &VectorEngineOptions,
+    vector_engine: &VectorEngineOptions,
     acceleration_opt: &AccelerationOptions,
     table_option: &megascience::TableOptions,
     column_config: &megascience::ColumnConfigOptions,
@@ -354,6 +373,17 @@ fn validate_combination(
     }
     if matches!(&acceleration_opt, AccelerationOptions::NoAcceleration) && column_config.is_fts() {
         return Err("Cannot have hybrid column with no acceleration".to_string());
+    }
+    if matches!(&vector_engine, VectorEngineOptions::S3Vectors)
+        && !matches!(
+            (&table_option, &acceleration_opt),
+            (
+                megascience::TableOptions::Dataset,
+                AccelerationOptions::Arrow | AccelerationOptions::DuckDb
+            )
+        )
+    {
+        return Err("S3 Vectors on reduced set of combinations".to_string());
     }
     Ok(())
 }

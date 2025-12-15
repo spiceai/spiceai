@@ -26,6 +26,7 @@ flight_client = { optional = true, path = "../flight_client" }
 arrow-flight = { optional = true, workspace = true }
 runtime-proto = { optional = true, path = "../runtime-proto" }
 prost = { optional = true, workspace = true }
+futures.workspace = true
 
 # Optional dependencies for feature-gated secret stores
 aws-config = { workspace = true, optional = true }

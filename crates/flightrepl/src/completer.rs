@@ -172,7 +172,6 @@ fn suggest_tables(
 impl Completer for EditorHelper {
     type Candidate = Pair;
 
-    #[expect(clippy::too_many_lines)]
     fn complete(
         &self,
         line: &str,

@@ -423,7 +423,6 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -961,7 +960,6 @@ fn to_delta_kernel_binary_expression(
 }
 
 #[expect(clippy::cast_sign_loss)]
-#[expect(clippy::too_many_lines)]
 fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
     match scalar {
         ScalarValue::Int8(Some(v)) => Some(Scalar::Byte(v)),
@@ -1136,7 +1134,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(clippy::too_many_lines)]
     #[expect(clippy::similar_names)]
     fn test_to_delta_kernel_expr() {
         // Test basic column reference
@@ -1287,7 +1284,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines)]
     fn test_to_delta_kernel_scalar() {
         // Test string scalar
         let scalar = ScalarValue::Utf8(Some("test".to_string()));

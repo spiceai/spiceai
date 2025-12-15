@@ -16,9 +16,14 @@ limitations under the License.
 use super::{Error, Result};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use aws_sdk_dynamodb::types::AttributeValue;
+use snafu::ensure;
 use std::collections::HashMap;
 use std::sync::Arc;
 use util::time_format::{ParsedDateTime, parse_datetime};
+
+/// Maximum recursion depth for nested `DynamoDB` structures.
+/// This limit prevents stack overflow from maliciously crafted deeply nested data.
+const MAX_RECURSION_DEPTH: usize = 100;
 
 pub fn infer_arrow_schema_from_items(
     items: &[HashMap<String, AttributeValue>],
@@ -51,7 +56,7 @@ fn analyze_item(
     time_format: &str,
 ) -> Result<()> {
     for (key, value) in item {
-        let inferred_type = infer_dynamodb_type(value, time_format)?;
+        let inferred_type = infer_dynamodb_type(value, time_format, 0)?;
 
         match field_types.get(key) {
             Some(existing_type) => {
@@ -68,7 +73,18 @@ fn analyze_item(
     Ok(())
 }
 
-fn infer_dynamodb_type(value: &AttributeValue, time_format: &str) -> Result<DataType> {
+fn infer_dynamodb_type(
+    value: &AttributeValue,
+    time_format: &str,
+    depth: usize,
+) -> Result<DataType> {
+    ensure!(
+        depth <= MAX_RECURSION_DEPTH,
+        super::MaxRecursionDepthExceededSnafu {
+            max_depth: MAX_RECURSION_DEPTH
+        }
+    );
+
     Ok(match value {
         AttributeValue::Bool(_) => DataType::Boolean,
         AttributeValue::S(s) => {
@@ -118,15 +134,19 @@ fn infer_dynamodb_type(value: &AttributeValue, time_format: &str) -> Result<Data
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
         }
         AttributeValue::M(map) => {
-            // Represent nested maps as JSON strings
-            infer_struct_type(map, time_format)?
+            // Represent nested maps as structs
+            infer_struct_type(map, time_format, depth)?
         }
         AttributeValue::Null(_) => DataType::Null,
         _ => return Err(Error::UnknownType),
     })
 }
 
-fn infer_struct_type(map: &HashMap<String, AttributeValue>, time_format: &str) -> Result<DataType> {
+fn infer_struct_type(
+    map: &HashMap<String, AttributeValue>,
+    time_format: &str,
+    depth: usize,
+) -> Result<DataType> {
     if map.is_empty() {
         return Ok(DataType::Struct(Fields::empty()));
     }
@@ -134,7 +154,7 @@ fn infer_struct_type(map: &HashMap<String, AttributeValue>, time_format: &str) -
     let mut fields = Vec::new();
 
     for (key, value) in map {
-        let field_type = infer_dynamodb_type(value, time_format)?;
+        let field_type = infer_dynamodb_type(value, time_format, depth + 1)?;
         fields.push(Field::new(key.clone(), field_type, true));
     }
 
@@ -1218,5 +1238,61 @@ mod tests {
             }
             _ => panic!("Expected first level Struct type"),
         }
+    }
+
+    #[test]
+    fn test_max_recursion_depth_exceeded() {
+        // Build a deeply nested structure that exceeds MAX_RECURSION_DEPTH
+        let depth = super::MAX_RECURSION_DEPTH + 10;
+
+        // Start with the innermost map
+        let mut current_map = HashMap::new();
+        current_map.insert("leaf".to_string(), av_string("value"));
+
+        // Wrap it in nested maps
+        for i in 0..depth {
+            let mut outer_map = HashMap::new();
+            outer_map.insert(format!("level_{i}"), AttributeValue::M(current_map));
+            current_map = outer_map;
+        }
+
+        let mut item = HashMap::new();
+        item.insert("nested".to_string(), AttributeValue::M(current_map));
+
+        let items = vec![item];
+        let result = infer_arrow_schema_from_items(&items, "2006-01-02T15:04:05Z07:00");
+
+        // Should fail with MaxRecursionDepthExceeded
+        let err = result.expect_err("expected MaxRecursionDepthExceeded error");
+        assert!(
+            err.to_string().contains("Maximum recursion depth"),
+            "Expected MaxRecursionDepthExceeded error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_within_recursion_depth_limit() {
+        // Build a nested structure within the limit
+        let depth = 50; // Well within MAX_RECURSION_DEPTH of 100
+
+        // Start with the innermost map
+        let mut current_map = HashMap::new();
+        current_map.insert("leaf".to_string(), av_string("value"));
+
+        // Wrap it in nested maps
+        for i in 0..depth {
+            let mut outer_map = HashMap::new();
+            outer_map.insert(format!("level_{i}"), AttributeValue::M(current_map));
+            current_map = outer_map;
+        }
+
+        let mut item = HashMap::new();
+        item.insert("nested".to_string(), AttributeValue::M(current_map));
+
+        let items = vec![item];
+        let result = infer_arrow_schema_from_items(&items, "2006-01-02T15:04:05Z07:00");
+
+        // Should succeed
+        assert!(result.is_ok(), "Expected success for depth {depth}");
     }
 }

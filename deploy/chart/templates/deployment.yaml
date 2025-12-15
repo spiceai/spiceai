@@ -65,9 +65,7 @@ spec:
               "--metrics",
               "0.0.0.0:9090",
               "--flight",
-              "0.0.0.0:50051",
-              "--open_telemetry",
-              "0.0.0.0:50052"
+              "0.0.0.0:50051"
             ]
           env:
             {{- if .Values.additionalEnv }}
@@ -80,8 +78,6 @@ spec:
               name: metrics
             - containerPort: 50051
               name: flight
-            - containerPort: 50052
-              name: otel
           livenessProbe:
             httpGet:
               path: /health
