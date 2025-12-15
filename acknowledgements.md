@@ -6,32 +6,36 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Go Modules
 
+cloud.google.com/go/compute/metadata, https://github.com/googleapis/google-cloud-go/blob/compute/metadata/v0.9.0/compute/metadata/LICENSE, Apache-2.0
 github.com/AzureAD/microsoft-authentication-library-for-go/apps, https://github.com/AzureAD/microsoft-authentication-library-for-go/blob/v1.6.0/LICENSE, MIT
-github.com/apache/arrow-adbc/go/adbc, https://github.com/apache/arrow-adbc/blob/v1.4.0/go/adbc/LICENSE.txt, Apache-2.0
+github.com/apache/arrow-adbc/go/adbc, https://github.com/apache/arrow-adbc/blob/go/adbc/v1.9.0/go/adbc/LICENSE.txt, Apache-2.0
 github.com/apache/arrow-go/v18, https://github.com/apache/arrow-go/blob/v18.4.1/LICENSE.txt, Apache-2.0
-github.com/bradleyjkemp/cupaloy, https://github.com/bradleyjkemp/cupaloy/blob/v2.3.0/LICENCE, MIT
+github.com/bluele/gcache, https://github.com/bluele/gcache/blob/v0.0.2/LICENSE, MIT
 github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/v4.3.0/LICENSE, MIT
+github.com/cenkalti/backoff/v5, https://github.com/cenkalti/backoff/blob/v5.0.3/LICENSE, MIT
+github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/v2.3.0/LICENSE.txt, MIT
 github.com/chzyer/readline, https://github.com/chzyer/readline/blob/2972be24d48e/LICENSE, MIT
-github.com/clipperhouse/displaywidth, https://github.com/clipperhouse/displaywidth/blob/v0.3.1/LICENSE, MIT
+github.com/clipperhouse/displaywidth, https://github.com/clipperhouse/displaywidth/blob/v0.6.0/LICENSE, MIT
 github.com/clipperhouse/stringish, https://github.com/clipperhouse/stringish/blob/v0.1.1/LICENSE, MIT
-github.com/clipperhouse/uax29/v2, https://github.com/clipperhouse/uax29/blob/v2.2.0/LICENSE, MIT
+github.com/clipperhouse/uax29/v2, https://github.com/clipperhouse/uax29/blob/v2.3.0/LICENSE, MIT
 github.com/dustin/go-humanize, https://github.com/dustin/go-humanize/blob/v1.0.1/LICENSE, MIT
 github.com/fatih/color, https://github.com/fatih/color/blob/v1.16.0/LICENSE.md, MIT
 github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/v1.9.0/LICENSE, BSD-3-Clause
-github.com/go-logr/logr, https://github.com/go-logr/logr/blob/v1.4.2/LICENSE, Apache-2.0
+github.com/go-logr/logr, https://github.com/go-logr/logr/blob/v1.4.3/LICENSE, Apache-2.0
 github.com/go-logr/stdr, https://github.com/go-logr/stdr/blob/v1.2.2/LICENSE, Apache-2.0
 github.com/go-viper/mapstructure/v2, https://github.com/go-viper/mapstructure/blob/v2.4.0/LICENSE, MIT
 github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/b87c2d0e983a/LICENSE, MIT
-github.com/goccy/go-json, https://github.com/goccy/go-json/blob/v0.10.3/LICENSE, MIT
+github.com/goccy/go-json, https://github.com/goccy/go-json/blob/v0.10.5/LICENSE, MIT
 github.com/golang-jwt/jwt/v5, https://github.com/golang-jwt/jwt/blob/v5.2.2/LICENSE, MIT
-github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/v24.3.25/LICENSE, Apache-2.0
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/v25.9.23/LICENSE, Apache-2.0
 github.com/google/uuid, https://github.com/google/uuid/blob/v1.6.0/LICENSE, BSD-3-Clause
+github.com/grpc-ecosystem/grpc-gateway/v2, https://github.com/grpc-ecosystem/grpc-gateway/blob/v2.27.3/LICENSE, BSD-3-Clause
 github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/v0.5.2/LICENSE, MPL-2.0
 github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/v0.7.8/LICENSE, MPL-2.0
 github.com/joho/godotenv, https://github.com/joho/godotenv/blob/v1.5.1/LICENCE, MIT
-github.com/klauspost/compress, https://github.com/klauspost/compress/blob/v1.18.1/LICENSE, Apache-2.0
-github.com/klauspost/compress/internal/snapref, https://github.com/klauspost/compress/blob/v1.18.1/internal/snapref/LICENSE, BSD-3-Clause
-github.com/klauspost/compress/zstd/internal/xxhash, https://github.com/klauspost/compress/blob/v1.18.1/zstd/internal/xxhash/LICENSE.txt, MIT
+github.com/klauspost/compress, https://github.com/klauspost/compress/blob/v1.18.2/LICENSE, Apache-2.0
+github.com/klauspost/compress/internal/snapref, https://github.com/klauspost/compress/blob/v1.18.2/internal/snapref/LICENSE, BSD-3-Clause
+github.com/klauspost/compress/zstd/internal/xxhash, https://github.com/klauspost/compress/blob/v1.18.2/zstd/internal/xxhash/LICENSE.txt, MIT
 github.com/kylelemons/godebug, https://github.com/kylelemons/godebug/blob/v1.1.0/LICENSE, Apache-2.0
 github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/v2.0.3/LICENSE, Unlicense
 github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9.0/LICENSE.md, BSD-3-Clause
@@ -40,36 +44,45 @@ github.com/mattn/go-isatty, https://github.com/mattn/go-isatty/blob/v0.0.20/LICE
 github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.19/LICENSE, MIT
 github.com/olekukonko/cat, https://github.com/olekukonko/cat/blob/50322a0618f6/LICENSE, MIT
 github.com/olekukonko/errors, https://github.com/olekukonko/errors/blob/v1.1.0/LICENSE, MIT
-github.com/olekukonko/ll, https://github.com/olekukonko/ll/blob/v0.1.2/LICENSE, MIT
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v1.1.1/LICENSE.md, MIT
+github.com/olekukonko/ll, https://github.com/olekukonko/ll/blob/v0.1.3/LICENSE, MIT
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v1.1.2/LICENSE.md, MIT
 github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.2.4/LICENSE, MIT
 github.com/peterh/liner, https://github.com/peterh/liner/blob/v1.2.2/COPYING, MIT
-github.com/pierrec/lz4/v4, https://github.com/pierrec/lz4/blob/v4.1.21/LICENSE, BSD-3-Clause
+github.com/pierrec/lz4/v4, https://github.com/pierrec/lz4/blob/v4.1.22/LICENSE, BSD-3-Clause
 github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
 github.com/sagikazarmark/locafero, https://github.com/sagikazarmark/locafero/blob/v0.11.0/LICENSE, MIT
 github.com/sourcegraph/conc, https://github.com/sourcegraph/conc/blob/5f936abd7ae8/LICENSE, MIT
 github.com/spf13/afero, https://github.com/spf13/afero/blob/v1.15.0/LICENSE.txt, Apache-2.0
 github.com/spf13/cast, https://github.com/spf13/cast/blob/v1.10.0/LICENSE, MIT
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.10.1/LICENSE.txt, Apache-2.0
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.10.2/LICENSE.txt, Apache-2.0
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.10/LICENSE, BSD-3-Clause
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.21.0/LICENSE, MIT
 github.com/spiceai/gospice/v8, https://github.com/spiceai/gospice/blob/v8.0.0/LICENSE, Apache-2.0
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
 github.com/zeebo/xxh3, https://github.com/zeebo/xxh3/blob/v1.0.2/LICENSE, BSD-2-Clause
-go.opentelemetry.io/otel, https://github.com/open-telemetry/opentelemetry-go/blob/v1.31.0/LICENSE, Apache-2.0
-go.opentelemetry.io/otel/metric, https://github.com/open-telemetry/opentelemetry-go/blob/metric/v1.31.0/metric/LICENSE, Apache-2.0
-go.opentelemetry.io/otel/sdk, https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.31.0/sdk/LICENSE, Apache-2.0
-go.opentelemetry.io/otel/trace, https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.31.0/trace/LICENSE, Apache-2.0
+go.opentelemetry.io/auto/sdk, https://github.com/open-telemetry/opentelemetry-go-instrumentation/blob/sdk/v1.2.1/sdk/LICENSE, Apache-2.0
+go.opentelemetry.io/otel, https://github.com/open-telemetry/opentelemetry-go/blob/v1.39.0/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/exporters/otlp/otlptrace, https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/v1.39.0/exporters/otlp/otlptrace/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc, https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.39.0/exporters/otlp/otlptrace/otlptracegrpc/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp, https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracehttp/v1.39.0/exporters/otlp/otlptrace/otlptracehttp/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/exporters/stdout/stdouttrace, https://github.com/open-telemetry/opentelemetry-go/blob/exporters/stdout/stdouttrace/v1.39.0/exporters/stdout/stdouttrace/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/metric, https://github.com/open-telemetry/opentelemetry-go/blob/metric/v1.39.0/metric/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/sdk, https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.39.0/sdk/LICENSE, Apache-2.0
+go.opentelemetry.io/otel/trace, https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.39.0/trace/LICENSE, Apache-2.0
+go.opentelemetry.io/proto/otlp, https://github.com/open-telemetry/opentelemetry-proto-go/blob/otlp/v1.9.0/otlp/LICENSE, Apache-2.0
 go.yaml.in/yaml/v3, https://github.com/yaml/go-yaml/blob/v3.0.4/LICENSE, MIT
-golang.org/x/exp, https://cs.opensource.google/go/x/exp/+/f66d83c2:LICENSE, BSD-3-Clause
-golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.30.0:LICENSE, BSD-3-Clause
-golang.org/x/net, https://cs.opensource.google/go/x/net/+/v0.46.0:LICENSE, BSD-3-Clause
-golang.org/x/sys, https://cs.opensource.google/go/x/sys/+/v0.38.0:LICENSE, BSD-3-Clause
-golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.30.0:LICENSE, BSD-3-Clause
+golang.org/x/exp, https://cs.opensource.google/go/x/exp/+/8475f288:LICENSE, BSD-3-Clause
+golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.31.0:LICENSE, BSD-3-Clause
+golang.org/x/net, https://cs.opensource.google/go/x/net/+/v0.48.0:LICENSE, BSD-3-Clause
+golang.org/x/oauth2, https://cs.opensource.google/go/x/oauth2/+/v0.34.0:LICENSE, BSD-3-Clause
+golang.org/x/sync/errgroup, https://cs.opensource.google/go/x/sync/+/v0.19.0:LICENSE, BSD-3-Clause
+golang.org/x/sys, https://cs.opensource.google/go/x/sys/+/v0.39.0:LICENSE, BSD-3-Clause
+golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.32.0:LICENSE, BSD-3-Clause
 golang.org/x/xerrors, https://cs.opensource.google/go/x/xerrors/+/7835f813:LICENSE, BSD-3-Clause
-google.golang.org/genproto/googleapis/rpc/status, https://github.com/googleapis/go-genproto/blob/324edc3d5d38/googleapis/rpc/LICENSE, Apache-2.0
-google.golang.org/grpc, https://github.com/grpc/grpc-go/blob/v1.67.1/LICENSE, Apache-2.0
-google.golang.org/protobuf, https://github.com/protocolbuffers/protobuf-go/blob/v1.35.1/LICENSE, BSD-3-Clause
+google.golang.org/genproto/googleapis/api/httpbody, https://github.com/googleapis/go-genproto/blob/ff82c1b0f217/googleapis/api/LICENSE, Apache-2.0
+google.golang.org/genproto/googleapis/rpc, https://github.com/googleapis/go-genproto/blob/ff82c1b0f217/googleapis/rpc/LICENSE, Apache-2.0
+google.golang.org/grpc, https://github.com/grpc/grpc-go/blob/v1.77.0/LICENSE, Apache-2.0
+google.golang.org/protobuf, https://github.com/protocolbuffers/protobuf-go/blob/v1.36.10/LICENSE, BSD-3-Clause
 gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
@@ -161,7 +174,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-sdk-dynamodbstreams 1.91.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-glue 1.131.0, Apache-2.0 
+- aws-sdk-glue 1.132.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - aws-sdk-s3 1.115.0, Apache-2.0 
@@ -404,8 +417,8 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hostname 0.3.1, MIT 
   <br/>https://github.com/svartalf/hostname
 
-- hostname 0.4.1, MIT 
-  <br/>https://github.com/svartalf/hostname
+- hostname 0.4.2, MIT 
+  <br/>https://github.com/djc/hostname
 
 - http 0.2.12, Apache-2.0 OR MIT 
   <br/>https://github.com/hyperium/http
@@ -428,7 +441,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hyper 1.8.1, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper-util 0.1.18, MIT 
+- hyper-util 0.1.19, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
 - iceberg 0.7.0, Apache-2.0 
@@ -737,7 +750,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - spiceai 3.1.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 1.10.0, Apache-2.0 
+- spicepod-validator 1.10.1, Apache-2.0 
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
@@ -769,6 +782,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - tera 1.20.1, MIT 
   <br/>https://github.com/Keats/tera
+
+- test-log 0.2.19, Apache-2.0 OR MIT 
+  <br/>https://github.com/d-e-s-o/test-log.git
 
 - text-embeddings-backend 1.8.2,  
   <br/>
@@ -836,7 +852,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tower-http 0.6.7, MIT 
   <br/>https://github.com/tower-rs/tower-http
 
-- tracing 0.1.41, MIT 
+- tracing 0.1.43, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
 - tracing-futures 0.2.5, MIT 
@@ -884,43 +900,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - vortex 0.1.0, Apache-2.0 
   <br/>https://github.com/spiraldb/vortex
 
-- vortex-alp 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-array 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-bytebool 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
 - vortex-datafusion 0.1.0, Apache-2.0 
   <br/>https://github.com/spiraldb/vortex
 
-- vortex-datetime-parts 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-decimal-byte-parts 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-fastlanes 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-fsst 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-runend 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-sequence 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
 - vortex-session 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-sparse 0.1.0, Apache-2.0 
-  <br/>https://github.com/spiraldb/vortex
-
-- vortex-zigzag 0.1.0, Apache-2.0 
   <br/>https://github.com/spiraldb/vortex
 
 - winver 1.0.0, MIT 
