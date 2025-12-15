@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "cluster")]
-use datafusion::execution::SessionStateBuilder;
 use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
@@ -51,9 +49,10 @@ mod tracker;
 #[cfg(feature = "cluster")]
 use {
     crate::config::ClusterMode,
-    crate::datafusion::builder::default_extension_planners,
+    crate::datafusion::{builder::default_extension_planners, query::Error::UnableToExecuteQuery},
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
+    datafusion::execution::SessionStateBuilder,
     datafusion::physical_planner::DefaultPhysicalPlanner,
     datafusion_proto::protobuf::LogicalPlanNode,
 };
