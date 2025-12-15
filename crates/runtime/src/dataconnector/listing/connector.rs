@@ -854,7 +854,6 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn create_listing_table(
         &self,
         dataset: &Dataset,

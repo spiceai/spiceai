@@ -34,7 +34,6 @@ use regex::Regex;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
-    #[expect(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")

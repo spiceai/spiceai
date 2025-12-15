@@ -770,7 +770,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn retention_sql_fails_with_internal_tables() {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -932,7 +931,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
         let schema = Arc::new(Schema::new(vec![
@@ -1176,7 +1174,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_retention_sql_with_duckdb_accelerator() {
         use tempfile::TempDir;
 

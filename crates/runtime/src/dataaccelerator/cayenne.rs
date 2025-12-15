@@ -616,7 +616,6 @@ impl DataAccelerator for CayenneAccelerator {
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     /// Cayenne supports file mode and can optionally partition data.
-    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,

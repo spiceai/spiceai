@@ -183,7 +183,6 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -453,6 +452,13 @@ async fn start_anonymous_telemetry(
     spicepod_telemetry_config: Option<&TelemetryConfig>,
     spicepod_name: Option<&String>,
 ) {
+    // Always log hardware info at debug level regardless of telemetry settings
+    // Use async version to avoid blocking the async runtime
+    let hardware_info = telemetry::hardware::HardwareInfo::detect_async()
+        .await
+        .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
+    hardware_info.log_debug();
+
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 

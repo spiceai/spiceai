@@ -145,18 +145,16 @@ pub(crate) fn create_api_bindings_config() -> Config {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
     let localhost: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(localhost, http_port))
-        .with_flight_bind_address(SocketAddr::new(localhost, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(localhost, otel_port));
+        .with_flight_bind_address(SocketAddr::new(localhost, flight_port));
 
     tracing::debug!(
-        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
     );
 
     api_config

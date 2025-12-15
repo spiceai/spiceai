@@ -303,7 +303,6 @@ impl Runtime {
         .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn register_loaded_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,

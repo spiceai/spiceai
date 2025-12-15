@@ -180,7 +180,6 @@ pub fn append_value_to_struct_builder(
 }
 
 #[expect(clippy::cast_possible_truncation)]
-#[expect(clippy::too_many_lines)]
 fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,

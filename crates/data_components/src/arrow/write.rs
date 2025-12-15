@@ -528,7 +528,6 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-#[expect(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],

@@ -15645,7 +15645,10 @@ dependencies = [
  "otel-arrow",
  "sha2",
  "snafu",
+ "sysinfo 0.35.2",
+ "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
