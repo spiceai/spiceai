@@ -632,7 +632,7 @@ fn sanitize_cayenne_file_paths(plan: &str) -> String {
                         .count();
                     result.push_str(
                         format!(
-                            r#"file_groups={{{} group: [[{}]]}}"#,
+                            r"file_groups={{{} group: [[{}]]}}",
                             num_files,
                             ["<NORMALIZED_PATH>/.vortex"].repeat(num_files).join(", ")
                         )
