@@ -8731,6 +8731,7 @@ dependencies = [
  "regex",
  "reqwest",
  "reqwest-eventsource",
+ "rstest 0.25.0",
  "runtime-rate-control",
  "schemars 1.1.0",
  "secrecy",
