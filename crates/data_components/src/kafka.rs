@@ -385,8 +385,11 @@ impl KafkaConsumer {
             // Don't automatically store offsets the library provides to us - we will store them after processing explicitly
             // This is what gives us the "at least once" semantics
             .set("enable.auto.offset.store", "false")
-            .set("security.protocol", &kafka_config.security_protocol)
-            .set("sasl.mechanism", &kafka_config.sasl_mechanism);
+            .set("security.protocol", &kafka_config.security_protocol);
+
+        if kafka_config.security_protocol.to_lowercase() != "plaintext" {
+            config.set("sasl.mechanism", &kafka_config.sasl_mechanism);
+        }
 
         if let Some(sasl_username) = &kafka_config.sasl_username {
             config.set("sasl.username", sasl_username);

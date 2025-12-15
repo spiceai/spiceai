@@ -228,6 +228,12 @@ impl DynamoDBTableProvider {
             .items()
             .to_vec();
 
+        if items.is_empty() {
+            return Err(Error::EmptyTable {
+                table_name: table_name.to_string(),
+            });
+        }
+
         let (unnested_items, flattened_fields) = match unnest_depth {
             None => (items, HashSet::new()),
             Some(depth) => unnest_dynamodb_items(items, depth)?,
