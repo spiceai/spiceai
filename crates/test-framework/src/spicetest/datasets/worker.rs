@@ -27,9 +27,12 @@ use dashmap::DashMap;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use spiceai::{Client as SpiceClient, SpiceClientError};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::constants::{HTTP_BASE_URL, SQL_ENDPOINT};
+use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
     metrics::QueryStatus,
@@ -57,6 +60,13 @@ pub(crate) struct SpiceTestQueryWorker {
     reference_schema: Option<String>,
     /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
     skip_row_count_validation: HashSet<String>,
+    /// Whether to validate row counts between HTTP and Flight endpoints, and check for zero rows
+    validate_row_counts: bool,
+    shutdown_token: CancellationToken,
+    /// Optional sender for streaming query metrics to OTLP
+    streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
+    /// Duration threshold - queries exceeding this are marked as failed in streaming metrics
+    query_duration_threshold: Option<Duration>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -117,6 +127,10 @@ impl SpiceTestQueryWorker {
             validation_data: None,
             reference_schema: None,
             skip_row_count_validation: default_row_count_validation_skip_queries(),
+            validate_row_counts: true,
+            shutdown_token: CancellationToken::new(),
+            streaming_metrics_sender: None,
+            query_duration_threshold: None,
         }
     }
 
@@ -135,8 +149,23 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
+    }
+
     pub fn with_validate(mut self, validate: bool) -> Self {
         self.validate = validate;
+        self
+    }
+
+    pub fn with_streaming_metrics(mut self, sender: mpsc::Sender<QueryMetricEvent>) -> Self {
+        self.streaming_metrics_sender = Some(sender);
+        self
+    }
+
+    pub fn with_query_duration_threshold(mut self, threshold: Duration) -> Self {
+        self.query_duration_threshold = Some(threshold);
         self
     }
 
@@ -171,6 +200,34 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_validate_row_counts(mut self, validate_row_counts: bool) -> Self {
+        self.validate_row_counts = validate_row_counts;
+        self
+    }
+
+    /// Send a query metric event to the streaming exporter if configured.
+    /// If a duration threshold is set and the query exceeds it, it will be marked as a timeout failure.
+    fn send_streaming_metric(&self, query_name: &str, duration: Duration, success: bool) {
+        let Some(sender) = &self.streaming_metrics_sender else {
+            return;
+        };
+
+        // Check if duration exceeds threshold - if so, mark as timeout failure
+        let exceeded_threshold =
+            success && self.query_duration_threshold.is_some_and(|t| duration > t);
+
+        let event = if exceeded_threshold {
+            QueryMetricEvent::with_failure(query_name.to_string(), duration, self.id, "timeout")
+        } else if success {
+            QueryMetricEvent::new(query_name.to_string(), duration, true, self.id)
+        } else {
+            QueryMetricEvent::with_failure(query_name.to_string(), duration, self.id, "error")
+        };
+
+        // Non-blocking send - if channel is full, we drop the metric
+        let _ = sender.try_send(event);
+    }
+
     /// Validate query results against expected data
     /// Uses TPCH validation for TPCH queries, custom validation data for scenario queries
     fn validate_query_results(
@@ -193,7 +250,6 @@ impl SpiceTestQueryWorker {
         validation::validate_tpch_query(query, actual_batches)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
@@ -208,9 +264,11 @@ impl SpiceTestQueryWorker {
             let start = Instant::now();
 
             match self.end_condition {
-                EndCondition::Duration(_) => {
-                    // For Duration-based end condition, keep running queries in sequence
-                    while !self.end_condition.is_met(&start, query_set_count) {
+                EndCondition::Duration(_) | EndCondition::Unlimited => {
+                    // For Duration-based or Unlimited end condition, keep running queries in sequence
+                    while !self.shutdown_token.is_cancelled()
+                        && !self.end_condition.is_met(&start, query_set_count)
+                    {
                         if self.progress_bar.is_none() && self.id == 0 {
                             println!(
                                 "Worker {} - Query set count: {} - Elapsed time: {:?}",
@@ -243,6 +301,9 @@ impl SpiceTestQueryWorker {
                     // For QuerySetCompleted, run each query target_count times before moving to next
                     let start = SystemTime::now();
                     for query in &self.query_set {
+                        if self.shutdown_token.is_cancelled() {
+                            break;
+                        }
                         if self.validate && query.name.contains("simple") {
                             continue; // skip validation for simple TPCH queries, because they are not part of the spec
                         }
@@ -466,7 +527,6 @@ impl SpiceTestQueryWorker {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute_flight(
         &self,
         query: &Query,
@@ -499,6 +559,9 @@ impl SpiceTestQueryWorker {
                         limited_records.clear();
                         validation_records.clear();
                     } else {
+                        let duration = query_start.elapsed();
+                        // Send streaming metric for failed Flight query
+                        self.send_streaming_metric(&query.name, duration, false);
                         eprintln!(
                             "{} FAIL - Worker {} - Query '{}' failed: {}",
                             chrono::Utc::now(),
@@ -666,6 +729,9 @@ impl SpiceTestQueryWorker {
 
         let duration = query_start.elapsed();
 
+        // Send streaming metric for real-time OTLP export
+        self.send_streaming_metric(&query.name, duration, true);
+
         query_durations
             .entry(Arc::clone(&query.name))
             .or_default()
@@ -722,7 +788,7 @@ impl SpiceTestQueryWorker {
                     .get("row_count")
                     .and_then(serde_json::Value::as_u64)
                 {
-                    #[allow(clippy::cast_possible_truncation)]
+                    #[expect(clippy::cast_possible_truncation)]
                     let row_count_usize = row_count as usize;
                     http_row_counts
                         .entry(Arc::clone(&query.name))
@@ -772,10 +838,11 @@ impl SpiceTestQueryWorker {
         )
         .await?;
 
-        // skip row count validation for specific queries that legitimately return 0 rows
-        if self
-            .skip_row_count_validation
-            .contains(&query.name.to_string())
+        // Skip row count validation if disabled or for specific queries that legitimately return 0 rows
+        if !self.validate_row_counts
+            || self
+                .skip_row_count_validation
+                .contains(&query.name.to_string())
         {
             return Ok(());
         }

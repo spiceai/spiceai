@@ -161,13 +161,13 @@ impl Default for FibonacciBackoffBuilder {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn duration_to_nanos(d: Duration) -> f64 {
     d.as_secs() as f64 * 1_000_000_000.0 + f64::from(d.subsec_nanos())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 fn nanos_to_duration(nanos: f64) -> Duration {
     let secs = nanos / 1_000_000_000.0;
     let nanos = nanos as u64 % 1_000_000_000;

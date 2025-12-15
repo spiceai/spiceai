@@ -622,7 +622,7 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 		// Check cache status header
 		cacheStatus := resp.Header.Get("Search-Results-Cache-Status")
 		cachedStr := ""
-		if cacheStatus == "HIT" {
+		if cacheStatus == "HIT" || cacheStatus == "STALE" {
 			cachedStr = " (cached)"
 		}
 

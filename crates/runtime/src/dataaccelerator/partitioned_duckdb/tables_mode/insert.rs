@@ -35,7 +35,7 @@ use datafusion_optimizer_rules::pass_thru::PassThruExec;
 use datafusion_table_providers::{
     duckdb::{TableDefinition, write_settings::DuckDBWriteSettings},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-    util::on_conflict::OnConflict,
+    util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
 use futures::StreamExt;
 use runtime_table_partition::{
@@ -57,6 +57,7 @@ pub struct DuckDBPartitionedInsertStrategy {
     pool: Arc<DuckDbConnectionPool>,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
     write_settings: DuckDBWriteSettings,
     partition_buffer_config: PartitionBufferConfig,
 }
@@ -67,6 +68,7 @@ impl DuckDBPartitionedInsertStrategy {
         pool: Arc<DuckDbConnectionPool>,
         table_definition: Arc<TableDefinition>,
         on_conflict: Option<OnConflict>,
+        upsert_options: UpsertOptions,
         source: &dyn AccelerationSource,
     ) -> Self {
         let write_settings = if let Some(acceleration) = source.acceleration() {
@@ -93,6 +95,7 @@ impl DuckDBPartitionedInsertStrategy {
             pool,
             table_definition,
             on_conflict,
+            upsert_options,
             write_settings,
             partition_buffer_config,
         }
@@ -198,6 +201,7 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             Arc::clone(&self.table_definition),
             insert_op,
             self.on_conflict.clone(),
+            self.upsert_options.clone(),
             schema,
             partitioner,
         )

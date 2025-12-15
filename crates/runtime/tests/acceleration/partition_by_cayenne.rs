@@ -125,6 +125,8 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            // Keep a per-test metadata DB to avoid SQLite contention with other concurrent Cayenne tests.
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -138,6 +140,10 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             params.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            params.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
 
             dataset.acceleration = Some(Acceleration {
@@ -259,6 +265,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -273,6 +280,10 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = spicepod::param::Params::from_string_map(param_map);
 
@@ -383,7 +394,6 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 /// 4. Data with NULL partition values can be queried correctly
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -398,6 +408,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -411,6 +422,10 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = Params::from_string_map(param_map);
 
@@ -536,7 +551,6 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
 /// This test verifies NULL handling specifically for numeric partition columns
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-#[allow(clippy::too_many_lines)]
 async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
@@ -551,6 +565,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -564,6 +579,10 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = Params::from_string_map(param_map);
 
@@ -704,6 +723,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             let temp_dir = tempfile::tempdir()
                 .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {e}"))?;
             let cayenne_path = temp_dir.path().to_path_buf();
+            let metadata_dir = temp_dir.path().join("metadata");
 
             crate::configure_test_datafusion();
 
@@ -717,6 +737,10 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             param_map.insert(
                 "cayenne_file_path".to_string(),
                 cayenne_path.display().to_string(),
+            );
+            param_map.insert(
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
             );
             let acceleration_params = Params::from_string_map(param_map);
 

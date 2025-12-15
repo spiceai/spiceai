@@ -67,7 +67,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
     }
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()> {
-        if let Ok(()) = self.inner.try_encode(node, buf) {
+        if matches!(self.inner.try_encode(node, buf), Ok(())) {
             return Ok(());
         }
 

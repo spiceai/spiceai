@@ -437,7 +437,10 @@ mod test {
 
         let monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
 
-        assert!(monitor.register_dataset(&dataset).await.is_ok());
+        monitor
+            .register_dataset(&dataset)
+            .await
+            .expect("should register dataset");
 
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }

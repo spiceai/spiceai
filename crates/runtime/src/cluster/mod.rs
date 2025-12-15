@@ -1,4 +1,5 @@
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
+use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
@@ -28,11 +29,12 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
-use datafusion_optimizer_rules::physical_plan::cluster::datafusion_and_cluster_physical_optimizers;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::TryFutureExt;
+use prost::Message;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
+use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::env;
@@ -62,7 +64,6 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
-#[allow(clippy::too_many_lines)]
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
@@ -129,11 +130,17 @@ pub async fn initialize_cluster_executor(
         });
     };
 
+    let Ok(hostname) = gethostname::gethostname().into_string() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to determine executor hostname".to_string().into(),
+        });
+    };
+
     let executor_id = Uuid::new_v4().to_string();
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service
-        host: Some(bind_addr.ip().to_string()),
+        host: Some(hostname),
         port: u32::from(bind_addr.port()),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,
@@ -167,14 +174,6 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    // Bind app manifest to runtime
-    executor_bind_app(
-        &rt,
-        rt.config.cluster.scheduler_url.to_string(),
-        executor_id,
-    )
-    .await?;
-
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
 
     let executor_poll_loop = tokio::spawn(
@@ -191,7 +190,17 @@ pub async fn initialize_cluster_executor(
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
         rt.status.update_cluster("executor", ComponentStatus::Ready);
+
+        // Initialize secrets first so they're available for object store configuration
+        executor_bind_app(
+            &rt,
+            rt.config.cluster.scheduler_url.to_string(),
+            executor_id,
+        )
+        .await?;
+
         executor_bind_object_stores(Arc::clone(&rt)).await?;
+
         executor_poll_loop
             .await
             .boxed()
@@ -228,7 +237,7 @@ async fn create_scheduler_server(
                 .with_option_extension(SpiceClusterConfig::default());
 
             Ok(
-                SessionStateBuilder::new_from_existing(current_context.as_ref().state().clone())
+                SessionStateBuilder::new_from_existing(current_context.as_ref().state())
                     .with_config(cfg)
                     .with_runtime_env(default_runtime_env(io_runtime.clone()))
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
@@ -273,9 +282,13 @@ async fn executor_bind_app(
     .boxed()
     .context(FailedToStartClusterExecutorSnafu)?;
 
+    let app_definition_request = GetAppDefinitionRequest {
+        executor_id: executor_id.clone(),
+    };
+
     let action = arrow_flight::Action {
         r#type: "GetAppDefinition".to_string(),
-        body: bytes::Bytes::new(),
+        body: bytes::Bytes::from(app_definition_request.encode_to_vec()),
     };
 
     let response = flight_client

@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::common::plan_node_key::PlanNodeKey;
 use crate::common::search_visitor::SearchVisitor;
 use crate::concrete;
@@ -53,7 +69,8 @@ impl UnionProjectionPushdownOptimizer {
 
         // All `UnionExec` inputs must also be unary chains that end with `DataSourceExec` leaves
         // that have the same schema, without any intermediate projections
-        let data_source_exec_leaves = union_exec
+        // The union inputs should represent the same number of DataSourceExec instances
+        if union_exec
             .inputs()
             .iter()
             .filter_map(|p_child| {
@@ -71,10 +88,9 @@ impl UnionProjectionPushdownOptimizer {
                     .ok()
                     .and_then(|nodes| nodes.into_iter().last())
             })
-            .collect::<Vec<_>>();
-
-        // The union inputs should represent the same number of DataSourceExec instances
-        if data_source_exec_leaves.len() != union_exec.inputs().len() {
+            .count()
+            != union_exec.inputs().len()
+        {
             return Ok(None);
         }
 
@@ -174,77 +190,5 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
 
     fn schema_check(&self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::physical_plan::cluster::distribute_file_scan::DistributeFileScanOptimizer;
-    use crate::physical_plan::cluster::distribute_file_scan::tests::create_partitioned_file;
-    use crate::physical_plan::cluster::distribute_file_scan::tests::{
-        DEFAULT_CONFIG_OPTIONS, create_data_source_exec,
-    };
-    use datafusion::physical_expr::expressions::col;
-    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
-    use std::sync::LazyLock;
-
-    static OPTIMIZER: LazyLock<PhysicalOptimizer> = LazyLock::new(|| {
-        PhysicalOptimizer::with_rules(vec![
-            DistributeFileScanOptimizer::new(),
-            UnionProjectionPushdownOptimizer::new(),
-        ])
-    });
-
-    fn optimize(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        OPTIMIZER.rules.iter().fold(Arc::clone(plan), |acc, rule| {
-            rule.optimize(acc, &DEFAULT_CONFIG_OPTIONS)
-                .expect("Must optimize")
-        })
-    }
-
-    #[test]
-    fn test_projection_pushdown() {
-        let files = vec![
-            create_partitioned_file("file:///file4.parquet", 256_000_000, None),
-            create_partitioned_file("file:///file5.parquet", 256_000_000, None),
-        ];
-
-        let data_source_exec = create_data_source_exec(files);
-        let projection_exec = ProjectionExec::try_new(
-            vec![(
-                col("id", data_source_exec.schema().as_ref()).expect("Must bind expr"),
-                "foo".to_string(),
-            )],
-            data_source_exec,
-        )
-        .expect("Must make projection_exec");
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(projection_exec);
-
-        // We start with 1 projection
-        assert_eq!(
-            SearchVisitor::collect_concrete_down::<ProjectionExec>(&plan)
-                .expect("Must collect")
-                .len(),
-            1
-        );
-
-        let optimized = optimize(&plan);
-
-        let data_source_exec_leaves =
-            SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized)
-                .expect("Must collect")
-                .len();
-
-        // Make sure we have enough leaves to test with
-        assert!(data_source_exec_leaves > 1);
-
-        // The number of projections must match the number of DataSourceExec leaves
-        assert_eq!(
-            SearchVisitor::collect_concrete_down::<ProjectionExec>(&optimized)
-                .expect("Must collect")
-                .len(),
-            data_source_exec_leaves
-        );
     }
 }

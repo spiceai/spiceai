@@ -138,7 +138,7 @@ pub enum HashBuilder {
 }
 
 impl std::hash::BuildHasher for HashBuilder {
-    type Hasher = Box<dyn Hasher>;
+    type Hasher = Box<dyn Hasher + Send + Sync + 'static>;
 
     fn build_hasher(&self) -> Self::Hasher {
         match self {
@@ -223,7 +223,7 @@ mod xxhash_compat {
     }
 
     impl Hasher for XxHash3_128Wrapper {
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         fn finish(&self) -> u64 {
             let hasher_copy = self.hasher.clone();
             let hash128 = hasher_copy.finish_128();
@@ -382,7 +382,12 @@ impl QueryResultsCacheProvider {
         // Cache TTL should be the base TTL plus the stale-while-revalidate window
         // so entries aren't evicted before they can be served as stale
         let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
-        let cache = Arc::new(LruCache::new(cache_max_size, cache_ttl, hash_builder));
+        let cache = Arc::new(LruCache::new(
+            cache_max_size,
+            cache_ttl,
+            hash_builder,
+            config.caching_policy,
+        ));
 
         let encoder = encoding::get_encoder(config.encoding);
 

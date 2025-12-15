@@ -267,7 +267,7 @@ impl AsyncScalarUDFImpl for Ai {
 
         // Emit timing metrics for explain analyze
         let elapsed = start_time.elapsed();
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let elapsed_compute_ns = elapsed.as_nanos() as u64;
 
         // Log metrics in a format consistent with DataFusion explain analyze
@@ -362,7 +362,7 @@ impl Ai {
         let model_call_elapsed = model_call_start.elapsed();
 
         // Emit per-row timing metrics for explain analyze
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let elapsed_ns = model_call_elapsed.as_nanos() as u64;
         tracing::debug!(
             target: "datafusion::physical_plan::metrics",
@@ -483,7 +483,8 @@ impl Ai {
             results.into_iter().map(|(_, result)| result).collect();
 
         // debug assertion only
-        #[allow(clippy::disallowed_macros)]
+        #[expect(clippy::disallowed_macros, clippy::allow_attributes)]
+        #[allow(unfulfilled_lint_expectations)]
         {
             debug_assert_eq!(
                 ordered_results.len(),
@@ -499,11 +500,7 @@ impl Ai {
 #[cfg(test)]
 // Allow various lints in test code for simplicity and readability.
 // Test code prioritizes clarity over strict lint compliance.
-#[allow(
-    clippy::clone_on_ref_ptr,
-    clippy::uninlined_format_args,
-    clippy::too_many_lines
-)]
+#[expect(clippy::clone_on_ref_ptr, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
@@ -608,7 +605,7 @@ mod tests {
                     message: ChatCompletionResponseMessage {
                         content: Some(response_text),
                         role: Role::Assistant,
-                        #[allow(deprecated)]
+                        #[expect(deprecated)]
                         function_call: None,
                         tool_calls: None,
                         refusal: None,
@@ -856,7 +853,7 @@ mod tests {
                             role: Some(Role::Assistant),
                             tool_calls: None,
                             refusal: None,
-                            #[allow(deprecated)]
+                            #[expect(deprecated)]
                             function_call: None,
                         },
                         finish_reason: None,
@@ -903,7 +900,7 @@ mod tests {
                     message: ChatCompletionResponseMessage {
                         content: None, // This represents a null/empty response
                         role: Role::Assistant,
-                        #[allow(deprecated)]
+                        #[expect(deprecated)]
                         function_call: None,
                         tool_calls: None,
                         refusal: None,
@@ -1416,7 +1413,7 @@ mod tests {
                                 role: Some(Role::Assistant),
                                 tool_calls: None,
                                 refusal: None,
-                                #[allow(deprecated)]
+                                #[expect(deprecated)]
                                 function_call: None,
                             },
                             finish_reason: None,

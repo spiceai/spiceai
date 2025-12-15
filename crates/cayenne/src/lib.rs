@@ -58,9 +58,10 @@ pub mod cayenne_catalog;
 pub mod deletion;
 pub mod metadata;
 pub mod metastore;
+pub mod optimizer_rules;
 pub mod provider;
 
 pub use catalog::MetadataCatalog;
 pub use cayenne_catalog::CayenneCatalog;
-pub use metadata::{DataFile, DeleteFile, PartitionMetadata, PartitionStats, TableMetadata};
+pub use metadata::{DataFile, DeleteFile, PartitionMetadata, TableMetadata};
 pub use provider::CayenneTableProvider;

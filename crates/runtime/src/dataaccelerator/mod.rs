@@ -28,33 +28,16 @@ use datafusion::{
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
+    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
+use linkme::distributed_slice;
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-
-use self::arrow::ArrowAccelerator;
-
-#[cfg(not(windows))]
-use self::cayenne::CayenneAccelerator;
-#[cfg(feature = "duckdb")]
-use self::duckdb::DuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::tables_mode::TablesModePartitionedDuckDBAccelerator;
-#[cfg(feature = "postgres")]
-use self::postgres::PostgresAccelerator;
-#[cfg(feature = "sqlite")]
-use self::sqlite::SqliteAccelerator;
-#[cfg(feature = "turso")]
-use self::turso::TursoAccelerator;
 
 pub mod arrow;
 #[cfg(not(windows))]
@@ -72,8 +55,78 @@ pub mod turso;
 
 mod snapshots;
 pub mod spice_sys;
+pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
+
+#[derive(Clone, Copy)]
+pub struct AcceleratorRegistration {
+    pub engine: Engine,
+    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+}
+
+impl AcceleratorRegistration {
+    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+        Self {
+            engine,
+            constructor,
+        }
+    }
+}
+
+/// Distributed slice that automatically collects all data accelerator registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_accelerator!`] macro.
+#[distributed_slice]
+pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
+
+/// Registers a data accelerator for a given engine.
+///
+/// This macro creates a constructor function for the specified accelerator type and
+/// registers it in the global distributed slice of data accelerators. This allows
+/// the runtime to discover and instantiate accelerators for supported engines.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_accelerator!(Engine::Foo, FooAccelerator);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_accelerator!(
+///     my_accel_fn,
+///     MY_ACCEL_STATIC,
+///     Engine::Bar,
+///     BarAccelerator
+/// );
+/// ```
+///
+/// Using this macro automatically adds the accelerator to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_accelerator {
+    ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataaccelerator::DataAccelerator> {
+            ::std::sync::Arc::new(<$accelerator>::new())
+        }
+
+        #[linkme::distributed_slice($crate::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataaccelerator::AcceleratorRegistration =
+            $crate::dataaccelerator::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    ($engine:expr, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $accelerator
+            );
+        }
+    };
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -141,35 +194,10 @@ impl AcceleratorEngineRegistry {
     }
 
     pub(crate) async fn register_all(&self) {
-        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::PartitionedDuckDB,
-            Arc::new(PartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::TableModePartitionedDuckDB,
-            Arc::new(TablesModePartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "postgres")]
-        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
-            .await;
-        #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
-            .await;
-        #[cfg(feature = "turso")]
-        self.register_accelerator_engine(Engine::Turso, Arc::new(TursoAccelerator::new()))
-            .await;
-        #[cfg(not(windows))]
-        self.register_accelerator_engine(Engine::Cayenne, Arc::new(CayenneAccelerator::new()))
-            .await;
+        for registration in DATA_ACCELERATOR_REGISTRATIONS {
+            self.register_accelerator_engine(registration.engine, (registration.constructor)())
+                .await;
+        }
     }
 
     pub async fn unregister_all(&self) {
@@ -177,7 +205,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -246,16 +274,14 @@ impl AcceleratorEngineRegistry {
         .indexes(acceleration_settings.indexes.clone());
 
         // If there are constraints from the federated table, then add them to the accelerated table
-        // and automatically configure upsert behavior for them. This can be overridden by the user.
+        // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
         if let Some(constraints) = constraints
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
             let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                ColumnReference::new(primary_keys),
-                UpsertOptions::default(),
-            ));
+            external_table_builder = external_table_builder
+                .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
         }
 
         if let Some(on_conflict) =
@@ -268,6 +294,10 @@ impl AcceleratorEngineRegistry {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
         }
 
+        // Pass UpsertOptions for constraint validation behavior
+        external_table_builder =
+            external_table_builder.upsert_options(acceleration_settings.upsert_options());
+
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
                 if !constraints.is_empty() {
@@ -279,11 +309,9 @@ impl AcceleratorEngineRegistry {
                         let primary_keys: Vec<String> =
                             get_primary_keys_from_constraints(&constraints, &schema);
                         if !primary_keys.is_empty() {
-                            external_table_builder =
-                                external_table_builder.on_conflict(OnConflict::Upsert(
-                                    ColumnReference::new(primary_keys),
-                                    UpsertOptions::default(),
-                                ));
+                            external_table_builder = external_table_builder.on_conflict(
+                                OnConflict::Upsert(ColumnReference::new(primary_keys)),
+                            );
                         }
                     }
                 }
@@ -406,6 +434,7 @@ pub struct AcceleratorExternalTableBuilder {
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -420,6 +449,7 @@ impl AcceleratorExternalTableBuilder {
             indexes: HashMap::new(),
             constraints: None,
             on_conflict: None,
+            upsert_options: UpsertOptions::default(),
         }
     }
 
@@ -450,6 +480,12 @@ impl AcceleratorExternalTableBuilder {
     #[must_use]
     pub fn constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = Some(constraints);
+        self
+    }
+
+    #[must_use]
+    pub fn upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
+        self.upsert_options = upsert_options;
         self
     }
 
@@ -496,7 +532,21 @@ impl AcceleratorExternalTableBuilder {
         }
 
         if let Some(on_conflict) = self.on_conflict {
-            options.insert("on_conflict".to_string(), on_conflict.to_string());
+            let on_conflict_str = on_conflict.to_string();
+            tracing::debug!("Adding on_conflict to options: {}", on_conflict_str);
+            options.insert("on_conflict".to_string(), on_conflict_str);
+        }
+
+        // Pass upsert_options as JSON serialized string
+        if self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins {
+            options.insert(
+                "upsert_remove_duplicates".to_string(),
+                self.upsert_options.remove_duplicates.to_string(),
+            );
+            options.insert(
+                "upsert_last_write_wins".to_string(),
+                self.upsert_options.last_write_wins.to_string(),
+            );
         }
 
         let constraints = match self.constraints {
@@ -729,7 +779,7 @@ mod test {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::redundant_closure_for_method_calls,
     clippy::uninlined_format_args,
     clippy::bool_assert_comparison,
@@ -1854,7 +1904,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_basic_insert_and_query() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
@@ -1876,7 +1926,10 @@ mod accelerator_compat_tests {
             assert_eq!(total_rows, 100, "{:?}: should have {} rows", engine, 100);
 
             // Test 2: Filter with WHERE clause (id > 50)
-            // Note: Arrow and Vortex engines don't support filter pushdown, so they return all rows
+            // Note: Arrow and Vortex engines don't support filter pushdown at the TableProvider
+            // level (via scan() method). Vortex supports filter pushdown at the physical plan
+            // level via DataFusion's FilterPushdown optimizer rule, but that only applies when
+            // running SQL queries, not when calling scan() directly.
             let filter = col("id").gt(lit(50_i64));
             let scan = table
                 .scan(&ctx.state(), None, &[filter], None)
@@ -1910,7 +1963,8 @@ mod accelerator_compat_tests {
             );
 
             // Test 4: LIMIT clause
-            // Note: Arrow and Vortex engines don't support limit pushdown
+            // Note: Arrow doesn't support limit pushdown. Vortex supports limit pushdown via
+            // FileScanConfig.limit at the TableProvider level when scan() is called with a limit.
             let limit = Some(10);
             let scan = table
                 .scan(&ctx.state(), None, &[], limit)
@@ -1930,7 +1984,9 @@ mod accelerator_compat_tests {
             }
 
             // Test 5: Combined filter + projection + limit
-            // Note: Arrow and Vortex engines don't support filter/limit pushdown
+            // Note: Arrow doesn't support filter/limit pushdown at the TableProvider level.
+            // Vortex supports limit pushdown via FileScanConfig.limit but filter pushdown
+            // only works via DataFusion's physical optimizer (when running SQL queries).
             let filter = col("id").lt(lit(30_i64));
             let projection = Some(vec![1_usize]); // name only
             let limit = Some(5);
@@ -1978,7 +2034,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_delete_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
@@ -2378,7 +2434,9 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            // (when calling scan() directly). Filter pushdown for Vortex only works via
+            // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
@@ -2404,7 +2462,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2428,7 +2486,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2454,7 +2512,7 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
             let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
@@ -2602,9 +2660,10 @@ mod accelerator_compat_tests {
                 .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow doesn't support filter or limit pushdown, so it returns all rows
-            // Vortex doesn't support filter pushdown but does support limit pushdown
-            // DuckDB supports both filter and limit pushdown
+            // Arrow doesn't support filter or limit pushdown at the TableProvider level
+            // Vortex doesn't support filter pushdown at TableProvider level (only via physical
+            // optimizer when running SQL), but does support limit pushdown via FileScanConfig.limit
+            // DuckDB supports both filter and limit pushdown at TableProvider level
             if engine == Engine::Arrow {
                 // No pushdown - returns all 10 rows
                 assert_eq!(
@@ -2767,7 +2826,7 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_overwrite_operations() {
         run_compat_test(|engine, table, _mode, _test_env| async move {
             // Turso/SQLite doesn't support INSERT OVERWRITE in the same way - it appends instead

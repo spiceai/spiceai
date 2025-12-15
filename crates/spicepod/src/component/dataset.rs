@@ -190,6 +190,14 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn with_params(self, params: Params) -> Self {
+        Self {
+            params: Some(params),
+            ..self
+        }
+    }
+
+    #[must_use]
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
@@ -345,7 +353,7 @@ struct DatasetDeserializer {
     check_availability: CheckAvailability,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
 
@@ -437,7 +445,6 @@ mod check_availability_tests {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_yaml;

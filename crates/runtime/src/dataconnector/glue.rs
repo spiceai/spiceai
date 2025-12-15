@@ -37,6 +37,7 @@ use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 use crate::{
     component::dataset::Dataset,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 use super::{
@@ -289,6 +290,8 @@ impl DataConnector for GlueDataConnector {
     }
 }
 
+register_data_connector!("glue", GlueDataConnectorFactory);
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {
     // Avro,
@@ -423,6 +426,11 @@ async fn create_iceberg_provider(
         props.insert(AWS_SESSION_TOKEN.to_string(), session_token.to_string());
         props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
     }
+
+    // Disable OpenDAL's automatic credential loading from environment variables and config files.
+    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
+    // or other credentials from the environment that may not be valid for this specific connection.
+    props.insert("s3.disable-config-load".to_string(), "true".to_string());
 
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),

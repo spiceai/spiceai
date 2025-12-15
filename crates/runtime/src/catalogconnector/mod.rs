@@ -219,7 +219,7 @@ pub trait CatalogConnector: Send + Sync {
 
     /// Returns whether the catalog connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
     }
 }
 

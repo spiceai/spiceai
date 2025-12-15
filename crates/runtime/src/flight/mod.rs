@@ -18,7 +18,7 @@ limitations under the License.
 use {
     crate::config::ClusterMode,
     ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
+    ballista_executor::flight_service::BallistaFlightService, std::net::ToSocketAddrs,
 };
 
 use crate::auth::EndpointAuth;
@@ -26,6 +26,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
+use crate::opentelemetry::create_metrics_service;
 use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
@@ -202,7 +203,7 @@ impl Service {
         query.get_schema().await.map_err(handle_datafusion_error)
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()
@@ -302,7 +303,6 @@ fn record_batches_to_flight_stream(
         .map_err(to_tonic_err)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn to_tonic_err<E>(e: E) -> Status
 where
     E: std::fmt::Display + 'static,
@@ -323,7 +323,6 @@ fn handle_query_error(e: query::Error) -> Status {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn handle_datafusion_error(e: DataFusionError) -> Status {
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
@@ -486,7 +485,9 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
-    #[allow(unused_mut)]
+    // Create the OpenTelemetry MetricsService
+    let otel_service = create_metrics_service(rt.datafusion());
+
     let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion(), rt.secrets()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
@@ -495,7 +496,9 @@ pub async fn start(
         .layer(auth_layer);
 
     #[cfg(not(feature = "cluster"))]
-    let server = server.add_service(spice_flight_service);
+    let server = server
+        .add_service(spice_flight_service)
+        .add_service(otel_service);
 
     #[cfg(feature = "cluster")]
     let server = match rt.config.cluster.mode {
@@ -514,36 +517,49 @@ pub async fn start(
             server
                 .add_service(spice_flight_service)
                 .add_service(scheduler_grpc_server)
+                .add_service(otel_service)
         }
         Some(ClusterMode::Executor) => {
             let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
                 .max_decoding_message_size(usize::MAX)
                 .max_encoding_message_size(usize::MAX);
 
-            server.add_service(executor_flight)
+            server
+                .add_service(executor_flight)
+                .add_service(otel_service)
         }
-        _ => server.add_service(spice_flight_service),
+        _ => server
+            .add_service(spice_flight_service)
+            .add_service(otel_service),
     };
 
     // If running an executor, we may have resolved another port to bind if 50051 is taken
+    // Cast truncation for port is OK: was originally widened to u32 because it's a u32 in
+    // Ballista `ExecutorRegistration`
+    #[expect(clippy::cast_possible_truncation)]
     #[cfg(feature = "cluster")]
-    let bind_address: SocketAddr = if let Some((host, port)) =
-        rt.df.executor.read().ok().and_then(|maybe_executor| {
+    let bind_address = rt
+        .df
+        .executor
+        .read()
+        .ok()
+        .and_then(|maybe_executor| {
             maybe_executor
                 .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
-        }) {
-        if let Ok(addr) = format!("{host}:{port}").parse() {
-            addr
-        } else {
-            tracing::warn!(
-                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
-            );
-            bind_address
-        }
-    } else {
-        bind_address
-    };
+                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
+        })
+        .and_then(|spec| {
+            let (host, port) = &spec;
+            tokio::task::block_in_place(|| match spec.to_socket_addrs() {
+                Ok(sa) => Some(sa),
+                Err(e) => {
+                    tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
+                    None
+                }
+            })
+        })
+        .and_then(|mut addrs| addrs.next())
+        .unwrap_or(bind_address);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);

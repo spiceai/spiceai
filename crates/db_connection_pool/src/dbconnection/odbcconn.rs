@@ -125,11 +125,26 @@ impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self {
-        ODBCConnection {
-            conn: Arc::new(conn.into()),
-            params: Arc::new(HashMap::new()),
-        }
+    fn new(_: Connection<'a>) -> Self {
+        unimplemented!(
+            "ODBCConnection::new() is not used; use the constructor with parameters instead"
+        )
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "ODBC tables() requires driver-specific implementation".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetSchemas {
+            source: "ODBC schemas() requires driver-specific implementation".into(),
+        })
     }
 
     async fn get_schema(
@@ -197,7 +212,7 @@ where
             let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
-            let mut statement = prepared.into_statement();
+            let mut statement = prepared.into_handle();
 
             bind_parameters(&mut statement, &params)?;
 
@@ -266,7 +281,7 @@ where
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
-        let mut statement = prepared.into_statement();
+        let mut statement = prepared.into_handle();
 
         bind_parameters(&mut statement, params)?;
 
@@ -388,7 +403,7 @@ mod tests {
         let mut statement = driver_cxn
             .prepare("select * from (select 'hopper' as name, 100 as age) as cats where name = ? and age = ?")
             .expect("Must prepare")
-            .into_statement();
+            .into_handle();
 
         let params: Vec<Box<dyn ODBCSyncParameter>> = vec![
             Box::new("hopper".into_parameter()),

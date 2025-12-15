@@ -160,7 +160,7 @@ pub trait CacheMetrics: Send + Sync {
         Self: Sized;
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn calculate_hit_ratio(hits: u64, total: u64) -> f64 {
     if total > 0 {
         hits as f64 / total as f64

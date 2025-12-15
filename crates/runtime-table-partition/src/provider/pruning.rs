@@ -190,7 +190,6 @@ fn evaluate_expr(
 }
 
 /// Evaluates if a filter expression excludes a partition value based on the partition-by expression.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn prune_partition(
     filters: &[Expr],
     partition_by: &Expr,
@@ -383,7 +382,6 @@ fn filter_or_udf_value_matches(
 }
 
 /// Evaluates inequality conditions to determine if they exclude the partition value.
-#[allow(clippy::too_many_lines)]
 fn evaluate_inequality(
     col: &Column,
     op: Operator,
@@ -456,7 +454,6 @@ fn evaluate_inequality(
 
 /// Special handler for bucket inequality that needs access to all filters to determine bounded ranges.
 /// This is called from `prune_partition` when we detect a bucket expression.
-#[allow(clippy::too_many_lines)]
 fn evaluate_bucket_inequality(
     filters: &[Expr],
     col: &Column,
@@ -510,7 +507,7 @@ fn evaluate_bucket_inequality(
         // Only handle integer types for now (can extend to other types)
         match (&lower, &upper) {
             (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(u))) => {
-                #[allow(clippy::items_after_statements, clippy::cast_sign_loss)]
+                #[expect(clippy::items_after_statements, clippy::cast_sign_loss)]
                 {
                     let start = if lower_inc { *l } else { l + 1 };
                     let end = if upper_inc { *u } else { u - 1 };
@@ -560,7 +557,7 @@ fn evaluate_bucket_inequality(
                 }
             }
             (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(u))) => {
-                #[allow(
+                #[expect(
                     clippy::items_after_statements,
                     clippy::cast_sign_loss,
                     clippy::cast_possible_truncation
@@ -1297,7 +1294,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn test_prune_partition_date_trunc() -> Result<(), DataFusionError> {
         let schema = Schema::new(vec![Field::new(
             "date",
@@ -1306,7 +1302,7 @@ mod tests {
         )]);
         let filter_date =
             ScalarValue::TimestampNanosecond(Some(timestamp_nanos("2025-07-15 00:00:00")), None);
-        let filters = &[col("date").eq(lit(filter_date.clone()))];
+        let filters = &[col("date").eq(lit(filter_date))];
 
         // Test multiple granularities
         let granularities = vec!["year", "month", "day", "hour", "minute", "second"];
@@ -1665,7 +1661,7 @@ mod tests {
         assert_prune_partition!(
             filters,
             &partition_by,
-            schema.clone(),
+            schema,
             Int64,
             [
                 (0, true),     // All values 0-999 <= 1500
@@ -1697,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     fn test_prune_partition_modulo_all_operators() -> Result<(), DataFusionError> {
         // Test all inequality operators with modulo - should correctly prune based on value ranges
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
@@ -1726,7 +1722,6 @@ mod tests {
         // Greater than or equal: a >= 25
         // Partition 5: 25, 35, 45... satisfy -> should NOT prune
         // Partition 3: 33, 43, 53... satisfy -> should NOT prune
-        #[allow(clippy::similar_names)]
         let filters_gte = &[col("a").gt_eq(lit(25))];
         assert!(!prune_partition(
             &filters_gte[..],
@@ -1744,7 +1739,6 @@ mod tests {
         // Less than: a < 20
         // Partition 5: 5, 15 satisfy -> should NOT prune
         // Partition 3: 3, 13 satisfy -> should NOT prune
-        #[allow(clippy::similar_names)]
         let filters_lt = &[col("a").lt(lit(20))];
         assert!(!prune_partition(
             &filters_lt[..],
@@ -1762,7 +1756,6 @@ mod tests {
         // Less than or equal: a <= 15
         // Partition 5: 5, 15 satisfy -> should NOT prune
         // Partition 3: 3, 13 satisfy -> should NOT prune
-        #[allow(clippy::similar_names)]
         let filters_lte = &[col("a").lt_eq(lit(15))];
         assert!(!prune_partition(
             &filters_lte[..],

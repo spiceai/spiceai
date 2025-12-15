@@ -36,7 +36,6 @@ use test_framework::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
-    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::{observe_memory, recursively_get_dir_size},
 };
@@ -45,7 +44,7 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
     // determine if any dataset has acceleration enabled with a file mode engine
     if !app.datasets.iter().any(|ds| {
         ds.acceleration.as_ref().is_some_and(|accel| {
-            accel.mode == Mode::File
+            matches!(accel.mode, Mode::File | Mode::FileCreate)
                 && accel.enabled
                 && matches!(
                     accel.engine.as_deref(),
@@ -67,7 +66,6 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -81,6 +79,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .await?;
 
     let ready_wait_duration = ready_wait_start.elapsed();
+
+    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
+    // Resource will be set later with set_resource() before emit()
+    let mut telemetry = super::create_telemetry(&args.common);
+
     let health_monitor = HealthMonitor::spawn()?;
 
     // Start metrics scraper if enabled
@@ -124,19 +127,21 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let app_name = app.name.clone();
-    let benchmark_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "benchmark_query"),
-        KeyValue::new("name", app_name.clone()),
-        KeyValue::new("spiced_version", spiced_version.clone()),
-        KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("branch_name", metrics.branch_name.clone()),
-        KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
-    ]);
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "benchmark_query"),
+            KeyValue::new("name", app_name.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", metrics.branch_name.clone()),
+            KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
+        ])
+        .build();
 
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    telemetry.set_resource(benchmark_resource);
 
     let mut failures = Vec::new();
     for query in &metrics.metrics {

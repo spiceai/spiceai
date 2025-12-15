@@ -20,6 +20,7 @@ data_components = { path = "../data_components", optional = true }
 datafusion.workspace = true
 datafusion-expr.workspace = true
 datafusion-functions-json = { workspace = true }
+datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
 futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", optional = true }

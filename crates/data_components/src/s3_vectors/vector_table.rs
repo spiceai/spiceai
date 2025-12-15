@@ -484,13 +484,13 @@ impl S3VectorsTable {
             .zip(key.into_iter())
             .enumerate()
             .filter_map(|(i, (data, key))| {
-                let key = key?.to_string();
+                let key = key?;
                 let data = data?;
                 let meta: HashMap<String, Document> = metadata
                     .iter()
                     .filter_map(|(k, v)| {
                         let value = v.get(i)?.as_ref()?;
-                        let meta = json_value_to_document(value.clone());
+                        let meta = json_value_to_document(value.clone()).ok()?;
 
                         if matches!(meta, Document::Null) {
                             return None;
@@ -725,7 +725,7 @@ mod tests {
         let vectors = create_test_vectors(5);
         let result = table.write_chunk_with_spilling(&vectors).await;
 
-        assert!(result.is_ok());
+        result.expect("Should write without error");
         assert_eq!(mock_client.get_vector_count("test-index"), 5);
 
         Ok(())
@@ -769,13 +769,13 @@ mod tests {
 
         let vectors = create_test_vectors(3);
         let result = table.write_chunk_with_spilling(&vectors).await;
-        assert!(result.is_ok());
+        result.expect("Should write without error");
         let vectors = create_test_vectors(3);
         let result = table.write_chunk_with_spilling(&vectors).await;
-        assert!(result.is_ok());
+        result.expect("Should write without error");
         let vectors = create_test_vectors(3);
         let result = table.write_chunk_with_spilling(&vectors).await;
-        assert!(result.is_ok());
+        result.expect("Should write without error");
 
         assert_eq!(mock_client.get_vector_count("test-index"), 3);
         assert_eq!(mock_client.get_vector_count("test-index.01"), 3);

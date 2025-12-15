@@ -78,7 +78,7 @@ pub struct DatasetResponseItem {
     pub properties: HashMap<String, serde_json::Value>,
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
@@ -436,6 +436,9 @@ pub(crate) async fn acceleration(
 
 fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
     let mut properties = HashMap::new();
+
+    #[cfg(not(feature = "models"))]
+    let _ = ds;
 
     #[cfg(feature = "models")]
     properties.insert(

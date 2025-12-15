@@ -140,21 +140,21 @@ mod tests {
     fn test_invalid_top_level() {
         let json = json!(42);
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on invalid top-level JSON");
     }
 
     #[test]
     fn test_array_with_nested_array() {
         let json = json!([1, [2, 3]]);
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested array");
     }
 
     #[test]
     fn test_object_with_nested_object() {
         let json = json!({"a": 1, "b": {"c": 2}});
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested object");
     }
 
     #[test]
@@ -245,13 +245,13 @@ mod tests {
     fn test_error_with_specific_index() {
         let json = json!([1, "two", [3]]);
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested array");
     }
 
     #[test]
     fn test_error_with_specific_key() {
         let json = json!({"a": 1, "b": "two", "c": {"d": 3}});
         let result = convert_json_to_param_values(json);
-        assert!(result.is_err());
+        result.expect_err("should error on nested object");
     }
 }
