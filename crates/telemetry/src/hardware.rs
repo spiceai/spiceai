@@ -158,7 +158,9 @@ fn get_system_cpu_count() -> usize {
         cpu_count
     } else {
         // Absolute fallback - every system has at least 1 CPU
-        tracing::warn!("sysinfo returned 0 CPUs, falling back to 1. This may indicate a detection problem.");
+        tracing::warn!(
+            "sysinfo returned 0 CPUs, falling back to 1. This may indicate a detection problem."
+        );
         1
     }
 }
@@ -217,7 +219,8 @@ fn get_cgroup_v2_cpuset_effective() -> Option<usize> {
 /// Gets CPU count from cgroup v1 `cpuset.cpus`.
 fn get_cgroup_v1_cpuset() -> Option<usize> {
     let cpuset_path = get_process_cgroup_v1_path("cpuset")?;
-    let mountpoint = get_cgroup_v1_mountpoint("cpuset").unwrap_or_else(|| "/sys/fs/cgroup/cpuset".to_string());
+    let mountpoint =
+        get_cgroup_v1_mountpoint("cpuset").unwrap_or_else(|| "/sys/fs/cgroup/cpuset".to_string());
 
     let path = build_cgroup_file_path(&mountpoint, &cpuset_path, "cpuset.cpus");
     let contents = std::fs::read_to_string(&path).ok()?;
@@ -442,8 +445,8 @@ fn parse_cgroup_v2_cpu_max(contents: &str) -> Option<usize> {
 /// cgroup v1 uses separate files for quota and period.
 fn get_cgroup_v1_cpu_limit() -> Option<usize> {
     let cpu_path = get_process_cgroup_v1_path("cpu")?;
-    let mountpoint = get_cgroup_v1_mountpoint("cpu")
-        .unwrap_or_else(|| "/sys/fs/cgroup/cpu".to_string());
+    let mountpoint =
+        get_cgroup_v1_mountpoint("cpu").unwrap_or_else(|| "/sys/fs/cgroup/cpu".to_string());
 
     let quota_path = build_cgroup_file_path(&mountpoint, &cpu_path, "cpu.cfs_quota_us");
     let period_path = build_cgroup_file_path(&mountpoint, &cpu_path, "cpu.cfs_period_us");
@@ -544,8 +547,8 @@ fn parse_cgroup_v2_memory_max(contents: &str) -> Option<u64> {
 /// Reads memory limit from cgroup v1.
 fn get_cgroup_v1_memory_limit() -> Option<u64> {
     let mem_path = get_process_cgroup_v1_path("memory")?;
-    let mountpoint = get_cgroup_v1_mountpoint("memory")
-        .unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
+    let mountpoint =
+        get_cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
 
     let path = build_cgroup_file_path(&mountpoint, &mem_path, "memory.limit_in_bytes");
     let contents = std::fs::read_to_string(&path).ok()?;
