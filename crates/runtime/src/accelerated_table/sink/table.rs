@@ -44,8 +44,11 @@ impl TableSink {
         overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let start = std::time::Instant::now();
-        tracing::info!("TableSink::insert_into starting (overwrite: {:?})", overwrite);
-        
+        tracing::info!(
+            "TableSink::insert_into starting (overwrite: {:?})",
+            overwrite
+        );
+
         let ctx = SessionContext::new();
         let target_schema = self.table_provider.schema();
         let streaming_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
@@ -78,7 +81,9 @@ impl TableSink {
             }
         };
 
-        tracing::info!("TableSink: executing insertion plan with collect() - this will read source and write to accelerator");
+        tracing::info!(
+            "TableSink: executing insertion plan with collect() - this will read source and write to accelerator"
+        );
         let collect_start = std::time::Instant::now();
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
             tracing::error!(

@@ -780,15 +780,14 @@ impl CayenneAccelerator {
             .with_virtual_hosted_style_request(true);
 
         // Build the S3 Express endpoint with virtual-hosted-style format
-        let express_endpoint = format!(
-            "https://{bucket_name}.s3express-{zone_id}.{region}.amazonaws.com"
-        );
+        let express_endpoint =
+            format!("https://{bucket_name}.s3express-{zone_id}.{region}.amazonaws.com");
         tracing::debug!("Validation using S3 Express endpoint: {express_endpoint}");
         s3_builder = s3_builder.with_endpoint(&express_endpoint);
 
         // Set default timeout consistent with data upload configuration
-        let client_options = ClientOptions::default()
-            .with_timeout(std::time::Duration::from_secs(300)); // 5 minutes per request
+        let client_options =
+            ClientOptions::default().with_timeout(std::time::Duration::from_secs(300)); // 5 minutes per request
         s3_builder = s3_builder.with_client_options(client_options);
 
         // Handle credentials
@@ -808,7 +807,9 @@ impl CayenneAccelerator {
             match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
                 Ok(Some(sdk_config)) => {
                     if sdk_config.credentials_provider().is_some() {
-                        tracing::debug!("Using S3 credentials provider from SDK config for validation");
+                        tracing::debug!(
+                            "Using S3 credentials provider from SDK config for validation"
+                        );
                         s3_builder = s3_builder.with_credentials(Arc::new(
                             S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(
                                 |e| Error::S3ObjectStoreCreation {
@@ -2145,19 +2146,18 @@ impl PartitionCreator for CayennePartitionCreator {
 
             // Create Cayenne table provider for this partition
             let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
-            
+
             // Use builder pattern to pass object store config for S3 support
             let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
                 .with_retention_filters(self.retention_filters.clone());
             if let Some(ref object_store) = self.object_store_config {
                 builder = builder.with_object_store(object_store.clone());
             }
-            let cayenne_table = builder
-                .open(&partition_table_name)
-                .await
-                .map_err(|e| creator::Error::InferringPartitions {
+            let cayenne_table = builder.open(&partition_table_name).await.map_err(|e| {
+                creator::Error::InferringPartitions {
                     source: Box::new(e),
-                })?;
+                }
+            })?;
 
             result.push(Partition {
                 partition_value,

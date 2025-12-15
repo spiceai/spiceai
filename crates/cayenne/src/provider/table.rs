@@ -1524,7 +1524,7 @@ impl TableProvider for CayenneTableProvider {
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let is_s3 = self.table_metadata.path.starts_with("s3://");
-        
+
         if is_s3 {
             tracing::info!(
                 "Cayenne insert_into called for S3 table {} (overwrite: {:?})",
