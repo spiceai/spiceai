@@ -89,12 +89,6 @@ pub enum Error {
     #[snafu(display("Failed to execute query: {source}"))]
     UnableToExecuteQuery { source: DataFusionError },
 
-    #[snafu(display("Failed to execute query: {source}"))]
-    UnableToExecuteQueryWithErrorCode {
-        source: DataFusionError,
-        code: ErrorCode,
-    },
-
     #[snafu(display("Failed to access query results cache: {source}"))]
     FailedToAccessCache { source: ::cache::Error },
 
@@ -323,11 +317,17 @@ impl Query {
                     {
                         Ok(plan) => plan,
                         Err(e) => match e {
-                            Error::UnableToExecuteQueryWithErrorCode { source, code } => {
+                            Error::UnableToExecuteQuery { source } => {
+                                let code = ErrorCode::from(&source);
+                                let snafu_err = Error::UnableToExecuteQuery { source };
                                 if let Some(t) = tracker {
-                                    t.finish_with_error(&request_context, source.to_string(), code);
+                                    t.finish_with_error(
+                                        &request_context,
+                                        snafu_err.to_string(),
+                                        code,
+                                    );
                                 }
-                                return Err(Error::UnableToExecuteQuery { source });
+                                return Err(snafu_err);
                             }
                             _ => return Err(e),
                         },

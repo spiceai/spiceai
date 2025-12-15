@@ -135,11 +135,13 @@ impl Query {
         let plan = match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
             Ok(plan) => plan,
             Err(e) => {
-                if let super::Error::UnableToExecuteQueryWithErrorCode { source, code } = e {
+                if let super::Error::UnableToExecuteQuery { source } = e {
+                    let code = ErrorCode::from(&source);
+                    let snafu_err = super::Error::UnableToExecuteQuery { source };
                     if let Some(t) = tracker {
-                        t.finish_with_error(&request_context, source.to_string(), code);
+                        t.finish_with_error(&request_context, snafu_err.to_string(), code);
                     }
-                    return Err(super::Error::UnableToExecuteQuery { source });
+                    return Err(snafu_err);
                 }
                 return Err(e);
             }
@@ -200,9 +202,9 @@ impl Query {
         {
             Ok(plan) => plan,
             Err(e) => {
-                let e = find_datafusion_root(e);
-                let code = ErrorCode::from(&e);
-                return Err(super::Error::UnableToExecuteQueryWithErrorCode { source: e, code });
+                return Err(super::Error::UnableToExecuteQuery {
+                    source: find_datafusion_root(e),
+                });
             }
         };
 
