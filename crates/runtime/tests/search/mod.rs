@@ -386,7 +386,9 @@ fn validate_combination(
             (&table_option, &acceleration_opt),
             (
                 megascience::TableOptions::Dataset,
-                AccelerationOptions::Arrow | AccelerationOptions::DuckDb
+                AccelerationOptions::Arrow
+                    | AccelerationOptions::DuckDb
+                    | AccelerationOptions::Cayenne
             )
         )
     {
