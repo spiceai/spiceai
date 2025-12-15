@@ -49,7 +49,7 @@ mod tracker;
 #[cfg(feature = "cluster")]
 use {
     crate::config::ClusterMode,
-    crate::datafusion::{builder::default_extension_planners, query::Error::UnableToExecuteQuery},
+    crate::datafusion::builder::default_extension_planners,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
     datafusion::execution::SessionStateBuilder,
