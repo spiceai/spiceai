@@ -9,40 +9,40 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Since there are 50 equal numbers, each number is equal to \\("
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "primary_key": {
-        "id": 507
+        "id": 361
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of groups of 7 in 21."
+        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
       },
       "primary_key": {
-        "id": 359
+        "id": 1277
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
       },
       "primary_key": {
-        "id": 470
+        "id": 787
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "4, 2))^3 \\times 40}\\)"
+        "answer": " divisors other than 1 and itself (e.g., 2, 3, 4, 6, 9, 12, 18)"
       },
       "primary_key": {
-        "id": 450
+        "id": 484
       },
       "score": 0.01
     }
