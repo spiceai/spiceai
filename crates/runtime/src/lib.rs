@@ -148,6 +148,9 @@ pub enum Error {
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
 
+    #[snafu(display("Unable to start internal cluster server: {source}"))]
+    UnableToStartClusterServer { source: flight::Error },
+
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
@@ -673,7 +676,7 @@ impl Runtime {
                         Some(cloned_shutdown),
                     )
                     .await
-                    .context(UnableToStartFlightServerSnafu)
+                    .context(UnableToStartClusterServerSnafu)
                 };
                 let self_for_task = Arc::clone(&self);
                 Some(Box::pin(

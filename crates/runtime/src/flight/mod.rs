@@ -419,6 +419,10 @@ pub enum Error {
     ClusterSchedulerNotInitialized {},
 
     #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to start internal cluster server: {source}"))]
+    UnableToStartClusterServer { source: tonic::transport::Error },
+
+    #[cfg(feature = "cluster")]
     #[snafu(display("The flight service has an insecure configuration: {message}"))]
     InsecureConfiguration { message: String },
 }

@@ -105,7 +105,7 @@ pub async fn start_internal_cluster_server(
                 addr: bind_address.to_string(),
             };
         }
-        Error::UnableToStartFlightServer { source: e }
+        Error::UnableToStartClusterServer { source: e }
     })?;
 
     tracing::debug!("Spice Runtime internal cluster server stopped");
