@@ -509,8 +509,21 @@ impl MetadataCatalog for CayenneCatalog {
             },
         )
         .await
-        .map_err(|_| CatalogError::TableNotFound {
-            table_name: table_name_owned,
+        .map_err(|e| {
+            // Check if the error is specifically "no rows returned" (table doesn't exist)
+            // Otherwise, preserve the original error for better debugging
+            if matches!(
+                &e,
+                CatalogError::Sqlite {
+                    source: rusqlite::Error::QueryReturnedNoRows
+                }
+            ) {
+                CatalogError::TableNotFound {
+                    table_name: table_name_owned,
+                }
+            } else {
+                e
+            }
         })
     }
 

@@ -699,16 +699,38 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any chunk write fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Progress tracking for S3 Express uploads adds necessary complexity"
+    )]
     async fn chunk_and_write_parallel(
         &self,
         mut stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> CatalogResult<(u64, usize)> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
         use tokio::sync::Semaphore;
 
         // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
         let semaphore = Arc::new(Semaphore::new(4));
+
+        // Progress tracking for S3 Express uploads
+        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
+        let start_time = Instant::now();
+        let last_progress_time = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let total_bytes_written = Arc::new(AtomicUsize::new(0));
+        let files_written = Arc::new(AtomicUsize::new(0));
         let mut write_tasks = tokio::task::JoinSet::new();
+
+        // Log when starting S3 upload process
+        if is_s3_storage {
+            tracing::info!(
+                "Starting S3 upload for table {} (target chunk size: {})",
+                self.table_metadata.table_name,
+                format_bytes(target_size_bytes)
+            );
+        }
 
         // Pre-allocate chunk vector with estimated capacity
         // Estimate: average batch ~8MB, so reserve for a few batches per chunk
@@ -739,13 +761,65 @@ impl CayenneTableProvider {
                     &mut current_chunk,
                     Vec::with_capacity(estimated_batches_per_chunk),
                 );
+                let chunk_size = current_size;
                 current_size = 0;
                 chunk_count += 1;
 
-                // Clone self for the async task
+                // Clone self and progress trackers for the async task
                 let self_clone = self.clone_for_write();
+                let total_bytes = Arc::clone(&total_bytes_written);
+                let files_count = Arc::clone(&files_written);
+                let progress_time = Arc::clone(&last_progress_time);
+                let is_s3 = is_s3_storage;
+                let table_name = self.table_metadata.table_name.clone();
+                let start = start_time;
+                let current_chunk_num = chunk_count;
+
+                // Log when starting a chunk upload (before the slow I/O operation)
+                if is_s3 {
+                    tracing::info!(
+                        "Starting S3 upload for {} chunk {} ({})...",
+                        table_name,
+                        current_chunk_num,
+                        format_bytes(chunk_size)
+                    );
+                }
+
                 write_tasks.spawn(async move {
                     let result = self_clone.write_chunk(chunk_to_write).await;
+
+                    // Track progress for S3 uploads
+                    if is_s3 {
+                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
+                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        // Log progress every 10 seconds or when a file completes
+                        let mut last_time = progress_time
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let should_log = last_time.elapsed().as_secs() >= 10 || result.is_ok();
+                        if should_log {
+                            let elapsed = start.elapsed();
+                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                                #[expect(clippy::cast_precision_loss)]
+                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
+                                format_bytes_per_sec(bytes_per_sec)
+                            } else {
+                                "calculating...".to_string()
+                            };
+                            tracing::info!(
+                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                table_name,
+                                file_num,
+                                format_bytes(bytes_so_far),
+                                elapsed.as_secs_f64(),
+                                throughput
+                            );
+                            *last_time = Instant::now();
+                        }
+                    }
+
                     drop(permit); // Release permit after write completes
                     result
                 });
@@ -764,10 +838,22 @@ impl CayenneTableProvider {
             })?;
 
             chunk_count += 1;
+            let final_chunk_size = current_size;
 
             let self_clone = self.clone_for_write();
+            let total_bytes = Arc::clone(&total_bytes_written);
+            let files_count = Arc::clone(&files_written);
+            let is_s3 = is_s3_storage;
+
             write_tasks.spawn(async move {
                 let result = self_clone.write_chunk(current_chunk).await;
+
+                // Track final chunk for S3 uploads
+                if is_s3 {
+                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
+                    files_count.fetch_add(1, Ordering::Relaxed);
+                }
+
                 drop(permit);
                 result
             });
@@ -779,6 +865,29 @@ impl CayenneTableProvider {
                 message: format!("Write task panicked: {e}"),
             })??;
             total_rows += row_count;
+        }
+
+        // Log final summary for S3 Express uploads
+        if is_s3_storage {
+            let elapsed = start_time.elapsed();
+            let total_bytes = total_bytes_written.load(Ordering::Relaxed);
+            let files_count = files_written.load(Ordering::Relaxed);
+            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                #[expect(clippy::cast_precision_loss)]
+                let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
+                format_bytes_per_sec(bytes_per_sec)
+            } else {
+                "N/A".to_string()
+            };
+            tracing::info!(
+                "Completed S3 upload for {}: {} rows in {} files ({}) in {:.1}s, {}",
+                self.table_metadata.table_name,
+                total_rows,
+                files_count,
+                format_bytes(total_bytes),
+                elapsed.as_secs_f64(),
+                throughput
+            );
         }
 
         Ok((total_rows, chunk_count))
@@ -999,14 +1108,21 @@ impl CayenneTableProvider {
     /// Create a `SessionContext` for data operations, registering object store if configured.
     fn create_session_context(&self) -> SessionContext {
         let ctx = SessionContext::new();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
 
         // Register object store if configured for remote storage (e.g., S3 Express One Zone)
         if let Some(ref config) = self.object_store_config {
             ctx.runtime_env()
                 .register_object_store(&config.url, Arc::clone(&config.store));
-            tracing::debug!(
-                "Registered object store for S3 URL: {}",
+            tracing::info!(
+                "Created SessionContext with S3 Express object store for {}: {}",
+                self.table_metadata.table_name,
                 config.url.as_str()
+            );
+        } else if is_s3 {
+            tracing::warn!(
+                "Creating SessionContext for S3 table {} but no object_store_config!",
+                self.table_metadata.table_name
             );
         }
 
@@ -1305,6 +1421,14 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Register object store with the session's runtime env if configured for S3 Express One Zone.
+        // This ensures the session can access S3 when the underlying ListingTable reads data.
+        if let Some(ref config) = self.object_store_config {
+            state
+                .runtime_env()
+                .register_object_store(&config.url, Arc::clone(&config.store));
+        }
+
         // Delegate to the underlying listing table first
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
@@ -1399,6 +1523,34 @@ impl TableProvider for CayenneTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        
+        if is_s3 {
+            tracing::info!(
+                "Cayenne insert_into called for S3 table {} (overwrite: {:?})",
+                self.table_metadata.table_name,
+                overwrite
+            );
+        }
+
+        // Register object store with the session's runtime env if configured for S3 Express One Zone.
+        // This ensures the session can access S3 when the underlying ListingTable writes data.
+        if let Some(ref config) = self.object_store_config {
+            state
+                .runtime_env()
+                .register_object_store(&config.url, Arc::clone(&config.store));
+            tracing::info!(
+                "Registered S3 Express One Zone object store for {}: {}",
+                self.table_metadata.table_name,
+                config.url.as_str()
+            );
+        } else if is_s3 {
+            tracing::warn!(
+                "S3 table {} has no object_store_config! Writes will fail.",
+                self.table_metadata.table_name
+            );
+        }
+
         // Handle overwrite by creating a new snapshot
         // Directory structure: [data_dir]/[table_id]/[snapshot_id]/
         if overwrite == InsertOp::Overwrite {
@@ -1504,9 +1656,24 @@ impl TableProvider for CayenneTableProvider {
             })?;
             Arc::clone(&guard)
         };
+
+        if is_s3 {
+            tracing::info!(
+                "Delegating S3 write to ListingTable for {}",
+                self.table_metadata.table_name
+            );
+        }
+
         let result = listing_table
             .insert_into(state, input, InsertOp::Append)
             .await?;
+
+        if is_s3 {
+            tracing::info!(
+                "ListingTable insert_into returned for {} (S3 write plan created)",
+                self.table_metadata.table_name
+            );
+        }
 
         // Refresh the listing table to pick up new files and update statistics
         // This ensures query plans have access to up-to-date statistics after the insert
@@ -1539,5 +1706,42 @@ impl DeletionTableProvider for CayenneTableProvider {
             )),
             &self.table_metadata.schema,
         )))
+    }
+}
+
+/// Formats a byte count as a human-readable string (e.g., "1.23 GiB").
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    #[expect(clippy::cast_precision_loss)]
+    let bytes_f64 = bytes as f64;
+
+    if bytes_f64 >= GIB {
+        format!("{:.2} GiB", bytes_f64 / GIB)
+    } else if bytes_f64 >= MIB {
+        format!("{:.2} MiB", bytes_f64 / MIB)
+    } else if bytes_f64 >= KIB {
+        format!("{:.2} KiB", bytes_f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Formats bytes per second as a human-readable throughput string.
+fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    if bytes_per_sec >= GIB {
+        format!("{:.2} GiB/s", bytes_per_sec / GIB)
+    } else if bytes_per_sec >= MIB {
+        format!("{:.2} MiB/s", bytes_per_sec / MIB)
+    } else if bytes_per_sec >= KIB {
+        format!("{:.2} KiB/s", bytes_per_sec / KIB)
+    } else {
+        format!("{bytes_per_sec:.0} B/s")
     }
 }
