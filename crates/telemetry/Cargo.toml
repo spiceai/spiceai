@@ -18,7 +18,10 @@ opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 sha2.workspace = true
 snafu.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+util = { path = "../util" }
 
 [features]
 anonymous_telemetry = []
