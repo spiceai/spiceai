@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::{common::Column, execution::SendableRecordBatchStream};
 use serde_json::{Value, json};
 use snafu::{ResultExt, Snafu};
 
@@ -80,7 +80,7 @@ pub trait CandidateAggregation: Sync + Send {
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
-        primary_keys: Vec<String>,
+        primary_keys: Vec<Column>,
         limit: usize,
     ) -> Result<AggregationResult>;
 }
@@ -99,7 +99,7 @@ pub struct AggregationResult {
     /// to all the columns in `data` that derived from it.
     ///
     /// Example
-    /// ```
+    /// ```json
     /// {
     ///   "body": ["body_fts", "body_similarity"]
     /// }
@@ -121,12 +121,14 @@ impl std::fmt::Debug for AggregationResult {
 
 fn from_single_input(
     input: VectorSearchGenerationResult,
-    primary_key: Vec<String>,
+    primary_key: Vec<Column>,
 ) -> AggregationResult {
     let VectorSearchGenerationResult {
         data,
         derived_from: derived_column,
     } = input;
+
+    let primary_key: Vec<_> = primary_key.into_iter().map(|c| c.flat_name()).collect();
 
     // Results from [`super::generation::CandidateGeneration::search`] outputs the matches as the
     // `SEARCH_VALUE_COLUMN_NAME` column, so we directly know the mapping.

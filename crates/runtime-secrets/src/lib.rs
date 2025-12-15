@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 #[cfg(feature = "cluster")]
+pub use crate::stores::scheduler_rpc::ClusterSecretExpander;
+#[cfg(feature = "cluster")]
 use crate::stores::scheduler_rpc::SchedulerRPCSecretStore;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -87,12 +89,14 @@ impl Secrets {
 
     #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn new_for_cluster_executor(scheduler_url: String, executor_id: String) -> Self {
+    pub fn new_for_cluster_executor(
+        expander: Box<dyn crate::stores::scheduler_rpc::ClusterSecretExpander>,
+        executor_id: String,
+    ) -> Self {
         let mut stores = IndexMap::new();
         stores.insert(
             "scheduler_rpc".to_string(),
-            Arc::new(SchedulerRPCSecretStore::new(scheduler_url, executor_id))
-                as Arc<dyn SecretStore>,
+            Arc::new(SchedulerRPCSecretStore::new(expander, executor_id)) as Arc<dyn SecretStore>,
         );
 
         Self { stores }

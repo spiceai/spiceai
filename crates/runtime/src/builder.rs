@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::{
@@ -55,6 +57,8 @@ pub struct RuntimeBuilder {
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
+    #[cfg(feature = "cluster")]
+    resolved_cluster_config: Option<ResolvedClusterConfig>,
 }
 
 impl RuntimeBuilder {
@@ -74,6 +78,8 @@ impl RuntimeBuilder {
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
+            #[cfg(feature = "cluster")]
+            resolved_cluster_config: None,
         }
     }
 
@@ -146,6 +152,15 @@ impl RuntimeBuilder {
         self
     }
 
+    #[cfg(feature = "cluster")]
+    pub fn with_resolved_cluster_config(
+        mut self,
+        resolved_cluster_config: ResolvedClusterConfig,
+    ) -> Self {
+        self.resolved_cluster_config = Some(resolved_cluster_config);
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -200,9 +215,6 @@ impl RuntimeBuilder {
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
-        #[cfg(feature = "cluster")]
-        let cluster_config = Arc::new(self.runtime_config.cluster.clone());
-
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Create resource monitor early so it can be passed to DataFusion
@@ -222,9 +234,9 @@ impl RuntimeBuilder {
         .with_resource_monitor(resource_monitor.clone());
 
         #[cfg(feature = "cluster")]
-        {
-            df_builder = df_builder.with_cluster_config(cluster_config);
-        };
+        if let Some(resolved_cluster_config) = self.resolved_cluster_config {
+            df_builder = df_builder.with_cluster_config(resolved_cluster_config);
+        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);

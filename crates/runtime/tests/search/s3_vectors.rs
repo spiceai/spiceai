@@ -71,10 +71,11 @@ pub(super) async fn prepare_for_aws_tests(
             .set_vector_bucket_name(Some(bucket_name.to_string()))
             .build()?;
 
+        // Don't return error if delete fails, as index may not exist
         let _ = s3_vector_client.delete_index(input).await.boxed().map_err(|e| {
-            tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
+            tracing::debug!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
             anyhow::anyhow!(e)
-        })?;
+        });
     }
     Ok(())
 }
