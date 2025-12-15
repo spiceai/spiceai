@@ -349,10 +349,11 @@ pub async fn initialize_cluster_executor(
     let (advertise_host, advertise_port) = if let Some(advertise_addr) =
         rt.df.cluster_config.cluster_advertise_address()
     {
-        // Parse the advertise address (format: "host:port")
-        let parts: Vec<&str> = advertise_addr.rsplitn(2, ':').collect();
-        if parts.len() == 2 {
-            let port = parts[0]
+        // Parse the advertise address (format: "host:port" or "[ipv6]:port")
+        if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
+            (socket_addr.ip().to_string(), socket_addr.port())
+        } else if let Some((host_part, port_part)) = advertise_addr.rsplit_once(':') {
+            let port = port_part
                 .parse::<u16>()
                 .map_err(|_| FailedToStartClusterExecutor {
                     source: format!(
@@ -360,11 +361,12 @@ pub async fn initialize_cluster_executor(
                     )
                     .into(),
                 })?;
-            (parts[1].to_string(), port)
+            let host = host_part.trim_matches(['[', ']']).to_string();
+            (host, port)
         } else {
             return Err(FailedToStartClusterExecutor {
                     source: format!(
-                        "Invalid --cluster-advertise-address format: {advertise_addr}. Expected 'host:port'"
+                        "Invalid --cluster-advertise-address format: {advertise_addr}. Expected 'host:port' (IPv6 must be in [addr]:port form)"
                     )
                     .into(),
                 });
