@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -184,11 +185,13 @@ This command creates:
 - A client private key (~/.spice/pki/<client-name>.key)
 
 The client certificate is valid for 1 year and uses ECDSA P-256.
+The certificate includes localhost and 127.0.0.1 as Subject Alternative Names (SANs).
 
 The CA must be initialized first using 'spice cluster tls init'.`,
 	Example: `
 spice cluster tls add node1
 spice cluster tls add my-spice-instance
+spice cluster tls add node1 --host myserver.example.com
 `,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -290,6 +293,21 @@ spice cluster tls add my-spice-instance
 		notBefore := time.Now()
 		notAfter := notBefore.AddDate(clientValidityYears, 0, 0)
 
+		// Build SANs - always include localhost and 127.0.0.1
+		dnsNames := []string{"localhost"}
+		ipAddresses := []net.IP{net.ParseIP("127.0.0.1")}
+
+		// Add optional host to SANs
+		hostFlag, _ := cmd.Flags().GetString("host")
+		if hostFlag != "" {
+			// Check if it's an IP address or DNS name
+			if ip := net.ParseIP(hostFlag); ip != nil {
+				ipAddresses = append(ipAddresses, ip)
+			} else {
+				dnsNames = append(dnsNames, hostFlag)
+			}
+		}
+
 		clientTemplate := x509.Certificate{
 			SerialNumber: serialNumber,
 			Subject: pkix.Name{
@@ -301,6 +319,8 @@ spice cluster tls add my-spice-instance
 			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 			BasicConstraintsValid: true,
 			IsCA:                  false,
+			DNSNames:              dnsNames,
+			IPAddresses:           ipAddresses,
 		}
 
 		// Create client certificate signed by CA
@@ -334,6 +354,12 @@ spice cluster tls add my-spice-instance
 		cmd.Println(fmt.Sprintf("Private Key: %s", clientKeyPath))
 		cmd.Println(fmt.Sprintf("Validity:    %d year (until %s)", clientValidityYears, notAfter.Format("2006-01-02")))
 		cmd.Println(fmt.Sprintf("CN:          %s", clientName))
+		cmd.Println(fmt.Sprintf("DNS SANs:    %s", strings.Join(dnsNames, ", ")))
+		ipStrs := make([]string, len(ipAddresses))
+		for i, ip := range ipAddresses {
+			ipStrs[i] = ip.String()
+		}
+		cmd.Println(fmt.Sprintf("IP SANs:     %s", strings.Join(ipStrs, ", ")))
 	},
 }
 
@@ -395,6 +421,7 @@ func writePEMFile(path string, pemType string, data []byte) error {
 }
 
 func init() {
+	tlsAddCmd.Flags().String("host", "", "Host to include in Subject Alternative Names (e.g., myserver.example.com)")
 	tlsCmd.AddCommand(tlsInitCmd)
 	tlsCmd.AddCommand(tlsAddCmd)
 	clusterCmd.AddCommand(tlsCmd)

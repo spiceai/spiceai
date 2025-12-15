@@ -54,6 +54,7 @@ use runtime_proto::GetAppDefinitionRequest;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
+use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
@@ -167,6 +168,124 @@ impl Default for ResolvedClusterConfig {
     }
 }
 
+/// Cluster configuration with lazily loaded TLS config.
+///
+/// This struct wraps `ClusterConfig` and caches the `ClientTlsConfig` on first access
+/// to avoid reading the CA certificate file on every query.
+#[derive(Debug)]
+pub struct ResolvedClusterConfig {
+    config: ClusterConfig,
+    /// Cached client TLS config, loaded lazily from `cluster_ca_certificate_file`.
+    client_tls_config: OnceLock<Option<ClientTlsConfig>>,
+}
+
+impl ResolvedClusterConfig {
+    /// Creates a new `ResolvedClusterConfig` from the given `ClusterConfig`, eagerly loading
+    /// the TLS configuration if a CA certificate file is specified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CA certificate file cannot be read.
+    pub fn try_new(config: ClusterConfig) -> std::io::Result<Self> {
+        let client_tls_config = OnceLock::new();
+
+        // Eagerly load the TLS config if a CA certificate file is specified
+        if let Some(ref ca_path) = config.cluster_ca_certificate_file {
+            let ca_certificate = std::fs::read(ca_path)?;
+            let tls_config =
+                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate));
+            // This cannot fail since we just created the OnceLock
+            let _ = client_tls_config.set(Some(tls_config));
+        } else {
+            let _ = client_tls_config.set(None);
+        }
+
+        Ok(Self {
+            config,
+            client_tls_config,
+        })
+    }
+
+    /// Returns the cluster mode.
+    #[must_use]
+    pub fn mode(&self) -> Option<&ClusterMode> {
+        self.config.mode.as_ref()
+    }
+
+    /// Returns the scheduler URL.
+    #[must_use]
+    pub fn scheduler_url(&self) -> &Url {
+        &self.config.scheduler_url
+    }
+
+    /// Returns the cluster API key.
+    #[must_use]
+    pub fn cluster_api_key(&self) -> Option<&String> {
+        self.config.cluster_api_key.as_ref()
+    }
+
+    /// Returns whether insecure connections are allowed.
+    #[must_use]
+    pub fn allow_insecure_connections(&self) -> bool {
+        self.config.allow_insecure_connections
+    }
+
+    /// Returns the path to the CA certificate file.
+    #[must_use]
+    pub fn cluster_ca_certificate_file(&self) -> Option<&String> {
+        self.config.cluster_ca_certificate_file.as_ref()
+    }
+
+    /// Returns the cached client TLS config, if configured.
+    #[must_use]
+    pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
+        self.client_tls_config
+            .get()
+            .and_then(std::option::Option::as_ref)
+    }
+
+    /// Creates a new `ResolvedClusterConfig` from a `ClusterConfig`, optionally merging
+    /// the API key from the app's auth configuration if no cluster API key is already set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CA certificate file cannot be read.
+    pub fn from_config_and_app(
+        mut config: ClusterConfig,
+        app: Option<&App>,
+    ) -> std::io::Result<Self> {
+        // If no cluster API key is set, try to use the app's auth API key
+        if config.cluster_api_key.is_none()
+            && let Some(api_key) = app
+                .and_then(|a| a.runtime.auth.as_ref())
+                .and_then(|a| a.api_key.as_ref())
+                .and_then(|ak| {
+                    if ak.enabled {
+                        ak.keys.first().cloned()
+                    } else {
+                        None
+                    }
+                })
+        {
+            let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
+            config.cluster_api_key = Some(key);
+        }
+
+        Self::try_new(config)
+    }
+}
+
+impl Default for ResolvedClusterConfig {
+    fn default() -> Self {
+        let client_tls_config = OnceLock::new();
+        let _ = client_tls_config.set(None);
+        Self {
+            config: ClusterConfig::default(),
+            client_tls_config,
+        }
+    }
+}
+
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
     let scheduler = create_scheduler_server(rt).await?;
@@ -229,7 +348,24 @@ pub async fn initialize_cluster_executor(
                 .into(),
             })?;
 
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
+    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to start executor without an API key".into(),
+        });
+    };
+
+    let interceptor = move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {api_key}")
+                .parse()
+                .map_err(|_| tonic::Status::invalid_argument("Invalid API key"))?,
+        );
+
+        Ok(req)
+    };
+
+    let scheduler = SchedulerGrpcClient::with_interceptor(scheduler_connection, interceptor)
         .max_encoding_message_size(usize::MAX)
         .max_decoding_message_size(usize::MAX);
 

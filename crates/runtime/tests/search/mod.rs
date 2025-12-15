@@ -245,7 +245,8 @@ impl EmbeddingModels {
     ignore = "Extended test - run with --features extended_tests"
 )]
 async fn test_megascience_permutations(
-    #[values(VectorEngineOptions::NoVectorEngine)] vector_engine: VectorEngineOptions,
+    #[values(VectorEngineOptions::NoVectorEngine, VectorEngineOptions::S3Vectors)]
+    vector_engine: VectorEngineOptions,
     #[values(
         AccelerationOptions::NoAcceleration,
         AccelerationOptions::Arrow,
@@ -267,7 +268,8 @@ async fn test_megascience_permutations(
         megascience::ColumnConfigOptions::TextSearch,
         megascience::ColumnConfigOptions::MultiTextColumn,
         megascience::ColumnConfigOptions::TextSearchMetadata,
-        megascience::ColumnConfigOptions::MultiEmbeddings
+        megascience::ColumnConfigOptions::MultiEmbeddings,
+        megascience::ColumnConfigOptions::VectorSearchMetadata
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
@@ -295,9 +297,6 @@ async fn test_megascience_permutations(
 
     // Prepare vector store for AWS tests if needed.
     let mut vector_store = vector_engine.to_vector_store();
-    prepare_for_aws_tests(&vector_store, vector_store.enabled)
-        .await
-        .expect("could not prepare vector store for tests");
 
     // Update vector store params with dynamic values as needed.
     if vector_store.engine.as_deref() == Some("s3_vectors")
@@ -314,6 +313,9 @@ async fn test_megascience_permutations(
             )),
         );
     }
+    prepare_for_aws_tests(&vector_store, vector_store.enabled)
+        .await
+        .expect("could not prepare vector store for tests");
 
     let (views, datasets) = enrich_table(
         SearchTable {
@@ -355,7 +357,7 @@ async fn test_megascience_permutations(
 }
 
 fn validate_combination(
-    _vector_engine: &VectorEngineOptions,
+    vector_engine: &VectorEngineOptions,
     acceleration_opt: &AccelerationOptions,
     table_option: &megascience::TableOptions,
     column_config: &megascience::ColumnConfigOptions,
@@ -371,6 +373,17 @@ fn validate_combination(
     }
     if matches!(&acceleration_opt, AccelerationOptions::NoAcceleration) && column_config.is_fts() {
         return Err("Cannot have hybrid column with no acceleration".to_string());
+    }
+    if matches!(&vector_engine, VectorEngineOptions::S3Vectors)
+        && !matches!(
+            (&table_option, &acceleration_opt),
+            (
+                megascience::TableOptions::Dataset,
+                AccelerationOptions::Arrow | AccelerationOptions::DuckDb
+            )
+        )
+    {
+        return Err("S3 Vectors on reduced set of combinations".to_string());
     }
     Ok(())
 }
