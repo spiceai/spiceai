@@ -3173,7 +3173,7 @@ dependencies = [
  "snafu",
  "text-splitter",
  "tiktoken-rs",
- "tokenizers",
+ "tokenizers 0.22.2",
  "tracing",
 ]
 
@@ -8745,7 +8745,7 @@ dependencies = [
  "text-embeddings-backend-core",
  "text-embeddings-core",
  "token_provider",
- "tokenizers",
+ "tokenizers 0.22.2",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -9403,7 +9403,7 @@ dependencies = [
  "symphonia",
  "sysinfo 0.30.13",
  "thiserror 2.0.17",
- "tokenizers",
+ "tokenizers 0.21.4",
  "tokio",
  "tokio-rayon",
  "tokio-tungstenite 0.24.0",
@@ -9504,7 +9504,7 @@ dependencies = [
  "ndarray 0.15.6",
  "safetensors 0.5.3",
  "serde_json",
- "tokenizers",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]
@@ -11154,7 +11154,7 @@ dependencies = [
  "serde_json",
  "spicepod",
  "tiktoken-rs",
- "tokenizers",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]
@@ -15840,7 +15840,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend-core",
  "thiserror 1.0.69",
- "tokenizers",
+ "tokenizers 0.21.4",
  "tracing",
 ]
 
@@ -15865,7 +15865,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend",
  "thiserror 1.0.69",
- "tokenizers",
+ "tokenizers 0.21.4",
  "tokio",
  "tracing",
 ]
@@ -15887,7 +15887,7 @@ dependencies = [
  "strum 0.26.3",
  "thiserror 2.0.17",
  "tiktoken-rs",
- "tokenizers",
+ "tokenizers 0.21.4",
  "unicode-segmentation",
 ]
 
@@ -16176,6 +16176,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenizers"
+version = "0.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
+dependencies = [
+ "ahash 0.8.12",
+ "aho-corasick",
+ "compact_str",
+ "dary_heap",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.3.4",
+ "hf-hub",
+ "indicatif 0.18.3",
+ "itertools 0.14.0",
+ "log",
+ "macro_rules_attribute 0.2.2",
+ "monostate",
+ "onig",
+ "paste",
+ "rand 0.9.2",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 2.0.17",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
 name = "tokio"
 version = "1.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16363,7 +16398,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "tokenizers",
+ "tokenizers 0.21.4",
  "toktrie",
 ]
 

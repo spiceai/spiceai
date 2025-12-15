@@ -255,7 +255,7 @@ tiberius = { version = "0.12.3", default-features = false, features = [
     "rustls",
     "chrono",
 ] }
-tokenizers = "0.21.2"
+tokenizers = "0.22.2"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "signal",
