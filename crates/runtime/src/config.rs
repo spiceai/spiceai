@@ -46,7 +46,7 @@ pub struct Config {
     pub cluster: ClusterConfig,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
 pub enum ClusterMode {
     Scheduler,
     Executor,
@@ -94,38 +94,59 @@ pub struct ClusterConfig {
     )]
     pub mode: Option<ClusterMode>,
 
-    /// Configure cluster scheduler URI. Used by executors to
-    /// join a cluster, or by schedulers to control their bind
-    /// address.
+    /// The bind address for the internal cluster gRPC service.
+    /// Used by both schedulers and executors.
     #[arg(
-        long = "scheduler-url",
-        value_name = "SCHEDULER_URL",
-        default_value = "spiced://localhost:50051",
+        long = "cluster-address",
+        value_name = "CLUSTER_ADDRESS",
+        default_value = "0.0.0.0:50052",
         action
     )]
-    pub scheduler_url: Url,
+    pub cluster_address: SocketAddr,
 
+    /// The path to the CA certificate used to validate cluster node identities.
     #[arg(
-        long = "allow-insecure-connections",
-        value_name = "ALLOW_INSECURE_CONNECTIONS",
-        required = false,
-        action
+        long = "cluster-ca-certificate-file",
+        value_name = "CLUSTER_CA_CERTIFICATE_FILE"
     )]
-    pub allow_insecure_connections: bool,
+    pub cluster_ca_certificate_file: Option<String>,
+
+    /// The path to the certificate file used for both server TLS and client mTLS.
+    #[arg(
+        long = "cluster-certificate-file",
+        value_name = "CLUSTER_CERTIFICATE_FILE"
+    )]
+    pub cluster_certificate_file: Option<String>,
+
+    /// The path to the private key file for the cluster certificate.
+    #[arg(long = "cluster-key-file", value_name = "CLUSTER_KEY_FILE")]
+    pub cluster_key_file: Option<String>,
+
+    /// The URL of the scheduler service. Required for executors to join a cluster.
+    #[arg(long = "cluster-scheduler-url", value_name = "CLUSTER_SCHEDULER_URL")]
+    pub cluster_scheduler_url: Option<Url>,
+
+    /// The hostname and port that this node advertises to other cluster nodes.
+    /// For schedulers: used as the URL for distributed query planning.
+    /// For executors: used during registration to tell the scheduler how to contact this node.
+    #[arg(
+        long = "cluster-advertise-address",
+        value_name = "CLUSTER_ADVERTISE_ADDRESS"
+    )]
+    pub cluster_advertise_address: Option<String>,
 }
 
 #[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
-        let url = match Url::parse("spiced://localhost:50051") {
-            Ok(url) => url,
-            Err(e) => unreachable!("The default URI could not be parsed: {}", e),
-        };
-
         Self {
             mode: None,
-            scheduler_url: url,
-            allow_insecure_connections: false,
+            cluster_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50052),
+            cluster_ca_certificate_file: None,
+            cluster_certificate_file: None,
+            cluster_key_file: None,
+            cluster_scheduler_url: None,
+            cluster_advertise_address: None,
         }
     }
 }
@@ -139,8 +160,14 @@ impl ClusterConfig {
     }
 
     #[must_use]
-    pub fn with_scheduler_url(mut self, url: Url) -> Self {
-        self.scheduler_url = url;
+    pub fn with_cluster_address(mut self, addr: SocketAddr) -> Self {
+        self.cluster_address = addr;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cluster_scheduler_url(mut self, url: Url) -> Self {
+        self.cluster_scheduler_url = Some(url);
         self
     }
 }

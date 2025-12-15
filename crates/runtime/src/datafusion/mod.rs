@@ -47,7 +47,7 @@ use crate::{status, view};
 
 #[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterConfig,
+    crate::cluster::ResolvedClusterConfig,
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -362,7 +362,7 @@ pub struct DataFusion {
 
     pub temp_directory: Option<String>,
     #[cfg(feature = "cluster")]
-    pub cluster_config: Arc<ClusterConfig>,
+    pub cluster_config: Arc<ResolvedClusterConfig>,
     #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     #[cfg(feature = "cluster")]

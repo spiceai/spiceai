@@ -1029,9 +1029,9 @@ func displayArrowResults(reader array.RecordReader) (int, uint64, error) {
 func init() {
 	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
 	sqlCmd.Flags().String("endpoint", "", "Specifies the remote Spice instance endpoint. Supports http://, https://, grpc://, or grpc+tls:// schemes. If not provided, uses local spiced runtime.")
-	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the remote Spice instance Flight endpoint (treated as gRPC endpoint). If not provided, uses local spiced runtime.")
+	sqlCmd.Flags().String("flight-endpoint", "", "(Deprecated) Specifies the remote Spice instance Flight endpoint (treated as gRPC endpoint). If not provided, uses local spiced runtime.")
 	sqlCmd.Flags().StringSlice("headers", []string{}, "Custom HTTP headers to pass to remote endpoint in the format 'Key:Value'. Can be specified multiple times.")
 	// Must override `--http-endpoint` to provide socket address (i.e. 0.0.0.0:8090), not http endpoint (http://localhost:8090). `spice sql` uses flight endpoint.
-	sqlCmd.PersistentFlags().String(constants.HttpEndpointKeyFlag, "0.0.0.0:8090", "HTTP endpoint of Spice")
+	sqlCmd.PersistentFlags().String(constants.HttpEndpointKeyFlag, "0.0.0.0:8090", "(Deprecated) HTTP endpoint of Spice")
 	RootCmd.AddCommand(sqlCmd)
 }

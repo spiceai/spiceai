@@ -33,6 +33,8 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
+use runtime::cluster::ResolvedClusterConfig;
+#[cfg(feature = "cluster")]
 use runtime::config::ClusterMode;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
@@ -215,6 +217,10 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
+    #[cfg(feature = "cluster")]
+    let resolved_cluster_config =
+        ResolvedClusterConfig::from_config_and_app(args.runtime.cluster.clone(), app.as_deref());
+
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
         // User configured extensions
@@ -228,6 +234,11 @@ pub async fn run(args: Args) -> Result<()> {
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .with_runtime_config(args.runtime.clone())
         .with_io_runtime(Handle::current());
+
+    #[cfg(feature = "cluster")]
+    if let Ok(resolved_cluster_config) = resolved_cluster_config {
+        builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+    }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
