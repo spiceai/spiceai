@@ -19,7 +19,6 @@ limitations under the License.
 //! This service handles scheduler-executor communication for cluster mode,
 //! including app definition retrieval and secret expansion.
 
-use crate::datafusion::DataFusion;
 use app::App;
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::{
@@ -27,7 +26,6 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
@@ -35,58 +33,14 @@ use tonic::{Request, Response, Status};
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
     app: Arc<RwLock<Option<Arc<App>>>>,
-    datafusion: Arc<DataFusion>,
     secrets: Arc<RwLock<Secrets>>,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
-    pub fn new(
-        app: Arc<RwLock<Option<Arc<App>>>>,
-        datafusion: Arc<DataFusion>,
-        secrets: Arc<RwLock<Secrets>>,
-    ) -> Self {
-        Self {
-            app,
-            datafusion,
-            secrets,
-        }
-    }
-
-    /// Checks if executor is a part of the Ballista cluster.
-    async fn check_executor_registration(&self, executor_id: &str) -> Result<(), Status> {
-        let scheduler = {
-            let Some(maybe_scheduler) = self.datafusion.scheduler_server.read().ok() else {
-                return Err(Status::internal("Cluster scheduler context cannot be read"));
-            };
-
-            let Some(ref scheduler) = *maybe_scheduler else {
-                return Err(Status::internal("Cluster scheduler context not available"));
-            };
-
-            Arc::clone(scheduler)
-        };
-
-        let executor_state = scheduler
-            .state
-            .executor_manager
-            .get_executor_state()
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get executor state: {e}")))?;
-
-        let executors = executor_state
-            .into_iter()
-            .map(|(e, _)| e.id)
-            .collect::<HashSet<_>>();
-
-        if executors.contains(executor_id) {
-            Ok(())
-        } else {
-            Err(Status::invalid_argument(format!(
-                "Executor {executor_id} is not a part of the cluster"
-            )))
-        }
+    pub fn new(app: Arc<RwLock<Option<Arc<App>>>>, secrets: Arc<RwLock<Secrets>>) -> Self {
+        Self { app, secrets }
     }
 }
 
@@ -101,9 +55,6 @@ impl ClusterService for ClusterServiceImpl {
             "ClusterService::get_app_definition for executor {}",
             request.executor_id
         );
-
-        self.check_executor_registration(&request.executor_id)
-            .await?;
 
         let app_guard = self.app.read().await;
         let Some(ref app) = *app_guard else {
@@ -136,9 +87,6 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id,
             request.key
         );
-
-        self.check_executor_registration(&request.executor_id)
-            .await?;
 
         tracing::debug!(
             "ExpandSecret: expanding secret {} for executor {}",

@@ -669,7 +669,7 @@ impl Runtime {
                 let cloned_tls_config = tls_config.clone();
                 let cloned_shutdown = internal_server_shutdown.clone();
                 let internal_server_fut = async move {
-                    flight::start_internal_cluster_server(
+                    cluster::start_internal_cluster_server(
                         Arc::clone(&self_ref),
                         cloned_tls_config,
                         Some(cloned_shutdown),
@@ -711,24 +711,69 @@ impl Runtime {
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
-        let cloned_endpoint_auth = endpoint_auth.clone();
-        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+        #[cfg(feature = "cluster")]
+        let flight_future: std::pin::Pin<
+            Box<dyn Future<Output = Result<(), Error>> + Send>,
+        > = if self.config.cluster.mode == Some(ClusterMode::Executor) {
+            Box::pin(
+                self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                    cluster::start_executor_flight_server(
+                        config.flight_bind_address,
+                        Arc::clone(&self_ref),
+                        cloned_tls_config,
+                        Some(flight_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartFlightServerSnafu)
+                })
+                .await,
+            )
+        } else {
+            let cloned_endpoint_auth = endpoint_auth.clone();
+            let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
-                )
-                .await
-                .context(UnableToStartFlightServerSnafu)
-            })
-            .await;
+            Box::pin(
+                self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                    flight::start(
+                        config.flight_bind_address,
+                        cloned_app_ref,
+                        Arc::clone(&self_ref),
+                        cloned_tls_config,
+                        cloned_endpoint_auth,
+                        Arc::clone(&self_ref.rate_limits),
+                        Some(flight_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartFlightServerSnafu)
+                })
+                .await,
+            )
+        };
+
+        #[cfg(not(feature = "cluster"))]
+        let flight_future: std::pin::Pin<
+            Box<dyn Future<Output = Result<(), Error>> + Send>,
+        > = {
+            let cloned_endpoint_auth = endpoint_auth.clone();
+            let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+
+            Box::pin(
+                self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                    flight::start(
+                        config.flight_bind_address,
+                        cloned_app_ref,
+                        Arc::clone(&self_ref),
+                        cloned_tls_config,
+                        cloned_endpoint_auth,
+                        Arc::clone(&self_ref.rate_limits),
+                        Some(flight_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartFlightServerSnafu)
+                })
+                .await,
+            )
+        };
 
         #[cfg(feature = "cluster")]
         // If this is an executor, we only need the shutdown signal and flight server

@@ -40,18 +40,6 @@ message ExpandSecretResponse {
     string value = 2;
 }
 
-// Legacy messages for Flight-based RPC (deprecated, kept for codec compatibility).
-// TODO: Remove these after migration is complete.
-message ExecutorExpandSecretRequest {
-    string executor_id = 1;
-    string key = 2;
-}
-
-message ExecutorExpandSecretResponse {
-    string key = 1;
-    string value = 2;
-}
-
 // Physical plan
 message SchemaCastScanExecNode {
     bytes schema = 1;

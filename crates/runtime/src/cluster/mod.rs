@@ -54,7 +54,6 @@ use runtime_proto::GetAppDefinitionRequest;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
-use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
@@ -64,8 +63,10 @@ use url::Url;
 use uuid::Uuid;
 
 pub mod datafusion;
+mod servers;
 mod service;
 
+pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::ClusterServiceImpl;
 
 /// Cluster configuration with lazily loaded TLS config.
@@ -118,12 +119,6 @@ impl ResolvedClusterConfig {
         &self.config.scheduler_url
     }
 
-    /// Returns the cluster API key.
-    #[must_use]
-    pub fn cluster_api_key(&self) -> Option<&String> {
-        self.config.cluster_api_key.as_ref()
-    }
-
     /// Returns whether insecure connections are allowed.
     #[must_use]
     pub fn allow_insecure_connections(&self) -> bool {
@@ -142,27 +137,6 @@ impl ResolvedClusterConfig {
         self.config.cluster_bind_address
     }
 
-    /// Returns the scheduler's cluster service URL.
-    ///
-    /// If `scheduler_cluster_url` is explicitly set, returns it.
-    /// Otherwise, derives it from `scheduler_url` by replacing the port with 50052.
-    #[must_use]
-    pub fn scheduler_cluster_url(&self) -> Url {
-        const DEFAULT_CLUSTER_PORT: u16 = 50052;
-
-        if let Some(ref url) = self.config.scheduler_cluster_url {
-            return url.clone();
-        }
-
-        // Derive from scheduler_url by replacing the port
-        let mut url = self.config.scheduler_url.clone();
-        if url.set_port(Some(DEFAULT_CLUSTER_PORT)).is_err() {
-            // If we can't set the port (e.g., for file:// URLs), return original
-            return self.config.scheduler_url.clone();
-        }
-        url
-    }
-
     /// Returns the cached client TLS config, if configured.
     #[must_use]
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
@@ -177,27 +151,7 @@ impl ResolvedClusterConfig {
     /// # Errors
     ///
     /// Returns an error if the CA certificate file cannot be read.
-    pub fn from_config_and_app(
-        mut config: ClusterConfig,
-        app: Option<&App>,
-    ) -> std::io::Result<Self> {
-        // If no cluster API key is set, try to use the app's auth API key
-        if config.cluster_api_key.is_none()
-            && let Some(api_key) = app
-                .and_then(|a| a.runtime.auth.as_ref())
-                .and_then(|a| a.api_key.as_ref())
-                .and_then(|ak| {
-                    if ak.enabled {
-                        ak.keys.first().cloned()
-                    } else {
-                        None
-                    }
-                })
-        {
-            let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
-            config.cluster_api_key = Some(key);
-        }
-
+    pub fn from_config_and_app(config: ClusterConfig, _app: Option<&App>) -> std::io::Result<Self> {
         Self::try_new(config)
     }
 }
@@ -275,24 +229,7 @@ pub async fn initialize_cluster_executor(
                 .into(),
             })?;
 
-    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to start executor without an API key".into(),
-        });
-    };
-
-    let interceptor = move |mut req: tonic::Request<()>| {
-        req.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {api_key}")
-                .parse()
-                .map_err(|_| tonic::Status::invalid_argument("Invalid API key"))?,
-        );
-
-        Ok(req)
-    };
-
-    let scheduler = SchedulerGrpcClient::with_interceptor(scheduler_connection, interceptor)
+    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
         .max_encoding_message_size(usize::MAX)
         .max_decoding_message_size(usize::MAX);
 
@@ -406,7 +343,7 @@ pub async fn initialize_cluster_executor(
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
-    let bind_addr = rt.config.flight_bind_address;
+    let bind_addr = rt.df.cluster_config.cluster_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
@@ -472,13 +409,10 @@ async fn create_scheduler_server(
 
 /// Creates a gRPC client for the scheduler's internal cluster service.
 async fn create_cluster_service_client(
-    scheduler_cluster_url: &Url,
-    api_key: &str,
+    scheduler_url: &Url,
     client_tls_config: Option<ClientTlsConfig>,
-) -> crate::Result<
-    ClusterServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
-> {
-    let endpoint_url = scheduler_cluster_url.to_string();
+) -> crate::Result<ClusterServiceClient<Channel>> {
+    let endpoint_url = scheduler_url.to_string();
     let mut endpoint = Endpoint::from_shared(endpoint_url.clone())
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
@@ -498,48 +432,18 @@ async fn create_cluster_service_client(
                 .into(),
         })?;
 
-    // Add authorization header with API key
-    let interceptor = AuthInterceptor {
-        api_key: api_key.to_string(),
-    };
-
-    Ok(ClusterServiceClient::with_interceptor(channel, interceptor))
+    Ok(ClusterServiceClient::new(channel))
 }
-
-/// Interceptor that adds the Authorization header to all requests.
-#[derive(Clone)]
-pub struct AuthInterceptor {
-    api_key: String,
-}
-
-impl tonic::service::Interceptor for AuthInterceptor {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
-        let auth_value = format!("Bearer {}", self.api_key)
-            .parse()
-            .map_err(|_| tonic::Status::internal("Invalid API key format"))?;
-        request.metadata_mut().insert("authorization", auth_value);
-        Ok(request)
-    }
-}
-
-/// Type alias for the intercepted cluster service client.
-pub type InterceptedClusterClient =
-    ClusterServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>;
 
 /// Wrapper struct that implements `ClusterSecretExpander` for the gRPC cluster client.
 pub struct ClusterSecretExpanderImpl {
-    client: tokio::sync::Mutex<InterceptedClusterClient>,
+    client: ClusterServiceClient<Channel>,
 }
 
 impl ClusterSecretExpanderImpl {
     #[must_use]
-    pub fn new(client: InterceptedClusterClient) -> Self {
-        Self {
-            client: tokio::sync::Mutex::new(client),
-        }
+    pub fn new(client: ClusterServiceClient<Channel>) -> Self {
+        Self { client }
     }
 }
 
@@ -553,8 +457,7 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
 
         let response = self
             .client
-            .lock()
-            .await
+            .clone()
             .expand_secret(request)
             .await
             .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
@@ -570,16 +473,9 @@ async fn executor_bind_app(
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<()> {
-    let Some(api_key) = rt.df.cluster_config.cluster_api_key().cloned() else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to start executor without an API key".into(),
-        });
-    };
-
-    let scheduler_cluster_url = rt.df.cluster_config.scheduler_cluster_url();
+    let scheduler_url = rt.df.cluster_config.scheduler_url().clone();
     let mut cluster_client =
-        create_cluster_service_client(&scheduler_cluster_url, &api_key, client_tls_config.clone())
-            .await?;
+        create_cluster_service_client(&scheduler_url, client_tls_config.clone()).await?;
 
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
@@ -594,24 +490,15 @@ async fn executor_bind_app(
 
     let app_json = response.into_inner().app_json;
 
-    let mut app_def: App = serde_json::from_str(&app_json)
+    let app_def: App = serde_json::from_str(&app_json)
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
-
-    app_def.runtime.auth = Some(Auth {
-        api_key: Some(ApiKeyAuth {
-            enabled: true,
-            keys: vec![ApiKey::ReadOnly {
-                key: api_key.clone(),
-            }],
-        }),
-    });
 
     *rt.app.write().await = Some(Arc::new(app_def));
 
     // Create a new cluster client for secrets
     let secrets_cluster_client =
-        create_cluster_service_client(&scheduler_cluster_url, &api_key, client_tls_config).await?;
+        create_cluster_service_client(&scheduler_url, client_tls_config).await?;
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);

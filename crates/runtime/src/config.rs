@@ -100,7 +100,7 @@ pub struct ClusterConfig {
     #[arg(
         long = "scheduler-url",
         value_name = "SCHEDULER_URL",
-        default_value = "http://localhost:50051",
+        default_value = "http://localhost:50052",
         action
     )]
     pub scheduler_url: Url,
@@ -114,20 +114,6 @@ pub struct ClusterConfig {
         action
     )]
     pub cluster_bind_address: SocketAddr,
-
-    /// Configure the scheduler's internal cluster service URL.
-    /// Used by executors to connect for task polling and app/secrets RPCs.
-    /// Defaults to scheduler-url with port 50052.
-    #[arg(
-        long = "scheduler-cluster-url",
-        value_name = "SCHEDULER_CLUSTER_URL",
-        action
-    )]
-    pub scheduler_cluster_url: Option<Url>,
-
-    /// Set the API key configured in the scheduler for secure RPC
-    #[arg(long = "cluster-api-key", value_name = "CLUSTER_API_KEY", action)]
-    pub cluster_api_key: Option<String>,
 
     #[arg(
         long = "allow-insecure-connections",
@@ -148,7 +134,7 @@ pub struct ClusterConfig {
 #[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
-        let url = match Url::parse("spiced://localhost:50051") {
+        let url = match Url::parse("http://localhost:50052") {
             Ok(url) => url,
             Err(e) => unreachable!("The default URI could not be parsed: {}", e),
         };
@@ -157,8 +143,6 @@ impl Default for ClusterConfig {
             mode: None,
             scheduler_url: url,
             cluster_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
-            scheduler_cluster_url: None,
-            cluster_api_key: None,
             allow_insecure_connections: false,
             cluster_ca_certificate_file: None,
         }
