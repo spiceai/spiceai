@@ -25,7 +25,7 @@ use datafusion::{
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, Operator, TableProviderFilterPushDown},
-    physical_expr::EquivalenceProperties,
+    physical_expr::{self, EquivalenceProperties},
     physical_plan::{
         DisplayAs, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
         execution_plan::{
@@ -317,7 +317,7 @@ impl TableProvider for WorkflowRunsTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -328,7 +328,7 @@ impl TableProvider for WorkflowRunsTableProvider {
         tracing::debug!("Pushing down filters to GitHub API: {query_params:?}");
         tracing::debug!("Remaining filters after pushdown: {remaining_filters:?}");
 
-        Ok(Arc::new(WorkflowRunsExecutionPlan {
+        let github_plan = Arc::new(WorkflowRunsExecutionPlan {
             owner: Arc::clone(&self.owner),
             repo: Arc::clone(&self.repo),
             workflow_id: Arc::clone(&self.workflow_id),
@@ -347,7 +347,24 @@ impl TableProvider for WorkflowRunsTableProvider {
                 EmissionType::Final,
                 Boundedness::Bounded,
             ),
-        }))
+        });
+
+        if let Some(projection) = projection {
+            let mut projection_expr = Vec::with_capacity(projection.len());
+            for idx in projection {
+                let col_name = self.schema.field(*idx).name();
+                projection_expr.push((
+                    Arc::new(physical_expr::expressions::Column::new(col_name, *idx))
+                        as Arc<dyn PhysicalExpr>,
+                    col_name.to_string(),
+                ));
+            }
+
+            let projection_exec = ProjectionExec::try_new(projection_expr, github_plan)?;
+            return Ok(Arc::new(projection_exec));
+        }
+
+        Ok(github_plan)
     }
 }
 

@@ -1107,11 +1107,11 @@ impl GithubRestClient {
 
     #[expect(clippy::too_many_lines)]
     pub async fn fetch_workflows(
-        &self,
-        owner: &str,
-        repo: &str,
+        self: Arc<Self>,
+        owner: Arc<str>,
+        repo: Arc<str>,
         limit: Option<usize>,
-    ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         self.rate_limiter.check_rate_limit().await?;
 
         let endpoint = format!("https://api.github.com/repos/{owner}/{repo}/actions/workflows");
@@ -1250,10 +1250,15 @@ impl GithubRestClient {
 
         let schema = Arc::new(Schema::new(fields));
 
-        let record_batch =
-            RecordBatch::try_new(schema, columns).context(UnableToConstructRecordBatchSnafu)?;
+        let record_batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+            .context(UnableToConstructRecordBatchSnafu)?;
 
-        Ok(vec![record_batch])
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(record_batch.clone())]),
+        );
+
+        Ok(Box::pin(stream_adapter))
     }
 }
 
