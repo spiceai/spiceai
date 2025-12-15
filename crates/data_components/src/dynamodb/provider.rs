@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, EmptyTableSnafu, Error, FailedToBootstrapTableSnafu,
-    FailedToInitializeCheckpointSnafu, FailedToInitializeStreamSnafu, Result, ScanSnafu,
-    TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
+    DescribeTableSnafu, Error, FailedToBootstrapTableSnafu, FailedToInitializeCheckpointSnafu,
+    FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
+    TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangeBatch;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
