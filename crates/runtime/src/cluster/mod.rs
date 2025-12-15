@@ -153,8 +153,8 @@ impl ResolvedClusterConfig {
         app: Option<&App>,
     ) -> std::io::Result<Self> {
         // If no cluster API key is set, try to use the app's auth API key
-        if config.cluster_api_key.is_none() {
-            if let Some(api_key) = app
+        if config.cluster_api_key.is_none()
+            && let Some(api_key) = app
                 .and_then(|a| a.runtime.auth.as_ref())
                 .and_then(|a| a.api_key.as_ref())
                 .and_then(|ak| {
@@ -164,10 +164,9 @@ impl ResolvedClusterConfig {
                         None
                     }
                 })
-            {
-                let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
-                config.cluster_api_key = Some(key);
-            }
+        {
+            let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
+            config.cluster_api_key = Some(key);
         }
 
         Self::try_new(config)
