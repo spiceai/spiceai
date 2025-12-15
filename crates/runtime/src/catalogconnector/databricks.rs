@@ -54,7 +54,7 @@ impl Databricks {
         let component_initialization =
             match DatabricksDataConnector::build_auth_credentials(&params.parameters) {
                 Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-                _ => ComponentInitialization::OnStartup,
+                _ => ComponentInitialization::default(),
             };
 
         Arc::new(Self {
@@ -133,7 +133,6 @@ impl CatalogConnector for Databricks {
         self
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: Arc<Runtime>,

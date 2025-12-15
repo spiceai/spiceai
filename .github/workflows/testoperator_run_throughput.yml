@@ -37,6 +37,7 @@ on:
           - 'odbc-databricks'
           - 'duckdb'
           - 'duckdb-zero-results'
+          - 'duckdb-partitioned'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'

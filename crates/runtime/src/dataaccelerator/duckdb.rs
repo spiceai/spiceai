@@ -69,6 +69,8 @@ pub(crate) mod settings;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+    "spice.optimizer.duckdb_aggregate_pushdown";
 
 use super::upsert_dedup;
 
@@ -301,6 +303,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("partitioned_write_buffer"),
+    ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
 #[async_trait]
@@ -549,6 +552,17 @@ pub(crate) async fn create_table_provider(
         "duckdb".to_string(),
     );
 
+    let agg_pushdown_optimization = cmd
+        .options
+        .get("optimizer_duckdb_aggregate_pushdown")
+        .map_or("disabled", |v| v.as_str())
+        .to_lowercase();
+
+    schema_metadata.insert(
+        SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
+        agg_pushdown_optimization,
+    );
+
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,
         delete_provider,
@@ -756,7 +770,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn retention_sql_fails_with_internal_tables() {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -918,7 +931,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
         let schema = Arc::new(Schema::new(vec![
@@ -1162,7 +1174,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_retention_sql_with_duckdb_accelerator() {
         use tempfile::TempDir;
 

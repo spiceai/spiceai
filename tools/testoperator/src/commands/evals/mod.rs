@@ -111,6 +111,11 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
+
+    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
+    // Resource will be set later with set_resource() before emit()
+    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+
     let health_monitor = HealthMonitor::spawn()?;
 
     println!("Executing {eval} eval benchmark for model {model}. It might take several minutes...");
@@ -186,7 +191,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
         ])
         .build();
 
-    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    telemetry.set_resource(benchmark_resource);
 
     let attributes = vec![
         KeyValue::new("model_name", model.to_string()),

@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{exporter::TelemetryExporterBuilder, reader::InitialReader};
+use crate::{exporter::TelemetryExporterBuilder, hardware::HardwareInfo, reader::InitialReader};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     Resource,
@@ -42,7 +42,23 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 /// How often to send telemetry data to the endpoint
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
 
-fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
+/// Converts a usize to i64 for telemetry, logging a warning if overflow occurs.
+fn usize_to_i64_telemetry(value: usize, metric_name: &str) -> i64 {
+    i64::try_from(value).unwrap_or_else(|_| {
+        tracing::warn!("{metric_name} value {value} exceeds i64::MAX, clamping to i64::MAX");
+        i64::MAX
+    })
+}
+
+/// Converts a u64 to i64 for telemetry, logging a warning if overflow occurs.
+fn u64_to_i64_telemetry(value: u64, metric_name: &str) -> i64 {
+    i64::try_from(value).unwrap_or_else(|_| {
+        tracing::warn!("{metric_name} value {value} exceeds i64::MAX, clamping to i64::MAX");
+        i64::MAX
+    })
+}
+
+async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
@@ -58,6 +74,13 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
+    // Detect hardware info (vCPUs, GPUs, and memory) using async version
+    // to avoid blocking the async runtime
+    let hardware_info = HardwareInfo::detect_async().await.unwrap_or_else(|e| {
+        tracing::warn!("Failed to detect hardware info: {e}. Using default values.");
+        HardwareInfo::default()
+    });
+
     Resource::builder_empty()
         .with_attributes(telemetry_properties.into_iter().chain(vec![
             KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
@@ -65,12 +88,24 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             KeyValue::new("service.instance.id", instance_id),
             KeyValue::new("spicepod.id", spicepod_id),
+            KeyValue::new(
+                "host.cpu.count",
+                usize_to_i64_telemetry(hardware_info.vcpu_count, "host.cpu.count"),
+            ),
+            KeyValue::new(
+                "host.gpu.count",
+                usize_to_i64_telemetry(hardware_info.gpu_count, "host.gpu.count"),
+            ),
+            KeyValue::new(
+                "host.memory.bytes",
+                u64_to_i64_telemetry(hardware_info.total_memory_bytes, "host.memory.bytes"),
+            ),
         ]))
         .build()
 }
 
 pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
-    let resource = resource(spicepod_name, telemetry_properties);
+    let resource = resource(spicepod_name, telemetry_properties).await;
 
     let Ok(exporter) = TelemetryExporterBuilder::new()
         .with_endpoint(Arc::clone(&ENDPOINT))

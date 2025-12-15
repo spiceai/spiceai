@@ -178,6 +178,8 @@ pub struct AppendArgs {
     pub load_steps: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_conflict_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_retention_data: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for LoadArgs {

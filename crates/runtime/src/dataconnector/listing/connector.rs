@@ -15,17 +15,17 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Result as DFResult, ScalarValue};
+use datafusion::common::{Constraints, DFSchema, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::file_format::{
@@ -40,6 +40,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
+#[cfg(feature = "vortex")]
+use datafusion_datasource::file_format::FileFormatFactory;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{PartitionedFile, metadata::MetadataColumn};
@@ -47,6 +49,8 @@ use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
+#[cfg(feature = "vortex")]
+use vortex_datafusion::VortexFormatFactory;
 
 use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
@@ -59,6 +63,7 @@ use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
 use super::DelimitedFormat;
+use crate::dataconnector::DataConnectorError::SchemaMismatch;
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
@@ -536,6 +541,11 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
             )),
+            #[cfg(feature = "vortex")]
+            (Some("vortex"), _) | (None, Some("vortex")) => Ok((
+                Some(VortexFormatFactory::new().default()),
+                extension.unwrap_or(".vortex".to_string()),
+            )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(
                     ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
@@ -844,7 +854,6 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn create_listing_table(
         &self,
         dataset: &Dataset,
@@ -971,9 +980,21 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
+        let final_schema = if dataset.get_param("hive_partitioning_enabled", false)
+            && table_path.is_collection()
+        {
+            self.deduplicate_partition_columns_expressed_in_file(
+                dataset,
+                expanded_schema,
+                &options.table_partition_cols,
+            )?
+        } else {
+            expanded_schema
+        };
+
         let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
-            .with_schema(expanded_schema);
+            .with_schema(final_schema);
 
         // This shouldn't error because we're passing the schema and options correctly.
         let table =
@@ -1022,6 +1043,55 @@ pub trait ListingTableConnector: DataConnector {
         } else {
             Ok(table_arc)
         }
+    }
+
+    fn deduplicate_partition_columns_expressed_in_file(
+        &self,
+        dataset: &Dataset,
+        schema: SchemaRef,
+        partition_cols: &[(String, DataType)],
+    ) -> DataConnectorResult<SchemaRef> {
+        if partition_cols.is_empty() {
+            return Ok(schema);
+        }
+
+        let mut idents = schema
+            .fields
+            .iter()
+            .map(|f| (f.name().to_string(), f.as_ref().clone()))
+            .collect::<HashMap<_, _>>();
+
+        for (name, partition_type) in partition_cols {
+            if let Some(field) = idents.remove(name) {
+                let types_match = match (partition_type, field.data_type()) {
+                    (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View) => true,
+                    (pt, ft) => DFSchema::datatype_is_semantically_equal(pt, ft),
+                };
+
+                if !types_match {
+                    return Err(SchemaMismatch {
+                        dataset_name: dataset.name.to_string(),
+                        differences: format!(
+                            "Field {name} cannot be deduplicated as its field types differ:\
+                            (partition column): {}, (file column): {}",
+                            partition_type,
+                            field.data_type()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let new_schema = Schema::new(
+            schema
+                .fields
+                .iter()
+                .filter_map(|f| idents.remove(f.name()))
+                .collect::<Vec<_>>(),
+        )
+        .with_metadata(schema.metadata.clone());
+
+        Ok(Arc::new(new_schema))
     }
 }
 

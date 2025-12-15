@@ -82,6 +82,11 @@ impl Embeddings {
     }
 
     #[must_use]
+    pub fn with_params(self, params: HashMap<String, Value>) -> Self {
+        Self { params, ..self }
+    }
+
+    #[must_use]
     pub fn get_prefix(&self) -> Option<EmbeddingPrefix> {
         EmbeddingPrefix::try_from(self.from.as_str()).ok()
     }
