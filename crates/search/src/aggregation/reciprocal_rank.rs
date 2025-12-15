@@ -275,7 +275,7 @@ fn ith_search_value_column(i: usize) -> String {
 ///
 /// This function takes already-registered table names from a SessionContext and builds
 /// a logical plan that performs reciprocal rank fusion across them.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn reciprocal_rank_fusion_plan(
     ctx: &SessionContext,
     tables: &[TableReference],
