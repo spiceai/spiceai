@@ -82,4 +82,7 @@ pub enum Error {
 
     #[snafu(display("Failed to Bootstrap DynamoDB Table: {source}"))]
     FailedToBootstrapTable { source: DataFusionError },
+
+    #[snafu(display("DynamoDB table {table_name} is empty"))]
+    EmptyTable { table_name: String },
 }
