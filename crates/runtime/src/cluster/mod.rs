@@ -534,9 +534,11 @@ async fn create_cluster_service_client(
     let channel = endpoint
         .connect()
         .await
-        .map_err(|_| FailedToStartClusterExecutor {
-            source: format!("Unable to connect to scheduler cluster service at {endpoint_url}")
-                .into(),
+        .map_err(|e| FailedToStartClusterExecutor {
+            source: format!(
+                "Unable to connect to scheduler cluster service at {endpoint_url}: {e}"
+            )
+            .into(),
         })?;
 
     Ok(ClusterServiceClient::new(channel))
