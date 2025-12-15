@@ -479,7 +479,7 @@ pub async fn start(
     }
 
     #[cfg(feature = "cluster")]
-    if rt.config.cluster.mode.is_some() && rt.df.cluster_config.cluster_api_key.is_none() {
+    if rt.config.cluster.mode.is_some() && rt.df.cluster_config.cluster_api_key().is_none() {
         return Err(Error::InsecureConfiguration {
             message:
                 "Refusing to start in clustered mode without configuring API key authentication.\

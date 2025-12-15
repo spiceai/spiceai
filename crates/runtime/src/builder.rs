@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "cluster")]
+use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::{
@@ -32,7 +34,6 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
-use spicepod::component::runtime::ApiKey;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -56,6 +57,8 @@ pub struct RuntimeBuilder {
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
+    #[cfg(feature = "cluster")]
+    resolved_cluster_config: Option<ResolvedClusterConfig>,
 }
 
 impl RuntimeBuilder {
@@ -75,6 +78,8 @@ impl RuntimeBuilder {
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
+            #[cfg(feature = "cluster")]
+            resolved_cluster_config: None,
         }
     }
 
@@ -144,6 +149,15 @@ impl RuntimeBuilder {
 
     pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
         self.io_runtime = Some(io_runtime);
+        self
+    }
+
+    #[cfg(feature = "cluster")]
+    pub fn with_resolved_cluster_config(
+        mut self,
+        resolved_cluster_config: ResolvedClusterConfig,
+    ) -> Self {
+        self.resolved_cluster_config = Some(resolved_cluster_config);
         self
     }
 
@@ -220,29 +234,9 @@ impl RuntimeBuilder {
         .with_resource_monitor(resource_monitor.clone());
 
         #[cfg(feature = "cluster")]
-        {
-            let mut cluster_config = self.runtime_config.cluster.clone();
-
-            if let Some(api_key) = self
-                .app
-                .as_ref()
-                .and_then(|a| a.runtime.auth.as_ref())
-                .and_then(|a| a.api_key.as_ref())
-                .and_then(|ak| {
-                    if ak.enabled {
-                        ak.keys.first().cloned()
-                    } else {
-                        None
-                    }
-                })
-            {
-                let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
-                cluster_config.cluster_api_key = Some(key);
-            }
-
-            let cluster_config = Arc::new(cluster_config);
-            df_builder = df_builder.with_cluster_config(cluster_config);
-        };
+        if let Some(resolved_cluster_config) = self.resolved_cluster_config {
+            df_builder = df_builder.with_cluster_config(resolved_cluster_config);
+        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);

@@ -82,7 +82,6 @@ use opentelemetry::KeyValue;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
-use tonic::transport::{Certificate, ClientTlsConfig};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -167,27 +166,16 @@ impl Query {
 
     #[cfg(feature = "cluster")]
     fn get_session_state(&self) -> Result<SessionState> {
-        if !matches!(self.df.cluster_config.mode, Some(ClusterMode::Scheduler)) {
+        if !matches!(self.df.cluster_config.mode(), Some(ClusterMode::Scheduler)) {
             return Ok(self.df.ctx.state());
         }
 
-        let Some(ref api_key) = self.df.cluster_config.cluster_api_key else {
+        let Some(api_key) = self.df.cluster_config.cluster_api_key() else {
             return config_err!("API key is required for scheduler to perform planning")
                 .map_err(|e| UnableToExecuteQuery { source: e });
         };
 
-        let maybe_client_tls_config =
-            if let Some(ref ca_path) = self.df.cluster_config.cluster_ca_certificate_file {
-                let ca_certificate =
-                    std::fs::read(ca_path)
-                        .boxed()
-                        .map_err(|e| Error::UnableToExecuteQuery {
-                            source: DataFusionError::External(e),
-                        })?;
-                Some(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)))
-            } else {
-                None
-            };
+        let maybe_client_tls_config = self.df.cluster_config.client_tls_config().cloned();
 
         let use_tls = maybe_client_tls_config.is_some();
 
@@ -212,7 +200,7 @@ impl Query {
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
-                self.df.cluster_config.scheduler_url.to_string(),
+                self.df.cluster_config.scheduler_url().to_string(),
                 cfg.ballista_config(),
                 SpiceLogicalCodec::new_codec(),
                 DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
@@ -224,7 +212,7 @@ impl Query {
                     .with_option_extension(SpiceClusterConfig::default()),
             )
             .build()
-            .upgrade_for_ballista(self.df.cluster_config.scheduler_url.to_string())
+            .upgrade_for_ballista(self.df.cluster_config.scheduler_url().to_string())
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
     }
 
