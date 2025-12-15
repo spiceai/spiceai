@@ -15,6 +15,7 @@ datafusion-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-proto = { workspace = true }
 prost = { workspace = true }
+tonic = { workspace = true }
 
 [build-dependencies]
-prost-build = "0.13.1"
+tonic-build = "0.13"

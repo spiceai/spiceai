@@ -13373,7 +13373,8 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-proto",
  "prost 0.13.5",
- "prost-build",
+ "tonic 0.13.1",
+ "tonic-build",
 ]
 
 [[package]]
@@ -13434,6 +13435,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tokio",
+ "tonic 0.13.1",
  "tracing",
 ]
 
