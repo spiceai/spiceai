@@ -15,9 +15,9 @@ limitations under the License.
 */
 use crate::concrete;
 use crate::config::cluster_config::SpiceClusterConfig;
-use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, Statistics};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::Partitioning;
@@ -167,11 +167,14 @@ impl DistributeFileScanOptimizer {
                 let mut stats = Statistics::new_unknown(file_scan_config.file_schema.as_ref());
 
                 // We can deduce the byte size from the read range
-                stats.total_byte_size = Precision::Exact(Self::read_size(&pf) as usize);
+                stats.total_byte_size =
+                    Precision::Exact(usize::try_from(Self::read_size(&pf)).map_err(|_| {
+                        DataFusionError::Execution("Cannot cast usize".to_string())
+                    })?);
                 pf.statistics = Some(Arc::new(stats));
-                pf
+                Ok(pf)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         let read_size: u64 = partitioned_files.iter().map(Self::read_size).sum();
 
