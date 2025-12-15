@@ -42,6 +42,22 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 /// How often to send telemetry data to the endpoint
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
 
+/// Converts a usize to i64 for telemetry, logging a warning if overflow occurs.
+fn usize_to_i64_telemetry(value: usize, metric_name: &str) -> i64 {
+    i64::try_from(value).unwrap_or_else(|_| {
+        tracing::warn!("{metric_name} value {value} exceeds i64::MAX, clamping to i64::MAX");
+        i64::MAX
+    })
+}
+
+/// Converts a u64 to i64 for telemetry, logging a warning if overflow occurs.
+fn u64_to_i64_telemetry(value: u64, metric_name: &str) -> i64 {
+    i64::try_from(value).unwrap_or_else(|_| {
+        tracing::warn!("{metric_name} value {value} exceeds i64::MAX, clamping to i64::MAX");
+        i64::MAX
+    })
+}
+
 async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
@@ -60,9 +76,10 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
 
     // Detect hardware info (vCPUs, GPUs, and memory) using async version
     // to avoid blocking the async runtime
-    let hardware_info = HardwareInfo::detect_async()
-        .await
-        .unwrap_or_else(|_| HardwareInfo::detect());
+    let hardware_info = HardwareInfo::detect_async().await.unwrap_or_else(|e| {
+        tracing::warn!("Failed to detect hardware info: {e}. Using default values.");
+        HardwareInfo::default()
+    });
 
     Resource::builder_empty()
         .with_attributes(telemetry_properties.into_iter().chain(vec![
@@ -73,15 +90,15 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
             KeyValue::new("spicepod.id", spicepod_id),
             KeyValue::new(
                 "host.cpu.count",
-                i64::try_from(hardware_info.vcpu_count).unwrap_or(i64::MAX),
+                usize_to_i64_telemetry(hardware_info.vcpu_count, "host.cpu.count"),
             ),
             KeyValue::new(
                 "host.gpu.count",
-                i64::try_from(hardware_info.gpu_count).unwrap_or(i64::MAX),
+                usize_to_i64_telemetry(hardware_info.gpu_count, "host.gpu.count"),
             ),
             KeyValue::new(
                 "host.memory.bytes",
-                i64::try_from(hardware_info.total_memory_bytes).unwrap_or(i64::MAX),
+                u64_to_i64_telemetry(hardware_info.total_memory_bytes, "host.memory.bytes"),
             ),
         ]))
         .build()
