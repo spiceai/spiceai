@@ -28,6 +28,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use util::time_format::{ParsedDateTime, parse_datetime};
 
+/// Maximum recursion depth for nested `DynamoDB` structures during JSON conversion.
+/// This limit prevents stack overflow from maliciously crafted deeply nested data.
+const MAX_RECURSION_DEPTH: usize = 100;
+
 pub fn dynamodb_items_to_arrow(
     items: &[HashMap<String, AttributeValue>],
     projected_schema: SchemaRef,
@@ -477,14 +481,26 @@ fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
 }
 
 pub fn attribute_map_to_json(map: &HashMap<String, AttributeValue>) -> Value {
+    attribute_map_to_json_with_depth(map, 0)
+}
+
+fn attribute_map_to_json_with_depth(map: &HashMap<String, AttributeValue>, depth: usize) -> Value {
+    if depth > MAX_RECURSION_DEPTH {
+        // Return null for excessively nested structures to prevent stack overflow
+        return Value::Null;
+    }
     Value::Object(
         map.iter()
-            .map(|(k, v)| (k.clone(), attribute_value_to_json(v)))
+            .map(|(k, v)| (k.clone(), attribute_value_to_json_with_depth(v, depth)))
             .collect(),
     )
 }
 
-fn attribute_value_to_json(av: &AttributeValue) -> Value {
+fn attribute_value_to_json_with_depth(av: &AttributeValue, depth: usize) -> Value {
+    if depth > MAX_RECURSION_DEPTH {
+        // Return null for excessively nested structures to prevent stack overflow
+        return Value::Null;
+    }
     match av {
         AttributeValue::S(s) => Value::String(s.clone()),
         AttributeValue::N(n) => {
@@ -501,8 +517,12 @@ fn attribute_value_to_json(av: &AttributeValue) -> Value {
             }
         }
         AttributeValue::Bool(b) => Value::Bool(*b),
-        AttributeValue::L(list) => Value::Array(list.iter().map(attribute_value_to_json).collect()),
-        AttributeValue::M(map) => attribute_map_to_json(map),
+        AttributeValue::L(list) => Value::Array(
+            list.iter()
+                .map(|item| attribute_value_to_json_with_depth(item, depth + 1))
+                .collect(),
+        ),
+        AttributeValue::M(map) => attribute_map_to_json_with_depth(map, depth + 1),
         AttributeValue::Null(_) | _ => Value::Null,
     }
 }
@@ -1213,5 +1233,61 @@ mod tests {
         assert_eq!(string_values.value(0), "valid");
         assert!(string_values.is_null(1));
         assert_eq!(string_values.value(2), "also_valid");
+    }
+
+    #[test]
+    fn test_attribute_map_to_json_max_depth() {
+        // Build a deeply nested structure that exceeds MAX_RECURSION_DEPTH
+        let depth = super::MAX_RECURSION_DEPTH + 10;
+
+        // Start with the innermost map
+        let mut current_map = HashMap::new();
+        current_map.insert("leaf".to_string(), AttributeValue::S("value".to_string()));
+
+        // Wrap it in nested maps
+        for i in 0..depth {
+            let mut outer_map = HashMap::new();
+            outer_map.insert(format!("level_{i}"), AttributeValue::M(current_map));
+            current_map = outer_map;
+        }
+
+        // Should not panic - returns null for too-deep structures
+        let result = attribute_map_to_json(&current_map);
+
+        // The result should be a valid JSON value (we truncate at depth limit)
+        assert!(result.is_object());
+    }
+
+    #[test]
+    fn test_attribute_map_to_json_within_limit() {
+        // Build a nested structure within the limit
+        let depth = 50; // Well within MAX_RECURSION_DEPTH of 100
+
+        // Start with the innermost map
+        let mut current_map = HashMap::new();
+        current_map.insert("leaf".to_string(), AttributeValue::S("value".to_string()));
+
+        // Wrap it in nested maps
+        for i in 0..depth {
+            let mut outer_map = HashMap::new();
+            outer_map.insert(format!("level_{i}"), AttributeValue::M(current_map));
+            current_map = outer_map;
+        }
+
+        let result = attribute_map_to_json(&current_map);
+
+        // Should be valid object
+        assert!(result.is_object());
+
+        // Navigate to the leaf value
+        let mut current = &result;
+        for i in (0..depth).rev() {
+            let key = format!("level_{i}");
+            current = current.get(&key).expect("expected nested object");
+        }
+        assert_eq!(
+            current.get("leaf"),
+            Some(&Value::String("value".to_string()))
+        );
     }
 }

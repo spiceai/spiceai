@@ -22,8 +22,8 @@ use super::{
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
-use std::path::Path;
 use std::sync::Arc;
+use std::{fmt::Debug, path::Path};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 
@@ -31,6 +31,14 @@ use turso::{Builder, Connection, Database, Value as TursoValue};
 pub struct TursoMetastore {
     db: Arc<Mutex<Option<Database>>>,
     connection_string: String,
+}
+
+impl Debug for TursoMetastore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TursoMetastore")
+            .field("connection_string", &self.connection_string)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TursoMetastore {
@@ -61,21 +69,19 @@ impl TursoMetastore {
         let db_path = self.db_path();
 
         // Create parent directory if it doesn't exist
-        let db_dir = Path::new(db_path)
-            .parent()
-            .ok_or_else(|| CatalogError::InvalidOperation {
-                message: "Invalid database path".to_string(),
-            })?;
+        let db_dir =
+            Path::new(db_path)
+                .parent()
+                .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                    path: db_path.to_string(),
+                })?;
 
         if !db_dir.exists() {
             tokio::fs::create_dir_all(db_dir).await?;
         }
 
         let db = Builder::new_local(db_path)
-            // Note: Turso doesn't support indexes with MVCC, and PRIMARY KEY automatically creates
-            // indexes. All PRIMARY KEY constraints have been replaced with NOT NULL to enable
-            // MVCC for better concurrent read performance. Once Turso supports indexes with MVCC, we can re-add indexes.
-            .with_mvcc(true)
+            .with_mvcc(false) // Enable MVCC when Turso supports it with indexes: https://github.com/spiceai/spiceai/issues/8526
             .build()
             .await
             .map_err(|e| CatalogError::Database {
@@ -94,20 +100,10 @@ impl TursoMetastore {
         })
     }
 
-    /// Schema for the `cayenne_metadata` table that tracks next IDs.
-    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
-    const METADATA_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_metadata (
-            key TEXT NOT NULL,
-            value BIGINT NOT NULL
-        )
-    ";
-
     /// Schema for the `cayenne_table` table.
-    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id BIGINT NOT NULL,
+            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_uuid TEXT NOT NULL,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -120,49 +116,33 @@ impl TursoMetastore {
         )
     ";
 
-    /// Schema for the `cayenne_data_file` table.
-    /// Note: PRIMARY KEY and FOREIGN KEY constraints removed to enable MVCC mode in libSQL.
-    /// MVCC is incompatible with any indexes, including those created by constraints.
-    const DATA_FILE_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_data_file (
-            data_file_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
-            partition_id BIGINT,
-            file_order BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_format TEXT NOT NULL,
-            record_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            row_id_start BIGINT NOT NULL
-        )
-    ";
-
     /// Schema for the `cayenne_delete_file` table.
-    /// Note: PRIMARY KEY constraint removed to enable MVCC mode in libSQL.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
-            data_file_id BIGINT NOT NULL,
+            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
-            file_size_bytes BIGINT NOT NULL
+            file_size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 
     /// Schema for the `cayenne_partition` table.
-    /// Note: UNIQUE constraint removed for Turso as indexes are not yet supported with MVCC
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
+            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
+            partition_column TEXT NOT NULL,
             partition_value TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            row_count BIGINT NOT NULL
+            path TEXT NOT NULL,
+            path_is_relative BOOLEAN NOT NULL,
+            record_count BIGINT NOT NULL DEFAULT 0,
+            file_size_bytes BIGINT NOT NULL DEFAULT 0,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            UNIQUE(table_id, partition_column, partition_value)
         )
     ";
 }
@@ -256,10 +236,6 @@ impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
 
-        // Note: Foreign keys are NOT enabled because FOREIGN KEY constraints create indexes
-        // that are incompatible with MVCC mode. All foreign key constraints have been removed
-        // from the schema to enable MVCC for better concurrent read performance.
-
         // NORMAL synchronous mode: safe with WAL, more performant than FULL
         // With WAL mode, NORMAL only syncs at checkpoints, not on every commit
         conn.execute("PRAGMA synchronous = NORMAL", ())
@@ -278,10 +254,8 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {};",
-            Self::METADATA_TABLE_DDL,
+            "{}; {}; {};",
             Self::TABLE_TABLE_DDL,
-            Self::DATA_FILE_TABLE_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL
         );
@@ -291,34 +265,6 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
             })?;
-
-        // Initialize metadata with next IDs if not exists
-        conn.execute(
-            "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_catalog_id', 1)",
-            (),
-        )
-        .await
-        .map_err(|e| CatalogError::Database {
-            message: format!("Failed to initialize metadata: {e}"),
-        })?;
-
-        conn.execute(
-            "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_file_id', 1)",
-            (),
-        )
-        .await
-        .map_err(|e| CatalogError::Database {
-            message: format!("Failed to initialize metadata: {e}"),
-        })?;
-
-        conn.execute(
-            "INSERT OR IGNORE INTO cayenne_metadata (key, value) VALUES ('next_partition_id', 1)",
-            (),
-        )
-        .await
-        .map_err(|e| CatalogError::Database {
-            message: format!("Failed to initialize metadata: {e}"),
-        })?;
 
         Ok(())
     }

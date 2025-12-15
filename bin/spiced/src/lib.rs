@@ -262,11 +262,20 @@ pub async fn run(args: Args) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let tokio_runtime = ManagedTokioRuntime::try_new()
+            let cpu_runtime = ManagedTokioRuntime::try_new()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cpu_runtime(tokio_runtime);
+            rt.datafusion().set_cpu_runtime(cpu_runtime);
+
+            // Create a dedicated refresh runtime for acceleration refresh workers.
+            // This isolates refresh workloads from query execution to prevent large refresh
+            // operations from impacting query latency.
+            let refresh_runtime = ManagedTokioRuntime::try_new()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_refresh_runtime(refresh_runtime);
         }
         Some("disabled") => {
             tracing::info!(

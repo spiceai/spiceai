@@ -19,9 +19,9 @@ use std::{panic, sync::Arc};
 use crate::{flight::query_to_batches, queries::Query};
 use spiceai::Client as SpiceClient;
 
-const CAYENNE_PATH_FILTER_PATTERN: &str =
+pub const CAYENNE_PATH_FILTER_PATTERN: &str =
     r"(/data/[A-Za-z0-9_\-\[\]=]+)(?:/[A-Za-z0-9_\-\.\[\]=]+)+\.vortex";
-const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
+pub const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
 const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
 const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 

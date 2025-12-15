@@ -34,5 +34,5 @@ object_store.workspace = true
 tokio.workspace = true
 
 [features]
-cluster = []
+cluster = ["datafusion-optimizer-rules/cluster"]
 default = []
