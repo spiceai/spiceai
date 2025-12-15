@@ -40,15 +40,6 @@ pub struct Config {
     )]
     pub flight_bind_address: SocketAddr,
 
-    /// Configure runtime OpenTelemetry address.
-    #[arg(
-        long = "open_telemetry",
-        value_name = "OPEN_TELEMETRY_BIND_ADDRESS",
-        default_value = "127.0.0.1:50052",
-        action
-    )]
-    pub open_telemetry_bind_address: SocketAddr,
-
     /// All cluster related arguments
     #[cfg(feature = "cluster")]
     #[clap(flatten)]
@@ -67,7 +58,6 @@ impl Config {
         Self {
             http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090),
             flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
-            open_telemetry_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
             #[cfg(feature = "cluster")]
             cluster: ClusterConfig::default(),
         }
@@ -82,12 +72,6 @@ impl Config {
     #[must_use]
     pub fn with_flight_bind_address(mut self, bind_addr: SocketAddr) -> Self {
         self.flight_bind_address = bind_addr;
-        self
-    }
-
-    #[must_use]
-    pub fn with_open_telemetry_bind_address(mut self, bind_addr: SocketAddr) -> Self {
-        self.open_telemetry_bind_address = bind_addr;
         self
     }
 }
@@ -116,10 +100,14 @@ pub struct ClusterConfig {
     #[arg(
         long = "scheduler-url",
         value_name = "SCHEDULER_URL",
-        default_value = "spiced://localhost:50051",
+        default_value = "http://localhost:50051",
         action
     )]
     pub scheduler_url: Url,
+
+    /// Set the API key configured in the scheduler for secure RPC
+    #[arg(long = "cluster-api-key", value_name = "CLUSTER_API_KEY", action)]
+    pub cluster_api_key: Option<String>,
 
     #[arg(
         long = "allow-insecure-connections",
@@ -128,6 +116,13 @@ pub struct ClusterConfig {
         action
     )]
     pub allow_insecure_connections: bool,
+
+    /// The path to the CA cert used to validate the server's identity
+    #[arg(
+        long = "cluster-ca-certificate-file",
+        value_name = "CLUSTER_CA_CERTIFICATE_FILE"
+    )]
+    pub cluster_ca_certificate_file: Option<String>,
 }
 
 #[cfg(feature = "cluster")]
@@ -141,7 +136,9 @@ impl Default for ClusterConfig {
         Self {
             mode: None,
             scheduler_url: url,
+            cluster_api_key: None,
             allow_insecure_connections: false,
+            cluster_ca_certificate_file: None,
         }
     }
 }

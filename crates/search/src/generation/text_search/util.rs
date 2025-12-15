@@ -90,7 +90,6 @@ macro_rules! downcast_array {
     };
 }
 
-#[expect(clippy::too_many_lines)]
 pub fn array_to_terms(field: Field, arr: &ArrayRef) -> Result<Vec<Term>, ArrowError> {
     let mut terms = Vec::with_capacity(arr.len());
 

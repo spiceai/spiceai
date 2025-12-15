@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/search/mod.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "How is microsporidia infection typically acquired?"
+      },
+      "primary_key": {
+        "id": 446
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
+      },
+      "primary_key": {
+        "id": 1193
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+      },
+      "primary_key": {
+        "id": 449
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "Which of the following is an intensive property of a system?"
+      },
+      "primary_key": {
+        "id": 1289
+      },
+      "score": 0.01
+    }
+  ]
+}

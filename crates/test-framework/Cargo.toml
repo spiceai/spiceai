@@ -12,6 +12,7 @@ version.workspace = true
 anyhow.workspace = true
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
+arrow-json.workspace = true
 async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -29,6 +30,7 @@ indicatif = "0.18.0"
 insta.workspace = true
 octocrab = "0.47.0"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 rand.workspace = true

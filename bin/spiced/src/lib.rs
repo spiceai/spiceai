@@ -33,6 +33,8 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
+use runtime::cluster::ResolvedClusterConfig;
+#[cfg(feature = "cluster")]
 use runtime::config::ClusterMode;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
@@ -183,7 +185,6 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -216,6 +217,10 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
+    #[cfg(feature = "cluster")]
+    let resolved_cluster_config =
+        ResolvedClusterConfig::from_config_and_app(args.runtime.cluster.clone(), app.as_deref());
+
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
         // User configured extensions
@@ -229,6 +234,11 @@ pub async fn run(args: Args) -> Result<()> {
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .with_runtime_config(args.runtime.clone())
         .with_io_runtime(Handle::current());
+
+    #[cfg(feature = "cluster")]
+    if let Ok(resolved_cluster_config) = resolved_cluster_config {
+        builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+    }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -262,11 +272,25 @@ pub async fn run(args: Args) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let tokio_runtime = ManagedTokioRuntime::try_new()
+            let cpu_runtime = ManagedTokioRuntime::try_new()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cpu_runtime(tokio_runtime);
+            rt.datafusion().set_cpu_runtime(cpu_runtime);
+
+            // Create a dedicated refresh runtime for acceleration refresh workers and
+            // stale-while-revalidate background cache refresh tasks. This isolates refresh
+            // workloads from query execution to prevent large refresh operations from
+            // impacting query latency.
+            // Uses low thread priority to minimize impact on latency-sensitive operations.
+            let refresh_runtime = ManagedTokioRuntime::builder()
+                .with_low_priority()
+                .with_thread_name("refresh-worker")
+                .build()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_refresh_runtime(refresh_runtime);
         }
         Some("disabled") => {
             tracing::info!(
@@ -439,6 +463,13 @@ async fn start_anonymous_telemetry(
     spicepod_telemetry_config: Option<&TelemetryConfig>,
     spicepod_name: Option<&String>,
 ) {
+    // Always log hardware info at debug level regardless of telemetry settings
+    // Use async version to avoid blocking the async runtime
+    let hardware_info = telemetry::hardware::HardwareInfo::detect_async()
+        .await
+        .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
+    hardware_info.log_debug();
+
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 

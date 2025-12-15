@@ -693,18 +693,10 @@ func (c *RuntimeContext) configureMetricsFlag(args []string) []string {
 	return args
 }
 
-func (c *RuntimeContext) configureOpenTelemetryEndpoint(args []string) []string {
-	if otelEndpoint, err := c.flags.GetString("open-telemetry-endpoint"); err == nil && otelEndpoint != "" {
-		args = appendIfAbsent(args, "--open_telemetry", otelEndpoint)
-	}
-	return args
-}
-
 func (c *RuntimeContext) configureEndpoints(args []string) []string {
 	args = c.configureFlightFlag(args)
 	args = appendIfAbsent(args, "--http", c.HttpSocketAddress())
 	args = c.configureMetricsFlag(args)
-	args = c.configureOpenTelemetryEndpoint(args)
 	return args
 }
 

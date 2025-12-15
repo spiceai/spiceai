@@ -72,7 +72,6 @@ pub fn parse_datetime(input: &str, go_format: &str) -> Option<ParsedDateTime> {
     }
 }
 
-#[expect(clippy::too_many_lines)]
 fn convert_go_format_to_rust(go_format: &str) -> Option<String> {
     if go_format.is_empty() {
         return None;

@@ -226,7 +226,6 @@ impl SearchIndex for ChunkedSearchIndex {
     /// | 116 | Do planning and scheduling mean the                  | 0        | [0, 35]   | textbook_reasoning |
     /// | 116 | same thing? (Yes | No)                               | 0        | [35, 57]  | textbook_reasoning |
     /// +-----+------------------------------------------------------+----------|-----------|--------------------+
-    #[expect(clippy::too_many_lines)]
     async fn write(
         &self,
         record: RecordBatch,

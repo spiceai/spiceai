@@ -41,6 +41,21 @@ pub enum Error {
 
 impl Error {
     #[must_use]
+    pub fn is_user_error(&self) -> bool {
+        #[cfg(feature = "text_search")]
+        {
+            matches!(
+                self,
+                Error::TextSearchError { source } if source.is_user_error()
+            )
+        }
+        #[cfg(not(feature = "text_search"))]
+        {
+            false
+        }
+    }
+
+    #[must_use]
     pub fn internal(msg: &str) -> Self {
         Self::InternalError {
             source: Box::from(msg),

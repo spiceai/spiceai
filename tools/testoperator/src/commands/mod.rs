@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use crate::args::{DatasetTestArgs, QuerySetLoader};
+use crate::args::{CommonArgs, DatasetTestArgs, QuerySetLoader};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
@@ -25,6 +25,7 @@ use test_framework::{
     spicepod::Spicepod,
     spicepod_utils::from_app,
     spicetest::datasets::NotStarted,
+    telemetry::{OtlpExporterConfig, Telemetry},
 };
 
 #[cfg(feature = "append")]
@@ -41,7 +42,18 @@ pub(crate) mod throughput;
 mod util;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
-use crate::args::CommonArgs;
+#[must_use]
+pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
+    if let Some(endpoint) = &common.otlp_endpoint {
+        return Telemetry::with_otlp(OtlpExporterConfig {
+            endpoint: endpoint.clone().into(),
+            headers: common.otlp_header.clone(),
+            timeout: Duration::from_secs(10),
+        });
+    }
+
+    Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY")
+}
 
 /// Build a test configuration with validation data if applicable
 ///
@@ -103,7 +115,7 @@ pub(crate) async fn get_app_and_start_request(
     spicepod.dependencies = vec![];
     let app = app_builder.build();
 
-    let mut start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app.clone()))?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());

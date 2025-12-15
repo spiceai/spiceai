@@ -1,0 +1,27 @@
+---
+source: crates/runtime/tests/search/mod.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "id": 890,
+    "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume.",
+    "score": 0.632
+  },
+  {
+    "id": 1303,
+    "answer": "The metallic bonds become longer and weaker as the atoms get larger, resulting in lower boiling points.",
+    "score": 0.606
+  },
+  {
+    "id": 449,
+    "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
+    "score": 0.58
+  },
+  {
+    "id": 819,
+    "answer": "The main advantages of PI chemotherapy are reduced hematologic toxicity and lower total cost because fewer drugs are used.",
+    "score": 0.576
+  }
+]
