@@ -100,10 +100,14 @@ pub struct ClusterConfig {
     #[arg(
         long = "scheduler-url",
         value_name = "SCHEDULER_URL",
-        default_value = "spiced://localhost:50051",
+        default_value = "http://localhost:50051",
         action
     )]
     pub scheduler_url: Url,
+
+    /// Set the API key configured in the scheduler for secure RPC
+    #[arg(long = "cluster-api-key", value_name = "CLUSTER_API_KEY", action)]
+    pub cluster_api_key: Option<String>,
 
     #[arg(
         long = "allow-insecure-connections",
@@ -112,6 +116,13 @@ pub struct ClusterConfig {
         action
     )]
     pub allow_insecure_connections: bool,
+
+    /// The path to the CA cert used to validate the server's identity
+    #[arg(
+        long = "cluster-ca-certificate-file",
+        value_name = "CLUSTER_CA_CERTIFICATE_FILE"
+    )]
+    pub cluster_ca_certificate_file: Option<String>,
 }
 
 #[cfg(feature = "cluster")]
@@ -125,7 +136,9 @@ impl Default for ClusterConfig {
         Self {
             mode: None,
             scheduler_url: url,
+            cluster_api_key: None,
             allow_insecure_connections: false,
+            cluster_ca_certificate_file: None,
         }
     }
 }

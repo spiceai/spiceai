@@ -1,5 +1,22 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
+use crate::config::{ClusterConfig, ClusterMode};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
@@ -17,7 +34,7 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_connection;
+use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -30,21 +47,142 @@ use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use futures::TryFutureExt;
+use flight_client::arrow_flight_factory::make_arrow_flight_client;
+use futures::{StreamExt, TryFutureExt};
 use prost::Message;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::GetAppDefinitionRequest;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
+use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tonic::transport::{Certificate, ClientTlsConfig};
 use url::Url;
 use uuid::Uuid;
 
 pub mod datafusion;
+
+/// Cluster configuration with lazily loaded TLS config.
+///
+/// This struct wraps `ClusterConfig` and caches the `ClientTlsConfig` on first access
+/// to avoid reading the CA certificate file on every query.
+#[derive(Debug)]
+pub struct ResolvedClusterConfig {
+    config: ClusterConfig,
+    /// Cached client TLS config, loaded lazily from `cluster_ca_certificate_file`.
+    client_tls_config: OnceLock<Option<ClientTlsConfig>>,
+}
+
+impl ResolvedClusterConfig {
+    /// Creates a new `ResolvedClusterConfig` from the given `ClusterConfig`, eagerly loading
+    /// the TLS configuration if a CA certificate file is specified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CA certificate file cannot be read.
+    pub fn try_new(config: ClusterConfig) -> std::io::Result<Self> {
+        let client_tls_config = OnceLock::new();
+
+        // Eagerly load the TLS config if a CA certificate file is specified
+        if let Some(ref ca_path) = config.cluster_ca_certificate_file {
+            let ca_certificate = std::fs::read(ca_path)?;
+            let tls_config =
+                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate));
+            // This cannot fail since we just created the OnceLock
+            let _ = client_tls_config.set(Some(tls_config));
+        } else {
+            let _ = client_tls_config.set(None);
+        }
+
+        Ok(Self {
+            config,
+            client_tls_config,
+        })
+    }
+
+    /// Returns the cluster mode.
+    #[must_use]
+    pub fn mode(&self) -> Option<&ClusterMode> {
+        self.config.mode.as_ref()
+    }
+
+    /// Returns the scheduler URL.
+    #[must_use]
+    pub fn scheduler_url(&self) -> &Url {
+        &self.config.scheduler_url
+    }
+
+    /// Returns the cluster API key.
+    #[must_use]
+    pub fn cluster_api_key(&self) -> Option<&String> {
+        self.config.cluster_api_key.as_ref()
+    }
+
+    /// Returns whether insecure connections are allowed.
+    #[must_use]
+    pub fn allow_insecure_connections(&self) -> bool {
+        self.config.allow_insecure_connections
+    }
+
+    /// Returns the path to the CA certificate file.
+    #[must_use]
+    pub fn cluster_ca_certificate_file(&self) -> Option<&String> {
+        self.config.cluster_ca_certificate_file.as_ref()
+    }
+
+    /// Returns the cached client TLS config, if configured.
+    #[must_use]
+    pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
+        self.client_tls_config
+            .get()
+            .and_then(std::option::Option::as_ref)
+    }
+
+    /// Creates a new `ResolvedClusterConfig` from a `ClusterConfig`, optionally merging
+    /// the API key from the app's auth configuration if no cluster API key is already set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CA certificate file cannot be read.
+    pub fn from_config_and_app(
+        mut config: ClusterConfig,
+        app: Option<&App>,
+    ) -> std::io::Result<Self> {
+        // If no cluster API key is set, try to use the app's auth API key
+        if config.cluster_api_key.is_none()
+            && let Some(api_key) = app
+                .and_then(|a| a.runtime.auth.as_ref())
+                .and_then(|a| a.api_key.as_ref())
+                .and_then(|ak| {
+                    if ak.enabled {
+                        ak.keys.first().cloned()
+                    } else {
+                        None
+                    }
+                })
+        {
+            let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
+            config.cluster_api_key = Some(key);
+        }
+
+        Self::try_new(config)
+    }
+}
+
+impl Default for ResolvedClusterConfig {
+    fn default() -> Self {
+        let client_tls_config = OnceLock::new();
+        let _ = client_tls_config.set(None);
+        Self {
+            config: ClusterConfig::default(),
+            client_tls_config,
+        }
+    }
+}
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
@@ -82,8 +220,23 @@ pub async fn initialize_cluster_executor(
         .clone()
         .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
+    let mut scheduler_endpoint =
+        create_grpc_client_endpoint(rt.config.cluster.scheduler_url.clone().to_string())
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+    let maybe_client_tls_config = runtime_tls_configuration(rt.as_ref()).await?;
+
+    if let Some(tls_config) = &maybe_client_tls_config {
+        scheduler_endpoint = scheduler_endpoint
+            .tls_config(tls_config.clone())
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+    }
+
     let scheduler_connection =
-        create_grpc_client_connection(rt.config.cluster.scheduler_url.clone().to_string())
+        scheduler_endpoint
+            .connect()
             .await
             .map_err(|_| FailedToStartClusterExecutor {
                 source: format!(
@@ -93,7 +246,24 @@ pub async fn initialize_cluster_executor(
                 .into(),
             })?;
 
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
+    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to start executor without an API key".into(),
+        });
+    };
+
+    let interceptor = move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {api_key}")
+                .parse()
+                .map_err(|_| tonic::Status::invalid_argument("Invalid API key"))?,
+        );
+
+        Ok(req)
+    };
+
+    let scheduler = SchedulerGrpcClient::with_interceptor(scheduler_connection, interceptor)
         .max_encoding_message_size(usize::MAX)
         .max_decoding_message_size(usize::MAX);
 
@@ -189,17 +359,19 @@ pub async fn initialize_cluster_executor(
             .await
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
-        rt.status.update_cluster("executor", ComponentStatus::Ready);
 
         // Initialize secrets first so they're available for object store configuration
         executor_bind_app(
             &rt,
             rt.config.cluster.scheduler_url.to_string(),
             executor_id,
+            maybe_client_tls_config,
         )
         .await?;
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
+
+        rt.status.update_cluster("executor", ComponentStatus::Ready);
 
         executor_poll_loop
             .await
@@ -216,6 +388,8 @@ async fn create_scheduler_server(
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
+
+    let maybe_client_tls_config = runtime_tls_configuration(rt.as_ref()).await?;
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -243,6 +417,13 @@ async fn create_scheduler_server(
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
                     .build(),
             )
+        })),
+        override_create_grpc_client_endpoint: Some(Arc::new(move |ep| {
+            if let Some(ref tls_config) = maybe_client_tls_config {
+                ep.tls_config(tls_config.clone())
+            } else {
+                Ok(ep)
+            }
         })),
         ..Default::default()
     };
@@ -272,11 +453,18 @@ async fn executor_bind_app(
     rt: &Arc<Runtime>,
     scheduler_flight_url: String,
     executor_id: String,
+    client_tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<()> {
-    let flight_client = flight_client::FlightClient::try_new(
-        scheduler_flight_url.clone().into(),
-        flight_client::Credentials::anonymous(),
-        None,
+    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Unable to start executor without an API key".into(),
+        });
+    };
+
+    let mut flight_client = make_arrow_flight_client(
+        &scheduler_flight_url,
+        Some(api_key.clone()),
+        client_tls_config,
     )
     .await
     .boxed()
@@ -292,29 +480,29 @@ async fn executor_bind_app(
     };
 
     let response = flight_client
-        .client()
-        .clone()
         .do_action(action)
         .await
         .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-
-    let mut stream = response.into_inner();
-    if let Some(result) = stream
-        .message()
-        .await
-        .boxed()
         .context(FailedToStartClusterExecutorSnafu)?
-    {
-        let app_def: App = serde_json::from_slice(&result.body)
+        .next()
+        .await;
+
+    if let Some(Ok(bytes)) = response {
+        let mut app_def: App = serde_json::from_slice(&bytes)
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
+
+        app_def.runtime.auth = Some(Auth {
+            api_key: Some(ApiKeyAuth {
+                enabled: true,
+                keys: vec![ApiKey::ReadOnly { key: api_key }],
+            }),
+        });
 
         *rt.app.write().await = Some(Arc::new(app_def));
     }
 
-    *rt.secrets.write().await =
-        Secrets::new_for_cluster_executor(scheduler_flight_url, executor_id);
+    *rt.secrets.write().await = Secrets::new_for_cluster_executor(flight_client, executor_id);
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
@@ -389,4 +577,18 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     }
 
     Ok(())
+}
+
+async fn runtime_tls_configuration(rt: &Runtime) -> crate::Result<Option<ClientTlsConfig>> {
+    if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
+        let ca_certificate = tokio::fs::read(ca_path)
+            .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+        Ok(Some(
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)),
+        ))
+    } else {
+        Ok(None)
+    }
 }

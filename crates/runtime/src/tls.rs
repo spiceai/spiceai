@@ -24,6 +24,7 @@ use std::{
     io::{self, Cursor},
     sync::Arc,
 };
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use x509_certificate::X509Certificate;
 
 pub struct TlsConfig {
@@ -68,4 +69,15 @@ fn load_key(
 ) -> std::result::Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new(key_bytes);
     private_key(&mut cursor)?.ok_or_else(|| "No private key found in provided TLS key".into())
+}
+
+pub(crate) fn server_with_tls_config(
+    server: Server,
+    tls_config: impl AsRef<TlsConfig>,
+) -> Result<tonic::transport::Server, tonic::transport::Error> {
+    let server_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+        tls_config.as_ref().cert.expose_secret(),
+        tls_config.as_ref().key.expose_secret(),
+    ));
+    server.tls_config(server_tls_config)
 }
