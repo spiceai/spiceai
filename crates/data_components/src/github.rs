@@ -755,7 +755,7 @@ impl GithubRestClient {
 
             // Add query parameters if provided
             if let Some(ref params) = query_params {
-                for (key, value) in params.iter() {
+                for (key, value) in params {
                     url.query_pairs_mut().append_pair(key, value);
                 }
             }
@@ -1016,7 +1016,7 @@ impl GithubRestClient {
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
-            futures::stream::iter(vec![Ok(record_batch.clone())]),
+            futures::stream::iter(vec![Ok(record_batch)]),
         );
 
         Ok(Box::pin(stream_adapter))
@@ -1255,7 +1255,7 @@ impl GithubRestClient {
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
-            futures::stream::iter(vec![Ok(record_batch.clone())]),
+            futures::stream::iter(vec![Ok(record_batch)]),
         );
 
         Ok(Box::pin(stream_adapter))
