@@ -384,7 +384,7 @@ fn validate_combination(
         )
     {
         return Err("S3 Vectors on reduced set of combinations".to_string());
-    };
+    }
     Ok(())
 }
 
