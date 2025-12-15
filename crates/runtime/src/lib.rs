@@ -666,12 +666,10 @@ impl Runtime {
                 // Start internal cluster server for scheduler on separate port
                 let internal_server_shutdown = CancellationToken::new();
                 let self_ref = Arc::clone(&self);
-                let cloned_tls_config = tls_config.clone();
                 let cloned_shutdown = internal_server_shutdown.clone();
                 let internal_server_fut = async move {
                     cluster::start_internal_cluster_server(
                         Arc::clone(&self_ref),
-                        cloned_tls_config,
                         Some(cloned_shutdown),
                     )
                     .await
@@ -720,7 +718,6 @@ impl Runtime {
                     cluster::start_executor_flight_server(
                         config.flight_bind_address,
                         Arc::clone(&self_ref),
-                        cloned_tls_config,
                         Some(flight_shutdown),
                     )
                     .await

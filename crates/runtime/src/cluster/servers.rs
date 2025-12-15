@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::ClusterTlsConfig;
 use crate::cluster::ClusterServiceImpl;
 use crate::flight::{Error, is_address_in_use_error};
-use crate::tls::{TlsConfig, server_with_tls_config};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use ballista_executor::flight_service::BallistaFlightService;
@@ -24,9 +24,24 @@ use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
+use tonic::transport::{Server, ServerTlsConfig};
 
 type ClusterServerResult<T> = std::result::Result<T, Error>;
+
+/// Configures a tonic server with mTLS using the cluster TLS configuration.
+///
+/// This enables mutual TLS: the server presents its certificate and requires
+/// clients to present valid certificates signed by the cluster CA.
+fn server_with_cluster_mtls(
+    server: Server,
+    tls_config: &ClusterTlsConfig,
+) -> Result<Server, tonic::transport::Error> {
+    let server_tls_config = ServerTlsConfig::new()
+        .identity(tls_config.server_identity.clone())
+        .client_ca_root(tls_config.ca_certificate.clone());
+
+    server.tls_config(server_tls_config)
+}
 
 /// Starts the internal cluster gRPC server for scheduler mode.
 ///
@@ -35,12 +50,12 @@ type ClusterServerResult<T> = std::result::Result<T, Error>;
 /// - `ClusterServiceServer`: Spice-specific RPCs (`GetAppDefinition`, `ExpandSecret`)
 ///
 /// This server should only be started when running in scheduler mode.
+/// mTLS is required and enforced, requiring client certificates.
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
-    tls_config: Option<Arc<TlsConfig>>,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
-    let bind_address = rt.df.cluster_config.cluster_bind_address();
+    let bind_address = rt.df.cluster_config.cluster_address();
 
     let Some(scheduler) = rt
         .df
@@ -52,12 +67,17 @@ pub async fn start_internal_cluster_server(
         return Err(Error::ClusterSchedulerNotInitialized {});
     };
 
-    let mut server = Server::builder();
+    // mTLS is required for cluster mode
+    let Some(tls_config) = rt.df.cluster_config.tls_config() else {
+        return Err(Error::InsecureConfiguration {
+            message: "Cluster mode requires mTLS configuration".to_string(),
+        });
+    };
 
-    if let Some(ref tls_config) = tls_config {
-        server = server_with_tls_config(server, tls_config)
-            .map_err(|source| Error::UnableToConfigureTls { source })?;
-    }
+    let mut server = server_with_cluster_mtls(Server::builder(), tls_config)
+        .map_err(|source| Error::UnableToConfigureTls { source })?;
+
+    tracing::info!("Cluster mTLS enabled for internal cluster server");
 
     let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
         .max_decoding_message_size(usize::MAX)
@@ -94,25 +114,24 @@ pub async fn start_internal_cluster_server(
 }
 
 /// Starts the executor Ballista Flight server used for receiving query fragments.
+///
+/// mTLS is required and enforced, requiring client certificates.
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
-    tls_config: Option<Arc<TlsConfig>>,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
-    let mut server = Server::builder();
-
-    if let Some(ref tls_config) = tls_config {
-        server = server_with_tls_config(server, tls_config)
-            .map_err(|source| Error::UnableToConfigureTls { source })?;
-    } else if !rt.config.cluster.allow_insecure_connections {
+    // mTLS is required for cluster mode
+    let Some(tls_config) = rt.df.cluster_config.tls_config() else {
         return Err(Error::InsecureConfiguration {
-            message: "Refusing to start executor flight server without a valid TLS configuration. \
-            To acknowledge and override, pass --allow-insecure-connections as an argument to spiced.\
-            Both schedulers and executors must share the same TLS configuration."
-                .to_string(),
+            message: "Cluster mode requires mTLS configuration".to_string(),
         });
-    }
+    };
+
+    let mut server = server_with_cluster_mtls(Server::builder(), tls_config)
+        .map_err(|source| Error::UnableToConfigureTls { source })?;
+
+    tracing::info!("Cluster mTLS enabled for executor flight server");
 
     // Executor: serve only BallistaFlightService for receiving query fragments.
     // No OTel service needed on executors.
