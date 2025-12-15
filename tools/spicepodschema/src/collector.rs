@@ -78,8 +78,8 @@ use runtime::dataconnector::mongodb as _;
 use runtime::dataconnector::mssql as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::mysql as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::odbc as _;
+// #[expect(unused_imports)]
+// use runtime::dataconnector::odbc as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::oracle as _;
 #[expect(unused_imports)]

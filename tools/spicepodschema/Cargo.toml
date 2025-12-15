@@ -33,7 +33,7 @@ runtime = { path = "../../crates/runtime", features = [
     "mongodb",
     "mssql",
     "mysql",
-    "odbc",
+    # "odbc",
     "oracle",
     "postgres",
     "sharepoint",
