@@ -30,49 +30,90 @@ use runtime_parameters::ParameterSpec;
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
 // `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
+#[allow(unused_imports)]
 use runtime::dataconnector::abfs as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::clickhouse as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::databricks as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::debezium as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::delta_lake as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::dremio as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::duckdb as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::dynamodb as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::file as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::flightsql as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::ftp as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::git as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::github as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::glue as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::graphql as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::https as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::iceberg as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::imap as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::kafka as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::localpod as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::memory as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::mongodb as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::mssql as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::mysql as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::odbc as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::oracle as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::postgres as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::s3 as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::sftp as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::sharepoint as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::sink as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::snowflake as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::spark as _;
+#[allow(unused_imports)]
 use runtime::dataconnector::spiceai as _;
 
 // Force linkage of all data accelerator modules
+#[allow(unused_imports)]
 use runtime::dataaccelerator::arrow as _;
 #[cfg(not(windows))]
+#[allow(unused_imports)]
 use runtime::dataaccelerator::cayenne as _;
+#[allow(unused_imports)]
 use runtime::dataaccelerator::duckdb as _;
+#[allow(unused_imports)]
 use runtime::dataaccelerator::partitioned_duckdb as _;
+#[allow(unused_imports)]
 use runtime::dataaccelerator::postgres as _;
+#[allow(unused_imports)]
 use runtime::dataaccelerator::sqlite as _;
+#[allow(unused_imports)]
 use runtime::dataaccelerator::turso as _;
 
 /// Schema information for a connector or accelerator.
