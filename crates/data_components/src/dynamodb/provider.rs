@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::{
-    DescribeTableSnafu, Error, FailedToBootstrapTableSnafu, FailedToInitializeCheckpointSnafu,
-    FailedToInitializeStreamSnafu, Result, ScanSnafu, TableDoesNotExistSnafu,
-    TableStatusIsNotActiveSnafu,
+    DescribeTableSnafu, EmptyTableSnafu, Error, FailedToBootstrapTableSnafu,
+    FailedToInitializeCheckpointSnafu, FailedToInitializeStreamSnafu, Result, ScanSnafu,
+    TableDoesNotExistSnafu, TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangeBatch;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
@@ -227,6 +227,12 @@ impl DynamoDBTableProvider {
             .context(ScanSnafu)?
             .items()
             .to_vec();
+
+        if items.is_empty() {
+            return Err(Error::EmptyTable {
+                table_name: table_name.to_string(),
+            });
+        }
 
         let (unnested_items, flattened_fields) = match unnest_depth {
             None => (items, HashSet::new()),
