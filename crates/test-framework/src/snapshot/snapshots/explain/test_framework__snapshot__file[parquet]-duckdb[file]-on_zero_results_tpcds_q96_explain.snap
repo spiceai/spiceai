@@ -2,89 +2,89 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: tpcds_q96"
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                               |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: count(*) ASC NULLS LAST, fetch=100                                                                                                                           |
-|               |   Projection: count(Int64(1)) AS count(*)                                                                                                                          |
-|               |     Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                              |
-|               |       Projection:                                                                                                                                                  |
-|               |         Inner Join: store_sales.ss_store_sk = store.s_store_sk                                                                                                     |
-|               |           Projection: store_sales.ss_store_sk                                                                                                                      |
-|               |             Inner Join: store_sales.ss_sold_time_sk = time_dim.t_time_sk                                                                                           |
-|               |               Projection: store_sales.ss_sold_time_sk, store_sales.ss_store_sk                                                                                     |
-|               |                 Inner Join: store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk                                                                            |
-|               |                   TableScan: store_sales projection=[ss_sold_time_sk, ss_hdemo_sk, ss_store_sk]                                                                    |
-|               |                   Projection: household_demographics.hd_demo_sk                                                                                                    |
-|               |                     Filter: household_demographics.hd_dep_count = Int32(5)                                                                                         |
-|               |                       TableScan: household_demographics projection=[hd_demo_sk, hd_dep_count], partial_filters=[household_demographics.hd_dep_count = Int32(5)]    |
-|               |               Projection: time_dim.t_time_sk                                                                                                                       |
-|               |                 Filter: time_dim.t_hour = Int32(8) AND time_dim.t_minute >= Int32(30)                                                                              |
-|               |                   TableScan: time_dim projection=[t_time_sk, t_hour, t_minute], partial_filters=[time_dim.t_hour = Int32(8), time_dim.t_minute >= Int32(30)]       |
-|               |           Projection: store.s_store_sk                                                                                                                             |
-|               |             Filter: store.s_store_name = LargeUtf8("ese")                                                                                                          |
-|               |               TableScan: store projection=[s_store_sk, s_store_name], partial_filters=[store.s_store_name = LargeUtf8("ese")]                                      |
-| physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as count(*)]                                                                                                               |
-|               |   GlobalLimitExec: skip=0, fetch=100                                                                                                                               |
-|               |     AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                                      |
-|               |       CoalescePartitionsExec                                                                                                                                       |
-|               |         AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                                |
-|               |           ProjectionExec: expr=[]                                                                                                                                  |
-|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
-|               |               HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_store_sk@0, s_store_sk@0)]                                                                  |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
-|               |                   RepartitionExec: partitioning=Hash([ss_store_sk@0], 32), input_partitions=32                                                                     |
-|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                    |
-|               |                       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_sold_time_sk@0, t_time_sk@0)], projection=[ss_store_sk@1]                           |
-|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                |
-|               |                           RepartitionExec: partitioning=Hash([ss_sold_time_sk@0], 32), input_partitions=32                                                         |
-|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                            |
-|               |                               HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_hdemo_sk@1, hd_demo_sk@0)], projection=[ss_sold_time_sk@0, ss_store_sk@2]   |
-|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                        |
-|               |                                   RepartitionExec: partitioning=Hash([ss_hdemo_sk@1], 32), input_partitions=32                                                     |
-|               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                          |
-|               |                                       SchemaCastScanExec                                                                                                           |
-|               |                                         FallbackOnZeroResultsScanExec                                                                                              |
-|               |                                           CoalescePartitionsExec                                                                                                   |
-|               |                                             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                  |
-|               |                                               CooperativeExec                                                                                                      |
-|               |                                                 BytesProcessedExec                                                                                                 |
-|               |                                                   DuckSqlExec sql= SELECT "ss_sold_time_sk", "ss_hdemo_sk", "ss_store_sk" FROM store_sales                         |
-|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                        |
-|               |                                   RepartitionExec: partitioning=Hash([hd_demo_sk@0], 32), input_partitions=32                                                      |
-|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                    |
-|               |                                       FilterExec: hd_dep_count@1 = 5, projection=[hd_demo_sk@0]                                                                    |
-|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                      |
-|               |                                           SchemaCastScanExec                                                                                                       |
-|               |                                             FallbackOnZeroResultsScanExec                                                                                          |
-|               |                                               CoalescePartitionsExec                                                                                               |
-|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                              |
-|               |                                                   CooperativeExec                                                                                                  |
-|               |                                                     BytesProcessedExec                                                                                             |
-|               |                                                       DuckSqlExec sql= SELECT "hd_demo_sk", "hd_dep_count" FROM household_demographics WHERE ("hd_dep_count" = 5)  |
-|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                |
-|               |                           RepartitionExec: partitioning=Hash([t_time_sk@0], 32), input_partitions=32                                                               |
-|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                            |
-|               |                               FilterExec: t_hour@1 = 8 AND t_minute@2 >= 30, projection=[t_time_sk@0]                                                              |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                              |
-|               |                                   SchemaCastScanExec                                                                                                               |
-|               |                                     FallbackOnZeroResultsScanExec                                                                                                  |
-|               |                                       CoalescePartitionsExec                                                                                                       |
-|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                      |
-|               |                                           CooperativeExec                                                                                                          |
-|               |                                             BytesProcessedExec                                                                                                     |
-|               |                                               DuckSqlExec sql= SELECT "t_time_sk", "t_hour", "t_minute" FROM time_dim WHERE ("t_hour" = 8) AND ("t_minute" >= 30)  |
-|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
-|               |                   RepartitionExec: partitioning=Hash([s_store_sk@0], 32), input_partitions=32                                                                      |
-|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                    |
-|               |                       FilterExec: s_store_name@1 = ese, projection=[s_store_sk@0]                                                                                  |
-|               |                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                      |
-|               |                           SchemaCastScanExec                                                                                                                       |
-|               |                             FallbackOnZeroResultsScanExec                                                                                                          |
-|               |                               CoalescePartitionsExec                                                                                                               |
-|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                              |
-|               |                                   CooperativeExec                                                                                                                  |
-|               |                                     BytesProcessedExec                                                                                                             |
-|               |                                       DuckSqlExec sql= SELECT "s_store_sk", "s_store_name" FROM store WHERE ("s_store_name" = 'ese')                               |
-|               |                                                                                                                                                                    |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: count(*) ASC NULLS LAST, fetch=100                                                                                                                                                            |
+|               |   Projection: count(Int64(1)) AS count(*)                                                                                                                                                           |
+|               |     Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                                                                               |
+|               |       Projection:                                                                                                                                                                                   |
+|               |         Inner Join: store_sales.ss_store_sk = store.s_store_sk                                                                                                                                      |
+|               |           Projection: store_sales.ss_store_sk                                                                                                                                                       |
+|               |             Inner Join: store_sales.ss_sold_time_sk = time_dim.t_time_sk                                                                                                                            |
+|               |               Projection: store_sales.ss_sold_time_sk, store_sales.ss_store_sk                                                                                                                      |
+|               |                 Inner Join: store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk                                                                                                             |
+|               |                   TableScan: store_sales projection=[ss_sold_time_sk, ss_hdemo_sk, ss_store_sk]                                                                                                     |
+|               |                   Projection: household_demographics.hd_demo_sk                                                                                                                                     |
+|               |                     Filter: household_demographics.hd_dep_count = Int32(5)                                                                                                                          |
+|               |                       TableScan: household_demographics projection=[hd_demo_sk, hd_dep_count], partial_filters=[household_demographics.hd_dep_count = Int32(5)]                                     |
+|               |               Projection: time_dim.t_time_sk                                                                                                                                                        |
+|               |                 Filter: time_dim.t_hour = Int32(8) AND time_dim.t_minute >= Int32(30)                                                                                                               |
+|               |                   TableScan: time_dim projection=[t_time_sk, t_hour, t_minute], partial_filters=[time_dim.t_hour = Int32(8), time_dim.t_minute >= Int32(30)]                                        |
+|               |           Projection: store.s_store_sk                                                                                                                                                              |
+|               |             Filter: store.s_store_name = LargeUtf8("ese")                                                                                                                                           |
+|               |               TableScan: store projection=[s_store_sk, s_store_name], partial_filters=[store.s_store_name = LargeUtf8("ese")]                                                                       |
+| physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as count(*)]                                                                                                                                                |
+|               |   GlobalLimitExec: skip=0, fetch=100                                                                                                                                                                |
+|               |     AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                                                                                                                                       |
+|               |       CoalescePartitionsExec                                                                                                                                                                        |
+|               |         AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                                                                 |
+|               |           ProjectionExec: expr=[]                                                                                                                                                                   |
+|               |             CoalesceBatchesExec: target_batch_size=8192                                                                                                                                             |
+|               |               HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(ss_store_sk@0, s_store_sk@0)]                                                                |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                                         |
+|               |                   RepartitionExec: partitioning=Hash([ss_store_sk@0], 32), input_partitions=32                                                                                                      |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
+|               |                       HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(ss_sold_time_sk@0, t_time_sk@0)], projection=[ss_store_sk@1]                         |
+|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
+|               |                           RepartitionExec: partitioning=Hash([ss_sold_time_sk@0], 32), input_partitions=32                                                                                          |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
+|               |                               HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(ss_hdemo_sk@1, hd_demo_sk@0)], projection=[ss_sold_time_sk@0, ss_store_sk@2] |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                         |
+|               |                                   RepartitionExec: partitioning=Hash([ss_hdemo_sk@1], 32), input_partitions=32                                                                                      |
+|               |                                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                           |
+|               |                                       SchemaCastScanExec                                                                                                                                            |
+|               |                                         FallbackOnZeroResultsScanExec                                                                                                                               |
+|               |                                           CoalescePartitionsExec                                                                                                                                    |
+|               |                                             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                   |
+|               |                                               CooperativeExec                                                                                                                                       |
+|               |                                                 BytesProcessedExec                                                                                                                                  |
+|               |                                                   DuckSqlExec sql= SELECT "ss_sold_time_sk", "ss_hdemo_sk", "ss_store_sk" FROM store_sales                                                          |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                         |
+|               |                                   RepartitionExec: partitioning=Hash([hd_demo_sk@0], 32), input_partitions=32                                                                                       |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                     |
+|               |                                       FilterExec: hd_dep_count@1 = 5, projection=[hd_demo_sk@0]                                                                                                     |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                       |
+|               |                                           SchemaCastScanExec                                                                                                                                        |
+|               |                                             FallbackOnZeroResultsScanExec                                                                                                                           |
+|               |                                               CoalescePartitionsExec                                                                                                                                |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                               |
+|               |                                                   CooperativeExec                                                                                                                                   |
+|               |                                                     BytesProcessedExec                                                                                                                              |
+|               |                                                       DuckSqlExec sql= SELECT "hd_demo_sk", "hd_dep_count" FROM household_demographics WHERE ("hd_dep_count" = 5)                                   |
+|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                 |
+|               |                           RepartitionExec: partitioning=Hash([t_time_sk@0], 32), input_partitions=32                                                                                                |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                                             |
+|               |                               FilterExec: t_hour@1 = 8 AND t_minute@2 >= 30, projection=[t_time_sk@0]                                                                                               |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                               |
+|               |                                   SchemaCastScanExec                                                                                                                                                |
+|               |                                     FallbackOnZeroResultsScanExec                                                                                                                                   |
+|               |                                       CoalescePartitionsExec                                                                                                                                        |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                       |
+|               |                                           CooperativeExec                                                                                                                                           |
+|               |                                             BytesProcessedExec                                                                                                                                      |
+|               |                                               DuckSqlExec sql= SELECT "t_time_sk", "t_hour", "t_minute" FROM time_dim WHERE ("t_hour" = 8) AND ("t_minute" >= 30)                                   |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                                         |
+|               |                   RepartitionExec: partitioning=Hash([s_store_sk@0], 32), input_partitions=32                                                                                                       |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                                     |
+|               |                       FilterExec: s_store_name@1 = ese, projection=[s_store_sk@0]                                                                                                                   |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                       |
+|               |                           SchemaCastScanExec                                                                                                                                                        |
+|               |                             FallbackOnZeroResultsScanExec                                                                                                                                           |
+|               |                               CoalescePartitionsExec                                                                                                                                                |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                               |
+|               |                                   CooperativeExec                                                                                                                                                   |
+|               |                                     BytesProcessedExec                                                                                                                                              |
+|               |                                       DuckSqlExec sql= SELECT "s_store_sk", "s_store_name" FROM store WHERE ("s_store_name" = 'ese')                                                                |
+|               |                                                                                                                                                                                                     |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
