@@ -47,60 +47,140 @@ use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use flight_client::arrow_flight_factory::make_arrow_flight_client;
-use futures::{StreamExt, TryFutureExt};
-use prost::Message;
+use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::GetAppDefinitionRequest;
+use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
-use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth};
 use std::env;
-use std::sync::{Arc, OnceLock};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tonic::transport::{Certificate, ClientTlsConfig};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 use uuid::Uuid;
 
 pub mod datafusion;
+mod servers;
+mod service;
 
-/// Cluster configuration with lazily loaded TLS config.
+pub use servers::{start_executor_flight_server, start_internal_cluster_server};
+pub use service::ClusterServiceImpl;
+
+/// mTLS configuration for cluster communications.
 ///
-/// This struct wraps `ClusterConfig` and caches the `ClientTlsConfig` on first access
-/// to avoid reading the CA certificate file on every query.
-#[derive(Debug)]
+/// This holds the loaded certificates and keys for both server and client TLS,
+/// enabling mutual TLS authentication between cluster nodes.
+#[derive(Debug, Clone)]
+pub struct ClusterTlsConfig {
+    /// CA certificate used to validate other cluster nodes
+    pub ca_certificate: Certificate,
+    /// Client TLS config with CA and client identity for mTLS
+    pub client_tls_config: ClientTlsConfig,
+    /// Server identity (cert + key) for serving TLS
+    pub server_identity: Identity,
+}
+
+impl ClusterTlsConfig {
+    /// Creates a new `ClusterTlsConfig` by loading the CA, certificate, and key files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the files cannot be read.
+    pub fn try_new(ca_cert_path: &str, cert_path: &str, key_path: &str) -> std::io::Result<Self> {
+        let ca_cert_pem = std::fs::read(ca_cert_path)?;
+        let cert_pem = std::fs::read(cert_path)?;
+        let key_pem = std::fs::read(key_path)?;
+
+        let ca_certificate = Certificate::from_pem(&ca_cert_pem);
+
+        // Client TLS config with mTLS: CA for server validation + client identity
+        let client_tls_config = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&ca_cert_pem))
+            .identity(Identity::from_pem(&cert_pem, &key_pem));
+
+        // Server identity for TLS
+        let server_identity = Identity::from_pem(&cert_pem, &key_pem);
+
+        Ok(Self {
+            ca_certificate,
+            client_tls_config,
+            server_identity,
+        })
+    }
+}
+
+/// Cluster configuration with eagerly loaded TLS config.
+///
+/// This struct wraps `ClusterConfig` and caches the `ClusterTlsConfig` on creation
+/// to avoid reading certificate files repeatedly.
+#[derive(Debug, Default)]
 pub struct ResolvedClusterConfig {
     config: ClusterConfig,
-    /// Cached client TLS config, loaded lazily from `cluster_ca_certificate_file`.
-    client_tls_config: OnceLock<Option<ClientTlsConfig>>,
+    /// Cached cluster TLS config for mTLS (required when cluster mode is enabled).
+    tls_config: Option<ClusterTlsConfig>,
+    /// Pre-computed scheduler URL string for Ballista configuration.
+    scheduler_url: Option<String>,
 }
 
 impl ResolvedClusterConfig {
     /// Creates a new `ResolvedClusterConfig` from the given `ClusterConfig`, eagerly loading
-    /// the TLS configuration if a CA certificate file is specified.
+    /// the TLS configuration.
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA certificate file cannot be read.
+    /// Returns an error if:
+    /// - Cluster mode is set but TLS certificates are not fully specified
+    /// - Cluster mode is set but advertise address is not specified
+    /// - Certificate files cannot be read
     pub fn try_new(config: ClusterConfig) -> std::io::Result<Self> {
-        let client_tls_config = OnceLock::new();
+        // Cluster mode requires mTLS - all certificate files must be specified
+        let tls_config = match (
+            &config.cluster_ca_certificate_file,
+            &config.cluster_certificate_file,
+            &config.cluster_key_file,
+        ) {
+            (Some(ca_path), Some(cert_path), Some(key_path)) => {
+                Some(ClusterTlsConfig::try_new(ca_path, cert_path, key_path)?)
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cluster mTLS requires all of: --cluster-ca-certificate-file, --cluster-certificate-file, --cluster-key-file",
+                ));
+            }
+        };
 
-        // Eagerly load the TLS config if a CA certificate file is specified
-        if let Some(ref ca_path) = config.cluster_ca_certificate_file {
-            let ca_certificate = std::fs::read(ca_path)?;
-            let tls_config =
-                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate));
-            // This cannot fail since we just created the OnceLock
-            let _ = client_tls_config.set(Some(tls_config));
-        } else {
-            let _ = client_tls_config.set(None);
+        // Validate cluster mode requirements
+        if config.mode.is_some() {
+            if tls_config.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cluster mode requires mTLS. Specify all of: --cluster-ca-certificate-file, --cluster-certificate-file, --cluster-key-file",
+                ));
+            }
+            if config.cluster_advertise_address.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cluster mode requires --cluster-advertise-address",
+                ));
+            }
         }
+
+        // Pre-compute scheduler URL from advertise address
+        let scheduler_url = config
+            .cluster_advertise_address
+            .as_ref()
+            .map(|addr| format!("https://{addr}"));
 
         Ok(Self {
             config,
-            client_tls_config,
+            tls_config,
+            scheduler_url,
         })
     }
 
@@ -110,77 +190,52 @@ impl ResolvedClusterConfig {
         self.config.mode.as_ref()
     }
 
-    /// Returns the scheduler URL.
+    /// Returns the cluster bind address.
     #[must_use]
-    pub fn scheduler_url(&self) -> &Url {
-        &self.config.scheduler_url
+    pub fn cluster_address(&self) -> SocketAddr {
+        self.config.cluster_address
     }
 
-    /// Returns the cluster API key.
+    /// Returns the scheduler URL (for executors).
     #[must_use]
-    pub fn cluster_api_key(&self) -> Option<&String> {
-        self.config.cluster_api_key.as_ref()
+    pub fn cluster_scheduler_url(&self) -> Option<&Url> {
+        self.config.cluster_scheduler_url.as_ref()
     }
 
-    /// Returns whether insecure connections are allowed.
+    /// Returns the scheduler URL as a string for use in Ballista configuration.
+    ///
+    /// This is constructed from the advertise address during initialization.
+    /// Returns `None` if advertise address was not configured.
     #[must_use]
-    pub fn allow_insecure_connections(&self) -> bool {
-        self.config.allow_insecure_connections
+    pub fn scheduler_url_string(&self) -> Option<&str> {
+        self.scheduler_url.as_deref()
     }
 
-    /// Returns the path to the CA certificate file.
+    /// Returns the advertise address.
     #[must_use]
-    pub fn cluster_ca_certificate_file(&self) -> Option<&String> {
-        self.config.cluster_ca_certificate_file.as_ref()
+    pub fn cluster_advertise_address(&self) -> Option<&str> {
+        self.config.cluster_advertise_address.as_deref()
     }
 
-    /// Returns the cached client TLS config, if configured.
+    /// Returns the cluster TLS config if configured.
+    #[must_use]
+    pub fn tls_config(&self) -> Option<&ClusterTlsConfig> {
+        self.tls_config.as_ref()
+    }
+
+    /// Returns the client TLS config for connecting to other cluster nodes.
     #[must_use]
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
-        self.client_tls_config
-            .get()
-            .and_then(std::option::Option::as_ref)
+        self.tls_config.as_ref().map(|t| &t.client_tls_config)
     }
 
-    /// Creates a new `ResolvedClusterConfig` from a `ClusterConfig`, optionally merging
-    /// the API key from the app's auth configuration if no cluster API key is already set.
+    /// Creates a new `ResolvedClusterConfig` from a `ClusterConfig`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA certificate file cannot be read.
-    pub fn from_config_and_app(
-        mut config: ClusterConfig,
-        app: Option<&App>,
-    ) -> std::io::Result<Self> {
-        // If no cluster API key is set, try to use the app's auth API key
-        if config.cluster_api_key.is_none()
-            && let Some(api_key) = app
-                .and_then(|a| a.runtime.auth.as_ref())
-                .and_then(|a| a.api_key.as_ref())
-                .and_then(|ak| {
-                    if ak.enabled {
-                        ak.keys.first().cloned()
-                    } else {
-                        None
-                    }
-                })
-        {
-            let (ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key }) = api_key;
-            config.cluster_api_key = Some(key);
-        }
-
+    /// Returns an error if the TLS configuration is invalid or files cannot be read.
+    pub fn from_config_and_app(config: ClusterConfig, _app: Option<&App>) -> std::io::Result<Self> {
         Self::try_new(config)
-    }
-}
-
-impl Default for ResolvedClusterConfig {
-    fn default() -> Self {
-        let client_tls_config = OnceLock::new();
-        let _ = client_tls_config.set(None);
-        Self {
-            config: ClusterConfig::default(),
-            client_tls_config,
-        }
     }
 }
 
@@ -220,50 +275,40 @@ pub async fn initialize_cluster_executor(
         .clone()
         .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
-    let mut scheduler_endpoint =
-        create_grpc_client_endpoint(rt.config.cluster.scheduler_url.clone().to_string())
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
+    // Get scheduler URL - required for executors
+    let Some(scheduler_url) = rt.df.cluster_config.cluster_scheduler_url() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "--cluster-scheduler-url is required for executor mode"
+                .to_string()
+                .into(),
+        });
+    };
 
-    let maybe_client_tls_config = runtime_tls_configuration(rt.as_ref()).await?;
+    // mTLS is required for cluster mode
+    let Some(client_tls_config) = rt.df.cluster_config.client_tls_config().cloned() else {
+        return Err(FailedToStartClusterExecutor {
+            source: "Cluster mode requires mTLS configuration"
+                .to_string()
+                .into(),
+        });
+    };
 
-    if let Some(tls_config) = &maybe_client_tls_config {
-        scheduler_endpoint = scheduler_endpoint
-            .tls_config(tls_config.clone())
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-    }
+    let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?
+        .tls_config(client_tls_config.clone())
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
 
     let scheduler_connection =
         scheduler_endpoint
             .connect()
             .await
-            .map_err(|_| FailedToStartClusterExecutor {
-                source: format!(
-                    "Unable to connect to scheduler at {}",
-                    rt.config.cluster.scheduler_url
-                )
-                .into(),
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: format!("Unable to connect to scheduler at {scheduler_url}: {e}").into(),
             })?;
 
-    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to start executor without an API key".into(),
-        });
-    };
-
-    let interceptor = move |mut req: tonic::Request<()>| {
-        req.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {api_key}")
-                .parse()
-                .map_err(|_| tonic::Status::invalid_argument("Invalid API key"))?,
-        );
-
-        Ok(req)
-    };
-
-    let scheduler = SchedulerGrpcClient::with_interceptor(scheduler_connection, interceptor)
+    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
         .max_encoding_message_size(usize::MAX)
         .max_decoding_message_size(usize::MAX);
 
@@ -300,18 +345,49 @@ pub async fn initialize_cluster_executor(
         });
     };
 
-    let Ok(hostname) = gethostname::gethostname().into_string() else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to determine executor hostname".to_string().into(),
-        });
+    // Determine the advertise host and port for executor registration
+    let (advertise_host, advertise_port) = if let Some(advertise_addr) =
+        rt.df.cluster_config.cluster_advertise_address()
+    {
+        // Parse the advertise address (format: "host:port" or "[ipv6]:port")
+        if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
+            (socket_addr.ip().to_string(), socket_addr.port())
+        } else if let Some((host_part, port_part)) = advertise_addr.rsplit_once(':') {
+            let port = port_part
+                .parse::<u16>()
+                .map_err(|_| FailedToStartClusterExecutor {
+                    source: format!(
+                        "Invalid port in --cluster-advertise-address: {advertise_addr}"
+                    )
+                    .into(),
+                })?;
+            let host = host_part.trim_matches(['[', ']']).to_string();
+            (host, port)
+        } else {
+            return Err(FailedToStartClusterExecutor {
+                    source: format!(
+                        "Invalid --cluster-advertise-address format: {advertise_addr}. Expected 'host:port' (IPv6 must be in [addr]:port form)"
+                    )
+                    .into(),
+                });
+        }
+    } else {
+        // Fall back to hostname and bind_addr port
+        let hostname =
+            gethostname::gethostname()
+                .into_string()
+                .map_err(|_| FailedToStartClusterExecutor {
+                    source: "Unable to determine executor hostname".to_string().into(),
+                })?;
+        (hostname, bind_addr.port())
     };
 
     let executor_id = Uuid::new_v4().to_string();
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
-        // flight service
-        host: Some(hostname),
-        port: u32::from(bind_addr.port()),
+        // flight service - use advertise address for scheduler to contact this executor
+        host: Some(advertise_host),
+        port: u32::from(advertise_port),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,
         specification: Some(ExecutorSpecification {
@@ -361,13 +437,7 @@ pub async fn initialize_cluster_executor(
             .context(FailedToStartClusterExecutorSnafu)?;
 
         // Initialize secrets first so they're available for object store configuration
-        executor_bind_app(
-            &rt,
-            rt.config.cluster.scheduler_url.to_string(),
-            executor_id,
-            maybe_client_tls_config,
-        )
-        .await?;
+        executor_bind_app(&rt, executor_id, client_tls_config).await?;
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
 
@@ -383,13 +453,18 @@ pub async fn initialize_cluster_executor(
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
-    let bind_addr = rt.config.flight_bind_address;
+    let bind_addr = rt.df.cluster_config.cluster_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
-    let maybe_client_tls_config = runtime_tls_configuration(rt.as_ref()).await?;
+    // mTLS is required for cluster mode
+    let Some(client_tls_config) = rt.df.cluster_config.client_tls_config().cloned() else {
+        return Err(FailedToStartClusterScheduler {
+            source: "Cluster mode requires mTLS configuration".into(),
+        });
+    };
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -419,11 +494,7 @@ async fn create_scheduler_server(
             )
         })),
         override_create_grpc_client_endpoint: Some(Arc::new(move |ep| {
-            if let Some(ref tls_config) = maybe_client_tls_config {
-                ep.tls_config(tls_config.clone())
-            } else {
-                Ok(ep)
-            }
+            ep.tls_config(client_tls_config.clone())
         })),
         ..Default::default()
     };
@@ -447,62 +518,105 @@ async fn create_scheduler_server(
     .context(FailedToStartClusterSchedulerSnafu)
 }
 
+/// Creates a gRPC client for the scheduler's internal cluster service.
+async fn create_cluster_service_client(
+    scheduler_url: &Url,
+    client_tls_config: ClientTlsConfig,
+) -> crate::Result<ClusterServiceClient<Channel>> {
+    let endpoint_url = scheduler_url.to_string();
+    let endpoint = Endpoint::from_shared(endpoint_url.clone())
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?
+        .tls_config(client_tls_config)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| FailedToStartClusterExecutor {
+            source: format!(
+                "Unable to connect to scheduler cluster service at {endpoint_url}: {e}"
+            )
+            .into(),
+        })?;
+
+    Ok(ClusterServiceClient::new(channel))
+}
+
+/// Wrapper struct that implements `ClusterSecretExpander` for the gRPC cluster client.
+pub struct ClusterSecretExpanderImpl {
+    client: ClusterServiceClient<Channel>,
+}
+
+impl ClusterSecretExpanderImpl {
+    #[must_use]
+    pub fn new(client: ClusterServiceClient<Channel>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
+    async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
+        let request = runtime_proto::ExpandSecretRequest {
+            executor_id: executor_id.to_string(),
+            key: key.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .expand_secret(request)
+            .await
+            .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
+
+        Ok(response.into_inner().value)
+    }
+}
+
 /// - Initializes relevant `App` runtime components retrieved from the scheduler node
 /// - Initializes and binds `SchedulerRPCSecretStore`
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
-    scheduler_flight_url: String,
     executor_id: String,
-    client_tls_config: Option<ClientTlsConfig>,
+    client_tls_config: ClientTlsConfig,
 ) -> crate::Result<()> {
-    let Some(api_key) = rt.config.cluster.cluster_api_key.clone() else {
+    let Some(scheduler_url) = rt.df.cluster_config.cluster_scheduler_url() else {
         return Err(FailedToStartClusterExecutor {
-            source: "Unable to start executor without an API key".into(),
+            source: "--cluster-scheduler-url is required for executor mode"
+                .to_string()
+                .into(),
         });
     };
-
-    let mut flight_client = make_arrow_flight_client(
-        &scheduler_flight_url,
-        Some(api_key.clone()),
-        client_tls_config,
-    )
-    .await
-    .boxed()
-    .context(FailedToStartClusterExecutorSnafu)?;
+    let mut cluster_client =
+        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
 
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
     };
 
-    let action = arrow_flight::Action {
-        r#type: "GetAppDefinition".to_string(),
-        body: bytes::Bytes::from(app_definition_request.encode_to_vec()),
-    };
-
-    let response = flight_client
-        .do_action(action)
+    let response = cluster_client
+        .get_app_definition(app_definition_request)
         .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to get app definition from scheduler: {status}").into(),
+        })?;
+
+    let app_json = response.into_inner().app_json;
+
+    let app_def: App = serde_json::from_str(&app_json)
         .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?
-        .next()
-        .await;
+        .context(FailedToStartClusterExecutorSnafu)?;
 
-    if let Some(Ok(bytes)) = response {
-        let mut app_def: App = serde_json::from_slice(&bytes)
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
+    *rt.app.write().await = Some(Arc::new(app_def));
 
-        app_def.runtime.auth = Some(Auth {
-            api_key: Some(ApiKeyAuth {
-                enabled: true,
-                keys: vec![ApiKey::ReadOnly { key: api_key }],
-            }),
-        });
+    // Create a new cluster client for secrets
+    let secrets_cluster_client =
+        create_cluster_service_client(scheduler_url, client_tls_config).await?;
 
-        *rt.app.write().await = Some(Arc::new(app_def));
-    }
-
-    *rt.secrets.write().await = Secrets::new_for_cluster_executor(flight_client, executor_id);
+    let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
+    *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
@@ -577,18 +691,4 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     }
 
     Ok(())
-}
-
-async fn runtime_tls_configuration(rt: &Runtime) -> crate::Result<Option<ClientTlsConfig>> {
-    if let Some(ref ca_path) = rt.config.cluster.cluster_ca_certificate_file {
-        let ca_certificate = tokio::fs::read(ca_path)
-            .await
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-        Ok(Some(
-            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_certificate)),
-        ))
-    } else {
-        Ok(None)
-    }
 }
