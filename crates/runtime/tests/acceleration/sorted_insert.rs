@@ -18,16 +18,19 @@ limitations under the License.
 
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
+use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{
-    acceleration::Acceleration, component::dataset::Dataset as SpicepodDataset, param::Params,
+    acceleration::Acceleration,
+    component::dataset::Dataset as SpicepodDataset,
+    param::{ParamValue, Params},
 };
 use std::fs;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::{configure_test_datafusion, init_tracing, utils::runtime_ready_check};
 
-/// Test that Arrow accelerator properly sorts data when sort_columns is configured.
+/// Test that Arrow accelerator properly sorts data when `sort_columns` is configured.
 #[tokio::test]
 async fn test_arrow_sorted_insert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -51,11 +54,17 @@ async fn test_arrow_sorted_insert() -> Result<(), anyhow::Error> {
     let mut dataset = SpicepodDataset::new(format!("file:{file_path}"), "sorted_data");
 
     let mut dataset_params = Params::default();
-    dataset_params.insert("file_format".to_string(), "csv".to_string());
+    dataset_params.data.insert(
+        "file_format".to_string(),
+        ParamValue::String("csv".to_string()),
+    );
     dataset.params = Some(dataset_params);
 
     let mut accel_params = Params::default();
-    accel_params.insert("sort_columns".to_string(), "timestamp".to_string());
+    accel_params.data.insert(
+        "sort_columns".to_string(),
+        ParamValue::String("timestamp".to_string()),
+    );
 
     dataset.acceleration = Some(Acceleration {
         enabled: true,
@@ -69,9 +78,15 @@ async fn test_arrow_sorted_insert() -> Result<(), anyhow::Error> {
         .build();
 
     configure_test_datafusion();
-    let rt = Runtime::builder().with_app(app).build().await;
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    rt.load_components().await;
+    let cloned_rt = Arc::clone(&rt);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+        }
+        () = cloned_rt.load_components() => {}
+    }
     runtime_ready_check(&rt).await;
 
     // Wait for data to load and be sorted
@@ -87,7 +102,7 @@ async fn test_arrow_sorted_insert() -> Result<(), anyhow::Error> {
 
     let batches: Vec<_> = query_result.data.try_collect().await?;
 
-    let expected = vec![
+    let expected = [
         "+----+--------+-----------+",
         "| id | value  | timestamp |",
         "+----+--------+-----------+",
@@ -111,7 +126,7 @@ async fn test_arrow_sorted_insert() -> Result<(), anyhow::Error> {
 
     let batches: Vec<_> = range_query.data.try_collect().await?;
 
-    let expected = vec![
+    let expected = [
         "+----+--------+-----------+",
         "| id | value  | timestamp |",
         "+----+--------+-----------+",

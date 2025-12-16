@@ -716,21 +716,18 @@ impl RefreshTask {
         if overwrite == InsertOp::Overwrite {
             use crate::accelerated_table::sink::AccelerationSink;
 
-            if let AccelerationSink::Table(table_sink) = sink {
-                if let Some(cayenne_provider) = table_sink
-                    .table_provider
+            if let AccelerationSink::Table(table_sink) = sink
+                && let Some(cayenne_provider) = table_sink
+                    .table_provider()
                     .as_any()
                     .downcast_ref::<cayenne::CayenneTableProvider>()
-                {
-                    if let Err(e) = cayenne_provider.sort_on_full_refresh().await {
-                        tracing::warn!(
-                            "Failed to sort data for {} after full refresh: {}",
-                            self.dataset_name,
-                            e
-                        );
-                        // Don't fail the refresh if sorting fails - data is still valid, just not optimally sorted
-                    }
-                }
+                && let Err(e) = cayenne_provider.sort_on_full_refresh().await
+            {
+                tracing::warn!(
+                    "Failed to sort data for {} after full refresh: {e}",
+                    self.dataset_name,
+                );
+                // Don't fail the refresh if sorting fails - data is still valid, just not optimally sorted
             }
         }
 

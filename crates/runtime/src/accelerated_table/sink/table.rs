@@ -38,6 +38,11 @@ impl TableSink {
         Self { table_provider }
     }
 
+    /// Returns a reference to the underlying table provider.
+    pub fn table_provider(&self) -> &Arc<dyn TableProvider> {
+        &self.table_provider
+    }
+
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,

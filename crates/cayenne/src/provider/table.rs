@@ -402,6 +402,38 @@ impl CayenneTableProvider {
         &self.table_metadata
     }
 
+    /// Sort and rewrite all data in the table if `sort_columns` is configured.
+    ///
+    /// This method is called by the refresh task after a full refresh completes.
+    /// It reads all data from the listing table, sorts it by the configured columns,
+    /// and rewrites it to optimize zone maps for query pruning.
+    ///
+    /// # When to call
+    ///
+    /// This should be called after a full refresh (INSERT OVERWRITE) operation
+    /// when `sort_on_refresh` is enabled. The refresh task calls this automatically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading, sorting, or rewriting fails.
+    pub async fn sort_on_full_refresh(&self) -> CatalogResult<()> {
+        if self.vortex_config.sort_columns.is_empty()
+            || self.vortex_config.sort_on_refresh.is_disabled()
+        {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Sorting data on full refresh for table {} by columns {:?}",
+            self.table_metadata.table_name,
+            self.vortex_config.sort_columns
+        );
+
+        // Use default target size for sorting (256 MB)
+        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+        self.sort_and_rewrite_data(target_size_bytes).await
+    }
+
     /// Insert data from a record batch stream.
     ///
     /// This method writes data to the Vortex `ListingTable`. The actual file writing is
@@ -523,15 +555,17 @@ impl CayenneTableProvider {
             }
         }
 
-        // If sort_columns is configured, sort the data on disk after retention filters.
-        // This operates on the listing table data (the complete corpus after retention),
-        // ensuring optimal zone maps with non-overlapping min/max ranges.
+        // If sort_columns is configured AND sort_on_refresh is disabled, sort the data on disk.
+        // When sort_on_refresh is enabled, sorting only happens via sort_on_full_refresh()
+        // which is called by the refresh task after full refresh completes.
         // Sorting uses DataFusion's SortExec with:
         // - Automatic disk spilling for datasets larger than available memory
         // - Streaming external merge sort for efficient memory usage
         // - SIMD-optimized kernels (NEON on arm64, AVX2/AVX-512 on amd64)
         // - Configurable compression for spill files (zstd, lz4_frame, uncompressed)
-        if !self.vortex_config.sort_columns.is_empty() {
+        if !self.vortex_config.sort_columns.is_empty()
+            && self.vortex_config.sort_on_refresh.is_disabled()
+        {
             self.sort_and_rewrite_data(target_size_bytes).await?;
         }
 
