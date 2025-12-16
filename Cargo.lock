@@ -13299,6 +13299,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-optimizer-rules",
  "futures",
+ "globset",
  "itertools 0.14.0",
  "object_store",
  "opentelemetry 0.29.1",

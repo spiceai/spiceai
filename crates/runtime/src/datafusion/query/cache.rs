@@ -131,31 +131,20 @@ impl Query {
             response => response,
         };
 
-        // Always use CacheKey::Query when checking the plan cache
-        // Only compute this hash if we need it for the plan cache lookup
         let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
-        let plan = match df
-            .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
-            .await
-        {
+        let plan = match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
             Ok(plan) => plan,
             Err(e) => {
-                let e = find_datafusion_root(e);
-                let error_code = ErrorCode::from(&e);
-                let snafu_error = super::Error::UnableToExecuteQuery { source: e };
-                if let Some(t) = tracker {
-                    t.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                if let super::Error::UnableToExecuteQuery { source } = e {
+                    let code = ErrorCode::from(&source);
+                    let snafu_err = super::Error::UnableToExecuteQuery { source };
+                    if let Some(t) = tracker {
+                        t.finish_with_error(&request_context, snafu_err.to_string(), code);
+                    }
+                    return Err(snafu_err);
                 }
-                return Err(snafu_error);
+                return Err(e);
             }
-        };
-
-        // Use the logical plan with parameter values for caching and lookup
-        let plan = match parameters {
-            Some(param_values) => plan
-                .with_param_values(param_values)
-                .context(BindingParametersSnafu)?,
-            None => plan,
         };
 
         // Try to get cached results from plan
@@ -197,6 +186,36 @@ impl Query {
             tracker,
             RequestCacheManager::new(cache_status, request_raw_cache_key),
         ))
+    }
+
+    /// Get the logical plan for the given SQL query, applying parameter values if provided.
+    pub(super) async fn get_plan(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        sql: &str,
+        sql_raw_cache_key: &RawCacheKey,
+        parameters: Option<ParamValues>,
+    ) -> super::Result<LogicalPlan> {
+        let plan = match df
+            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Err(super::Error::UnableToExecuteQuery {
+                    source: find_datafusion_root(e),
+                });
+            }
+        };
+
+        // Use the logical plan with parameter values for caching and lookup
+        let plan = match parameters {
+            Some(param_values) => plan
+                .with_param_values(param_values)
+                .context(BindingParametersSnafu)?,
+            None => plan,
+        };
+        Ok(plan)
     }
 
     /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
