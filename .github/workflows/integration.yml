@@ -232,7 +232,7 @@ jobs:
       # Download the test archive artifact
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-test-archive
           path: ./integration_test
@@ -356,7 +356,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -404,7 +404,7 @@ jobs:
           os: 'linux'
 
       - name: Download AWS SDK test archive
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk_test
@@ -447,7 +447,7 @@ jobs:
           os: 'linux'
 
       - name: Download AWS SDK credential bridge test archive
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test
@@ -494,7 +494,7 @@ jobs:
           os: 'linux'
 
       - name: Download data components test archive
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-data-components-test-archive
           path: ./data_components_test
@@ -526,7 +526,7 @@ jobs:
           os: 'linux'
 
       - name: Download partition table test archive
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test
