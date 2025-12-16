@@ -20,7 +20,7 @@ use async_openai::types::{
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
 use rstest::rstest;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     str::FromStr,
     sync::{Arc, LazyLock, Mutex},
