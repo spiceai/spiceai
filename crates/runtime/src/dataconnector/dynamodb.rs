@@ -37,6 +37,7 @@ use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_parameters::ExposedParamLookup;
 use snafu::ResultExt;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
@@ -254,6 +255,12 @@ impl DataConnector for DynamoDB {
             .and_then(|v| fundu::parse_duration(v).ok())
             .unwrap_or(Duration::from_secs(2));
 
+        let json_nesting_static_fields: Option<HashSet<String>> = Some(
+            ["PK".to_string(), "SK".to_string(), "Baz".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
         let provider = DynamoDBTableProvider::try_new(
             config,
             Arc::from(table_name),
@@ -264,6 +271,7 @@ impl DataConnector for DynamoDB {
             time_format.to_string(),
             ready_lag,
             Arc::clone(&self.metrics_collector),
+            json_nesting_static_fields,
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
