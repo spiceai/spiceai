@@ -1081,15 +1081,14 @@ async fn test_cayenne_sorted_insert_impl(
 
     // Test range query - with proper sorting, zone maps should enable efficient pruning
     let df = ctx
-        .sql("SELECT * FROM sorted_table WHERE timestamp >= 3 AND timestamp <= 7 ORDER BY timestamp")
+        .sql(
+            "SELECT * FROM sorted_table WHERE timestamp >= 3 AND timestamp <= 7 ORDER BY timestamp",
+        )
         .await?;
     let results = df.collect().await?;
 
     let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(
-        total_rows, 5,
-        "Expected 5 rows in range [3,7] (inclusive)"
-    );
+    assert_eq!(total_rows, 5, "Expected 5 rows in range [3,7] (inclusive)");
 
     let mut filtered_timestamps = Vec::new();
     for batch in &results {

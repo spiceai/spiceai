@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::unnecessary_literal_bound)]
+#![allow(clippy::unused_async)]
+
 //! Utilities for working with DataFusion record batch streams.
 
 use std::any::Any;
@@ -23,11 +30,11 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Partitioning,
-};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use parking_lot::Mutex;
 
 /// Sort a record batch stream using DataFusion's SortExec.
@@ -189,15 +196,14 @@ impl ExecutionPlan for StreamingExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let mut guard = self
-            .stream
-            .try_lock()
-            .ok_or_else(|| DataFusionError::Execution("Failed to acquire stream lock".to_string()))?;
-        
+        let mut guard = self.stream.try_lock().ok_or_else(|| {
+            DataFusionError::Execution("Failed to acquire stream lock".to_string())
+        })?;
+
         let stream = guard
             .take()
             .ok_or_else(|| DataFusionError::Execution("Stream already consumed".to_string()))?;
-        
+
         Ok(stream)
     }
 }
@@ -238,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn test_sort_stream_single_column() {
         let schema = create_test_schema();
-        
+
         // Create unsorted data
         let batch = create_test_batch(
             vec![3, 1, 4, 2],
@@ -246,10 +252,8 @@ mod tests {
             vec![30, 10, 40, 20],
         );
 
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
 
         let context = create_task_context();
         let sorted = sort_stream(Box::pin(stream), &["id".to_string()], &context)
@@ -262,13 +266,13 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
-        
+
         let ids = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("ids column");
-        
+
         assert_eq!(ids.values(), &[1, 2, 3, 4]);
     }
 
@@ -289,10 +293,8 @@ mod tests {
         )
         .expect("create batch");
 
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
 
         let context = create_task_context();
         let sorted = sort_stream(
@@ -309,7 +311,7 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
-        
+
         let categories = batch
             .column(0)
             .as_any()
@@ -450,10 +452,8 @@ mod tests {
         )
         .expect("create batch");
 
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
 
         let context = create_task_context();
         let sorted = sort_stream(Box::pin(stream), &["id".to_string()], &context)

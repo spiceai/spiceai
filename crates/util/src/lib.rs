@@ -32,6 +32,36 @@ pub use tracing_util::in_tracing_context;
 pub mod arrow;
 pub mod time_format;
 
+/// Generic enabled/disabled configuration enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnabledDisabled {
+    /// Feature is enabled
+    Enabled,
+    /// Feature is disabled
+    Disabled,
+}
+
+impl Default for EnabledDisabled {
+    fn default() -> Self {
+        Self::Enabled
+    }
+}
+
+impl EnabledDisabled {
+    /// Returns `true` if the value is `Enabled`
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    /// Returns `true` if the value is `Disabled`
+    #[must_use]
+    pub const fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_possible_truncation)]

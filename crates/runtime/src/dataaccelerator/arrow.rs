@@ -82,7 +82,8 @@ impl DataAccelerator for ArrowAccelerator {
         if let Some(source) = source {
             if let Some(acceleration) = source.get_acceleration() {
                 if let Some(sort_cols_str) = acceleration.params.get("sort_columns") {
-                    cmd.options.insert("sort_columns".to_string(), sort_cols_str.clone());
+                    cmd.options
+                        .insert("sort_columns".to_string(), sort_cols_str.clone());
                 }
             }
         }

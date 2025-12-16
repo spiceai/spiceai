@@ -14,6 +14,7 @@ chrono.workspace = true
 ctrlc = "3.5"
 humantime = "2.1.0"
 rand.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }

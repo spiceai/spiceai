@@ -43,8 +43,10 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
 use datafusion::physical_plan::metrics::MetricsSet;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
+use futures::stream;
 use tokio::sync::RwLock;
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
@@ -100,7 +102,7 @@ pub struct MemTable {
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
 
     pub on_conflict: Option<OnConflict>,
-    
+
     /// Optional columns to sort by during insert operations.
     /// When specified, data is sorted before being written to improve
     /// zone map efficiency for range queries.
@@ -361,7 +363,7 @@ struct MemSink {
     primary_key: Option<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
-    
+
     /// Optional columns to sort by before writing
     sort_columns: Vec<String>,
 }
@@ -1006,17 +1008,19 @@ impl DataSink for MemSink {
             if !self.sort_columns.is_empty() && !batches.is_empty() {
                 // Concatenate batches in this partition for sorting
                 let schema = batches[0].schema();
-                let combined_batch = if batches.len() == 1 && let Some(batch) = batches.into_iter().next() {
-                    batch
+                let combined_batch = if batches.len() == 1 {
+                    // Take the single batch without cloning
+                    batches.into_iter().next().ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected single batch but found none".to_string(),
+                        )
+                    })?
                 } else {
                     arrow::compute::concat_batches(&schema, &batches)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
                 };
 
                 // Sort the combined batch
-                use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-                use futures::stream;
-                
                 let sorted_stream = RecordBatchStreamAdapter::new(
                     Arc::clone(&schema),
                     stream::iter(vec![Ok(combined_batch)]),

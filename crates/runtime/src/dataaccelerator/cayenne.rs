@@ -340,6 +340,13 @@ impl CayenneAccelerator {
                     .collect();
             }
 
+            // Parse sort_on_refresh (default: enabled)
+            config.sort_on_refresh = acceleration
+                .params
+                .get("sort_on_refresh")
+                .and_then(|v| serde_json::from_str(&format!("\"{}\"", v)).ok())
+                .unwrap_or_default();
+
             tracing::debug!(
                 "Cayenne Vortex config: ALP={}, FSST={}, BitPacking={}, Delta={}, RLE={}, Dict={}, FOR={}, ZigZag={}, footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}",
                 config.enable_alp,

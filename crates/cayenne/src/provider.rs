@@ -831,18 +831,6 @@ impl CayenneTableProvider {
             }
         }
 
-        // If sort_columns is configured, sort the data on disk after retention filters.
-        // This operates on the listing table data (the complete corpus after retention),
-        // ensuring optimal zone maps with non-overlapping min/max ranges.
-        // Sorting uses DataFusion's SortExec with:
-        // - Automatic disk spilling for datasets larger than available memory
-        // - Streaming external merge sort for efficient memory usage
-        // - SIMD-optimized kernels (NEON on arm64, AVX2/AVX-512 on amd64)
-        // - Configurable compression for spill files (zstd, lz4_frame, uncompressed)
-        if !self.vortex_config.sort_columns.is_empty() {
-            self.sort_and_rewrite_data(target_size_bytes).await?;
-        }
-
         // Refresh the listing table to pick up new/rewritten files and update statistics.
         // This ensures that query plans have access to up-to-date table statistics
         // after the insert operation completes. The write lock ensures this refresh
@@ -852,6 +840,39 @@ impl CayenneTableProvider {
 
         // Write lock is released here, allowing the next insert to proceed
         Ok(total_rows)
+    }
+
+    /// Sort and rewrite data on full refresh if sorting is configured.
+    ///
+    /// This should be called after a full refresh completes to sort the complete dataset
+    /// and optimize zone maps for range query performance.
+    ///
+    /// Note: `sort_and_rewrite_data()` already updates the listing table to point to the
+    /// new sorted snapshot, so no additional refresh is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sorting fails.
+    pub async fn sort_on_full_refresh(&self) -> CatalogResult<()> {
+        // Only sort if both sort_on_refresh is enabled and sort_columns are configured
+        if !self.vortex_config.sort_on_refresh.is_enabled()
+            || self.vortex_config.sort_columns.is_empty()
+        {
+            return Ok(());
+        }
+
+        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+
+        tracing::info!(
+            "Sorting table {} on full refresh by columns {:?}",
+            self.table_metadata.table_name,
+            self.vortex_config.sort_columns
+        );
+
+        // sort_and_rewrite_data already updates the listing table to point to the new snapshot
+        self.sort_and_rewrite_data(target_size_bytes).await?;
+
+        Ok(())
     }
 
     /// Process stream in chunks and write them in parallel with bounded concurrency.
@@ -989,26 +1010,26 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Sort a record batch stream using DataFusion's SortExec for optimal performance.
+    /// Sort a record batch stream using `DataFusion`'s `SortExec` for optimal performance.
     ///
     /// This is used during refresh operations to sort the **entire refresh corpus** before it's
     /// chunked and written to files, ensuring optimal zone map statistics across all Vortex files.
     ///
     /// # External Sort with Disk Spilling
     ///
-    /// Uses DataFusion's `SortExec` which provides:
+    /// Uses `DataFusion`'s `SortExec` which provides:
     /// - **Automatic disk spilling**: Handles datasets larger than available memory
     /// - **Streaming external merge sort**: Processes data incrementally without loading all into RAM
     /// - **SIMD-optimized kernels**: Hardware-accelerated sorting (NEON on arm64, AVX2/AVX-512 on amd64)
-    /// - **Configurable spill compression**: Supports zstd, lz4_frame, or uncompressed spill files
-    /// - **Memory management**: Integrates with DataFusion's memory pool and reservation system
+    /// - **Configurable spill compression**: Supports zstd, `lz4_frame`, or uncompressed spill files
+    /// - **Memory management**: Integrates with `DataFusion`'s memory pool and reservation system
     ///
     /// # Configuration
     ///
     /// Spill behavior is controlled by runtime configuration:
     /// - `sort_spill_reservation_bytes`: Memory reserved for merge operations (default: 10MB)
     /// - `sort_in_place_threshold_bytes`: Size below which data is sorted in-place (default: 1MB)
-    /// - `spill_compression`: Compression codec for spill files (uncompressed/lz4_frame/zstd)
+    /// - `spill_compression`: Compression codec for spill files (uncompressed/`lz4_frame`/zstd)
     /// - `temp_directory`: Directory for spill files (configured in runtime)
     ///
     /// # Performance
@@ -1051,33 +1072,43 @@ impl CayenneTableProvider {
         Ok(sorted_stream)
     }
 
-    /// Sort and rewrite data on disk by reading from the listing table.
+    /// Sort and rewrite data on disk using atomic snapshot switching.
     ///
-    /// This method:
-    /// 1. Reads all data from the current listing table (includes retention filter results)
-    /// 2. Sorts the data using DataFusion's SortExec (with disk spilling)
-    /// 3. Deletes the old unsorted files
-    /// 4. Writes the sorted data back in optimally-sized chunks
+    /// This method provides crash-safe sorting by:
+    /// 1. Reading all data from the current listing table (includes retention filter results)
+    /// 2. Sorting the data using `DataFusion`'s `SortExec` (with disk spilling)
+    /// 3. Creating a NEW snapshot directory for the sorted data
+    /// 4. Writing the sorted data to the new snapshot in optimally-sized chunks
+    /// 5. Atomically switching the catalog pointer to the new snapshot
+    /// 6. Updating the in-memory listing table to point to the new snapshot
+    /// 7. Asynchronously cleaning up the old snapshot directory
     ///
-    /// This ensures zone maps have non-overlapping min/max ranges for optimal pruning.
+    /// This ensures:
+    /// - **Crash safety**: If the process crashes during sorting/writing, the old snapshot remains intact
+    /// - **Atomic visibility**: The switch to sorted data is instantaneous via catalog update
+    /// - **Zone map optimization**: Sorted data has non-overlapping min/max ranges for optimal pruning
     ///
     /// # Errors
     ///
     /// Returns an error if reading, sorting, or rewriting fails.
+    #[allow(clippy::too_many_lines)]
     async fn sort_and_rewrite_data(&self, target_size_bytes: usize) -> CatalogResult<()> {
         use datafusion::execution::context::SessionContext;
 
         tracing::info!(
-            "Sorting and rewriting data for table {} by columns {:?}",
+            "Sorting and rewriting data for table {} by columns {:?} using atomic snapshot switching",
             self.table_metadata.table_name,
             self.vortex_config.sort_columns
         );
 
         // Read all data from the current listing table
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| CatalogError::LockPoisoned {
-                operation: "read listing table for sort".to_string(),
-            })?;
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "read listing table for sort".to_string(),
+                })?;
             Arc::clone(&*guard)
         };
 
@@ -1100,67 +1131,367 @@ impl CayenneTableProvider {
         // Sort the stream using our existing sort logic
         let sorted_stream = self.sort_stream(stream).await?;
 
-        // Delete all existing Vortex files in the snapshot directory before rewriting
-        let snapshot_dir = Self::snapshot_dir_path(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &self.table_metadata.current_snapshot_id,
+        // Generate a new UUIDv7 for the sorted snapshot
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let old_snapshot_id = &self.table_metadata.current_snapshot_id;
+
+        tracing::debug!(
+            "Creating new snapshot {} for sorted data (old snapshot: {})",
+            new_snapshot_id,
+            old_snapshot_id
         );
 
-        self.delete_snapshot_files(&snapshot_dir).await?;
+        // Create the new snapshot directory
+        let new_snapshot_dir = Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+        Self::ensure_snapshot_dir_exists(&new_snapshot_dir)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to create new snapshot directory: {e}"),
+            })?;
 
-        // Write the sorted data back in chunks
+        // Create a temporary listing table pointing to the new snapshot for writes
+        let temp_listing_table = Self::create_listing_table(
+            &new_snapshot_dir,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )?;
+
+        // Write the sorted data to the new snapshot using a temporary provider
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(sorted_stream, target_size_bytes)
-            .await?;
+            .write_to_snapshot(sorted_stream, target_size_bytes, temp_listing_table)
+            .await
+            .map_err(|e| {
+                // Clean up the failed new snapshot directory on error
+                let new_snapshot_dir_clone = new_snapshot_dir.clone();
+                tokio::task::spawn(async move {
+                    if let Err(cleanup_err) =
+                        tokio::fs::remove_dir_all(&new_snapshot_dir_clone).await
+                    {
+                        tracing::warn!(
+                            "Failed to cleanup new snapshot directory after write failure: {}",
+                            cleanup_err
+                        );
+                    }
+                });
+
+                CatalogError::InvalidOperation {
+                    message: format!("Failed to write sorted data to new snapshot: {e}"),
+                }
+            })?;
 
         tracing::info!(
-            "Rewrote {} rows in {} sorted chunk(s) for table {}",
+            "Wrote {} rows in {} sorted chunk(s) to new snapshot {}",
             total_rows,
             chunk_count,
-            self.table_metadata.table_name
+            new_snapshot_id
+        );
+
+        // Atomically update the catalog to point to the new snapshot
+        // This is the commit point - after this, all queries will see the sorted data
+        self.catalog
+            .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
+            .await?;
+
+        tracing::debug!(
+            "Atomically switched catalog pointer from snapshot {} to {}",
+            old_snapshot_id,
+            new_snapshot_id
+        );
+
+        // Create a new listing table pointing to the new snapshot directory
+        let new_listing_table = Self::create_listing_table(
+            &new_snapshot_dir,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )?;
+
+        // Update the in-memory listing table to point to the new snapshot
+        {
+            let mut listing_table_guard =
+                self.listing_table
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "update listing table after sort".to_string(),
+                    })?;
+            *listing_table_guard = new_listing_table;
+        }
+
+        tracing::debug!("Updated in-memory listing table to use new snapshot");
+
+        // Asynchronously cleanup the old snapshot directory
+        // This is fire-and-forget to avoid blocking
+        let table_path = self.table_metadata.path.clone();
+        let table_id = self.table_metadata.table_id;
+        let current_snapshot = new_snapshot_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) =
+                Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+            {
+                tracing::warn!(
+                    "Failed to cleanup old snapshots after sort for table {}: {}",
+                    table_id,
+                    e
+                );
+            }
+        });
+
+        tracing::info!(
+            "Successfully sorted and rewrote table {} (old snapshot: {}, new snapshot: {})",
+            self.table_metadata.table_name,
+            old_snapshot_id,
+            new_snapshot_id
         );
 
         Ok(())
     }
 
-    /// Delete all Vortex files in a snapshot directory.
+    /// Write data to a specific snapshot using a temporary listing table.
+    ///
+    /// This is a helper method for atomic snapshot switching during sort operations.
+    /// It writes the data using the provided listing table without modifying the
+    /// current table's listing table reference.
     ///
     /// # Errors
     ///
-    /// Returns an error if files cannot be deleted.
-    async fn delete_snapshot_files(&self, snapshot_dir: &std::path::Path) -> CatalogResult<()> {
-        if !snapshot_dir.exists() {
-            return Ok(());
+    /// Returns an error if writing fails.
+    async fn write_to_snapshot(
+        &self,
+        mut stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        listing_table: Arc<ListingTable>,
+    ) -> CatalogResult<(u64, usize)> {
+        use tokio::sync::Semaphore;
+
+        // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
+        let semaphore = Arc::new(Semaphore::new(4));
+        let mut write_tasks = tokio::task::JoinSet::new();
+
+        // Pre-allocate chunk vector with estimated capacity
+        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
+        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
+        let mut current_size = 0usize;
+        let mut total_rows = 0u64;
+        let mut chunk_count = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch =
+                batch_result.map_err(|e| super::catalog::CatalogError::InvalidOperation {
+                    message: format!("Failed to read batch from stream: {e}"),
+                })?;
+
+            let batch_size = batch.get_array_memory_size();
+
+            // If adding this batch would exceed target size and we have data, write current chunk
+            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
+                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
+                    super::catalog::CatalogError::InvalidOperation {
+                        message: format!("Failed to acquire write permit: {e}"),
+                    }
+                })?;
+
+                let chunk_to_write = std::mem::replace(
+                    &mut current_chunk,
+                    Vec::with_capacity(estimated_batches_per_chunk),
+                );
+                current_size = 0;
+                chunk_count += 1;
+
+                let listing_table_clone = Arc::clone(&listing_table);
+                write_tasks.spawn(async move {
+                    let result =
+                        Self::write_chunk_to_listing_table(chunk_to_write, listing_table_clone)
+                            .await;
+                    drop(permit);
+                    result
+                });
+            }
+
+            current_size += batch_size;
+            current_chunk.push(batch);
         }
 
-        let mut read_dir = tokio::fs::read_dir(snapshot_dir)
-            .await
-            .map_err(|source| CatalogError::IoError { source })?;
+        // Write final chunk if non-empty
+        if !current_chunk.is_empty() {
+            let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
+                super::catalog::CatalogError::InvalidOperation {
+                    message: format!("Failed to acquire write permit for final chunk: {e}"),
+                }
+            })?;
 
-        let mut deleted_count = 0;
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|source| CatalogError::IoError { source })?
-        {
-            let path = entry.path();
-            
-            // Only delete files (Vortex files), not subdirectories
-            if path.is_file() {
-                tokio::fs::remove_file(&path)
-                    .await
-                    .map_err(|source| CatalogError::IoError { source })?;
-                deleted_count += 1;
+            chunk_count += 1;
+            let listing_table_clone = Arc::clone(&listing_table);
+            write_tasks.spawn(async move {
+                let result =
+                    Self::write_chunk_to_listing_table(current_chunk, listing_table_clone).await;
+                drop(permit);
+                result
+            });
+        }
+
+        // Wait for all writes to complete and collect row counts
+        while let Some(result) = write_tasks.join_next().await {
+            let rows = result.map_err(|e| super::catalog::CatalogError::InvalidOperation {
+                message: format!("Write task panicked: {e}"),
+            })??;
+            total_rows += rows;
+        }
+
+        Ok((total_rows, chunk_count))
+    }
+
+    /// Write a chunk directly to a listing table (static method).
+    ///
+    /// This is used during atomic snapshot creation to write to a temporary snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the chunk cannot be written.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::items_after_statements)]
+    async fn write_chunk_to_listing_table(
+        chunk: Vec<RecordBatch>,
+        listing_table: Arc<ListingTable>,
+    ) -> CatalogResult<u64> {
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = chunk[0].schema();
+        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
+
+        // Create a stream from the chunk batches
+        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
+        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+
+        // Create a streaming execution plan
+        struct StreamingExec {
+            schema: arrow_schema::SchemaRef,
+            stream: tokio::sync::Mutex<Option<DFStream>>,
+            properties: datafusion_physical_plan::PlanProperties,
+        }
+
+        impl std::fmt::Debug for StreamingExec {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("StreamingExec").finish()
             }
         }
 
-        tracing::debug!(
-            "Deleted {} Vortex file(s) from snapshot directory before rewriting sorted data",
-            deleted_count
+        impl DisplayAs for StreamingExec {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter,
+            ) -> std::fmt::Result {
+                write!(f, "StreamingExec")
+            }
+        }
+
+        impl ExecutionPlan for StreamingExec {
+            fn name(&self) -> &'static str {
+                "StreamingExec"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn schema(&self) -> arrow_schema::SchemaRef {
+                Arc::<arrow_schema::Schema>::clone(&self.schema)
+            }
+
+            fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+                &self.properties
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![]
+            }
+
+            fn with_new_children(
+                self: Arc<Self>,
+                _children: Vec<Arc<dyn ExecutionPlan>>,
+            ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+                Ok(self)
+            }
+
+            fn execute(
+                &self,
+                _partition: usize,
+                _context: Arc<datafusion_execution::TaskContext>,
+            ) -> datafusion_common::Result<DFStream> {
+                let schema = Arc::<arrow_schema::Schema>::clone(&self.schema);
+                let stream_mutex = Arc::new(tokio::sync::Mutex::new(
+                    self.stream
+                        .try_lock()
+                        .map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                "Stream lock already taken".to_string(),
+                            )
+                        })?
+                        .take()
+                        .ok_or_else(|| {
+                            datafusion_common::DataFusionError::Execution(
+                                "Stream already consumed".to_string(),
+                            )
+                        })?,
+                ));
+
+                let forward_stream = futures::stream::unfold(stream_mutex, |mutex| async move {
+                    let result = {
+                        let mut guard = mutex.lock().await;
+                        guard.next().await
+                    };
+                    result.map(|r| (r, mutex))
+                });
+
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    forward_stream,
+                )))
+            }
+        }
+
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::<arrow_schema::Schema>::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            },
         );
 
-        Ok(())
+        let stream_exec = Arc::new(StreamingExec {
+            schema: Arc::<arrow_schema::Schema>::clone(&schema),
+            stream: tokio::sync::Mutex::new(Some(Box::pin(chunk_stream))),
+            properties,
+        });
+
+        // Create a session context for executing the insert
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Delegate to ListingTable's insert_into to write Vortex files
+        let insert_plan = listing_table
+            .insert_into(&state, stream_exec, InsertOp::Append)
+            .await
+            .map_err(|e| super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to create insert plan for chunk: {e}"),
+            })?;
+
+        // Execute the insert plan
+        collect(insert_plan, state.task_ctx()).await.map_err(|e| {
+            super::catalog::CatalogError::InvalidOperation {
+                message: format!("Failed to execute insert for chunk: {e}"),
+            }
+        })?;
+
+        tracing::debug!("Wrote chunk with {} rows to Vortex", row_count);
+
+        Ok(row_count)
     }
 
     /// Write a single chunk of record batches as a Vortex file.
@@ -1429,9 +1760,9 @@ impl CayenneTableProvider {
     ///
     /// # Statistics Handling
     ///
-    /// Vortex automatically computes column statistics (min, max, null_count, distinct_count) when
+    /// Vortex automatically computes column statistics (min, max, `null_count`, `distinct_count`) when
     /// writing files. These statistics are embedded in Vortex file footers. The `ListingTable`
-    /// aggregates these statistics across all files to provide table-level statistics to DataFusion's
+    /// aggregates these statistics across all files to provide table-level statistics to `DataFusion`'s
     /// query optimizer.
     ///
     /// When `sort_columns` is configured, sorted data produces tighter min/max bounds, making
@@ -2794,19 +3125,16 @@ mod tests {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
 
-        let temp_dir =
-            TempDir::new().expect("Failed to create temporary directory for sort test");
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory for sort test");
         let data_path = temp_dir.path().join("data");
         std::fs::create_dir_all(&data_path).expect("Failed to create data directory");
 
-        let connection_string = format!("sqlite://{}/cayenne.db", temp_dir.path().to_string_lossy());
+        let connection_string =
+            format!("sqlite://{}/cayenne.db", temp_dir.path().to_string_lossy());
         let catalog = Arc::new(
             crate::CayenneCatalog::new(connection_string).expect("Failed to create catalog"),
         );
-        catalog
-            .init()
-            .await
-            .expect("Failed to initialize catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2853,6 +3181,12 @@ mod tests {
             .insert(Box::pin(batch_stream))
             .await
             .expect("Failed to insert data");
+
+        // Explicitly trigger sorting (in production this happens during full refresh)
+        table
+            .sort_on_full_refresh()
+            .await
+            .expect("Failed to sort data");
 
         // Verify data is sorted by timestamp, then by id
         let ctx = SessionContext::new();

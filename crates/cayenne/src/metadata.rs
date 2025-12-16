@@ -157,6 +157,8 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Whether to sort data on full refresh operations (default: enabled)
+    pub sort_on_refresh: util::EnabledDisabled,
 }
 
 impl Default for VortexConfig {
@@ -178,6 +180,8 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            // Sort on refresh enabled by default
+            sort_on_refresh: util::EnabledDisabled::Enabled,
         }
     }
 }

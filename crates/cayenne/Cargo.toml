@@ -35,6 +35,7 @@ snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
+util = { path = "../util" }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
 vortex-alp = { workspace = true }

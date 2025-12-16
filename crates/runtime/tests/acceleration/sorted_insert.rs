@@ -19,7 +19,9 @@ limitations under the License.
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
-use spicepod::{component::dataset::Dataset as SpicepodDataset, acceleration::Acceleration, param::Params};
+use spicepod::{
+    acceleration::Acceleration, component::dataset::Dataset as SpicepodDataset, param::Params,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -41,20 +43,20 @@ async fn test_arrow_sorted_insert() -> Result<(), anyhow::Error> {
                     3,third,8\n\
                     4,fourth,1\n\
                     5,fifth,4\n";
-    
+
     fs::write(&data_file, csv_data)?;
 
     // Create dataset with Arrow acceleration and sort_columns
     let file_path = data_file.to_string_lossy().to_string();
     let mut dataset = SpicepodDataset::new(format!("file:{file_path}"), "sorted_data");
-    
+
     let mut dataset_params = Params::default();
     dataset_params.insert("file_format".to_string(), "csv".to_string());
     dataset.params = Some(dataset_params);
-    
+
     let mut accel_params = Params::default();
     accel_params.insert("sort_columns".to_string(), "timestamp".to_string());
-    
+
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: None, // None means Arrow
