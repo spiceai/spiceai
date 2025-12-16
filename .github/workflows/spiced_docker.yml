@@ -135,7 +135,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile-release
@@ -212,7 +212,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile-release
@@ -270,7 +270,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA models image
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile-cuda-release
