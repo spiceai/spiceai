@@ -40,6 +40,20 @@ func TestUntarPreventsPathTraversal(t *testing.T) {
 	assert.True(t, os.IsNotExist(statErr), "expected no file to be written outside target directory")
 }
 
+func TestUntarRejectsAbsolutePath(t *testing.T) {
+	tarData := createTarArchive(t, map[string]string{
+		"/escape.txt": "malicious content",
+	})
+
+	targetDir := t.TempDir()
+	err := Untar(bytes.NewReader(tarData), targetDir, false)
+
+	assert.Error(t, err)
+	entries, readErr := os.ReadDir(targetDir)
+	require.NoError(t, readErr)
+	assert.Empty(t, entries, "expected target directory to remain empty")
+}
+
 func TestUntarExtractsWithinTargetDirectory(t *testing.T) {
 	const (
 		filePath = "nested/file.txt"

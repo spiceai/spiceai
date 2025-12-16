@@ -21,10 +21,11 @@ use opentelemetry::KeyValue;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub enum Error {}
 
 impl Runtime {
+    #[cfg(feature = "models")]
     pub(crate) async fn load_workers(self: Arc<Self>) {
         let app_lock = self.app.read().await;
 

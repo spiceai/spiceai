@@ -148,7 +148,7 @@ impl RetryBackoff {
     fn linear_interval(&self) -> Duration {
         // Linear backoff: constant interval each time
         // Capped at 5 minutes
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let interval_ms = self.base_interval.as_millis() as u64;
         let max_interval_ms = 300_000; // 5 minutes
         Duration::from_millis(interval_ms.min(max_interval_ms))
@@ -157,11 +157,11 @@ impl RetryBackoff {
     fn exponential_interval(&self) -> Duration {
         // Exponential backoff: base_interval * 2^retry_count
         // Capped at 5 minutes
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let base_ms = self.base_interval.as_millis() as u64;
         let max_interval_ms = 300_000; // 5 minutes
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let multiplier = 2_u64.saturating_pow(self.num_retries.saturating_sub(1) as u32);
         let interval_ms = base_ms.saturating_mul(multiplier);
 
@@ -256,16 +256,14 @@ fn get_random_value_from_interval(
     let max_interval = current_interval_nanos + delta;
     let diff = max_interval - min_interval;
 
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::cast_sign_loss)]
     let nanos = min_interval + (random * diff);
 
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_sign_loss)]
     Duration::from_nanos(nanos as u64)
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn duration_to_nanos(duration: Duration) -> f64 {
     (duration.as_secs() as f64) * 1e9 + f64::from(duration.subsec_nanos())
 }
@@ -296,7 +294,9 @@ mod tests {
             "exp".parse::<BackoffMethod>().ok(),
             Some(BackoffMethod::Exponential)
         );
-        assert!("invalid".parse::<BackoffMethod>().is_err());
+        "invalid"
+            .parse::<BackoffMethod>()
+            .expect_err("Should fail for invalid method");
     }
 
     #[test]

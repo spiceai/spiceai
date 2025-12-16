@@ -40,6 +40,7 @@ use crate::{
     },
     model::params::concat_arrays,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -113,7 +114,6 @@ impl IcebergDataConnector {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn create_iceberg_table_provider(
         &self,
         dataset: &Dataset,
@@ -319,3 +319,5 @@ impl DataConnector for IcebergDataConnector {
         Some(self.create_iceberg_table_provider(dataset).await)
     }
 }
+
+register_data_connector!("iceberg", IcebergDataConnectorFactory);

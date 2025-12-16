@@ -65,7 +65,7 @@ pub fn hash<T: Hash>(value: &T) -> u64 {
 // replace insta headers with an empty string
 const INSTA_HEADER_REGEX: &str = r"^---\n(([\w\W]*\n)+)---\n";
 static INSTA_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)] // the regex is valid
+    #[expect(clippy::expect_used)] // the regex is valid
     Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build")
 });
 

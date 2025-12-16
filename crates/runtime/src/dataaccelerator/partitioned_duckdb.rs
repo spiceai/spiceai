@@ -56,11 +56,11 @@ use super::{
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
-    component::dataset::acceleration::Mode,
+    component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::FilePathError,
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     parameters::ParameterSpec,
-    spice_data_base_path,
+    register_data_accelerator, spice_data_base_path,
 };
 
 pub mod tables_mode;
@@ -287,8 +287,8 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 
-        let partition_by_first = partition_by
-            .first()
+        let partition_by_last = partition_by
+            .last()
             .context(PartitionByRequiredSnafu)?
             .clone();
 
@@ -302,7 +302,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         let creator = Arc::new(DuckDBPartitionCreator::new(
             partition_dir(source),
             cmd,
-            partition_by_first,
+            partition_by_last,
             Arc::clone(&schema),
         ));
         let table_provider =
@@ -493,3 +493,5 @@ async fn get_pool(
             .await?,
     ))
 }
+
+register_data_accelerator!(Engine::PartitionedDuckDB, PartitionedDuckDBAccelerator);

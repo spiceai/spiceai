@@ -607,7 +607,6 @@ impl Stream for CustomStream {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn make_a_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -616,7 +615,7 @@ fn make_a_stream(
     mut s: ChatCompletionResponseStream,
 ) -> ChatCompletionResponseStream {
     let (sender, receiver) = mpsc::channel(100);
-    let sender_clone = sender.clone();
+    let sender_clone = sender;
 
     tokio::spawn(
         request_context
@@ -974,7 +973,7 @@ mod tests {
             create_tool_message("test_id", "dataset1, dataset2"),
         ];
 
-        let result = insert_initial_tools(messages.clone(), "list_datasets", &tool_messages);
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
         insta::assert_json_snapshot!(result, {
             "[].Assistant.tool_calls[].id" => "[tool_call_id]"

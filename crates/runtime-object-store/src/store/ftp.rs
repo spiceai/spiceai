@@ -261,7 +261,7 @@ impl ObjectStore for FTPObjectStore {
         }
 
         Ok(GetResult {
-            meta: object_meta.clone(),
+            meta: object_meta,
             payload: GetResultPayload::Stream(pipe_stream(
                 client,
                 location_string,

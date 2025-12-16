@@ -36,6 +36,16 @@ pub(crate) fn add_full_text_search_to_table(
     columns: &[Column],
     tbl: &TableReference,
 ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+    let schema = inner_table_provider.schema();
+    for c in columns {
+        if schema.column_with_name(&c.name).is_none() {
+            tracing::warn!(
+                "The table {} is configured with column {} in the spicepod, but the column is not in the table's schema",
+                tbl.to_string(),
+                c.name
+            );
+        }
+    }
     let Some(FullTextSearchDatasetConfig {
         index_store,
         index_path,
@@ -67,7 +77,7 @@ pub(crate) fn add_full_text_search_to_table(
     let store_fields = columns
         .iter()
         .filter_map(|c| {
-            if let Some(MetadataType::NonFilterable) = c.as_vector_metadata() {
+            if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
                 return Some(c.name.clone());
             }
             None
@@ -76,7 +86,7 @@ pub(crate) fn add_full_text_search_to_table(
 
     let index = FullTextDatabaseIndex::try_new(
         Arc::clone(&inner_table_provider),
-        search_fields.clone(),
+        search_fields,
         Some(primary_key),
         directory,
         &store_fields,

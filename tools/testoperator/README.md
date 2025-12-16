@@ -9,10 +9,11 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
-- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary.
+- `-s, --spiced-path <SPICED_PATH>`: Path to the `spiced` binary, or URL to an already-running spiced instance's Flight endpoint (e.g., `http://localhost:50051` to connect to an external instance).
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 - `--disable-progress-bars`: Disable progress bars during the test.
+- `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
 ## Use cases
 
@@ -141,6 +142,8 @@ testoperator run throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.data 
 A load test replicates a throughput test, but instead of running for a set number of query executions (2 by default for throughput tests) load tests run for a specified duration. A load test uses the same command options as a throughput test, with the additional options:
 
 - `--duration <SECONDS>`: The duration of the load test to run in seconds.
+- `--run-until-stopped`: Continue the load phase until manually interrupted (Ctrl+C). Warm-up and baseline still use `--duration` to size their runs.
+- `--mark-query-failed-if-exceeds <DURATION>`: Mark queries as failed if they exceed this duration threshold (e.g., "500ms", "2s"). Useful for identifying slow queries that should be treated as failures in metrics.
 
 A load test will match the specified duration as a best-effort. A load test will never be shorter than the specified duration, but can be longer than the specified duration if there are running queries when the end duration is passed. For example, a `--duration 10` is specified but a query that takes 60 seconds runs. The load test will end after the query finishes, taking 60 seconds instead of 10.
 

@@ -141,7 +141,7 @@ pub struct Request {
     #[serde(default = "default_sample_data_enabled")]
     pub sample_data_enabled: bool,
 
-    /// Names of datasets to sample from. If omitted, all datasets are used.
+    /// Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
 }
@@ -290,7 +290,6 @@ pub(crate) async fn post(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_nsql_query(
     rt: Arc<Runtime>,
     context: Arc<RequestContext>,

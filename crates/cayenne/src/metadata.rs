@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use serde::{Deserialize, Serialize};
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -82,8 +83,6 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
-    /// Data file this delete file applies to
-    pub data_file_id: i64,
     /// Path to the delete file (Parquet format)
     pub path: String,
     /// Whether the path is relative
@@ -117,35 +116,19 @@ pub struct PartitionMetadata {
     pub file_size_bytes: i64,
 }
 
-/// Statistics about a partition for query optimization.
-#[derive(Debug, Clone, Default)]
-pub struct PartitionStats {
-    /// Total number of records
-    pub record_count: i64,
-    /// Total file size in bytes
-    pub file_size_bytes: i64,
+/// Which compression strategy to use for the Vortex layout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum CompressionStrategy {
+    /// Uses the default Vortex Btrblocks compression.
+    #[default]
+    Btrblocks,
+    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    Zstd,
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
-    /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
-    pub enable_alp: bool,
-    /// Enable FSST (Fast String Suffix Trie) encoding for string columns
-    pub enable_fsst: bool,
-    /// Enable `BitPacking` encoding for integer columns
-    pub enable_bitpacking: bool,
-    /// Enable Delta encoding for sequential data
-    pub enable_delta: bool,
-    /// Enable Run-Length Encoding (RLE)
-    pub enable_rle: bool,
-    /// Enable Dictionary encoding for low-cardinality columns
-    pub enable_dict: bool,
-    /// Enable Frame-of-Reference (FOR) encoding
-    pub enable_for: bool,
-    /// Enable `ZigZag` encoding for signed integers
-    pub enable_zigzag: bool,
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
     /// Segment cache size in MB
@@ -153,35 +136,30 @@ pub struct VortexConfig {
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 256 MB.
+    /// Defaults to 128 MB.
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
     /// Whether to sort data on full refresh operations (default: enabled)
     pub sort_on_refresh: util::EnabledDisabled,
+    /// Compression strategy to use for Vortex files
+    /// Defaults to Btrblocks
+    pub compression_strategy: CompressionStrategy,
 }
 
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Enable all SIMD-optimized encodings by default
-            enable_alp: true,
-            enable_fsst: true,
-            enable_bitpacking: true,
-            enable_delta: true,
-            enable_rle: true,
-            enable_dict: true,
-            enable_for: true,
-            enable_zigzag: true,
-            // Cache configuration
+            // Larger caches improve read performance
             footer_cache_mb: 128,
-            segment_cache_mb: 32,
-            // Target file size: 256 MB
-            target_vortex_file_size_mb: 256,
+            segment_cache_mb: 256,
+            // Smaller files = better parallelism and predicate pushdown
+            target_vortex_file_size_mb: 128,
             // No sort columns by default
             sort_columns: Vec::new(),
             // Sort on refresh enabled by default
             sort_on_refresh: util::EnabledDisabled::Enabled,
+            compression_strategy: CompressionStrategy::default(),
         }
     }
 }
@@ -201,19 +179,4 @@ pub struct CreateTableOptions {
     pub partition_column: Option<String>,
     /// Vortex encoding configuration
     pub vortex_config: VortexConfig,
-}
-
-/// Statistics about a table.
-#[derive(Debug, Clone, Default)]
-pub struct TableStats {
-    /// Total number of records (including deleted ones)
-    pub total_records: i64,
-    /// Number of deleted records
-    pub deleted_records: i64,
-    /// Total size in bytes of all data files
-    pub total_size_bytes: i64,
-    /// Number of active data files
-    pub active_data_files: i64,
-    /// Number of delete files
-    pub delete_files: i64,
 }

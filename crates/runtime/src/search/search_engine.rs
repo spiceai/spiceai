@@ -23,7 +23,7 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::{DFSchema, SchemaError};
+use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast;
@@ -334,7 +334,7 @@ impl SearchEngine {
                         &tbl,
                         get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
                         table_cols,
-                        primary_keys.to_vec(),
+                        primary_keys.iter().map(|pk| Column::from_qualified_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
                         *limit
                     ).await.context(SearchPipelineSnafu)?;
@@ -507,12 +507,7 @@ fn wrap_cache_to_result(
         if results.is_empty() {
             tracing::trace!("No results to cache for tables: {expected_keys:?}");
             return;
-        } else if !expected_keys
-            .iter()
-            .filter(|key| !results.contains_key(key))
-            .collect::<Vec<_>>()
-            .is_empty()
-        {
+        } else if expected_keys.iter().any(|key| !results.contains_key(key)) {
             tracing::trace!(
                 "Not all expected keys were found in the cached results: {expected_keys:?}"
             );

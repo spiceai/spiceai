@@ -20,7 +20,10 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, acceleration::RefreshMode};
+use crate::{
+    component::dataset::{Dataset, acceleration::RefreshMode},
+    register_data_connector,
+};
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -223,3 +226,5 @@ impl DisplayAs for SinkDataSink {
         write!(f, "SinkDataSink")
     }
 }
+
+register_data_connector!("sink", SinkConnectorFactory);

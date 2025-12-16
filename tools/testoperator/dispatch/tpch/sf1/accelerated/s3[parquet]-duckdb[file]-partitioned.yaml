@@ -6,13 +6,16 @@ tests:
     validate_results: true
     reference_schema: arrow
     duration: 28800
+    query_overrides: duckdb-partitioned
   throughput:
     spicepod_path: accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
+    query_overrides: duckdb-partitioned
   load:
     spicepod_path: accelerated/s3[parquet]-duckdb[file]-partitioned.yaml
     query_set: tpch
     runner_type: spiceai-dev-runners
     duration: 28800
+    query_overrides: duckdb-partitioned

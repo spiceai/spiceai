@@ -20,6 +20,7 @@ use runtime::{
 };
 use spicepod::{acceleration::Mode, param::Params};
 
+mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres")]

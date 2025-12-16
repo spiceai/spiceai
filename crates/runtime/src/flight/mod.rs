@@ -14,19 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "cluster")]
-use {
-    crate::config::ClusterMode,
-    ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    ballista_executor::flight_service::BallistaFlightService, std::net::SocketAddr,
-};
-
 use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
 use crate::dataupdate::DataUpdate;
-use crate::tls::TlsConfig;
+use crate::opentelemetry::create_metrics_service;
+use crate::tls::{TlsConfig, server_with_tls_config};
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -55,7 +49,6 @@ use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -63,7 +56,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
@@ -202,7 +195,7 @@ impl Service {
         query.get_schema().await.map_err(handle_datafusion_error)
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()
@@ -302,7 +295,6 @@ fn record_batches_to_flight_stream(
         .map_err(to_tonic_err)
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn to_tonic_err<E>(e: E) -> Status
 where
     E: std::fmt::Display + 'static,
@@ -323,7 +315,6 @@ fn handle_query_error(e: query::Error) -> Status {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn handle_datafusion_error(e: DataFusionError) -> Status {
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
@@ -426,11 +417,19 @@ pub enum Error {
         "The cluster scheduler is not initialized, preventing the flight service from starting."
     ))]
     ClusterSchedulerNotInitialized {},
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Unable to start internal cluster server: {source}"))]
+    UnableToStartClusterServer { source: tonic::transport::Error },
+
+    #[cfg(feature = "cluster")]
+    #[snafu(display("The flight service has an insecure configuration: {message}"))]
+    InsecureConfiguration { message: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+pub(crate) fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
     let mut source: Option<&dyn std::error::Error> = Some(err);
     while let Some(e) = source {
         if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
@@ -454,6 +453,18 @@ pub async fn start(
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
+    #[cfg(feature = "cluster")]
+    if matches!(
+        rt.config.cluster.mode,
+        Some(crate::config::ClusterMode::Executor)
+    ) {
+        return Err(Error::InsecureConfiguration {
+            message:
+                "Executor flight server must be started via cluster::start_executor_flight_server"
+                    .to_string(),
+        });
+    }
+
     let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
     let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
@@ -461,32 +472,16 @@ pub async fn start(
     let mut server = Server::builder();
 
     if let Some(ref tls_config) = tls_config {
-        let server_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
-            tls_config.cert.expose_secret(),
-            tls_config.key.expose_secret(),
-        ));
-        server = server
-            .tls_config(server_tls_config)
-            .context(UnableToConfigureTlsSnafu)?;
-    }
-
-    #[cfg(feature = "cluster")]
-    if tls_config.is_none()
-        && rt.config.cluster.mode.is_some()
-        && !rt.config.cluster.allow_insecure_connections
-    {
-        panic!(
-            "Refusing to start in clustered mode without a valid TLS configuration. \
-            To acknowledge and override, pass --allow-insecure-connections as an argument to spiced.\
-            Both schedulers and executors must share the same TLS configuration."
-        );
+        server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
     }
 
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
-    #[allow(unused_mut)]
+    // Create the OpenTelemetry MetricsService
+    let otel_service = create_metrics_service(rt.datafusion());
+
     let mut server = server
         .layer(RequestContextLayer::new(app, rt.datafusion(), rt.secrets()))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
@@ -494,56 +489,9 @@ pub async fn start(
         )))
         .layer(auth_layer);
 
-    #[cfg(not(feature = "cluster"))]
-    let server = server.add_service(spice_flight_service);
-
-    #[cfg(feature = "cluster")]
-    let server = match rt.config.cluster.mode {
-        Some(ClusterMode::Scheduler) => {
-            let Some(scheduler) = rt
-                .df
-                .scheduler_server
-                .read()
-                .ok()
-                .and_then(|r| r.iter().next().cloned())
-            else {
-                return Err(Error::ClusterSchedulerNotInitialized {});
-            };
-
-            let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler);
-            server
-                .add_service(spice_flight_service)
-                .add_service(scheduler_grpc_server)
-        }
-        Some(ClusterMode::Executor) => {
-            let executor_flight = FlightServiceServer::new(BallistaFlightService::new())
-                .max_decoding_message_size(usize::MAX)
-                .max_encoding_message_size(usize::MAX);
-
-            server.add_service(executor_flight)
-        }
-        _ => server.add_service(spice_flight_service),
-    };
-
-    // If running an executor, we may have resolved another port to bind if 50051 is taken
-    #[cfg(feature = "cluster")]
-    let bind_address: SocketAddr = if let Some((host, port)) =
-        rt.df.executor.read().ok().and_then(|maybe_executor| {
-            maybe_executor
-                .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port)))
-        }) {
-        if let Ok(addr) = format!("{host}:{port}").parse() {
-            addr
-        } else {
-            tracing::warn!(
-                "Failed to parse executor address {host}:{port}, using default bind_address {bind_address}"
-            );
-            bind_address
-        }
-    } else {
-        bind_address
-    };
+    let server = server
+        .add_service(spice_flight_service)
+        .add_service(otel_service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);

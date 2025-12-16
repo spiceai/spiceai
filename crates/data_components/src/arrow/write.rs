@@ -19,38 +19,36 @@
 
 use arrow::array::{Array, BooleanBuilder};
 use arrow::compute::filter_record_batch;
+use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::scalar::ScalarValue;
-use datafusion_table_providers::util::column_reference::ColumnReference;
-use datafusion_table_providers::util::on_conflict::OnConflict;
-use std::any::Any;
-use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Debug};
-
-use std::sync::{Arc, Mutex};
-
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use async_trait::async_trait;
-use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::datasource::{TableProvider, TableType, provider_as_source};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+use datafusion::scalar::ScalarValue;
+use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::on_conflict::OnConflict;
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use futures::StreamExt;
 use futures::stream;
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Debug};
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
-use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
 /// A wrapper around `XxHash3_64` that uses a fixed seed (0) for deterministic hashing.
 /// This is necessary because `XxHash3_64::default()` may use a random seed for DOS protection,
@@ -152,7 +150,7 @@ impl MemTable {
 
     #[must_use]
     pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
-        if !matches!(on_conflict, OnConflict::Upsert(_, _)) {
+        if !matches!(on_conflict, OnConflict::Upsert(_)) {
             tracing::warn!(
                 "In-memory tables only support Upsert on_conflict, but got: {on_conflict:?}. Setting will be ignored."
             );
@@ -232,26 +230,20 @@ impl MemTable {
         pk: &[usize],
         on_conflict: &ColumnReference,
     ) -> Result<()> {
-        let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
-
-        if on_conflict_cols.len() != pk.len() {
-            return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
-            ));
-        }
-
         let schema = self.schema();
 
-        if on_conflict_cols
+        let pk_names: HashSet<&str> = pk
             .iter()
-            .zip(pk.iter())
-            .any(|(c, pk)| c != schema.field(*pk).name())
-        {
+            .map(|&idx| schema.field(idx).name().as_str())
+            .collect();
+
+        let on_conflict_set: HashSet<&str> = on_conflict.iter().collect();
+
+        if pk_names != on_conflict_set {
             return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
+                "Primary key columns must match the on_conflict definition".to_string(),
             ));
         }
-
         Ok(())
     }
 
@@ -331,8 +323,7 @@ impl TableProvider for MemTable {
 
         // In-memory tables only support primary keys constraints. Support for `OnConflict` is limited to `Upsert` matching the primary key.
         // So we verify that the `on_conflict` and  the primary key matches
-        if let (Some(OnConflict::Upsert(on_conflict, _)), Some(pk)) =
-            (&self.on_conflict, &primary_key)
+        if let (Some(OnConflict::Upsert(on_conflict)), Some(pk)) = (&self.on_conflict, &primary_key)
         {
             self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
         }
@@ -402,7 +393,7 @@ impl MemSink {
             batches,
             overwrite,
             primary_key: primary_key.map(|pks| {
-                let mut z = pks.clone();
+                let mut z = pks;
                 z.sort_unstable();
                 z
             }),
@@ -535,7 +526,6 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
@@ -860,7 +850,7 @@ pub mod bench_wrappers {
     };
 
     /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn check_and_filter_non_null_unique_primary_keys(
         pks: &[Option<String>],
         existing_pks: Option<&HashSet<String>>,
@@ -869,7 +859,7 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn check_and_filter_unique_constraint(
         ids: &[&str],
         existing_ids: Option<&HashSet<String>>,
@@ -886,7 +876,7 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `filter_existing`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn filter_existing(
         existing_batches: &mut Vec<RecordBatch>,
         overwriting_primary_keys: &HashSet<String>,
@@ -955,6 +945,11 @@ impl DataSink for MemSink {
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
+        //
+        // For InsertOp::Replace, we allow duplicate primary keys in new data because the operation will:
+        // 1. Remove all existing rows matching ANY of the new primary keys
+        // 2. Insert all new rows (even if they share primary keys)
+        // This is essential for caching scenarios where multiple result rows share the same request metadata.
         let mut new_key_set: HashSet<
             String,
             std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
@@ -962,9 +957,26 @@ impl DataSink for MemSink {
         if let Some(ref pks) = self.primary_key {
             let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
-            new_key_set = check_and_filter_non_null_unique_primary_keys::<
-                std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
-            >(&new_primary_key_ids, None)?;
+
+            // For InsertOp::Replace, we don't require unique primary keys in new data
+            // because we'll remove all existing rows with these keys before inserting
+            if matches!(self.overwrite, InsertOp::Replace) {
+                // Just collect unique keys and check for nulls, don't enforce uniqueness
+                for id in &new_primary_key_ids {
+                    if let Some(key) = id {
+                        new_key_set.insert(key.to_string());
+                    } else {
+                        return Err(DataFusionError::Execution(
+                            "Primary key values cannot be null".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                // For Append/Overwrite, require unique primary keys
+                new_key_set = check_and_filter_non_null_unique_primary_keys::<
+                    std::hash::BuildHasherDefault<XxHash3_64WithFixedSeed>,
+                >(&new_primary_key_ids, None)?;
+            }
         }
 
         let mut writable_targets: Vec<_> =
@@ -1009,29 +1021,26 @@ impl DataSink for MemSink {
                 // Concatenate batches in this partition for sorting
                 let schema = batches[0].schema();
                 let combined_batch = if batches.len() == 1 {
-                    // Take the single batch without cloning
-                    batches.into_iter().next().ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "Expected single batch but found none".to_string(),
-                        )
-                    })?
+                    // SAFETY: We've just checked that batches.len() == 1, so pop() cannot fail
+                    match batches.pop() {
+                        Some(batch) => batch,
+                        None => unreachable!("batches.len() == 1 guarantees pop() succeeds"),
+                    }
                 } else {
                     arrow::compute::concat_batches(&schema, &batches)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
                 };
 
-                // Sort the combined batch
                 let sorted_stream = RecordBatchStreamAdapter::new(
                     Arc::clone(&schema),
                     stream::iter(vec![Ok(combined_batch)]),
                 );
 
-                let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+                let sorted_stream = util::stream_utils::sort_stream(
                     Box::pin(sorted_stream),
                     &self.sort_columns,
                     context,
-                )
-                .await?;
+                )?;
 
                 // Collect sorted batches
                 batches = datafusion::physical_plan::common::collect(sorted_stream).await?;
@@ -1673,7 +1682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_delete_from() {
         let (rb, schema) = create_batch_with_string_columns(&[(
             "time_in_string",
@@ -2066,6 +2075,53 @@ mod tests {
         assert!(
             result.is_err(),
             "should fail when on_conflict columns don't match primary key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_validation_column_order() {
+        // Tests that composite primary key validation works correctly when
+        // primary key / on_conflict columns indices are not lexicographically ordered.
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "b"]),
+            ("pk2", vec!["1", "2"]),
+            ("value", vec!["v1", "v2"]),
+        ]);
+
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![1, 0]), // Composite key
+            ]))
+            .await
+            .expect("constraints should be satisfied")
+            .with_on_conflict(
+                OnConflict::try_from("upsert:(pk2,pk1)").expect("create on_conflict"),
+            );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Try to insert duplicate composite key
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "c"]),
+            ("pk2", vec!["1", "1"]),
+            ("value", vec!["v5", "v6"]),
+        ]);
+
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        assert!(
+            collect(insertion, ctx.task_ctx()).await.is_ok(),
+            "insertion should succeed"
         );
     }
 

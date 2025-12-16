@@ -9,17 +9,6 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers.",
-        "question": "How many numbers between 0 and 60 are even multiples of 5?"
-      },
-      "primary_key": {
-        "id": 470
-      },
-      "score": 0.03
-    },
-    {
-      "dataset": "qs",
-      "matches": {
         "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -31,20 +20,31 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Identify the given number as prime, composite, or neither: 36."
+        "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers.",
+        "question": "How many numbers between 0 and 60 are even multiples of 5?"
       },
       "primary_key": {
-        "id": 484
+        "id": 470
+      },
+      "score": 0.03
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+      },
+      "primary_key": {
+        "id": 458
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
+        "question": "Calculate the number of permutations of 14 items taken 4 at a time."
       },
       "primary_key": {
-        "id": 42
+        "id": 41
       },
       "score": 0.01
     }

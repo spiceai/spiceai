@@ -126,7 +126,6 @@ impl RouterModel {
 
 #[async_trait::async_trait]
 impl Chat for RouterModel {
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -212,7 +211,6 @@ impl Chat for RouterModel {
         })))
     }
 
-    #[allow(deprecated)]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,

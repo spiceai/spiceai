@@ -80,7 +80,7 @@ fn create_test_batch(region: &str, size: usize) -> RecordBatch {
         Field::new("region", DataType::Utf8, false),
     ]));
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let ids: Vec<i32> = (0..size as i32).collect();
     let id_array = Arc::new(Int32Array::from(ids));
     let region_array = Arc::new(StringArray::from(vec![region; size]));

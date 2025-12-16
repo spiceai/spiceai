@@ -72,7 +72,7 @@ impl KafkaSys {
                     ],
                 )?;
 
-                Ok(())
+                Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(Error::external)
@@ -101,10 +101,13 @@ impl KafkaSys {
                         consumer_group_id,
                         topic,
                         schema: KafkaSys::deserialize_schema(&schema_json)
-                            .map_err(|err| tokio_rusqlite::Error::Other(Box::new(err)))?,
+                            .map_err(|err| {
+                                tracing::warn!("Failed to deserialize Kafka schema from SQLite: {err}");
+                                rusqlite::Error::InvalidQuery
+                            })?,
                     })
                 } else {
-                    Err(tokio_rusqlite::Error::Other("No row found".into()))
+                    Err(rusqlite::Error::QueryReturnedNoRows)
                 }
             })
             .await

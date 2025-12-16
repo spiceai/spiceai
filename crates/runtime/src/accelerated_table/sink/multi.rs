@@ -383,8 +383,8 @@ mod tests {
         assert_eq!(received_values, vec![1, 2, 3, 4, 5, 6]);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::cast_possible_wrap)]
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_barrier_synchronization() {
         let barrier = Arc::new(Barrier::new(2));
@@ -478,11 +478,8 @@ mod tests {
         }
 
         // Verify we get an error when reading from a lagged stream
-        if let Some(result) = stream.next().await {
-            assert!(result.is_err());
-        } else {
-            panic!("expected error");
-        }
+        let result = stream.next().await.expect("should have an item");
+        result.expect_err("expected lagging error");
     }
 
     #[tokio::test]

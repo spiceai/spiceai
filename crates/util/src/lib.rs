@@ -30,6 +30,7 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+pub mod stream_utils;
 pub mod time_format;
 
 /// Generic enabled/disabled configuration enum
@@ -62,10 +63,10 @@ impl EnabledDisabled {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_precision_loss)]
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_wrap)]
 #[must_use]
 pub fn human_readable_bytes(num: usize) -> String {
     let units = ["B", "kiB", "MiB", "GiB"];
@@ -208,7 +209,7 @@ async fn shutdown_signal_impl() {
 
 This function will propagate `SystemTimeError` from `time.elapsed()`
 */
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
     time.elapsed()
         .map(|elapsed| {
