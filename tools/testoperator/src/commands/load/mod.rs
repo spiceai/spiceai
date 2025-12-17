@@ -21,10 +21,9 @@ use test_framework::{
     TestType, anyhow,
     app::AppBuilder,
     arrow::util::pretty::print_batches,
-    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus, StatisticsCollector},
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
-    queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicepod::Spicepod,
     spicetest::{
@@ -82,16 +81,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // warm up run
     println!("Performing warm up");
 
-    // Parameterized queries may contain variations of the same query with different parameters.
-    // For the baseline run, we include only unique queries to avoid excessively long baseline durations.
-    let mut seen = std::collections::HashSet::new();
-    let baseline_queries: Vec<_> = queries
-        .iter()
-        .filter(|q| seen.insert(Arc::clone(&q.name)))
-        .cloned()
-        .collect();
-
-    let (_query_set, test_builder) = super::build_test_with_validation(
+    let (baseline_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
@@ -274,9 +264,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
+
     // Use baseline_queries that represent unique query names, otherwise the same failure
     // could be reported multiple times for each parameterized query params set variation
-    for query in baseline_queries {
+    for query in baseline_query_set
+        .get_queries(query_overrides, None, None)
+        .await?
+    {
         let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
             // Query Failed, no percentile statistics recorded
             continue;
