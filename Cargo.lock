@@ -9526,7 +9526,6 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
- "tract-core",
  "tract-onnx",
  "util",
 ]
