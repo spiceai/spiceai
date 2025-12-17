@@ -1010,7 +1010,6 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .await
 }
 
-#[expect(clippy::too_many_lines)]
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {

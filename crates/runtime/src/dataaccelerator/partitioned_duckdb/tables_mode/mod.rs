@@ -185,8 +185,8 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let partition_by_first = partition_by
-            .first()
+        let partition_by_last = partition_by
+            .last()
             .context(super::PartitionByRequiredSnafu)?
             .clone();
 
@@ -202,7 +202,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             DuckDBPartitionCreator::new(
                 self.get_shared_pool(source).await?,
                 cmd.clone(),
-                partition_by_first,
+                partition_by_last,
                 Arc::clone(&schema),
                 &self.duckdb_factory,
             )
@@ -494,7 +494,6 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_tables_mode_partitioned_duckdb_accelerator() {
         // Ensure no previous database version exists
         let test_db_path = "./test_table.db";

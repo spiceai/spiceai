@@ -69,9 +69,10 @@ anyhow.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 dotenvy.workspace = true
-insta.workspace = true
+insta = {workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 paste.workspace = true
+rstest = "0.25.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 

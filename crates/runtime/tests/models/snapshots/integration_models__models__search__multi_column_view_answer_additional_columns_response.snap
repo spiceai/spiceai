@@ -8,53 +8,53 @@ snapshot_kind: text
   "results": [
     {
       "data": {
-        "question": "What is the fifth root of 32?"
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
       "dataset": "qs",
       "matches": {
-        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
       },
       "primary_key": {
-        "id": 948
+        "id": 468
       },
       "score": 0.01
     },
     {
       "data": {
-        "question": "How many groups of 3 are in 18?"
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 3 are in 18?"
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "primary_key": {
-        "id": 463
+        "id": 361
       },
       "score": 0.01
     },
     {
       "data": {
-        "question": "How many groups of 5 are in 25?"
+        "question": "How many groups of 2 are in 14?"
       },
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 5 are in 25?"
+        "question": "How many groups of 2 are in 14?"
       },
       "primary_key": {
-        "id": 464
+        "id": 462
       },
       "score": 0.01
     },
     {
       "data": {
-        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 189
+        "id": 1277
       },
       "score": 0.01
     }

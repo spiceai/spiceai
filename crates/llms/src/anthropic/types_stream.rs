@@ -259,7 +259,6 @@ pub struct MessageDelta {
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
-#[expect(clippy::too_many_lines)]
 pub fn transform_stream(
     stream: Pin<
         Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,

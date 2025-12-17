@@ -23,7 +23,7 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::{DFSchema, SchemaError};
+use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast;
@@ -334,7 +334,7 @@ impl SearchEngine {
                         &tbl,
                         get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
                         table_cols,
-                        primary_keys.to_vec(),
+                        primary_keys.iter().map(|pk| Column::from_qualified_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
                         *limit
                     ).await.context(SearchPipelineSnafu)?;

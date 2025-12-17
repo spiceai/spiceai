@@ -66,6 +66,11 @@ pub enum Error {
     #[snafu(display("DynamoDB returned value of 'Unknown' type"))]
     UnknownType,
 
+    #[snafu(display(
+        "Maximum recursion depth of {max_depth} exceeded while processing nested DynamoDB data"
+    ))]
+    MaxRecursionDepthExceeded { max_depth: usize },
+
     #[snafu(display("Table has no partition key"))]
     MissingPartitionKey,
 
@@ -77,4 +82,7 @@ pub enum Error {
 
     #[snafu(display("Failed to Bootstrap DynamoDB Table: {source}"))]
     FailedToBootstrapTable { source: DataFusionError },
+
+    #[snafu(display("DynamoDB table {table_name} is empty"))]
+    EmptyTable { table_name: String },
 }

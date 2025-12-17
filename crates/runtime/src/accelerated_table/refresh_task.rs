@@ -369,7 +369,6 @@ impl RefreshTask {
         })
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
         self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;

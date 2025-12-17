@@ -131,7 +131,7 @@ jobs:
           echo "CARGO_FEATURES=release" >> $GITHUB_ENV
       - &build-arm64-image
         name: Build ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile
@@ -159,7 +159,7 @@ jobs:
           echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - *build-arm64-image
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
@@ -201,7 +201,7 @@ jobs:
           echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
       - &build-amd64-image
         name: Build AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile
@@ -229,7 +229,7 @@ jobs:
           echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
       - *build-amd64-image
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
@@ -241,7 +241,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           path: /tmp
           pattern: images-*
