@@ -281,7 +281,6 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-tract-core = "0.22.0"
 turso = "0.3.0"
 twox-hash = "2.1.2"
 url = "2.5"

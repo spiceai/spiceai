@@ -9527,7 +9527,6 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
- "tract-core",
  "tract-onnx",
  "util",
 ]
@@ -13215,7 +13214,6 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "tract-core",
  "turso",
  "twox-hash",
  "url",
@@ -13346,7 +13344,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
- "tract-core",
 ]
 
 [[package]]
