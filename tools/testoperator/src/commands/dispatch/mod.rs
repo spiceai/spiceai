@@ -45,7 +45,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         .iter()
         .map(|path| {
             let file = std::fs::File::open(path)?;
-            let tests: DispatchTestFile = serde_yaml::from_reader(file)?;
+            let tests: DispatchTestFile = serde_yaml::from_reader(file)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?;
 
             Ok::<_, anyhow::Error>((path, tests))
         })
