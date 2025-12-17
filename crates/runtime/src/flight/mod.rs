@@ -455,8 +455,8 @@ pub async fn start(
 ) -> Result<()> {
     #[cfg(feature = "cluster")]
     if matches!(
-        rt.config.cluster.mode,
-        Some(crate::config::ClusterMode::Executor)
+        rt.df.cluster_config.effective_role(),
+        Some(crate::config::ClusterRole::Executor)
     ) {
         return Err(Error::InsecureConfiguration {
             message:

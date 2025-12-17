@@ -48,7 +48,7 @@ mod tracker;
 
 #[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterMode,
+    crate::config::ClusterRole,
     crate::datafusion::builder::default_extension_planners,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
@@ -170,14 +170,14 @@ impl Query {
 
     #[cfg(feature = "cluster")]
     fn get_session_state(&self) -> Result<SessionState> {
-        if !matches!(self.df.cluster_config.mode(), Some(ClusterMode::Scheduler)) {
+        if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
             return Ok(self.df.ctx.state());
         }
 
         let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
             return Err(Error::UnableToExecuteQuery {
                 source: datafusion::error::DataFusionError::Configuration(
-                    "Scheduler mode requires --cluster-advertise-address".to_string(),
+                    "Scheduler mode requires --node-advertise-address".to_string(),
                 ),
             });
         };

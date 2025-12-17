@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
-use crate::config::{ClusterConfig, ClusterMode};
+use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
@@ -139,9 +139,9 @@ impl ResolvedClusterConfig {
     pub fn try_new(config: ClusterConfig) -> std::io::Result<Self> {
         // Cluster mode requires mTLS - all certificate files must be specified
         let tls_config = match (
-            &config.cluster_ca_certificate_file,
-            &config.cluster_certificate_file,
-            &config.cluster_key_file,
+            &config.node_mtls_ca_certificate_file,
+            &config.node_mtls_certificate_file,
+            &config.node_mtls_key_file,
         ) {
             (Some(ca_path), Some(cert_path), Some(key_path)) => {
                 Some(ClusterTlsConfig::try_new(ca_path, cert_path, key_path)?)
@@ -150,30 +150,33 @@ impl ResolvedClusterConfig {
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mTLS requires all of: --cluster-ca-certificate-file, --cluster-certificate-file, --cluster-key-file",
+                    "Cluster mTLS requires all of: --node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
                 ));
             }
         };
 
-        // Validate cluster mode requirements
-        if config.mode.is_some() {
+        // Determine effective cluster role (explicit or implicit from scheduler_address)
+        let is_cluster_role = config.role.is_some() || config.scheduler_address.is_some();
+
+        // Validate cluster role requirements
+        if is_cluster_role {
             if tls_config.is_none() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mode requires mTLS. Specify all of: --cluster-ca-certificate-file, --cluster-certificate-file, --cluster-key-file",
+                    "Cluster mode requires mTLS. Specify all of: --node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
                 ));
             }
-            if config.cluster_advertise_address.is_none() {
+            if config.node_advertise_address.is_none() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mode requires --cluster-advertise-address",
+                    "Multi-node clusters require --node-advertise-address. Set this to the hostname or IP address other cluster nodes can use to reach this node.",
                 ));
             }
         }
 
         // Pre-compute scheduler URL from advertise address
         let scheduler_url = config
-            .cluster_advertise_address
+            .node_advertise_address
             .as_ref()
             .map(|addr| format!("https://{addr}"));
 
@@ -184,22 +187,38 @@ impl ResolvedClusterConfig {
         })
     }
 
-    /// Returns the cluster mode.
+    /// Returns the cluster role.
     #[must_use]
-    pub fn mode(&self) -> Option<&ClusterMode> {
-        self.config.mode.as_ref()
+    pub fn role(&self) -> Option<&ClusterRole> {
+        self.config.role.as_ref()
+    }
+
+    /// Returns the effective cluster role.
+    ///
+    /// This accounts for the implicit executor role: if `--scheduler-address` is set
+    /// but no explicit `--role` is specified, this returns `ClusterRole::Executor`.
+    #[must_use]
+    pub fn effective_role(&self) -> Option<ClusterRole> {
+        if let Some(role) = &self.config.role {
+            return Some(role.clone());
+        }
+        // If scheduler_address is set, implicitly assume executor role
+        if self.config.scheduler_address.is_some() {
+            return Some(ClusterRole::Executor);
+        }
+        None
     }
 
     /// Returns the cluster bind address.
     #[must_use]
-    pub fn cluster_address(&self) -> SocketAddr {
-        self.config.cluster_address
+    pub fn node_bind_address(&self) -> SocketAddr {
+        self.config.node_bind_address
     }
 
     /// Returns the scheduler URL (for executors).
     #[must_use]
-    pub fn cluster_scheduler_url(&self) -> Option<&Url> {
-        self.config.cluster_scheduler_url.as_ref()
+    pub fn scheduler_address(&self) -> Option<&Url> {
+        self.config.scheduler_address.as_ref()
     }
 
     /// Returns the scheduler URL as a string for use in Ballista configuration.
@@ -213,8 +232,8 @@ impl ResolvedClusterConfig {
 
     /// Returns the advertise address.
     #[must_use]
-    pub fn cluster_advertise_address(&self) -> Option<&str> {
-        self.config.cluster_advertise_address.as_deref()
+    pub fn node_advertise_address(&self) -> Option<&str> {
+        self.config.node_advertise_address.as_deref()
     }
 
     /// Returns the cluster TLS config if configured.
@@ -276,9 +295,9 @@ pub async fn initialize_cluster_executor(
         .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
     // Get scheduler URL - required for executors
-    let Some(scheduler_url) = rt.df.cluster_config.cluster_scheduler_url() else {
+    let Some(scheduler_url) = rt.df.cluster_config.scheduler_address() else {
         return Err(FailedToStartClusterExecutor {
-            source: "--cluster-scheduler-url is required for executor mode"
+            source: "--scheduler-address is required for executor mode"
                 .to_string()
                 .into(),
         });
@@ -347,7 +366,7 @@ pub async fn initialize_cluster_executor(
 
     // Determine the advertise host and port for executor registration
     let (advertise_host, advertise_port) = if let Some(advertise_addr) =
-        rt.df.cluster_config.cluster_advertise_address()
+        rt.df.cluster_config.node_advertise_address()
     {
         // Parse the advertise address (format: "host:port" or "[ipv6]:port")
         if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
@@ -356,17 +375,15 @@ pub async fn initialize_cluster_executor(
             let port = port_part
                 .parse::<u16>()
                 .map_err(|_| FailedToStartClusterExecutor {
-                    source: format!(
-                        "Invalid port in --cluster-advertise-address: {advertise_addr}"
-                    )
-                    .into(),
+                    source: format!("Invalid port in --node-advertise-address: {advertise_addr}")
+                        .into(),
                 })?;
             let host = host_part.trim_matches(['[', ']']).to_string();
             (host, port)
         } else {
             return Err(FailedToStartClusterExecutor {
                     source: format!(
-                        "Invalid --cluster-advertise-address format: {advertise_addr}. Expected 'host:port' (IPv6 must be in [addr]:port form)"
+                        "Invalid --node-advertise-address format: {advertise_addr}. Expected 'host:port' (IPv6 must be in [addr]:port form)"
                     )
                     .into(),
                 });
@@ -453,7 +470,7 @@ pub async fn initialize_cluster_executor(
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
-    let bind_addr = rt.df.cluster_config.cluster_address();
+    let bind_addr = rt.df.cluster_config.node_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
     let current_context = Arc::clone(&rt.df.ctx);
@@ -582,9 +599,9 @@ async fn executor_bind_app(
     executor_id: String,
     client_tls_config: ClientTlsConfig,
 ) -> crate::Result<()> {
-    let Some(scheduler_url) = rt.df.cluster_config.cluster_scheduler_url() else {
+    let Some(scheduler_url) = rt.df.cluster_config.scheduler_address() else {
         return Err(FailedToStartClusterExecutor {
-            source: "--cluster-scheduler-url is required for executor mode"
+            source: "--scheduler-address is required for executor mode"
                 .to_string()
                 .into(),
         });
