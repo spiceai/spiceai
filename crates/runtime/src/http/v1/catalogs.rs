@@ -31,6 +31,7 @@ use mediatype::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tract_core::tract_data::itertools::Itertools;
 
 use super::{Format, convert_entry_to_csv};
 
@@ -114,7 +115,7 @@ pub(crate) async fn get(
             from: d.from.clone(),
             name: d.name.clone(),
         })
-        .collect::<Vec<_>>();
+        .collect_vec();
 
     let mut format = Format::Json;
     if let Some(accept) = accept
