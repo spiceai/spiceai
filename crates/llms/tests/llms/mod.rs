@@ -65,6 +65,15 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                 }),
             ),
             (
+                "google",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_google("gemini-2.0-flash")
+                            .map_err(|e| anyhow::anyhow!("failed to create google model: {e}"))
+                    })
+                }),
+            ),
+            (
                 "openai",
                 Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
             ),
@@ -221,7 +230,8 @@ async fn test_basic(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity"
+        "perplexity",
+        "google"
     )]
     model_name: &str,
     #[values(false, true)] as_stream: bool,
@@ -261,7 +271,8 @@ async fn test_usage(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity"
+        "perplexity",
+        "google"
     )]
     model_name: &str,
     #[values(false, true)] as_stream: bool,
@@ -312,7 +323,7 @@ async fn test_usage(
 #[rstest]
 #[tokio::test]
 async fn test_system_prompt(
-    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3")] model_name: &str,
+    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -353,7 +364,16 @@ async fn test_system_prompt(
 #[rstest]
 #[tokio::test]
 async fn test_supports_basic_message_roles(
-    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "bedrock")] model_name: &str,
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "google"
+    )]
+    model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -393,7 +413,7 @@ async fn test_supports_basic_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_supports_all_message_roles(
-    #[values("anthropic", "openai", "xai", "bedrock")] model_name: &str,
+    #[values("anthropic", "openai", "xai", "bedrock", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -456,7 +476,7 @@ async fn test_supports_all_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_tool_use(
-    #[values("anthropic", "openai", "xai", "bedrock")] model_name: &str,
+    #[values("anthropic", "openai", "google", "xai", "bedrock")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     // serde_json::from_value(
