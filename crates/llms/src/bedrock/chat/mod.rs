@@ -119,7 +119,6 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are neither [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`Message`] format.
     ///
     /// Other enum variants will be ignored.
-    #[expect(clippy::too_many_lines)]
     fn convert_non_system_messages(
         msgs: Vec<ChatCompletionRequestMessage>,
     ) -> Result<Vec<Message>, BuildError> {
@@ -478,7 +477,6 @@ impl BedrockConverse {
         })
     }
 
-    #[expect(clippy::too_many_lines)]
     fn process_stream(
         model: &str,
         input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,

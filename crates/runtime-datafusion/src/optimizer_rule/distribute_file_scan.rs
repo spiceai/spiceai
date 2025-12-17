@@ -15,7 +15,9 @@ limitations under the License.
 */
 use crate::concrete;
 use crate::config::cluster_config::SpiceClusterConfig;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, Statistics};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::Partitioning;
@@ -25,10 +27,10 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
-use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::{DataSource, DataSourceExec};
+use datafusion_datasource::{PartitionedFile, compute_all_files_statistics};
 use itertools::Itertools;
 use std::cmp::max;
 use std::sync::Arc;
@@ -161,7 +163,18 @@ impl DistributeFileScanOptimizer {
             .file_groups
             .iter()
             .flat_map(|fg| fg.iter().cloned())
-            .collect::<Vec<_>>();
+            .map(|mut pf| {
+                let mut stats = Statistics::new_unknown(file_scan_config.file_schema.as_ref());
+
+                // We can deduce the byte size from the read range
+                stats.total_byte_size =
+                    Precision::Exact(usize::try_from(Self::read_size(&pf)).map_err(|_| {
+                        DataFusionError::Execution("Cannot cast usize".to_string())
+                    })?);
+                pf.statistics = Some(Arc::new(stats));
+                Ok(pf)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let read_size: u64 = partitioned_files.iter().map(Self::read_size).sum();
 
@@ -239,6 +252,13 @@ impl DistributeFileScanOptimizer {
         stage: Vec<FileGroup>,
         task_partitions: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (stage_with_stats, agg_stats) = compute_all_files_statistics(
+            stage,
+            Arc::clone(&original_file_scan.file_schema),
+            true,
+            true,
+        )?;
+
         // Copy all existing attributes including projection, excluding file groups as they are potentially
         // expensive to clone for large scans
         let new_scan = FileScanConfigBuilder::new(
@@ -250,13 +270,13 @@ impl DistributeFileScanOptimizer {
         .with_constraints(original_file_scan.constraints.clone())
         .with_expr_adapter(original_file_scan.expr_adapter_factory.clone())
         .with_file_compression_type(original_file_scan.file_compression_type)
-        .with_file_groups(stage)
+        .with_file_groups(stage_with_stats)
         .with_limit(original_file_scan.limit)
         .with_metadata_cols(original_file_scan.metadata_cols.clone())
         .with_object_versioning_type(original_file_scan.object_versioning_type.clone())
         .with_output_ordering(original_file_scan.output_ordering.clone())
         .with_projection(original_file_scan.projection.clone())
-        .with_statistics(original_file_scan.statistics()?)
+        .with_statistics(agg_stats)
         .with_table_partition_cols(
             original_file_scan
                 .table_partition_cols
@@ -502,6 +522,48 @@ pub mod tests {
         let optimized_plan_key: PlanNodeKey = optimized_plan.as_ref().into();
 
         assert_eq!(plan_key, optimized_plan_key);
+    }
+
+    #[test]
+    fn test_statistics_recomputed_correctly() {
+        let optimizer = DistributeFileScanOptimizer::new();
+
+        // This scan will get split into two (>128M)
+        let files = vec![
+            create_partitioned_file("file:///file1.parquet", 256_000_000, None),
+            create_partitioned_file("file:///file2.parquet", 256_000_000, None),
+        ];
+
+        let plan = create_data_source_exec(files);
+
+        let optimized_plan = optimizer
+            .optimize(plan, &DEFAULT_CONFIG_OPTIONS)
+            .expect("Must optimize");
+
+        let data_source_execs =
+            SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized_plan)
+                .expect("Must search plan");
+
+        assert_eq!(
+            data_source_execs.len(),
+            2,
+            "Must have two DataSourceExec nodes after rewrite"
+        );
+
+        for exec in &data_source_execs {
+            if let Some(file_scan) = concrete!(exec, DataSourceExec)
+                .and_then(|ds| ds.data_source().as_any().downcast_ref::<FileScanConfig>())
+            {
+                let stats = file_scan
+                    .file_source
+                    .statistics()
+                    .expect("Must have statistics");
+                assert_eq!(
+                    stats.total_byte_size.get_value(),
+                    Some(256_000_000_usize).as_ref()
+                );
+            }
+        }
     }
 
     #[cfg(feature = "cluster")]

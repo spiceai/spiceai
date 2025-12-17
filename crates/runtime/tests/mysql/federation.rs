@@ -163,7 +163,6 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));

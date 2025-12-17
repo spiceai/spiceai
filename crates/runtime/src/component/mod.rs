@@ -195,7 +195,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(clippy::too_many_lines)]
     fn test_validate_identifier() {
         // Valid identifiers
         validate_identifier("valid_identifier").expect("should validate successfully");

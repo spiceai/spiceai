@@ -1,0 +1,50 @@
+---
+source: crates/runtime/tests/search/mod.rs
+expression: normalize_search_response(resp)
+snapshot_kind: text
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+      },
+      "primary_key": {
+        "id": 361
+      },
+      "score": 0.78
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+      },
+      "primary_key": {
+        "id": 787
+      },
+      "score": 0.75
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+      },
+      "primary_key": {
+        "id": 470
+      },
+      "score": 0.74
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "Find the number of groups of 7 in 21."
+      },
+      "primary_key": {
+        "id": 359
+      },
+      "score": 0.73
+    }
+  ]
+}

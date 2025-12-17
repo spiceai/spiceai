@@ -190,7 +190,6 @@ fn evaluate_expr(
 }
 
 /// Evaluates if a filter expression excludes a partition value based on the partition-by expression.
-#[expect(clippy::too_many_lines)]
 pub(crate) fn prune_partition(
     filters: &[Expr],
     partition_by: &Expr,
@@ -455,7 +454,6 @@ fn evaluate_inequality(
 
 /// Special handler for bucket inequality that needs access to all filters to determine bounded ranges.
 /// This is called from `prune_partition` when we detect a bucket expression.
-#[expect(clippy::too_many_lines)]
 fn evaluate_bucket_inequality(
     filters: &[Expr],
     col: &Column,
@@ -1296,7 +1294,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines)]
     fn test_prune_partition_date_trunc() -> Result<(), DataFusionError> {
         let schema = Schema::new(vec![Field::new(
             "date",

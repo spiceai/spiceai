@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use prost::Message;
-use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -24,25 +22,15 @@ use crate::{
     timing::TimedStream,
 };
 
-use crate::datafusion::app_context_extension::AppContextExtension;
-use crate::datafusion::request_context_extension::DataFusionContextExtension;
-use crate::datafusion::secrets_context_extension::SecretsContextExtension;
 use arrow_flight::{
     Action, ActionType as FlightActionType,
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
 };
-use runtime_proto::{
-    ExecutorExpandSecretRequest, ExecutorExpandSecretResponse, GetAppDefinitionRequest,
-};
-use runtime_request_context::{AsyncMarker, RequestContext};
-use secrecy::ExposeSecret;
 
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
-    GetAppDefinition,
-    ExpandSecret,
     Unknown,
 }
 
@@ -51,8 +39,6 @@ impl ActionType {
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
-            "GetAppDefinition" => ActionType::GetAppDefinition,
-            "ExpandSecret" => ActionType::ExpandSecret,
             _ => ActionType::Unknown,
         }
     }
@@ -61,8 +47,6 @@ impl ActionType {
         match self {
             ActionType::CreatePreparedStatement => "CreatePreparedStatement",
             ActionType::ClosePreparedStatement => "ClosePreparedStatement",
-            ActionType::GetAppDefinition => "GetAppDefinition",
-            ActionType::ExpandSecret => "ExpandSecret",
             ActionType::Unknown => "Unknown",
         }
     }
@@ -91,26 +75,9 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: N/A"
             .into(),
     };
-    let get_app_definition_action_type = FlightActionType {
-        r#type: ActionType::GetAppDefinition.to_string(),
-        description:
-            "Used in cluster mode to ask Spice for its App declaration for runtime dependencies.\n
-            Request Message: N/A
-            Response Message: app::App serialized as JSON bytes"
-                .into(),
-    };
-    let expand_secret_action_type = FlightActionType {
-        r#type: ActionType::ExpandSecret.to_string(),
-        description: "Used in cluster mode to ask the scheduler for the value of a secret\n
-            Request Message: ExecutorExpandSecretRequest
-            Response Message: ExecutorExpandSecretResponse"
-            .into(),
-    };
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
         Ok(close_prepared_statement_action_type),
-        Ok(get_app_definition_action_type),
-        Ok(expand_secret_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);
@@ -146,78 +113,6 @@ pub(crate) async fn do_action(
             tracing::trace!("do_action: ClosePreparedStatement");
             futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
         }
-        ActionType::GetAppDefinition => {
-            tracing::trace!("do_action: GetAppDefinition");
-            let context = RequestContext::current(AsyncMarker::new().await);
-            let request =
-                GetAppDefinitionRequest::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
-
-            check_executor_registration(&context, &request.executor_id).await?;
-
-            let Some(app) = context
-                .extension::<AppContextExtension>()
-                .and_then(|a| a.app())
-            else {
-                return Err(Status::internal("App context not available"));
-            };
-
-            let bs = serde_json::to_vec(&app).map_err(to_tonic_err)?;
-            let result = arrow_flight::Result::new(bs);
-            futures::stream::iter(vec![Ok(result)])
-        }
-        ActionType::ExpandSecret => {
-            tracing::trace!("do_action: ExpandSecret");
-
-            let request = ExecutorExpandSecretRequest::decode(&*request.get_ref().body)
-                .map_err(to_tonic_err)?;
-
-            let span = tracing::span!(
-                target: "task_history",
-                tracing::Level::INFO,
-                "cluster::expand_secret",
-                executor_id = %request.executor_id,
-                key = %request.key
-            );
-            let _guard = span.enter();
-
-            let context = RequestContext::current(AsyncMarker::new().await);
-            check_executor_registration(&context, &request.executor_id).await?;
-
-            tracing::debug!(
-                "ExpandSecret: expanding secret {} for executor {}",
-                request.key,
-                request.executor_id
-            );
-
-            let Some(sctx) = context.extension::<SecretsContextExtension>() else {
-                return Err(Status::internal("Secrets context not available"));
-            };
-
-            let secrets = sctx.secrets();
-            let secrets = secrets.read().await;
-            let Some(value) = secrets
-                .get_secret(&request.key)
-                .await
-                .map_err(to_tonic_err)?
-            else {
-                tracing::error!(target: "task_history", "Secret not found");
-                return Err(Status::invalid_argument(format!(
-                    "Unable to read secret {}",
-                    request.key
-                )));
-            };
-
-            let exposed = value.expose_secret();
-            let response = ExecutorExpandSecretResponse {
-                key: request.key,
-                value: exposed.to_string(),
-            };
-
-            tracing::debug!(target: "task_history", "Secret expanded successfully");
-
-            let result = arrow_flight::Result::new(response.encode_to_vec());
-            futures::stream::iter(vec![Ok(result)])
-        }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };
 
@@ -225,48 +120,4 @@ pub(crate) async fn do_action(
         stream,
         move || start,
     ))))
-}
-
-/// Checks if executor is a part of the Ballista cluster
-async fn check_executor_registration(
-    request_context: &RequestContext,
-    executor_id: &str,
-) -> Result<(), Status> {
-    let Some(df) = request_context
-        .extension::<DataFusionContextExtension>()
-        .map(|df| df.datafusion())
-    else {
-        return Err(Status::internal("DataFusion context not available"));
-    };
-
-    let scheduler = {
-        let Some(maybe_scheduler) = df.scheduler_server.read().ok() else {
-            return Err(Status::internal("Cluster scheduler context cannot be read"));
-        };
-
-        let Some(ref scheduler) = *maybe_scheduler else {
-            return Err(Status::internal("Cluster scheduler context not available"));
-        };
-
-        Arc::clone(scheduler)
-    };
-
-    let executor_state = scheduler
-        .state
-        .executor_manager
-        .get_executor_state()
-        .await
-        .map_err(to_tonic_err)?;
-    let executors = executor_state
-        .into_iter()
-        .map(|(e, _)| e.id)
-        .collect::<HashSet<_>>();
-
-    if executors.contains(executor_id) {
-        Ok(())
-    } else {
-        Err(Status::invalid_argument(format!(
-            "Executor {executor_id} is not a part of the cluster"
-        )))
-    }
 }

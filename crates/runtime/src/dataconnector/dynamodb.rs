@@ -136,7 +136,6 @@ impl DataConnector for DynamoDB {
         self
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn read_provider(
         &self,
         dataset: &Dataset,

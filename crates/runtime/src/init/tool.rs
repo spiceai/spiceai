@@ -64,7 +64,7 @@ impl Runtime {
         let mut tools_map = self.tools.write().await;
 
         tools_map.insert(name.clone(), Arc::clone(t).into());
-        tracing::debug!("Tool catalog {} ready to use", name.clone());
+        tracing::trace!("Tool catalog {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
         self.status
             .update_tool_catalog(&name, status::ComponentStatus::Ready);
@@ -75,7 +75,7 @@ impl Runtime {
         let mut tools_map = self.tools.write().await;
 
         tools_map.insert(name.clone(), t);
-        tracing::debug!("Tool {} ready to use", name.clone());
+        tracing::trace!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status
             .update_tool(&name, status::ComponentStatus::Ready);

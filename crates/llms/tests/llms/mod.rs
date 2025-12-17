@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
+use async_openai::types::{
+    ChatCompletionStreamOptions, CreateChatCompletionRequest, CreateChatCompletionResponse,
+};
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
-use serde_json::{Value, json};
+use rstest::rstest;
+use serde_json::json;
 use std::{
     str::FromStr,
     sync::{Arc, LazyLock, Mutex},
@@ -28,32 +31,6 @@ use crate::{TEST_ARGS, init_tracing};
 mod create;
 mod streaming_tests;
 
-#[derive(Clone)]
-pub struct TestCase {
-    pub name: &'static str,
-    pub req: CreateChatCompletionRequest,
-
-    /// Maps (id, `JSONPath` selector), where the selector is into the [`CreateChatCompletionResponse`].
-    /// This is used in snapshot testing to assert certain properties of the response.
-    pub json_path: Vec<(&'static str, &'static str)>,
-}
-
-/// Creates [`TestCase`] instances from request/response that JSON serialize to
-/// [`CreateChatCompletionRequest`] and [`CreateChatCompletionResponse`].
-#[macro_export]
-macro_rules! test_case {
-    ($name:expr, $req:expr, $jsonpaths:expr) => {{
-        let mut r = $req.clone();
-        r["model"] = Value::String("not_needed".to_string());
-        TestCase {
-            name: $name,
-            req: serde_json::from_value(r)
-                .expect(&format!("Failed to parse request in test case '{}'", $name)),
-            json_path: $jsonpaths,
-        }
-    }};
-}
-
 /// Async function that creates a model instance
 type AsyncModelCreator = Box<
     dyn Fn() -> std::pin::Pin<
@@ -63,7 +40,7 @@ type AsyncModelCreator = Box<
 >;
 
 /// A given model to test - cached after first creation
-type ModelDef = (&'static str, Mutex<Option<Arc<dyn Chat>>>);
+type ModelCache = Mutex<Option<Arc<dyn Chat>>>;
 
 static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = LazyLock::new(
     || {
@@ -133,7 +110,7 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
     },
 );
 
-static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
+static MODEL_CACHES: LazyLock<Vec<(&'static str, ModelCache)>> = LazyLock::new(|| {
     TEST_MODEL_CREATORS
         .iter()
         .filter_map(|(name, _)| {
@@ -146,226 +123,12 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
         .collect()
 });
 
-/// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
-static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    vec![
-        ("hf_phi3", "tool_use"),
-        ("local_phi3", "tool_use"),
-        ("perplexity", "tool_use"),
-        ("perplexity", "system_prompt"),
-        ("perplexity", "supports_basic_message_roles"),
-        ("perplexity", "supports_all_message_roles"),
-        ("perplexity", "tool_use"),
-    ]
-});
-
-static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
-    vec![
-        test_case!(
-            "basic",
-            json!({
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Say Hello"
-                    }
-                ]
-            }),
-            vec![(
-                "replied_appropriately",
-                "$.choices[*].message[?(@.content ~= 'Hello')].length()"
-            )]
-        ),
-        test_case!(
-            "usage",
-            json!({
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Say Hello"
-                    }
-                ]
-            }),
-            vec![
-                (
-                    "has_prompt_tokens",
-                    "$.usage[?(@.prompt_tokens > 0)].length()"
-                ),
-                (
-                    "has_completion_tokens",
-                    "$.usage[?(@.completion_tokens > 0)].length()"
-                ),
-                (
-                    "has_total_tokens",
-                    "$.usage[?(@.total_tokens > 0)].length()"
-                ),
-                (
-                    "total_tokens_gt_prompt_tokens",
-                    "$.usage[?(@.total_tokens >= @.prompt_tokens)].length()"
-                ),
-                (
-                    "total_tokens_gt_completion_tokens",
-                    "$.usage[?(@.total_tokens >= @.completion_tokens)].length()"
-                )
-            ]
-        ),
-        test_case!(
-            "system_prompt",
-            json!({
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Quote back the exact message from the user"
-                    },
-                    {
-                        "role": "user",
-                        "content": "pong"
-                    }
-                ],
-                "max_completion_tokens": 100,
-            }),
-            vec![
-                (
-                    "assistant_response",
-                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'pong')].length()"
-                ),
-                (
-                    "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= '(?i)pong')].length()"
-                )
-            ]
-        ),
-        test_case!(
-            "supports_basic_message_roles",
-            json!({
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Quote back the exact message from the user"
-                    },
-                    {
-                        "role": "user",
-                        "content": "call a tool"
-                    },
-                    {
-                        "role": "assistant",
-                        "content": "Sorry I, can't call a tool. ",
-                    },
-                    {
-                        "role": "user",
-                        "content": "That's fine. Tell me a joke."
-                    }
-                ],
-            }),
-            // This test is just to ensure that the model can handle all message roles.
-            // We don't need to check the response.
-            vec![]
-        ),
-        test_case!(
-            "supports_all_message_roles",
-            json!({
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Quote back the exact message from the user"
-                    },
-                    {
-                        "role": "user",
-                        "content": "call a tool"
-                    },
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": "1",
-                                "type": "function",
-                                "function": {
-                                    "name": "get_current_weather",
-                                    "arguments": "{\"location\": \"San Francisco, CA\"}"
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        "role": "tool",
-                        "content": "72",
-                        "tool_call_id": "1"
-                    }
-                ],
-                "tools": [
-                  {
-                    "type": "function",
-                    "function": {
-                      "name": "get_current_weather",
-                      "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                      }
-                    }
-                  }
-                ]
-            }),
-            // This test is just to ensure that the model can handle all message roles.
-            // We don't need to check the response.
-            vec![]
-        ),
-        test_case!(
-            "tool_use",
-            json!({
-                "messages": [
-                    {
-                      "role": "user",
-                      "content": "What'\''s the weather like in Boston today?"
-                    }
-                ],
-                "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
-                "tools": [
-                  {
-                    "type": "function",
-                    "function": {
-                      "name": "get_current_weather",
-                      "description": "Get the current weather in a given location, in Celsius",
-                      "parameters": {
-                        "type": "object",
-                        "properties": {
-                          "location": {
-                            "type": "string",
-                            "description": "The city and state, e.g. San Francisco."
-                          },
-                          "unit": {
-                            "type": "string",
-                            "enum": ["celsius", "fahrenheit"]
-                          }
-                        },
-                        "required": ["location", "unit"]
-                      }
-                    }
-                  }
-                ]
-            }),
-            vec![
-                ("finish_reason", "$.choices[0].finish_reason"),
-                (
-                    "tool_choice",
-                    "$.choices[0].message.tool_calls[0].function.name"
-                ),
-                (
-                    "valid_function_args",
-                    "$.choices[0].message.tool_calls[0].function.arguments"
-                )
-            ]
-        ),
-    ]
-});
-
 /// Get or create a model instance for the given name
 async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    // Find the model in TEST_MODELS
-    let (_, model_cache) = TEST_MODELS
+    let (_, model_cache) = MODEL_CACHES
         .iter()
         .find(|(name, _)| *name == model_name)
-        .ok_or_else(|| anyhow::anyhow!("model {model_name} not found in TEST_MODELS"))?;
+        .ok_or_else(|| anyhow::anyhow!("model {model_name} not found in MODEL_CACHES"))?;
 
     // Check if model is already cached
     {
@@ -396,65 +159,47 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     Ok(model)
 }
 
-#[expect(clippy::expect_used)]
-async fn run_single_test(
-    test_name: &str,
+async fn run_test(
     model_name: &str,
+    test_name: &str,
+    req: CreateChatCompletionRequest,
     as_stream: bool,
-) -> Result<(), anyhow::Error> {
+    json_path_checks: Vec<(&str, &str)>,
+) -> Result<Option<CreateChatCompletionResponse>, anyhow::Error> {
     let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
     init_tracing(None);
 
-    // Check if we should skip this test; either because user specified to skip it, or this
-    // combination is not supported.
-    if TEST_DENY_LIST
-        .iter()
-        .any(|(m, t)| *m == model_name && *t == test_name)
-    {
-        return Ok(());
-    }
-
-    let test = TEST_CASES
-        .iter()
-        .find(|t| t.name == test_name)
-        .expect("test case not found");
-
     if TEST_ARGS.skip_model(model_name) {
         tracing::debug!("Skipping test {model_name}/{test_name}");
-        return Ok(());
+        return Ok(None);
     }
 
-    // Get and run model
     let model = get_or_create_model(model_name)
         .await
         .unwrap_or_else(|e| panic!("failed to get or create model {model_name}: {e}"));
 
-    tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
+    tracing::info!("Running test {test_name}/{model_name} with {req:?}");
 
     let actual_resp = if as_stream {
-        let mut req = test.req.clone();
+        let mut req = req;
         req.stream = Some(true);
         req.stream_options = Some(ChatCompletionStreamOptions {
             include_usage: true,
         });
         accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
-            panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
+            panic!("For test {test_name}/{model_name}, chat_stream failed. Error: {e:#?}")
         }))
         .await
     } else {
-        model
-            .chat_request(test.req.clone())
-            .await
-            .unwrap_or_else(|e| {
-                panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
-            })
+        model.chat_request(req).await.unwrap_or_else(|e| {
+            panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
+        })
     };
     tracing::debug!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
-    // Perform snapshot test from JSONPaths into the response.
     let resp_value =
         serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
-    for (id, json_ptr) in &test.json_path {
+    for (id, json_ptr) in &json_path_checks {
         let resp_ptr = JsonPath::from_str(json_ptr)
             .expect("invalid JSONPath selector")
             .find(&resp_value);
@@ -463,134 +208,330 @@ async fn run_single_test(
             serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
         );
     }
-    Ok(())
+    Ok(Some(actual_resp))
 }
 
-// Macro to create test module and functions
-#[macro_export]
-macro_rules! generate_model_tests {
-    () => {
-        macro_rules! test_model_case {
-            ($model_name_expr:expr, $test_case_expr:expr, true) => {
-                paste::paste! {
-                    #[tokio::test]
-                    async fn [<test_ $model_name_expr _ $test_case_expr _stream>]() {
-                        run_single_test(
-                            stringify!($test_case_expr),
-                            stringify!($model_name_expr),
-                            true
-                        ).await.expect("test failed");
+#[rstest]
+#[tokio::test]
+async fn test_basic(
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "perplexity"
+    )]
+    model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Say Hello"
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    let _ = run_test(
+        model_name,
+        "basic",
+        req,
+        as_stream,
+        vec![(
+            "replied_appropriately",
+            "$.choices[*].message[?(@.content ~= 'Hello')].length()",
+        )],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_usage(
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "perplexity"
+    )]
+    model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Say Hello"
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    run_test(
+        model_name,
+        "usage",
+        req,
+        as_stream,
+        vec![
+            (
+                "has_prompt_tokens",
+                "$.usage[?(@.prompt_tokens > 0)].length()",
+            ),
+            (
+                "has_completion_tokens",
+                "$.usage[?(@.completion_tokens > 0)].length()",
+            ),
+            (
+                "has_total_tokens",
+                "$.usage[?(@.total_tokens > 0)].length()",
+            ),
+            (
+                "total_tokens_gt_prompt_tokens",
+                "$.usage[?(@.total_tokens >= @.prompt_tokens)].length()",
+            ),
+            (
+                "total_tokens_gt_completion_tokens",
+                "$.usage[?(@.total_tokens >= @.completion_tokens)].length()",
+            ),
+        ],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_system_prompt(
+    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Quote back the exact message from the user"
+            },
+            {
+                "role": "user",
+                "content": "pong"
+            }
+        ],
+        "max_completion_tokens": 100,
+    }))
+    .expect("failed to create request");
+    run_test(
+        model_name,
+        "system_prompt",
+        req,
+        as_stream,
+        vec![
+            (
+                "assistant_response",
+                "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'pong')].length()",
+            ),
+            (
+                "replied_appropriately",
+                "$.choices[*].message[?(@.content ~= '(?i)pong')].length()",
+            ),
+        ],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_supports_basic_message_roles(
+    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "bedrock")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Quote back the exact message from the user"
+            },
+            {
+                "role": "user",
+                "content": "call a tool"
+            },
+            {
+                "role": "assistant",
+                "content": "Sorry I, can't call a tool. ",
+            },
+            {
+                "role": "user",
+                "content": "That's fine. Tell me a joke."
+            }
+        ],
+    }))
+    .expect("failed to create request");
+
+    run_test(
+        model_name,
+        "supports_basic_message_roles",
+        req,
+        as_stream,
+        vec![],
+    )
+    .await
+    .expect("test failed");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_supports_all_message_roles(
+    #[values("anthropic", "openai", "xai", "bedrock")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Quote back the exact message from the user"
+            },
+            {
+                "role": "user",
+                "content": "call a tool"
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_weather",
+                            "arguments": "{\"location\": \"San Francisco, CA\"}"
+                        }
                     }
-                }
-            };
-            ($model_name_expr:expr, $test_case_expr:expr) => {
-                paste::paste! {
-                    #[tokio::test]
-                    async fn [<test_ $model_name_expr _ $test_case_expr>]() {
-                        run_single_test(
-                            stringify!($test_case_expr),
-                            stringify!($model_name_expr),
-                            false
-                        ).await.expect("test failed");
-                    }
-                }
-            };
-        }
+                ]
+            },
+            {
+                "role": "tool",
+                "content": "72",
+                "tool_call_id": "1"
+            }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_current_weather",
+              "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          }
+        ]
+    }))
+    .expect("failed to create request");
 
-        // Non-Criteria test
-        test_model_case!(perplexity, basic);
-        test_model_case!(perplexity, usage);
+    run_test(
+        model_name,
+        "supports_all_message_roles",
+        req,
+        as_stream,
+        vec![],
+    )
+    .await
+    .expect("test failed");
+}
 
-        // Alpha Criteria
-        test_model_case!(anthropic, basic);
-        test_model_case!(anthropic, system_prompt);
-        test_model_case!(anthropic, supports_basic_message_roles);
-        test_model_case!(anthropic, basic, true);
-        test_model_case!(anthropic, system_prompt, true);
-        test_model_case!(anthropic, supports_basic_message_roles, true);
+#[rstest]
+#[tokio::test]
+async fn test_tool_use(
+    #[values("anthropic", "openai", "xai", "bedrock")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    // serde_json::from_value(
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+              "role": "user",
+              "content": "What's the weather like in Boston today?"
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_current_weather",
+              "description": "Get the current weather in a given location, in Celsius",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string",
+                    "description": "The city and state, e.g. San Francisco."
+                  },
+                  "unit": {
+                    "type": "string",
+                    "enum": ["celsius", "fahrenheit"]
+                  }
+                },
+                "required": ["location", "unit"]
+              }
+            }
+          }
+        ]
+    }))
+    .expect("failed to create request");
 
-        test_model_case!(openai, basic);
-        test_model_case!(openai, system_prompt);
-        test_model_case!(openai, supports_basic_message_roles);
-        test_model_case!(openai, basic, true);
-        test_model_case!(openai, system_prompt, true);
-        test_model_case!(openai, supports_basic_message_roles, true);
+    let resp = run_test(
+        model_name,
+        "tool_use",
+        req,
+        as_stream,
+        vec![
+            ("finish_reason", "$.choices[0].finish_reason"),
+            (
+                "tool_choice",
+                "$.choices[0].message.tool_calls[0].function.name",
+            ),
+        ],
+    )
+    .await
+    .expect("test failed");
 
-        test_model_case!(xai, basic);
-        test_model_case!(xai, system_prompt);
-        test_model_case!(xai, supports_basic_message_roles);
-        test_model_case!(xai, basic, true);
-        test_model_case!(xai, system_prompt, true);
-        test_model_case!(xai, supports_basic_message_roles, true);
-
-        test_model_case!(local_phi3, basic);
-        test_model_case!(local_phi3, system_prompt);
-        test_model_case!(local_phi3, supports_basic_message_roles);
-        test_model_case!(local_phi3, basic, true);
-        test_model_case!(local_phi3, system_prompt, true);
-        test_model_case!(local_phi3, supports_basic_message_roles, true);
-
-        test_model_case!(hf_phi3, basic);
-        test_model_case!(hf_phi3, system_prompt);
-        test_model_case!(hf_phi3, supports_basic_message_roles);
-        test_model_case!(hf_phi3, basic, true);
-        test_model_case!(hf_phi3, system_prompt, true);
-        test_model_case!(hf_phi3, supports_basic_message_roles, true);
-
-        test_model_case!(bedrock, basic);
-        test_model_case!(bedrock, supports_basic_message_roles);
-        test_model_case!(bedrock, basic, true);
-        test_model_case!(bedrock, supports_basic_message_roles, true);
-        // Cannot comply with responding with just `pong`.
-        // test_model_case!(bedrock, system_prompt);
-        // test_model_case!(bedrock, system_prompt, true);
-
-        // Beta
-        test_model_case!(anthropic, tool_use);
-        test_model_case!(anthropic, usage);
-        test_model_case!(anthropic, supports_all_message_roles);
-        test_model_case!(anthropic, tool_use, true);
-        test_model_case!(anthropic, usage, true);
-        test_model_case!(anthropic, supports_all_message_roles, true);
-
-        test_model_case!(bedrock, tool_use);
-        test_model_case!(bedrock, usage);
-        test_model_case!(bedrock, supports_all_message_roles);
-        test_model_case!(bedrock, tool_use, true);
-        test_model_case!(bedrock, usage, true);
-        test_model_case!(bedrock, supports_all_message_roles, true);
-
-        test_model_case!(openai, tool_use);
-        test_model_case!(openai, tool_use, true);
-        test_model_case!(openai, usage);
-        test_model_case!(openai, usage, true);
-        test_model_case!(openai, supports_all_message_roles);
-        test_model_case!(openai, supports_all_message_roles, true);
-
-        test_model_case!(xai, tool_use);
-        test_model_case!(xai, tool_use, true);
-        test_model_case!(xai, usage);
-        test_model_case!(xai, usage, true);
-        test_model_case!(xai, supports_all_message_roles);
-        test_model_case!(xai, supports_all_message_roles, true);
-
-        test_model_case!(local_phi3, tool_use);
-        test_model_case!(local_phi3, tool_use, true);
-        test_model_case!(local_phi3, usage);
-        test_model_case!(local_phi3, usage, true);
-        // test_model_case!(local_phi3, supports_all_message_roles);
-        // test_model_case!(local_phi3, supports_all_message_roles, true);
-
-        test_model_case!(hf_phi3, tool_use);
-        test_model_case!(hf_phi3, tool_use, true);
-        test_model_case!(hf_phi3, usage);
-        test_model_case!(hf_phi3, usage, true);
-        // test_model_case!(hf_phi3, supports_all_message_roles);
-        // test_model_case!(hf_phi3, supports_all_message_roles, true);
+    let Some(resp) = resp else {
+        // Test was skipped
+        return;
     };
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    generate_model_tests!();
+
+    // JSON Parse the function arguments to ensure robust to ordering.
+    let args: serde_json::Value = serde_json::from_str(
+        resp.choices
+            .first()
+            .expect("no choices in response")
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("no tool calls in message")
+            .first()
+            .expect("no tool calls")
+            .function
+            .arguments
+            .as_str(),
+    )
+    .expect("failed to parse tool call arguments");
+
+    insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }

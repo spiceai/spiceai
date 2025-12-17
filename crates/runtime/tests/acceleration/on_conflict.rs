@@ -34,7 +34,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::get_params;
 
-#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

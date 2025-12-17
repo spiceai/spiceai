@@ -317,7 +317,6 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
 #[must_use]
-#[expect(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
