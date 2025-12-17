@@ -132,7 +132,6 @@ static MODEL_CACHES: LazyLock<Vec<(&'static str, ModelCache)>> = LazyLock::new(|
         .collect()
 });
 
-
 /// Get or create a model instance for the given name
 async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let (_, model_cache) = MODEL_CACHES
@@ -365,7 +364,16 @@ async fn test_system_prompt(
 #[rstest]
 #[tokio::test]
 async fn test_supports_basic_message_roles(
-    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "bedrock", "google")] model_name: &str,
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "google"
+    )]
+    model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
