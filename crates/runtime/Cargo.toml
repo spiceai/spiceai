@@ -173,7 +173,6 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tracing-subscriber.workspace = true
-tract-core.workspace = true
 turso = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
