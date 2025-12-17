@@ -44,7 +44,7 @@ impl TableSink {
         overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let start = std::time::Instant::now();
-        tracing::info!(
+        tracing::debug!(
             "TableSink::insert_into starting (overwrite: {:?})",
             overwrite
         );
@@ -56,7 +56,7 @@ impl TableSink {
         let cast_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
 
-        tracing::info!("TableSink: calling table_provider.insert_into to create execution plan");
+        tracing::debug!("TableSink: calling table_provider.insert_into to create execution plan");
         let plan_start = std::time::Instant::now();
         let insertion_plan = match self
             .table_provider
@@ -64,7 +64,7 @@ impl TableSink {
             .await
         {
             Ok(plan) => {
-                tracing::info!(
+                tracing::debug!(
                     "TableSink: insert_into returned execution plan in {:.2}s",
                     plan_start.elapsed().as_secs_f64()
                 );
@@ -81,19 +81,19 @@ impl TableSink {
             }
         };
 
-        tracing::info!(
+        tracing::debug!(
             "TableSink: executing insertion plan with collect() - this will read source and write to accelerator"
         );
         let collect_start = std::time::Instant::now();
         if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
-            tracing::error!(
+            tracing::debug!(
                 "TableSink: collect() failed after {:.2}s: {e}",
                 collect_start.elapsed().as_secs_f64()
             );
             return Err(retry_from_df_error(e));
         }
 
-        tracing::info!(
+        tracing::debug!(
             "TableSink::insert_into completed in {:.2}s (collect phase: {:.2}s)",
             start.elapsed().as_secs_f64(),
             collect_start.elapsed().as_secs_f64()
