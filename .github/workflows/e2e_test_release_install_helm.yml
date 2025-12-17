@@ -164,7 +164,7 @@ jobs:
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \
-            --timeout 5m
+            --timeout 10m
 
       # Install Spice using Helm (from GitHub release)
       - name: Install Spice with Helm (GitHub release)
