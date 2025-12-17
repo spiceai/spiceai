@@ -131,7 +131,7 @@ jobs:
             echo "Using latest release version: $RELEASE_VERSION"
             # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1). 
             IMAGE_TAG="${RELEASE_VERSION#v}-models"
-            echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            echo "version=${RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
             echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=github-release" >> $GITHUB_OUTPUT
           else
