@@ -4910,7 +4910,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=0e2615ab09dcdd0caa3a91281516b151d0e6e3ae#0e2615ab09dcdd0caa3a91281516b151d0e6e3ae"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=9e0eddca2291965c4b7192678de2a7a7606e2d87#9e0eddca2291965c4b7192678de2a7a7606e2d87"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14024,9 +14024,8 @@ dependencies = [
 
 [[package]]
 name = "sea-query"
-version = "0.32.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a5d1c518eaf5eda38e5773f902b26ab6d5e9e9e2bb2349ca6c64cf96f80448c"
+version = "0.32.0-rc.1"
+source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -14038,16 +14037,14 @@ dependencies = [
 
 [[package]]
 name = "sea-query-derive"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bae0cbad6ab996955664982739354128c58d16e126114fe88c2a493642502aab"
+version = "0.4.1"
+source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
 dependencies = [
- "darling 0.20.11",
  "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.111",
- "thiserror 2.0.17",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
