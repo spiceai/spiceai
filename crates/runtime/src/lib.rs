@@ -47,7 +47,7 @@ use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 
 #[cfg(feature = "cluster")]
-use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterMode};
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
@@ -662,46 +662,48 @@ impl Runtime {
         )]
         type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
         #[cfg(feature = "cluster")]
-        let maybe_cluster_future: Option<BoxedClusterFuture> = match self.config.cluster.mode {
-            Some(ClusterMode::Scheduler) => {
-                cluster::initialize_cluster_scheduler(&self).await?;
-                // Start internal cluster server for scheduler on separate port
-                let internal_server_shutdown = CancellationToken::new();
-                let self_ref = Arc::clone(&self);
-                let cloned_shutdown = internal_server_shutdown.clone();
-                let internal_server_fut = async move {
-                    cluster::start_internal_cluster_server(
-                        Arc::clone(&self_ref),
-                        Some(cloned_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartClusterServerSnafu)
-                };
-                let self_for_task = Arc::clone(&self);
-                Some(Box::pin(
-                    self_for_task
-                        .start_runtime_task(
-                            CLUSTER_INTERNAL_SERVER,
-                            Some(internal_server_shutdown),
-                            internal_server_fut,
+        let maybe_cluster_future: Option<BoxedClusterFuture> =
+            match self.df.cluster_config.effective_role() {
+                Some(ClusterRole::Scheduler) => {
+                    cluster::initialize_cluster_scheduler(&self).await?;
+                    // Start internal cluster server for scheduler on separate port
+                    let internal_server_shutdown = CancellationToken::new();
+                    let self_ref = Arc::clone(&self);
+                    let cloned_shutdown = internal_server_shutdown.clone();
+                    let internal_server_fut = async move {
+                        cluster::start_internal_cluster_server(
+                            Arc::clone(&self_ref),
+                            Some(cloned_shutdown),
                         )
-                        .await,
-                ))
-            }
-            Some(ClusterMode::Executor) => {
-                let executor_fut = cluster::initialize_cluster_executor(Arc::clone(&self)).await?;
-                let self_ref = Arc::clone(&self);
-                Some(Box::pin(
-                    self_ref
-                        .start_runtime_task(CLUSTER_EXECUTOR, None, executor_fut)
-                        .await,
-                ))
-            }
-            _ => None,
-        };
+                        .await
+                        .context(UnableToStartClusterServerSnafu)
+                    };
+                    let self_for_task = Arc::clone(&self);
+                    Some(Box::pin(
+                        self_for_task
+                            .start_runtime_task(
+                                CLUSTER_INTERNAL_SERVER,
+                                Some(internal_server_shutdown),
+                                internal_server_fut,
+                            )
+                            .await,
+                    ))
+                }
+                Some(ClusterRole::Executor) => {
+                    let executor_fut =
+                        cluster::initialize_cluster_executor(Arc::clone(&self)).await?;
+                    let self_ref = Arc::clone(&self);
+                    Some(Box::pin(
+                        self_ref
+                            .start_runtime_task(CLUSTER_EXECUTOR, None, executor_fut)
+                            .await,
+                    ))
+                }
+                _ => None,
+            };
 
         #[cfg(feature = "cluster")]
-        if self.config.cluster.mode.is_some() {
+        if self.df.cluster_config.effective_role().is_some() {
             tracing::warn!(
                 "Distributed Query (Alpha) is in preview and should not be used in production."
             );
@@ -714,7 +716,7 @@ impl Runtime {
         #[cfg(feature = "cluster")]
         let flight_future: std::pin::Pin<
             Box<dyn Future<Output = Result<(), Error>> + Send>,
-        > = if self.config.cluster.mode == Some(ClusterMode::Executor) {
+        > = if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
             Box::pin(
                 self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
                     cluster::start_executor_flight_server(
@@ -776,7 +778,10 @@ impl Runtime {
 
         #[cfg(feature = "cluster")]
         // If this is an executor, we only need the shutdown signal and flight server
-        if matches!(self.config.cluster.mode, Some(ClusterMode::Executor)) {
+        if matches!(
+            self.df.cluster_config.effective_role(),
+            Some(ClusterRole::Executor)
+        ) {
             let Some(executor_future) = maybe_cluster_future else {
                 return Err(FailedToStartClusterExecutor {
                     source: "Executor work loop not bound. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
