@@ -78,7 +78,6 @@ pub use util::shutdown_signal;
 
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
-
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
