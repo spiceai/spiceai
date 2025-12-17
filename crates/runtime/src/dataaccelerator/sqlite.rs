@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use data_components::serialized_write::SerializedWriteProvider;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -26,6 +28,7 @@ use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
+use parking_lot::RwLock;
 use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
@@ -84,8 +87,20 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Type alias for write locks - one mutex per SQLite file path.
+/// Uses `tokio::sync::Mutex` because the lock is held across `.await` points during insert operations.
+type WriteLocks = Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
 pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
+    /// Write locks to serialize insert and delete operations per SQLite file.
+    /// SQLite allows only one writer at a time, even with WAL mode. When multiple
+    /// tables share the same SQLite file (common with `accelerated_sqlite.db`),
+    /// concurrent writes cause "database is locked" errors.
+    ///
+    /// This map stores one `tokio::sync::Mutex` per unique file path. All tables
+    /// writing to the same file share the same lock, ensuring writes are serialized.
+    write_locks: WriteLocks,
 }
 
 impl Default for SqliteAccelerator {
@@ -119,7 +134,31 @@ impl SqliteAccelerator {
                 .with_decimal_between(true)
                 .with_batch_insert_use_prepared_statements(true)
                 .with_function_support(deny_spice_specific_functions()),
+            write_locks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Get or create a write lock for the given SQLite file path.
+    ///
+    /// Returns a shared `tokio::sync::Mutex` that serializes write operations
+    /// to the specified SQLite file. All tables writing to the same file
+    /// will share the same lock.
+    fn get_or_create_write_lock(&self, file_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // Fast path: check if lock already exists
+        {
+            let locks = self.write_locks.read();
+            if let Some(lock) = locks.get(file_path) {
+                return Arc::clone(lock);
+            }
+        }
+
+        // Slow path: create new lock
+        let mut locks = self.write_locks.write();
+        // Double-check after acquiring write lock
+        locks
+            .entry(file_path.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
@@ -348,9 +387,16 @@ impl DataAccelerator for SqliteAccelerator {
         let read_provider = Arc::clone(&sqlite_writer.read_provider);
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
-        // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options);
+        // Only wrap with serialized write for file-mode SQLite where multiple tables
+        // may write to the same file. Memory-mode tables are independent and don't need serialization.
+        let (write_provider, delete_provider) = if let Some(file_path) = cmd.options.get("file") {
+            let write_lock = self.get_or_create_write_lock(file_path);
+            let serialized_writer =
+                Arc::new(SerializedWriteProvider::new(sqlite_writer, write_lock));
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(serialized_writer, &cmd.options)
+        } else {
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options)
+        };
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,

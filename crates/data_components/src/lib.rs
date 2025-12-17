@@ -83,6 +83,7 @@ pub mod http;
 pub mod imap;
 pub mod object;
 pub mod poly;
+pub mod serialized_write;
 
 #[async_trait]
 pub trait Read: Send + Sync {
