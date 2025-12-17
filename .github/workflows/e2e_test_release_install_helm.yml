@@ -277,7 +277,7 @@ jobs:
           # Test simple SQL query
           RESPONSE=$(curl -s -X POST http://localhost:8090/v1/sql \
             -H "Content-Type: application/json" \
-            -d '{"query": "SELECT 1 as test"}')
+            -d '{"sql": "SELECT 1 as test", "parameters": {}}')
           
           echo "Query response: $RESPONSE"
           
@@ -314,7 +314,7 @@ jobs:
           helm upgrade spice-test ./deploy/chart \
             --namespace spice-system \
             --set image.repository=ghcr.io/spiceai/spiceai \
-            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set image.tag=${{ steps.chart-version.outputs.version }}-models \
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \
