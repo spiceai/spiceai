@@ -21,10 +21,10 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
-use datafusion::error::DataFusionError;
+use s3_vectors::S3Vectors;
 use snafu::prelude::*;
 
-use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, fetch_all_index_names};
+use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, list_index_names};
 
 /// The separator used between the base index name and spill sequence number.
 const SPILL_SEPARATOR: &str = "-";
@@ -62,7 +62,11 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl SpillIndex {
-    fn format_name(base_name: &str, sequence: u8) -> String {
+    fn format_name(&self) -> String {
+        let Self {
+            base_name,
+            sequence,
+        } = self;
         format!("{base_name}{SPILL_SEPARATOR}{sequence:02}")
     }
 
@@ -118,10 +122,7 @@ impl SpillIndex {
         // Sort by sequence number for consistent ordering
         spill_indexes.sort_by(|a, b| a.sequence.cmp(&b.sequence));
 
-        spill_indexes
-            .into_iter()
-            .map(|i| Self::format_name(&i.base_name, i.sequence))
-            .collect()
+        spill_indexes.into_iter().map(|i| i.format_name()).collect()
     }
 
     /// Gets all index names (main + spills) that belong to a virtual index.
@@ -149,6 +150,21 @@ impl SpillIndex {
 
         result
     }
+}
+
+/// Find the last spill number for a given virtual index.
+pub async fn get_last_spill_index_for_virtual_index(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: &str,
+    virtual_index_name: &str,
+) -> Result<u8, super::Error> {
+    let all_indexes = list_index_names(client, bucket_name, virtual_index_name).await?;
+    Ok(all_indexes
+        .iter()
+        .filter_map(|i| SpillIndex::parse(i).ok().flatten())
+        .max_by_key(|s| s.sequence)
+        .map(|s| s.sequence)
+        .unwrap_or_default())
 }
 
 /// Returns the current index identifier, accounting for spilling.
@@ -198,7 +214,7 @@ pub fn next_index(
 pub(super) async fn all_spill_tables(
     table: &S3VectorsTable,
     spill_index: &Arc<AtomicU8>,
-) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+) -> Result<Vec<S3VectorsTable>, super::Error> {
     let current_index = current_index(&table.idx, spill_index);
     let (_, Some(bucket_name), Some(index_name)) = current_index.index_identifier_variables()
     else {
@@ -206,10 +222,11 @@ pub(super) async fn all_spill_tables(
         return Ok(vec![]);
     };
 
-    let all_index_names =
-        fetch_all_index_names(&table.client, Some(&bucket_name), Some(&index_name))
-            .await?
-            .unwrap_or_default();
+    let spill_index_name = match SpillIndex::parse(&index_name) {
+        Ok(Some(name)) => name.base_name,
+        _ => index_name.clone(),
+    };
+    let all_index_names = list_index_names(&table.client, &bucket_name, &spill_index_name).await?;
 
     Ok(
         SpillIndex::get_all_indexes_for_virtual_index(&index_name, &all_index_names)
@@ -227,14 +244,6 @@ pub(super) async fn all_spill_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_name() {
-        assert_eq!(SpillIndex::format_name("myindex", 0), "myindex-00");
-        assert_eq!(SpillIndex::format_name("myindex", 1), "myindex-01");
-        assert_eq!(SpillIndex::format_name("myindex", 42), "myindex-42");
-        assert_eq!(SpillIndex::format_name("myindex", 99), "myindex-99");
-    }
 
     #[test]
     fn test_parse_valid_spill_index() {

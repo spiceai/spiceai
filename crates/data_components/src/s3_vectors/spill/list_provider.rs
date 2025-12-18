@@ -29,15 +29,16 @@ use datafusion::{
     catalog::{Session, TableProvider},
     common::Constraints,
     datasource::TableType,
-    error::Result as DataFusionResult,
+    error::{DataFusionError, Result as DataFusionResult},
     logical_expr::TableProviderFilterPushDown,
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
+use snafu::ResultExt;
 #[derive(Debug, Clone)]
 pub struct S3VectorsSpillListTable {
     table: S3VectorsTable,
-    spill_index: Arc<AtomicU8>,
+    spill_index: Arc<AtomicU8>, // probably don't need this.
 }
 
 impl S3VectorsSpillListTable {
@@ -88,7 +89,9 @@ impl TableProvider for S3VectorsSpillListTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let list_tables: Vec<Arc<dyn TableProvider>> =
             all_spill_tables(&self.table, &self.spill_index)
-                .await?
+                .await
+                .boxed()
+                .map_err(DataFusionError::External)?
                 .into_iter()
                 .map(|table| Arc::new(S3VectorsListTable::new(table)) as Arc<dyn TableProvider>)
                 .collect();

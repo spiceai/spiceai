@@ -435,6 +435,7 @@ impl S3VectorsTable {
         data: Vec<Option<Vec<f32>>>,
         key: Vec<Option<String>>,
         metadata: HashMap<String, Vec<Option<Value>>>,
+        spill_index: Option<Arc<AtomicU8>>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -475,8 +476,8 @@ impl S3VectorsTable {
             .collect();
 
         for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-            // TODO: add spill index.
-            self.write_chunk_with_spilling(chunk, None).await?;
+            self.write_chunk_with_spilling(chunk, spill_index.clone())
+                .await?;
         }
 
         tracing::info!(

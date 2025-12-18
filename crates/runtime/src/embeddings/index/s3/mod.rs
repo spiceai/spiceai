@@ -127,7 +127,18 @@ pub async fn try_from_table(
             },
         })
         .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
-
+    let spill_writes = string_from_params(&params, "s3_vectors_spill_writes")
+        .and_then(|s| match s.parse::<bool>() {
+            Ok(val) if partition_by.is_empty() => Some(val),
+            Ok(_) => {
+                tracing::warn!("Spill writes are not supported with partitioned S3 vector indexes. Ignoring 's3_vectors_spill_writes' setting.");
+                None
+            },
+            Err(e) => {
+                tracing::warn!("Invalid value for 's3_vectors_spill_writes': {s}. Error: {e}. Defaulting to false.");
+                None
+            },
+        });
     let table = try_vector_table(
         metadata_columns.clone(),
         params,
@@ -147,7 +158,7 @@ pub async fn try_from_table(
         )));
     };
 
-    Ok(S3Vector::new(
+    let mut s3_vec = S3Vector::new(
         table,
         column.clone(),
         primary_key,
@@ -155,7 +166,13 @@ pub async fn try_from_table(
         Arc::clone(model),
         partition_by,
         batch_write_rows,
-    ))
+    );
+
+    if spill_writes == Some(true) {
+        s3_vec = s3_vec.enable_spill_writes();
+    }
+
+    Ok(s3_vec)
 }
 
 #[expect(clippy::cast_sign_loss)]

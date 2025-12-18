@@ -28,18 +28,19 @@ use datafusion::{
     catalog::{Session, TableProvider},
     common::Constraints,
     datasource::TableType,
-    error::Result as DataFusionResult,
+    error::{DataFusionError, Result as DataFusionResult},
     logical_expr::TableProviderFilterPushDown,
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
+use snafu::ResultExt;
 
 #[derive(Debug, Clone)]
 pub struct S3VectorsSpillQueryTable {
     table: S3VectorsTable,
     compute_vector: Arc<dyn ComputeQueryVector>,
     query: String,
-    spill_index: Arc<AtomicU8>,
+    spill_index: Arc<AtomicU8>, // we probably don't need this.
 }
 
 impl S3VectorsSpillQueryTable {
@@ -91,7 +92,9 @@ impl TableProvider for S3VectorsSpillQueryTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let query_tables = all_spill_tables(&self.table, &self.spill_index)
-            .await?
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
             .into_iter()
             .map(|table| {
                 Arc::new(S3VectorsQueryTable::new(

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::AtomicU8;
 use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
@@ -21,8 +22,11 @@ use arrow::compute::concat_batches;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::s3_vectors::compute_query::{CachedQueryVector, ComputeQueryVector};
-use data_components::s3_vectors::partition::S3VectorsPartitionedQueryTable;
+use data_components::s3_vectors::partition::{
+    S3VectorsPartitionedListTable, S3VectorsPartitionedQueryTable,
+};
 use data_components::s3_vectors::query_provider::S3_VECTOR_DISTANCE_NAME;
+use data_components::s3_vectors::spill::get_last_spill_index_for_virtual_index;
 use data_components::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorIdentifier, S3VectorsTable,
     list_provider::S3VectorsListTable, partition::PartitionedIndexName,
@@ -76,6 +80,8 @@ pub struct S3Vector {
     pub partition_by: Vec<Expr>,
 
     batch_write_rows: usize,
+
+    spill_writes: bool,
 }
 
 impl S3Vector {
@@ -97,11 +103,32 @@ impl S3Vector {
             compute_query,
             partition_by,
             batch_write_rows,
+            spill_writes: false,
         }
     }
 
     fn metadata_columns(&self) -> &MetadataColumns {
         &self.metadata_columns
+    }
+    #[must_use] 
+    pub fn enable_spill_writes(mut self) -> Self {
+        self.spill_writes = true;
+        self
+    }
+
+    // If the index supports spill writes, retrieve the last spill index to commence writing from.
+    pub async fn spill_index(
+        &self,
+    ) -> Result<Option<Arc<AtomicU8>>, data_components::s3_vectors::Error> {
+        if !self.spill_writes {
+            return Ok(None);
+        }
+        let (_, Some(bucket), Some(index)) = self.table.idx.index_identifier_variables() else {
+            return Ok(None);
+        };
+        get_last_spill_index_for_virtual_index(&self.table.client, &bucket, &index)
+            .await
+            .map(|u| Some(Arc::new(AtomicU8::new(u))))
     }
 }
 
@@ -210,19 +237,26 @@ impl SearchIndex for S3Vector {
             Arc::new(EmbedQuery(Arc::clone(&self.compute_query))),
             query.to_string(),
         )) as Arc<dyn ComputeQueryVector>;
-        let table: Arc<dyn TableProvider> = match self.partition_by.len() {
-            0 => Arc::new(S3VectorsQueryTable::new(
+        let table: Arc<dyn TableProvider> = match (self.spill_writes, self.partition_by.len()) {
+            (false, 0) => Arc::new(S3VectorsQueryTable::new(
                 self.table.clone(),
                 compute_vector,
                 query.to_string(),
             )),
-            _ => Arc::new(S3VectorsPartitionedQueryTable::new(
+            (false, _) => Arc::new(S3VectorsPartitionedQueryTable::new(
                 self.table.clone(),
                 compute_vector,
                 query.to_string(),
                 self.embedded_column.clone(),
                 self.partition_by.clone(),
             )),
+            (true, _) => Arc::new(
+                data_components::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable::new(
+                    self.table.clone(),
+                    compute_vector,
+                    query.to_string(),
+                ),
+            ),
         };
         Ok(
             LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(table)), None)?
@@ -263,23 +297,29 @@ impl VectorIndex for S3Vector {
     ///   1. Convert the primary key to its appropriate name and data type
     ///   2. Rename [`S3_VECTOR_EMBEDDING_NAME`] appropriately
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
-        // check on self.partition_by.len()
-        LogicalPlanBuilder::scan(
-            "tbl",
-            Arc::new(DefaultTableSource::new(Arc::new(S3VectorsListTable::new(
+        let table: Arc<dyn TableProvider> = match (self.spill_writes, self.partition_by.len()) {
+            (false, 0) => Arc::new(S3VectorsListTable::new(self.table.clone())),
+            (false, _) => Arc::new(S3VectorsPartitionedListTable::new(
                 self.table.clone(),
-            )))),
-            None,
-        )?
-        .project(
-            [
-                s3_vectors_primary_key_cast(&self.primary_fields()),
-                metadata_columns_to_exprs(&self.metadata_columns),
-                vec![col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(&self.search_column()))],
-            ]
-            .concat(),
-        )?
-        .build()
+                self.embedded_column.clone(),
+                self.partition_by.clone(),
+            )),
+            (true, _) => Arc::new(
+                data_components::s3_vectors::spill::list_provider::S3VectorsSpillListTable::new(
+                    self.table.clone(),
+                ),
+            ),
+        };
+        LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(table)), None)?
+            .project(
+                [
+                    s3_vectors_primary_key_cast(&self.primary_fields()),
+                    metadata_columns_to_exprs(&self.metadata_columns),
+                    vec![col(S3_VECTOR_EMBEDDING_NAME).alias(embedding_col(&self.search_column()))],
+                ]
+                .concat(),
+            )?
+            .build()
     }
 }
 

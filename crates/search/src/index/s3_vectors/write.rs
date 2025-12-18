@@ -206,8 +206,17 @@ async fn process_single_batch(
     let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
 
+    let spill_index = index.spill_index().await.context(CannotWriteIndexSnafu {
+        index: index.name().to_string(),
+    })?;
+
     table
-        .write_data(filtered_embeddings, filtered_primary_key, filtered_metadata)
+        .write_data(
+            filtered_embeddings,
+            filtered_primary_key,
+            filtered_metadata,
+            spill_index,
+        )
         .await
         .context(CannotWriteIndexSnafu {
             index: index.name().to_string(),

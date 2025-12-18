@@ -36,7 +36,7 @@ pub mod list_provider;
 pub mod partition;
 pub mod put_vectors_sink;
 pub mod query_provider;
-mod spill;
+pub mod spill;
 pub use spill::{Error as SpillIndexError, SpillIndex};
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
@@ -89,6 +89,9 @@ pub enum Error {
     #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
     S3VectorGetIndexError { source: Box<GetIndexError> },
 
+    #[snafu(display("Failed to list indexes from S3 Vectors. {source}"))]
+    S3VectorListIndexesError { source: Box<ListIndexesError> },
+
     #[snafu(display("Failed to construct a request to send to S3 Vectors. {source}"))]
     S3VectorBuildError { source: BuildError },
 
@@ -119,8 +122,6 @@ pub enum Error {
         exists: DistanceMetric,
         specified: DistanceMetric,
     },
-    #[snafu(display("S3 vector indexes cannot be listed"))]
-    S3VectorListIndexesError { source: Box<ListIndexesError> },
 
     #[snafu(display("Spill index error: {source}"))]
     SpillIndexError { source: SpillIndexError },
@@ -174,16 +175,6 @@ impl S3VectorIdentifier {
             Self::IndexArn(_) => None,
         }
     }
-
-    /// Gets the virtual index name for this identifier, if it's a virtual index.
-    #[must_use]
-    pub fn index_name(&self) -> Option<&str> {
-        if let Self::Index { index_name, .. } = self {
-            Some(index_name)
-        } else {
-            None
-        }
-    }
 }
 
 /// Lists index names with the given prefix in the specified bucket.
@@ -191,24 +182,18 @@ pub async fn list_index_names(
     client: &Arc<dyn S3Vectors + Send + Sync>,
     bucket_name: &str,
     prefix: &str,
-) -> Result<Vec<String>, DataFusionError> {
+) -> Result<Vec<String>, Error> {
     let list_indexes_output = client
         .list_indexes(
             ListIndexesInput::builder()
                 .set_vector_bucket_name(Some(bucket_name.to_string()))
                 .set_prefix(Some(prefix.to_string()))
                 .build()
-                .boxed()
-                .map_err(DataFusionError::External)?,
+                .context(S3VectorBuildSnafu)?,
         )
         .await
-        .map_err(|e| {
-            DataFusionError::External(
-                Error::S3VectorListIndexesError {
-                    source: Box::new(e.into_service_error()),
-                }
-                .into(),
-            )
+        .map_err(|e| Error::S3VectorListIndexesError {
+            source: Box::new(e.into_service_error()),
         })?;
 
     Ok(list_indexes_output
@@ -218,29 +203,9 @@ pub async fn list_index_names(
         .collect())
 }
 
-async fn fetch_all_index_names(
-    client: &Arc<dyn S3Vectors + Send + Sync>,
-    bucket_name: Option<&str>,
-    index_name: Option<&str>,
-) -> Result<Option<Vec<String>>, DataFusionError> {
-    if let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) {
-        // Use the base name (without spill suffix) as prefix to get all related indexes
-        let base_name = if let Ok(Some(spill)) = SpillIndex::parse(index_name) {
-            spill.base_name
-        } else {
-            index_name.to_string()
-        };
-        Ok(Some(
-            list_index_names(client, bucket_name, &base_name).await?,
-        ))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Scans multiple table providers and combines their execution plans with a UnionExec.
+/// Scans multiple table providers and combines their execution plans with a `UnionExec`.
 ///
-/// Both pushes down `limit`, but also ensures it is global limit.
+/// Both pushes down `limit` to each [`TableProvider`], but also limits the returned [`ExecutionPlan`].
 async fn gather_and_limit_providers(
     providers: Vec<Arc<dyn TableProvider>>,
     state: &dyn Session,
