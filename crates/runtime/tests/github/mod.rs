@@ -786,7 +786,7 @@ async fn test_github_workflows() -> Result<(), String> {
             run_query_and_check_results(
                 &mut rt,
                 "test_github_workflows_list",
-                "select * from (select name, path from spiceai_workflows_auto ORDER BY created_at ASC) limit 10;",
+                "select name, path from spiceai_workflows_auto ORDER BY created_at ASC limit 10;",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let pretty_batches = batches_to_string(&result_batches);

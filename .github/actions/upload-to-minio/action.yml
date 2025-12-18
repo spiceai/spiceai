@@ -1,0 +1,46 @@
+name: Upload to MinIO
+description: 'Setup MinIO client and upload a file to MinIO'
+
+inputs:
+  minio_endpoint:
+    description: 'MinIO endpoint'
+    required: true
+    type: string
+  minio_access_key:
+    description: 'MinIO access key'
+    required: true
+    type: string
+  minio_secret_key:
+    description: 'MinIO secret key'
+    required: true
+    type: string
+  source_path:
+    description: 'Path to the file to upload'
+    required: true
+    type: string
+  destination_path:
+    description: 'Destination path in MinIO (e.g., spice-minio/bucket/path/)'
+    required: true
+    type: string
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install MinIO client
+      shell: bash
+      run: |
+        if ! command -v mc &> /dev/null; then
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+        fi
+        mc alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
+
+    - name: Upload to MinIO
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.source_path }}" ]; then
+          mc cp ${{ inputs.source_path }} ${{ inputs.destination_path }}
+        else
+          echo "File ${{ inputs.source_path }} not found, skipping upload"
+        fi

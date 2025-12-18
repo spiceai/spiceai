@@ -8718,6 +8718,7 @@ dependencies = [
  "dotenvy",
  "either",
  "futures",
+ "google-genai",
  "governor",
  "hf-hub",
  "indexmap 2.12.1",
@@ -9526,7 +9527,6 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
- "tract-core",
  "tract-onnx",
  "util",
 ]
@@ -13194,7 +13194,6 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "tract-core",
  "turso",
  "twox-hash",
  "url",
@@ -13325,7 +13324,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
- "tract-core",
 ]
 
 [[package]]
