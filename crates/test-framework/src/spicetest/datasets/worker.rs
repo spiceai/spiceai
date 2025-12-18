@@ -250,7 +250,6 @@ impl SpiceTestQueryWorker {
         validation::validate_tpch_query(query, actual_batches)
     }
 
-    #[expect(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
@@ -528,7 +527,6 @@ impl SpiceTestQueryWorker {
         }
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn execute_flight(
         &self,
         query: &Query,

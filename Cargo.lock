@@ -310,7 +310,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "serde",
  "snafu",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2006,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=12957e480d1433b97bbb5de328e6bc0387d8551a#12957e480d1433b97bbb5de328e6bc0387d8551a"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=9c17685db62a1511ecf2e90aa72b19feabdea1cb#9c17685db62a1511ecf2e90aa72b19feabdea1cb"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2040,7 +2040,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=12957e480d1433b97bbb5de328e6bc0387d8551a#12957e480d1433b97bbb5de328e6bc0387d8551a"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=9c17685db62a1511ecf2e90aa72b19feabdea1cb#9c17685db62a1511ecf2e90aa72b19feabdea1cb"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2069,7 +2069,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=12957e480d1433b97bbb5de328e6bc0387d8551a#12957e480d1433b97bbb5de328e6bc0387d8551a"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=9c17685db62a1511ecf2e90aa72b19feabdea1cb#9c17685db62a1511ecf2e90aa72b19feabdea1cb"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
@@ -4079,7 +4079,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "data_components"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4160,11 +4160,12 @@ dependencies = [
  "url",
  "util",
  "uuid 1.18.1",
+ "zip 3.0.0",
 ]
 
 [[package]]
 name = "dataformat-json"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4675,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "async-stream",
@@ -4964,7 +4965,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5344,7 +5345,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -5481,7 +5482,7 @@ dependencies = [
 
 [[package]]
 name = "dynamodb-streams"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
@@ -5752,7 +5753,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "futures",
  "snafu",
@@ -6029,7 +6030,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6044,7 +6045,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6057,7 +6058,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -6081,7 +6082,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6176,12 +6177,12 @@ dependencies = [
 
 [[package]]
 name = "fs4"
-version = "0.8.4"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7e180ac76c23b45e767bd7ae9579bc0bb458618c4bc71835926e098e61d15f8"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
 dependencies = [
- "rustix 0.38.44",
- "windows-sys 0.52.0",
+ "rustix 1.1.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6612,9 +6613,9 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "git2"
-version = "0.20.2"
+version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2deb07a133b1520dc1a5690e9bd08950108873d7ed5de38dcc74d3b5ebffa110"
+checksum = "3e2b37e2f62729cdada11f0e6b3b6fe383c69c29fc619e391223e12856af308c"
 dependencies = [
  "bitflags 2.10.0",
  "libc",
@@ -6669,7 +6670,7 @@ dependencies = [
 
 [[package]]
 name = "google-genai"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -8487,9 +8488,9 @@ dependencies = [
 
 [[package]]
 name = "libgit2-sys"
-version = "0.18.2+1.9.1"
+version = "0.18.3+1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c42fe03df2bd3c53a3a9c7317ad91d80c81cd1fb0caec8d7cc4cd2bfa10c222"
+checksum = "c9b3acc4b91781bb0b3386669d325163746af5f6e4f73e6d2d630e09a35f3487"
 dependencies = [
  "cc",
  "libc",
@@ -8699,7 +8700,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -8717,6 +8718,7 @@ dependencies = [
  "dotenvy",
  "either",
  "futures",
+ "google-genai",
  "governor",
  "hf-hub",
  "indexmap 2.12.1",
@@ -8731,6 +8733,7 @@ dependencies = [
  "regex",
  "reqwest",
  "reqwest-eventsource",
+ "rstest 0.25.0",
  "runtime-rate-control",
  "schemars 1.1.0",
  "secrecy",
@@ -9508,7 +9511,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -9524,7 +9527,6 @@ dependencies = [
  "spicepod",
  "tokio",
  "tracing",
- "tract-core",
  "tract-onnx",
  "util",
 ]
@@ -10008,7 +10010,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "hickory-resolver",
  "snafu",
@@ -10939,7 +10941,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -10950,7 +10952,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "clap",
  "opentelemetry-proto 0.30.0",
@@ -11019,7 +11021,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -11143,7 +11145,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "bytes",
  "chunking",
@@ -12689,11 +12691,10 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.24"
+version = "0.12.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d0946410b9f7b082a427e4ef5c8ff541a88b357bc6c637c40db3a68ac70a36f"
+checksum = "3b4c14b2d9afca6a60277086b0cc6a6ae0b568f6f7916c943a8cdc79f8be240f"
 dependencies = [
- "async-compression",
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
@@ -13023,7 +13024,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -13193,7 +13194,6 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "tract-core",
  "turso",
  "twox-hash",
  "url",
@@ -13209,7 +13209,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -13238,7 +13238,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "futures",
  "libc",
@@ -13250,7 +13250,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "app",
  "axum",
@@ -13265,7 +13265,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -13278,6 +13278,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-optimizer-rules",
  "futures",
+ "globset",
  "itertools 0.14.0",
  "object_store",
  "opentelemetry 0.29.1",
@@ -13292,7 +13293,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -13305,7 +13306,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -13323,12 +13324,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
- "tract-core",
 ]
 
 [[package]]
 name = "runtime-object-store"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -13352,7 +13352,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -13364,7 +13364,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -13372,12 +13372,13 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-proto",
  "prost 0.13.5",
- "prost-build",
+ "tonic 0.13.1",
+ "tonic-build",
 ]
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "futures",
  "governor",
@@ -13388,7 +13389,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "app",
  "async-trait",
@@ -13408,7 +13409,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -13419,6 +13420,7 @@ dependencies = [
  "base64 0.22.1",
  "dotenvy",
  "flight_client",
+ "futures",
  "indexmap 2.12.1",
  "keyring",
  "logos",
@@ -13432,12 +13434,13 @@ dependencies = [
  "snafu",
  "spicepod",
  "tokio",
+ "tonic 0.13.1",
  "tracing",
 ]
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -13787,7 +13790,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
 name = "s3_vectors"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -13799,7 +13802,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -13901,7 +13904,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14053,7 +14056,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -14757,7 +14760,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14801,7 +14804,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14837,7 +14840,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -14860,7 +14863,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "app",
  "clap",
@@ -14870,7 +14873,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "schemars 1.1.0",
  "serde_json",
@@ -14879,7 +14882,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "clap",
  "runtime",
@@ -15455,9 +15458,9 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 
 [[package]]
 name = "tantivy"
-version = "0.24.2"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64a966cb0e76e311f09cf18507c9af192f15d34886ee43d7ba7c7e3803660c43"
+checksum = "502915c7381c5cb2d2781503962610cb880ad8f1a0ca95df1bae645d5ebf2545"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -15507,18 +15510,18 @@ dependencies = [
 
 [[package]]
 name = "tantivy-bitpacker"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1adc286a39e089ae9938935cd488d7d34f14502544a36607effd2239ff0e2494"
+checksum = "c3b04eed5108d8283607da6710fe17a7663523440eaf7ea5a1a440d19a1448b6"
 dependencies = [
  "bitpacking",
 ]
 
 [[package]]
 name = "tantivy-columnar"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6300428e0c104c4f7db6f95b466a6f5c1b9aece094ec57cdd365337908dc7344"
+checksum = "8b628488ae936c83e92b5c4056833054ca56f76c0e616aee8339e24ac89119cd"
 dependencies = [
  "downcast-rs 2.0.2",
  "fastdivide",
@@ -15532,9 +15535,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy-common"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91b6ea6090ce03dc72c27d0619e77185d26cc3b20775966c346c6d4f7e99d7f"
+checksum = "f880aa7cab0c063a47b62596d10991cdd0b6e0e0575d9c5eeb298b307a25de55"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -15556,9 +15559,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy-query-grammar"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e810cdeeebca57fc3f7bfec5f85fdbea9031b2ac9b990eb5ff49b371d52bbe6a"
+checksum = "768fccdc84d60d86235d42d7e4c33acf43c418258ff5952abf07bd7837fcd26b"
 dependencies = [
  "nom 7.1.3",
  "serde",
@@ -15567,9 +15570,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy-sstable"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "709f22c08a4c90e1b36711c1c6cad5ae21b20b093e535b69b18783dd2cb99416"
+checksum = "f8292095d1a8a2c2b36380ec455f910ab52dde516af36321af332c93f20ab7d5"
 dependencies = [
  "futures-util",
  "itertools 0.14.0",
@@ -15581,9 +15584,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy-stacker"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bcdebb267671311d1e8891fd9d1301803fdb8ad21ba22e0a30d0cab49ba59c1"
+checksum = "23d38a379411169f0b3002c9cba61cdfe315f757e9d4f239c00c282497a0749d"
 dependencies = [
  "murmurhash32",
  "rand_distr 0.4.3",
@@ -15592,9 +15595,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy-tokenizer-api"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfa942fcee81e213e09715bbce8734ae2180070b97b33839a795ba1de201547d"
+checksum = "23024f6aeb25ceb1a0e27740c84bdb0fae52626737b7e9a9de6ad5aa25c7b038"
 dependencies = [
  "serde",
 ]
@@ -15630,7 +15633,7 @@ checksum = "df7f62577c25e07834649fc3b39fafdc597c0a3527dc1c60129201ccfcbaa50c"
 
 [[package]]
 name = "telemetry"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -15641,7 +15644,10 @@ dependencies = [
  "otel-arrow",
  "sha2",
  "snafu",
+ "sysinfo 0.35.2",
+ "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -15717,7 +15723,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -15784,7 +15790,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
@@ -16124,7 +16130,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "secrecy",
  "snafu",
@@ -16517,7 +16523,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -16565,18 +16571,22 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.7"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cf146f99d442e8e68e585f5d798ccd3cad9a7835b917e09728880a862706456"
+checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
+ "async-compression",
  "bitflags 2.10.0",
  "bytes",
+ "futures-core",
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
  "iri-string",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
@@ -16597,7 +16607,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -17383,7 +17393,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -19027,7 +19037,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 dependencies = [
  "async-openai",
  "async-trait",

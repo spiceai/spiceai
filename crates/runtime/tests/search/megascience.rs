@@ -37,6 +37,7 @@ pub(crate) enum ColumnConfigOptions {
     TextSearch,
     MultiTextColumn,
     TextSearchMetadata,
+    VectorSearchMetadata,
     MultiEmbeddings,
 }
 
@@ -50,6 +51,7 @@ impl fmt::Display for ColumnConfigOptions {
             ColumnConfigOptions::TextSearch => "text_search",
             ColumnConfigOptions::MultiTextColumn => "multi_text_column",
             ColumnConfigOptions::TextSearchMetadata => "text_search_metadata",
+            ColumnConfigOptions::VectorSearchMetadata => "vector_search_metadata",
             ColumnConfigOptions::MultiEmbeddings => "multi_embeddings",
         };
         write!(f, "{s}")
@@ -114,6 +116,15 @@ impl ColumnConfigOptions {
                 Column::new("subject").with_metadata(HashMap::from([(
                     "vectors".to_string(),
                     serde_json::Value::String("non-filterable".to_string()),
+                )])),
+            ],
+            ColumnConfigOptions::VectorSearchMetadata => vec![
+                Column::new("answer").with_embedding(
+                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                ),
+                Column::new("subject").with_metadata(HashMap::from([(
+                    "vectors".to_string(),
+                    serde_json::Value::String("filterable".to_string()),
                 )])),
             ],
             ColumnConfigOptions::MultiEmbeddings => {
@@ -217,6 +228,7 @@ pub(crate) enum TestCases {
     VectorSearchSqlNoScore,
     VectorSearchSqlRandom,
     VectorSearchSqlVectors,
+    VectorSearchSqlIndexOnly,
 }
 
 impl fmt::Display for TestCases {
@@ -232,6 +244,7 @@ impl fmt::Display for TestCases {
             TestCases::VectorSearchSqlNoScore => "vector_search_sql_no_score",
             TestCases::VectorSearchSqlRandom => "vector_search_sql_random",
             TestCases::VectorSearchSqlVectors => "vector_search_sql_vectors",
+            TestCases::VectorSearchSqlIndexOnly => "vector_search_sql_index_only",
         };
         write!(f, "{s}")
     }
@@ -250,6 +263,7 @@ impl TestCases {
             TestCases::VectorSearchSqlNoScore,
             TestCases::VectorSearchSqlRandom,
             TestCases::VectorSearchSqlVectors,
+            TestCases::VectorSearchSqlIndexOnly,
         ]
     }
 
@@ -291,6 +305,9 @@ impl TestCases {
             ),
             Self::VectorSearchSqlVectors => SearchTestType::Sql(
                 "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;".to_string()
+            ),
+            Self::VectorSearchSqlIndexOnly => SearchTestType::Sql(
+                "SELECT id, trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;".to_string()
             ),
        }
     }

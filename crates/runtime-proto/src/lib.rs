@@ -14,4 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Allow clippy lints for tonic-generated code that we cannot control.
+#![allow(
+    clippy::pedantic,
+    clippy::clone_on_ref_ptr,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::default_trait_access,
+    clippy::allow_attributes,
+    clippy::mixed_attributes_style
+)]
+
 include!(concat!(env!("OUT_DIR"), "/spice.protobuf.rs"));

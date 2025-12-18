@@ -84,7 +84,6 @@ macro_rules! ensure_no_expr {
     };
 }
 
-#[expect(clippy::too_many_lines)]
 pub fn validate_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,

@@ -48,7 +48,6 @@ pub fn get_s3_hive_partitioned_dataset(
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

@@ -50,7 +50,6 @@ fn get_dataset(from: &str, name: &str, path: &str) -> Dataset {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

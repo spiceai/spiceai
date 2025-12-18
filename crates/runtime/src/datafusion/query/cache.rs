@@ -131,31 +131,20 @@ impl Query {
             response => response,
         };
 
-        // Always use CacheKey::Query when checking the plan cache
-        // Only compute this hash if we need it for the plan cache lookup
         let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
-        let plan = match df
-            .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
-            .await
-        {
+        let plan = match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
             Ok(plan) => plan,
             Err(e) => {
-                let e = find_datafusion_root(e);
-                let error_code = ErrorCode::from(&e);
-                let snafu_error = super::Error::UnableToExecuteQuery { source: e };
-                if let Some(t) = tracker {
-                    t.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                if let super::Error::UnableToExecuteQuery { source } = e {
+                    let code = ErrorCode::from(&source);
+                    let snafu_err = super::Error::UnableToExecuteQuery { source };
+                    if let Some(t) = tracker {
+                        t.finish_with_error(&request_context, snafu_err.to_string(), code);
+                    }
+                    return Err(snafu_err);
                 }
-                return Err(snafu_error);
+                return Err(e);
             }
-        };
-
-        // Use the logical plan with parameter values for caching and lookup
-        let plan = match parameters {
-            Some(param_values) => plan
-                .with_param_values(param_values)
-                .context(BindingParametersSnafu)?,
-            None => plan,
         };
 
         // Try to get cached results from plan
@@ -199,6 +188,36 @@ impl Query {
         ))
     }
 
+    /// Get the logical plan for the given SQL query, applying parameter values if provided.
+    pub(super) async fn get_plan(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        sql: &str,
+        sql_raw_cache_key: &RawCacheKey,
+        parameters: Option<ParamValues>,
+    ) -> super::Result<LogicalPlan> {
+        let plan = match df
+            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Err(super::Error::UnableToExecuteQuery {
+                    source: find_datafusion_root(e),
+                });
+            }
+        };
+
+        // Use the logical plan with parameter values for caching and lookup
+        let plan = match parameters {
+            Some(param_values) => plan
+                .with_param_values(param_values)
+                .context(BindingParametersSnafu)?,
+            None => plan,
+        };
+        Ok(plan)
+    }
+
     /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
     pub(super) fn plan_hasher(df: &DataFusion) -> Box<dyn Hasher> {
         df.plans_cache_provider().map_or(
@@ -207,7 +226,6 @@ impl Query {
         )
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
@@ -699,7 +717,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
@@ -1122,7 +1139,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_complete_lifecycle() {
         // This test validates the complete stale-while-revalidate lifecycle:
         // 1. Initial cache population
@@ -1352,7 +1368,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
         // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
@@ -1516,7 +1531,6 @@ mod tests {
             .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_single_in_flight_revalidation() {
         // This test validates that concurrent stale-while-revalidate requests

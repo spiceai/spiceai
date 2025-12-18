@@ -33,7 +33,9 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
-use runtime::config::ClusterMode;
+use runtime::cluster::ResolvedClusterConfig;
+#[cfg(feature = "cluster")]
+use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
@@ -183,7 +185,6 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -216,6 +217,10 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
+    #[cfg(feature = "cluster")]
+    let resolved_cluster_config =
+        ResolvedClusterConfig::from_config_and_app(args.runtime.cluster.clone(), app.as_deref());
+
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
         // User configured extensions
@@ -229,6 +234,11 @@ pub async fn run(args: Args) -> Result<()> {
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .with_runtime_config(args.runtime.clone())
         .with_io_runtime(Handle::current());
+
+    #[cfg(feature = "cluster")]
+    if let Ok(resolved_cluster_config) = resolved_cluster_config {
+        builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+    }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -351,11 +361,18 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
     #[cfg(feature = "cluster")]
-    if matches!(args.runtime.cluster.mode, Some(ClusterMode::Executor)) {
-        tracing::info!(
-            "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
-        );
-        return Ok((Some(Arc::new(App::default())), None));
+    {
+        // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
+        let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
+            || (args.runtime.cluster.role.is_none()
+                && args.runtime.cluster.scheduler_address.is_some());
+
+        if is_executor {
+            tracing::info!(
+                "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
+            );
+            return Ok((Some(Arc::new(App::default())), None));
+        }
     }
 
     let spicepod_path = args
@@ -453,6 +470,13 @@ async fn start_anonymous_telemetry(
     spicepod_telemetry_config: Option<&TelemetryConfig>,
     spicepod_name: Option<&String>,
 ) {
+    // Always log hardware info at debug level regardless of telemetry settings
+    // Use async version to avoid blocking the async runtime
+    let hardware_info = telemetry::hardware::HardwareInfo::detect_async()
+        .await
+        .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
+    hardware_info.log_debug();
+
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
