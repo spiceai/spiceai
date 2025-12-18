@@ -39,4 +39,8 @@ runs:
     - name: Upload to MinIO
       shell: bash
       run: |
-        mc cp ${{ inputs.source_path }} ${{ inputs.destination_path }}
+        if [ -f "${{ inputs.source_path }}" ]; then
+          mc cp ${{ inputs.source_path }} ${{ inputs.destination_path }}
+        else
+          echo "File ${{ inputs.source_path }} not found, skipping upload"
+        fi
