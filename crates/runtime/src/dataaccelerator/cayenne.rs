@@ -136,6 +136,9 @@ pub enum Error {
         Manual cleanup may be required."
     ))]
     MultiZoneRollbackFailed { zone: String, reason: String },
+
+    #[snafu(display("Invalid S3 Express One Zone bucket name: {reason}"))]
+    InvalidBucketName { reason: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -247,6 +250,39 @@ fn transform_schema_for_vortex(
     Ok(arrow::datatypes::Schema::new(transformed_fields))
 }
 
+/// Returns true if the provided error or any of its sources indicates an authentication failure.
+///
+/// This walks the error chain and inspects both structured error sources (when available) and
+/// a last-resort string check. This keeps the string matching centralized instead of duplicating
+/// it at each call site.
+fn is_auth_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        // If the object store wrapped another error (e.g., AWS SDK), inspect the source chain
+        if let Some(store_err) = err.downcast_ref::<object_store::Error>()
+            && let object_store::Error::Generic { source, .. } = store_err
+            && is_auth_error(source.as_ref())
+        {
+            return true;
+        }
+
+        let error_str = format!("{err:?}");
+        if error_str.contains("UnauthorizedException")
+            || error_str.contains("ExpiredToken")
+            || error_str.contains("InvalidAccessKeyId")
+            || error_str.contains("SignatureDoesNotMatch")
+            || error_str.contains("AccessDenied")
+            || error_str.contains("403")
+        {
+            return true;
+        }
+
+        current = err.source();
+    }
+
+    false
+}
+
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
 }
@@ -288,44 +324,48 @@ impl CayenneAccelerator {
     /// 3. Default: `spice_data_base_path()/{dataset_name}/`
     pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
-            Err(Error::InvalidConfiguration {
+            return Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
-            })
-        } else if let Some(acceleration) = source.acceleration() {
-            let acceleration_params = acceleration.params.clone();
-
-            // Get the sanitized dataset name
-            let dataset_name = source.name().to_string().replace(['.', '/'], "_");
-
-            let dir_path = if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
-                // Validate the path - reject standard S3, only allow S3 Express One Zone or local
-                Self::validate_file_path(custom_path)?;
-
-                // Add dataset name as a suffix for isolation
-                let base = custom_path.trim_end_matches('/');
-                format!("{base}/{dataset_name}/")
-            } else if let Some(zone_id) = acceleration_params.get("cayenne_s3_zone_id") {
-                // Auto-generate S3 Express One Zone path from app name and dataset name
-                // when cayenne_s3_zone_id is specified
-
-                // Get app name from the source
-                let app_name = source.app().name.clone();
-
-                // Generate bucket name
-                let bucket_name = Self::generate_bucket_name(&app_name, &dataset_name, zone_id);
-
-                // Return S3 Express path with dataset subdirectory
-                format!("s3://{bucket_name}/{dataset_name}/")
-            } else {
-                format!("{}/{dataset_name}/", spice_data_base_path())
-            };
-
-            Ok(dir_path)
-        } else {
-            Err(Error::AccelerationNotEnabled {
-                dataset: Arc::from(source.name().to_string()),
-            })
+            });
         }
+
+        let Some(acceleration) = source.acceleration() else {
+            return Err(Error::AccelerationNotEnabled {
+                dataset: Arc::from(source.name().to_string()),
+            });
+        };
+
+        let acceleration_params = acceleration.params.clone();
+        let dataset_name = source.name().to_string().replace(['.', '/'], "_");
+
+        if let Some(custom_path) = acceleration_params.get("cayenne_file_path") {
+            return Self::resolve_custom_data_path(&dataset_name, custom_path);
+        }
+
+        if let Some(zone_id) = acceleration_params.get("cayenne_s3_zone_id") {
+            return Self::resolve_auto_s3_data_path(&source.app().name, &dataset_name, zone_id);
+        }
+
+        Ok(Self::resolve_default_data_path(&dataset_name))
+    }
+
+    fn resolve_custom_data_path(dataset_name: &str, custom_path: &str) -> Result<String> {
+        Self::validate_file_path(custom_path)?;
+        let base = custom_path.trim_end_matches('/');
+        Ok(format!("{base}/{dataset_name}/"))
+    }
+
+    fn resolve_auto_s3_data_path(
+        app_name: &str,
+        dataset_name: &str,
+        zone_id: &str,
+    ) -> Result<String> {
+        let bucket_name = Self::generate_bucket_name(app_name, dataset_name, zone_id)?;
+        Ok(format!("s3://{bucket_name}/{dataset_name}/"))
+    }
+
+    fn resolve_default_data_path(dataset_name: &str) -> String {
+        format!("{}/{dataset_name}/", spice_data_base_path())
     }
 
     /// Returns true if the path is an S3 Express One Zone path.
@@ -439,15 +479,15 @@ impl CayenneAccelerator {
         let dataset_name = source.name().to_string().replace(['.', '/'], "_");
         let app_name = source.app().name.clone();
 
-        let paths: Vec<String> = zone_ids
+        let paths: Result<Vec<String>, Error> = zone_ids
             .iter()
             .map(|zone_id| {
-                let bucket_name = Self::generate_bucket_name(&app_name, &dataset_name, zone_id);
-                format!("s3://{bucket_name}/{dataset_name}/")
+                let bucket_name = Self::generate_bucket_name(&app_name, &dataset_name, zone_id)?;
+                Ok(format!("s3://{bucket_name}/{dataset_name}/"))
             })
             .collect();
 
-        Ok(paths)
+        paths
     }
 
     /// Extracts the zone ID from an S3 Express One Zone bucket name.
@@ -472,7 +512,7 @@ impl CayenneAccelerator {
     /// - Lowercase only
     /// - Only alphanumeric and hyphens allowed
     /// - Max 63 characters total (we leave room for the suffix)
-    fn generate_bucket_name(app_name: &str, dataset_name: &str, zone_id: &str) -> String {
+    fn generate_bucket_name(app_name: &str, dataset_name: &str, zone_id: &str) -> Result<String> {
         // Sanitize names for S3 bucket naming requirements
         fn sanitize(s: &str) -> String {
             s.to_lowercase()
@@ -489,11 +529,27 @@ impl CayenneAccelerator {
         let sanitized_app = sanitize(app_name);
         let sanitized_dataset = sanitize(dataset_name);
 
+        ensure!(
+            !sanitized_app.is_empty() && !sanitized_dataset.is_empty(),
+            InvalidBucketNameSnafu {
+                reason: "App or dataset name is empty after sanitization".to_string(),
+            }
+        );
+
         // S3 bucket names can be max 63 chars
         // We need room for: "spice-" (6) + "--" (2) + zone_id + "--x-s3" (6) = 14 + zone_id.len()
         let suffix_len = 2 + zone_id.len() + 6; // "--{zone_id}--x-s3"
         let prefix_len = 6; // "spice-"
         let max_name_len = 63 - prefix_len - suffix_len - 1; // -1 for the hyphen between app and dataset
+
+        ensure!(
+            max_name_len > 0,
+            InvalidBucketNameSnafu {
+                reason: format!(
+                    "Zone ID '{zone_id}' leaves no room for bucket naming (max length <= 0)"
+                ),
+            }
+        );
 
         let base_name = format!("{sanitized_app}-{sanitized_dataset}");
         let truncated_name = if base_name.len() > max_name_len {
@@ -502,7 +558,14 @@ impl CayenneAccelerator {
             base_name
         };
 
-        format!("spice-{truncated_name}--{zone_id}--x-s3")
+        ensure!(
+            !truncated_name.is_empty(),
+            InvalidBucketNameSnafu {
+                reason: "Bucket name is empty after truncation".to_string(),
+            }
+        );
+
+        Ok(format!("spice-{truncated_name}--{zone_id}--x-s3"))
     }
 
     /// Creates an S3 Express One Zone directory bucket if it doesn't exist.
@@ -612,13 +675,18 @@ impl CayenneAccelerator {
                         );
                         false
                     } else {
-                        // Check for authentication errors
-                        let error_str = format!("{service_error:?}");
-                        if error_str.contains("UnauthorizedException")
-                            || error_str.contains("ExpiredToken")
-                            || error_str.contains("InvalidAccessKeyId")
-                            || error_str.contains("SignatureDoesNotMatch")
-                            || error_str.contains("AccessDenied")
+                        // Check for authentication errors using structured error codes first
+                        let code = service_error.meta().code();
+                        if matches!(
+                            code,
+                            Some(
+                                "UnauthorizedException"
+                                    | "ExpiredToken"
+                                    | "InvalidAccessKeyId"
+                                    | "SignatureDoesNotMatch"
+                                    | "AccessDenied"
+                            )
+                        ) || is_auth_error(&service_error)
                         {
                             return Err(Error::S3AuthenticationFailed);
                         }
@@ -656,14 +724,7 @@ impl CayenneAccelerator {
             .put(&test_path, test_content.clone().into())
             .await
             .map_err(|e| {
-                let error_str = format!("{e:?}");
-                if error_str.contains("UnauthorizedException")
-                    || error_str.contains("ExpiredToken")
-                    || error_str.contains("InvalidAccessKeyId")
-                    || error_str.contains("SignatureDoesNotMatch")
-                    || error_str.contains("AccessDenied")
-                    || error_str.contains("403")
-                {
+                if is_auth_error(&e) {
                     Error::S3AuthenticationFailed
                 } else {
                     Error::S3DirectoryBucketCreation {
@@ -675,14 +736,7 @@ impl CayenneAccelerator {
 
         // Read test object back using object_store
         let get_result = object_store.get(&test_path).await.map_err(|e| {
-            let error_str = format!("{e:?}");
-            if error_str.contains("UnauthorizedException")
-                || error_str.contains("ExpiredToken")
-                || error_str.contains("InvalidAccessKeyId")
-                || error_str.contains("SignatureDoesNotMatch")
-                || error_str.contains("AccessDenied")
-                || error_str.contains("403")
-            {
+            if is_auth_error(&e) {
                 Error::S3AuthenticationFailed
             } else {
                 Error::S3DirectoryBucketCreation {
@@ -1017,39 +1071,16 @@ impl CayenneAccelerator {
         let zone_id = Self::extract_zone_id_from_bucket(bucket_name);
 
         // Derive region from zone_id if not explicitly provided
-        // Zone ID format: use2-az1 -> region: us-east-2
-        // The zone ID prefix (e.g., "use2") maps to region (e.g., "us-east-2")
-        let derived_region = zone_id.and_then(|zid| {
-            // Parse zone ID to extract region prefix (e.g., "use2" from "use2-az1")
-            let zone_prefix = zid.split('-').next()?;
-            // Map common zone prefixes to regions
-            match zone_prefix {
-                "use1" => Some("us-east-1"),
-                "use2" => Some("us-east-2"),
-                "usw1" => Some("us-west-1"),
-                "usw2" => Some("us-west-2"),
-                "euw1" => Some("eu-west-1"),
-                "euw2" => Some("eu-west-2"),
-                "euw3" => Some("eu-west-3"),
-                "euc1" => Some("eu-central-1"),
-                "eun1" => Some("eu-north-1"),
-                "aps1" => Some("ap-south-1"),
-                "apne1" => Some("ap-northeast-1"),
-                "apne2" => Some("ap-northeast-2"),
-                "apne3" => Some("ap-northeast-3"),
-                "apse1" => Some("ap-southeast-1"),
-                "apse2" => Some("ap-southeast-2"),
-                "sae1" => Some("sa-east-1"),
-                "cac1" => Some("ca-central-1"),
-                _ => None,
-            }
-        });
+        let derived_region = zone_id.and_then(Self::derive_region_from_zone);
 
-        // Use explicit region if provided, otherwise use derived region
+        // Use explicit region if provided, otherwise use derived region. If neither is available, fail fast.
         let effective_region = s3_region
-            .as_deref()
             .or(derived_region)
-            .unwrap_or("us-east-1");
+            .ok_or_else(|| Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Cannot determine AWS region for S3 Express One Zone. Specify 'cayenne_s3_region' or use an S3 Express bucket name that encodes the zone (bucket--<zone>--x-s3).",
+                ),
+            })?;
 
         // Build the S3 object store
         let io_runtime = tokio::runtime::Handle::current();
@@ -1057,7 +1088,7 @@ impl CayenneAccelerator {
             .with_bucket_name(bucket_name)
             .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
             .with_allow_http(s3_allow_http)
-            .with_region(effective_region);
+            .with_region(effective_region.clone());
 
         // Configure longer retry timeout for S3 Express uploads from outside AWS
         // S3 Express One Zone is optimized for same-AZ access; from outside AWS,
@@ -1133,7 +1164,7 @@ impl CayenneAccelerator {
             } else {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(
-                        "S3 auth method 'key' requires both 's3_key' and 's3_secret' parameters",
+                        "S3 auth method 'key' requires both 'cayenne_s3_key' and 'cayenne_s3_secret' parameters",
                     ),
                 });
             }
@@ -1218,21 +1249,11 @@ impl CayenneAccelerator {
     /// Parse Vortex encoding configuration from acceleration parameters.
     /// This allows fine-grained control over which SIMD-optimized encodings to use.
     ///
-    /// For S3 Express One Zone storage, a smaller default file size (8MB) is used
-    /// to reduce upload timeouts when accessing from outside AWS.
     fn get_vortex_config(
         table_name: &str,
         source: &dyn AccelerationSource,
-        is_s3_express: bool,
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig::default();
-
-        // For S3 Express One Zone, use smaller file sizes by default to reduce
-        // upload timeouts when accessing from outside AWS (optimized for same-AZ access).
-        // 8MB results in ~2 multipart upload parts (5MB each), reducing timeout risk.
-        if is_s3_express {
-            config.target_vortex_file_size_mb = 8;
-        }
 
         if let Some(acceleration) = source.acceleration() {
             // Parse cache options - use VortexConfig defaults if not specified
@@ -1403,7 +1424,7 @@ impl CayenneAccelerator {
 
         // Check if using S3 Express One Zone storage
         let is_s3_express = Self::is_s3_express_data_path(source);
-        let vortex_config = Self::get_vortex_config(table_name, source, is_s3_express);
+        let vortex_config = Self::get_vortex_config(table_name, source);
 
         // Build S3 object store if using S3 Express One Zone storage
         let object_store = Self::build_s3_object_store(source).await?;
@@ -1437,10 +1458,11 @@ impl CayenneAccelerator {
             );
             builder = builder.with_object_store(object_store);
         } else if is_s3_express {
-            tracing::error!(
-                "S3 Express One Zone storage detected but no object store built for {}!",
-                table_name
-            );
+            return Err(Error::AccelerationCreationFailed {
+                source: Box::new(std::io::Error::other(
+                    "S3 Express One Zone storage detected but object store configuration is missing",
+                )),
+            });
         }
         let cayenne_table =
             builder
@@ -1465,32 +1487,32 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("How to handle data types not natively supported by Cayenne (internally using Vortex format) (Time32, Time64, Duration, Interval, Map, etc.). Options: 'string' (convert schema to Utf8, default - requires data source to provide string data), 'error' (fail on unsupported types), 'warn' (include in schema, may fail on insert), 'ignore' (skip unsupported fields)")
         .default("string"),
     // S3 Express One Zone authentication parameters (used when file_path is an S3 Express path)
-    ParameterSpec::component("s3_region")
-        .description("AWS region for S3 Express One Zone storage. If not specified, derived from s3_zone_id."),
-    ParameterSpec::component("s3_endpoint")
+    ParameterSpec::component("cayenne_s3_region")
+        .description("AWS region for S3 Express One Zone storage. If not specified, derived from cayenne_s3_zone_id."),
+    ParameterSpec::component("cayenne_s3_endpoint")
         .description("Custom S3 endpoint URL for S3 Express One Zone."),
-    ParameterSpec::component("s3_key")
+    ParameterSpec::component("cayenne_s3_key")
         .description("AWS access key ID for S3 authentication.")
         .secret(),
-    ParameterSpec::component("s3_secret")
+    ParameterSpec::component("cayenne_s3_secret")
         .description("AWS secret access key for S3 authentication.")
         .secret(),
-    ParameterSpec::component("s3_session_token")
+    ParameterSpec::component("cayenne_s3_session_token")
         .description("AWS session token for temporary credentials (optional).")
         .secret(),
-    ParameterSpec::component("s3_auth")
+    ParameterSpec::component("cayenne_s3_auth")
         .description("Authentication method for S3 Express One Zone. Options: 'iam_role' (default, uses environment credentials), 'key' (uses explicit cayenne_s3_key/cayenne_s3_secret).")
         .default("iam_role")
         .one_of(&["iam_role", "key"]),
-    ParameterSpec::component("s3_client_timeout")
+    ParameterSpec::component("cayenne_s3_client_timeout")
         .description("Timeout for S3 client operations (e.g., '30s', '5m')."),
-    ParameterSpec::component("s3_allow_http")
+    ParameterSpec::component("cayenne_s3_allow_http")
         .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
         .default("false"),
     // S3 Express One Zone auto-generation parameter
-    ParameterSpec::component("s3_zone_id")
-        .description("Availability Zone ID for S3 Express One Zone storage (e.g., 'usw2-az1', 'use1-az4'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, use 's3_zone_ids' instead."),
-    ParameterSpec::component("s3_zone_ids")
+    ParameterSpec::component("cayenne_s3_zone_id")
+        .description("Availability Zone ID for S3 Express One Zone storage (e.g., 'usw2-az1', 'use1-az4'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, use 'cayenne_s3_zone_ids' instead."),
+    ParameterSpec::component("cayenne_s3_zone_ids")
         .description("Comma-separated list of Availability Zone IDs for multi-zone S3 Express One Zone storage (e.g., 'usw2-az1,usw2-az2'). Data is written to all zones with ACID guarantees - writes succeed only if all zones succeed. Reads are served from the primary (first) zone with fallback to replicas. Provides redundancy and resilience across availability zones."),
     ParameterSpec::component("footer_cache_mb")
         .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB")
@@ -1498,8 +1520,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("segment_cache_mb")
         .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
         .default("256"),
-    ParameterSpec::component("target_file_size_mb")
-        .description("Target size for Vortex data files in MB. Default: 256 MB for local storage, 8 MB for S3 Express One Zone (smaller files reduce upload timeouts when accessing from outside AWS).")
+    ParameterSpec::component("cayenne_target_file_size_mb")
+        .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
         .default("256"),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
@@ -1869,7 +1891,7 @@ impl DataAccelerator for CayenneAccelerator {
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = Self::is_s3_express_data_path(source);
-            let vortex_config = Self::get_vortex_config(&table_name, source, is_s3_express);
+            let vortex_config = Self::get_vortex_config(&table_name, source);
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
@@ -2338,25 +2360,29 @@ mod tests {
     fn test_generate_bucket_name() {
         // Basic bucket name generation
         assert_eq!(
-            CayenneAccelerator::generate_bucket_name("myapp", "orders", "usw2-az1"),
+            CayenneAccelerator::generate_bucket_name("myapp", "orders", "usw2-az1")
+                .expect("bucket name"),
             "spice-myapp-orders--usw2-az1--x-s3"
         );
 
         // Special characters are sanitized
         assert_eq!(
-            CayenneAccelerator::generate_bucket_name("My.App", "order_items", "use1-az4"),
+            CayenneAccelerator::generate_bucket_name("My.App", "order_items", "use1-az4")
+                .expect("bucket name"),
             "spice-my-app-order-items--use1-az4--x-s3"
         );
 
         // Uppercase is converted to lowercase
         assert_eq!(
-            CayenneAccelerator::generate_bucket_name("MyApp", "MyDataset", "euw1-az2"),
+            CayenneAccelerator::generate_bucket_name("MyApp", "MyDataset", "euw1-az2")
+                .expect("bucket name"),
             "spice-myapp-mydataset--euw1-az2--x-s3"
         );
 
         // Names with multiple special chars
         assert_eq!(
-            CayenneAccelerator::generate_bucket_name("my--app", "data..set", "aps1-az1"),
+            CayenneAccelerator::generate_bucket_name("my--app", "data..set", "aps1-az1")
+                .expect("bucket name"),
             "spice-my-app-data-set--aps1-az1--x-s3"
         );
     }
@@ -2366,7 +2392,8 @@ mod tests {
         // Very long names should be truncated to fit within S3 bucket name limits
         let long_app = "a".repeat(50);
         let long_dataset = "b".repeat(50);
-        let bucket = CayenneAccelerator::generate_bucket_name(&long_app, &long_dataset, "usw2-az1");
+        let bucket = CayenneAccelerator::generate_bucket_name(&long_app, &long_dataset, "usw2-az1")
+            .expect("bucket name");
 
         // S3 bucket names can be max 63 chars
         assert!(

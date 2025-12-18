@@ -33,6 +33,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::Constraints;
@@ -42,7 +43,8 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::ExecutionPlan;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
+use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
@@ -230,6 +232,138 @@ impl CayenneTableProvider {
         url_str
     }
 
+    fn register_object_store_if_needed(
+        runtime_env: &Arc<RuntimeEnv>,
+        config: &crate::metadata::ObjectStoreConfig,
+    ) {
+        // Use the object store registry to check if already registered
+        let already_registered = runtime_env
+            .object_store_registry
+            .get_store(&config.url)
+            .map(|existing| Arc::ptr_eq(&existing, &config.store))
+            .unwrap_or(false);
+
+        if !already_registered {
+            runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
+            tracing::debug!("Registered object store for {}", config.url.as_str());
+        }
+    }
+
+    fn require_object_store(&self) -> CatalogResult<&crate::metadata::ObjectStoreConfig> {
+        self.object_store_config
+            .as_ref()
+            .ok_or_else(|| CatalogError::InvalidOperation {
+                message: "S3 storage requires an object_store_config".to_string(),
+                source: Box::new(std::io::Error::other("missing object store configuration")),
+            })
+    }
+
+    fn snapshot_object_store_prefix(
+        &self,
+        snapshot_id: &str,
+    ) -> CatalogResult<Option<ObjectStorePath>> {
+        if !self.table_metadata.path.starts_with("s3://") {
+            return Ok(None);
+        }
+
+        let snapshot_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            snapshot_id,
+        );
+
+        let url = url::Url::parse(&snapshot_url).map_err(|e| CatalogError::InvalidOperation {
+            message: format!("Failed to parse snapshot URL {snapshot_url}"),
+            source: Box::new(e),
+        })?;
+
+        let host = url.host_str().unwrap_or_default();
+        let config = self.require_object_store()?;
+        let config_host = config.url.host_str().unwrap_or_default();
+
+        if !config_host.is_empty() && !host.is_empty() && config_host != host {
+            return Err(CatalogError::InvalidOperation {
+                message: format!(
+                    "Snapshot host {host} does not match configured object store host {config_host}"
+                ),
+                source: Box::new(std::io::Error::other("host mismatch")),
+            });
+        }
+
+        let path = url.path().trim_start_matches('/');
+        Ok(Some(ObjectStorePath::from(path)))
+    }
+
+    async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> CatalogResult<()> {
+        let config = self.require_object_store()?;
+        let objects: Vec<_> = config
+            .store
+            .list(Some(prefix))
+            .try_collect()
+            .await
+            .map_err(|source| CatalogError::InvalidOperation {
+                message: "Failed to list objects for snapshot cleanup".to_string(),
+                source: Box::new(source),
+            })?;
+
+        for meta in objects {
+            config
+                .store
+                .delete(&meta.location)
+                .await
+                .map_err(|source| CatalogError::InvalidOperation {
+                    message: format!(
+                        "Failed to delete object {} from snapshot cleanup",
+                        meta.location
+                    ),
+                    source: Box::new(source),
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_old_snapshots_s3(&self, current_snapshot: &str) -> CatalogResult<()> {
+        let config = self.require_object_store()?;
+
+        let base_url = url::Url::parse(&self.table_metadata.path).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to parse table path for snapshot cleanup: {}",
+                    self.table_metadata.path
+                ),
+                source: Box::new(e),
+            }
+        })?;
+
+        let mut base_prefix = base_url.path().trim_start_matches('/').to_string();
+        if !base_prefix.ends_with('/') {
+            base_prefix.push('/');
+        }
+
+        let prefix =
+            ObjectStorePath::from(format!("{base_prefix}{}/", self.table_metadata.table_id));
+
+        let list_result = config
+            .store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .map_err(|source| CatalogError::InvalidOperation {
+                message: "Failed to list snapshots for cleanup".to_string(),
+                source: Box::new(source),
+            })?;
+
+        for common_prefix in list_result.common_prefixes {
+            if let Some(snapshot_id) = common_prefix.parts().last() {
+                if snapshot_id.as_ref() != current_snapshot {
+                    self.delete_prefix_with_object_store(&common_prefix).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a new `ListingTable` for a snapshot directory.
     ///
     /// # Arguments
@@ -246,11 +380,12 @@ impl CayenneTableProvider {
         schema: SchemaRef,
         vortex_config: &crate::metadata::VortexConfig,
     ) -> CatalogResult<Arc<ListingTable>> {
-        let table_url =
-            ListingTableUrl::parse(snapshot_dir_url).map_err(|e| CatalogError::InvalidOperation {
+        let table_url = ListingTableUrl::parse(snapshot_dir_url).map_err(|e| {
+            CatalogError::InvalidOperation {
                 message: format!("Failed to parse table URL '{snapshot_dir_url}'."),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         // Create a configured Vortex session with selected encodings
         let vortex_session = VortexSession::default();
@@ -457,6 +592,15 @@ impl CayenneTableProvider {
         object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
+
+        if table_metadata.path.starts_with("s3://") && object_store_config.is_none() {
+            return Err(CatalogError::InvalidOperation {
+                message: format!(
+                    "Table {table_name} uses S3 storage but no object_store_config was provided"
+                ),
+                source: Box::new(std::io::Error::other("missing object store configuration")),
+            });
+        }
 
         // Construct URL to current snapshot
         // Directory structure: [table_path]/[table_id]/[snapshot_id]/
@@ -710,7 +854,7 @@ impl CayenneTableProvider {
         mut stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> CatalogResult<(u64, usize)> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
         use tokio::sync::Semaphore;
 
@@ -720,7 +864,7 @@ impl CayenneTableProvider {
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
         let start_time = Instant::now();
-        let last_progress_time = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
         let total_bytes_written = Arc::new(AtomicUsize::new(0));
         let files_written = Arc::new(AtomicUsize::new(0));
         let mut write_tasks = tokio::task::JoinSet::new();
@@ -773,7 +917,7 @@ impl CayenneTableProvider {
                 let self_clone = self.clone_for_write();
                 let total_bytes = Arc::clone(&total_bytes_written);
                 let files_count = Arc::clone(&files_written);
-                let progress_time = Arc::clone(&last_progress_time);
+                let progress_time = Arc::clone(&last_progress_ms);
                 let is_s3 = is_s3_storage;
                 let table_name = self.table_metadata.table_name.clone();
                 let start = start_time;
@@ -798,12 +942,13 @@ impl CayenneTableProvider {
                         let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                         // Log progress every 10 seconds or when a file completes
-                        let mut last_time = progress_time
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let should_log = last_time.elapsed().as_secs() >= 10 || result.is_ok();
+                        let elapsed = start.elapsed();
+                        // Use saturating conversion since elapsed time in real usage won't exceed u64::MAX milliseconds
+                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                        let last_logged = progress_time.load(Ordering::Relaxed);
+                        let should_log =
+                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
                         if should_log {
-                            let elapsed = start.elapsed();
                             let bytes_so_far = total_bytes.load(Ordering::Relaxed);
                             let throughput = if elapsed.as_secs_f64() > 0.0 {
                                 #[expect(clippy::cast_precision_loss)]
@@ -820,7 +965,7 @@ impl CayenneTableProvider {
                                 elapsed.as_secs_f64(),
                                 throughput
                             );
-                            *last_time = Instant::now();
+                            progress_time.store(elapsed_ms, Ordering::Relaxed);
                         }
                     }
 
@@ -1048,9 +1193,15 @@ impl CayenneTableProvider {
         let is_s3_path = self.table_metadata.path.starts_with("s3://");
 
         if is_s3_path {
-            tracing::warn!(
-                "Sorted rewrite for S3 storage skips file deletion - old files may remain in snapshot directory"
-            );
+            if let Some(prefix) =
+                self.snapshot_object_store_prefix(&self.table_metadata.current_snapshot_id)?
+            {
+                self.delete_prefix_with_object_store(&prefix).await?;
+            } else {
+                tracing::warn!(
+                    "S3 path detected but no object store prefix could be derived for sorted rewrite cleanup"
+                );
+            }
         } else {
             let snapshot_dir = Self::snapshot_dir_path(
                 &self.table_metadata.path,
@@ -1121,13 +1272,7 @@ impl CayenneTableProvider {
 
         // Register object store if configured for remote storage (e.g., S3 Express One Zone)
         if let Some(ref config) = self.object_store_config {
-            ctx.runtime_env()
-                .register_object_store(&config.url, Arc::clone(&config.store));
-            tracing::info!(
-                "Created SessionContext with S3 Express object store for {}: {}",
-                self.table_metadata.table_name,
-                config.url.as_str()
-            );
+            Self::register_object_store_if_needed(&ctx.runtime_env(), config);
         } else if is_s3 {
             tracing::warn!(
                 "Creating SessionContext for S3 table {} but no object_store_config!",
@@ -1438,9 +1583,7 @@ impl TableProvider for CayenneTableProvider {
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable reads data.
         if let Some(ref config) = self.object_store_config {
-            state
-                .runtime_env()
-                .register_object_store(&config.url, Arc::clone(&config.store));
+            Self::register_object_store_if_needed(state.runtime_env(), config);
         }
 
         // Delegate to the underlying listing table first
@@ -1550,14 +1693,7 @@ impl TableProvider for CayenneTableProvider {
         // Register object store with the session's runtime env if configured for S3 Express One Zone.
         // This ensures the session can access S3 when the underlying ListingTable writes data.
         if let Some(ref config) = self.object_store_config {
-            state
-                .runtime_env()
-                .register_object_store(&config.url, Arc::clone(&config.store));
-            tracing::info!(
-                "Registered S3 Express One Zone object store for {}: {}",
-                self.table_metadata.table_name,
-                config.url.as_str()
-            );
+            Self::register_object_store_if_needed(state.runtime_env(), config);
         } else if is_s3 {
             tracing::warn!(
                 "S3 table {} has no object_store_config! Writes will fail.",
@@ -1619,17 +1755,26 @@ impl TableProvider for CayenneTableProvider {
 
             // Update the provider's listing table to point to the new snapshot
             // This ensures subsequent queries in the same context will read from the new data
-            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            *listing_table_guard = new_listing_table;
+            {
+                let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        LISTING_TABLE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                *listing_table_guard = new_listing_table;
+            }
 
             // Trigger cleanup of old snapshot directories after successful full refresh
-            // This is fire-and-forget using spawn_blocking to avoid blocking the async runtime
-            // Skip for S3 paths - S3 cleanup requires object store operations, not local filesystem
-            if !self.table_metadata.path.starts_with("s3://") {
+            // Local paths use blocking cleanup; S3 paths use object store deletion
+            if self.table_metadata.path.starts_with("s3://") {
+                let current_snapshot = new_snapshot_id.clone();
+                if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
+                    tracing::warn!(
+                        "Failed to cleanup old S3 snapshots for table {}: {err}",
+                        self.table_metadata.table_id
+                    );
+                }
+            } else {
                 let table_path = self.table_metadata.path.clone();
                 let table_id = self.table_metadata.table_id;
                 let current_snapshot = new_snapshot_id.clone();
