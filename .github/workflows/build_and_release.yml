@@ -239,6 +239,16 @@ jobs:
           name: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      - name: Upload spiced to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
+
       ## Models flavor
       - name: Build spiced (models)
         if: contains(matrix.target.tags, 'models')
@@ -279,6 +289,16 @@ jobs:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      - name: Upload spiced_models to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'models')
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced_models_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
+
       ## ODBC + Models flavor - for now, assume ODBC only builds with models because this binary is only used for internal testing.
       - name: Build spiced (odbc,models)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
@@ -301,6 +321,16 @@ jobs:
         with:
           name: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      - name: Upload spiced_odbc_models to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced_odbc_models_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
       ## Models + metal flavor
       - name: Build spiced (models)
@@ -363,33 +393,15 @@ jobs:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      # Publish Linux x86_64 binaries to MinIO
-      - name: Setup MinIO
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
-        uses: ./.github/actions/setup-minio
+      - name: Upload spice CLI to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: Upload artifacts to Minio
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
-        run: |
-          if [ -f "spiced_linux_x86_64.tar.gz" ]; then
-            mc cp spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
-          fi;
-
-          if [ -f "spiced_models_linux_x86_64.tar.gz" ]; then
-            mc cp spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
-          fi;
-
-          if [ -f "spiced_odbc_models_linux_x86_64.tar.gz" ]; then
-            mc cp spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
-          fi;
-
-          if [ -f "spice_linux_x86_64.tar.gz" ]; then
-            mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
-          fi;
+          source_path: spice_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
