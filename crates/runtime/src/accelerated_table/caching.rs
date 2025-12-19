@@ -660,12 +660,6 @@ impl CacheRefreshHelper {
         // Use overwrite to ensure clean state in child
         Self::overwrite_accelerator(Arc::clone(child_accelerator), dataset_name, batches).await?;
 
-        tracing::info!(
-            "Initialized child accelerator with {} rows from parent for dataset={}",
-            total_rows,
-            dataset_name
-        );
-
         Ok(total_rows)
     }
 
