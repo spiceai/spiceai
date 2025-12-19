@@ -21,7 +21,7 @@ use test_framework::{
     anyhow,
     app::{App, AppBuilder},
     queries::QuerySet,
-    spiced::StartRequest,
+    spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
     spicepod_utils::from_app,
     spicetest::datasets::NotStarted,
@@ -93,6 +93,27 @@ pub(crate) fn build_test_with_validation(
     }
 
     Ok((query_set, test_builder))
+}
+
+pub(crate) async fn run_or_connect_spiced(
+    args: &CommonArgs,
+) -> anyhow::Result<(App, SpicedInstance)> {
+    if args.is_external_instance() {
+        println!(
+            "Connecting to external spiced instance at: {}",
+            args.spiced_path
+        );
+        let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
+        let app = AppBuilder::new(spicepod.name.clone())
+            .with_spicepod(spicepod)
+            .build();
+        let instance = SpicedInstance::external(&args.spiced_path);
+        Ok((app, instance))
+    } else {
+        let (app, start_request) = get_app_and_start_request(&args).await?;
+        let instance = SpicedInstance::start(start_request).await?;
+        Ok((app, instance))
+    }
 }
 
 pub(crate) async fn get_app_and_start_request(

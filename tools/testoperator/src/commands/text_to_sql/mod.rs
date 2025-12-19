@@ -14,39 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::args::{CommonArgs, TextToSqlArgs, TextToSqlQuery};
+use crate::{
+    args::{TextToSqlArgs, TextToSqlQuery},
+    commands::run_or_connect_spiced,
+};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use test_framework::{
-    anyhow,
-    constants::HTTP_BASE_URL,
-    futures::TryStreamExt,
-    spiced::{SpicedInstance, StartRequest},
+    anyhow, constants::HTTP_BASE_URL, futures::TryStreamExt, spiced::SpicedInstance,
     utils::wait_until_true,
 };
 use tokio::time::{Instant, sleep};
 
-use super::get_app_and_start_request;
-use crate::health::HealthMonitor;
-
 pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
-    let queries = args.load_queries()?;
-
-    println!("Running text-to-sql test with {} queries", queries.len());
-
-    let (_app, start_request) = get_app_and_start_request(&args.common).await?;
-    let mut spiced_instance = run_spice(&args.common, start_request).await?;
+    let (_app, mut spiced_instance) = run_or_connect_spiced(&args.common).await?;
     let spiced_client: spiceai::Client = spiced_instance.spice_client(None, true).await?;
-
-    let health_monitor = HealthMonitor::spawn()?;
 
     for sample_data_enabled in args.sample_data_enabled.values() {
         for return_sql in args.return_sql.values() {
             for TextToSqlQuery {
                 question,
                 expected_sql,
-            } in &queries
+            } in args.load_queries()?
             {
                 match run_single_test(
                     &spiced_instance,
@@ -86,34 +76,11 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
         }
     }
 
-    let health_report = health_monitor.stop().await;
-
     if !args.common.is_external_instance() {
         spiced_instance.stop()?;
     }
 
-    let health_report = health_report?;
-    if let Some(message) = health_report.failure_message() {
-        return Err(anyhow::anyhow!(message));
-    }
-
     Ok(())
-}
-
-async fn run_spice(
-    common: &CommonArgs,
-    start_request: StartRequest,
-) -> anyhow::Result<SpicedInstance> {
-    if common.is_external_instance() {
-        println!("Using external spiced instance at {}", common.spiced_path);
-        Ok(SpicedInstance::external(common.spiced_path.clone()))
-    } else {
-        let mut spiced = SpicedInstance::start(start_request).await?;
-        spiced
-            .wait_for_ready(Duration::from_secs(common.ready_wait))
-            .await?;
-        Ok(spiced)
-    }
 }
 
 /// Data needed from the result of text-to-SQL attempt to use to generate measurements.
@@ -168,6 +135,7 @@ async fn run_single_test(
         (1, text)
     } else {
         // Must get SQL first, since `number_of_attempts` will return 0 if trace is not in `runtime.task_history`.
+        // `find_last_sql_statement` will wait until the trace is available.
         let sql = find_last_sql_statement(spice_client)
             .await
             .map_err(|e| anyhow::anyhow!("could not find last sql_query statement. Error: {e}"))?;
@@ -202,7 +170,7 @@ Duration::from_secs(10)
     )
     .await;
 
-    let Some(Some(rb)) = data.as_ref().map(|s| s.first().clone()) else {
+    let Some(rb) = data.as_ref().and_then(|s| s.first().clone()) else {
         return Err(anyhow::anyhow!(
             "could not find task history for text to SQL"
         ));
@@ -232,7 +200,7 @@ LIMIT 1"#,
     )
     .await;
 
-    let Some(Some(rb)) = data.as_ref().map(|s| s.first().clone()) else {
+    let Some(rb) = data.as_ref().and_then(|s| s.first().clone()) else {
         return Err(anyhow::anyhow!(
             "could not find last sql_query task in runtime.task_history"
         ));
@@ -251,6 +219,7 @@ LIMIT 1"#,
     Ok(sql)
 }
 
+/// Retry the given query until it returns results or the wait_for duration elapses.
 async fn retry_query_expecting_results(
     spice_client: &spiceai::Client,
     query: &str,
