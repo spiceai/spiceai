@@ -33,19 +33,17 @@ use rdkafka::{
     util::get_rdkafka_version,
 };
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use snafu::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{any::Any, sync::Arc};
 use tonic::async_trait;
+use tokio_stream::StreamExt;
 
 use crate::cdc::{
-    self, ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
-
-pub use rdkafka;
-use serde_json::Value;
-use tokio_stream::StreamExt;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -549,33 +547,6 @@ impl Kafka {
                     return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
                 }
 
-                // // Build newline-delimited JSON from all messages
-                // let json_str: String = messages
-                //     .iter()
-                //     .map(|msg| match &flatten_json {
-                //         Some(delimiter) => {
-                //             dataformat_json::flatten_json_obj(msg.value(), delimiter).to_string()
-                //         }
-                //         None => msg.value().to_string(),
-                //     })
-                //     .collect::<Vec<_>>()
-                //     .join("\n");
-                //
-                // // Convert JSON string to Arrow record batch (ReaderBuilder handles NDJSON)
-                // let rb = ReaderBuilder::new(Arc::clone(&schema))
-                //     .build(std::io::Cursor::new(json_str.as_bytes()))
-                //     .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
-                //     .next()
-                //     .transpose()
-                //     .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
-                //     .ok_or_else(|| {
-                //         cdc::StreamError::Arrow("No record batch found in JSON message".to_string())
-                //     })?;
-
-                // Wrap the record batch to emulate a change event
-                // let change_batch = cdc::wrap_data_as_change_batch(&schema, &rb);
-
-                // let change_batch = messages_to_change_batch(&messages, &flatten_json, &schema);
                 let change_batch = values_to_change_batch(
                     messages.iter().map(|m| m.value()),
                     &flatten_json,
