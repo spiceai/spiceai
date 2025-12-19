@@ -484,7 +484,7 @@ mod tests {
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
         assert_eq!(data["IntNum"], 42.0);
-        assert_eq!(data["FloatNum"], 3.14159);
+        assert_eq!(data["FloatNum"], std::f64::consts::PI);
         assert_eq!(data["ScientificNum"], 1.23e10);
     }
 }

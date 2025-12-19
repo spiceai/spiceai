@@ -1543,7 +1543,7 @@ mod tests {
                         || params
                             .expression_attribute_names
                             .as_ref()
-                            .unwrap()
+                            .expect("value")
                             .is_empty()
                 );
 
