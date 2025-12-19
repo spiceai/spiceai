@@ -11,11 +11,14 @@ pub struct JsonNesting {
     pub static_fields: HashSet<String>,
     pub json_field_name: String,
 }
-// This schema:
-// PK (string) |  SK (string) |  Foo (Map) |  Bar (List) |  Baz (string)
-//
-// Becomes this:
-// PK (string) | SK (string) | Baz (string) | Data ({"Foo": <map>, "Bar": <list>})
+
+/// With the following configuration: JsonNesting {static_fields: {"PK", "SK", "Baz"}, json_field_name: "Data"}
+///
+/// This schema:
+/// PK (string) | SK (string) | Foo (Map) | Bar (List) | Baz (string)
+///
+/// Becomes this:
+/// PK (string) | SK (string) | Baz (string) | Data ({"Foo": <map>, "Bar": <list>})
 pub fn json_nest_except_fields(
     rows: Vec<DynamoDBRow>,
     json_nesting: &JsonNesting,
