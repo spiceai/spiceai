@@ -3,6 +3,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Value, json};
 use snafu::ResultExt;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -18,7 +19,8 @@ pub fn json_nest_except_fields(
     rows.into_iter()
         .map(|row| {
             let mut result = HashMap::new();
-            let mut data_map = serde_json::Map::new();
+            // To make fields sorted alphabetically
+            let mut data_map = BTreeMap::new();
 
             for (key, value) in row {
                 if json_nesting.static_fields.contains(&key) {
