@@ -5,9 +5,15 @@ use serde_json::{Value, json};
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone)]
+pub struct JsonNesting {
+    pub static_fields: HashSet<String>,
+    pub json_field_name: String,
+}
+
 pub fn json_nest_except_fields(
     rows: Vec<DynamoDBRow>,
-    static_fields: &HashSet<String>,
+    json_nesting: &JsonNesting,
 ) -> Result<Vec<DynamoDBRow>> {
     rows.into_iter()
         .map(|row| {
@@ -15,7 +21,7 @@ pub fn json_nest_except_fields(
             let mut data_map = serde_json::Map::new();
 
             for (key, value) in row {
-                if static_fields.contains(&key) {
+                if json_nesting.static_fields.contains(&key) {
                     result.insert(key, value);
                 } else {
                     data_map.insert(key, attribute_value_to_json(&value));
@@ -25,7 +31,10 @@ pub fn json_nest_except_fields(
             if !data_map.is_empty() {
                 let json_string =
                     serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
-                result.insert("Data".to_string(), AttributeValue::S(json_string));
+                result.insert(
+                    json_nesting.json_field_name.to_string(),
+                    AttributeValue::S(json_string),
+                );
             }
 
             Ok(result)

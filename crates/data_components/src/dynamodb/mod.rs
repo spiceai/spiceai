@@ -30,6 +30,8 @@ mod table_schema;
 mod unnest;
 mod utils;
 
+pub use json_nest::JsonNesting;
+
 type DynamoDBRow = HashMap<String, AttributeValue>;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
