@@ -648,19 +648,19 @@ mod tests {
     #[test]
     fn test_single_message() {
         let schema = test_schema();
-        let values = vec![json!({"id": 1, "name": "alice"})];
+        let values = [json!({"id": 1, "name": "alice"})];
 
         let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
-        let batch = result.unwrap();
+        let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 1);
     }
 
     #[test]
     fn test_multiple_messages() {
         let schema = test_schema();
-        let values = vec![
+        let values = [
             json!({"id": 1, "name": "alice"}),
             json!({"id": 2, "name": "bob"}),
             json!({"id": 3, "name": "charlie"}),
@@ -669,7 +669,7 @@ mod tests {
         let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
-        let batch = result.unwrap();
+        let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 3);
     }
 
@@ -680,7 +680,6 @@ mod tests {
 
         let result = values_to_change_batch(values.iter(), None, &schema);
 
-        assert!(result.is_err());
         match result {
             Err(cdc::StreamError::Arrow(msg)) => {
                 assert!(msg.contains("No record batch found"));
@@ -692,7 +691,7 @@ mod tests {
     #[test]
     fn test_with_null_fields() {
         let schema = test_schema_with_nullable();
-        let values = vec![
+        let values = [
             json!({"id": 1, "name": "alice", "age": 30}),
             json!({"id": 2, "name": null, "age": null}),
             json!({"id": 3, "name": "charlie", "age": 25}),
@@ -701,7 +700,7 @@ mod tests {
         let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
-        let batch = result.unwrap();
+        let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 3);
     }
 
@@ -714,7 +713,7 @@ mod tests {
             Field::new("address_zip", DataType::Utf8, false),
         ]));
 
-        let values = vec![
+        let values = [
             json!({"id": 1, "address": {"city": "NYC", "zip": "10001"}}),
             json!({"id": 2, "address": {"city": "LA", "zip": "90001"}}),
         ];
@@ -722,7 +721,7 @@ mod tests {
         let result = values_to_change_batch(values.iter(), Some(&"_".to_string()), &schema);
 
         assert!(result.is_ok());
-        let batch = result.unwrap();
+        let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 2);
     }
 
@@ -739,12 +738,12 @@ mod tests {
     #[test]
     fn test_change_batch_has_correct_structure() {
         let schema = test_schema();
-        let values = vec![
+        let values = [
             json!({"id": 1, "name": "alice"}),
             json!({"id": 2, "name": "bob"}),
         ];
 
-        let batch = values_to_change_batch(values.iter(), None, &schema).unwrap();
+        let batch = values_to_change_batch(values.iter(), None, &schema).expect("batch");
 
         // ChangeBatch should have: op, primary_keys, data columns
         let record_batch = batch.record;
@@ -755,7 +754,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("array");
         assert_eq!(op_col.value(0), "c");
         assert_eq!(op_col.value(1), "c");
     }
@@ -763,14 +762,14 @@ mod tests {
     #[test]
     fn test_large_batch() {
         let schema = test_schema();
-        let values: Vec<serde_json::Value> = (0..1000)
+        let values: Vec<Value> = (0..1000)
             .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
             .collect();
 
         let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
-        let batch = result.unwrap();
+        let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 1000);
     }
 }
