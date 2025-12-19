@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0
-	github.com/apache/arrow-go/v18 v18.4.1
+	github.com/apache/arrow-go/v18 v18.5.0
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
 	github.com/dustin/go-humanize v1.0.1
 	github.com/gocarina/gocsv v0.0.0-20231116093920-b87c2d0e983a

@@ -21,7 +21,6 @@ runtime-request-context = { path = "../runtime-request-context" }
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tract-core.workspace = true
 
 [dev-dependencies]
 async-stream.workspace = true

@@ -35,7 +35,7 @@ use otel_arrow::OtelArrowExporter;
 #[cfg(feature = "cluster")]
 use runtime::cluster::ResolvedClusterConfig;
 #[cfg(feature = "cluster")]
-use runtime::config::ClusterMode;
+use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
@@ -361,11 +361,18 @@ pub async fn run(args: Args) -> Result<()> {
 
 async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
     #[cfg(feature = "cluster")]
-    if matches!(args.runtime.cluster.mode, Some(ClusterMode::Executor)) {
-        tracing::info!(
-            "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
-        );
-        return Ok((Some(Arc::new(App::default())), None));
+    {
+        // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
+        let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
+            || (args.runtime.cluster.role.is_none()
+                && args.runtime.cluster.scheduler_address.is_some());
+
+        if is_executor {
+            tracing::info!(
+                "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
+            );
+            return Ok((Some(Arc::new(App::default())), None));
+        }
     }
 
     let spicepod_path = args
