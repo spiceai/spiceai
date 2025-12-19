@@ -3,7 +3,7 @@ name: search benchmark tests
 
 on:
   schedule:
-    - cron: '0 10 * * 6' # Runs at 10 AM UTC (2AM PT) on Saturdays.
+    - cron: '0 6 * * 2,5' # Every Monday and Thursday at 8pm PST (6am UTC next day)
   workflow_dispatch:
     inputs:
       spiced_commit:

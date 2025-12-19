@@ -55,7 +55,7 @@ pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
-    let bind_address = rt.df.cluster_config.cluster_address();
+    let bind_address = rt.df.cluster_config.node_bind_address();
 
     let Some(scheduler) = rt
         .df
