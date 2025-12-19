@@ -753,7 +753,6 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[ignore = "Temporarily disabled, https://github.com/spicehq/ai-platform/issues/9224"]
 async fn test_github_workflows() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
