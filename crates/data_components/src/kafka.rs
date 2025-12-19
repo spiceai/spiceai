@@ -728,11 +728,11 @@ mod tests {
     #[test]
     fn test_schema_mismatch_returns_error() {
         let schema = test_schema(); // expects id (Int64), name (Utf8)
-        let values = vec![json!({"wrong_field": "value"})];
+        let values = [json!({"wrong_field": "value"})];
 
         let result = values_to_change_batch(values.iter(), None, &schema);
 
-        assert!(result.is_err());
+        result.expect_err("error");
     }
 
     #[test]
