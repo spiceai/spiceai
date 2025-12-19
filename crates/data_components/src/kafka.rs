@@ -38,12 +38,12 @@ use snafu::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{any::Any, sync::Arc};
-use tonic::async_trait;
 use tokio_stream::StreamExt;
+use tonic::async_trait;
 
-use crate::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
-};
+use crate::cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
+
+pub use rdkafka;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -548,8 +548,8 @@ impl Kafka {
                 }
 
                 let change_batch = values_to_change_batch(
-                    messages.iter().map(|m| m.value()),
-                    &flatten_json,
+                    messages.iter().map(KafkaMessage::value),
+                    flatten_json.as_ref(),
                     &schema,
                 );
 
@@ -568,7 +568,7 @@ impl Kafka {
 
 fn values_to_change_batch<'a>(
     values: impl Iterator<Item = &'a Value>,
-    flatten_json: &Option<String>,
+    flatten_json: Option<&String>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
     // Build newline-delimited JSON from all values
@@ -650,7 +650,7 @@ mod tests {
         let schema = test_schema();
         let values = vec![json!({"id": 1, "name": "alice"})];
 
-        let result = values_to_change_batch(values.iter(), &None, &schema);
+        let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
         let batch = result.unwrap();
@@ -666,7 +666,7 @@ mod tests {
             json!({"id": 3, "name": "charlie"}),
         ];
 
-        let result = values_to_change_batch(values.iter(), &None, &schema);
+        let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
         let batch = result.unwrap();
@@ -678,7 +678,7 @@ mod tests {
         let schema = test_schema();
         let values: Vec<serde_json::Value> = vec![];
 
-        let result = values_to_change_batch(values.iter(), &None, &schema);
+        let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_err());
         match result {
@@ -698,7 +698,7 @@ mod tests {
             json!({"id": 3, "name": "charlie", "age": 25}),
         ];
 
-        let result = values_to_change_batch(values.iter(), &None, &schema);
+        let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
         let batch = result.unwrap();
@@ -719,7 +719,7 @@ mod tests {
             json!({"id": 2, "address": {"city": "LA", "zip": "90001"}}),
         ];
 
-        let result = values_to_change_batch(values.iter(), &Some("_".to_string()), &schema);
+        let result = values_to_change_batch(values.iter(), Some(&"_".to_string()), &schema);
 
         assert!(result.is_ok());
         let batch = result.unwrap();
@@ -731,7 +731,7 @@ mod tests {
         let schema = test_schema(); // expects id (Int64), name (Utf8)
         let values = vec![json!({"wrong_field": "value"})];
 
-        let result = values_to_change_batch(values.iter(), &None, &schema);
+        let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_err());
     }
@@ -744,7 +744,7 @@ mod tests {
             json!({"id": 2, "name": "bob"}),
         ];
 
-        let batch = values_to_change_batch(values.iter(), &None, &schema).unwrap();
+        let batch = values_to_change_batch(values.iter(), None, &schema).unwrap();
 
         // ChangeBatch should have: op, primary_keys, data columns
         let record_batch = batch.record;
@@ -767,7 +767,7 @@ mod tests {
             .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
             .collect();
 
-        let result = values_to_change_batch(values.iter(), &None, &schema);
+        let result = values_to_change_batch(values.iter(), None, &schema);
 
         assert!(result.is_ok());
         let batch = result.unwrap();

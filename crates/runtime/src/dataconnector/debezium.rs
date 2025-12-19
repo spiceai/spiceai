@@ -166,7 +166,7 @@ impl Debezium {
             .unwrap_or(Duration::from_secs(1));
 
         Ok(Self {
-            kafka_config,
+            kafka_config: kafka_config,
             batching: (batch_max_size, batch_duration),
         })
     }

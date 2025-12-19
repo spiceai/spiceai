@@ -63,7 +63,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct Kafka {
-    kafka_config: KafkaConfig,
+    config: KafkaConfig,
     json_options: Arc<SpiceJsonOptions>,
     batching: (usize, Duration),
 }
@@ -147,7 +147,7 @@ impl Kafka {
             .unwrap_or(Duration::from_secs(1));
 
         Ok(Self {
-            kafka_config,
+            config: kafka_config,
             json_options: get_json_format(&params)?,
             batching: (batch_max_size, batch_duration),
         })
@@ -309,7 +309,7 @@ impl DataConnector for Kafka {
         let topic = dataset.path();
 
         let (kafka_consumer, schema) =
-            init_kafka_consumer(dataset, topic, &self.kafka_config, &self.json_options).await?;
+            init_kafka_consumer(dataset, topic, &self.config, &self.json_options).await?;
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
@@ -358,7 +358,7 @@ impl DataConnector for Kafka {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
+        if let Some(metrics) = self.config.metrics_store.as_ref() {
             Some(Arc::new(KafkaMetricsProvider::new(Arc::clone(metrics))))
         } else {
             None

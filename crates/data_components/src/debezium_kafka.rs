@@ -116,7 +116,10 @@ impl DebeziumKafka {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(cdc::StreamError::Kafka)?;
 
-                let changes: Vec<_> = messages.iter().map(|m| m.value()).collect();
+                let changes: Vec<_> = messages
+                    .iter()
+                    .map(super::kafka::KafkaMessage::value)
+                    .collect();
 
                 let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;

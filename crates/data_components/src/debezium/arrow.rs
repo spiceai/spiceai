@@ -617,7 +617,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), n);
+        assert_eq!(result.ok().flatten(), Some(n));
     }
 
     #[test]
@@ -625,7 +625,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
@@ -633,7 +633,7 @@ mod tests {
         let n: i128 = 12345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 4);
-        assert_eq!(result.expect("Parse decimal"), 1_234_500);
+        assert_eq!(result.ok().flatten(), Some(1_234_500));
     }
 
     #[test]
@@ -641,7 +641,7 @@ mod tests {
         let n: i128 = 1_234_500;
         let input = json!({"scale": 4, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
