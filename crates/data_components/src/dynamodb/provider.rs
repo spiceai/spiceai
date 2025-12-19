@@ -461,8 +461,7 @@ impl TableProvider for DynamoDBTableProvider {
             // For Query request, always use 1 partition.
             DynamoDBRequestPlan::Query(_) => 1,
             DynamoDBRequestPlan::Scan(_) => {
-                self
-                    .config_partitions
+                self.config_partitions
                     // If `config_partitions` is empty (i.e. it was set to 'auto' in the config), use table size as a heuristic.
                     .unwrap_or_else(|| self.get_partitions_from_table_size())
             }

@@ -819,7 +819,8 @@ mod tests {
         let filters = vec![col("id").eq(lit("user123"))];
         let projection = create_projection_schema(&["id", "name"]);
 
-        let result = builder.build_request_plan(&filters, &projection, Some(i32::MAX as usize + 1), None);
+        let result =
+            builder.build_request_plan(&filters, &projection, Some(i32::MAX as usize + 1), None);
 
         assert!(result.is_err());
         assert!(
@@ -1537,8 +1538,14 @@ mod tests {
                 assert_eq!(params.projection_expression, None);
 
                 // No expression attribute names when no filters
-                assert!(params.expression_attribute_names.is_none()
-                    || params.expression_attribute_names.as_ref().unwrap().is_empty());
+                assert!(
+                    params.expression_attribute_names.is_none()
+                        || params
+                            .expression_attribute_names
+                            .as_ref()
+                            .unwrap()
+                            .is_empty()
+                );
 
                 assert_eq!(params.filter_expression, None);
                 assert_eq!(params.expression_attribute_values, None);
@@ -1598,10 +1605,7 @@ mod tests {
         let schema = create_test_schema();
         let builder = DynamoDBRequestPlanBuilder::new(schema);
 
-        let filters = vec![
-            col("id").eq(lit("user123")),
-            col("age").gt(lit(25_i64)),
-        ];
+        let filters = vec![col("id").eq(lit("user123")), col("age").gt(lit(25_i64))];
         let projection = create_projection_schema(&["id", "name", "age"]);
 
         let static_fields = HashSet::from(["id".to_string(), "sort_key".to_string()]);
