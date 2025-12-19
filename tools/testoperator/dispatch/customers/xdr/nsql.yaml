@@ -1,0 +1,6 @@
+tests:
+  nsql:
+    spicepod_path: s3[parquet]-duckdb[file]_view_indexes.yaml
+    ready_wait: 300
+    validate_results: true
+    runner_type: spicehq-dev-runners

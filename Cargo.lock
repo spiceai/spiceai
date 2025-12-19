@@ -15789,6 +15789,7 @@ dependencies = [
 name = "testoperator"
 version = "1.11.0-unstable"
 dependencies = [
+ "arrow",
  "arrow-json",
  "clap",
  "hf-hub",

@@ -15,14 +15,17 @@ limitations under the License.
 */
 
 use crate::args::{CommonArgs, TextToSqlArgs, TextToSqlQuery};
+use arrow::array::{Int64Array, RecordBatch, StringArray};
 use serde_json::json;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow,
     constants::HTTP_BASE_URL,
+    futures::TryStreamExt,
     spiced::{SpicedInstance, StartRequest},
+    utils::wait_until_true,
 };
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 
 use super::get_app_and_start_request;
 use crate::health::HealthMonitor;
@@ -34,6 +37,7 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
 
     let (_app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = run_spice(&args.common, start_request).await?;
+    let spiced_client: spiceai::Client = spiced_instance.spice_client(None, true).await?;
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -46,6 +50,7 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
             {
                 match run_single_test(
                     &spiced_instance,
+                    &spiced_client,
                     &args.model,
                     &question,
                     sample_data_enabled,
@@ -122,6 +127,7 @@ pub struct TestRunOutputs {
 
 async fn run_single_test(
     spiced_instance: &SpicedInstance,
+    spice_client: &spiceai::Client,
     model_name: &str,
     question: &str,
     sample_data_enabled: bool,
@@ -158,17 +164,20 @@ async fn run_single_test(
         return Err(anyhow::anyhow!("HTTP error: {text}"));
     }
 
-    let sql = if return_sql {
-        text
+    let (number_of_attempts, sql) = if return_sql {
+        (1, text)
     } else {
-        // TODO: use `spice trace` to get the sql generated.
-        "select 1".to_string()
-    };
-    let number_of_attempts = if return_sql {
-        1
-    } else {
-        // TODO: get number of `sql_query` attempts under v1/nsql
-        2
+        // Must get SQL first, since `number_of_attempts` will return 0 if trace is not in `runtime.task_history`.
+        let sql = find_last_sql_statement(spice_client)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not find last sql_query statement. Error: {e}"))?;
+        let number_of_attempts = find_number_of_sql_attempts(spice_client)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("could not find number of sql_query attempts. Error: {e}")
+            })?;
+
+        (number_of_attempts, sql)
     };
 
     Ok(TestRunOutputs {
@@ -178,15 +187,102 @@ async fn run_single_test(
     })
 }
 
-fn normalize_sql(sql: &str) -> String {
-    sql.trim()
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with("--"))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+/// When text-to-SQL returns data (i.e. not 'Accept: application/sql`), find how many internal SQL queries it attempted before returning a valid result.
+async fn find_number_of_sql_attempts(
+    spice_client: &spiceai::Client,
+) -> Result<usize, anyhow::Error> {
+    let data = retry_query_expecting_results(
+        spice_client,
+         r#"
+SELECT count(1) AS cnt
+FROM runtime.task_history
+WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1) and task='sql_query'
+"#,
+Duration::from_secs(10)
+    )
+    .await;
+
+    let Some(Some(rb)) = data.as_ref().map(|s| s.first().clone()) else {
+        return Err(anyhow::anyhow!(
+            "could not find task history for text to SQL"
+        ));
+    };
+    let count: i64 = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("could not downcast input column to Int64Array"))?
+        .value(0);
+    Ok(count as usize)
+}
+
+/// Finds the input of the  last `sql_query` in the `runtime.task_history` for the given trace_id.
+async fn find_last_sql_statement(spice_client: &spiceai::Client) -> Result<String, anyhow::Error> {
+    let data = retry_query_expecting_results(
+        spice_client,
+        &format!(
+            r#"
+SELECT input
+FROM runtime.task_history
+WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1)
+  AND task='sql_query'
+ORDER BY end_time DESC
+LIMIT 1"#,
+        ), Duration::from_secs(10)
+    )
+    .await;
+
+    let Some(Some(rb)) = data.as_ref().map(|s| s.first().clone()) else {
+        return Err(anyhow::anyhow!(
+            "could not find last sql_query task in runtime.task_history"
+        ));
+    };
+
+    let sql: String = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            test_framework::anyhow::anyhow!("could not downcast input column to StringArray")
+        })?
+        .value(0)
+        .to_string();
+
+    Ok(sql)
+}
+
+async fn retry_query_expecting_results(
+    spice_client: &spiceai::Client,
+    query: &str,
+    wait_for: Duration,
+) -> Option<Vec<RecordBatch>> {
+    let spice_client = Arc::new(spice_client.clone());
+    let query = query.to_string();
+    let data = Arc::new(tokio::sync::Mutex::new(None));
+
+    wait_until_true(wait_for, || {
+        let spice_client = spice_client.clone();
+        let query = query.clone();
+        let data = data.clone();
+        async move {
+            match spice_client.query(&query).await {
+                Ok(stream) => {
+                    let z = stream.try_collect::<Vec<RecordBatch>>().await.ok();
+                    let no_data = z
+                        .as_ref()
+                        .is_none_or(|z| !z.first().is_some_and(|rb| rb.num_rows() > 0));
+                    if no_data {
+                        return false;
+                    }
+                    *data.lock().await = z;
+                    sleep(Duration::from_secs(1)).await;
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    })
+    .await;
+
+    (data.lock().await).clone()
 }
