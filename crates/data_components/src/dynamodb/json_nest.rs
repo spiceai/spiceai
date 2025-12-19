@@ -12,7 +12,7 @@ pub struct JsonNesting {
     pub json_field_name: String,
 }
 
-/// With the following configuration: JsonNesting {static_fields: {"PK", "SK", "Baz"}, json_field_name: "Data"}
+/// With the following configuration: `JsonNesting` {`static_fields`: {"PK", "SK", "Baz"}, `json_field_name`: "Data"}
 ///
 /// This schema:
 /// PK (string) | SK (string) | Foo (Map) | Bar (List) | Baz (string)

@@ -127,9 +127,8 @@ impl DynamoDBTableProvider {
             .await?;
 
         // Check that all static fields are present in the table schema
-        if let Some(static_fields) = json_nesting
-            .clone()
-            .map(|json_nesting| json_nesting.static_fields.clone())
+        if let Some(static_fields) =
+            json_nesting.map(|json_nesting| json_nesting.static_fields.clone())
         {
             let missing_fields: Vec<String> = static_fields
                 .iter()
