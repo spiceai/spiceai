@@ -33,7 +33,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
-use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
+use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc, time::Duration};
 
 use url::Url;
 
@@ -649,6 +649,7 @@ pub struct GraphQLClient {
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     semaphore: Option<Arc<Semaphore>>,
+    pagination_delay: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -773,6 +774,7 @@ impl GraphQLClient {
         schema: Option<SchemaRef>,
         rate_limiter: Option<Arc<dyn RateLimiter>>,
         semaphore: Option<Arc<Semaphore>>,
+        pagination_delay: Option<Duration>,
     ) -> Result<Self> {
         // Validate unnest depth to prevent excessive recursion
         if let UnnestBehavior::Depth(depth) = &unnest_behavior
@@ -811,6 +813,7 @@ impl GraphQLClient {
             schema,
             rate_limiter,
             semaphore,
+            pagination_delay,
         })
     }
 
@@ -919,14 +922,14 @@ impl GraphQLClient {
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| format!("{response:?}"))
         );
 
-        // Check for errors before processing data
-        handle_http_error(status, &response)?;
-        handle_graphql_query_error(&response, &query_string)?;
-
         // Custom error checker (e.g., for GitHub rate limits)
         error_checker
             .map(|p| p(&response_headers, &response))
             .transpose()?;
+
+        // Check for errors before processing data
+        handle_http_error(status, &response)?;
+        handle_graphql_query_error(&response, &query_string)?;
 
         let json_pointer = query
             .json_pointer
@@ -1146,6 +1149,11 @@ impl GraphQLClient {
                     if limit == Some(0) {
                         break;
                     }
+                }
+
+                if let Some(delay) = self.pagination_delay {
+                    tracing::debug!("Applying pagination delay of {:?}", delay);
+                    tokio::time::sleep(delay).await;
                 }
 
                 previous_cursor = Some(next_cursor_val.clone());

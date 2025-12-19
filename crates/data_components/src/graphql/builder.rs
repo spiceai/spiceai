@@ -18,7 +18,7 @@ use crate::rate_limit::RateLimiter;
 
 use super::{Result, client::GraphQLClient, client::UnnestBehavior};
 use arrow::datatypes::SchemaRef;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 
@@ -34,6 +34,7 @@ pub struct GraphQLClientBuilder {
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     semaphore: Option<Arc<Semaphore>>,
+    pagination_delay: Option<Duration>,
 }
 
 impl GraphQLClientBuilder {
@@ -49,6 +50,7 @@ impl GraphQLClientBuilder {
             schema: None,
             rate_limiter: None,
             semaphore: None,
+            pagination_delay: None,
         }
     }
 
@@ -94,6 +96,12 @@ impl GraphQLClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_pagination_delay(mut self, delay: Option<Duration>) -> Self {
+        self.pagination_delay = delay;
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
         GraphQLClient::new(
             client,
@@ -106,6 +114,7 @@ impl GraphQLClientBuilder {
             self.schema,
             self.rate_limiter,
             self.semaphore,
+            self.pagination_delay,
         )
     }
 }

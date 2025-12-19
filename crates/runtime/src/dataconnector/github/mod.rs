@@ -326,6 +326,7 @@ impl Github {
         .with_schema(gql_client_params.schema)
         .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
+        .with_pagination_delay(Some(Duration::from_millis(100)))
         .build(client)
         .boxed()
     }
