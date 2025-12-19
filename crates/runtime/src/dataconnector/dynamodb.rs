@@ -165,9 +165,8 @@ fn parse_json_nesting_static_fields(
     }
 
     let json_column = json_object_columns[0];
-    let json_object_value = match json_column.metadata.get("json_object") {
-        Some(value) => value,
-        None => unreachable!("json_object key existence was checked above"),
+    let Some(json_object_value) = json_column.metadata.get("json_object") else {
+        unreachable!("json_object key existence was checked above")
     };
 
     // Validate that json_object value is "*"
