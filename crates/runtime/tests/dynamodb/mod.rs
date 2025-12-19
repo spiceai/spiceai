@@ -587,7 +587,7 @@ async fn dynamodb_json_nesting_simple() -> Result<(), anyhow::Error> {
                 () = cloned_rt.load_components() => {}
             }
 
-            run_and_snapshot_query(&rt, r#"SELECT * FROM test_dynamodb"#, "json_nesting_simple")
+            run_and_snapshot_query(&rt, r"SELECT * FROM test_dynamodb", "json_nesting_simple")
                 .await?;
 
             Ok(())
@@ -632,7 +632,7 @@ async fn dynamodb_json_nesting_with_unnest() -> Result<(), anyhow::Error> {
 
             run_and_snapshot_query(
                 &rt,
-                r#"SELECT * FROM test_dynamodb"#,
+                r"SELECT * FROM test_dynamodb",
                 "json_nesting_with_unnest",
             )
             .await?;
