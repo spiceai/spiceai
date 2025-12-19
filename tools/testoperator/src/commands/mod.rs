@@ -98,7 +98,7 @@ pub(crate) fn build_test_with_validation(
 pub(crate) async fn run_or_connect_spiced(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, SpicedInstance)> {
-    if args.is_external_instance() {
+    let (app, mut instance) = if args.is_external_instance() {
         println!(
             "Connecting to external spiced instance at: {}",
             args.spiced_path
@@ -108,12 +108,17 @@ pub(crate) async fn run_or_connect_spiced(
             .with_spicepod(spicepod)
             .build();
         let instance = SpicedInstance::external(&args.spiced_path);
-        Ok((app, instance))
+        (app, instance)
     } else {
-        let (app, start_request) = get_app_and_start_request(&args).await?;
+        let (app, start_request) = get_app_and_start_request(args).await?;
         let instance = SpicedInstance::start(start_request).await?;
-        Ok((app, instance))
-    }
+        (app, instance)
+    };
+    instance
+        .wait_for_ready(std::time::Duration::from_secs(args.ready_wait))
+        .await?;
+
+    Ok((app, instance))
 }
 
 pub(crate) async fn get_app_and_start_request(

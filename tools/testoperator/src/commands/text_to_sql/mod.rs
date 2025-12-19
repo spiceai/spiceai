@@ -14,68 +14,72 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{
-    args::{TextToSqlArgs, TextToSqlQuery},
-    commands::run_or_connect_spiced,
-};
-use arrow::array::{Int64Array, RecordBatch, StringArray};
-use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use crate::{args::TextToSqlArgs, commands::run_or_connect_spiced};
 use test_framework::{
-    anyhow, constants::HTTP_BASE_URL, futures::TryStreamExt, spiced::SpicedInstance,
-    utils::wait_until_true,
+    TestType,
+    anyhow::{self, Context},
+    git,
+    metrics::{MetricCollector, QueryMetrics},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
+    process::MemoryReading,
+    spicetest::{
+        SpiceTest,
+        text_to_sql::{NotStarted, TextToSqlMetric, TextToSqlRunMetric},
+    },
+    telemetry::Telemetry,
+    utils::observe_memory,
 };
-use tokio::time::{Instant, sleep};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+type SpicedMemoryUsageMonitor = (
+    CancellationToken,
+    JoinHandle<anyhow::Result<Vec<MemoryReading>>>,
+);
 
 pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
-    let (_app, mut spiced_instance) = run_or_connect_spiced(&args.common).await?;
-    let spiced_client: spiceai::Client = spiced_instance.spice_client(None, true).await?;
+    let telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
 
-    for sample_data_enabled in args.sample_data_enabled.values() {
-        for return_sql in args.return_sql.values() {
-            for TextToSqlQuery {
-                question,
-                expected_sql,
-            } in args.load_queries()?
-            {
-                match run_single_test(
-                    &spiced_instance,
-                    &spiced_client,
-                    &args.model,
-                    &question,
-                    sample_data_enabled,
-                    return_sql,
-                )
-                .await
-                {
-                    Ok(TestRunOutputs {
-                        sql,
-                        number_of_attempts,
-                        duration,
-                    }) => {
-                        let payload = json!({
-                            "query": question,
-                            "sample_data_enabled": sample_data_enabled,
-                            "return_sql": return_sql,
-                            "expected_sql": expected_sql.replace("\n", "\n      "),
-                            "generated_sql": sql.replace("\n", "\n      "),
-                            "duration_ms": duration.as_millis(),
-                            "number_of_attempts": number_of_attempts,
-                        });
-                        println!(
-                            "{}",
-                            serde_json::to_string(&payload)
-                                .expect("could not serialize text-to-sql test result to JSON")
-                        );
-                    }
-                    Err(e) => {
-                        println!("✗ Query: {question} - ERROR: {e}");
-                    }
-                }
-            }
-        }
-    }
+    let (app, spiced_instance) = run_or_connect_spiced(&args.common).await?;
 
+    // If we are running `spiced`, monitor its memory usage.
+    let memory_handle_opt: Option<SpicedMemoryUsageMonitor> =
+        spiced_instance.process().ok().map(|p| {
+            let memory_token = CancellationToken::new();
+            let handle = p.watch_memory(&memory_token);
+            (memory_token, handle)
+        });
+
+    let test = SpiceTest::new(
+        app.name.clone(),
+        NotStarted::new().with_config(
+            args.construct_requests()
+                .context("Cannot make text-to-SQL test cases")?,
+        ),
+    )
+    .with_spiced_instance(spiced_instance)
+    .start()
+    .await?;
+
+    let test = test.wait().await?;
+    let memory_usage_opt = if let Some((memory_token, memory_readings)) = memory_handle_opt {
+        let (max, median) = observe_memory(memory_token, memory_readings).await?;
+        Some((max, median))
+    } else {
+        None
+    };
+
+    println!("Text-to-SQL requests completed, calculating results...");
+
+    let metrics = test
+        .collect(TestType::TextToSql)?
+        .with_run_metric(test.get_run_metrics()?);
+
+    metrics.show_run(None)?;
+    let () = emit_telemetry(telemetry, &metrics, memory_usage_opt).await?;
+
+    let mut spiced_instance = test.end()?;
     if !args.common.is_external_instance() {
         spiced_instance.stop()?;
     }
@@ -83,175 +87,42 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Data needed from the result of text-to-SQL attempt to use to generate measurements.
-pub struct TestRunOutputs {
-    sql: String,
-    // Internally, determine how many attempts were made to get a valid SQL response.
-    // When `Accept: application/sql` this is currently 1.
-    number_of_attempts: usize,
-    duration: Duration,
-}
+async fn emit_telemetry(
+    mut telemetry: Telemetry,
+    metrics: &QueryMetrics<TextToSqlMetric, TextToSqlRunMetric>,
+    memory_usage: Option<(f64, f64)>,
+) -> Result<(), anyhow::Error> {
+    telemetry.set_resource(
+        Resource::builder_empty()
+            .with_attributes(vec![
+                KeyValue::new("service.name", "testoperator"),
+                KeyValue::new("type", "text_to_sql"),
+                KeyValue::new("name", metrics.run_name.clone()),
+                KeyValue::new("spiced_version", metrics.spiced_version.clone()),
+                KeyValue::new("spiced_commit_sha", metrics.commit_sha.clone()),
+                KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+                KeyValue::new("branch_name", git::get_branch_name()),
+            ])
+            .build(),
+    );
+    crate::metrics::TEST_DURATION.record(
+        u64::try_from(metrics.finished_at - metrics.started_at)?,
+        &[],
+    );
 
-async fn run_single_test(
-    spiced_instance: &SpicedInstance,
-    spice_client: &spiceai::Client,
-    model_name: &str,
-    question: &str,
-    sample_data_enabled: bool,
-    return_sql: bool,
-) -> anyhow::Result<TestRunOutputs> {
-    let http_client = spiced_instance.http_client()?;
-
-    let url = format!("{HTTP_BASE_URL}/v1/nsql");
-    let body = json!({
-        "query": question,
-        "model": model_name,
-        "sample_data_enabled": sample_data_enabled,
-        "stream": false
-    });
-    let accept_header = if return_sql {
-        "application/sql"
-    } else {
-        "application/json"
-    };
-
-    let start = Instant::now();
-    let request = http_client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", accept_header);
-
-    let response = request.body(body.to_string()).send().await?;
-    let status = response.status();
-    let text = response.text().await?;
-
-    let duration = start.elapsed();
-
-    if !status.is_success() {
-        return Err(anyhow::anyhow!("HTTP error: {text}"));
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
     }
 
-    let (number_of_attempts, sql) = if return_sql {
-        (1, text)
-    } else {
-        // Must get SQL first, since `number_of_attempts` will return 0 if trace is not in `runtime.task_history`.
-        // `find_last_sql_statement` will wait until the trace is available.
-        let sql = find_last_sql_statement(spice_client)
-            .await
-            .map_err(|e| anyhow::anyhow!("could not find last sql_query statement. Error: {e}"))?;
-        let number_of_attempts = find_number_of_sql_attempts(spice_client)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("could not find number of sql_query attempts. Error: {e}")
-            })?;
-
-        (number_of_attempts, sql)
+    if let Some(run_metrics) = &metrics.run_metric {
+        crate::metrics::TEXT_TO_SQL_EXACT_MATCH_RATE.record(run_metrics.exact_match_rate, &[]);
+        crate::metrics::AVERAGE_TEXT_TO_SQL_ATTEMPTS.record(run_metrics.avg_attempts, &[]);
+        crate::metrics::P95_DURATION.record(run_metrics.p95_latency_ms as u64, &[]);
+        crate::metrics::MEDIAN_DURATION.record(run_metrics.median_latency_ms as u64, &[]);
     };
 
-    Ok(TestRunOutputs {
-        sql,
-        number_of_attempts,
-        duration,
-    })
-}
+    telemetry.emit().await?;
 
-/// When text-to-SQL returns data (i.e. not 'Accept: application/sql`), find how many internal SQL queries it attempted before returning a valid result.
-async fn find_number_of_sql_attempts(
-    spice_client: &spiceai::Client,
-) -> Result<usize, anyhow::Error> {
-    let data = retry_query_expecting_results(
-        spice_client,
-         r#"
-SELECT count(1) AS cnt
-FROM runtime.task_history
-WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1) and task='sql_query'
-"#,
-Duration::from_secs(10)
-    )
-    .await;
-
-    let Some(rb) = data.as_ref().and_then(|s| s.first().clone()) else {
-        return Err(anyhow::anyhow!(
-            "could not find task history for text to SQL"
-        ));
-    };
-    let count: i64 = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow::anyhow!("could not downcast input column to Int64Array"))?
-        .value(0);
-    Ok(count as usize)
-}
-
-/// Finds the input of the  last `sql_query` in the `runtime.task_history` for the given trace_id.
-async fn find_last_sql_statement(spice_client: &spiceai::Client) -> Result<String, anyhow::Error> {
-    let data = retry_query_expecting_results(
-        spice_client,
-        &format!(
-            r#"
-SELECT input
-FROM runtime.task_history
-WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1)
-  AND task='sql_query'
-ORDER BY end_time DESC
-LIMIT 1"#,
-        ), Duration::from_secs(10)
-    )
-    .await;
-
-    let Some(rb) = data.as_ref().and_then(|s| s.first().clone()) else {
-        return Err(anyhow::anyhow!(
-            "could not find last sql_query task in runtime.task_history"
-        ));
-    };
-
-    let sql: String = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            test_framework::anyhow::anyhow!("could not downcast input column to StringArray")
-        })?
-        .value(0)
-        .to_string();
-
-    Ok(sql)
-}
-
-/// Retry the given query until it returns results or the wait_for duration elapses.
-async fn retry_query_expecting_results(
-    spice_client: &spiceai::Client,
-    query: &str,
-    wait_for: Duration,
-) -> Option<Vec<RecordBatch>> {
-    let spice_client = Arc::new(spice_client.clone());
-    let query = query.to_string();
-    let data = Arc::new(tokio::sync::Mutex::new(None));
-
-    wait_until_true(wait_for, || {
-        let spice_client = spice_client.clone();
-        let query = query.clone();
-        let data = data.clone();
-        async move {
-            match spice_client.query(&query).await {
-                Ok(stream) => {
-                    let z = stream.try_collect::<Vec<RecordBatch>>().await.ok();
-                    let no_data = z
-                        .as_ref()
-                        .is_none_or(|z| !z.first().is_some_and(|rb| rb.num_rows() > 0));
-                    if no_data {
-                        return false;
-                    }
-                    *data.lock().await = z;
-                    sleep(Duration::from_secs(1)).await;
-                    true
-                }
-                Err(_) => false,
-            }
-        }
-    })
-    .await;
-
-    (data.lock().await).clone()
+    Ok(())
 }

@@ -18,7 +18,10 @@ use super::CommonArgs;
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
-use test_framework::anyhow;
+use test_framework::{
+    anyhow,
+    spicetest::text_to_sql::{TextToSqlConfig, TextToSqlRequest},
+};
 
 #[derive(Parser, Debug, Clone)]
 pub struct TextToSqlArgs {
@@ -47,7 +50,7 @@ pub struct TextToSqlArgs {
 }
 
 impl TextToSqlArgs {
-    pub fn load_queries(&self) -> Result<Vec<TextToSqlQuery>, anyhow::Error> {
+    pub(crate) fn load_queries(&self) -> Result<Vec<TextToSqlQuery>, anyhow::Error> {
         if let Some(file_path) = &self.queryset_file {
             fs::read_to_string(file_path)?
                 .lines()
@@ -59,6 +62,40 @@ impl TextToSqlArgs {
         } else {
             Ok(vec![])
         }
+    }
+
+    /// Loads queries based on flags and generates independent [`TextToSqlRequests`].
+    pub fn construct_requests(&self) -> Result<TextToSqlConfig, anyhow::Error> {
+        Ok(TextToSqlConfig::new(
+            self.load_queries()?
+                .into_iter()
+                .zip(self.sample_data_enabled.values())
+                .zip(self.return_sql.values())
+                .map(
+                    |(
+                        (
+                            TextToSqlQuery {
+                                question,
+                                expected_sql,
+                            },
+                            sample_data,
+                        ),
+                        return_sql,
+                    )| {
+                        TextToSqlRequest::new(
+                        format!(
+                            "sample_data={sample_data},return_sql={return_sql},question={question}",
+                        ),
+                        question,
+                        expected_sql,
+                        self.model.clone(),
+                    )
+                    .with_sample_data_enabled(sample_data)
+                    .with_return_sql(return_sql)
+                    },
+                )
+                .collect(),
+        ))
     }
 }
 

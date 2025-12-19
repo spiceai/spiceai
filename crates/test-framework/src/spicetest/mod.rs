@@ -25,6 +25,7 @@ pub mod append;
 pub mod datasets;
 pub mod http;
 pub mod search;
+pub mod text_to_sql;
 
 pub trait TestState {}
 pub trait TestNotStarted: TestState {}
