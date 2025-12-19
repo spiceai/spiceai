@@ -468,7 +468,10 @@ mod tests {
         let mut row = HashMap::new();
         row.insert("PK".to_string(), make_string_attr("pk1"));
         row.insert("IntNum".to_string(), make_number_attr("42"));
-        row.insert("FloatNum".to_string(), make_number_attr("3.141592653589793"));
+        row.insert(
+            "FloatNum".to_string(),
+            make_number_attr("3.141592653589793"),
+        );
         row.insert("ScientificNum".to_string(), make_number_attr("1.23e10"));
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
