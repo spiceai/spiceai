@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, pin::Pin, sync::Arc};
-
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
@@ -27,6 +25,8 @@ use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use std::time::Duration;
+use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::async_trait;
 
 use crate::{
@@ -65,6 +65,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Kafka {
     kafka_config: KafkaConfig,
     json_options: Arc<SpiceJsonOptions>,
+    batching: (usize, Duration),
 }
 
 impl Kafka {
@@ -131,9 +132,24 @@ impl Kafka {
             metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
+        let batch_max_size = params
+            .get("batching_max_size")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10000);
+
+        let batch_duration = params
+            .get("batching_duration")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(1));
+
         Ok(Self {
             kafka_config,
             json_options: get_json_format(&params)?,
+            batching: (batch_max_size, batch_duration),
         })
     }
 }
@@ -218,6 +234,12 @@ const PARAMETERS: &[ParameterSpec] = &[
         .is_boolean(),
     ParameterSpec::component("consumer_group_id")
         .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
+    ParameterSpec::runtime("batching_max_size")
+        .description("Maximum number of change events to batch together before processing")
+        .default("10000"),
+    ParameterSpec::runtime("batching_duration")
+        .description("Maximum time to wait for a batch to fill before processing")
+        .default("1s"),
 ];
 
 impl DataConnectorFactory for KafkaFactory {
@@ -311,7 +333,8 @@ impl DataConnector for Kafka {
 
         Ok(Arc::new(
             data_components::kafka::Kafka::new(schema, kafka_consumer)
-                .with_flatten_json(self.json_options.flatten_json.clone()),
+                .with_flatten_json(self.json_options.flatten_json.clone())
+                .with_batching(self.batching),
         ))
     }
 

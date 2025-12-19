@@ -96,6 +96,7 @@ url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
 zip = "3.0.0"
+tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
