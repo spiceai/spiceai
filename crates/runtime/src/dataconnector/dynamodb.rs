@@ -335,7 +335,7 @@ impl DataConnector for DynamoDB {
             time_format.to_string(),
             ready_lag,
             Arc::clone(&self.metrics_collector),
-            parse_json_nesting_static_fields(dataset)?,
+            parse_json_nesting_static_fields(dataset)?.as_ref(),
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {

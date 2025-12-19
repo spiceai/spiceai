@@ -103,7 +103,7 @@ impl DynamoDBTableProvider {
         time_format: String,
         ready_lag: Duration,
         metrics_collector: Arc<MetricsCollector>,
-        json_nesting: Option<JsonNesting>,
+        json_nesting: Option<&JsonNesting>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
@@ -122,14 +122,14 @@ impl DynamoDBTableProvider {
                 unnest_depth,
                 schema_infer_max_records,
                 &time_format,
-                &json_nesting,
+                json_nesting,
             )
             .await?;
 
         // Check that all static fields are present in the table schema
         if let Some(static_fields) = json_nesting
             .clone()
-            .map(|json_nesting| json_nesting.static_fields)
+            .map(|json_nesting| json_nesting.static_fields.clone())
         {
             let missing_fields: Vec<String> = static_fields
                 .iter()
@@ -182,7 +182,7 @@ impl DynamoDBTableProvider {
             config_partitions,
             table_total_item_count,
             ready_lag,
-            json_nesting,
+            json_nesting: json_nesting.cloned(),
         })
     }
 
@@ -192,7 +192,7 @@ impl DynamoDBTableProvider {
         unnest_depth: Option<usize>,
         schema_infer_max_records: i32,
         time_format: &str,
-        json_nesting: &Option<JsonNesting>,
+        json_nesting: Option<&JsonNesting>,
     ) -> Result<(
         SchemaRef,
         String,

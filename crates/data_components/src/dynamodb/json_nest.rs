@@ -11,7 +11,11 @@ pub struct JsonNesting {
     pub static_fields: HashSet<String>,
     pub json_field_name: String,
 }
-
+// This schema:
+// PK (string) |  SK (string) |  Foo (Map) |  Bar (List) |  Baz (string)
+//
+// Becomes this:
+// PK (string) | SK (string) | Baz (string) | Data ({"Foo": <map>, "Bar": <list>})
 pub fn json_nest_except_fields(
     rows: Vec<DynamoDBRow>,
     json_nesting: &JsonNesting,
@@ -53,7 +57,6 @@ fn attribute_value_to_json(attr: &AttributeValue) -> Value {
                 .map_or_else(|_| Value::String(n.clone()), |num| json!(num))
         }
         AttributeValue::Bool(b) => Value::Bool(*b),
-        AttributeValue::Null(_) => Value::Null,
         AttributeValue::M(m) => {
             let mut map = serde_json::Map::new();
             for (k, v) in m {
@@ -125,7 +128,14 @@ mod tests {
         let static_fields: HashSet<String> =
             ["PK".to_string(), "SK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         assert_eq!(result.len(), 1);
         let result_row = &result[0];
@@ -149,7 +159,14 @@ mod tests {
         let static_fields: HashSet<String> =
             ["PK".to_string(), "SK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         assert_eq!(result.len(), 1);
         let result_row = &result[0];
@@ -170,7 +187,14 @@ mod tests {
 
         let static_fields: HashSet<String> = HashSet::new();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         assert_eq!(result.len(), 1);
         let result_row = &result[0];
@@ -188,7 +212,14 @@ mod tests {
     fn test_empty_rows() {
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         assert_eq!(result.len(), 0);
     }
@@ -205,7 +236,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row1, row2], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row1, row2],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         assert_eq!(result.len(), 2);
 
@@ -238,7 +276,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         assert_eq!(result.len(), 1);
         let result_row = &result[0];
@@ -263,7 +308,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
         assert_eq!(data["NullField"], Value::Null);
@@ -284,7 +336,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
         assert_eq!(data["StringSet"], json!(["value1", "value2", "value3"]));
@@ -301,7 +360,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
         assert_eq!(data["NumberSet"], json!(["1", "2", "3"]));
@@ -318,7 +384,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
 
@@ -340,7 +413,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let result_row = &result[0];
 
@@ -367,7 +447,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
         assert_eq!(data["NestedMap"]["level2"]["deep"], "value");
@@ -383,7 +470,14 @@ mod tests {
 
         let static_fields: HashSet<String> = ["PK".to_string()].into_iter().collect();
 
-        let result = json_nest_except_fields(vec![row], &static_fields).expect("result");
+        let result = json_nest_except_fields(
+            vec![row],
+            &JsonNesting {
+                static_fields,
+                json_field_name: "Data".to_string(),
+            },
+        )
+        .expect("result");
 
         let data = extract_data_field(&result[0]).expect("Data field should exist");
         assert_eq!(data["IntNum"], 42.0);
