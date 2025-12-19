@@ -38,6 +38,7 @@ pub(crate) mod http;
 pub(crate) mod load;
 pub(crate) mod query;
 pub(crate) mod search;
+pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
 mod util;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
