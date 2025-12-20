@@ -159,7 +159,7 @@ impl Debezium {
             .unwrap_or(10000);
 
         let batch_duration = params
-            .get("batching_duration")
+            .get("batching_max_duration")
             .expose()
             .ok()
             .and_then(|v| fundu::parse_duration(v).ok())
@@ -227,7 +227,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("batching_max_size")
         .description("Maximum number of change events to batch together before processing")
         .default("10000"),
-    ParameterSpec::runtime("batching_duration")
+    ParameterSpec::runtime("batching_max_duration")
         .description("Maximum time to wait for a batch to fill before processing")
         .default("1s"),
 ];
