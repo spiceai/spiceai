@@ -117,7 +117,7 @@ pub enum Error {
 
     #[snafu(display(
         "Cannot determine S3 Express One Zone bucket info: {reason}. \
-        Either provide a valid 'cayenne_file_path' with an S3 Express bucket, or specify 'cayenne_s3_zone_id' to auto-generate the bucket name."
+        Either provide a valid 'cayenne_file_path' with an S3 Express bucket, or specify 'cayenne_s3_zone_ids' to auto-generate the bucket name."
     ))]
     CannotAutoCreateBucket { reason: String },
 
@@ -315,12 +315,13 @@ impl CayenneAccelerator {
     /// If `cayenne_file_path` is an S3 Express One Zone path (e.g., `s3://{bucket}--{zone-id}--x-s3/`),
     /// data files will be stored exclusively in S3 Express One Zone while metadata remains on local disk.
     ///
-    /// If `cayenne_s3_zone_id` is specified (without `cayenne_file_path`), a bucket name will be
+    /// If `cayenne_s3_zone_ids` is specified (without `cayenne_file_path`), a bucket name will be
     /// auto-generated from the spicepod name and dataset name, and created if it doesn't exist.
+    /// The first zone in the comma-separated list is used as the primary zone for reads.
     ///
     /// Order:
     /// 1. `cayenne_file_path` - Custom path (local or S3 Express One Zone)
-    /// 2. Auto-generated S3 Express path if `cayenne_s3_zone_id` is specified
+    /// 2. Auto-generated S3 Express path if `cayenne_s3_zone_ids` is specified (uses first zone)
     /// 3. Default: `spice_data_base_path()/{dataset_name}/`
     pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
@@ -342,8 +343,21 @@ impl CayenneAccelerator {
             return Self::resolve_custom_data_path(&dataset_name, custom_path);
         }
 
-        if let Some(zone_id) = acceleration_params.get("cayenne_s3_zone_id") {
-            return Self::resolve_auto_s3_data_path(&source.app().name, &dataset_name, zone_id);
+        if let Some(zone_ids) = acceleration_params.get("cayenne_s3_zone_ids") {
+            // Use the first zone ID as the primary zone for data path
+            let primary_zone = zone_ids
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::InvalidConfiguration {
+                    detail: Arc::from("cayenne_s3_zone_ids is empty or contains no valid zone IDs"),
+                })?;
+            return Self::resolve_auto_s3_data_path(
+                &source.app().name,
+                &dataset_name,
+                primary_zone,
+            );
         }
 
         Ok(Self::resolve_default_data_path(&dataset_name))
@@ -391,7 +405,7 @@ impl CayenneAccelerator {
     ///
     /// This returns true if either:
     /// - `cayenne_file_path` is set to an S3 Express path, or
-    /// - `cayenne_s3_zone_id` or `cayenne_s3_zone_ids` is set (which means we'll auto-generate S3 Express paths)
+    /// - `cayenne_s3_zone_ids` is set (which means we'll auto-generate S3 Express paths)
     fn is_s3_express_data_path(source: &dyn AccelerationSource) -> bool {
         source.acceleration().is_some_and(|a| {
             // Check for explicit S3 Express path
@@ -401,9 +415,8 @@ impl CayenneAccelerator {
             {
                 return true;
             }
-            // Check for auto-generated path via zone_id or zone_ids
-            a.params.contains_key("cayenne_s3_zone_id")
-                || a.params.contains_key("cayenne_s3_zone_ids")
+            // Check for auto-generated path via zone_ids
+            a.params.contains_key("cayenne_s3_zone_ids")
         })
     }
 
@@ -422,27 +435,20 @@ impl CayenneAccelerator {
         })
     }
 
-    /// Returns the list of zone IDs for multi-zone S3 Express One Zone storage.
+    /// Returns the list of zone IDs for S3 Express One Zone storage.
     ///
-    /// Returns a vector with a single zone if only `cayenne_s3_zone_id` is specified,
-    /// or multiple zones if `cayenne_s3_zone_ids` is specified.
+    /// Parses the `cayenne_s3_zone_ids` parameter as a comma-separated list of zone IDs.
+    /// Returns an empty vector if the parameter is not set.
     fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Vec<String> {
         source
             .acceleration()
-            .map(|a| {
-                // Prefer multi-zone configuration
-                if let Some(zone_ids) = a.params.get("cayenne_s3_zone_ids") {
-                    return zone_ids
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-                // Fall back to single zone
-                if let Some(zone_id) = a.params.get("cayenne_s3_zone_id") {
-                    return vec![zone_id.clone()];
-                }
-                Vec::new()
+            .and_then(|a| a.params.get("cayenne_s3_zone_ids"))
+            .map(|zone_ids| {
+                zone_ids
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -538,9 +544,24 @@ impl CayenneAccelerator {
 
         // S3 bucket names can be max 63 chars
         // We need room for: "spice-" (6) + "--" (2) + zone_id + "--x-s3" (6) = 14 + zone_id.len()
-        let suffix_len = 2 + zone_id.len() + 6; // "--{zone_id}--x-s3"
-        let prefix_len = 6; // "spice-"
-        let max_name_len = 63 - prefix_len - suffix_len - 1; // -1 for the hyphen between app and dataset
+        let suffix_len = 2_usize.saturating_add(zone_id.len()).saturating_add(6); // "--{zone_id}--x-s3"
+        let prefix_len = 6_usize; // "spice-"
+        
+        // Check if zone_id is too long (max 49 chars to leave at least 1 char for name)
+        // 63 (max) - 6 (prefix) - 1 (hyphen) - 6 (--x-s3) - 2 (--) = 48 max for zone_id + 1 for name
+        let required_fixed_len = prefix_len.saturating_add(1).saturating_add(suffix_len);
+        ensure!(
+            required_fixed_len < 63,
+            InvalidBucketNameSnafu {
+                reason: format!(
+                    "Zone ID '{zone_id}' is too long ({} chars). Maximum zone ID length is {} characters to fit S3 bucket naming constraints.",
+                    zone_id.len(),
+                    63_usize.saturating_sub(prefix_len).saturating_sub(1).saturating_sub(8) // 8 = 2 + 6 (-- + --x-s3)
+                ),
+            }
+        );
+        
+        let max_name_len = 63_usize.saturating_sub(required_fixed_len);
 
         ensure!(
             max_name_len > 0,
@@ -869,7 +890,7 @@ impl CayenneAccelerator {
     /// Extracts S3 bucket information (bucket name, zone ID, region, credentials) from the source configuration.
     ///
     /// If `cayenne_file_path` is provided as an S3 Express path, extracts info from that.
-    /// Otherwise, generates a bucket name from the app name and dataset name using `cayenne_s3_zone_id`.
+    /// Otherwise, generates a bucket name from the app name and dataset name using `cayenne_s3_zone_ids`.
     ///
     /// # Returns
     ///
@@ -910,9 +931,16 @@ impl CayenneAccelerator {
 
         // Extract zone ID from bucket name (e.g., "mybucket--usw2-az1--x-s3" -> "usw2-az1")
         let zone_id = Self::extract_zone_id_from_bucket(&bucket_name)
-            .or_else(|| acceleration.params.get("cayenne_s3_zone_id").map(String::as_str))
+            .or_else(|| {
+                acceleration
+                    .params
+                    .get("cayenne_s3_zone_ids")
+                    .and_then(|ids| ids.split(',').next())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
             .ok_or_else(|| Error::CannotAutoCreateBucket {
-                reason: "Could not determine zone ID. Either use a valid S3 Express bucket name format (bucket--zone-id--x-s3) or specify 'cayenne_s3_zone_id' parameter".to_string(),
+                reason: "Could not determine zone ID. Either use a valid S3 Express bucket name format (bucket--zone-id--x-s3) or specify 'cayenne_s3_zone_ids' parameter".to_string(),
             })?
             .to_string();
 
@@ -1488,7 +1516,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("string"),
     // S3 Express One Zone authentication parameters (used when file_path is an S3 Express path)
     ParameterSpec::component("cayenne_s3_region")
-        .description("AWS region for S3 Express One Zone storage. If not specified, derived from cayenne_s3_zone_id."),
+        .description("AWS region for S3 Express One Zone storage. If not specified, derived from cayenne_s3_zone_ids."),
     ParameterSpec::component("cayenne_s3_endpoint")
         .description("Custom S3 endpoint URL for S3 Express One Zone."),
     ParameterSpec::component("cayenne_s3_key")
@@ -1510,10 +1538,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
         .default("false"),
     // S3 Express One Zone auto-generation parameter
-    ParameterSpec::component("cayenne_s3_zone_id")
-        .description("Availability Zone ID for S3 Express One Zone storage (e.g., 'usw2-az1', 'use1-az4'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, use 'cayenne_s3_zone_ids' instead."),
     ParameterSpec::component("cayenne_s3_zone_ids")
-        .description("Comma-separated list of Availability Zone IDs for multi-zone S3 Express One Zone storage (e.g., 'usw2-az1,usw2-az2'). Data is written to all zones with ACID guarantees - writes succeed only if all zones succeed. Reads are served from the primary (first) zone with fallback to replicas. Provides redundancy and resilience across availability zones."),
+        .description("Comma-separated list of Availability Zone IDs for S3 Express One Zone storage (e.g., 'usw2-az1' or 'usw2-az1,usw2-az2'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, specify multiple zones. Data is written to all zones with ACID guarantees - writes succeed only if all zones succeed. Reads are served from the primary (first) zone with fallback to replicas."),
     ParameterSpec::component("footer_cache_mb")
         .description("Size of the in-memory Vortex footer cache in MB. Larger values improve query performance for repeated scans. Default: 128 MB")
         .default("128"),
@@ -1596,16 +1622,16 @@ impl DataAccelerator for CayenneAccelerator {
 
         if let Some(acceleration) = source.acceleration() {
             // Validate S3 Express One Zone configuration - only one method allowed
-            let has_s3_zone_id = acceleration.params.contains_key("cayenne_s3_zone_id");
+            let has_s3_zone_ids = acceleration.params.contains_key("cayenne_s3_zone_ids");
             let has_s3_express_file_path = acceleration
                 .params
                 .get("cayenne_file_path")
                 .is_some_and(|path| Self::is_s3_express_path(path));
 
-            if has_s3_zone_id && has_s3_express_file_path {
+            if has_s3_zone_ids && has_s3_express_file_path {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(
-                        "Cannot specify both 'cayenne_s3_zone_id' and 'cayenne_file_path' with an S3 Express path. Use either 'cayenne_s3_zone_id' for auto-generated bucket names, or 'cayenne_file_path' for explicit bucket paths.",
+                        "Cannot specify both 'cayenne_s3_zone_ids' and 'cayenne_file_path' with an S3 Express path. Use either 'cayenne_s3_zone_ids' for auto-generated bucket names, or 'cayenne_file_path' for explicit bucket paths.",
                     ),
                 }));
             }
