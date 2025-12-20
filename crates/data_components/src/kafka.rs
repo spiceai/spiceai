@@ -559,7 +559,6 @@ impl Kafka {
                 };
 
                 change_batch.map(|rb| ChangeEnvelope::new(Box::new(last_msg), rb, true))
-                // .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
             });
 
         Box::pin(stream)
