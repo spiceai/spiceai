@@ -252,6 +252,12 @@ impl SpiceTestQueryWorker {
 
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
+            // Load test queries may be generated with multiple parameter sets, resulting in a large
+            // set of queries. To respect duration limits, we group queries by name and run one
+            // group at a time, cycling through each group's parameter variations.
+            // If queries are unique, it will result in a single query set and will be the same as usual
+            let query_sets = build_unique_query_sets(&self.query_set)?;
+
             let query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>> = Arc::new(DashMap::new());
 
             // Keeps track of the start and end time of each query iteration
@@ -278,11 +284,18 @@ impl SpiceTestQueryWorker {
                             );
                         }
 
+                        // Select the query set to use for this iteration
+                        let queries_to_run = {
+                            let set_index = query_set_count % query_sets.len();
+                            &query_sets[set_index]
+                        };
+
                         if !self
                             .run_query_set(
                                 Arc::clone(&query_durations),
                                 &mut query_statuses,
                                 &mut row_counts,
+                                queries_to_run,
                             )
                             .await?
                         {
@@ -433,8 +446,9 @@ impl SpiceTestQueryWorker {
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         query_statuses: &mut BTreeMap<Arc<str>, QueryStatus>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
+        queries: &[Query],
     ) -> Result<bool> {
-        for query in &self.query_set {
+        for query in queries {
             let QueryRunResult {
                 connection_failed,
                 query_failure,
@@ -756,30 +770,27 @@ impl SpiceTestQueryWorker {
     ) -> Result<()> {
         if let Some(http_client) = self.http_client.as_ref() {
             let query_start = Instant::now();
+            let sql_text = query.to_sql_with_inlined_params();
             let sql_url = format!("{HTTP_BASE_URL}{SQL_ENDPOINT}");
             let http_response = http_client
                 .post(&sql_url)
                 .header("Accept", "application/vnd.spiceai.sql.v1+json")
-                .body(query.sql.to_string())
+                .body(sql_text.to_string())
                 .send()
                 .await?;
 
-            if !http_response.status().is_success() {
+            let status = http_response.status();
+            let response_text = http_response.text().await.unwrap_or_default();
+
+            if !status.is_success() {
                 eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {}",
+                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {status} - {response_text}",
                     chrono::Utc::now(),
                     self.id,
                     query.name,
-                    http_response.status()
                 );
-                return Err(anyhow::anyhow!(
-                    "Query HTTP request failed: {}",
-                    http_response.status()
-                ));
+                return Err(anyhow::anyhow!("Query HTTP request failed: {status}",));
             }
-
-            // Extract row count from response
-            let response_text = http_response.text().await?;
 
             let duration = query_start.elapsed();
 
@@ -925,4 +936,168 @@ fn default_row_count_validation_skip_queries() -> HashSet<String> {
     .iter()
     .map(std::string::ToString::to_string)
     .collect()
+}
+
+/// Build unique query sets by grouping queries by parameter index.
+/// Creates one query set per parameter variation, where each set contains
+/// one query of each type with the same parameter index.
+fn build_unique_query_sets(queries: &[Query]) -> Result<Vec<Vec<Query>>> {
+    use std::collections::HashMap;
+
+    // Group queries by name first
+    let mut groups: HashMap<Arc<str>, Vec<&Query>> = HashMap::new();
+    for query in queries {
+        groups
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(query);
+    }
+
+    // Validate that all groups have the same size
+    let mut expected_size = None;
+    for (name, query_group) in &groups {
+        let group_size = query_group.len();
+        match expected_size {
+            None => expected_size = Some(group_size),
+            Some(expected) if expected != group_size => {
+                return Err(anyhow::anyhow!(
+                    "Uneven parameter groups detected: query '{name}' has {group_size} parameters, expected {expected}"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let num_variations = expected_size.unwrap_or(0);
+
+    // Create query sets by parameter index
+    let mut result = Vec::with_capacity(num_variations);
+
+    for param_index in 0..num_variations {
+        let mut query_set = Vec::with_capacity(groups.len());
+
+        for query_group in groups.values() {
+            if let Some(query) = query_group.get(param_index) {
+                query_set.push((*query).clone());
+            }
+        }
+
+        result.push(query_set);
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::queries::parameterized::ParameterValue;
+
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_build_unique_query_sets_single_group() {
+        let queries = vec![
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("1".into())]),
+            },
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("2".into())]),
+            },
+        ];
+
+        let result = build_unique_query_sets(&queries).expect("Should succeed");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have two query sets (one per parameter)"
+        );
+        assert_eq!(result[0].len(), 1, "Each set should have one query");
+        assert_eq!(result[1].len(), 1, "Each set should have one query");
+    }
+
+    #[test]
+    fn test_build_unique_query_sets_multiple_groups() {
+        let queries = vec![
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table1"),
+                overridden: false,
+                parameters: None,
+            },
+            Query {
+                name: Arc::from("query2"),
+                sql: Arc::from("SELECT * FROM table2"),
+                overridden: false,
+                parameters: None,
+            },
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table1 WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("1".into())]),
+            },
+            Query {
+                name: Arc::from("query2"),
+                sql: Arc::from("SELECT * FROM table2 WHERE id = ?"),
+                overridden: false,
+                parameters: Some(vec![ParameterValue::String("2".into())]),
+            },
+        ];
+
+        let result = build_unique_query_sets(&queries).expect("Should succeed");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have two query sets (one per parameter)"
+        );
+        for group in &result {
+            assert_eq!(
+                group.len(),
+                2,
+                "Each set should have two queries (one per query type)"
+            );
+        }
+
+        // Verify each set contains one query of each type
+        let set1_names: Vec<&str> = result[0].iter().map(|q| q.name.as_ref()).collect();
+        let set2_names: Vec<&str> = result[1].iter().map(|q| q.name.as_ref()).collect();
+        assert!(set1_names.contains(&"query1") && set1_names.contains(&"query2"));
+        assert!(set2_names.contains(&"query1") && set2_names.contains(&"query2"));
+    }
+
+    #[test]
+    fn test_build_unique_query_sets_unique_names() {
+        let queries = vec![
+            Query {
+                name: Arc::from("query1"),
+                sql: Arc::from("SELECT * FROM table1"),
+                overridden: false,
+                parameters: None,
+            },
+            Query {
+                name: Arc::from("query2"),
+                sql: Arc::from("SELECT * FROM table2"),
+                overridden: false,
+                parameters: None,
+            },
+        ];
+
+        let result = build_unique_query_sets(&queries).expect("Should succeed");
+
+        assert_eq!(result.len(), 1, "Should have one query set");
+        assert_eq!(result[0].len(), 2, "Set should have both queries");
+
+        // Verify we have both query names in the single set
+        let names: Vec<&str> = result[0].iter().map(|q| q.name.as_ref()).collect();
+        assert!(names.contains(&"query1") && names.contains(&"query2"));
+    }
 }
