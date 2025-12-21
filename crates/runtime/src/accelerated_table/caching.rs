@@ -40,7 +40,7 @@ use datafusion_expr::expr::ExprListDisplay;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::HashSet;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 
@@ -565,6 +565,104 @@ impl CacheRefreshHelper {
         filters.iter().cloned().reduce(Expr::and).map(not)
     }
 
+    /// Propagate cached data to synchronized child accelerators (for localpod caching).
+    /// This is called after successfully storing data in the parent accelerator.
+    async fn propagate_to_synchronized_children(
+        synchronized_children: &SynchronizedChildren,
+        dataset_name: &str,
+        filters: &[Expr],
+        batches: &[RecordBatch],
+        is_expired: bool,
+    ) {
+        let children = synchronized_children.read().await;
+        if children.is_empty() {
+            return;
+        }
+
+        let num_children = children.len();
+        tracing::debug!(
+            "Propagating {} batches to {} synchronized children for dataset={}",
+            batches.len(),
+            num_children,
+            dataset_name
+        );
+
+        for (idx, child) in children.iter().enumerate() {
+            let result = if is_expired {
+                Self::upsert_into_accelerator(child, dataset_name, filters, batches.to_vec()).await
+            } else {
+                Self::insert_into_accelerator(child, dataset_name, batches.to_vec()).await
+            };
+
+            if let Err(e) = result {
+                tracing::warn!(
+                    "Failed to propagate cached data to synchronized child {} for dataset {}: {}",
+                    idx,
+                    dataset_name,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    "Successfully propagated cached data to synchronized child {} for dataset={}",
+                    idx,
+                    dataset_name
+                );
+            }
+        }
+    }
+
+    /// Initialize a child accelerator from the parent's existing cached data.
+    /// This is called when setting up localpod synchronization to ensure the child
+    /// starts with the parent's existing cache state (e.g., from a file-mode `DuckDB`
+    /// accelerator that was restored from disk or a snapshot).
+    ///
+    /// # Arguments
+    /// * `parent_accelerator` - The parent's accelerator containing existing cached data
+    /// * `child_accelerator` - The child's accelerator to initialize
+    /// * `dataset_name` - Name of the dataset for logging
+    ///
+    /// # Returns
+    /// Returns the number of rows copied, or an error if the operation fails.
+    pub async fn initialize_child_from_parent(
+        parent_accelerator: &Arc<dyn TableProvider>,
+        child_accelerator: &Arc<dyn TableProvider>,
+        dataset_name: &str,
+    ) -> DataFusionResult<usize> {
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        tracing::debug!(
+            "Scanning parent accelerator for existing cached data to initialize child for dataset={}",
+            dataset_name
+        );
+
+        // Scan all existing data from the parent accelerator
+        let plan = parent_accelerator.scan(&state, None, &[], None).await?;
+        let task_ctx = Arc::new(TaskContext::default());
+        let batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        if batches.is_empty() || total_rows == 0 {
+            tracing::debug!(
+                "No existing data in parent accelerator to initialize child for dataset={}",
+                dataset_name
+            );
+            return Ok(0);
+        }
+
+        tracing::debug!(
+            "Initializing child accelerator with {} rows from parent for dataset={}",
+            total_rows,
+            dataset_name
+        );
+
+        // Use overwrite to ensure clean state in child
+        Self::overwrite_accelerator(Arc::clone(child_accelerator), dataset_name, batches).await?;
+
+        Ok(total_rows)
+    }
+
     /// Fetch data from federated source for given filters
     async fn fetch_from_source(
         federated: &Arc<dyn TableProvider>,
@@ -615,6 +713,7 @@ impl CacheRefreshHelper {
     /// * `expired_batches` - The expired cached data to serve if `stale_if_error` is enabled and
     ///   the source returns an error.
     /// * `accelerator_mutex` - Mutex to protect concurrent access to the accelerator.
+    /// * `synchronized_children` - Child accelerators that should also receive the cached data.
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
@@ -627,6 +726,7 @@ impl CacheRefreshHelper {
         stale_if_error: bool,
         expired_batches: Option<Vec<RecordBatch>>,
         accelerator_mutex: Arc<Mutex<()>>,
+        synchronized_children: SynchronizedChildren,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
             Ok(batches) if !batches.is_empty() => {
@@ -667,6 +767,16 @@ impl CacheRefreshHelper {
                         e
                     );
                 }
+
+                // Propagate to synchronized children (localpod caching)
+                Self::propagate_to_synchronized_children(
+                    &synchronized_children,
+                    dataset_name,
+                    filters,
+                    &batches,
+                    is_expired,
+                )
+                .await;
 
                 // Use the schema from the fetched batches, not from the accelerator scan
                 let batch_schema = batches[0].schema();
@@ -847,6 +957,9 @@ impl CacheRefreshHelper {
     }
 }
 
+/// Type alias for synchronized child accelerators
+pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
+
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
@@ -868,6 +981,8 @@ pub struct CachingAccelerationScanExec {
     accelerator_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: InFlightRevalidations,
+    /// Child accelerators that should receive cached data when this parent stores new cache entries
+    synchronized_children: SynchronizedChildren,
 }
 
 impl CachingAccelerationScanExec {
@@ -886,6 +1001,7 @@ impl CachingAccelerationScanExec {
         limit: Option<usize>,
         accelerator_mutex: Arc<Mutex<()>>,
         in_flight_revalidations: InFlightRevalidations,
+        synchronized_children: SynchronizedChildren,
     ) -> Self {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
@@ -911,6 +1027,7 @@ impl CachingAccelerationScanExec {
             limit,
             accelerator_mutex,
             in_flight_revalidations,
+            synchronized_children,
         }
     }
 }
@@ -970,6 +1087,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.limit,
             Arc::clone(&self.accelerator_mutex),
             Arc::clone(&self.in_flight_revalidations),
+            Arc::clone(&self.synchronized_children),
         )))
     }
 
@@ -999,6 +1117,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let io_runtime = self.io_runtime.clone();
         let accelerator_mutex = Arc::clone(&self.accelerator_mutex);
         let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
+        let synchronized_children = Arc::clone(&self.synchronized_children);
 
         tracing::debug!(
             "CacheAccelerationScanExec::execute about to spawn cache check for dataset={}",
@@ -1067,6 +1186,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             stale_if_error,
                             expired_batches,
                             Arc::clone(&accelerator_mutex),
+                            Arc::clone(&synchronized_children),
                         )
                         .await;
                     }
@@ -1103,6 +1223,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     false, // stale_if_error = false, no expired data to fall back to
                     None,  // no expired batches
                     accelerator_mutex,
+                    synchronized_children,
                 )
                 .await
             }

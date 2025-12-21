@@ -47,7 +47,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
-pub enum ClusterMode {
+pub enum ClusterRole {
     Scheduler,
     Executor,
 }
@@ -85,68 +85,61 @@ impl Default for Config {
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, clap::Parser)]
 pub struct ClusterConfig {
-    /// Configure cluster mode role
-    #[arg(
-        long = "cluster-mode",
-        value_name = "CLUSTER_MODE",
-        required = false,
-        action
-    )]
-    pub mode: Option<ClusterMode>,
+    /// Configure cluster node role: scheduler or executor
+    #[arg(long = "role", value_name = "ROLE", required = false, action)]
+    pub role: Option<ClusterRole>,
 
     /// The bind address for the internal cluster gRPC service.
     /// Used by both schedulers and executors.
     #[arg(
-        long = "cluster-address",
-        value_name = "CLUSTER_ADDRESS",
+        long = "node-bind-address",
+        value_name = "NODE_BIND_ADDRESS",
         default_value = "0.0.0.0:50052",
         action
     )]
-    pub cluster_address: SocketAddr,
+    pub node_bind_address: SocketAddr,
 
     /// The path to the CA certificate used to validate cluster node identities.
     #[arg(
-        long = "cluster-ca-certificate-file",
-        value_name = "CLUSTER_CA_CERTIFICATE_FILE"
+        long = "node-mtls-ca-certificate-file",
+        value_name = "NODE_MTLS_CA_CERTIFICATE_FILE"
     )]
-    pub cluster_ca_certificate_file: Option<String>,
+    pub node_mtls_ca_certificate_file: Option<String>,
 
     /// The path to the certificate file used for both server TLS and client mTLS.
     #[arg(
-        long = "cluster-certificate-file",
-        value_name = "CLUSTER_CERTIFICATE_FILE"
+        long = "node-mtls-certificate-file",
+        value_name = "NODE_MTLS_CERTIFICATE_FILE"
     )]
-    pub cluster_certificate_file: Option<String>,
+    pub node_mtls_certificate_file: Option<String>,
 
     /// The path to the private key file for the cluster certificate.
-    #[arg(long = "cluster-key-file", value_name = "CLUSTER_KEY_FILE")]
-    pub cluster_key_file: Option<String>,
+    #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
+    pub node_mtls_key_file: Option<String>,
 
     /// The URL of the scheduler service. Required for executors to join a cluster.
-    #[arg(long = "cluster-scheduler-url", value_name = "CLUSTER_SCHEDULER_URL")]
-    pub cluster_scheduler_url: Option<Url>,
+    /// If set, --role executor is implied and can be omitted.
+    #[arg(long = "scheduler-address", value_name = "SCHEDULER_ADDRESS")]
+    pub scheduler_address: Option<Url>,
 
     /// The hostname and port that this node advertises to other cluster nodes.
     /// For schedulers: used as the URL for distributed query planning.
     /// For executors: used during registration to tell the scheduler how to contact this node.
-    #[arg(
-        long = "cluster-advertise-address",
-        value_name = "CLUSTER_ADVERTISE_ADDRESS"
-    )]
-    pub cluster_advertise_address: Option<String>,
+    #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
+    pub node_advertise_address: Option<String>,
 }
 
 #[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            mode: None,
-            cluster_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50052),
-            cluster_ca_certificate_file: None,
-            cluster_certificate_file: None,
-            cluster_key_file: None,
-            cluster_scheduler_url: None,
-            cluster_advertise_address: None,
+            role: None,
+            node_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50052),
+            node_mtls_ca_certificate_file: None,
+            node_mtls_certificate_file: None,
+            node_mtls_key_file: None,
+            scheduler_address: None,
+            node_advertise_address: None,
         }
     }
 }
@@ -154,20 +147,20 @@ impl Default for ClusterConfig {
 #[cfg(feature = "cluster")]
 impl ClusterConfig {
     #[must_use]
-    pub fn with_mode(mut self, mode: ClusterMode) -> Self {
-        self.mode = Some(mode);
+    pub fn with_role(mut self, role: ClusterRole) -> Self {
+        self.role = Some(role);
         self
     }
 
     #[must_use]
-    pub fn with_cluster_address(mut self, addr: SocketAddr) -> Self {
-        self.cluster_address = addr;
+    pub fn with_node_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.node_bind_address = addr;
         self
     }
 
     #[must_use]
-    pub fn with_cluster_scheduler_url(mut self, url: Url) -> Self {
-        self.cluster_scheduler_url = Some(url);
+    pub fn with_scheduler_address(mut self, url: Url) -> Self {
+        self.scheduler_address = Some(url);
         self
     }
 }

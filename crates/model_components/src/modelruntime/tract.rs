@@ -28,7 +28,6 @@ use snafu::prelude::*;
 use std::sync::Arc;
 
 use crate::modelformat::onnx;
-use tract_core::tract_data::itertools::Itertools;
 use tract_onnx::prelude::*;
 
 pub struct Tract {
@@ -104,7 +103,7 @@ impl Runnable for Model {
 
             let schema = first_record.schema();
             let fields = schema.fields();
-            let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect_vec();
+            let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect::<Vec<_>>();
 
             let [_, lookback_size, num_variates] = this.try_get_input_shape()?;
 
@@ -127,7 +126,7 @@ impl Runnable for Model {
                         let Some(float_col) = a.as_any().downcast_ref::<Float64Array>() else {
                             return;
                         };
-                        let col = float_col.into_iter().flatten().collect_vec();
+                        let col = float_col.into_iter().flatten().collect::<Vec<_>>();
                         let end_idx: usize =
                             std::cmp::min(lookback_size - data[i].len(), col.len());
                         data[i].append(&mut col[..end_idx].to_vec());
@@ -138,7 +137,7 @@ impl Runnable for Model {
                 .enumerate()
                 .filter(|(i, _)| schema.field(*i).name() != "ts") //: (usize, ArrayRef)
                 .map(|(_, x)| x.clone())
-                .collect_vec();
+                .collect::<Vec<_>>();
 
             if inp.len() != num_variates {
                 return Err(Box::new(Error::TractError {
@@ -152,7 +151,7 @@ impl Runnable for Model {
 
             let small_vec: Tensor = tract_ndarray::Array3::from_shape_vec(
                 (1, lookback_size, num_variates),
-                inp.into_iter().concat(),
+                inp.into_iter().flatten().collect(),
             )
             .map_err(|_| Error::ShapeError {
                 source: ndarray::ShapeError::from_kind(ndarray::ErrorKind::IncompatibleShape),
@@ -172,7 +171,7 @@ impl Runnable for Model {
                 .context(TractSnafu)?
                 .iter()
                 .copied()
-                .collect_vec();
+                .collect::<Vec<_>>();
 
             let record_batch = RecordBatch::try_new(
                 Arc::new(return_schema),

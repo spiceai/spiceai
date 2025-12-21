@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tract_core::tract_data::itertools::Itertools;
 
 #[derive(Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -291,13 +290,12 @@ async fn run_inference(
         Ok(inference_result) => {
             if let Some(column_data) = inference_result.column_by_name("y") {
                 if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
-                    let result = array.values().iter().copied().collect_vec();
                     return PredictResponse {
                         status: PredictStatus::Success,
                         error_message: None,
                         model_name,
                         model_version: Some(modelsource::version(&model.from)),
-                        prediction: Some(result),
+                        prediction: Some(array.values().to_vec()),
                         duration_ms: start_time.elapsed().as_millis(),
                     };
                 }

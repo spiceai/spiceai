@@ -116,6 +116,7 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::HuggingFace => {
             huggingface(&component.name, model_id, &params, embeddings_cache.clone()).await
         }
+        EmbeddingPrefix::Google => google(model_id, &params, embeddings_cache.clone()),
         EmbeddingPrefix::Databricks => {
             databricks(
                 model_id,
@@ -183,6 +184,47 @@ fn model2vec(
     .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
         source: Box::new(e),
     })
+}
+
+fn google(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+    embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+) -> Result<Arc<dyn Embed>, EmbedError> {
+    let Some(model_id) = model_id else {
+        return Err(EmbedError::ModelNotProvided {
+            model_source: "google".to_string(),
+        });
+    };
+    let Some(api_key) = params.get("google_api_key") else {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "`google_api_key` is required.",
+            )),
+        });
+    };
+
+    let dimensions: Option<u32> = params
+        .get("google_dimensions")
+        .map(|d| d.expose_secret().parse())
+        .transpose()
+        // Only error if user provided dimensions.
+        .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Failed to parse 'dimensions' as u32 parameter: {e}"),
+            )),
+        })?;
+    let google =
+        llms::google::Google::new_embeddings(api_key, &model_id, dimensions, embeddings_cache)
+            .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
+                source: Box::new(std::io::Error::other(format!(
+                    "Failed to create Google embeddings client: {e}"
+                ))),
+            })?;
+
+    Ok(Arc::new(google) as Arc<dyn Embed>)
 }
 
 #[cfg(feature = "bedrock")]
