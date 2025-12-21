@@ -546,7 +546,7 @@ impl CayenneAccelerator {
         // We need room for: "spice-" (6) + "--" (2) + zone_id + "--x-s3" (6) = 14 + zone_id.len()
         let suffix_len = 2_usize.saturating_add(zone_id.len()).saturating_add(6); // "--{zone_id}--x-s3"
         let prefix_len = 6_usize; // "spice-"
-        
+
         // Check if zone_id is too long (max 49 chars to leave at least 1 char for name)
         // 63 (max) - 6 (prefix) - 1 (hyphen) - 6 (--x-s3) - 2 (--) = 48 max for zone_id + 1 for name
         let required_fixed_len = prefix_len.saturating_add(1).saturating_add(suffix_len);
@@ -556,11 +556,14 @@ impl CayenneAccelerator {
                 reason: format!(
                     "Zone ID '{zone_id}' is too long ({} chars). Maximum zone ID length is {} characters to fit S3 bucket naming constraints.",
                     zone_id.len(),
-                    63_usize.saturating_sub(prefix_len).saturating_sub(1).saturating_sub(8) // 8 = 2 + 6 (-- + --x-s3)
+                    63_usize
+                        .saturating_sub(prefix_len)
+                        .saturating_sub(1)
+                        .saturating_sub(8) // 8 = 2 + 6 (-- + --x-s3)
                 ),
             }
         );
-        
+
         let max_name_len = 63_usize.saturating_sub(required_fixed_len);
 
         ensure!(
