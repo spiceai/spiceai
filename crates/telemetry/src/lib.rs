@@ -25,6 +25,7 @@ use std::{sync::LazyLock, time::Duration};
 #[cfg(feature = "anonymous_telemetry")]
 pub mod anonymous;
 pub mod exporter;
+pub mod hardware;
 pub mod meter;
 pub mod noop;
 pub mod reader;

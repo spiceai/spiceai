@@ -26,19 +26,22 @@ use snafu::ResultExt;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbedContentRequest {
+    /// Required. The model's resource name. Format: models/{model}
+    pub model: String,
     pub content: Content,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_type: Option<TaskType>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_dimensionality: Option<i32>,
+    pub output_dimensionality: Option<u32>,
 }
 
 impl EmbedContentRequest {
     #[must_use]
-    pub fn new(content: Content) -> Self {
+    pub fn new(model: String, content: Content) -> Self {
         Self {
+            model,
             content,
             task_type: None,
             output_dimensionality: None,
@@ -52,7 +55,7 @@ impl EmbedContentRequest {
     }
 
     #[must_use]
-    pub fn with_output_dimensionality(mut self, dimensionality: i32) -> Self {
+    pub fn with_output_dimensionality(mut self, dimensionality: u32) -> Self {
         self.output_dimensionality = Some(dimensionality);
         self
     }

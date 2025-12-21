@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+mod streams;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -621,7 +622,6 @@ pub async fn get_dynamodb_client() -> Result<aws_sdk_dynamodb::Client, anyhow::E
     Ok(client)
 }
 
-#[expect(clippy::too_many_lines)]
 #[expect(dead_code)]
 async fn init_test_table(table_name: &str) -> Result<(), anyhow::Error> {
     let client = get_dynamodb_client().await?;

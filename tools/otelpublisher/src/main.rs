@@ -38,7 +38,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "OTEL_ENDPOINT",
-        default_value = "http://localhost:50052"
+        default_value = "http://localhost:50051"
     )]
     pub otel_endpoint: String,
 
@@ -61,8 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
         let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
-        if otel_endpoint == "http://localhost:50052" {
-            otel_endpoint = "https://localhost:50052".to_string();
+        if otel_endpoint == "http://localhost:50051" {
+            otel_endpoint = "https://localhost:50051".to_string();
         }
         Channel::from_shared(otel_endpoint)?
             .tls_config(client_tls_config)?

@@ -331,7 +331,6 @@ impl AppBuilder {
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();

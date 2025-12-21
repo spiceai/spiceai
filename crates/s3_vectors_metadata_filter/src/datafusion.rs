@@ -593,7 +593,6 @@ mod tests {
     use datafusion::sql::unparser::{Unparser, dialect::DefaultDialect};
 
     #[test]
-    #[expect(clippy::too_many_lines)]
     fn test_valid_datafusion_expressions() {
         let columns = vec![
             "genre".to_string(),

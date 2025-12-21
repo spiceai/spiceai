@@ -508,7 +508,6 @@ impl DataAccelerator for TursoAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -1297,7 +1296,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_timestamp_unit_conversion() {
         // Test that timestamps are correctly converted between different units
         // All timestamps are stored as milliseconds in Turso, but should be

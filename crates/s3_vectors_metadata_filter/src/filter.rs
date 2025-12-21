@@ -17,15 +17,18 @@ limitations under the License.
 use crate::{
     Error,
     error::{
-        EmptyArraySnafu, InvalidFilterSnafu, InvalidValueTypeSnafu, JsonParsingSnafu, Result,
-        UnsupportedOperatorSnafu,
+        EmptyArraySnafu, InvalidFilterSnafu, InvalidValueTypeSnafu, JsonParsingSnafu,
+        MaxRecursionDepthExceededSnafu, Result, UnsupportedOperatorSnafu,
     },
 };
 use aws_smithy_types::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use std::{collections::HashMap, fmt, str::FromStr};
+
+/// Maximum recursion depth for nested `S3 Vectors` structures.
+const MAX_RECURSION_DEPTH: usize = 100;
 
 /// [`MetadataFilter`] is a data structure that defines expressible filters for S3 vector.
 /// ## Filter Examples
@@ -109,7 +112,7 @@ impl From<MetadataFilter> for Document {
         match val {
             MetadataFilter::Simple(map) => Document::Object(
                 map.into_iter()
-                    .map(|(k, v)| (k, json_value_to_document(v)))
+                    .filter_map(|(k, v)| json_value_to_document(v).ok().map(|doc| (k, doc)))
                     .collect(),
             ),
             MetadataFilter::Complex(expr) => expr.into(),
@@ -179,11 +182,15 @@ impl From<FieldOperation> for Value {
 impl From<FieldOperation> for Document {
     fn from(value: FieldOperation) -> Self {
         match value {
-            FieldOperation::Direct(value) => json_value_to_document(value),
+            FieldOperation::Direct(value) => {
+                json_value_to_document(value).unwrap_or(Document::Null)
+            }
             FieldOperation::Operation(map) => {
                 let mut result = HashMap::new();
                 for (key, value) in map {
-                    result.insert(key, json_value_to_document(value));
+                    if let Ok(doc) = json_value_to_document(value) {
+                        result.insert(key, doc);
+                    }
                 }
                 Document::Object(result)
             }
@@ -385,18 +392,28 @@ impl fmt::Display for LogicalOperation {
 }
 
 fn format_value(value: &Value) -> String {
+    format_value_with_depth(value, 0)
+}
+
+fn format_value_with_depth(value: &Value, depth: usize) -> String {
+    if depth >= MAX_RECURSION_DEPTH {
+        return "<max depth exceeded>".to_string();
+    }
     match value {
         Value::String(s) => format!("\"{s}\""),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(format_value).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| format_value_with_depth(v, depth + 1))
+                .collect();
             format!("[{}]", items.join(","))
         }
         Value::Object(obj) => {
             let items: Vec<String> = obj
                 .iter()
-                .map(|(k, v)| format!("{k}:{}", format_value(v)))
+                .map(|(k, v)| format!("{k}:{}", format_value_with_depth(v, depth + 1)))
                 .collect();
             format!("{{{}}}", items.join(","))
         }
@@ -717,30 +734,60 @@ fn value_type_name(value: &Value) -> &'static str {
 }
 
 /// TODO: Standardise logic with `llms` crate (Bedrock models): `https://github.com/spiceai/spiceai/issues/6676`.
-#[must_use]
-pub fn document_to_json_map(document: Document) -> Map<String, Value> {
+///
+/// # Errors
+///
+/// Returns an error if the document nesting exceeds `MAX_RECURSION_DEPTH`.
+pub fn document_to_json_map(document: Document) -> Result<Map<String, Value>> {
     match document {
-        Document::Object(map) => map
-            .into_iter()
-            .map(|(k, v)| (k, document_to_json_value(v)))
-            .collect(),
-        _ => Map::new(),
+        Document::Object(map) => {
+            let mut result = Map::new();
+            for (k, v) in map {
+                result.insert(k, document_to_json_value_with_depth(v, 1)?);
+            }
+            Ok(result)
+        }
+        _ => Ok(Map::new()),
     }
 }
 
-#[must_use]
-pub fn document_to_json_value(document: Document) -> Value {
+/// Converts a `Document` to a JSON `Value`.
+///
+/// # Errors
+///
+/// Returns an error if the document nesting exceeds `MAX_RECURSION_DEPTH`.
+pub fn document_to_json_value(document: Document) -> Result<Value> {
+    document_to_json_value_with_depth(document, 0)
+}
+
+fn document_to_json_value_with_depth(document: Document, depth: usize) -> Result<Value> {
+    ensure!(
+        depth < MAX_RECURSION_DEPTH,
+        MaxRecursionDepthExceededSnafu {
+            max_depth: MAX_RECURSION_DEPTH
+        }
+    );
     match document {
-        Document::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(k, v)| (k, document_to_json_value(v)))
-                .collect(),
-        ),
-        Document::Array(arr) => Value::Array(arr.into_iter().map(document_to_json_value).collect()),
-        Document::Number(num) => aws_number_to_json_number(num).map_or(Value::Null, Value::Number),
-        Document::String(s) => Value::String(s),
-        Document::Bool(b) => Value::Bool(b),
-        Document::Null => Value::Null,
+        Document::Object(map) => {
+            let mut result = Map::new();
+            for (k, v) in map {
+                result.insert(k, document_to_json_value_with_depth(v, depth + 1)?);
+            }
+            Ok(Value::Object(result))
+        }
+        Document::Array(arr) => {
+            let mut result = Vec::new();
+            for item in arr {
+                result.push(document_to_json_value_with_depth(item, depth + 1)?);
+            }
+            Ok(Value::Array(result))
+        }
+        Document::Number(num) => {
+            Ok(aws_number_to_json_number(num).map_or(Value::Null, Value::Number))
+        }
+        Document::String(s) => Ok(Value::String(s)),
+        Document::Bool(b) => Ok(Value::Bool(b)),
+        Document::Null => Ok(Value::Null),
     }
 }
 
@@ -773,21 +820,43 @@ pub fn json_number_to_aws_number(num: serde_json::Number) -> Option<aws_smithy_t
     }
 }
 
-#[must_use]
-pub fn json_value_to_document(value: Value) -> Document {
-    match value {
-        Value::Object(map) => Document::Object(
-            map.into_iter()
-                .map(|(k, v)| (k, json_value_to_document(v)))
-                .collect(),
-        ),
-        Value::Array(arr) => Document::Array(arr.into_iter().map(json_value_to_document).collect()),
-        Value::Number(num) => {
-            json_number_to_aws_number(num).map_or(Document::Null, Document::Number)
+/// Converts a JSON `Value` to a `Document`.
+///
+/// # Errors
+///
+/// Returns an error if the value nesting exceeds `MAX_RECURSION_DEPTH`.
+pub fn json_value_to_document(value: Value) -> Result<Document> {
+    json_value_to_document_with_depth(value, 0)
+}
+
+fn json_value_to_document_with_depth(value: Value, depth: usize) -> Result<Document> {
+    ensure!(
+        depth < MAX_RECURSION_DEPTH,
+        MaxRecursionDepthExceededSnafu {
+            max_depth: MAX_RECURSION_DEPTH
         }
-        Value::String(s) => Document::String(s),
-        Value::Bool(b) => Document::Bool(b),
-        Value::Null => Document::Null,
+    );
+    match value {
+        Value::Object(map) => {
+            let mut result = HashMap::new();
+            for (k, v) in map {
+                result.insert(k, json_value_to_document_with_depth(v, depth + 1)?);
+            }
+            Ok(Document::Object(result))
+        }
+        Value::Array(arr) => {
+            let mut result = Vec::new();
+            for item in arr {
+                result.push(json_value_to_document_with_depth(item, depth + 1)?);
+            }
+            Ok(Document::Array(result))
+        }
+        Value::Number(num) => {
+            Ok(json_number_to_aws_number(num).map_or(Document::Null, Document::Number))
+        }
+        Value::String(s) => Ok(Document::String(s)),
+        Value::Bool(b) => Ok(Document::Bool(b)),
+        Value::Null => Ok(Document::Null),
     }
 }
 
@@ -852,6 +921,92 @@ mod tests {
         assert_eq!(
             logical_filter.to_string(),
             r#"{$or:[{genre:{$eq:"drama"}},{year:{$gte:2020}}]}"#
+        );
+    }
+
+    #[test]
+    fn test_json_value_to_document_max_depth() {
+        // Create a deeply nested JSON structure that exceeds MAX_RECURSION_DEPTH
+        let mut value = Value::String("deep".to_string());
+        for _ in 0..=MAX_RECURSION_DEPTH {
+            let mut map = serde_json::Map::new();
+            map.insert("nested".to_string(), value);
+            value = Value::Object(map);
+        }
+
+        let result = json_value_to_document(value);
+        assert!(
+            result.is_err(),
+            "Expected MaxRecursionDepthExceeded error for deeply nested JSON"
+        );
+    }
+
+    #[test]
+    fn test_json_value_to_document_within_limit() {
+        // Create a nested structure within the limit
+        let mut value = Value::String("ok".to_string());
+        for _ in 0..50 {
+            let mut map = serde_json::Map::new();
+            map.insert("nested".to_string(), value);
+            value = Value::Object(map);
+        }
+
+        let result = json_value_to_document(value);
+        assert!(
+            result.is_ok(),
+            "Expected success for moderately nested JSON"
+        );
+    }
+
+    #[test]
+    fn test_document_to_json_value_max_depth() {
+        // Create a deeply nested Document structure that exceeds MAX_RECURSION_DEPTH
+        let mut doc = Document::String("deep".to_string());
+        for _ in 0..=MAX_RECURSION_DEPTH {
+            let mut map = std::collections::HashMap::new();
+            map.insert("nested".to_string(), doc);
+            doc = Document::Object(map);
+        }
+
+        let result = document_to_json_value(doc);
+        assert!(
+            result.is_err(),
+            "Expected MaxRecursionDepthExceeded error for deeply nested Document"
+        );
+    }
+
+    #[test]
+    fn test_document_to_json_value_within_limit() {
+        // Create a nested Document structure within the limit
+        let mut doc = Document::String("ok".to_string());
+        for _ in 0..50 {
+            let mut map = std::collections::HashMap::new();
+            map.insert("nested".to_string(), doc);
+            doc = Document::Object(map);
+        }
+
+        let result = document_to_json_value(doc);
+        assert!(
+            result.is_ok(),
+            "Expected success for moderately nested Document"
+        );
+    }
+
+    #[test]
+    fn test_format_value_max_depth() {
+        // Create a deeply nested JSON structure
+        let mut value = Value::String("deep".to_string());
+        for _ in 0..=MAX_RECURSION_DEPTH {
+            let mut map = serde_json::Map::new();
+            map.insert("nested".to_string(), value);
+            value = Value::Object(map);
+        }
+
+        let result = format_value(&value);
+        // Should contain the max depth exceeded marker instead of crashing
+        assert!(
+            result.contains("<max depth exceeded>"),
+            "Expected max depth exceeded marker in formatted output"
         );
     }
 }

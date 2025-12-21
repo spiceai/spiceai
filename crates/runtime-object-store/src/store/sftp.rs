@@ -140,7 +140,6 @@ impl ObjectStore for SFTPObjectStore {
         unimplemented!()
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn get_opts(
         &self,
         location: &Path,

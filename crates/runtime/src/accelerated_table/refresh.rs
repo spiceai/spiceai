@@ -629,7 +629,6 @@ impl Refresher {
         }
     }
 
-    #[expect(clippy::too_many_lines)]
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -926,14 +925,14 @@ fn create_periodic_snapshot_callback(
 ) -> Option<SnapshotCallback> {
     let threshold = snapshots_trigger_threshold.unwrap_or(300i64);
 
-    tracing::info!(
-        "Snapshots for dataset {dataset_name} will be created every {threshold} batch updates"
-    );
-
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
             let snapshot_manager = Arc::new(snapshot_manager);
             let dataset_name = dataset_name.clone();
+
+            tracing::info!(
+                "Snapshots for dataset {dataset_name} will be created every {threshold} batch updates"
+            );
 
             // Track number of processed batches since last snapshot
             let batches_processed = Arc::new(RwLock::new(0i64));
@@ -1292,7 +1291,6 @@ mod tests {
         );
     }
 
-    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_iso8601() {
         async fn test(
@@ -1444,7 +1442,6 @@ mod tests {
         .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp() {
         async fn test(
@@ -1624,7 +1621,6 @@ mod tests {
         .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp_with_more_complicated_structs() {
         async fn test(
@@ -2069,7 +2065,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_startup_next_refresh() {
         struct TestCase {
             description: &'static str,
@@ -2234,7 +2229,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_startup_next_refresh_wait_time() {
         struct TestCase {
             description: &'static str,
