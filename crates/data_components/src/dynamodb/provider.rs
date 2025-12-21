@@ -137,7 +137,7 @@ impl DynamoDBTableProvider {
                 .collect();
 
             if !missing_fields.is_empty() {
-                return Err(Error::FieldsNotFound {
+                return Err(Error::ColumnsNotFound {
                     field_names: missing_fields.join(", "),
                 });
             }

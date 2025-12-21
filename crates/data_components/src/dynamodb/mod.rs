@@ -97,8 +97,8 @@ pub enum Error {
     JsonSerializationError { source: serde_json::Error },
 
     #[snafu(display(
-        "Fields specified in json_nesting_static_fields not found in table schema: {field_names}. \
-        Make sure configuration is correct, or increase schema_infer_max_records",
+        "Columns not found in table schema: {field_names}. \
+        Ensure configuration is correct, or increase schema_infer_max_records",
     ))]
-    FieldsNotFound { field_names: String },
+    ColumnsNotFound { field_names: String },
 }
