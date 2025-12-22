@@ -156,6 +156,7 @@ test_hadoop_catalog_docker = []
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
+aws-smithy-types = { workspace = true }
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.6.1"
