@@ -342,13 +342,18 @@ impl MetadataCatalog for CayenneCatalog {
 
         // Create the initial snapshot directory
         // Directory structure: [base_path]/[table_id]/[snapshot_id]/
-        let snapshot_dir = std::path::PathBuf::from(&base_path)
-            .join(table_id.to_string())
-            .join(&initial_snapshot_id);
+        // Create the initial snapshot directory (only for local paths)
+        // Directory structure: [base_path]/[table_id]/[snapshot_id]/
+        // For S3 paths, directories are virtual and created when files are written
+        if !base_path.starts_with("s3://") {
+            let snapshot_dir = std::path::PathBuf::from(&base_path)
+                .join(table_id.to_string())
+                .join(&initial_snapshot_id);
 
-        tokio::fs::create_dir_all(&snapshot_dir)
-            .await
-            .map_err(|e| CatalogError::Io { source: e })?;
+            tokio::fs::create_dir_all(&snapshot_dir)
+                .await
+                .map_err(|e| CatalogError::Io { source: e })?;
+        }
 
         Ok(table_id)
     }
