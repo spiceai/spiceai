@@ -759,7 +759,7 @@ fn warn_if_provided(
     }
 }
 
-const MAX_COMMENTS_FETCHED: u32 = 100;
+const MAX_COMMENTS_FETCHED: u32 = 75;
 
 // Organization-level resources (2 segments: owner/resource_type)
 const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
