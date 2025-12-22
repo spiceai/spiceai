@@ -208,11 +208,11 @@ impl TextToSqlWorker {
 async fn find_number_of_sql_attempts(spice_client: &spiceai::Client) -> Result<usize> {
     let data = retry_query_expecting_results(
         spice_client,
-        r#"
+        "
 SELECT count(1) AS cnt
 FROM runtime.task_history
 WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1) and task='sql_query'
-"#,
+",
         Duration::from_secs(10),
     )
     .await;
@@ -222,25 +222,26 @@ WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' orde
             "could not find task history for text to SQL"
         ));
     };
-    let count: i64 = rb
+    #[allow(clippy::cast_possible_truncation)]
+    let count = rb
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| anyhow::anyhow!("could not downcast input column to Int64Array"))?
-        .value(0);
-    Ok(count as usize)
+        .value(0) as usize;
+    Ok(count)
 }
 
 async fn find_last_sql_statement(spice_client: &spiceai::Client) -> Result<String> {
     let data = retry_query_expecting_results(
         spice_client,
-        r#"
+        "
 SELECT input
 FROM runtime.task_history
 WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1)
   AND task='sql_query'
 ORDER BY end_time DESC
-LIMIT 1"#,
+LIMIT 1",
         Duration::from_secs(10),
     )
     .await;
@@ -275,9 +276,9 @@ async fn retry_query_expecting_results(
     let data = Arc::new(tokio::sync::Mutex::new(None));
 
     wait_until_true(wait_for, || {
-        let spice_client = spice_client.clone();
+        let spice_client = Arc::clone(&spice_client);
         let query = query.clone();
-        let data = data.clone();
+        let data = Arc::clone(&data);
         async move {
             match spice_client.query(&query).await {
                 Ok(stream) => {
