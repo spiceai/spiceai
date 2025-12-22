@@ -74,7 +74,6 @@ impl GraphQLContext for IssuesTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // calculate cost based on secondary rate limit, as it is the more restrictive and delicate of the two
         // issues(first: 100) could retrieve up to 100 issues
         // each query returns labels, comments and assignees which are each additional requests
         // 1 + 100 (labels) + 100 (comments) + 100 (assignees) = 301 points
