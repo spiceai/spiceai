@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use governor::{
     Quota, RateLimiter,
@@ -30,6 +30,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub enum Error {
     #[snafu(display("Failed to acquire semaphore permit. {source}"))]
     SemaphoreAcquireError { source: tokio::sync::AcquireError },
+
+    #[snafu(display(
+        "The rate limiter has insufficient capacity for a request with weight '{weight}'. Reduce the request size, or increase the rate limit, and try again."
+    ))]
+    InsufficientCapacity { weight: u32 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,12 +62,19 @@ pub struct RateControllerBuilder {
     jitter: Option<JitterConfig>,
     max_concurrent_requests: Option<usize>,
     quotas: Vec<Quota>,
+    weighted_quota: Option<Quota>,
 }
 
 impl RateControllerBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_weighted_quota(mut self, quota: Quota) -> Self {
+        self.weighted_quota = Some(quota);
+        self
     }
 
     #[must_use]
@@ -98,11 +110,15 @@ impl RateControllerBuilder {
             .map(|quota| Arc::new(RateLimiter::direct(quota)))
             .collect::<Vec<_>>();
 
+        let weighted_rate_limiter = self
+            .weighted_quota
+            .map(|quota| Arc::new(RateLimiter::direct(quota)));
+
         let semaphore = self
             .max_concurrent_requests
             .map(|max_concurrent_requests| Arc::new(Semaphore::new(max_concurrent_requests)));
 
-        RateController::new(jitter, rate_limiters, semaphore)
+        RateController::new(jitter, rate_limiters, weighted_rate_limiter, semaphore)
     }
 }
 
@@ -110,12 +126,15 @@ impl RateControllerBuilder {
 pub struct RateController {
     jitter_config: JitterConfig,
     rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
+    weighted_rate_limiter:
+        Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
     semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug)]
 pub struct Permit {
     permit: Option<OwnedSemaphorePermit>,
+    weight: Option<u32>,
     rate_controller: Arc<RateController>,
 }
 
@@ -131,8 +150,10 @@ impl Permit {
     /// Re-check the quotas from an existing permit.
     /// For example, a request was permitted but has failed and needs to be retried.
     /// The caller retains their permit, but needs to ensure the rate limiters are still ready.
-    pub async fn until_ready(&self) {
-        Arc::clone(&self.rate_controller).until_ready().await;
+    pub async fn until_ready(&self) -> Result<()> {
+        Arc::clone(&self.rate_controller)
+            .until_weighted_ready(self.weight)
+            .await
     }
 }
 
@@ -142,18 +163,45 @@ impl RateController {
         RateControllerBuilder::new()
     }
 
-    async fn until_ready(self: Arc<Self>) {
+    async fn until_ready(self: Arc<Self>) -> Result<()> {
         futures::future::join_all(
             self.rate_limiters
                 .iter()
                 .map(|limiter| limiter.until_ready()),
         )
         .await;
+
+        Ok(())
+    }
+
+    async fn until_weighted_ready(self: Arc<Self>, weight: Option<u32>) -> Result<()> {
+        Arc::clone(&self).until_ready().await?;
+
+        if let Some(weight) = weight
+            && let Some(weighted_limiter) = &self.weighted_rate_limiter
+            && weight > 0
+        {
+            let Some(nonzero_weight) = NonZeroU32::new(weight) else {
+                unreachable!("weight checked to be > 0");
+            };
+
+            tracing::debug!("Acquiring weighted rate limiter for weight {weight}");
+
+            weighted_limiter
+                .until_n_ready(nonzero_weight)
+                .await
+                .map_err(|_| Error::InsufficientCapacity { weight })?;
+        }
+
+        Ok(())
     }
 
     fn new(
         jitter: Option<JitterConfig>,
         rate_limiters: Vec<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
+        weighted_rate_limiter: Option<
+            Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>,
+        >,
         semaphore: Option<Arc<Semaphore>>,
     ) -> Arc<Self> {
         let jitter_config = jitter.unwrap_or(JitterConfig {
@@ -164,17 +212,44 @@ impl RateController {
         Arc::new(Self {
             jitter_config,
             rate_limiters,
+            weighted_rate_limiter,
             semaphore,
         })
     }
 
-    /// Acquires a permit from the rate limiter.
+    /// Acquires a permit from the rate controller with a specified weight.
+    /// Asynchronously waits for the rate limiters to be ready and optionally acquires a semaphore permit for maximum concurrency if configured.
+    ///
+    /// The provided weight is used to check against the weighted quota, if configured.
+    ///
+    /// # Errors
+    ///
+    /// - If the semaphore has been closed, this will return an error.
+    /// - If the weighted quota does not have sufficient capacity for the provided weight, this will return an `InsufficientCapacity` error.
+    pub async fn acquire_weighted(self: &Arc<Self>, weight: u32) -> Result<Permit> {
+        self.acquire_weighted_opt(Some(weight)).await
+    }
+
+    /// Acquires a permit from the rate controller.
     /// Asynchronously waits for the rate limiters to be ready and optionally acquires a semaphore permit for maximum concurrency if configured.
     ///
     /// # Errors
     ///
     /// If the semaphore has been closed, this will return an error.
     pub async fn acquire(self: &Arc<Self>) -> Result<Permit> {
+        self.acquire_weighted_opt(None).await
+    }
+
+    /// Acquires a permit from the rate controller with an optional weight.
+    /// Asynchronously waits for the rate limiters to be ready and optionally acquires a semaphore permit for maximum concurrency if configured.
+    ///
+    /// The provided weight is used to check against the weighted quota, if configured.
+    ///
+    /// # Errors
+    ///
+    /// - If the semaphore has been closed, this will return an error.
+    /// - If the weighted quota does not have sufficient capacity for the provided weight, this will return an `InsufficientCapacity` error.
+    pub async fn acquire_weighted_opt(self: &Arc<Self>, weight: Option<u32>) -> Result<Permit> {
         let self_cloned = Arc::clone(self);
 
         // check for concurrency first - we may end up waiting for a concurrent request long enough that the rate limits clear
@@ -190,7 +265,7 @@ impl RateController {
         };
 
         // check all of the rate limiters async
-        Arc::clone(self).until_ready().await;
+        Arc::clone(self).until_weighted_ready(weight).await?;
 
         // add jitter
         let jitter_wait = rand::random_range(self.jitter_config.min..=self.jitter_config.max);
@@ -198,6 +273,7 @@ impl RateController {
 
         Ok(Permit {
             permit: semaphore,
+            weight,
             rate_controller: self_cloned,
         })
     }
@@ -291,7 +367,7 @@ mod tests {
 
         // The next request should wait until the rate limit is reset
         tokio::select! {
-            () = permit.until_ready() => {
+            _ = permit.until_ready() => {
                 panic!("Expected rate limiter to block, but it did not.");
             },
             () = tokio::time::sleep(Duration::from_secs(5)) => {}
@@ -299,7 +375,7 @@ mod tests {
 
         // permit should be able to be ready after the rate limit resets
         tokio::select! {
-            () = permit.until_ready() => {}
+            _ = permit.until_ready() => {}
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 panic!("Expected to be able to acquire a permit after rate limit reset, but timed out.");
             }

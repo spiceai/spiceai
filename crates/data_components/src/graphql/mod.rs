@@ -138,4 +138,11 @@ pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
     fn error_checker(&self) -> Option<ErrorChecker> {
         None
     }
+
+    /// If the query has a cost associated with it, return it
+    /// This value is only used when a rate controller is also supplied to the GraphQL client
+    /// When query cost is empty, the rate controller quotas are not updated
+    fn query_cost(&self) -> Option<u32> {
+        None
+    }
 }

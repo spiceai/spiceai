@@ -95,6 +95,7 @@ impl GraphQLTableProviderBuilder {
                     None,
                     None,
                     self.context.clone().and_then(|o| o.error_checker()),
+                    None,
                 )
                 .await?;
         }
@@ -107,6 +108,7 @@ impl GraphQLTableProviderBuilder {
                 None,
                 None,
                 self.context.clone().and_then(|o| o.error_checker()),
+                None,
             )
             .await?;
 
@@ -189,7 +191,7 @@ impl TableProvider for GraphQLTableProvider {
         let mut query = GraphQLQuery::try_from(Arc::clone(&self.base_query))
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-        let error_checker = if let Some(context) = &self.context {
+        let (error_checker, query_cost) = if let Some(context) = &self.context {
             let parameters = filters
                 .iter()
                 .map(|f| context.filter_pushdown(f))
@@ -197,9 +199,9 @@ impl TableProvider for GraphQLTableProvider {
 
             context.inject_parameters(&parameters, &mut query)?;
 
-            context.error_checker()
+            (context.error_checker(), context.query_cost())
         } else {
-            None
+            (None, None)
         };
 
         let graphql_exec = Arc::new(GraphQLTableProviderExec::new(
@@ -210,6 +212,7 @@ impl TableProvider for GraphQLTableProvider {
             limit,
             error_checker,
             self.transform_fn,
+            query_cost,
         ));
 
         if let Some(projection) = projection {
@@ -239,6 +242,7 @@ pub struct GraphQLTableProviderExec {
     error_checker: Option<ErrorChecker>,
     transform_fn: Option<TransformFn>,
     properties: PlanProperties,
+    query_cost: Option<u32>,
 }
 
 impl GraphQLTableProviderExec {
@@ -251,6 +255,7 @@ impl GraphQLTableProviderExec {
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
         transform_fn: Option<TransformFn>,
+        query_cost: Option<u32>,
     ) -> Self {
         Self {
             client,
@@ -266,6 +271,7 @@ impl GraphQLTableProviderExec {
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
+            query_cost,
         }
     }
 }
@@ -331,6 +337,7 @@ impl ExecutionPlan for GraphQLTableProviderExec {
             Arc::clone(&self.table_schema),
             self.limit,
             self.error_checker.clone(),
+            self.query_cost,
         );
 
         if let Some(transform_fn) = &self.transform_fn {
