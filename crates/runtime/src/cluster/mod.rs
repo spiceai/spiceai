@@ -284,16 +284,6 @@ pub async fn initialize_cluster_executor(
     let runtime_producer: RuntimeProducer =
         Arc::new(move |_cfg| Ok(Arc::clone(&runtime_handle.df.ctx.runtime_env())));
 
-    let config_producer: ConfigProducer = Arc::new(move || {
-        SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
-    });
-
-    let work_dir = rt
-        .df
-        .temp_directory
-        .clone()
-        .unwrap_or(env::temp_dir().to_string_lossy().to_string());
-
     // Get scheduler URL - required for executors
     let Some(scheduler_url) = rt.df.cluster_config.scheduler_address() else {
         return Err(FailedToStartClusterExecutor {
@@ -311,6 +301,25 @@ pub async fn initialize_cluster_executor(
                 .into(),
         });
     };
+
+    let config_producer_tls = client_tls_config.clone();
+
+    // Configure mTLS for executor-to-executor gRPC connections (e.g., shuffle fetch)
+    let config_producer: ConfigProducer = Arc::new(move || {
+        SessionConfig::new_with_ballista()
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_use_tls(true)
+            .with_ballista_override_create_grpc_client_endpoint({
+                let tls_config = config_producer_tls.clone();
+                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
+            })
+    });
+
+    let work_dir = rt
+        .df
+        .temp_directory
+        .clone()
+        .unwrap_or(env::temp_dir().to_string_lossy().to_string());
 
     let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
         .boxed()
