@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 use arrow_schema::ArrowError;
-use async_openai::{error::OpenAIError, types::CreateChatCompletionRequest};
+use async_openai::{error::OpenAIError, types::chat::CreateChatCompletionRequest};
 
 use dataset::{DatasetInput, DatasetOutput, get_eval_data};
 use llms::chat::Chat;

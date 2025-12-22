@@ -133,7 +133,7 @@ pub(crate) async fn post(
         input = %serde_json::to_string(&req).unwrap_or_default()
     );
     span.in_scope(
-        || tracing::info!(target: "task_history", model = %req.model, api = "responses", "labels"),
+        || tracing::info!(target: "task_history", model = %req.model.clone().unwrap_or_default(), api = "responses", "labels"),
     );
 
     if let Some(traceparent) = context.trace_parent() {
@@ -142,7 +142,7 @@ pub(crate) async fn post(
 
     let span_clone = span.clone();
     async move {
-        let model_id = req.model.clone();
+        let model_id = req.model.clone().unwrap_or_default();
         let stream = req.stream.unwrap_or(false);
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {

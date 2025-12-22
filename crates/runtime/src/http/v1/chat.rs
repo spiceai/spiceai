@@ -193,7 +193,7 @@ async fn handle_streaming(
         let mut events = match get_event_stream() {
             Ok(o) => o,
             Err(e) => {
-                return openai_error_to_response(OpenAIError::EventStream(format!(
+                return openai_error_to_response(OpenAIError::InvalidArgument(format!(
                     "An error occurred in reading progress: {e}"
                 )));
             }

@@ -26,13 +26,13 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionTokensDetails,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionObject,
-    PromptTokensDetails,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
+    FunctionObject, PromptTokensDetails, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -77,7 +77,6 @@ impl ToolUsingChat {
         self.tools
             .iter()
             .map(|t| ChatCompletionTool {
-                r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: t.strict(),
                     name: encode_tool_name(t.name().to_string().as_str()),
@@ -114,14 +113,15 @@ impl ToolUsingChat {
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
         Ok(vec![
             ChatCompletionRequestAssistantMessageArgs::default()
-                .tool_calls(vec![ChatCompletionMessageToolCall {
-                    id: "initial_list_datasets".to_string(),
-                    r#type: ChatCompletionToolType::Function,
-                    function: FunctionCall {
-                        name: list_datasets.name().to_string(),
-                        arguments: String::new(),
+                .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
+                    ChatCompletionMessageToolCall {
+                        id: "initial_list_datasets".to_string(),
+                        function: FunctionCall {
+                            name: list_datasets.name().to_string(),
+                            arguments: String::new(),
+                        },
                     },
-                }])
+                )])
                 .build()?
                 .into(),
             ChatCompletionRequestToolMessageArgs::default()
@@ -225,7 +225,13 @@ impl ToolUsingChat {
         // Tell model the assistant has these tools
         let assistant_message: ChatCompletionRequestMessage =
             ChatCompletionRequestAssistantMessageArgs::default()
-                .tool_calls(spiced_tools.clone()) // TODO - should this include non-spiced tools?
+                .tool_calls(
+                    spiced_tools
+                        .iter()
+                        .cloned()
+                        .map(ChatCompletionMessageToolCalls::Function)
+                        .collect_vec(),
+                ) // TODO - should this include non-spiced tools?
                 .build()?
                 .into();
 
@@ -283,11 +289,9 @@ impl ToolUsingChat {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         Box::pin(async move {
             // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-            if req
-                .tool_choice
-                .as_ref()
-                .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
-            {
+            if req.tool_choice.as_ref().is_some_and(|c| {
+                *c == ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None)
+            }) {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return self.inner_chat.chat_request(req).await;
             }
@@ -310,11 +314,18 @@ impl ToolUsingChat {
                 .first()
                 .and_then(|c| c.message.tool_calls.clone());
 
+            // Extract inner ChatCompletionMessageToolCall from the ChatCompletionMessageToolCalls enum
+            let tool_calls: Vec<ChatCompletionMessageToolCall> = tools_used
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|tc| match tc {
+                    ChatCompletionMessageToolCalls::Function(call) => Some(call),
+                    ChatCompletionMessageToolCalls::Custom(_) => None,
+                })
+                .collect();
+
             match self
-                .process_tool_calls_and_run_spice_tools(
-                    req.messages,
-                    tools_used.unwrap_or_default(),
-                )
+                .process_tool_calls_and_run_spice_tools(req.messages, tool_calls)
                 .await?
             {
                 // New messages means we have run spice tools locally, ready to recall model.
@@ -336,16 +347,33 @@ impl ToolUsingChat {
 
     /// Add the spice runtime tools to a list of tools (may contain external tools too), and ensure no duplicates.
     fn add_runtime_tools(&self, req: &CreateChatCompletionRequest) -> CreateChatCompletionRequest {
-        let mut runtime_tools = self.runtime_tools();
+        let runtime_tools = self.runtime_tools();
         if runtime_tools.is_empty() {
             req.clone()
         } else {
-            runtime_tools.extend(req.tools.clone().unwrap_or_default());
+            // Wrap runtime tools in ChatCompletionTools::Function and combine with existing tools
+            let mut all_tools: Vec<ChatCompletionTools> = runtime_tools
+                .into_iter()
+                .map(ChatCompletionTools::Function)
+                .collect();
+            all_tools.extend(req.tools.clone().unwrap_or_default());
+
+            // Helper to extract function name from ChatCompletionTools
+            fn get_fn_name(t: &ChatCompletionTools) -> Option<&str> {
+                match t {
+                    ChatCompletionTools::Function(f) => Some(&f.function.name),
+                    ChatCompletionTools::Custom(_) => None,
+                }
+            }
+
             // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
-            runtime_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-            runtime_tools.dedup_by(|a, b| a.function.name == b.function.name);
+            all_tools.sort_by(|a, b| get_fn_name(a).cmp(&get_fn_name(b)));
+            all_tools.dedup_by(|a, b| match (get_fn_name(a), get_fn_name(b)) {
+                (Some(a_name), Some(b_name)) => a_name == b_name,
+                _ => false,
+            });
             let mut req = req.clone();
-            req.tools = Some(runtime_tools);
+            req.tools = Some(all_tools);
             req
         }
     }
@@ -358,7 +386,7 @@ impl ToolUsingChat {
         if req
             .tool_choice
             .as_ref()
-            .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
+            .is_some_and(|c| *c == ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None))
         {
             return self.inner_chat.chat_stream(req).await;
         }
@@ -462,11 +490,13 @@ fn create_new_recursive_req(
     // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
     if matches!(
         new_req.tool_choice,
-        Some(ChatCompletionToolChoiceOption::Named(_)) | None
+        Some(ChatCompletionToolChoiceOption::Function(_)) | None
     ) {
         // Auto is default when tools exist.
         tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
-        new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Auto);
+        new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
     }
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
@@ -564,7 +594,10 @@ fn insert_initial_tools(
         else {
             return false;
         };
-        tools.iter().any(|t| t.function.name == tool_name)
+        tools.iter().any(|t| match t {
+            ChatCompletionMessageToolCalls::Function(call) => call.function.name == tool_name,
+            ChatCompletionMessageToolCalls::Custom(_) => false,
+        })
     }) {
         return messages;
     }
@@ -666,7 +699,6 @@ fn make_a_stream(
                                 let state = states_lock.entry(key).or_insert_with(|| {
                                     ChatCompletionMessageToolCall {
                                         id: tool_call_data.id.clone().unwrap_or_default(),
-                                        r#type: ChatCompletionToolType::Function,
                                         function: FunctionCall {
                                             name: tool_call_data
                                                 .function
@@ -845,7 +877,7 @@ mod tests {
     use async_openai::types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionToolType, FunctionCall,
+        ChatCompletionRequestUserMessageArgs, FunctionCall,
     };
 
     fn create_system_message(content: &str) -> ChatCompletionRequestMessage {
@@ -886,7 +918,6 @@ mod tests {
     fn create_list_datasets_tool_call() -> ChatCompletionMessageToolCall {
         ChatCompletionMessageToolCall {
             id: "test_id".to_string(),
-            r#type: ChatCompletionToolType::Function,
             function: FunctionCall {
                 name: "list_datasets".to_string(),
                 arguments: "{}".to_string(),
@@ -933,7 +964,6 @@ mod tests {
     fn test_insert_initial_tools_with_existing_assistant_message() {
         let existing_tool_call = ChatCompletionMessageToolCall {
             id: "existing_id".to_string(),
-            r#type: ChatCompletionToolType::Function,
             function: FunctionCall {
                 name: "other_tool".to_string(),
                 arguments: "{}".to_string(),
@@ -982,7 +1012,6 @@ mod tests {
     fn test_insert_initial_tools_with_different_tool_name() {
         let existing_tool_call = ChatCompletionMessageToolCall {
             id: "other_id".to_string(),
-            r#type: ChatCompletionToolType::Function,
             function: FunctionCall {
                 name: "other_tool".to_string(),
                 arguments: "{}".to_string(),
