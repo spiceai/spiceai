@@ -11,7 +11,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::chat::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
+use async_openai::types::chat::{
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
@@ -252,7 +254,9 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             content,
             ..
         }) => match content {
-            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Text(t) => {
+                t.clone()
+            }
             async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
@@ -268,7 +272,9 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
         }) => match content {
-            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Text(t) => {
+                t.clone()
+            }
             async_openai::types::chat::ChatCompletionRequestToolMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
@@ -312,11 +318,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         }) => match content {
             ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
-                let x: Vec<_> = parts.iter().filter_map(|p| {
-                    match p {
-                        ChatCompletionRequestDeveloperMessageContentPart::Text(t) => Some(t.text.clone()),
-                    }
-                }).collect();
+                let x: Vec<_> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ChatCompletionRequestDeveloperMessageContentPart::Text(t) => {
+                            Some(t.text.clone())
+                        }
+                    })
+                    .collect();
                 x.join("\n")
             }
         },
@@ -383,11 +392,14 @@ pub fn message_to_mistral(
             ..
         }) => {
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts.iter().filter_map(|p| {
-                match p {
-                    ChatCompletionRequestDeveloperMessageContentPart::Text(t) => Some(t.text.clone()),
-                }
-            }).collect::<Vec<_>>();
+            let content_json = parts
+                .iter()
+                .filter_map(|p| match p {
+                    ChatCompletionRequestDeveloperMessageContentPart::Text(t) => {
+                        Some(t.text.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
             IndexMap::from([
                 (
                     String::from("role"),

@@ -29,11 +29,10 @@ use crate::streaming_utils::{create_stream_response, generate_stream_id};
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessage,
-    ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestDeveloperMessageContentPart,
-    ChatCompletionRequestMessage,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
@@ -175,11 +174,14 @@ impl BedrockConverse {
                         tools
                             .iter()
                             .filter_map(|t| {
-                                let ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                    id,
-                                    function: FunctionCall { name, arguments },
-                                    ..
-                                }) = t else {
+                                let ChatCompletionMessageToolCalls::Function(
+                                    ChatCompletionMessageToolCall {
+                                        id,
+                                        function: FunctionCall { name, arguments },
+                                        ..
+                                    },
+                                ) = t
+                                else {
                                     return None;
                                 };
 
@@ -285,13 +287,11 @@ impl BedrockConverse {
                     },
                 ) => arr
                     .into_iter()
-                    .filter_map(|s| {
-                        match s {
-                            ChatCompletionRequestDeveloperMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText { text },
-                            ) => Some(SystemContentBlock::Text(text)),
-                            _ => None,
-                        }
+                    .filter_map(|s| match s {
+                        ChatCompletionRequestDeveloperMessageContentPart::Text(
+                            ChatCompletionRequestMessageContentPartText { text },
+                        ) => Some(SystemContentBlock::Text(text)),
+                        _ => None,
                     })
                     .collect(),
                 _ => vec![],
@@ -469,7 +469,11 @@ impl BedrockConverse {
                     message: ChatCompletionResponseMessage {
                         content: Some(content.into_iter().flatten().join("\n")),
                         refusal: Some(refusals.into_iter().flatten().join("\n")),
-                        tool_calls: if tool_calls_enum.is_empty() { None } else { Some(tool_calls_enum) },
+                        tool_calls: if tool_calls_enum.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls_enum)
+                        },
                         annotations: None,
                         role: try_convert_role(role)?,
                         function_call: None,

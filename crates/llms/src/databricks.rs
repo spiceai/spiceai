@@ -21,10 +21,10 @@ use async_openai::{
     traits::RequestOptionsBuilder,
     types::chat::{
         ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
-        ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
-        CreateChatCompletionRequest, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, PromptTokensDetails, ServiceTier,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream, ChatCompletionTools,
+        CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, PromptTokensDetails,
+        ServiceTier,
     },
     types::embeddings::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
 };
@@ -273,7 +273,12 @@ impl Chat for Databricks {
                         Item = Result<DatabricksCreateChatCompletionStreamResponse, OpenAIError>,
                     > + Send,
             >,
-        > = self.client.chat().path("")?.create_stream_byot(altered_req).await?;
+        > = self
+            .client
+            .chat()
+            .path("")?
+            .create_stream_byot(altered_req)
+            .await?;
         Ok(Box::pin(stream.map_ok(Into::into)))
     }
 
@@ -282,7 +287,11 @@ impl Chat for Databricks {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         // Must use `create_byot` with empty path to avoid concatenation of `chat/completions`.
-        self.client.chat().path("")?.create_byot(self.alter_request(req)).await
+        self.client
+            .chat()
+            .path("")?
+            .create_byot(self.alter_request(req))
+            .await
     }
 }
 

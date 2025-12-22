@@ -84,7 +84,10 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
         {
             Some(message) => match serde_json::from_str(message) {
                 Ok(StructuredNsqlOutput { sql }) => Ok(Some(sql)),
-                Err(e) => Err(OpenAIError::JSONDeserialize(e, "Failed to parse structured output".to_string())),
+                Err(e) => Err(OpenAIError::JSONDeserialize(
+                    e,
+                    "Failed to parse structured output".to_string(),
+                )),
             },
             None => Ok(None),
         }

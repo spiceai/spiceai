@@ -19,8 +19,8 @@ use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CompletionUsage,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
+        ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
+        FinishReason, FunctionCallStream, FunctionType, Role,
     },
 };
 use futures::{Stream, StreamExt};
@@ -260,9 +260,7 @@ pub struct MessageDelta {
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
 pub fn transform_stream(
-    stream: Pin<
-        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>,
-    >,
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:

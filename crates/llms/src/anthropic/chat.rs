@@ -24,16 +24,16 @@ use async_openai::traits::RequestOptionsBuilder;
 use async_openai::types::chat::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionNamedToolChoice, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
-    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolChoiceOption,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason,
-    FunctionCall, FunctionName, Role, StopConfiguration, ToolChoiceOptions,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionResponseStream, ChatCompletionToolChoiceOption, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall,
+    FunctionName, Role, StopConfiguration, ToolChoiceOptions,
 };
 use serde_json::json;
 
@@ -41,7 +41,8 @@ use super::Anthropic;
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
     MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens, tool_from_completion_tools,
+    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
+    tool_from_completion_tools,
 };
 use super::types_stream::transform_stream;
 use async_trait::async_trait;
@@ -384,13 +385,13 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             messages,
 
             tool_choice: match value.tool_choice {
-                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => Some(ToolChoiceParam::auto(
-                    !value.parallel_tool_calls.unwrap_or_default(),
-                )),
+                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => Some(
+                    ToolChoiceParam::auto(!value.parallel_tool_calls.unwrap_or_default()),
+                ),
                 None | Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None)) => None,
-                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => Some(ToolChoiceParam::any(
-                    !value.parallel_tool_calls.unwrap_or_default(),
-                )),
+                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => Some(
+                    ToolChoiceParam::any(!value.parallel_tool_calls.unwrap_or_default()),
+                ),
                 Some(ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
                     function: FunctionName { name },
                     ..
@@ -400,7 +401,9 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                 )),
                 _ => None, // AllowedTools or Custom not supported
             },
-            tools: value.tools.map(|t| t.iter().filter_map(tool_from_completion_tools).collect()),
+            tools: value
+                .tools
+                .map(|t| t.iter().filter_map(tool_from_completion_tools).collect()),
         })
     }
 }

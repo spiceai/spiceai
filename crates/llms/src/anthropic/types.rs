@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{error::OpenAIError, types::chat::{ChatCompletionTool, ChatCompletionTools}};
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{ChatCompletionTool, ChatCompletionTools},
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

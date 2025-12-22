@@ -23,11 +23,10 @@ use async_openai::{
     types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
         ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionTools, ChatCompletionToolChoiceOption,
-        CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
-        StopConfiguration, ToolChoiceOptions,
+        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
     },
 };
 use async_stream::stream;

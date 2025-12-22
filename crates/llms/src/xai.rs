@@ -121,12 +121,7 @@ struct Model {
 impl Chat for Xai {
     async fn health(&self) -> Result<(), Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
-        match self
-            .client
-            .models()
-            .retrieve(&self.model)
-            .await
-        {
+        match self.client.models().retrieve(&self.model).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");

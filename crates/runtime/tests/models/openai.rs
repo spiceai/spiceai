@@ -29,15 +29,15 @@ use crate::{
 use app::AppBuilder;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
-use async_openai::types::responses::{
-    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
-};
 use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs,
 };
 use async_openai::types::embeddings::EmbeddingInput;
 use async_openai::types::responses::{Content, Response as OpenAIResponse};
+use async_openai::types::responses::{
+    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
+};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;

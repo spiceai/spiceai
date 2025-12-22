@@ -71,7 +71,9 @@ mod tests {
     use super::Includes;
     use super::Scorer;
     use super::{DatasetInput, DatasetOutput};
-    use async_openai::types::chat::{ChatChoice, ChatCompletionResponseMessage, FinishReason, Role};
+    use async_openai::types::chat::{
+        ChatChoice, ChatCompletionResponseMessage, FinishReason, Role,
+    };
     use paste::paste;
 
     /// Macro to define test cases for Includes scorer with `AssistantResponse` variant.

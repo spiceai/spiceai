@@ -18,8 +18,8 @@ limitations under the License.
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::chat::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta, ChatCompletionTools,
-    ChatCompletionToolChoiceOption, CompletionUsage, FinishReason,
+    ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage, FinishReason,
     FunctionCall, FunctionName, FunctionObject, PromptTokensDetails, Role, ToolChoiceOptions,
 };
 use aws_sdk_bedrockruntime::error::SdkError;
