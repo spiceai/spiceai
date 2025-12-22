@@ -1034,7 +1034,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn scan_plan_with_partitioned_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
         let bucket_name = "test-bucket";

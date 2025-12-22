@@ -95,6 +95,8 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
+zip = "3.0.0"
+tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
@@ -151,6 +153,7 @@ test_hadoop_catalog_docker = []
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
+aws-smithy-types = { workspace = true }
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.6.1"

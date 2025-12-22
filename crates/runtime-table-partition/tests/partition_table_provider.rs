@@ -409,7 +409,6 @@ async fn test_explain_plan_filtering() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -532,7 +531,6 @@ async fn test_bucket_in_list_plan_filtering() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_truncate_in_list_plan_filtering() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),

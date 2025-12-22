@@ -607,7 +607,6 @@ impl Stream for CustomStream {
     }
 }
 
-#[expect(clippy::too_many_lines)]
 fn make_a_stream(
     span: Span,
     request_context: Arc<RequestContext>,

@@ -57,7 +57,6 @@ impl ParameterValue {
 
 /// Defines parameters for TPC-H queries. Values are extracted from the original TPC-H queries,
 /// with their values replaced with $1 parameters in the `/parameterized/` TPC-H files.
-#[expect(clippy::too_many_lines)]
 #[must_use]
 pub fn add_tpch_parameters(queries: Vec<Query>) -> Vec<Query> {
     queries

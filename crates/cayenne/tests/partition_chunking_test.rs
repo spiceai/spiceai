@@ -30,7 +30,6 @@ use std::sync::Arc;
 // Generate test variants for each backend
 test_with_backends!(test_partitioned_table_with_chunking_impl);
 
-#[expect(clippy::too_many_lines)]
 async fn test_partitioned_table_with_chunking_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -316,7 +315,6 @@ async fn test_partitioned_table_with_large_chunks_impl(
 // Generate test variants for timestamp partitioning test
 test_with_backends!(test_timestamp_partition_with_date_part_impl);
 
-#[expect(clippy::too_many_lines)]
 async fn test_timestamp_partition_with_date_part_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {

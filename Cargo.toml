@@ -69,7 +69,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.90"
-version = "1.10.1"
+version = "1.10.2"
 
 [workspace.dependencies]
 ahash = "0.8.12"
@@ -261,6 +261,7 @@ tokio = { version = "1", features = [
     "signal",
     "macros",
     "test-util",
+    "time",
 ] }
 tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
@@ -328,7 +329,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "b645aa11f67bf2921d3c6701344a172972e81611" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "b645aa11f67bf2921d3c6701344a172972e81611" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "4a9f784fc15a795ca428860b65602b1d777faf9a" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c9363befa430a53c471fc18a811ea0769e631114" } # spiceai
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "afcbd1ce99703f1322d176fc1b99745f647234d0" } # spiceai:spiceai-50
 

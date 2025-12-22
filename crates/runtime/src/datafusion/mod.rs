@@ -270,7 +270,7 @@ pub enum Error {
     AppendRequiresTimeColumn { from: String },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS data connector. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
+        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS or localpod data connectors. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
     ))]
     InvalidCachingRefreshMode {
         dataset_name: String,
@@ -974,7 +974,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -1027,8 +1026,9 @@ impl DataFusion {
             let connector = dataset.source();
             let is_http_connector =
                 connector.eq_ignore_ascii_case("http") || connector.eq_ignore_ascii_case("https");
+            let is_localpod_connector = connector.eq_ignore_ascii_case(LOCALPOD_DATACONNECTOR);
             ensure!(
-                is_http_connector,
+                is_http_connector || is_localpod_connector,
                 InvalidCachingRefreshModeSnafu {
                     dataset_name: dataset.name.to_string(),
                     connector: connector.to_string(),
@@ -1212,6 +1212,7 @@ impl DataFusion {
                 acceleration_settings.snapshot_behavior.clone(),
                 Some(snapshot_path),
                 acceleration_settings.snapshots_trigger_threshold,
+                acceleration_settings.snapshots_create_interval,
             );
         }
 
@@ -1288,7 +1289,7 @@ impl DataFusion {
     ///
     /// This will not work if:
     /// - The parent table is not an accelerated table.
-    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    /// - The parent and child acceleration modes don't match (both must be Full or both must be Caching).
     ///
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
     pub async fn attempt_to_synchronize_accelerated_table(

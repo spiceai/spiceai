@@ -37,7 +37,6 @@ use tonic_health::pb::health_client::HealthClient;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

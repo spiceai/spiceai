@@ -252,7 +252,6 @@ macro_rules! append_value {
     };
 }
 
-#[expect(clippy::too_many_lines)]
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
