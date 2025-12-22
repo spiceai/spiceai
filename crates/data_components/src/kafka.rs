@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{any::Any, sync::Arc};
-
+use arrow::datatypes::Schema;
 use arrow::{datatypes::SchemaRef, json::ReaderBuilder};
 use datafusion::common::project_schema;
 use datafusion::{
@@ -26,7 +24,7 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
@@ -35,10 +33,15 @@ use rdkafka::{
     util::get_rdkafka_version,
 };
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use snafu::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use std::{any::Any, sync::Arc};
+use tokio_stream::StreamExt;
 use tonic::async_trait;
 
-use crate::cdc::{self, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
+use crate::cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 
 pub use rdkafka;
 
@@ -70,6 +73,9 @@ pub enum Error {
 
     #[snafu(display("The metadata for topic {topic} was not found."))]
     MetadataTopicNotFound { topic: String },
+
+    #[snafu(display("Received empty batch. Retry"))]
+    EmptyBatch,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -278,7 +284,7 @@ impl KafkaConsumer {
     pub fn stream_json<K: DeserializeOwned, V: DeserializeOwned>(
         &self,
     ) -> impl Stream<Item = Result<KafkaMessage<'_, K, V>>> {
-        self.consumer.stream().filter_map(move |msg| async move {
+        self.consumer.stream().filter_map(move |msg| {
             let msg = match msg {
                 Ok(msg) => msg,
                 Err(e) => return Some(Err(Error::UnableToReceiveMessage { source: e })),
@@ -484,6 +490,7 @@ pub struct Kafka {
     schema: SchemaRef,
     consumer: &'static KafkaConsumer,
     flatten_json: Option<String>,
+    batching: (usize, Duration),
 }
 
 impl std::fmt::Debug for Kafka {
@@ -503,6 +510,7 @@ impl Kafka {
             schema,
             consumer: Box::leak(Box::new(consumer)),
             flatten_json: None,
+            batching: (10000, Duration::from_secs(1)),
         }
     }
 
@@ -513,42 +521,77 @@ impl Kafka {
     }
 
     #[must_use]
+    pub fn with_batching(mut self, batching: (usize, Duration)) -> Self {
+        self.batching = batching;
+        self
+    }
+
+    #[must_use]
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();
         let stream = self
             .consumer
             .stream_json::<serde_json::Value, serde_json::Value>()
-            .map(move |msg| {
+            .chunks_timeout(self.batching.0, self.batching.1)
+            .map(move |msgs| {
                 let schema = Arc::clone(&schema);
-                let msg = msg.map_err(cdc::StreamError::Kafka)?;
 
-                let json_str = match flatten_json {
-                    Some(ref delimiter) => {
-                        dataformat_json::flatten_json_obj(msg.value(), delimiter).to_string()
-                    }
-                    None => msg.value().to_string(),
+                // Collect all successful messages, fail on first error
+                let mut messages: Vec<_> = msgs
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(cdc::StreamError::Kafka)?;
+
+                if messages.is_empty() {
+                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
+                }
+
+                let change_batch = values_to_change_batch(
+                    messages.iter().map(KafkaMessage::value),
+                    flatten_json.as_ref(),
+                    &schema,
+                );
+
+                // Take the last message for the envelope
+                let Some(last_msg) = messages.pop() else {
+                    unreachable!("checked non-empty above");
                 };
 
-                // convert JSON string to Arrow record batch
-                let rb = ReaderBuilder::new(Arc::clone(&schema))
-                    .build(std::io::Cursor::new(json_str.as_bytes()))
-                    .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
-                    .next()
-                    .transpose()
-                    .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
-                    .ok_or_else(|| {
-                        cdc::StreamError::Arrow("No record batch found in JSON message".to_string())
-                    })?;
-
-                // Wrap the record batch to emulate a change event
-                cdc::wrap_data_as_change_batch(&schema, &rb)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb, true))
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+                change_batch.map(|rb| ChangeEnvelope::new(Box::new(last_msg), rb, true))
             });
 
         Box::pin(stream)
     }
+}
+
+fn values_to_change_batch<'a>(
+    values: impl Iterator<Item = &'a Value>,
+    flatten_json: Option<&String>,
+    schema: &Arc<Schema>,
+) -> Result<ChangeBatch, cdc::StreamError> {
+    // Build newline-delimited JSON from all values
+    let json_str: String = values
+        .map(|value| match flatten_json {
+            Some(delimiter) => dataformat_json::flatten_json_obj(value, delimiter).to_string(),
+            None => value.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Convert JSON string to Arrow record batch (ReaderBuilder handles NDJSON)
+    let rb = ReaderBuilder::new(Arc::clone(schema))
+        .build(std::io::Cursor::new(json_str.as_bytes()))
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
+        .next()
+        .transpose()
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
+        .ok_or_else(|| {
+            cdc::StreamError::Arrow("No record batch found in JSON message".to_string())
+        })?;
+
+    cdc::wrap_data_as_change_batch(schema, &rb)
+        .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
 }
 
 #[async_trait]
@@ -576,5 +619,156 @@ impl TableProvider for Kafka {
             &self.schema,
             projection,
         )?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+    }
+
+    fn test_schema_with_nullable() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]))
+    }
+
+    #[test]
+    fn test_single_message() {
+        let schema = test_schema();
+        let values = [json!({"id": 1, "name": "alice"})];
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_multiple_messages() {
+        let schema = test_schema();
+        let values = [
+            json!({"id": 1, "name": "alice"}),
+            json!({"id": 2, "name": "bob"}),
+            json!({"id": 3, "name": "charlie"}),
+        ];
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_empty_messages() {
+        let schema = test_schema();
+        let values: Vec<serde_json::Value> = vec![];
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        match result {
+            Err(cdc::StreamError::Arrow(msg)) => {
+                assert!(msg.contains("No record batch found"));
+            }
+            _ => panic!("Expected Arrow error"),
+        }
+    }
+
+    #[test]
+    fn test_with_null_fields() {
+        let schema = test_schema_with_nullable();
+        let values = [
+            json!({"id": 1, "name": "alice", "age": 30}),
+            json!({"id": 2, "name": null, "age": null}),
+            json!({"id": 3, "name": "charlie", "age": 25}),
+        ];
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_with_flatten_json() {
+        // Schema expects flattened field names
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("address_city", DataType::Utf8, false),
+            Field::new("address_zip", DataType::Utf8, false),
+        ]));
+
+        let values = [
+            json!({"id": 1, "address": {"city": "NYC", "zip": "10001"}}),
+            json!({"id": 2, "address": {"city": "LA", "zip": "90001"}}),
+        ];
+
+        let result = values_to_change_batch(values.iter(), Some(&"_".to_string()), &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_schema_mismatch_returns_error() {
+        let schema = test_schema(); // expects id (Int64), name (Utf8)
+        let values = [json!({"wrong_field": "value"})];
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        result.expect_err("error");
+    }
+
+    #[test]
+    fn test_change_batch_has_correct_structure() {
+        let schema = test_schema();
+        let values = [
+            json!({"id": 1, "name": "alice"}),
+            json!({"id": 2, "name": "bob"}),
+        ];
+
+        let batch = values_to_change_batch(values.iter(), None, &schema).expect("batch");
+
+        // ChangeBatch should have: op, primary_keys, data columns
+        let record_batch = batch.record;
+        assert_eq!(record_batch.num_columns(), 3);
+
+        // Check op column has "c" for all rows
+        let op_col = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("array");
+        assert_eq!(op_col.value(0), "c");
+        assert_eq!(op_col.value(1), "c");
+    }
+
+    #[test]
+    fn test_large_batch() {
+        let schema = test_schema();
+        let values: Vec<Value> = (0..1000)
+            .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
+            .collect();
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 1000);
     }
 }

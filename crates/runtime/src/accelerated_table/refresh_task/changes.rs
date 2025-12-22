@@ -452,6 +452,11 @@ enum StreamErrorType {
 /// These errors are generally nonfatal and often indicate that the consumer should retry or continue polling.
 fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) -> StreamErrorType {
     #[cfg(any(feature = "debezium", feature = "kafka"))]
+    if matches!(err, cdc::StreamError::Kafka(KafkaError::EmptyBatch)) {
+        return StreamErrorType::Transient;
+    }
+
+    #[cfg(any(feature = "debezium", feature = "kafka"))]
     if let cdc::StreamError::Kafka(KafkaError::UnableToReceiveMessage { source }) = err {
         match source {
             RdKafkaError::MessageConsumption(RDKafkaErrorCode::PollExceeded) => {

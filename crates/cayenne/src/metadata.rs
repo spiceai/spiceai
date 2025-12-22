@@ -169,10 +169,19 @@ pub struct CreateTableOptions {
     pub schema: SchemaRef,
     /// Primary key columns (for deletion vector support)
     pub primary_key: Vec<String>,
-    /// Base path for storing table data
+    /// Base path for storing table data (can be local path or S3 URL)
     pub base_path: String,
     /// Optional partition column name (for partitioned tables)
     pub partition_column: Option<String>,
     /// Vortex encoding configuration
     pub vortex_config: VortexConfig,
+}
+
+/// Configuration for an external object store (e.g., S3).
+#[derive(Debug, Clone)]
+pub struct ObjectStoreConfig {
+    /// The object store URL (e.g., `s3://bucket-name/prefix/`)
+    pub url: url::Url,
+    /// The object store implementation
+    pub store: std::sync::Arc<dyn object_store::ObjectStore>,
 }

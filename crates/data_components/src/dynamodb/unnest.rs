@@ -16,45 +16,43 @@ limitations under the License.
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::{HashMap, HashSet};
 
-use super::{Error, Result};
+use super::{DynamoDBRow, Error, Result};
 
-type DynamoDBItem = HashMap<String, AttributeValue>;
-
-pub fn unnest_dynamodb_items(
-    items: Vec<DynamoDBItem>,
+pub fn unnest_dynamodb_rows(
+    rows: Vec<DynamoDBRow>,
     unnest_depth: usize,
-) -> Result<(Vec<DynamoDBItem>, HashSet<String>)> {
-    let mut all_items = Vec::new();
+) -> Result<(Vec<DynamoDBRow>, HashSet<String>)> {
+    let mut unnested_rows = Vec::new();
     let mut all_flattened_fields = HashSet::new();
 
-    for item in items {
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, unnest_depth)?;
-        all_items.push(result);
+    for row in rows {
+        let (result, flattened_fields) = unnest_dynamodb_row(&row, unnest_depth)?;
+        unnested_rows.push(result);
         all_flattened_fields.extend(flattened_fields);
     }
 
-    Ok((all_items, all_flattened_fields))
+    Ok((unnested_rows, all_flattened_fields))
 }
 
-pub fn unnest_dynamodb_item(
-    item: &HashMap<String, AttributeValue>,
+pub fn unnest_dynamodb_row(
+    row: &DynamoDBRow,
     depth: usize,
 ) -> Result<(HashMap<String, AttributeValue>, HashSet<String>)> {
-    let mut new_item = HashMap::new();
+    let mut new_row = HashMap::new();
     let mut flattened_fields = HashSet::new();
-    flatten_item_recursive(item, "", &mut new_item, &mut flattened_fields, depth, 0)?;
-    Ok((new_item, flattened_fields))
+    flatten_row_recursive(row, "", &mut new_row, &mut flattened_fields, depth, 0)?;
+    Ok((new_row, flattened_fields))
 }
 
-fn flatten_item_recursive(
-    item: &HashMap<String, AttributeValue>,
+fn flatten_row_recursive(
+    row: &DynamoDBRow,
     current_path: &str,
-    flattened_item: &mut HashMap<String, AttributeValue>,
+    flattened_row: &mut DynamoDBRow,
     flattened_fields: &mut HashSet<String>,
     max_depth: usize,
     current_depth: usize,
 ) -> Result<()> {
-    for (key, value) in item {
+    for (key, value) in row {
         let new_path = if current_path.is_empty() {
             key.clone()
         } else {
@@ -66,17 +64,17 @@ fn flatten_item_recursive(
                 // Track the parent field as completely flattened (removed)
                 flattened_fields.insert(new_path.clone());
 
-                flatten_item_recursive(
+                flatten_row_recursive(
                     inner_map,
                     &new_path,
-                    flattened_item,
+                    flattened_row,
                     flattened_fields,
                     max_depth,
                     current_depth + 1,
                 )?;
             }
             _ => {
-                if flattened_item.contains_key(&new_path) {
+                if flattened_row.contains_key(&new_path) {
                     return Err(Error::InvalidItemAccess {
                         message: format!("Column '{key}' already exists in the item."),
                     });
@@ -86,7 +84,7 @@ fn flatten_item_recursive(
                 if new_path.contains('.') && !matches!(value, AttributeValue::M(_)) {
                     flattened_fields.insert(new_path.clone());
                 }
-                flattened_item.insert(new_path, value.clone());
+                flattened_row.insert(new_path, value.clone());
             }
         }
     }
@@ -116,7 +114,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("age".to_string(), av_number("30"));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 10).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 10).expect("unnested item");
 
         assert_eq!(result.len(), 2);
         assert!(matches!(result.get("name"), Some(AttributeValue::S(s)) if s == "Alice"));
@@ -136,7 +134,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("address".to_string(), av_map(inner_map));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 1).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 1).expect("unnested item");
 
         assert_eq!(result.len(), 3);
         assert!(matches!(result.get("name"), Some(AttributeValue::S(s)) if s == "Alice"));
@@ -164,7 +162,7 @@ mod tests {
         let mut item = HashMap::new();
         item.insert("level1".to_string(), av_map(level1));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 10).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 10).expect("unnested item");
 
         assert_eq!(result.len(), 1);
         assert!(matches!(
@@ -189,7 +187,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("address".to_string(), av_map(inner_map));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 0).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 0).expect("unnested item");
 
         // At depth 0, maps should not be flattened
         assert_eq!(result.len(), 2);
@@ -209,7 +207,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("user".to_string(), av_map(inner_map));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 10).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 10).expect("unnested item");
 
         assert_eq!(result.len(), 2);
         assert!(matches!(result.get("name"), Some(AttributeValue::S(s)) if s == "Alice"));
@@ -239,7 +237,7 @@ mod tests {
 
         let items = vec![item1, item2];
 
-        let (results, flattened_fields) = unnest_dynamodb_items(items, 1).expect("unnested items");
+        let (results, flattened_fields) = unnest_dynamodb_rows(items, 1).expect("unnested items");
 
         assert_eq!(results.len(), 2);
 
@@ -265,7 +263,7 @@ mod tests {
         item.insert("id".to_string(), av_string("1"));
         item.insert("metadata".to_string(), av_map(inner_map));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 1).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 1).expect("unnested item");
 
         assert_eq!(result.len(), 3);
         assert!(matches!(result.get("id"), Some(AttributeValue::S(s)) if s == "1"));
@@ -285,7 +283,7 @@ mod tests {
         item.insert("name".to_string(), av_string("Alice"));
         item.insert("empty".to_string(), av_map(HashMap::new()));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 1).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 1).expect("unnested item");
 
         // Empty map shouldn't add any keys
         assert_eq!(result.len(), 1);
@@ -310,7 +308,7 @@ mod tests {
         let mut item = HashMap::new();
         item.insert("level1".to_string(), av_map(level1));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 1).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 1).expect("unnested item");
 
         // Only flatten one level deep
         assert_eq!(result.len(), 1);
@@ -342,7 +340,7 @@ mod tests {
         item.insert("level1".to_string(), av_map(level1));
         item.insert("top_level".to_string(), av_string("value"));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 2).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 2).expect("unnested item");
 
         // Should flatten 2 levels deep
         assert_eq!(result.len(), 3);
@@ -380,7 +378,7 @@ mod tests {
         item.insert("complete".to_string(), av_map(complete_map));
         item.insert("partial".to_string(), av_map(partial_map));
 
-        let (result, flattened_fields) = unnest_dynamodb_item(&item, 1).expect("unnested item");
+        let (result, flattened_fields) = unnest_dynamodb_row(&item, 1).expect("unnested item");
 
         // "complete" is completely flattened (1 level deep)
         assert!(matches!(result.get("complete.field"), Some(AttributeValue::S(s)) if s == "data"));
