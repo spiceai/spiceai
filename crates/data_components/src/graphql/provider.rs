@@ -204,16 +204,18 @@ impl TableProvider for GraphQLTableProvider {
             (None, None)
         };
 
-        let graphql_exec = Arc::new(GraphQLTableProviderExec::new(
-            Arc::clone(&self.client),
-            query,
-            Arc::clone(&self.gql_schema),
-            Arc::clone(&self.table_schema),
-        ))
-        .with_limit(limit)
-        .with_error_checker(error_checker)
-        .with_transform_fn(self.transform_fn)
-        .with_query_cost(query_cost);
+        let graphql_exec = Arc::new(
+            GraphQLTableProviderExec::new(
+                Arc::clone(&self.client),
+                query,
+                Arc::clone(&self.gql_schema),
+                Arc::clone(&self.table_schema),
+            )
+            .with_limit(limit)
+            .with_error_checker(error_checker)
+            .with_transform_fn(self.transform_fn)
+            .with_query_cost(query_cost),
+        );
 
         if let Some(projection) = projection {
             let mut projection_expr = Vec::with_capacity(projection.len());
