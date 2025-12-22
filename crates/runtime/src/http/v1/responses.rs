@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::http::v1::chat::{KEEP_ALIVE_INTERVAL, OpenaiErrorEvent, openai_error_to_response};
 use async_openai::types::responses::{
-    Content, CreateResponse, OutputContent, OutputMessage, Response as OpenAIResponse,
-    ResponseCompleted, ResponseEvent, ResponseIncomplete, ResponseStream,
+    CreateResponse, OutputItem, OutputMessageContent, Response as OpenAIResponse,
+    ResponseCompletedEvent, ResponseIncompleteEvent, ResponseStream, ResponseStreamEvent,
 };
 use axum::{
     Extension, Json,
@@ -28,12 +28,12 @@ fn extract_text(resp: &OpenAIResponse) -> String {
     resp.output
         .iter()
         .filter_map(|out| {
-            let OutputContent::Message(OutputMessage { content, .. }) = out else {
+            let OutputItem::Message(msg) = out else {
                 return None;
             };
-            match content.first()? {
-                Content::OutputText(output_text) => Some(output_text.text.clone()),
-                Content::Refusal(_) => None,
+            match msg.content.first()? {
+                OutputMessageContent::OutputText(output_text) => Some(output_text.text.clone()),
+                OutputMessageContent::Refusal(_) => None,
             }
         })
         .join("\n")
@@ -206,24 +206,26 @@ async fn create_response_sse_response(
                     match msg {
                         Ok(response_event) => {
                             let should_break = match &response_event {
-                                ResponseEvent::ResponseOutputTextDelta(delta) => {
+                                ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                                     captured_output.push_str(&delta.delta);
                                     false
                                 }
-                                ResponseEvent::ResponseIncomplete(ResponseIncomplete {
-                                    sequence_number,
-                                    ..
-                                })
-                                | ResponseEvent::ResponseCompleted(ResponseCompleted {
-                                    sequence_number,
-                                    ..
-                                }) => {
+                                ResponseStreamEvent::ResponseIncomplete(
+                                    ResponseIncompleteEvent {
+                                        sequence_number, ..
+                                    },
+                                )
+                                | ResponseStreamEvent::ResponseCompleted(
+                                    ResponseCompletedEvent {
+                                        sequence_number, ..
+                                    },
+                                ) => {
                                     if id.is_none() {
                                         id = Some(*sequence_number);
                                     }
                                     true
                                 }
-                                ResponseEvent::ResponseFailed(_) => true,
+                                ResponseStreamEvent::ResponseFailed(_) => true,
                                 _ => false,
                             };
 
