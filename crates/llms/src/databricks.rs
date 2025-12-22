@@ -189,7 +189,8 @@ impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletion
             object,
             usage,
         } = val;
-        CreateChatCompletionStreamResponse {
+        #[expect(deprecated)]
+        let resp = CreateChatCompletionStreamResponse {
             id,
             choices,
             created,
@@ -198,7 +199,8 @@ impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletion
             system_fingerprint,
             object,
             usage: usage.map(Into::into),
-        }
+        };
+        resp
     }
 }
 

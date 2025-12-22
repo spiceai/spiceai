@@ -49,7 +49,8 @@ pub fn create_stream_response(
         .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
         .as_secs() as u32;
 
-    Ok(CreateChatCompletionStreamResponse {
+    #[expect(deprecated)]
+    let resp = CreateChatCompletionStreamResponse {
         id: id.to_string(),
         created,
         model: model.to_string(),
@@ -58,7 +59,8 @@ pub fn create_stream_response(
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    })
+    };
+    Ok(resp)
 }
 
 /// Creates a standardized `CreateChatCompletionStreamResponse` with custom timestamp
@@ -74,7 +76,8 @@ pub fn create_stream_response_with_timestamp(
     usage: Option<CompletionUsage>,
     created: u32,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
-    Ok(CreateChatCompletionStreamResponse {
+    #[expect(deprecated)]
+    let resp = CreateChatCompletionStreamResponse {
         id: id.to_string(),
         created,
         model: model.to_string(),
@@ -83,7 +86,8 @@ pub fn create_stream_response_with_timestamp(
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    })
+    };
+    Ok(resp)
 }
 
 /// Creates a chat choice for streaming with optional content

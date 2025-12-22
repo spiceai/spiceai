@@ -320,10 +320,9 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
-                    .filter_map(|p| match p {
-                        ChatCompletionRequestDeveloperMessageContentPart::Text(t) => {
-                            Some(t.text.clone())
-                        }
+                    .map(|p| {
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                        t.text.clone()
                     })
                     .collect();
                 x.join("\n")
@@ -394,10 +393,9 @@ pub fn message_to_mistral(
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
             let content_json = parts
                 .iter()
-                .filter_map(|p| match p {
-                    ChatCompletionRequestDeveloperMessageContentPart::Text(t) => {
-                        Some(t.text.clone())
-                    }
+                .map(|p| {
+                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                    t.text.clone()
                 })
                 .collect::<Vec<_>>();
             IndexMap::from([

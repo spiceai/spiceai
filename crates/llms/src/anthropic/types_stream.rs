@@ -184,6 +184,7 @@ impl Delta {
     }
 }
 
+#[expect(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicStreamError {
     #[serde(rename = "type")]

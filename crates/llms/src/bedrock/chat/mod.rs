@@ -101,18 +101,18 @@ impl BedrockConverse {
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
             for t in tools.iter_mut() {
-                if let ChatCompletionTools::Function(tool) = t {
-                    if tool.function.parameters.is_none() {
-                        tool.function.parameters.replace(json!(
-                            {
-                                "$schema": "http://json-schema.org/draft-07/schema#",
-                                "properties": {},
-                                "required": [],
-                                "title": "",
-                                "type": "object"
-                            }
-                        ));
-                    }
+                if let ChatCompletionTools::Function(tool) = t
+                    && tool.function.parameters.is_none()
+                {
+                    tool.function.parameters.replace(json!(
+                        {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "properties": {},
+                            "required": [],
+                            "title": "",
+                            "type": "object"
+                        }
+                    ));
                 }
             }
         }
@@ -287,11 +287,11 @@ impl BedrockConverse {
                     },
                 ) => arr
                     .into_iter()
-                    .filter_map(|s| match s {
-                        ChatCompletionRequestDeveloperMessageContentPart::Text(
+                    .map(|s| {
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(
                             ChatCompletionRequestMessageContentPartText { text },
-                        ) => Some(SystemContentBlock::Text(text)),
-                        _ => None,
+                        ) = s;
+                        SystemContentBlock::Text(text)
                     })
                     .collect(),
                 _ => vec![],

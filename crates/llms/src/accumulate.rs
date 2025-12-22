@@ -22,6 +22,7 @@ use async_openai::types::chat::{
 use futures::StreamExt;
 
 #[must_use]
+#[expect(deprecated)]
 pub fn empty_completion_response() -> CreateChatCompletionResponse {
     CreateChatCompletionResponse {
         id: String::new(),

@@ -685,7 +685,7 @@ fn stream_from_response(
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
-#[expect(clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_to_openai_stream(
     c: ChatCompletionChunkResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -749,13 +749,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
     match x {
-        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => ToolChoice::None,
         ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
         ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
             unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
         }
         ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
-        _ => ToolChoice::None, // AllowedTools or Custom not supported
+        // None, AllowedTools, or Custom not supported
+        _ => ToolChoice::None,
     }
 }
 

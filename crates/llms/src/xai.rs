@@ -76,10 +76,10 @@ impl Xai {
 
                 // xAI requires tool calls with empty parameters used to be `{}` not ``.
                 for t in tool_calls.iter_mut() {
-                    if let ChatCompletionMessageToolCalls::Function(func_call) = t {
-                        if func_call.function.arguments.is_empty() {
-                            func_call.function.arguments = "{}".to_string();
-                        }
+                    if let ChatCompletionMessageToolCalls::Function(func_call) = t
+                        && func_call.function.arguments.is_empty()
+                    {
+                        func_call.function.arguments = "{}".to_string();
                     }
                 }
             }
@@ -89,18 +89,18 @@ impl Xai {
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
             for t in tools.iter_mut() {
-                if let ChatCompletionTools::Function(func_tool) = t {
-                    if func_tool.function.parameters.is_none() {
-                        func_tool.function.parameters.replace(json!(
-                            {
-                                "$schema": "http://json-schema.org/draft-07/schema#",
-                                "properties": {},
-                                "required": [],
-                                "title": "",
-                                "type": "object"
-                            }
-                        ));
-                    }
+                if let ChatCompletionTools::Function(func_tool) = t
+                    && func_tool.function.parameters.is_none()
+                {
+                    func_tool.function.parameters.replace(json!(
+                        {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "properties": {},
+                            "required": [],
+                            "title": "",
+                            "type": "object"
+                        }
+                    ));
                 }
             }
         }
@@ -109,6 +109,7 @@ impl Xai {
     }
 }
 
+#[expect(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 struct Model {
     id: String,

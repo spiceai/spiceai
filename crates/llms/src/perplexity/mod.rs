@@ -122,7 +122,10 @@ impl PerplexitySonar {
         resp
     }
 
-    pub async fn search_stream(&self, mut req: PerplexityRequest) -> PerplexityResponseStream {
+    pub async fn search_stream(
+        &self,
+        mut req: PerplexityRequest,
+    ) -> Result<PerplexityResponseStream, OpenAIError> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations",
             model = %req.chat.model,
             input = %serde_json::to_string(&req.chat.messages).unwrap_or_default()
@@ -135,12 +138,10 @@ impl PerplexitySonar {
         let stream = self
             .client
             .chat()
-            .path("/chat/completions")
-            .expect("Failed to set path")
+            .path("/chat/completions")?
             .create_stream_byot(req)
-            .await
-            .expect("Failed to create stream");
-        Box::pin(
+            .await?;
+        Ok(Box::pin(
             stream
             .inspect_ok(move |r: &PerplexityStreamResponse|  {
                 if !span_stream.has_field("captured_output") {
@@ -154,6 +155,6 @@ impl PerplexitySonar {
                             if err.to_string() == SseError::StreamEnded{}.to_string());
 
                 futures::future::ready(!stream_ended)
-            }))
+            })))
     }
 }

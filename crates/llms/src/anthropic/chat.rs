@@ -388,7 +388,6 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                 Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => Some(
                     ToolChoiceParam::auto(!value.parallel_tool_calls.unwrap_or_default()),
                 ),
-                None | Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None)) => None,
                 Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => Some(
                     ToolChoiceParam::any(!value.parallel_tool_calls.unwrap_or_default()),
                 ),
@@ -399,7 +398,8 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                     name,
                     !value.parallel_tool_calls.unwrap_or_default(),
                 )),
-                _ => None, // AllowedTools or Custom not supported
+                // AllowedTools or Custom not supported, None and ToolChoiceOptions::None both map to None
+                _ => None,
             },
             tools: value
                 .tools

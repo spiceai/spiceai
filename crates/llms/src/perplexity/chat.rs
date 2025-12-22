@@ -37,7 +37,7 @@ impl Chat for PerplexitySonar {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let resp = self.search_stream(PerplexityRequest::from(req)).await;
+        let resp = self.search_stream(PerplexityRequest::from(req)).await?;
 
         Ok(Box::pin(resp.map_ok(|c| c.response)))
     }
