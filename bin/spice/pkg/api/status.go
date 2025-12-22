@@ -27,7 +27,5 @@ const (
 )
 
 func GetDatasetsWithStatus(rtContext *context.RuntimeContext) ([]Dataset, error) {
-	// The /v1/datasets?status=true endpoint now returns the correct status
-	// directly from RuntimeStatus, including Refreshing, Initializing, etc.
 	return GetData[Dataset](rtContext, "/v1/datasets?status=true")
 }
