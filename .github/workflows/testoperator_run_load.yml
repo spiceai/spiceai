@@ -51,11 +51,6 @@ on:
           - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
-      ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
-        required: true
-        default: '30'
-        type: string
       runner_type:
         description: 'Runner type'
         required: true
@@ -64,16 +59,20 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
-      concurrency_count:
+      concurrency:
         description: 'How many concurrent client connections to use?'
         required: true
         default: '8'
         type: string
-      scale_factor:
-        description: 'Scale factor for the benchmark'
+      random_param_set_count:
+        description: 'Number of random parameter sets to generate for parameterized queries (optional)'
         required: false
         type: string
-        default: '1'
+      http_clients:
+        description: 'Use HTTP clients for the test?'
+        required: false
+        type: boolean
+        default: false
       scrape_spiced_metrics:
         description: 'Scrape Prometheus metrics from spiced during the test'
         required: false
@@ -93,7 +92,7 @@ jobs:
         run: |
           query_set="${{ github.event.inputs.query_set }}"
           query_set="${query_set%%\[*\]*}"
-          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
 
       - name: Validate spicepod file exists
@@ -147,6 +146,11 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
+      - name: Install OpenMP runtime library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgomp1
+
       - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
@@ -156,11 +160,14 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
+            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -193,6 +200,7 @@ jobs:
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
 
       - name: Run the load test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -203,12 +211,15 @@ jobs:
             -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }} \
-            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }}
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
+            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -241,3 +252,4 @@ jobs:
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

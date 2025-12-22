@@ -23,7 +23,7 @@ use std::{
 
 use crate::{
     metrics::QueryStatus,
-    queries::{self, QueryOverrides, QuerySet},
+    queries::{self, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -39,6 +39,7 @@ mod worker;
 use worker::{AppendConfig, AppendWorker};
 
 mod sources;
+use crate::queries::QueryOverrides;
 use sources::FileAppendableSource;
 
 #[derive(Default)]
@@ -67,16 +68,15 @@ impl NotStarted {
         self
     }
 
-    #[must_use]
-    pub fn with_query_set(
+    pub async fn with_query_set(
         mut self,
         query_set: QuerySet,
         overrides: Option<QueryOverrides>,
-    ) -> Self {
-        self.queries = query_set.get_queries(overrides);
+    ) -> Result<Self> {
+        self.queries = query_set.get_queries(overrides, None, None).await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
-        self
+        Ok(self)
     }
 
     #[must_use]
