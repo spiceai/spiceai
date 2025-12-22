@@ -175,6 +175,19 @@ impl From<QuerySetArg> for QuerySet {
     }
 }
 
+impl PartialEq<QuerySet> for QuerySetArg {
+    fn eq(&self, other: &QuerySet) -> bool {
+        matches!(
+            (self, other),
+            (QuerySetArg::Tpch, QuerySet::Tpch)
+                | (QuerySetArg::Tpcds, QuerySet::Tpcds)
+                | (QuerySetArg::Clickbench, QuerySet::Clickbench)
+                | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
+                | (QuerySetArg::Scenario, QuerySet::Scenario { .. })
+        )
+    }
+}
+
 pub trait QuerySetLoader {
     fn query_set(&self) -> &QuerySetArg;
     fn scenario_query_file(&self) -> Option<&PathBuf>;
@@ -197,6 +210,13 @@ pub trait QuerySetLoader {
             }
             query_set => Ok(QuerySet::from(query_set.clone())),
         }
+    }
+}
+
+impl DatasetTestArgs {
+    /// Load the query set, handling scenario query sets from files
+    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
+        QuerySetLoader::load_query_set(self)
     }
 }
 
