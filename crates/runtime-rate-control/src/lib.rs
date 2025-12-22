@@ -133,14 +133,14 @@ pub struct RateController {
 
 #[derive(Debug)]
 pub struct Permit {
-    permit: Option<OwnedSemaphorePermit>,
+    semaphore: Option<OwnedSemaphorePermit>,
     weight: Option<u32>,
     rate_controller: Arc<RateController>,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Some(permit) = self.permit.take() {
+        if let Some(permit) = self.semaphore.take() {
             drop(permit);
         }
     }
@@ -150,6 +150,10 @@ impl Permit {
     /// Re-check the quotas from an existing permit.
     /// For example, a request was permitted but has failed and needs to be retried.
     /// The caller retains their permit, but needs to ensure the rate limiters are still ready.
+    ///
+    /// # Errors
+    ///
+    /// - If the weighted quota does not have sufficient capacity for the provided weight, this will return an `InsufficientCapacity` error.
     pub async fn until_ready(&self) -> Result<()> {
         Arc::clone(&self.rate_controller)
             .until_weighted_ready(self.weight)
@@ -179,12 +183,8 @@ impl RateController {
 
         if let Some(weight) = weight
             && let Some(weighted_limiter) = &self.weighted_rate_limiter
-            && weight > 0
+            && let Some(nonzero_weight) = NonZeroU32::new(weight)
         {
-            let Some(nonzero_weight) = NonZeroU32::new(weight) else {
-                unreachable!("weight checked to be > 0");
-            };
-
             tracing::debug!("Acquiring weighted rate limiter for weight {weight}");
 
             weighted_limiter
@@ -272,7 +272,7 @@ impl RateController {
         tokio::time::sleep(jitter_wait).await;
 
         Ok(Permit {
-            permit: semaphore,
+            semaphore,
             weight,
             rate_controller: self_cloned,
         })
@@ -306,7 +306,7 @@ mod tests {
         );
         let permit = permit.expect("should be Ok");
         assert!(
-            permit.permit.is_some(),
+            permit.semaphore.is_some(),
             "Semaphore permit should be Some if semaphore is configured"
         );
 
@@ -338,7 +338,7 @@ mod tests {
             permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after dropping one: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_some(), "Semaphore permit should be Some if semaphore is configured");
+                assert!(permit.semaphore.is_some(), "Semaphore permit should be Some if semaphore is configured");
             },
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 panic!("Expected to acquire a permit after dropping one, but timed out.");
@@ -363,7 +363,10 @@ mod tests {
         let permit = permit.expect("should be Ok");
 
         // Make 9 more waits to full the quota from the permit
-        futures::future::join_all((0..9).map(|_| permit.until_ready())).await;
+        futures::future::join_all(
+            (0..9).map(async |_| permit.until_ready().await.expect("should wait until ready")),
+        )
+        .await;
 
         // The next request should wait until the rate limit is reset
         tokio::select! {
@@ -408,7 +411,7 @@ mod tests {
             permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_millis(400)) => {
                 panic!("Expected to acquire a permit after rate limit reset, but timed out.");
@@ -448,7 +451,7 @@ mod tests {
             permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 panic!("Expected to acquire a permit after rate limit reset, but timed out.");
@@ -487,7 +490,7 @@ mod tests {
             permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_millis(200)) => {
                 panic!("Expected to acquire a permit after rate limit reset, but timed out.");
@@ -509,7 +512,7 @@ mod tests {
             permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit after rate limit reset: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_secs(2)) => {
                 panic!("Expected to acquire a permit after rate limit reset, but timed out.");
@@ -539,7 +542,7 @@ mod tests {
                 assert!(elapsed >= Duration::from_millis(1000), "Expected at least 1000ms of jitter, but got {elapsed:?}");
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_millis(2000)) => {
                 panic!("Expected to wait for up to 2000ms, but timed out.");
@@ -558,7 +561,7 @@ mod tests {
             permit = rate_controller.acquire() => {
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_millis(10)) => {
                 panic!("Expected to acquire a permit immediately, but timed out.");
@@ -587,7 +590,7 @@ mod tests {
                 assert!(elapsed >= Duration::from_millis(1000), "Expected at least 1000ms of jitter, but got {elapsed:?}");
                 assert!(permit.is_ok(), "Failed to acquire permit: {:?}", permit.err());
                 let permit = permit.expect("should be Ok");
-                assert!(permit.permit.is_none(), "Semaphore permit should be None if semaphore is not configured");
+                assert!(permit.semaphore.is_none(), "Semaphore permit should be None if semaphore is not configured");
             },
             () = tokio::time::sleep(Duration::from_millis(2000)) => {
                 panic!("Expected to wait for up to 2000ms, but timed out.");

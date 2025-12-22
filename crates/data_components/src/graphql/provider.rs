@@ -209,11 +209,11 @@ impl TableProvider for GraphQLTableProvider {
             query,
             Arc::clone(&self.gql_schema),
             Arc::clone(&self.table_schema),
-            limit,
-            error_checker,
-            self.transform_fn,
-            query_cost,
-        ));
+        ))
+        .with_limit(limit)
+        .with_error_checker(error_checker)
+        .with_transform_fn(self.transform_fn)
+        .with_query_cost(query_cost);
 
         if let Some(projection) = projection {
             let mut projection_expr = Vec::with_capacity(projection.len());
@@ -252,27 +252,47 @@ impl GraphQLTableProviderExec {
         query: GraphQLQuery,
         gql_schema: SchemaRef,
         table_schema: SchemaRef,
-        limit: Option<usize>,
-        error_checker: Option<ErrorChecker>,
-        transform_fn: Option<TransformFn>,
-        query_cost: Option<u32>,
     ) -> Self {
         Self {
             client,
             query,
             gql_schema,
             table_schema: Arc::clone(&table_schema),
-            limit,
-            error_checker,
-            transform_fn,
+            limit: None,
+            error_checker: None,
+            transform_fn: None,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
-            query_cost,
+            query_cost: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_error_checker(mut self, error_checker: Option<ErrorChecker>) -> Self {
+        self.error_checker = error_checker;
+        self
+    }
+
+    #[must_use]
+    pub fn with_transform_fn(mut self, transform_fn: Option<TransformFn>) -> Self {
+        self.transform_fn = transform_fn;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_cost(mut self, query_cost: Option<u32>) -> Self {
+        self.query_cost = query_cost;
+        self
     }
 }
 
