@@ -22,7 +22,7 @@ use super::Query;
 
 // DataFusion has ParamValues which can define a list of `Vec<ScalarValue>`
 // This is a scaled down equivalent to the `ScalarValue` enum, but we don't want to import DataFusion just for this.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParameterValue {
     String(Arc<str>),
     Number(i64),
@@ -51,6 +51,17 @@ impl ParameterValue {
                 let decimal_value = (*value * 1_000_000.0) as i128;
                 Arc::new(arrow::array::Decimal128Array::from(vec![decimal_value]))
             }
+        }
+    }
+
+    /// Converts the parameter value to a SQL literal string for use in queries
+    /// that don't support parameterized queries (e.g., HTTP endpoints).
+    #[must_use]
+    pub fn to_sql_literal(&self) -> String {
+        match self {
+            ParameterValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+            ParameterValue::Number(n) => n.to_string(),
+            ParameterValue::Float(f) => f.to_string(),
         }
     }
 }
