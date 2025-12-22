@@ -45,6 +45,9 @@ pub struct DatasetFilter {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema, utoipa::IntoParams))]
 pub struct DatasetQueryParams {
+    /// Whether to include the status field in the response. When `true`, the response includes
+    /// the current status of each dataset (e.g., `ready`, `initializing`, `refreshing`, `error`).
+    /// Defaults to `false`.
     #[serde(default)]
     status: bool,
 
@@ -69,7 +72,8 @@ pub struct DatasetResponseItem {
     /// Whether acceleration is enabled for the dataset
     pub acceleration_enabled: bool,
 
-    /// Optional status of the dataset
+    /// The current status of the dataset. Only included when `status=true` query parameter is specified.
+    /// Possible values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
 
@@ -91,6 +95,9 @@ pub(crate) struct Property {
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
 /// and additional filters can be applied using query parameters.
+///
+/// Use `status=true` query parameter to include the current status of each dataset in the response.
+/// Possible status values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/datasets",
@@ -98,35 +105,38 @@ pub(crate) struct Property {
     tag = "Datasets",
     params(DatasetQueryParams, DatasetFilter),
     responses(
-        (status = 200, description = "List of datasets", content((
+        (status = 200, description = "List of datasets. When `status=true` is specified, each dataset includes a `status` field.", content((
             DatasetResponseItem = "application/json",
             example = json!([
                 {
                     "from": "postgres:syncs",
                     "name": "daily_journal_accelerated",
                     "replication_enabled": false,
-                    "acceleration_enabled": true
+                    "acceleration_enabled": true,
+                    "status": "Ready"
                 },
                 {
                     "from": "databricks:hive_metastore.default.messages",
                     "name": "messages_accelerated",
                     "replication_enabled": false,
-                    "acceleration_enabled": true
+                    "acceleration_enabled": true,
+                    "status": "Refreshing"
                 },
                 {
                     "from": "postgres:aidemo_messages",
                     "name": "general",
                     "replication_enabled": false,
-                    "acceleration_enabled": false
+                    "acceleration_enabled": false,
+                    "status": "Initializing"
                 }
             ])
         ), (
             String = "text/csv",
             example = "
-from,name,replication_enabled,acceleration_enabled
-postgres:syncs,daily_journal_accelerated,false,true
-databricks:hive_metastore.default.messages,messages_accelerated,false,true
-postgres:aidemo_messages,general,false,false
+from,name,replication_enabled,acceleration_enabled,status
+postgres:syncs,daily_journal_accelerated,false,true,Ready
+databricks:hive_metastore.default.messages,messages_accelerated,false,true,Refreshing
+postgres:aidemo_messages,general,false,false,Initializing
 "
         ))),
         (status = 500, description = "Internal server error occurred while processing datasets", content((
@@ -160,7 +170,7 @@ pub(crate) async fn get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
 
-    let valid_datasets = rt.get_valid_datasets(readable_app, LogErrors(false));
+    let valid_datasets = Arc::clone(&rt).get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()

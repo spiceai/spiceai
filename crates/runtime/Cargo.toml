@@ -25,6 +25,7 @@ aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
+aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.10.1", features = ["typed-header"] }

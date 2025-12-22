@@ -261,6 +261,7 @@ tokio = { version = "1", features = [
     "signal",
     "macros",
     "test-util",
+    "time",
 ] }
 tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",

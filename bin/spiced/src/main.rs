@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
@@ -56,7 +57,11 @@ const fn get_allocator_name() -> Option<&'static str> {
 }
 
 fn main() {
-    let args = spiced::Args::parse();
+    let matches = spiced::Args::command().get_matches();
+    let open_telemetry_deprecated =
+        matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
+    let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    args.open_telemetry_deprecated = open_telemetry_deprecated;
 
     if args.version {
         println!("{}", get_version_string());

@@ -469,6 +469,8 @@ pub struct Refresher {
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
     snapshots_trigger_threshold: Option<i64>,
+    snapshots_create_interval: Option<Duration>,
+    snapshot_interval_task: Option<tokio::task::JoinHandle<()>>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -526,6 +528,8 @@ impl Refresher {
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
             snapshots_trigger_threshold: None,
+            snapshots_create_interval: None,
+            snapshot_interval_task: None,
             metrics: None,
             cpu_runtime,
             io_runtime,
@@ -584,10 +588,12 @@ impl Refresher {
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
         snapshots_trigger_threshold: Option<i64>,
+        snapshots_create_interval: Option<Duration>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
         self.snapshots_trigger_threshold = snapshots_trigger_threshold;
+        self.snapshots_create_interval = snapshots_create_interval;
         self
     }
 
@@ -677,7 +683,11 @@ impl Refresher {
             ),
             _ => None,
         }
-        .flatten();
+        .flatten()
+        .map(Arc::new);
+
+        let checkpointer = self.checkpointer.clone();
+        let federated_schema = self.federated.schema();
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
@@ -688,6 +698,14 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
+                let snapshot_interval_task = spawn_snapshot_interval_task(
+                    self.snapshots_create_interval,
+                    checkpointer.clone(),
+                    snapshot_manager.clone(),
+                    dataset_name.clone(),
+                    Arc::clone(&federated_schema),
+                );
+                self.snapshot_interval_task = snapshot_interval_task;
                 return Ok(Some(self.start_changes_stream(stream, snapshot_manager)));
             }
         };
@@ -726,15 +744,20 @@ impl Refresher {
         let refresh = Arc::clone(&self.refresh);
 
         let caching = self.caching.clone();
-        let checkpointer = self.checkpointer.clone();
-
         let refresh_check_interval = self.refresh.read().await.check_interval;
         let max_jitter = self.refresh.read().await.max_jitter;
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
 
         let synchronize_with = self.synchronize_with.clone();
-        let federated_schema = self.federated.schema();
+        let snapshot_interval_task = spawn_snapshot_interval_task(
+            self.snapshots_create_interval,
+            checkpointer.clone(),
+            snapshot_manager.clone(),
+            dataset_name.clone(),
+            Arc::clone(&federated_schema),
+        );
+        self.snapshot_interval_task = snapshot_interval_task;
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
@@ -862,7 +885,7 @@ impl Refresher {
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
-        snapshot_manager: Option<SnapshotManager>,
+        snapshot_manager: Option<Arc<SnapshotManager>>,
     ) -> tokio::task::JoinHandle<()> {
         let checkpointer = self.checkpointer.clone();
 
@@ -916,10 +939,58 @@ impl Refresher {
 type SnapshotCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
+fn spawn_snapshot_interval_task(
+    snapshots_create_interval: Option<Duration>,
+    checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
+    snapshot_manager: Option<Arc<SnapshotManager>>,
+    dataset_name: TableReference,
+    federated_schema: Arc<Schema>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let interval = snapshots_create_interval?;
+    let checkpointer = checkpointer?;
+    let snapshot_manager = snapshot_manager?;
+
+    tracing::info!(
+        "Snapshots for dataset {dataset_name} will be created every {}s",
+        interval.as_secs()
+    );
+
+    Some(tokio::spawn(async move {
+        let mut initial_delay = interval;
+        if let Ok(Some(last_checkpoint_time)) = checkpointer.last_checkpoint_time().await
+            && let Ok(elapsed) = SystemTime::now().duration_since(last_checkpoint_time)
+        {
+            if elapsed < interval {
+                initial_delay = interval - elapsed;
+            } else {
+                initial_delay = Duration::from_secs(0);
+            }
+        }
+
+        if !initial_delay.is_zero() {
+            sleep(initial_delay).await;
+        }
+
+        loop {
+            if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+                tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
+            } else if let Err(e) = snapshot_manager.create_snapshot(&federated_schema).await {
+                let dataset_label = dataset_name.to_string();
+                snapshot_metrics::record_snapshot_failure(&dataset_label);
+                tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
+            } else {
+                tracing::info!("Successfully created snapshot for dataset {dataset_name}");
+            }
+
+            sleep(interval).await;
+        }
+    }))
+}
+
 fn create_periodic_snapshot_callback(
     snapshots_trigger_threshold: Option<i64>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
-    snapshot_manager: Option<SnapshotManager>,
+    snapshot_manager: Option<Arc<SnapshotManager>>,
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
 ) -> Option<SnapshotCallback> {
@@ -927,7 +998,6 @@ fn create_periodic_snapshot_callback(
 
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
-            let snapshot_manager = Arc::new(snapshot_manager);
             let dataset_name = dataset_name.clone();
 
             tracing::info!(
@@ -987,6 +1057,9 @@ impl Drop for Refresher {
     fn drop(&mut self) {
         if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
             refresh_task_runner.abort();
+        }
+        if let Some(task) = self.snapshot_interval_task.take() {
+            task.abort();
         }
     }
 }

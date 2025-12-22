@@ -124,6 +124,15 @@ pub struct Args {
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
     pub metrics: Option<SocketAddr>,
 
+    /// Deprecated OpenTelemetry bind address (no effect).
+    #[arg(
+        long = "open_telemetry",
+        value_name = "OPEN_TELEMETRY_BIND_ADDRESS",
+        default_value = "127.0.0.1:50052",
+        action
+    )]
+    pub open_telemetry_bind_address: SocketAddr,
+
     /// Print the version and exit.
     #[arg(long)]
     pub version: bool,
@@ -183,6 +192,9 @@ pub struct Args {
     /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
+
+    #[arg(skip)]
+    pub open_telemetry_deprecated: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -260,6 +272,12 @@ pub async fn run(args: Args) -> Result<()> {
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
+
+    if args.open_telemetry_deprecated {
+        tracing::warn!(
+            "`--open_telemetry` is deprecated and has no effect; it will be removed in a future version"
+        );
+    }
 
     // Log spicepod load error now that tracing is initialized
     if let Some(err) = spicepod_load_error {
