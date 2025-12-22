@@ -146,7 +146,7 @@ pub fn vector_to_change_batch(
 
     let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
         unreachable!(
-            "We constructed the record batch with the correct schema, so this shouldn't fail"
+            "Record batch was constructed with the correct schema, so this shouldn't fail"
         );
     };
 
