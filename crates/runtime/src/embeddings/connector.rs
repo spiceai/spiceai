@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::index::VectorScanTableProvider;
 use crate::accelerated_table::AcceleratedTable;
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
@@ -36,6 +35,7 @@ use futures::StreamExt;
 use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
+use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::any::Any;
 use std::sync::Arc;
@@ -154,7 +154,7 @@ impl EmbeddingConnector {
             e
         })?;
 
-        let (change_committer, batch) = envelope.into_parts();
+        let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(
@@ -182,7 +182,11 @@ impl EmbeddingConnector {
         let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
             .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
+        Ok(ChangeEnvelope::new(
+            change_committer,
+            new_change_batch,
+            is_dataset_ready,
+        ))
     }
 }
 
@@ -240,7 +244,11 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.supports_changes_stream()
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        dataset: &Dataset,
+    ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) = table_provider
             .as_any()
@@ -250,7 +258,9 @@ impl DataConnector for EmbeddingConnector {
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self.inner_connector.changes_stream(federated_table);
+                return self
+                    .inner_connector
+                    .changes_stream(federated_table, dataset);
             };
 
             // Avoid reindexing full-text indexes.
@@ -268,7 +278,7 @@ impl DataConnector for EmbeddingConnector {
 
             let stream = self
                 .inner_connector
-                .changes_stream(underlying_federated_table)?
+                .changes_stream(underlying_federated_table, dataset)?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
@@ -279,10 +289,12 @@ impl DataConnector for EmbeddingConnector {
             .as_any()
             .downcast_ref::<VectorScanTableProvider>()
         {
-            self.inner_connector
-                .changes_stream(Arc::new(FederatedTable::Immediate(Arc::clone(
+            self.inner_connector.changes_stream(
+                Arc::new(FederatedTable::Immediate(Arc::clone(
                     &vector_scan.table_provider,
-                ))))
+                ))),
+                dataset,
+            )
         } else if let Some(embedding_table) =
             table_provider.as_any().downcast_ref::<EmbeddingTable>()
         {
@@ -292,7 +304,7 @@ impl DataConnector for EmbeddingConnector {
 
             Some(
                 self.inner_connector
-                    .changes_stream(underlying_federated_table)?
+                    .changes_stream(underlying_federated_table, dataset)?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
                     })
@@ -352,11 +364,14 @@ impl DataConnector for EmbeddingConnector {
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Option<Arc<FederatedTable>> {
+    #[cfg(not(feature = "s3_vectors"))]
+    let _ = src_table_provider;
+
     #[cfg(feature = "s3_vectors")]
     {
         if let Some(vector_scan) = src_table_provider
             .as_any()
-            .downcast_ref::<super::index::VectorScanTableProvider>()
+            .downcast_ref::<search::index::VectorScanTableProvider>()
         {
             return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
         }

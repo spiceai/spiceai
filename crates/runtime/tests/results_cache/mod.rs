@@ -31,7 +31,7 @@ use crate::{configure_test_datafusion, init_tracing, utils::test_request_context
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
-        format!("s3://spiceai-demo-datasets/tpch/{name}/").to_string(),
+        format!("s3://spiceai-demo-datasets/tpch/{name}/"),
         name.to_string(),
     );
     test_dataset.params = Some(Params::from_string_map(
@@ -66,24 +66,17 @@ async fn results_cache_system_queries() -> Result<(), String> {
 
             cloned_rt.load_components().await;
 
-            assert!(
-                execute_query_and_check_cache_status(
-                    &rt,
-                    "show tables",
-                    CacheStatus::CacheDisabled
-                )
+            execute_query_and_check_cache_status(&rt, "show tables", CacheStatus::CacheDisabled)
                 .await
-                .is_ok()
-            );
-            assert!(
-                execute_query_and_check_cache_status(
-                    &rt,
-                    "describe customer",
-                    CacheStatus::CacheDisabled
-                )
-                .await
-                .is_ok()
-            );
+                .expect("should run query successfully");
+
+            execute_query_and_check_cache_status(
+                &rt,
+                "describe customer",
+                CacheStatus::CacheDisabled,
+            )
+            .await
+            .expect("should run query successfully");
 
             Ok(())
         })

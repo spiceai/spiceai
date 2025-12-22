@@ -29,7 +29,7 @@ use async_stream::stream;
 use futures::StreamExt;
 
 #[must_use]
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
@@ -48,6 +48,11 @@ pub fn to_cached_record_batch_stream(
             if records_size < cache_max_size && let Ok(batch) = &batch_result {
                 records.push(batch.clone());
                 records_size += batch.get_array_memory_size();
+            } else if !records.is_empty() && records_size >= cache_max_size {
+                // eagerly clear the cached records, as this result won't be cached anyway
+                // this allows some memory reclamation if the stream is very large
+                records.clear();
+                records.shrink_to_fit();
             }
 
             yield batch_result;

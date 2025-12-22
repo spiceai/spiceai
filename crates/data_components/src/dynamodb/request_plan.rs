@@ -26,10 +26,20 @@ pub enum DynamoDBRequestPlan {
 #[derive(Default, Clone)]
 pub struct QueryParams {
     pub table_name: String,
+    // Specifies which partition key (and optionally sort key) to query
+    // Example: "PK = :pk AND SK BETWEEN :start AND :end"
     pub key_condition_expression: Option<String>,
+    // Filters results AFTER reading from the table (doesn't reduce consumed capacity)
+    // Example: "Age > :age AND Country = :country"
     pub filter_expression: Option<String>,
+    // Maps placeholder values (:value) used in expressions to actual values
+    // Example: {":pk": "user123", ":age": 25}
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    // Maps placeholder names (#name) to actual attribute names
+    // Example: {"#PK": "PK", "#name": "name"}
     pub expression_attribute_names: Option<HashMap<String, String>>,
+    // Specifies which attributes to return (like SQL SELECT)
+    // Example: "#PK, #SK, #name, #email"
     pub projection_expression: Option<String>,
     pub limit: Option<i32>,
 }
@@ -108,9 +118,17 @@ impl QueryParamsBuilder {
 #[derive(Default, Clone)]
 pub struct ScanParams {
     pub table_name: String,
+    // Filters results AFTER reading from the table (doesn't reduce consumed capacity)
+    // Example: "Age > :age AND Country = :country"
     pub filter_expression: Option<String>,
+    // Maps placeholder values (:value) used in expressions to actual values
+    // Example: {":pk": "user123", ":age": 25}
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    // Maps placeholder names (#name) to actual attribute names
+    // Example: {"#PK": "PK", "#name": "name"}
     pub expression_attribute_names: Option<HashMap<String, String>>,
+    // Specifies which attributes to return (like SQL SELECT)
+    // Example: "#PK, #SK, #name, #email"
     pub projection_expression: Option<String>,
     pub limit: Option<i32>,
 }

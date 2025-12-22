@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::checkpoint::{CheckpointPosition, GlobalCheckpoint, ShardCheckpoint};
+use crate::checkpoint::{Checkpoint, CheckpointPosition, ShardCheckpoint};
 use crate::client_sdk::SDKClient;
+use crate::metrics::MetricsCollector;
 use crate::stream::{DynamodbStream, DynamodbStreamProducer};
 use crate::stream_state::initialize_state_from_checkpoint;
-use crate::{FailedToInitializeCheckpointSnafu, Result};
+use crate::{FailedToInitializeCheckpointSnafu, Metrics, Result};
 use aws_config::SdkConfig;
 use snafu::OptionExt;
 use std::num::NonZeroUsize;
@@ -28,12 +29,13 @@ use tokio::time::Duration;
 use util::retry_strategy::{BackoffMethod, RetryBackoffBuilder};
 
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 pub struct Client {
     sdk_client: Arc<SDKClient>,
     table_name: String,
     interval: Option<Duration>,
     buffer: usize,
+    metrics_collector: Arc<MetricsCollector>,
 }
 
 const DEFAULT_BUFFER_SIZE: usize = 100;
@@ -53,7 +55,7 @@ impl Client {
     /// - The table has no stream enabled
     /// - AWS API calls fail (network, permissions, etc.)
     /// - Any open shard is missing a starting sequence number
-    pub async fn latest_global_checkpoint(&self) -> Result<GlobalCheckpoint> {
+    pub async fn latest_global_checkpoint(&self) -> Result<Checkpoint> {
         let stream_arn = self
             .sdk_client
             .get_stream_arn(self.table_name.clone())
@@ -73,7 +75,7 @@ impl Client {
                     s.shard_id.clone(),
                     ShardCheckpoint {
                         sequence_number,
-                        parent_id: s.parent_shard_id.clone(),
+                        parent_id: s.parent_shard_id,
                         updated_at: SystemTime::now(),
                         position: CheckpointPosition::At,
                     },
@@ -81,7 +83,9 @@ impl Client {
             })
             .collect::<Result<_>>()?;
 
-        Ok(GlobalCheckpoint {
+        tracing::debug!("Latest checkpoint initialized: {:#?}", checkpoint_shards);
+
+        Ok(Checkpoint {
             shards: checkpoint_shards,
         })
     }
@@ -97,14 +101,12 @@ impl Client {
     /// - The stream ARN cannot be retrieved
     /// - Checkpoint initialization fails (expired shards, invalid sequence numbers)
     /// - Initial shard iterator requests fail
-    pub async fn stream_from_checkpoint(
-        &self,
-        checkpoint: GlobalCheckpoint,
-    ) -> Result<DynamodbStream> {
+    pub async fn stream_from_checkpoint(&self, checkpoint: Checkpoint) -> Result<DynamodbStream> {
         let stream_arn = self
             .sdk_client
             .get_stream_arn(self.table_name.clone())
             .await?;
+
         let state = initialize_state_from_checkpoint(
             stream_arn.clone(),
             &checkpoint,
@@ -112,7 +114,14 @@ impl Client {
         )
         .await?;
 
+        tracing::debug!("Stream initialized from checkpoint: {:#?}", state);
+
         let (tx, rx) = mpsc::channel(self.buffer);
+
+        let retry_strategy = RetryBackoffBuilder::new()
+            .method(BackoffMethod::Fibonacci)
+            .max_retries(None)
+            .build();
 
         let producer = DynamodbStreamProducer {
             stream_arn,
@@ -120,18 +129,20 @@ impl Client {
             interval: self.interval,
             sender: tx,
             client: Arc::clone(&self.sdk_client),
-            retry_strategy: RetryBackoffBuilder::new()
-                .method(BackoffMethod::Fibonacci)
-                .max_retries(Some(3))
-                .build(),
+            retry_strategy,
+            metrics_collector: Arc::clone(&self.metrics_collector),
         };
 
         tokio::spawn(async move {
-            // https://github.com/spiceai/spiceai/issues/8074
             producer.streaming().await;
         });
 
         Ok(DynamodbStream { receiver: rx })
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> Metrics {
+        Metrics::new(Arc::clone(&self.metrics_collector))
     }
 }
 
@@ -142,6 +153,7 @@ pub struct ClientBuilder {
     interval: Option<Duration>,
     buffer: usize,
     shard_record_limit: Option<i32>,
+    metrics_collector: Option<Arc<MetricsCollector>>,
 }
 
 impl ClientBuilder {
@@ -153,6 +165,7 @@ impl ClientBuilder {
             interval: Some(DEFAULT_INTERVAL),
             buffer: DEFAULT_BUFFER_SIZE,
             shard_record_limit: None,
+            metrics_collector: None,
         }
     }
 
@@ -169,6 +182,12 @@ impl ClientBuilder {
     }
 
     #[must_use]
+    pub fn metrics_collector(mut self, metrics_collector: Arc<MetricsCollector>) -> Self {
+        self.metrics_collector = Some(metrics_collector);
+        self
+    }
+
+    #[must_use]
     pub fn shard_record_limit(mut self, shard_record_limit: Option<i32>) -> Self {
         self.shard_record_limit = shard_record_limit;
         self
@@ -181,6 +200,9 @@ impl ClientBuilder {
             table_name: self.table_name,
             interval: self.interval,
             buffer: self.buffer,
+            metrics_collector: self
+                .metrics_collector
+                .unwrap_or(Arc::new(MetricsCollector::default())),
         }
     }
 }

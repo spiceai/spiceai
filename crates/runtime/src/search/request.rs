@@ -68,7 +68,7 @@ pub struct SearchRequestHTTPJson {
 }
 
 #[derive(Debug, Clone)]
-#[allow(clippy::doc_markdown)]
+#[expect(clippy::doc_markdown)]
 pub struct SearchRequest {
     /// The text to search documents for similarity
     pub text: String,
@@ -464,19 +464,18 @@ pub(crate) mod tests {
 
         // Test with WHERE keyword
         let result = SearchRequest::parse_where_cond("WHERE column = 'value'".to_string());
-        assert!(result.is_ok());
+        result.expect("should parse WHERE condition with WHERE keyword");
 
         // Test numeric comparison
         let result = SearchRequest::parse_where_cond("age > 18".to_string());
-        assert!(result.is_ok());
-
+        result.expect("should parse numeric comparison");
         // Test boolean condition
         let result = SearchRequest::parse_where_cond("is_active = true".to_string());
-        assert!(result.is_ok());
+        result.expect("should parse boolean condition");
 
         // Test AND condition
         let result = SearchRequest::parse_where_cond("age > 18 AND is_active = true".to_string());
-        assert!(result.is_ok());
+        result.expect("should parse AND condition");
     }
 
     #[test]
@@ -490,38 +489,36 @@ pub(crate) mod tests {
         let result = SearchRequest::parse_where_cond(
             "column = 'value' UNION SELECT * FROM users".to_string(),
         );
-        assert!(result.is_err());
+        result.expect_err("should error on UNION injection");
 
         // Test multiple statements
         let result =
             SearchRequest::parse_where_cond("column = 'value'; SELECT * FROM users".to_string());
-        assert!(result.is_err());
+        result.expect_err("should error on multiple statements");
 
         // Test stacked queries
         let result = SearchRequest::parse_where_cond(
             "column = 'value'); SELECT * FROM users; --".to_string(),
         );
-        assert!(result.is_err());
+        result.expect_err("should error on stacked queries");
 
         // Test incomplete expression
         let result = SearchRequest::parse_where_cond("column =".to_string());
-        assert!(result.is_err());
+        result.expect_err("should error on incomplete expression");
 
         // Test invalid operator
         let result = SearchRequest::parse_where_cond("column === value".to_string());
-        assert!(result.is_err());
-
+        result.expect_err("should error on invalid operator");
         // Test unclosed string
         let result = SearchRequest::parse_where_cond("column = 'value".to_string());
-        assert!(result.is_err());
+        result.expect_err("should error on unclosed string");
 
         // Test invalid column name
         let result = SearchRequest::parse_where_cond("'column' = 'value'".to_string());
-        assert!(result.is_ok()); // Note: This is actually valid SQL syntax
-
+        result.expect("should parse valid SQL syntax with quoted column name");
         // Test empty condition
         let result = SearchRequest::parse_where_cond(String::new());
-        assert!(result.is_err());
+        result.expect_err("should error on empty condition");
     }
 
     #[test]
@@ -530,19 +527,18 @@ pub(crate) mod tests {
         let result = SearchRequest::parse_where_cond(
             "age > 18 AND (is_active = true OR role = 'admin')".to_string(),
         );
-        assert!(result.is_ok());
+        result.expect("should parse nested AND/OR condition");
 
         // Test IN clause
         let result = SearchRequest::parse_where_cond("status IN ('active', 'pending')".to_string());
-        assert!(result.is_ok());
-
+        result.expect("should parse IN clause");
         // Test BETWEEN
         let result = SearchRequest::parse_where_cond("age BETWEEN 18 AND 65".to_string());
-        assert!(result.is_ok());
+        result.expect("should parse BETWEEN clause");
 
         // Test IS NULL
         let result = SearchRequest::parse_where_cond("last_login IS NULL".to_string());
-        assert!(result.is_ok());
+        result.expect("should parse IS NULL clause");
     }
 
     #[test]

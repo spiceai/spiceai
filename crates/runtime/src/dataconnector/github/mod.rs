@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@ limitations under the License.
 
 use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
+use crate::{
+    component::dataset::Dataset, dataconnector::github::members::MembersTableArgs,
+    register_data_connector,
+};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -71,6 +74,8 @@ mod projects;
 mod pull_requests;
 mod rate_limit;
 mod stargazers;
+mod workflow_runs;
+mod workflows;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -592,6 +597,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("include_commits")
         .description("Whether to fetch commit information (created_at, updated_at) for files. Set to 'true' to enable.")
         .default("false"),
+    ParameterSpec::component("workflow_logs")
+        .description("Whether to download and include workflow run logs. Set to 'enabled' to download logs for each workflow run. Defaults to 'disabled'.")
+        .default("disabled"),
     ParameterSpec::runtime("include")
         .description("Include only files matching the pattern.")
         .examples(&["*.json", "**/*.yaml;src/**/*.json"]),
@@ -641,11 +649,8 @@ impl DataConnectorFactory for GithubFactory {
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
                 match (token, client_id, private_key, installation_id) {
                     (Some(token), _, _, _) => {
-                        let key = token.clone().expose_secret().to_string();
-                        (
-                            Some(Arc::new(StaticTokenProvider::new(token.clone()))),
-                            Some(key),
-                        )
+                        let key = token.expose_secret().to_string();
+                        (Some(Arc::new(StaticTokenProvider::new(token))), Some(key))
                     }
 
                     (None, Some(client_id), Some(private_key), Some(installation_id)) => {
@@ -694,6 +699,8 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
+register_data_connector!("github", GithubFactory);
+
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {
     Auto,
@@ -739,6 +746,7 @@ const REPO_LEVEL_RESOURCES: &[&str] = &[
     "stargazers",
     "projects",
     "files",
+    "workflows",
 ];
 
 /// Parsed GitHub path components
@@ -793,7 +801,6 @@ fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
         self
@@ -953,6 +960,73 @@ impl DataConnector for Github {
                     dataset,
                 )
                 .await
+            }
+            ("workflows", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "workflows", &component);
+
+                let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                    connector_component: component.clone(),
+                })?;
+
+                // Check if there's a remaining path (workflow_id/runs)
+                match parsed.remaining.as_deref() {
+                    None | Some("") => {
+                        // No workflow ID specified - list all workflows
+                        // Warn if github_workflow_logs is set since it's not applicable
+                        if dataset
+                            .params
+                            .get("github_workflow_logs")
+                            .is_some_and(|value| value.as_str() == "enabled")
+                        {
+                            tracing::warn!(
+                                "The 'github_workflow_logs' parameter is only supported when retrieving workflow runs (e.g., github.com/{}/{}/workflows/workflow.yml/runs), not when listing workflows. It will be ignored for {component}.",
+                                parsed.owner,
+                                repo
+                            );
+                        }
+
+                        Ok(Arc::new(
+                            workflows::WorkflowsTableProvider::new(
+                                client,
+                                parsed.owner,
+                                repo,
+                                dataset,
+                            )
+                            .await?,
+                        ) as Arc<dyn TableProvider>)
+                    }
+                    Some(remaining) => {
+                        // Workflow ID specified - parse workflow_id/runs
+                        let parts: Vec<&str> = remaining.split('/').collect();
+                        if parts.len() != 2 || parts[1] != "runs" {
+                            return Err(DataConnectorError::UnableToGetReadProvider {
+                                dataconnector: "github".to_string(),
+                                source: "Invalid workflow path. Expected format: github.com/owner/repo/workflows/workflow_file.yml/runs".into(),
+                                connector_component: component,
+                            });
+                        }
+
+                        let workflow_id = parts[0];
+
+                        let fetch_logs = dataset
+                            .params
+                            .get("github_workflow_logs")
+                            .is_some_and(|value| value.as_str() == "enabled");
+
+                        Ok(Arc::new(
+                            workflow_runs::WorkflowRunsTableProvider::new(
+                                client,
+                                parsed.owner,
+                                repo,
+                                workflow_id,
+                                fetch_logs,
+                                dataset,
+                            )
+                            .await?,
+                        ) as Arc<dyn TableProvider>)
+                    }
+                }
             }
             ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);

@@ -221,7 +221,7 @@ pub trait Embed: Debug + Sync + Send {
 
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         let format = req.encoding_format.unwrap_or_default();
         let result = self.embed(req.input).await?;
@@ -246,7 +246,7 @@ pub trait Embed: Debug + Sync + Send {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub async fn get_or_infer_size(inner: &Arc<dyn Embed>) -> Result<i32> {
     let size = inner.size();
     if size != -1 {

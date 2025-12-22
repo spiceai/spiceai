@@ -183,7 +183,7 @@ impl BedrockEmbeddingConfig<CohereEmbedRequest, CohereEmbedResponse> for CohereC
         &self.model_name
     }
 
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
         clippy::cast_sign_loss

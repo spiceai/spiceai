@@ -46,7 +46,6 @@ use tracing::{Instrument, Span};
 
 use crate::Runtime;
 use crate::model::ModelContextExtension;
-use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -94,12 +93,11 @@ impl ToolUsingChat {
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if !self.tools.iter().any(|t| t.name() == "list_datasets") {
-            return Ok(req);
+        if let Some(list_datasets) = self.tools.iter().find(|t| t.name() == "list_datasets") {
+            let list_dataset_messages = self.create_list_dataset_messages(list_datasets).await?;
+            req.messages =
+                insert_initial_tools(req.messages, "list_datasets", &list_dataset_messages);
         }
-
-        let list_dataset_messages = self.create_list_dataset_messages().await?;
-        req.messages = insert_initial_tools(req.messages, "list_datasets", &list_dataset_messages);
 
         Ok(req)
     }
@@ -108,9 +106,9 @@ impl ToolUsingChat {
     /// This is useful to prime the model as if it has already asked to list the available datasets.
     async fn create_list_dataset_messages(
         &self,
+        list_datasets: &Arc<dyn SpiceModelTool>,
     ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t = ListDatasetsTool::from(&self.rt);
-        let t_resp = t
+        let t_resp = list_datasets
             .call("")
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
@@ -120,7 +118,7 @@ impl ToolUsingChat {
                     id: "initial_list_datasets".to_string(),
                     r#type: ChatCompletionToolType::Function,
                     function: FunctionCall {
-                        name: t.name().to_string(),
+                        name: list_datasets.name().to_string(),
                         arguments: String::new(),
                     },
                 }])
@@ -607,7 +605,6 @@ impl Stream for CustomStream {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn make_a_stream(
     span: Span,
     request_context: Arc<RequestContext>,
@@ -616,7 +613,7 @@ fn make_a_stream(
     mut s: ChatCompletionResponseStream,
 ) -> ChatCompletionResponseStream {
     let (sender, receiver) = mpsc::channel(100);
-    let sender_clone = sender.clone();
+    let sender_clone = sender;
 
     tokio::spawn(
         request_context
@@ -974,7 +971,7 @@ mod tests {
             create_tool_message("test_id", "dataset1, dataset2"),
         ];
 
-        let result = insert_initial_tools(messages.clone(), "list_datasets", &tool_messages);
+        let result = insert_initial_tools(messages, "list_datasets", &tool_messages);
 
         insta::assert_json_snapshot!(result, {
             "[].Assistant.tool_calls[].id" => "[tool_call_id]"

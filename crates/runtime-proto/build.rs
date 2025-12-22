@@ -24,7 +24,10 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     if !proto_files.is_empty() {
-        prost_build::compile_protos(&proto_files, &["proto"])?;
+        tonic_build::configure()
+            .build_server(true)
+            .build_client(true)
+            .compile_protos(&proto_files, &["proto"])?;
     }
 
     Ok(())

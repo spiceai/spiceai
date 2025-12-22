@@ -152,7 +152,7 @@ impl MemTable {
 
     #[must_use]
     pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
-        if !matches!(on_conflict, OnConflict::Upsert(_, _)) {
+        if !matches!(on_conflict, OnConflict::Upsert(_)) {
             tracing::warn!(
                 "In-memory tables only support Upsert on_conflict, but got: {on_conflict:?}. Setting will be ignored."
             );
@@ -232,24 +232,20 @@ impl MemTable {
         pk: &[usize],
         on_conflict: &ColumnReference,
     ) -> Result<()> {
-        let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
         let schema = self.schema();
 
-        if on_conflict_cols.len() != pk.len() {
+        let pk_names: HashSet<&str> = pk
+            .iter()
+            .map(|&idx| schema.field(idx).name().as_str())
+            .collect();
+
+        let on_conflict_set: HashSet<&str> = on_conflict.iter().collect();
+
+        if pk_names != on_conflict_set {
             return Err(DataFusionError::Execution(
-                "Primary key must match the on_conflict definition".to_string(),
+                "Primary key columns must match the on_conflict definition".to_string(),
             ));
         }
-
-        for (c, pk_idx) in on_conflict_cols.iter().zip(pk.iter()) {
-            let pk_name = schema.field(*pk_idx).name();
-            if c != pk_name {
-                return Err(DataFusionError::Execution(
-                    "Primary key must match the on_conflict definition".to_string(),
-                ));
-            }
-        }
-
         Ok(())
     }
 
@@ -329,8 +325,7 @@ impl TableProvider for MemTable {
 
         // In-memory tables only support primary keys constraints. Support for `OnConflict` is limited to `Upsert` matching the primary key.
         // So we verify that the `on_conflict` and  the primary key matches
-        if let (Some(OnConflict::Upsert(on_conflict, _)), Some(pk)) =
-            (&self.on_conflict, &primary_key)
+        if let (Some(OnConflict::Upsert(on_conflict)), Some(pk)) = (&self.on_conflict, &primary_key)
         {
             self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
         }
@@ -400,7 +395,7 @@ impl MemSink {
             batches,
             overwrite,
             primary_key: primary_key.map(|pks| {
-                let mut z = pks.clone();
+                let mut z = pks;
                 z.sort_unstable();
                 z
             }),
@@ -533,7 +528,6 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
@@ -858,7 +852,7 @@ pub mod bench_wrappers {
     };
 
     /// Public wrapper for benchmarking `check_and_filter_non_null_unique_primary_keys`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn check_and_filter_non_null_unique_primary_keys(
         pks: &[Option<String>],
         existing_pks: Option<&HashSet<String>>,
@@ -867,7 +861,7 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `check_and_filter_unique_constraint`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn check_and_filter_unique_constraint(
         ids: &[&str],
         existing_ids: Option<&HashSet<String>>,
@@ -884,7 +878,7 @@ pub mod bench_wrappers {
     }
 
     /// Public wrapper for benchmarking `filter_existing`
-    #[allow(clippy::implicit_hasher)]
+    #[expect(clippy::implicit_hasher)]
     pub fn filter_existing(
         existing_batches: &mut Vec<RecordBatch>,
         overwriting_primary_keys: &HashSet<String>,
@@ -1044,7 +1038,7 @@ impl DataSink for MemSink {
                     stream::iter(vec![Ok(combined_batch)]),
                 );
 
-                let sorted_stream = runtime_datafusion::stream_utils::sort_stream(
+                let sorted_stream = util::stream_utils::sort_stream(
                     Box::pin(sorted_stream),
                     &self.sort_columns,
                     context,
@@ -1690,7 +1684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    #[expect(clippy::unreadable_literal)]
     async fn test_delete_from() {
         let (rb, schema) = create_batch_with_string_columns(&[(
             "time_in_string",
@@ -2083,6 +2077,53 @@ mod tests {
         assert!(
             result.is_err(),
             "should fail when on_conflict columns don't match primary key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_conflict_validation_column_order() {
+        // Tests that composite primary key validation works correctly when
+        // primary key / on_conflict columns indices are not lexicographically ordered.
+        let (rb, schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "b"]),
+            ("pk2", vec!["1", "2"]),
+            ("value", vec!["v1", "v2"]),
+        ]);
+
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![1, 0]), // Composite key
+            ]))
+            .await
+            .expect("constraints should be satisfied")
+            .with_on_conflict(
+                OnConflict::try_from("upsert:(pk2,pk1)").expect("create on_conflict"),
+            );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Try to insert duplicate composite key
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("pk1", vec!["a", "c"]),
+            ("pk2", vec!["1", "1"]),
+            ("value", vec!["v5", "v6"]),
+        ]);
+
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        assert!(
+            collect(insertion, ctx.task_ctx()).await.is_ok(),
+            "insertion should succeed"
         );
     }
 

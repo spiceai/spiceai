@@ -25,7 +25,7 @@ use super::{
     SPICE_RUNTIME_SCHEMA,
 };
 #[cfg(feature = "cluster")]
-use crate::config::ClusterConfig;
+use crate::cluster::ResolvedClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
@@ -56,6 +56,8 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
@@ -119,7 +121,7 @@ pub struct DataFusionBuilder {
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
     #[cfg(feature = "cluster")]
-    cluster_config: Arc<ClusterConfig>,
+    cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -162,7 +164,7 @@ impl DataFusionBuilder {
             caching: None,
             spill_compression: None,
             #[cfg(feature = "cluster")]
-            cluster_config: Arc::new(ClusterConfig::default()),
+            cluster_config: None,
             metrics: None,
             io_runtime,
             resource_monitor: None,
@@ -183,8 +185,8 @@ impl DataFusionBuilder {
 
     #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
-        self.cluster_config = config;
+    pub fn with_cluster_config(mut self, config: ResolvedClusterConfig) -> Self {
+        self.cluster_config = Some(Arc::new(config));
         self
     }
 
@@ -242,7 +244,6 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -265,12 +266,23 @@ impl DataFusionBuilder {
 
         #[cfg(feature = "duckdb")]
         {
+            let mut physical_optimizers_with_duckdb: Vec<
+                Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+            > = vec![
+                DuckDBAggregatePushdownRewriter::new(),
+                DuckDBIntermediateIndexMaterializationOptimizer::new(),
+            ];
+
+            physical_optimizers_with_duckdb.extend(
+                state
+                    .physical_optimizer_rules()
+                    .clone()
+                    .unwrap_or_else(|| PhysicalOptimizer::new().rules),
+            );
+
             state = state
                 .with_optimizer_rule(DuckDBAggregateLogicalPushdown::new())
-                .with_physical_optimizer_rule(DuckDBAggregatePushdownRewriter::new())
-                .with_physical_optimizer_rule(
-                    DuckDBIntermediateIndexMaterializationOptimizer::new(),
-                );
+                .with_physical_optimizer_rules(physical_optimizers_with_duckdb);
         }
 
         state = state
@@ -362,11 +374,12 @@ impl DataFusionBuilder {
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            refresh_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
             #[cfg(feature = "cluster")]
-            cluster_config: self.cluster_config,
+            cluster_config: self.cluster_config.unwrap_or_default(),
             #[cfg(feature = "cluster")]
             scheduler_server: RwLock::new(None),
             #[cfg(feature = "cluster")]
@@ -446,7 +459,7 @@ pub(crate) fn runtime_env(
     // If no memory limit is specified, default to 70% of total memory (container-aware)
     let effective_memory_limit = memory_limit.or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
@@ -456,7 +469,7 @@ pub(crate) fn runtime_env(
         tracing::debug!(
             "No memory limit specified, defaulting to 70% of total memory: {}",
             {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 util::human_readable_bytes(default_limit as usize)
             }
         );

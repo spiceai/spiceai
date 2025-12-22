@@ -185,7 +185,7 @@ impl KafkaMetrics {
 }
 
 impl rdkafka::ClientContext for KafkaConsumerContext {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn stats(&self, statistics: rdkafka::Statistics) {
         // Calculate total consumer lag from all topic partitions
         let mut total_lag = 0u64;
@@ -385,8 +385,11 @@ impl KafkaConsumer {
             // Don't automatically store offsets the library provides to us - we will store them after processing explicitly
             // This is what gives us the "at least once" semantics
             .set("enable.auto.offset.store", "false")
-            .set("security.protocol", &kafka_config.security_protocol)
-            .set("sasl.mechanism", &kafka_config.sasl_mechanism);
+            .set("security.protocol", &kafka_config.security_protocol);
+
+        if kafka_config.security_protocol.to_lowercase() != "plaintext" {
+            config.set("sasl.mechanism", &kafka_config.sasl_mechanism);
+        }
 
         if let Some(sasl_username) = &kafka_config.sasl_username {
             config.set("sasl.username", sasl_username);
@@ -540,7 +543,7 @@ impl Kafka {
 
                 // Wrap the record batch to emulate a change event
                 cdc::wrap_data_as_change_batch(&schema, &rb)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
+                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb, true))
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
             });
 

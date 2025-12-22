@@ -49,7 +49,7 @@ pub async fn accumulate(stream: ChatCompletionResponseStream) -> CreateChatCompl
         .await
 }
 
-#[allow(deprecated, clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 pub fn fold_completion_stream(
     acc: &mut CreateChatCompletionResponse,
     stream: &CreateChatCompletionStreamResponse,
@@ -180,7 +180,7 @@ pub mod tests {
 
     use super::*;
 
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     #[tokio::test]
     pub async fn test_accumulate() {
         let parts = vec![

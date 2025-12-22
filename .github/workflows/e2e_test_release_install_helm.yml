@@ -31,7 +31,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -70,11 +70,11 @@ jobs:
           echo "Arch: $(uname -m)"
 
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       # Set up Docker
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
 
       # Install kubectl
       - name: Install kubectl
@@ -129,9 +129,9 @@ jobs:
             # Get latest release tag from GitHub
             RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
             echo "Using latest release version: $RELEASE_VERSION"
-            # Replace '+' with '-' for Docker image tag compatibility (Kubernetes doesn't allow + in image tags)
-            IMAGE_TAG="${RELEASE_VERSION}-models"
-            echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1). 
+            IMAGE_TAG="${RELEASE_VERSION#v}-models"
+            echo "version=${RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
             echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=github-release" >> $GITHUB_OUTPUT
           else
@@ -277,7 +277,7 @@ jobs:
           # Test simple SQL query
           RESPONSE=$(curl -s -X POST http://localhost:8090/v1/sql \
             -H "Content-Type: application/json" \
-            -d '{"query": "SELECT 1 as test"}')
+            -d '{"sql": "SELECT 1 as test", "parameters": {}}')
           
           echo "Query response: $RESPONSE"
           
@@ -314,7 +314,7 @@ jobs:
           helm upgrade spice-test ./deploy/chart \
             --namespace spice-system \
             --set image.repository=ghcr.io/spiceai/spiceai \
-            --set image.tag=${{ steps.chart-version.outputs.version }}+models \
+            --set image.tag=${{ steps.chart-version.outputs.version }}-models \
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \

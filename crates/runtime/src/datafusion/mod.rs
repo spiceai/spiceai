@@ -47,7 +47,7 @@ use crate::{status, view};
 
 #[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterConfig,
+    crate::cluster::ResolvedClusterConfig,
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -270,6 +270,19 @@ pub enum Error {
     ))]
     AppendRequiresTimeColumn { from: String },
 
+    #[snafu(display(
+        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS or localpod data connectors. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
+    ))]
+    InvalidCachingRefreshMode {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
+        "Conflicting stale-while-revalidate settings for dataset {dataset_name}. When using `refresh_mode: caching`, set either acceleration `caching_stale_while_revalidate_ttl` or results cache `stale_while_revalidate_ttl`, but not both."
+    ))]
+    ConflictingStaleWhileRevalidateConfig { dataset_name: String },
+
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
 
@@ -340,14 +353,17 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
+    refresh_runtime: OnceLock<ManagedTokioRuntime>,
     io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
     pub temp_directory: Option<String>,
     #[cfg(feature = "cluster")]
-    pub cluster_config: Arc<ClusterConfig>,
+    pub cluster_config: Arc<ResolvedClusterConfig>,
     #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     #[cfg(feature = "cluster")]
@@ -437,7 +453,6 @@ impl DataFusion {
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
     ///
     /// This method is generally used for tables that are created by the Spice runtime.
-    #[allow(clippy::result_large_err)]
     pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
@@ -617,7 +632,7 @@ impl DataFusion {
         if self.cpu_runtime.set(handle).is_err() {
             // Failure to set means this was already set - that shouldn't happen.
             tracing::error!(
-                "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
+                "Failed to set cpu tokio runtime on the Datafusion struct, this is an unexpected internal error"
             );
         }
     }
@@ -625,6 +640,27 @@ impl DataFusion {
     #[must_use]
     pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
         self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
+    }
+
+    /// Set the dedicated refresh runtime for acceleration refresh workers.
+    /// This runtime is isolated from the query runtime to prevent refresh workloads from impacting query latency.
+    pub fn set_refresh_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.refresh_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set refresh tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// Returns the dedicated refresh runtime for acceleration refresh workers.
+    /// Falls back to `cpu_runtime()` if no dedicated refresh runtime is set.
+    #[must_use]
+    pub fn refresh_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.refresh_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+            .or_else(|| self.cpu_runtime())
     }
 
     async fn get_table_provider(
@@ -939,7 +975,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -988,6 +1023,19 @@ impl DataFusion {
         };
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
+        if refresh_mode == RefreshMode::Caching {
+            let connector = dataset.source();
+            let is_http_connector =
+                connector.eq_ignore_ascii_case("http") || connector.eq_ignore_ascii_case("https");
+            let is_localpod_connector = connector.eq_ignore_ascii_case(LOCALPOD_DATACONNECTOR);
+            ensure!(
+                is_http_connector || is_localpod_connector,
+                InvalidCachingRefreshModeSnafu {
+                    dataset_name: dataset.name.to_string(),
+                    connector: connector.to_string(),
+                }
+            );
+        }
 
         // Determine if we should pass constraints to the accelerator
         // Only pass constraints if not using refresh_sql (schema might have different column ordering)
@@ -1037,7 +1085,7 @@ impl DataFusion {
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
-                && acceleration_settings.snapshots.bootstrap_enabled();
+                && acceleration_settings.snapshot_behavior.bootstrap_enabled();
 
             if !delay_initial_ready {
                 self.runtime_status
@@ -1074,6 +1122,9 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
+        if let Some(caching_ttl) = acceleration_settings.caching_ttl {
+            refresh = refresh.caching_ttl(caching_ttl);
+        }
 
         // we must not fetch data older than the explicitly set refresh data window or retention period
         let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
@@ -1094,7 +1145,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
-        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
+        accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1131,18 +1182,39 @@ impl DataFusion {
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
-        // For caching mode, set the TTL from refresh_check_interval
-        if refresh_mode == RefreshMode::Caching
-            && let Some(check_interval) = acceleration_settings.refresh_check_interval
-        {
-            accelerated_table_builder.caching_ttl(Some(check_interval));
+        // For caching mode, set the TTL (max_age) and stale_while_revalidate from params
+        if refresh_mode == RefreshMode::Caching {
+            // Check for conflicting stale_while_revalidate configuration
+            if acceleration_settings
+                .caching_stale_while_revalidate_ttl
+                .is_some()
+                && let Some(results_cache) = &self.caching.results
+            {
+                ensure!(
+                    results_cache.stale_while_revalidate_ttl().is_none(),
+                    ConflictingStaleWhileRevalidateConfigSnafu {
+                        dataset_name: dataset.name.to_string(),
+                    }
+                );
+            }
+
+            accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
+            accelerated_table_builder.caching_stale_while_revalidate_ttl(
+                acceleration_settings.caching_stale_while_revalidate_ttl,
+            );
+            accelerated_table_builder
+                .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
-        if acceleration_settings.snapshots.create_enabled()
+        if acceleration_settings.snapshot_behavior.create_enabled()
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
         {
-            accelerated_table_builder
-                .snapshot_behavior(acceleration_settings.snapshots.clone(), Some(snapshot_path));
+            accelerated_table_builder.snapshot_behavior(
+                acceleration_settings.snapshot_behavior.clone(),
+                Some(snapshot_path),
+                acceleration_settings.snapshots_trigger_threshold,
+                acceleration_settings.snapshots_create_interval,
+            );
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -1150,7 +1222,7 @@ impl DataFusion {
                 .await
                 .map(|checkpoint| {
                     checkpoint
-                        .with_snapshot_behavior(acceleration_settings.snapshots)
+                        .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
                         .to_arc()
                 })
                 .ok(),
@@ -1178,7 +1250,7 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
+            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -1218,7 +1290,7 @@ impl DataFusion {
     ///
     /// This will not work if:
     /// - The parent table is not an accelerated table.
-    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    /// - The parent and child acceleration modes don't match (both must be Full or both must be Caching).
     ///
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
     pub async fn attempt_to_synchronize_accelerated_table(
@@ -1486,7 +1558,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     pub(crate) fn register_view(
         self: &Arc<Self>,
         view: Arc<View>,
@@ -1505,8 +1576,7 @@ impl DataFusion {
                 reason: format!(
                     "Expected 1 statement to create view from, received {}",
                     statements.len()
-                )
-                .to_string(),
+                ),
             }
             .fail();
         }
@@ -1672,7 +1742,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
-        builder.cpu_runtime(self.cpu_runtime().cloned());
+        builder.cpu_runtime(self.refresh_runtime().cloned());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
@@ -1680,7 +1750,7 @@ impl DataFusion {
                 .await
                 .map(|checkpoint| {
                     checkpoint
-                        .with_snapshot_behavior(acceleration.snapshots.clone())
+                        .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
                         .to_arc()
                 })
                 .ok(),
@@ -1776,7 +1846,6 @@ impl DataFusion {
             .collect_vec()
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn get_public_table_names(&self) -> Result<Vec<String>> {
         Ok(self
             .ctx

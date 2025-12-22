@@ -44,6 +44,7 @@ use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 use tonic::transport::Channel;
 
+pub mod arrow_flight_factory;
 pub mod tls;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
@@ -175,6 +176,11 @@ pub enum Error {
 
     #[snafu(display("Connection is reset by the server. Please retry the request. {source}"))]
     ConnectionReset { source: TonicStatusError },
+
+    #[snafu(display("An Arrow flight client error has occurred: {source}"))]
+    ArrowFlightError {
+        source: arrow_flight::error::FlightError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -656,7 +662,6 @@ impl FlightClient {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     if is_connection_reset_error(&e) {
         return Error::ConnectionReset {

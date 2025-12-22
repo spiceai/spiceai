@@ -2388,7 +2388,7 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_ok());
+        provider.extract_partitions(&filters).expect("should match");
 
         // Test * pattern
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -2399,7 +2399,7 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_ok());
+        provider.extract_partitions(&filters).expect("should match");
 
         // Test ** pattern
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -2410,7 +2410,7 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_ok());
+        provider.extract_partitions(&filters).expect("should match");
 
         // Test non-matching path
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -2421,7 +2421,9 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_err());
+        provider
+            .extract_partitions(&filters)
+            .expect_err("should not match");
     }
 
     #[tokio::test]

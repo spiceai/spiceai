@@ -64,10 +64,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{
-    SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex,
-    provider::SearchQueryProvider,
-};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -77,16 +74,17 @@ use crate::{
     embedding_col,
     embeddings::table::{EmbeddingColumnConfig, EmbeddingTable},
     model::EmbeddingModelStore,
-    search::util::{
-        find_concrete_table_provider, find_index_in_table_provider, table_ref_from_column_expr,
-        to_column_expr,
-    },
+    search::util::{find_concrete_table_provider, table_ref_from_column_expr, to_column_expr},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
 
-use search::index::chunking::ChunkedSearchIndex;
+#[cfg(feature = "s3_vectors")]
+use {
+    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
+    search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector,
+    search::provider::SearchQueryProvider,
+};
+
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
@@ -117,8 +115,8 @@ impl VectorSearchTableFuncArgs {
             .cloned();
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => Err(DataFusionError::Internal(format!(
-                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}.",
+            (Some(col), None) => Err(DataFusionError::Plan(format!(
+                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}",
                 self.tbl,
                 embedded_columns
                     .keys()
@@ -361,8 +359,8 @@ impl VectorSearchTableFunc {
                 .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
-                return Err(DataFusionError::Internal(format!(
-                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
+                return Err(DataFusionError::Plan(format!(
+                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`",
                     args.tbl,
                     vector_indexes.len()
                 )));
@@ -402,7 +400,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         let Some(table_provider) = df.get_table_sync(&args.tbl) else {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not exist.",
-                args.tbl.clone()
+                args.tbl
             )));
         };
 

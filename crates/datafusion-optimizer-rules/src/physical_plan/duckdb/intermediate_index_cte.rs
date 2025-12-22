@@ -114,7 +114,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
     /// Given the SELECT component of a statement and bound `DuckDB` indexes, attempt to build a
     /// materialized CTE with filters _only_ on index columns
-    #[allow(clippy::too_many_lines)]
     fn build_cte(
         select: &Select,
         indexes: &[(ColumnReference, IndexType)],
@@ -274,7 +273,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         Some((cte, cte_filters))
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn rewrite_statement(
         statement: &Statement,
         indexes: &[(ColumnReference, IndexType)],
@@ -457,8 +455,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::type_complexity)]
     fn test_rewrite_statement() {
         let test_cases: Vec<(&str, Vec<(ColumnReference, IndexType)>, Option<&str>)> = vec![
             // core query we want to optimize

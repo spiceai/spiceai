@@ -110,7 +110,7 @@ pub(crate) fn cosine_distance_to_sql(
     Ok(Some(ast_fn))
 }
 
-#[allow(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
+#[expect(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
 pub(crate) fn rand_to_random(
     _unparser: &datafusion::sql::unparser::Unparser,
     _args: &[Expr],

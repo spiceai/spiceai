@@ -19,8 +19,10 @@ serde_yaml.workspace = true
 spiceai.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
+tokio-util.workspace = true
 
 [features]
+default = ["append"]
 anonymous_telemetry = []
 aws-secrets-manager = []
 clickhouse = []

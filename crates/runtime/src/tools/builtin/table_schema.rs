@@ -30,8 +30,9 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::{error::DataFusionError, sql::TableReference};
 use itertools::Itertools;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -74,6 +75,8 @@ pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
     rt: Arc<Runtime>,
+
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl TableSchemaTool {
@@ -87,7 +90,14 @@ impl TableSchemaTool {
                     .to_string(),
             ),
             rt,
+            table_allowlist: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
+        self
     }
 
     pub async fn get_schema(
@@ -104,7 +114,7 @@ impl TableSchemaTool {
                 .map(|t| {
                     let tbl = TableReference::parse_str(t);
                     let cols = Self::table_column_information_for_table(&tbl, &Arc::clone(&app));
-                    (tbl.clone(), cols)
+                    (tbl, cols)
                 })
                 .collect_vec(),
             _ => vec![],
@@ -115,6 +125,14 @@ impl TableSchemaTool {
                 let mut table_schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
 
                 for (i, t) in tables.iter().enumerate() {
+                    if self.table_allowlist.as_ref().is_some_and(|list| {
+                        !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
+                    }) {
+                        return Err(crate::datafusion::Error::UnableToGetTable {
+                            source: DataFusionError::Plan(format!("No table named {t}")),
+                        })
+                        .boxed();
+                    }
                     let base_schema = self
                         .rt
                         .datafusion()
@@ -143,7 +161,7 @@ impl TableSchemaTool {
                                                     f.data_type().clone(),
                                                     f.is_nullable(),
                                                 )
-                                                .with_metadata(c.metadata().clone()),
+                                                .with_metadata(c.metadata()),
                                             ),
                                             None => Arc::clone(f),
                                         }
@@ -227,8 +245,7 @@ impl TableSchemaTool {
                 function: FunctionCall {
                     name: self.name().to_string(),
                     arguments: serde_json::to_string(&params)
-                        .map_err(OpenAIError::JSONDeserialize)?
-                        .to_string(),
+                        .map_err(OpenAIError::JSONDeserialize)?,
                 },
             }])
             .build()

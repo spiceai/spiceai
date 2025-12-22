@@ -1,0 +1,32 @@
+---
+source: crates/runtime/tests/search/mod.rs
+description: "SELECT subject FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4"
+snapshot_kind: text
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                  |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: vector_search(qs, Utf8("second"), answer).subject                                                                                                                                                         |
+|               |   Sort: vector_search(qs, Utf8("second"), answer).score DESC NULLS FIRST, fetch=4                                                                                                                                     |
+|               |     Projection: vector_search(qs, Utf8("second"), answer).subject, vector_search(qs, Utf8("second"), answer).score                                                                                                    |
+|               |       TableScan: vector_search(qs, Utf8("second"), answer) projection=[score, subject]                                                                                                                                |
+| physical_plan | ProjectionExec: expr=[subject@0 as subject]                                                                                                                                                                           |
+|               |   SortPreservingMergeExec: [score@1 DESC], fetch=4                                                                                                                                                                    |
+|               |     SortExec: TopK(fetch=4), expr=[score@1 DESC], preserve_partitioning=[true]                                                                                                                                        |
+|               |       ProjectionExec: expr=[subject@1 as subject, score@0 as score]                                                                                                                                                   |
+|               |         HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[score@1, subject@3]                                                                         |
+|               |           CoalescePartitionsExec                                                                                                                                                                                      |
+|               |             ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as score]                                                                                                                                |
+|               |               CooperativeExec                                                                                                                                                                                         |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                  |
+|               |                   BytesProcessedExec                                                                                                                                                                                  |
+|               |                     CooperativeExec                                                                                                                                                                                   |
+|               |                       S3VectorsQueryExec: limit=100                                                                                                                                                                   |
+|               |           SchemaCastScanExec                                                                                                                                                                                          |
+|               |             CooperativeExec                                                                                                                                                                                           |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                    |
+|               |                 BytesProcessedExec                                                                                                                                                                                    |
+|               |                   CooperativeExec                                                                                                                                                                                     |
+|               |                     VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "base_table"."id", "base_table"."subject" FROM "base_table" rewritten_sql=SELECT "qs"."id", "qs"."subject" FROM "qs" |
+|               |                                                                                                                                                                                                                       |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

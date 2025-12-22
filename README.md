@@ -4,7 +4,7 @@
 <p align="center">
   <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a>
-  <a href="https://discord.gg/kZnTfneP5u"><img src="https://img.shields.io/discord/803820740868571196" alt="Discord"/></a>
+  <a href="https://spiceai.org/slack"><img src="https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack" alt="Slack"/></a>
   <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
 </p>
 
@@ -324,7 +324,6 @@ Example output will be shown as follows:
 2025-01-20T19:26:10.679716Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
 2025-01-20T19:26:10.679786Z  INFO runtime::metrics_server: Spice Runtime Metrics listening on 127.0.0.1:9090
 2025-01-20T19:26:10.680140Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
-2025-01-20T19:26:10.682080Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 2025-01-20T19:26:10.879126Z  INFO runtime::init::results_cache: Initialized sql results cache; max size: 128.00 MiB, item ttl: 1s
 ```
 

@@ -20,30 +20,30 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "primary_key": {
-        "id": 42
+        "id": 361
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of groups of 7 in 21."
+        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
       "primary_key": {
-        "id": 359
+        "id": 1277
       },
       "score": 0.01
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
       },
       "primary_key": {
-        "id": 458
+        "id": 787
       },
       "score": 0.01
     }

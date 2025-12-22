@@ -17,6 +17,9 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 pub mod app_utils;
+#[expect(clippy::expect_used, clippy::missing_panics_doc)]
+// this is our test framework, used in tests - expect is acceptable
+pub mod arrow_record_batch_gen;
 pub mod constants;
 pub mod flight;
 pub mod gh_utils;
@@ -51,6 +54,7 @@ pub enum TestType {
     Throughput,
     Load,
     Benchmark,
+    Append,
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
@@ -64,6 +68,7 @@ impl TestType {
             TestType::Throughput => "testoperator_run_throughput.yml",
             TestType::Load => "testoperator_run_load.yml",
             TestType::Benchmark => "testoperator_run_bench.yml",
+            TestType::Append => "testoperator_run_append.yml",
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
             TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
@@ -78,6 +83,7 @@ impl Display for TestType {
             TestType::Throughput => write!(f, "throughput"),
             TestType::Load => write!(f, "load"),
             TestType::Benchmark => write!(f, "benchmark"),
+            TestType::Append => write!(f, "append"),
             TestType::DataConsistency => write!(f, "data_consistency"),
             TestType::HttpConsistency => write!(f, "http_consistency"),
             TestType::HttpOverhead => write!(f, "http_overhead"),
