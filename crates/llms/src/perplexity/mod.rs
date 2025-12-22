@@ -17,7 +17,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use async_openai::{Client, error::OpenAIError};
+use async_openai::{Client, error::OpenAIError, traits::RequestOptionsBuilder};
 use futures::{StreamExt, TryStreamExt};
 use reqwest_eventsource::Error as SseError;
 use secrecy::{ExposeSecret, SecretString};
@@ -108,8 +108,12 @@ impl PerplexitySonar {
         req.chat.model.clone_from(&self.model);
         req = self.with_overrides(req);
 
-        let resp: Result<PerplexityResponse, OpenAIError> =
-            self.client.post("/chat/completions", req).await;
+        let resp: Result<PerplexityResponse, OpenAIError> = self
+            .client
+            .chat()
+            .path("/chat/completions")?
+            .create_byot(req)
+            .await;
 
         if let Ok(ref r) = resp {
             tracing::info!(target: "task_history", parent: &span, captured_output = %format!("{:?}", r.citations));
@@ -128,10 +132,16 @@ impl PerplexitySonar {
         req = self.with_overrides(req);
         let span_stream = span.clone();
 
-        Box::pin(self
+        let stream = self
             .client
-            .post_stream("/chat/completions", req)
+            .chat()
+            .path("/chat/completions")
+            .expect("Failed to set path")
+            .create_stream_byot(req)
             .await
+            .expect("Failed to create stream");
+        Box::pin(
+            stream
             .inspect_ok(move |r: &PerplexityStreamResponse|  {
                 if !span_stream.has_field("captured_output") {
                     tracing::info!(target: "task_history", parent: &span_stream, captured_output = %format!("{:?}", r.citations));
@@ -140,8 +150,8 @@ impl PerplexitySonar {
             // Perplexity does not send "Done" messages as per SSE protocol.
             // Stop stream manually on `Stream ended` error.
             .take_while(|item| {
-                let stream_ended = matches!(item, Err(OpenAIError::StreamError(message))
-                            if SseError::StreamEnded{}.to_string().eq(message));
+                let stream_ended = matches!(item, Err(OpenAIError::StreamError(err))
+                            if err.to_string() == SseError::StreamEnded{}.to_string());
 
                 futures::future::ready(!stream_ended)
             }))

@@ -18,7 +18,7 @@ limitations under the License.
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CompletionUsage,
         CreateChatCompletionStreamResponse, FinishReason, Role,
     },
@@ -218,7 +218,7 @@ pub fn create_mock_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::{CompletionUsage, Role};
+    use async_openai::types::chat::{CompletionUsage, Role};
     use futures::StreamExt;
 
     #[test]

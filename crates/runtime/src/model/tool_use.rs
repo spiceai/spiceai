@@ -25,7 +25,7 @@ use llms::chat::nsql::SqlGeneration;
 use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
@@ -842,7 +842,7 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::{
+    use async_openai::types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
         ChatCompletionRequestUserMessageArgs, ChatCompletionToolType, FunctionCall,

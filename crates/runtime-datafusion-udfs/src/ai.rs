@@ -21,11 +21,11 @@ use arrow_schema::DataType;
 #[cfg(test)]
 use async_openai::error::ApiError;
 #[cfg(test)]
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse, FinishReason, Role,
 };
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions,
     CreateChatCompletionRequestArgs,
 };
@@ -504,7 +504,7 @@ impl Ai {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+    use async_openai::types::chat::{ChatCompletionResponseStream, CreateChatCompletionRequest};
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
     use std::collections::HashMap;

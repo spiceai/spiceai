@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionStreamOptions, CreateChatCompletionRequest, CreateChatCompletionResponse,
 };
 use jsonpath_rust::JsonPath;

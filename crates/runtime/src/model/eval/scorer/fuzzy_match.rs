@@ -105,7 +105,7 @@ mod tests {
     use super::FuzzyMatch;
     use super::Scorer;
     use super::{DatasetInput, DatasetOutput};
-    use async_openai::types::{ChatChoice, ChatCompletionResponseMessage, FinishReason, Role};
+    use async_openai::types::chat::{ChatChoice, ChatCompletionResponseMessage, FinishReason, Role};
     use paste::paste;
 
     // Macro to define test cases for FuzzyMatch scorer with AssistantResponse variant.

@@ -32,11 +32,12 @@ use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::{
     CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
 };
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
-    responses::{Content, Response as OpenAIResponse},
+    CreateChatCompletionRequestArgs,
 };
+use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::responses::{Content, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;

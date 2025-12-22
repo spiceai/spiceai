@@ -13,7 +13,7 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
         ResponseFormat,
@@ -66,7 +66,8 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
     ) -> Result<Option<String>, OpenAIError> {
         match resp.choices.iter().find_map(|c| c.message.content.clone()) {
             Some(json_resp) => {
-                Self::convert_json_object_to_sql(&json_resp).map_err(OpenAIError::JSONDeserialize)
+                Self::convert_json_object_to_sql(&json_resp)
+                    .map_err(|e| OpenAIError::JSONDeserialize(e, "Failed to convert JSON to SQL".to_string()))
             }
             None => Ok(None),
         }

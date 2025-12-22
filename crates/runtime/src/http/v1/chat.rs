@@ -23,10 +23,10 @@ use std::{
 
 use crate::model::LLMChatCompletionsModelStore;
 #[cfg(feature = "openapi")]
-use async_openai::types::CreateChatCompletionResponse;
+use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
         CreateChatCompletionStreamResponse, Role,

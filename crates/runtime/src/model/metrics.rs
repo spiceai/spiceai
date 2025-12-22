@@ -16,10 +16,10 @@ limitations under the License.
 
 use std::{sync::LazyLock, time::Duration};
 
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
-    responses::CreateResponse,
 };
+use async_openai::types::responses::CreateResponse;
 use opentelemetry::{
     Key, KeyValue, StringValue, Value, global,
     metrics::{Counter, Histogram, Meter},
