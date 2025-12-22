@@ -124,6 +124,19 @@ pub struct Args {
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
     pub metrics: Option<SocketAddr>,
 
+    /// Deprecated OpenTelemetry bind address (no effect).
+    #[arg(
+        long = "open-telemetry",
+        aliases = [
+            "open_telemetry",
+            "open-telemetry-bind-address",
+            "open_telemetry_bind_address"
+        ],
+        value_name = "BIND_ADDRESS",
+        help_heading = "Metrics"
+    )]
+    pub open_telemetry_bind_address: Option<SocketAddr>,
+
     /// Print the version and exit.
     #[arg(long)]
     pub version: bool,
@@ -187,6 +200,12 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
+
+    if args.open_telemetry_bind_address.is_some() {
+        tracing::warn!(
+            "`--open-telemetry` is deprecated and has no effect; it will be removed in a future version"
+        );
+    }
 
     let spicepod_path = args
         .spicepod
