@@ -152,14 +152,14 @@ impl Debezium {
         };
 
         let batch_max_size = params
-            .get("batching_max_size")
+            .get("batch_max_size")
             .expose()
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(10000);
 
-        let batch_duration = params
-            .get("batching_max_duration")
+        let batch_max_duration = params
+            .get("batch_max_duration")
             .expose()
             .ok()
             .and_then(|v| fundu::parse_duration(v).ok())
@@ -167,7 +167,7 @@ impl Debezium {
 
         Ok(Self {
             kafka_config,
-            batching: (batch_max_size, batch_duration),
+            batching: (batch_max_size, batch_max_duration),
         })
     }
 }
@@ -224,10 +224,10 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
     ParameterSpec::runtime("kafka_consumer_group_id")
         .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
-    ParameterSpec::runtime("batching_max_size")
+    ParameterSpec::runtime("batch_max_size")
         .description("Maximum number of change events to batch together before processing")
         .default("10000"),
-    ParameterSpec::runtime("batching_max_duration")
+    ParameterSpec::runtime("batch_max_duration")
         .description("Maximum time to wait for a batch to fill before processing")
         .default("1s"),
 ];
