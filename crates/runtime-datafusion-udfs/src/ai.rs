@@ -326,7 +326,8 @@ impl Ai {
                     ])
                     .stream(true)
                     .stream_options(ChatCompletionStreamOptions {
-                        include_usage: true,
+                        include_usage: Some(true),
+                        include_obfuscation: None,
                     })
                     .build()?,
             )
