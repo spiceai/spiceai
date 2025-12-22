@@ -170,7 +170,6 @@ pub(crate) async fn get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let df = get_current_datafusion(&context);
 
-    let runtime_status = rt.status();
     let valid_datasets = Arc::clone(&rt).get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
@@ -189,7 +188,7 @@ pub(crate) async fn get(
             acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
             properties: dataset_properties(d),
             status: if params.status {
-                Some(dataset_status(runtime_status.as_ref(), &df, d))
+                Some(dataset_status(&df, d))
             } else {
                 None
             },
