@@ -28,15 +28,18 @@ use crate::federated_table::FederatedTable;
 use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
-use data_components::dynamodb::Error;
 use data_components::dynamodb::provider::DynamoDBTableProvider;
+use data_components::dynamodb::{Error, JsonNesting};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_parameters::ExposedParamLookup;
+use serde_json::Value;
 use snafu::ResultExt;
+use spicepod::semantic::Column;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
@@ -128,6 +131,73 @@ impl DataConnectorFactory for DynamoDBFactory {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+}
+
+fn parse_json_nesting_static_fields(
+    dataset: &Dataset,
+) -> Result<Option<JsonNesting>, DataConnectorError> {
+    // Find all columns that have json_object metadata defined
+    let json_object_columns: Vec<&Column> = dataset
+        .columns
+        .iter()
+        .filter(|col| col.metadata.contains_key("json_object"))
+        .collect();
+
+    // No json_object columns means no JSON nesting configuration
+    if json_object_columns.is_empty() {
+        return Ok(None);
+    }
+
+    // Error if multiple columns have json_object defined
+    if json_object_columns.len() > 1 {
+        let column_names: Vec<&str> = json_object_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "dynamodb".to_string(),
+            message: format!(
+                "Multiple columns have 'json_object' metadata defined: {}. Only one column can be configured as a JSON object column.",
+                column_names.join(", ")
+            ),
+            connector_component: ConnectorComponent::from(dataset),
+        });
+    }
+
+    let json_column = json_object_columns[0];
+    let Some(json_object_value) = json_column.metadata.get("json_object") else {
+        unreachable!("json_object key existence was checked above")
+    };
+
+    // Validate that json_object value is "*"
+    let is_wildcard = match json_object_value {
+        Value::String(s) => s == "*",
+        _ => false,
+    };
+
+    if !is_wildcard {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "dynamodb".to_string(),
+            message: format!(
+                "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
+                json_column.name, json_object_value
+            ),
+            connector_component: ConnectorComponent::from(dataset),
+        });
+    }
+
+    // Collect all other columns as static fields
+    let static_fields: HashSet<String> = dataset
+        .columns
+        .iter()
+        .filter(|col| col.name != json_column.name)
+        .map(|col| col.name.clone())
+        .collect();
+
+    Ok(Some(JsonNesting {
+        static_fields,
+        json_field_name: json_column.name.clone(),
+    }))
 }
 
 #[async_trait]
@@ -264,6 +334,7 @@ impl DataConnector for DynamoDB {
             time_format.to_string(),
             ready_lag,
             Arc::clone(&self.metrics_collector),
+            parse_json_nesting_static_fields(dataset)?.as_ref(),
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
@@ -633,3 +704,108 @@ impl CommitChange for DynamoDBStreamCommitter {
 }
 
 register_data_connector!("dynamodb", DynamoDBFactory);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    async fn test_dataset(columns: Vec<Column>) -> Dataset {
+        let mut dataset = DatasetBuilder::try_new("test:test_dataset".to_string(), "test_dataset")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app::AppBuilder::new("test_app").build()))
+            .with_runtime(Arc::new(crate::Runtime::builder().build().await))
+            .build()
+            .expect("Failed to build dataset");
+
+        dataset.columns = columns;
+
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_no_json_object_columns_returns_none() {
+        let dataset = test_dataset(vec![
+            Column::new("PK"),
+            Column::new("SK"),
+            Column::new("Data"),
+        ])
+        .await;
+
+        let result = parse_json_nesting_static_fields(&dataset).expect("should return Ok");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_valid_json_nesting_configuration() {
+        let mut metadata = HashMap::new();
+        metadata.insert("json_object".to_string(), json!("*"));
+
+        let dataset = test_dataset(vec![
+            Column::new("PK"),
+            Column::new("SK"),
+            Column::new("Baz"),
+            Column::new("data_json").with_metadata(metadata),
+        ])
+        .await;
+
+        let result = parse_json_nesting_static_fields(&dataset)
+            .expect("should return Ok")
+            .expect("should return Some");
+
+        assert_eq!(result.json_field_name, "data_json");
+        assert_eq!(result.static_fields.len(), 3);
+        assert!(result.static_fields.contains("PK"));
+        assert!(result.static_fields.contains("SK"));
+        assert!(result.static_fields.contains("Baz"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_json_object_columns_errors() {
+        let mut metadata1 = HashMap::new();
+        metadata1.insert("json_object".to_string(), json!("*"));
+
+        let mut metadata2 = HashMap::new();
+        metadata2.insert("json_object".to_string(), json!("*"));
+
+        let dataset = test_dataset(vec![
+            Column::new("PK"),
+            Column::new("data1").with_metadata(metadata1),
+            Column::new("data2").with_metadata(metadata2),
+        ])
+        .await;
+
+        let result = parse_json_nesting_static_fields(&dataset);
+        assert!(result.is_err());
+
+        let err = result
+            .expect_err("should fail when multiple json_object columns defined")
+            .to_string();
+        assert!(err.contains("Multiple columns"));
+        assert!(err.contains("data1"));
+        assert!(err.contains("data2"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_object_value_errors() {
+        let mut metadata = HashMap::new();
+        metadata.insert("json_object".to_string(), json!("foo"));
+
+        let dataset = test_dataset(vec![
+            Column::new("PK"),
+            Column::new("data_json").with_metadata(metadata),
+        ])
+        .await;
+
+        let result = parse_json_nesting_static_fields(&dataset);
+        assert!(result.is_err());
+
+        let err = result
+            .expect_err("should fail when invalid value")
+            .to_string();
+        assert!(err.contains("invalid 'json_object' value"));
+        assert!(err.contains("Only '*' is supported"));
+    }
+}
