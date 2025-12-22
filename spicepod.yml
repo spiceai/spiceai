@@ -45,7 +45,6 @@ datasets:
       github_client_id: ${secrets:GITHUB_CLIENT_ID}
       github_private_key: ${secrets:GITHUB_PRIVATE_KEY}
       github_installation_id: ${secrets:GITHUB_INSTALLATION_ID}
-      github_include_comments: all
       github_query_mode: search
     time_column: updated_at
     time_format: timestamp
