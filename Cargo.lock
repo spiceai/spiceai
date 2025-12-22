@@ -4096,6 +4096,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-dynamodbstreams",
  "aws-smithy-async",
+ "aws-smithy-types",
  "base64 0.22.1",
  "bb8",
  "bb8-oracle",

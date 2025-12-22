@@ -294,6 +294,7 @@ pub struct Builder {
     snapshot_behavior: SnapshotBehavior,
     snapshot_local_path: Option<PathBuf>,
     snapshots_trigger_threshold: Option<i64>,
+    snapshots_create_interval: Option<Duration>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -335,6 +336,7 @@ impl Builder {
             snapshot_behavior: SnapshotBehavior::default(),
             snapshot_local_path: None,
             snapshots_trigger_threshold: None,
+            snapshots_create_interval: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -475,10 +477,12 @@ impl Builder {
         snapshot_behavior: SnapshotBehavior,
         snapshot_path: Option<PathBuf>,
         snapshots_trigger_threshold: Option<i64>,
+        snapshots_create_interval: Option<Duration>,
     ) -> &mut Self {
         self.snapshot_behavior = snapshot_behavior;
         self.snapshot_local_path = snapshot_path;
         self.snapshots_trigger_threshold = snapshots_trigger_threshold;
+        self.snapshots_create_interval = snapshots_create_interval;
         self
     }
 
@@ -632,6 +636,7 @@ impl Builder {
             self.snapshot_behavior,
             self.snapshot_local_path.clone(),
             self.snapshots_trigger_threshold,
+            self.snapshots_create_interval,
         );
 
         if let Some(ref resource_monitor) = self.resource_monitor {

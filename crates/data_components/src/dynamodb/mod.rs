@@ -13,11 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::error::DataFusionError;
 use snafu::Snafu;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod arrow;
+mod json_nest;
 pub mod provider;
 mod request_builder;
 mod request_plan;
@@ -26,6 +29,10 @@ pub mod stream;
 mod table_schema;
 mod unnest;
 mod utils;
+
+pub use json_nest::JsonNesting;
+
+type DynamoDBRow = HashMap<String, AttributeValue>;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -85,4 +92,13 @@ pub enum Error {
 
     #[snafu(display("DynamoDB table {table_name} is empty"))]
     EmptyTable { table_name: String },
+
+    #[snafu(display("Failed to serialize data to JSON: {source}"))]
+    JsonSerializationError { source: serde_json::Error },
+
+    #[snafu(display(
+        "Columns not found in table schema: {field_names}. \
+        Ensure configuration is correct, or increase schema_infer_max_records",
+    ))]
+    ColumnsNotFound { field_names: String },
 }
