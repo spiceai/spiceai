@@ -1212,6 +1212,7 @@ impl DataFusion {
                 acceleration_settings.snapshot_behavior.clone(),
                 Some(snapshot_path),
                 acceleration_settings.snapshots_trigger_threshold,
+                acceleration_settings.snapshots_create_interval,
             );
         }
 
