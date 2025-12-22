@@ -16,9 +16,8 @@ limitations under the License.
 
 use async_openai::types::chat::{
     ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream,
-    ChatCompletionStreamResponseDelta, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FunctionCall,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
 };
 use futures::StreamExt;
 
@@ -154,9 +153,7 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
                 }
 
                 // Access the inner tool call through the enum variant
-                if let ChatCompletionMessageToolCalls::Function(ref mut inner_tool) =
-                    acc_tools[i]
-                {
+                if let ChatCompletionMessageToolCalls::Function(ref mut inner_tool) = acc_tools[i] {
                     if let Some(id) = &tool.id {
                         inner_tool.id.clone_from(id);
                     }
@@ -206,7 +203,7 @@ pub mod tests {
         let stream: ChatCompletionResponseStream =
             Box::pin(futures::stream::iter(parts.into_iter().map(|s| {
                 serde_json::from_str::<CreateChatCompletionStreamResponse>(s)
-                    .map_err(OpenAIError::from)
+                    .map_err(|e| OpenAIError::JSONDeserialize(e, s.to_string()))
             })));
 
         let resp = accumulate(stream).await;
