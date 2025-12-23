@@ -244,7 +244,20 @@ jobs:
         run: |
           if git status --porcelain | grep -q .; then
             git add -A
-            git commit --no-edit
+            
+            # Build a descriptive commit message
+            UPSTREAM_SHORT=$(echo "$UPSTREAM_SHA" | cut -c1-7)
+            COMMIT_MSG="Merge upstream/${DEFAULT_BRANCH} (${UPSTREAM_SHORT})"
+            
+            if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
+              if [ "${{ steps.llm.outputs.status }}" = "resolved" ]; then
+                COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Conflicts auto-resolved using OpenAI Codex."
+              else
+                COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Contains unresolved conflicts requiring manual review."
+              fi
+            fi
+            
+            git commit -m "$COMMIT_MSG"
           fi
 
       - name: Build PR body
