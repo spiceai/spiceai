@@ -313,12 +313,10 @@ turso = [
     "data_components/turso",
     "dep:rusqlite",
 ]
-vortex = ["dep:vortex-datafusion", "dep:vortex"]
-
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }
-vortex = { workspace = true, optional = true }
-vortex-datafusion = { workspace = true, optional = true }
+vortex.workspace = true
+vortex-datafusion.workspace = true
 
 [[bench]]
 harness = false
