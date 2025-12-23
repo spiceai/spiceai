@@ -706,6 +706,7 @@ impl RefreshTask {
         let sink_lock = self.sink.read().await;
         let sink = &*sink_lock;
 
+        let _lock_guard = self.accelerator_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
             self.set_refresh_status(sql, status::ComponentStatus::Error)
                 .await;
