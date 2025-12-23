@@ -231,6 +231,7 @@ jobs:
         if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'true'
         run: |
           if git status --porcelain | grep -q .; then
+            git add -A
             git commit --no-edit
           fi
 
