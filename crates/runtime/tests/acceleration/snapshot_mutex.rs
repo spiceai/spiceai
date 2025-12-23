@@ -139,7 +139,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         Arc::new(MemTable::try_new(schema, vec![vec![accelerator_batch]])?);
 
     let refresh = Refresh::new(RefreshMode::Full);
-    let cache_mutex = Arc::new(Mutex::new(()));
+    let accelerator_write_mutex = Arc::new(Mutex::new(()));
 
     let mut refresher = Refresher::new(
         status::RuntimeStatus::new(),
@@ -150,7 +150,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         accelerator,
         None,
         runtime.tokio_io_runtime(),
-        Arc::clone(&cache_mutex),
+        Arc::clone(&accelerator_write_mutex),
     );
 
     refresher.checkpointer(Some(Arc::new(MockCheckpointer)));
@@ -166,7 +166,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         .start(AccelerationRefreshMode::Full(on_start_refresh))
         .await?;
 
-    let lock_guard = cache_mutex.lock().await;
+    let lock_guard = accelerator_write_mutex.lock().await;
     tokio::time::sleep(Duration::from_millis(450)).await;
 
     let locked_count = count_files(&snapshot_dir).await?;

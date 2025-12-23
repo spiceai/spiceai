@@ -54,7 +54,7 @@ pub struct RefreshTaskRunnerBuilder {
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator.
     /// Shared with `CachingAccelerationScanExec`.
-    cache_mutex: Arc<Mutex<()>>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -68,7 +68,7 @@ impl RefreshTaskRunnerBuilder {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
-        cache_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -83,7 +83,7 @@ impl RefreshTaskRunnerBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
-            cache_mutex,
+            accelerator_write_mutex,
         }
     }
 
@@ -130,7 +130,7 @@ impl RefreshTaskRunnerBuilder {
             self.federated_source,
             self.accelerator,
             self.io_runtime,
-            self.cache_mutex,
+            self.accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
         .with_metrics(self.metrics);
@@ -184,7 +184,7 @@ impl RefreshTaskRunner {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
-        cache_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> RefreshTaskRunnerBuilder {
         RefreshTaskRunnerBuilder::new(
             runtime_status,
@@ -194,7 +194,7 @@ impl RefreshTaskRunner {
             refresh,
             accelerator,
             io_runtime,
-            cache_mutex,
+            accelerator_write_mutex,
         )
     }
 

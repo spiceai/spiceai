@@ -239,7 +239,7 @@ impl RefreshTask {
             Box::pin(stream::once(async move { Ok(selected_batch) })),
         ));
 
-        let _lock_guard = self.accelerator_mutex.lock().await;
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         let insert_plan = self
             .accelerator
             .insert_into(
@@ -286,7 +286,7 @@ impl RefreshTask {
             all_where_exprs.extend(delete_where_exprs);
         }
 
-        let _lock_guard = self.accelerator_mutex.lock().await;
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         let delete_plan = deletion_provider
             .delete_from(&session_state, &all_where_exprs)
             .await
