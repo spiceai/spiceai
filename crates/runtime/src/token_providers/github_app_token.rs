@@ -78,8 +78,8 @@ pub struct GitHubAppTokenProvider {
 
 impl Hash for GitHubAppTokenProvider {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Only hash non-sensitive identifiers; do not include the private key.
         self.app_client_id.hash(state);
-        self.private_key.hash(state);
         self.installation_id.hash(state);
     }
 }
