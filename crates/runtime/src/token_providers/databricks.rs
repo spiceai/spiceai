@@ -18,8 +18,7 @@ limitations under the License.
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
-use std::hash::Hasher;
-use std::hash::{DefaultHasher, Hash};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 use std::{fmt, sync::Arc};
 use token_provider::{Result, TokenProvider};
