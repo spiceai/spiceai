@@ -150,7 +150,7 @@ impl ToolUsingChat {
                     tracing::info!(
                         target: "task_history",
                         progress = Progress::log()
-                            .id(tool_call.id.clone())
+                            .id(Some(tool_call.id.clone()))
                             .title(format!("'{}' tool completed successfully", tool_call.function.name))
                             .json_content(v.clone())
                             .to_jsonl(),
@@ -161,7 +161,7 @@ impl ToolUsingChat {
                     tracing::info!(
                         target: "task_history",
                         progress = Progress::error()
-                            .id(tool_call.id.clone())
+                            .id(Some(tool_call.id.clone()))
                             .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
                             .content(e.to_string())
                             .to_jsonl(),
@@ -239,7 +239,7 @@ impl ToolUsingChat {
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
-                    .id(t.id.clone())
+                    .id(Some(t.id.clone()))
                     .title(format!("Calling '{}' tool", t.function.name))
                     .content(t.function.arguments.clone())
                     .to_jsonl(),
@@ -317,25 +317,15 @@ impl ToolUsingChat {
             // Extract inner ChatCompletionMessageToolCall from the ChatCompletionMessageToolCalls enum
             let tool_calls: Vec<ChatCompletionMessageToolCall> = tools_used
                 .unwrap_or_default()
-                .into_iter()
+                .iter()
                 .filter_map(|tc| match tc {
-                    ChatCompletionMessageToolCalls::Function(call) => Some(call),
+                    ChatCompletionMessageToolCalls::Function(call) => Some(call.clone()),
                     ChatCompletionMessageToolCalls::Custom(_) => None,
                 })
                 .collect();
 
             match self
-                .process_tool_calls_and_run_spice_tools(
-                    req.messages,
-                    tools_used
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|t| match t {
-                            ChatCompletionMessageToolCalls::Function(f) => Some(f),
-                            _ => None,
-                        })
-                        .collect(),
-                )
+                .process_tool_calls_and_run_spice_tools(req.messages, tool_calls)
                 .await?
             {
                 // New messages means we have run spice tools locally, ready to recall model.
@@ -357,29 +347,24 @@ impl ToolUsingChat {
 
     /// Add the spice runtime tools to a list of tools (may contain external tools too), and ensure no duplicates.
     fn add_runtime_tools(&self, req: &CreateChatCompletionRequest) -> CreateChatCompletionRequest {
-        let runtime_tools = self.runtime_tools();
-        if runtime_tools.is_empty() {
-            req.clone()
-        } else {
-            runtime_tools.extend(
-                req.tools
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|t| match t {
-                        ChatCompletionTools::Function(f) => Some(f.clone()),
-                        _ => None,
-                    }),
-            );
-            // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
-            all_tools.sort_by(|a, b| get_fn_name(a).cmp(&get_fn_name(b)));
-            all_tools.dedup_by(|a, b| match (get_fn_name(a), get_fn_name(b)) {
-                (Some(a_name), Some(b_name)) => a_name == b_name,
-                _ => false,
-            });
-            let mut req = req.clone();
-            req.tools = Some(all_tools);
-            req
+        let mut runtime_tools = self.runtime_tools();
+        if let Some(ref request_tools) = req.tools {
+            runtime_tools.extend(request_tools.iter().filter_map(|t| match t {
+                ChatCompletionTools::Function(f) => Some(f.clone()),
+                _ => None,
+            }));
         }
+        // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
+        runtime_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        runtime_tools.dedup_by(|a, b| a.function.name == b.function.name);
+        let mut req = req.clone();
+        req.tools = Some(
+            runtime_tools
+                .into_iter()
+                .map(ChatCompletionTools::Function)
+                .collect(),
+        );
+        req
     }
 
     async fn chat_stream_inner(

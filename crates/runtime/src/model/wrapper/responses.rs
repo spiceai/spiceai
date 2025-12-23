@@ -244,7 +244,7 @@ where
                             );
                         }
 
-                        response.model.clone_from(self.model_public_name);
+                        response.model.clone_from(&self.model_public_name);
                     }
                     ResponseStreamEvent::ResponseFailed(_) => {
                         handle_metrics(self.started.elapsed(), true, &self.labels);

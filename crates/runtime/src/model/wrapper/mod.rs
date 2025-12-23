@@ -223,7 +223,7 @@ impl ChatWrapper {
     }
 
     /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
-    #[allow(deprecated)] // seed and user fields are deprecated in async-openai
+    #[expect(deprecated)] // seed and user fields are deprecated in async-openai
     fn with_model_defaults(
         &self,
         mut req: CreateChatCompletionRequest,

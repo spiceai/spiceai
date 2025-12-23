@@ -19,6 +19,7 @@ use std::{sync::LazyLock, time::Duration};
 use async_openai::types::chat::{
     ChatCompletionNamedToolChoice, ChatCompletionNamedToolChoiceCustom,
     ChatCompletionToolChoiceOption, CreateChatCompletionRequest, CustomName, FunctionName,
+    ToolChoiceOptions,
 };
 use async_openai::types::responses::CreateResponse;
 use opentelemetry::{
@@ -46,7 +47,7 @@ pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock:
         .build()
 });
 
-#[allow(deprecated)] // user field is deprecated in async-openai
+#[expect(deprecated)] // user field is deprecated in async-openai
 pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue> {
     #[expect(clippy::cast_possible_wrap)]
     let mut labels = vec![
@@ -63,8 +64,10 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
 
     if let Some(ref choice) = req.tool_choice {
         let choice_str: StringValue = match choice {
-            ChatCompletionToolChoiceOption::Mode(m) => m.into(),
-            ChatCompletionToolChoiceOption::AllowedTools(_) => "allowed_tools",
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => "auto".into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => "none".into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => "required".into(),
+            ChatCompletionToolChoiceOption::AllowedTools(_) => "allowed_tools".into(),
             ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
                 function: FunctionName { name, .. },
             })

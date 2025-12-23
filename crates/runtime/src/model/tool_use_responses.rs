@@ -16,15 +16,12 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::{
-        chat::FunctionCall,
-        responses::{
-            CodeInterpreterTool, CreateResponse, FunctionCallOutput, FunctionCallOutputItemParam,
-            FunctionTool, FunctionToolCall, InputContent, InputItem, InputMessage, InputParam,
-            InputTokenDetails, Item, OutputItem, OutputStatus, OutputTokenDetails, Response,
-            ResponseStream, ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition,
-            ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
-        },
+    types::responses::{
+        CodeInterpreterTool, CreateResponse, EasyInputContent, EasyInputMessage,
+        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem,
+        InputParam, InputTokenDetails, Item, MessageType, OutputItem, OutputTokenDetails, Response,
+        ResponseStream, ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition,
+        ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
     },
 };
 use async_trait::async_trait;
@@ -51,7 +48,7 @@ pub enum OpenAIResponsesTools {
     WebSearch,
 }
 
-impl From<OpenAIResponsesTools> for Tool {
+impl From<OpenAIResponsesTools> for ToolDefinition {
     fn from(tool: OpenAIResponsesTools) -> Self {
         match tool {
             OpenAIResponsesTools::CodeInterpreter => {
@@ -102,16 +99,9 @@ impl ToolUsingResponses {
     }
 
     fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
-        let existing_items = match req.input.clone() {
-            InputParam::Text(input) => vec![InputItem::Message(InputMessage {
-                content: InputContent::TextInput(input),
-                role: Role::User,
-                status: Some(OutputStatus::Completed),
-            })],
-            InputParam::Items(items) => items,
-        };
+        let existing_items = to_input_item(req.input.clone());
 
-        let openai_tool_definitions: Vec<Tool> = self
+        let openai_tool_definitions: Vec<ToolDefinition> = self
             .openai_tools
             .clone()
             .into_iter()
@@ -125,12 +115,12 @@ impl ToolUsingResponses {
     }
 
     #[must_use]
-    pub fn runtime_tools(&self) -> Vec<Tool> {
+    pub fn runtime_tools(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
             .map(|t| {
                 ToolDefinition::Function(FunctionTool {
-                    strict: t.strict().unwrap_or(false),
+                    strict: t.strict(),
                     name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
                     parameters: Some(
@@ -164,8 +154,7 @@ impl ToolUsingResponses {
             name,
             arguments,
             id,
-            call_id,
-            status,
+            ..
         } = tool_call;
         match self.as_spiced_tool(name) {
             Some(t) => match t.call(arguments).await {
@@ -233,7 +222,7 @@ impl ToolUsingResponses {
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
-                    .id(t.id.unwrap_or_default())
+                    .id(t.id.clone())
                     .title(format!("Calling '{}' tool", t.name))
                     .content(t.arguments.clone())
                     .to_jsonl(),
@@ -247,19 +236,19 @@ impl ToolUsingResponses {
         for (tool_call, response_content) in &tool_and_response_content {
             messages.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
                 arguments: tool_call.arguments.clone(),
-                call_id: tool_call.id.clone(),
+                call_id: tool_call.id.clone().unwrap_or_default(),
                 name: tool_call.name.clone(),
-                id: tool_call.name.clone(),
+                id: Some(tool_call.name.clone()),
                 status: None,
             })));
             messages.push(InputItem::Item(Item::FunctionCallOutput(
                 FunctionCallOutputItemParam {
-                    call_id: tool_call.id.clone(),
+                    call_id: tool_call.id.clone().unwrap_or_default(),
                     output: FunctionCallOutput::Text(
                         serde_json::to_string(&response_content)
                             .unwrap_or("Error calling tool.".to_string()),
                     ),
-                    id: tool_call.name.clone(),
+                    id: Some(tool_call.name.clone()),
                     status: None,
                 },
             )));
@@ -575,7 +564,7 @@ fn make_responses_stream(
 
                             ready_to_call_lock
                                 .iter()
-                                .filter(|call| model.as_spiced_tool(call.name).is_some())
+                                .filter(|call| model.as_spiced_tool(&call.name).is_some())
                                 .cloned()
                                 .collect()
                         }; // Lock is dropped here
@@ -667,14 +656,14 @@ fn make_responses_stream(
     Box::pin(CustomResponseStream { receiver }) as ResponseStream
 }
 
-fn get_tool_name(tool: &Tool) -> &str {
+fn get_tool_name(tool: &ToolDefinition) -> &str {
     match tool {
-        Tool::Function(f) => &f.name,
-        Tool::CodeInterpreter(_) => "code_interpreter",
-        Tool::WebSearchPreview(_) => "web_search",
-        Tool::FileSearch(_) => "file_search",
-        Tool::ComputerUsePreview(_) => "computer_use",
-        Tool::Mcp(_) => "mcp",
+        ToolDefinition::Function(f) => &f.name,
+        ToolDefinition::CodeInterpreter(_) => "code_interpreter",
+        ToolDefinition::WebSearchPreview(_) => "web_search",
+        ToolDefinition::FileSearch(_) => "file_search",
+        ToolDefinition::ComputerUsePreview(_) => "computer_use",
+        ToolDefinition::Mcp(_) => "mcp",
         _ => "unknown",
     }
 }
@@ -710,10 +699,10 @@ fn create_new_recursive_req(
 
 fn to_input_item(input: InputParam) -> Vec<InputItem> {
     match input {
-        InputParam::Text(text) => vec![InputItem::Message(InputMessage {
-            content: InputContent::TextInput(text),
+        InputParam::Text(text) => vec![InputItem::EasyMessage(EasyInputMessage {
+            content: EasyInputContent::Text(text),
             role: Role::User,
-            status: None,
+            r#type: MessageType::Message,
         })],
         InputParam::Items(items) => items,
     }
