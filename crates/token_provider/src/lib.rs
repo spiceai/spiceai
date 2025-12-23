@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
 use std::sync::Arc;
+use std::{fmt::Debug, hash::DefaultHasher};
 
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::hash::Hash;
+use std::hash::Hasher;
 use tokio::sync::watch;
 
 pub mod registry;
@@ -36,6 +38,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait TokenProvider: Send + Sync + Debug {
     fn get_token(&self) -> String;
 
+    /// Returns a hash representing the configuration of this token provider.
+    /// Token providers with the same configuration should return the same hash.
+    ///
+    /// This is used instead of implenting Hash directly on the trait object, as Hash is not dyn-compatible.
+    fn dyn_hash(&self) -> String;
+
     /// Returns a `watch::Receiver` of new tokens, if the provider supports refresh.
     ///
     /// The default implementation gives no updates.
@@ -46,6 +54,12 @@ pub trait TokenProvider: Send + Sync + Debug {
 
 pub struct StaticTokenProvider {
     token: Arc<SecretString>,
+}
+
+impl Hash for StaticTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.token.expose_secret().hash(state);
+    }
 }
 
 impl std::fmt::Debug for StaticTokenProvider {
@@ -68,5 +82,11 @@ impl StaticTokenProvider {
 impl TokenProvider for StaticTokenProvider {
     fn get_token(&self) -> String {
         self.token.expose_secret().to_string()
+    }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
     }
 }

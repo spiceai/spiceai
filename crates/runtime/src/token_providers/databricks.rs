@@ -18,6 +18,8 @@ limitations under the License.
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
+use std::hash::Hasher;
+use std::hash::{DefaultHasher, Hash};
 use std::time::Duration;
 use std::{fmt, sync::Arc};
 use token_provider::{Result, TokenProvider};
@@ -47,6 +49,13 @@ pub struct DatabricksM2MTokenProvider {
     rx: watch::Receiver<SecretString>,
 
     _handle: Arc<JoinHandle<()>>,
+}
+
+impl Hash for DatabricksM2MTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.endpoint.hash(state);
+        self.client_id.hash(state);
+    }
 }
 
 impl fmt::Debug for DatabricksM2MTokenProvider {
@@ -139,6 +148,12 @@ impl DatabricksM2MTokenProvider {
 impl TokenProvider for DatabricksM2MTokenProvider {
     fn get_token(&self) -> String {
         self.rx.borrow().expose_secret().to_string()
+    }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
@@ -239,6 +254,13 @@ pub struct DatabricksU2MTokenProvider {
     client_id: String,
 }
 
+impl Hash for DatabricksU2MTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.endpoint.hash(state);
+        self.client_id.hash(state);
+    }
+}
+
 impl fmt::Debug for DatabricksU2MTokenProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DatabricksU2MTokenProvider")
@@ -272,6 +294,12 @@ impl TokenProvider for DatabricksU2MTokenProvider {
         }
 
         String::new()
+    }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
     }
 }
 
