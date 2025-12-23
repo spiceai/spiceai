@@ -13,6 +13,7 @@ runtime:
 
 refresh_check_interval: &refresh_check_interval 3m
 
+# Uses static dataset because retention not yet supported for partitioning: https://github.com/spiceai/spiceai/issues/8233
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
     name: number_info

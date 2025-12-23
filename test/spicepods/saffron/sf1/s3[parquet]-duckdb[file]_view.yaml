@@ -31,7 +31,7 @@ datasets:
       retention_sql: DELETE FROM number_info WHERE __deleted != 'false'
       refresh_check_interval: *refresh_check_interval
       engine: duckdb
-      mode: file_create
+      mode: file
       refresh_mode: append
       primary_key: NumberSid
       on_conflict:
@@ -50,7 +50,7 @@ datasets:
       retention_sql: DELETE FROM number_caps WHERE __deleted != 'false'
       refresh_check_interval: *refresh_check_interval
       engine: duckdb
-      mode: file_create
+      mode: file
       refresh_mode: append
       primary_key: '(NumberSid, Capability)'
       on_conflict:
@@ -69,7 +69,7 @@ datasets:
       retention_sql: DELETE FROM sender_info_by_arrival WHERE __deleted != 'false'
       refresh_check_interval: *refresh_check_interval
       engine: duckdb
-      mode: file_create
+      mode: file
       refresh_mode: append
       primary_key: AutoId
       on_conflict:

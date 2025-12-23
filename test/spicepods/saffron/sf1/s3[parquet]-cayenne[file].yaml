@@ -13,6 +13,7 @@ runtime:
 
 refresh_check_interval: &refresh_check_interval 3m
 
+# Uses static dataset because on_conflict is not yet supported: https://github.com/spiceai/spiceai/issues/7762
 datasets:
   - from: s3://benchmarks/saffron/number_info_sf1
     name: number_info
