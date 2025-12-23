@@ -977,7 +977,7 @@ pub struct CachingAccelerationScanExec {
     filters: Vec<Expr>,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
-    /// Mutex to protect concurrent access to the accelerator during cache operations
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: InFlightRevalidations,

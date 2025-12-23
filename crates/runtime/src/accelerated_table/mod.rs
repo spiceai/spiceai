@@ -231,7 +231,7 @@ pub struct AcceleratedTable {
     cache_stale_while_revalidate_ttl: Option<Duration>,
     cache_stale_if_error: bool,
     io_runtime: Handle,
-    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,

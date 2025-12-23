@@ -116,7 +116,7 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// Mutex to protect concurrent access to the accelerator during cache operations.
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
@@ -258,7 +258,7 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// Mutex to protect concurrent access to the accelerator during cache operations.
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
