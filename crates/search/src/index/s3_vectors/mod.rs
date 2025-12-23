@@ -110,7 +110,7 @@ impl S3Vector {
     fn metadata_columns(&self) -> &MetadataColumns {
         &self.metadata_columns
     }
-    #[must_use] 
+    #[must_use]
     pub fn enable_spill_writes(mut self) -> Self {
         self.spill_writes = true;
         self

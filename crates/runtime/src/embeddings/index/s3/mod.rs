@@ -85,6 +85,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .description("Cache duration for listing S3 vector indexes (minimum: 5s). Defaults to list on every query."),
     ParameterSpec::component("batch_write_rows")
         .description("The number of rows to chunk record batches into for individual processing. Used to control memory usage during writes."),
+    ParameterSpec::component("spill_writes")
+        .description("If true, during periods where write throughput exceeds S3 vector rate limits, create and spill to an separate physical index. At query time, the spill index will also be queried. Incompatible with vector partitioning."),
 ];
 
 /// Attempt to construct an [`S3Vector`] for the provided dataset/view on the given column.
@@ -127,7 +129,7 @@ pub async fn try_from_table(
             },
         })
         .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
-    let spill_writes = string_from_params(&params, "s3_vectors_spill_writes")
+    let spill_writes = string_from_params(&params, "spill_writes")
         .and_then(|s| match s.parse::<bool>() {
             Ok(val) if partition_by.is_empty() => Some(val),
             Ok(_) => {
