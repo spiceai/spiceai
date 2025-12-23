@@ -39,7 +39,7 @@ pub trait TokenProvider: Send + Sync + Debug {
     /// Returns a hash representing the configuration of this token provider.
     /// Token providers with the same configuration should return the same hash.
     ///
-    /// This is used instead of implenting Hash directly on the trait object, as Hash is not dyn-compatible.
+    /// This is used instead of implementing Hash directly on the trait object, as Hash is not dyn-compatible.
     fn dyn_hash(&self) -> String;
 
     /// Returns a `watch::Receiver` of new tokens, if the provider supports refresh.
