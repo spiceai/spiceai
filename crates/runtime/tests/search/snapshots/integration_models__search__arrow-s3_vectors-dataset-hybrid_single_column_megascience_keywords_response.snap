@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -14,37 +13,37 @@ snapshot_kind: text
       "primary_key": {
         "id": 1277
       },
-      "score": 0.53
+      "score": 0.68
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
+        "answer": "To find the product of 8 and 2, multiply the two numbers together: \\(8 \\times 2 = 16\\). The answer is \\(\\boxed{16}\\)."
       },
       "primary_key": {
-        "id": 470
+        "id": 1075
       },
-      "score": 0.5
+      "score": 0.64
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+        "answer": "To find the product of 12 and 0.1, multiply the two numbers:\n\\[ 12 \\times 0.1 = 1.2 \\]\nThus, the product is \\(\\boxed{1.2}\\)."
       },
       "primary_key": {
-        "id": 458
+        "id": 1055
       },
-      "score": 0.5
+      "score": 0.64
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "To evaluate $12 \\times 12$, we multiply the two numbers:\n\\[ 12 \\times 12 = 144 \\]\nThus, the final answer is $\\boxed{144}$."
+        "answer": "When multiplying two negative numbers, the product is positive. Thus:  \n$-18(-2) = 36$.  \nThe answer is $\\boxed{36}$."
       },
       "primary_key": {
-        "id": 42
+        "id": 605
       },
-      "score": 0.48
+      "score": 0.64
     }
   ]
 }

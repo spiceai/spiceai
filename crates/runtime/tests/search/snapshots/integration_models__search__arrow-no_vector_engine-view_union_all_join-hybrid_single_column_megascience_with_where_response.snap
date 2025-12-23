@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -19,20 +18,10 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
+        "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
       },
       "primary_key": {
-        "id": 1193
-      },
-      "score": 0.01
-    },
-    {
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
-      },
-      "primary_key": {
-        "id": 449
+        "id": 1015
       },
       "score": 0.01
     },
@@ -43,6 +32,16 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 821
+      },
+      "score": 0.01
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+      },
+      "primary_key": {
+        "id": 449
       },
       "score": 0.01
     }
