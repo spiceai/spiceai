@@ -169,12 +169,13 @@
           "Datasets"
         ],
         "summary": "List Datasets",
-        "description": "This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,\nand additional filters can be applied using query parameters.",
+        "description": "This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,\nand additional filters can be applied using query parameters.\n\nUse `status=true` query parameter to include the current status of each dataset in the response.\nPossible status values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.",
         "operationId": "get_datasets",
         "parameters": [
           {
             "name": "status",
             "in": "query",
+            "description": "Whether to include the status field in the response. When `true`, the response includes\nthe current status of each dataset (e.g., `ready`, `initializing`, `refreshing`, `error`).\nDefaults to `false`.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -204,7 +205,7 @@
         ],
         "responses": {
           "200": {
-            "description": "List of datasets",
+            "description": "List of datasets. When `status=true` is specified, each dataset includes a `status` field.",
             "content": {
               "application/json": {
                 "schema": {
@@ -215,19 +216,22 @@
                     "from": "postgres:syncs",
                     "name": "daily_journal_accelerated",
                     "replication_enabled": false,
-                    "acceleration_enabled": true
+                    "acceleration_enabled": true,
+                    "status": "Ready"
                   },
                   {
                     "from": "databricks:hive_metastore.default.messages",
                     "name": "messages_accelerated",
                     "replication_enabled": false,
-                    "acceleration_enabled": true
+                    "acceleration_enabled": true,
+                    "status": "Refreshing"
                   },
                   {
                     "from": "postgres:aidemo_messages",
                     "name": "general",
                     "replication_enabled": false,
-                    "acceleration_enabled": false
+                    "acceleration_enabled": false,
+                    "status": "Initializing"
                   }
                 ]
               },
@@ -235,7 +239,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "\nfrom,name,replication_enabled,acceleration_enabled\npostgres:syncs,daily_journal_accelerated,false,true\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true\npostgres:aidemo_messages,general,false,false\n"
+                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status\npostgres:syncs,daily_journal_accelerated,false,true,Ready\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Refreshing\npostgres:aidemo_messages,general,false,false,Initializing\n"
               }
             }
           },
@@ -3434,7 +3438,8 @@
             "description": "The format of the response. Possible values are 'json' (default) or 'csv'."
           },
           "status": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether to include the status field in the response. When `true`, the response includes\nthe current status of each dataset (e.g., `ready`, `initializing`, `refreshing`, `error`).\nDefaults to `false`."
           }
         }
       },
@@ -3478,7 +3483,7 @@
               },
               {
                 "$ref": "#/components/schemas/ComponentStatus",
-                "description": "Optional status of the dataset"
+                "description": "The current status of the dataset. Only included when `status=true` query parameter is specified.\nPossible values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`."
               }
             ]
           }
