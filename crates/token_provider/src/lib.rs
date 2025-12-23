@@ -15,12 +15,10 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::{fmt::Debug, hash::DefaultHasher};
+use std::{fmt::Debug, hash::{DefaultHasher, Hash, Hasher}};
 
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::hash::Hash;
-use std::hash::Hasher;
 use tokio::sync::watch;
 
 pub mod registry;
