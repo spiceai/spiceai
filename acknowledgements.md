@@ -750,7 +750,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - spiceai 3.1.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 1.10.1, Apache-2.0 
+- spicepod-validator 1.10.2, Apache-2.0 
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
