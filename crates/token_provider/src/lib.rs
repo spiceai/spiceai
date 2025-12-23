@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::{fmt::Debug, hash::{DefaultHasher, Hash, Hasher}};
+use std::{
+    fmt::Debug,
+    hash::{DefaultHasher, Hash, Hasher},
+};
 
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
