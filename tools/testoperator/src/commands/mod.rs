@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use crate::args::{CommonArgs, DatasetTestArgs, QuerySetLoader};
+use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
@@ -65,7 +65,7 @@ pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
 ///
 /// # Returns
 /// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
-pub(crate) fn build_test_with_validation(
+pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
 ) -> anyhow::Result<(QuerySet, NotStarted)> {
@@ -74,7 +74,7 @@ pub(crate) fn build_test_with_validation(
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+    let queries = query_set.get_queries(query_overrides, None, None).await?;
 
     let mut test_builder = test_builder.with_query_set(queries);
 

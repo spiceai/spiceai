@@ -20,7 +20,7 @@ use crate::{
         arrow::changes,
         change_event::{ChangeEvent, ChangeEventKey},
     },
-    kafka::KafkaConsumer,
+    kafka::{Error, KafkaConsumer},
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -32,14 +32,16 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
-use futures::StreamExt;
 use std::{any::Any, sync::Arc};
+use tokio::time::Duration;
+use tokio_stream::StreamExt;
 
 pub struct DebeziumKafka {
     schema: SchemaRef,
     primary_keys: Vec<String>,
     constraints: Option<Constraints>,
     consumer: &'static KafkaConsumer,
+    batching: (usize, Duration),
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -54,7 +56,12 @@ impl std::fmt::Debug for DebeziumKafka {
 
 impl DebeziumKafka {
     #[must_use]
-    pub fn new(schema: SchemaRef, primary_keys: Vec<String>, consumer: KafkaConsumer) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        primary_keys: Vec<String>,
+        consumer: KafkaConsumer,
+        batching: (usize, Duration),
+    ) -> Self {
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
             unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
         };
@@ -79,6 +86,7 @@ impl DebeziumKafka {
             primary_keys,
             constraints,
             consumer: Box::leak(Box::new(consumer)),
+            batching,
         }
     }
 
@@ -94,16 +102,33 @@ impl DebeziumKafka {
         let stream = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
-            .map(move |msg| {
+            .chunks_timeout(self.batching.0, self.batching.1)
+            .map(move |msgs| {
                 let schema = Arc::clone(&schema);
                 let pk = primary_keys.clone();
 
-                let msg = msg.map_err(cdc::StreamError::Kafka)?;
+                if msgs.is_empty() {
+                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
+                }
 
-                let val = msg.value();
-                changes::to_change_batch(&schema, &pk, val)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb, true))
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+                let mut messages: Vec<_> = msgs
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(cdc::StreamError::Kafka)?;
+
+                let changes: Vec<_> = messages
+                    .iter()
+                    .map(super::kafka::KafkaMessage::value)
+                    .collect();
+
+                let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+
+                let Some(last_msg) = messages.pop() else {
+                    unreachable!("checked non-empty above");
+                };
+
+                Ok(ChangeEnvelope::new(Box::new(last_msg), rb, true))
             });
 
         Box::pin(stream)

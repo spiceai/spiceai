@@ -32,6 +32,9 @@ on:
       - 'Dockerfile*'
       - 'bin/spice/**'
 
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight UTC
+
   workflow_dispatch:
     inputs:
       run_all_tests:
@@ -72,7 +75,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'darwin'
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -85,7 +88,7 @@ jobs:
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           FEATURES="flightsql,models,metal,s3_vectors,kafka"
-          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
             FEATURES="${FEATURES},bedrock,extended_tests"
             echo "Including extended_tests"
           else
@@ -110,7 +113,7 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -127,7 +130,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -138,7 +141,7 @@ jobs:
 
       - name: Run Beta functionality embeddings test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -148,11 +151,11 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-  
+
   test-ai-udf:
     name: Test AI UDF
     needs: build
@@ -161,7 +164,7 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -180,7 +183,7 @@ jobs:
 
       - name: Run AI UDF basic test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
         run: |
@@ -196,7 +199,7 @@ jobs:
 
       - name: Run AI UDF with dataset test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
@@ -217,7 +220,7 @@ jobs:
 
       - name: Run AI UDF LEFT truncate test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
@@ -237,7 +240,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -245,13 +248,13 @@ jobs:
   test-hf:
     name: Test Huggingface Models
     needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          
+
       - name: Install Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -264,7 +267,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -275,7 +278,7 @@ jobs:
 
       - name: Run Beta functionality embedding tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -285,7 +288,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -311,13 +314,13 @@ jobs:
 
       - name: Run Beta functionality embedding tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
           if [ -z "$SPICE_HF_TOKEN" ] ; then
@@ -327,7 +330,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -335,7 +338,7 @@ jobs:
   test-bedrock:
     name: Test Bedrock Models
     needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' }}
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -354,14 +357,14 @@ jobs:
 
       - name: Run Beta functionality embedding tests
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           AWS_BEDROCK_SECRET: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -391,7 +394,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
@@ -401,7 +404,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -431,7 +434,7 @@ jobs:
 
       - name: Run integration test
         env:
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
@@ -443,7 +446,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

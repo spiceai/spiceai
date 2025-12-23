@@ -4154,6 +4154,7 @@ dependencies = [
  "token_provider",
  "tokio",
  "tokio-postgres",
+ "tokio-stream",
  "tokio-util",
  "tonic 0.13.1",
  "tracing",

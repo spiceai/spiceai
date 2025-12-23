@@ -1,0 +1,68 @@
+---
+name: integration tests (search)
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # Daily at 01:00 UTC
+
+  workflow_dispatch:
+    inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  test-search:
+    name: Test Search Integration
+    runs-on: 'spiceai-macos'
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'darwin'
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Set up API Keys
+        run: |
+          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
+
+      - name: Run search integration tests
+        env:
+          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+        run: |
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
+            exit 1
+          fi
+          cargo nextest run --test integration_models -p runtime --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
+
+      - name: Push snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
+        uses: ./.github/actions/push-snap-changes
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
