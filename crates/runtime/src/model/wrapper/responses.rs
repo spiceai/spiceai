@@ -79,8 +79,12 @@ impl Responses for ResponsesWrapper {
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
         let start = Instant::now();
         let req = self.prepare_req(req);
-        let model_name = req.model.clone().unwrap_or_default();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=true, model = %model_name, input = %serde_json::to_string(&req).unwrap_or_default());
+        let Some(ref model_id) = req.model else {
+            return Err(OpenAIError::InvalidArgument(
+                "Model ID must be specified in the request".into(),
+            ));
+        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=true, model = %model_id, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", metadata = ?metadata);
@@ -120,9 +124,14 @@ impl Responses for ResponsesWrapper {
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
         let start = Instant::now();
 
+        let Some(model_id) = req.model.clone() else {
+            return Err(OpenAIError::InvalidArgument(
+                "Model ID must be specified in the request".into(),
+            ));
+        };
+
         let req = self.prepare_req(req);
-        let model_name = req.model.clone().unwrap_or_default();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=false, model = %model_name, input = %serde_json::to_string(&req).unwrap_or_default());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=false, model = %model_id, input = %serde_json::to_string(&req).unwrap_or_default());
 
         let labels = request_labels_responses(&req);
         if let Some(metadata) = &req.metadata {
@@ -235,7 +244,7 @@ where
                             );
                         }
 
-                        response.model = self.model_public_name.clone();
+                        response.model.clone_from(self.model_public_name);
                     }
                     ResponseStreamEvent::ResponseFailed(_) => {
                         handle_metrics(self.started.elapsed(), true, &self.labels);

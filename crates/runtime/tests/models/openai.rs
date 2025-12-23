@@ -36,7 +36,7 @@ use async_openai::types::chat::{
 use async_openai::types::embeddings::EmbeddingInput;
 use async_openai::types::responses::{Content, Response as OpenAIResponse};
 use async_openai::types::responses::{
-    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
+    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, Tool as ToolDefinition,
 };
 use chrono::{DateTime, Utc};
 use futures::StreamExt;

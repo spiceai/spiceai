@@ -214,8 +214,8 @@ impl ChatWrapper {
                     Some(opts)
                 }
                 None => Some(ChatCompletionStreamOptions {
-                    include_usage: Some(true),
                     include_obfuscation: None,
+                    include_usage: Some(true),
                 }),
             };
         }

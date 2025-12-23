@@ -25,7 +25,7 @@ use crate::model::LLMChatCompletionsModelStore;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
-    error::OpenAIError,
+    error::{OpenAIError, StreamError},
     types::chat::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
@@ -193,8 +193,8 @@ async fn handle_streaming(
         let mut events = match get_event_stream() {
             Ok(o) => o,
             Err(e) => {
-                return openai_error_to_response(OpenAIError::InvalidArgument(format!(
-                    "An error occurred in reading progress: {e}"
+                return openai_error_to_response(OpenAIError::StreamError(Box::new(
+                    StreamError::EventStream(format!("An error occurred in reading progress: {e}")),
                 )));
             }
         };

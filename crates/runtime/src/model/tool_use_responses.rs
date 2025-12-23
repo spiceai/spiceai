@@ -16,13 +16,15 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::responses::{
-        CodeInterpreterContainerAuto, CodeInterpreterTool, CodeInterpreterToolContainer,
-        CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-        FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputContent, InputItem,
-        InputMessage, InputParam, InputRole, InputTokenDetails, Item, MessageItem, MessageType,
-        OutputItem, OutputTokenDetails, Response, ResponseStream, ResponseStreamEvent,
-        ResponseUsage, Role, Tool, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
+    types::{
+        chat::FunctionCall,
+        responses::{
+            CodeInterpreterTool, CreateResponse, FunctionCallOutput, FunctionCallOutputItemParam,
+            FunctionTool, FunctionToolCall, InputContent, InputItem, InputMessage, InputParam,
+            InputTokenDetails, Item, OutputItem, OutputStatus, OutputTokenDetails, Response,
+            ResponseStream, ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition,
+            ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
+        },
     },
 };
 use async_trait::async_trait;
@@ -40,7 +42,7 @@ use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
-use crate::model::tool_use::{combine_opt_u32, encode_tool_name};
+use crate::model::tool_use::encode_tool_name;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Clone, Debug)]
@@ -52,17 +54,12 @@ pub enum OpenAIResponsesTools {
 impl From<OpenAIResponsesTools> for Tool {
     fn from(tool: OpenAIResponsesTools) -> Self {
         match tool {
-            OpenAIResponsesTools::CodeInterpreter => Tool::CodeInterpreter(CodeInterpreterTool {
-                container: CodeInterpreterToolContainer::Auto(CodeInterpreterContainerAuto {
-                    file_ids: None,
-                    memory_limit: None,
-                }),
-            }),
-            OpenAIResponsesTools::WebSearch => Tool::WebSearchPreview(WebSearchTool {
-                search_context_size: None,
-                user_location: None,
-                filters: None,
-            }),
+            OpenAIResponsesTools::CodeInterpreter => {
+                ToolDefinition::CodeInterpreter(CodeInterpreterTool::default())
+            }
+            OpenAIResponsesTools::WebSearch => {
+                ToolDefinition::WebSearchPreview(WebSearchTool::default())
+            }
         }
     }
 }
@@ -106,10 +103,10 @@ impl ToolUsingResponses {
 
     fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
         let existing_items = match req.input.clone() {
-            InputParam::Text(input) => vec![InputItem::EasyMessage(EasyInputMessage {
-                r#type: MessageType::Message,
+            InputParam::Text(input) => vec![InputItem::Message(InputMessage {
+                content: InputContent::TextInput(input),
                 role: Role::User,
-                content: EasyInputContent::Text(input),
+                status: Some(OutputStatus::Completed),
             })],
             InputParam::Items(items) => items,
         };
@@ -132,8 +129,8 @@ impl ToolUsingResponses {
         self.tools
             .iter()
             .map(|t| {
-                Tool::Function(FunctionTool {
-                    strict: Some(t.strict().unwrap_or(false)),
+                ToolDefinition::Function(FunctionTool {
+                    strict: t.strict().unwrap_or(false),
                     name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
                     parameters: Some(
@@ -154,22 +151,30 @@ impl ToolUsingResponses {
             .collect()
     }
 
-    fn as_spiced_tool(&self, t: &FunctionToolCall) -> Option<Arc<dyn SpiceModelTool>> {
+    // This is a bad function name. Its more like `find_spiced_tool`.
+    fn as_spiced_tool(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         self.tools
             .iter()
-            .find(|tool| encode_tool_name(tool.name().as_ref()) == t.name)
+            .find(|tool| encode_tool_name(tool.name().as_ref()) == name)
             .cloned()
     }
 
     async fn call_tool(&self, tool_call: &FunctionToolCall) -> Value {
-        match self.as_spiced_tool(tool_call) {
-            Some(t) => match t.call(&tool_call.arguments).await {
+        let FunctionToolCall {
+            name,
+            arguments,
+            id,
+            call_id,
+            status,
+        } = tool_call;
+        match self.as_spiced_tool(name) {
+            Some(t) => match t.call(arguments).await {
                 Ok(v) => {
                     tracing::info!(
                         target: "task_history",
                         progress = Progress::log()
-                            .id(tool_call.call_id.clone())
-                            .title(format!("'{}' tool completed successfully", tool_call.name))
+                            .id(id.clone())
+                            .title(format!("'{name}' tool completed successfully"))
                             .json_content(v.clone())
                             .to_jsonl(),
                     );
@@ -179,8 +184,8 @@ impl ToolUsingResponses {
                     tracing::info!(
                         target: "task_history",
                         progress = Progress::error()
-                            .id(tool_call.call_id.clone())
-                            .title(format!("'{}' tool completed unsuccessfully", tool_call.name))
+                            .id(id.clone())
+                            .title(format!("'{name}' tool completed unsuccessfully"))
                             .content(e.to_string())
                             .to_jsonl(),
                     );
@@ -194,13 +199,11 @@ impl ToolUsingResponses {
                 // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
                 if cfg!(feature = "dev") {
                     panic!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.name
+                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
                     );
                 } else {
                     tracing::warn!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.name
+                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
                     );
                     Value::Null
                 }
@@ -215,7 +218,7 @@ impl ToolUsingResponses {
     ) -> Result<Option<Vec<InputItem>>, OpenAIError> {
         let spiced_tools = requested_tools
             .iter()
-            .filter(|&t| self.as_spiced_tool(t).is_some())
+            .filter(|&t| self.as_spiced_tool(&t.name).is_some())
             .cloned()
             .collect_vec();
 
@@ -230,7 +233,7 @@ impl ToolUsingResponses {
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
-                    .id(t.call_id.clone())
+                    .id(t.id.unwrap_or_default())
                     .title(format!("Calling '{}' tool", t.name))
                     .content(t.arguments.clone())
                     .to_jsonl(),
@@ -240,26 +243,27 @@ impl ToolUsingResponses {
         }
 
         // Tell model the assistant used these tools, and provided result.
-        let mut tool_messages: Vec<InputItem> = vec![];
+        let mut messages = original_messages.clone();
         for (tool_call, response_content) in &tool_and_response_content {
-            // Add the function call
-            tool_messages.push(InputItem::Item(Item::FunctionCall(tool_call.clone())));
-            // Add the function call output
-            tool_messages.push(InputItem::Item(Item::FunctionCallOutput(
+            messages.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                arguments: tool_call.arguments.clone(),
+                call_id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                id: tool_call.name.clone(),
+                status: None,
+            })));
+            messages.push(InputItem::Item(Item::FunctionCallOutput(
                 FunctionCallOutputItemParam {
-                    call_id: tool_call.call_id.clone(),
+                    call_id: tool_call.id.clone(),
                     output: FunctionCallOutput::Text(
                         serde_json::to_string(&response_content)
-                            .unwrap_or_else(|_| "Error calling tool.".to_string()),
+                            .unwrap_or("Error calling tool.".to_string()),
                     ),
-                    id: None,
+                    id: tool_call.name.clone(),
                     status: None,
                 },
             )));
         }
-
-        let mut messages = original_messages.clone();
-        messages.extend(tool_messages);
 
         if !messages.is_empty() {
             let used_tools = spiced_tools.len();
@@ -524,8 +528,10 @@ fn make_responses_stream(
 
                                     ready_to_call_lock
                                         .iter()
-                                        .find(|call| call.call_id == function_call.call_id)
-                                        .is_some_and(|call| model.as_spiced_tool(call).is_some())
+                                        .find(|call| call.id == function_call.id)
+                                        .is_some_and(|call| {
+                                            model.as_spiced_tool(&call.name).is_some()
+                                        })
                                 };
 
                                 if spice_tool_found {
@@ -547,7 +553,7 @@ fn make_responses_stream(
 
                                     ready_to_call_lock
                                         .iter()
-                                        .any(|call| model.as_spiced_tool(call).is_some())
+                                        .any(|call| model.as_spiced_tool(&call.name).is_some())
                                 };
 
                                 if has_spice_tools {
@@ -569,7 +575,7 @@ fn make_responses_stream(
 
                             ready_to_call_lock
                                 .iter()
-                                .filter(|call| model.as_spiced_tool(call).is_some())
+                                .filter(|call| model.as_spiced_tool(call.name).is_some())
                                 .cloned()
                                 .collect()
                         }; // Lock is dropped here
@@ -685,7 +691,7 @@ fn create_new_recursive_req(
     // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
     if matches!(
         new_req.tool_choice,
-        Some(ToolChoiceParam::Function { .. }) | None
+        Some(ToolChoiceParam::Function(ToolChoiceFunction { .. })) | None
     ) {
         // Auto is default when tools exist.
         tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
@@ -704,10 +710,10 @@ fn create_new_recursive_req(
 
 fn to_input_item(input: InputParam) -> Vec<InputItem> {
     match input {
-        InputParam::Text(text) => vec![InputItem::EasyMessage(EasyInputMessage {
-            r#type: MessageType::Message,
+        InputParam::Text(text) => vec![InputItem::Message(InputMessage {
+            content: InputContent::TextInput(text),
             role: Role::User,
-            content: EasyInputContent::Text(text),
+            status: None,
         })],
         InputParam::Items(items) => items,
     }
@@ -720,34 +726,19 @@ pub fn combine_usage(
     match (u1, u2) {
         (Some(u1), Some(u2)) => Some(ResponseUsage {
             input_tokens: u1.input_tokens + u2.input_tokens,
-            input_tokens_details: combine_token_details(
-                &u1.input_tokens_details,
-                &u2.input_tokens_details,
-            ),
+            input_tokens_details: InputTokenDetails {
+                cached_tokens: u1.input_tokens_details.cached_tokens
+                    + u2.input_tokens_details.cached_tokens,
+            },
             output_tokens: u1.output_tokens + u2.output_tokens,
-            output_tokens_details: combine_output_token_details(
-                &u1.output_tokens_details,
-                &u2.output_tokens_details,
-            ),
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: u1.output_tokens_details.reasoning_tokens
+                    + u2.output_tokens_details.reasoning_tokens,
+            },
             total_tokens: u1.total_tokens + u2.total_tokens,
         }),
         (Some(u1), None) => Some(u1),
         (None, Some(u2)) => Some(u2),
         (None, None) => None,
-    }
-}
-
-pub fn combine_token_details(a: &InputTokenDetails, b: &InputTokenDetails) -> InputTokenDetails {
-    InputTokenDetails {
-        cached_tokens: a.cached_tokens + b.cached_tokens,
-    }
-}
-
-pub fn combine_output_token_details(
-    a: &OutputTokenDetails,
-    b: &OutputTokenDetails,
-) -> OutputTokenDetails {
-    OutputTokenDetails {
-        reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens,
     }
 }

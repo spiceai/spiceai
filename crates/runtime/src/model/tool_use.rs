@@ -228,9 +228,8 @@ impl ToolUsingChat {
                 .tool_calls(
                     spiced_tools
                         .iter()
-                        .cloned()
-                        .map(ChatCompletionMessageToolCalls::Function)
-                        .collect_vec(),
+                        .map(|t| ChatCompletionMessageToolCalls::Function(t.clone()))
+                        .collect::<Vec<_>>(),
                 ) // TODO - should this include non-spiced tools?
                 .build()?
                 .into();
@@ -309,6 +308,7 @@ impl ToolUsingChat {
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
             let usage = resp.usage.clone();
 
+            // ChatCompletionMessageToolCall
             let tools_used = resp
                 .choices
                 .first()
@@ -325,7 +325,17 @@ impl ToolUsingChat {
                 .collect();
 
             match self
-                .process_tool_calls_and_run_spice_tools(req.messages, tool_calls)
+                .process_tool_calls_and_run_spice_tools(
+                    req.messages,
+                    tools_used
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|t| match t {
+                            ChatCompletionMessageToolCalls::Function(f) => Some(f),
+                            _ => None,
+                        })
+                        .collect(),
+                )
                 .await?
             {
                 // New messages means we have run spice tools locally, ready to recall model.
@@ -351,21 +361,15 @@ impl ToolUsingChat {
         if runtime_tools.is_empty() {
             req.clone()
         } else {
-            // Wrap runtime tools in ChatCompletionTools::Function and combine with existing tools
-            let mut all_tools: Vec<ChatCompletionTools> = runtime_tools
-                .into_iter()
-                .map(ChatCompletionTools::Function)
-                .collect();
-            all_tools.extend(req.tools.clone().unwrap_or_default());
-
-            // Helper to extract function name from ChatCompletionTools
-            fn get_fn_name(t: &ChatCompletionTools) -> Option<&str> {
-                match t {
-                    ChatCompletionTools::Function(f) => Some(&f.function.name),
-                    ChatCompletionTools::Custom(_) => None,
-                }
-            }
-
+            runtime_tools.extend(
+                req.tools
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| match t {
+                        ChatCompletionTools::Function(f) => Some(f.clone()),
+                        _ => None,
+                    }),
+            );
             // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
             all_tools.sort_by(|a, b| get_fn_name(a).cmp(&get_fn_name(b)));
             all_tools.dedup_by(|a, b| match (get_fn_name(a), get_fn_name(b)) {

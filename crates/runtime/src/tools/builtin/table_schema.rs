@@ -245,7 +245,7 @@ impl TableSchemaTool {
                     function: FunctionCall {
                         name: self.name().to_string(),
                         arguments: serde_json::to_string(&params)
-                            .map_err(|e| OpenAIError::JSONDeserialize(e, String::new()))?,
+                            .map_err(|e| OpenAIError::JSONDeserialize(e, "".to_string()))?,
                     },
                 },
             )])

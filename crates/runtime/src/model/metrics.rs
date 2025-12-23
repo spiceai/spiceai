@@ -17,8 +17,8 @@ limitations under the License.
 use std::{sync::LazyLock, time::Duration};
 
 use async_openai::types::chat::{
-    ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
-    ToolChoiceOptions,
+    ChatCompletionNamedToolChoice, ChatCompletionNamedToolChoiceCustom,
+    ChatCompletionToolChoiceOption, CreateChatCompletionRequest, CustomName, FunctionName,
 };
 use async_openai::types::responses::CreateResponse;
 use opentelemetry::{
@@ -63,15 +63,14 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
 
     if let Some(ref choice) = req.tool_choice {
         let choice_str: StringValue = match choice {
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => "none".into(),
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => "auto".into(),
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => "required".into(),
+            ChatCompletionToolChoiceOption::Mode(m) => m.into(),
+            ChatCompletionToolChoiceOption::AllowedTools(_) => "allowed_tools",
             ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
-                function,
-                ..
-            }) => format!("function:{}", function.name).into(),
-            ChatCompletionToolChoiceOption::AllowedTools(_) => "allowed_tools".into(),
-            ChatCompletionToolChoiceOption::Custom(_) => "custom".into(),
+                function: FunctionName { name, .. },
+            })
+            | ChatCompletionToolChoiceOption::Custom(ChatCompletionNamedToolChoiceCustom {
+                custom: CustomName { name },
+            }) => format!("function:{name}").into(),
         };
         labels.push(KeyValue::new(
             Key::new("tool_choice"),
@@ -79,6 +78,7 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
         ));
     }
 
+    #[expect(deprecated)]
     if let Some(ref user) = req.user {
         labels.push(KeyValue::new(
             Key::new("user"),

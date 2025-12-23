@@ -132,8 +132,12 @@ pub(crate) async fn post(
         "ai_chat",
         input = %serde_json::to_string(&req).unwrap_or_default()
     );
+
+    let Some(model_id) = req.model.clone() else {
+        return (StatusCode::BAD_REQUEST, "model is required").into_response();
+    };
     span.in_scope(
-        || tracing::info!(target: "task_history", model = %req.model.clone().unwrap_or_default(), api = "responses", "labels"),
+        || tracing::info!(target: "task_history", model = %model_id, api = "responses", "labels"),
     );
 
     if let Some(traceparent) = context.trace_parent() {
@@ -142,7 +146,7 @@ pub(crate) async fn post(
 
     let span_clone = span.clone();
     async move {
-        let model_id = req.model.clone().unwrap_or_default();
+        let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
 
         let Some(model) = llms.read().await.get(&model_id).cloned() else {

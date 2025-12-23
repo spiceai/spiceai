@@ -192,6 +192,8 @@ mod tests {
     use crate::embeddings::Embed;
     use crate::model2vec::Model2Vec;
     use async_openai::types::embeddings::EmbeddingInput;
+
+    #[expect(dead_code)]
     async fn test_embed() {
         // This embedding is dim 256
         let model = Model2Vec::from_params(
