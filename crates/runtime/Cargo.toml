@@ -69,7 +69,7 @@ globset.workspace = true
 governor.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-headers-accept = "0.1.3"
+headers-accept = "0.3.0"
 http.workspace = true
 http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
@@ -84,7 +84,7 @@ indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
 llms = { path = "../llms" }
-mediatype = "0.19.18"
+mediatype = "0.21.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
 mongodb = { workspace = true, optional = true }
