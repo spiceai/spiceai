@@ -7029,7 +7029,7 @@ checksum = "78beb98ea9a8f76b4a38c5ca651db6aa84701f307b63b4e0d78342ad4219c7e4"
 dependencies = [
  "headers-core",
  "http 1.4.0",
- "mediatype 0.21.0",
+ "mediatype",
 ]
 
 [[package]]
@@ -9114,12 +9114,6 @@ checksum = "51c55d61e72fc3ab704396c5fa16f4c184db37978ae4e94ca8959693a235fc0e"
 dependencies = [
  "log",
 ]
-
-[[package]]
-name = "mediatype"
-version = "0.19.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33746aadcb41349ec291e7f2f0a3aa6834d1d7c58066fb4b01f68efc4c4b7631"
 
 [[package]]
 name = "mediatype"
@@ -13123,7 +13117,7 @@ dependencies = [
  "jsonwebtoken",
  "linkme",
  "llms",
- "mediatype 0.19.20",
+ "mediatype",
  "model_components",
  "moka",
  "mongodb",
