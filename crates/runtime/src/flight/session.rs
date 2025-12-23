@@ -98,6 +98,17 @@ impl SessionStore {
     /// Creates a new session with a unique ID and returns both the ID and the context.
     ///
     /// The session context is created from the provided base context's state.
+    ///
+    /// # Important: Session State Snapshot
+    ///
+    /// The session context is a **point-in-time snapshot** of the base context's state.
+    /// Any changes to datasets, catalogs, or tables registered after session creation
+    /// will **not** be visible within existing sessions. Clients will only see the
+    /// schema and tables that existed at the moment of session creation.
+    ///
+    /// This design is intentional for consistency within a session's lifetime, but
+    /// long-running sessions may see stale catalog information if the runtime's
+    /// registered datasets change.
     #[must_use]
     pub fn create_session(&self, base_ctx: &SessionContext) -> (String, Arc<SessionContext>) {
         let session_id = Uuid::now_v7().hyphenated().to_string();
