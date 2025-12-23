@@ -274,6 +274,7 @@ impl RuntimeBuilder {
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
             df,
+            #[cfg(feature = "models")]
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
             responses_llms: Arc::new(RwLock::new(HashMap::new())),

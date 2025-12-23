@@ -16,6 +16,7 @@ limitations under the License.
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
+#[cfg(feature = "models")]
 use model_components::model::{Error as ModelError, Model};
 use std::result::Result;
 use std::sync::Arc;
@@ -57,6 +58,7 @@ use crate::DataFusion;
 
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
 
+#[cfg(feature = "models")]
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
         .query_builder(

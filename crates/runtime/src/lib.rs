@@ -65,6 +65,7 @@ pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
+#[cfg(feature = "models")]
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
@@ -453,6 +454,7 @@ pub struct LogErrors(pub bool);
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
+    #[cfg(feature = "models")]
     models: Arc<RwLock<HashMap<String, Model>>>,
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
     // LLMs that support the OpenAI Responses API

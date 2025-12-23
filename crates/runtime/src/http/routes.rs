@@ -246,7 +246,8 @@ pub(crate) fn routes(
             .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
     }
 
-    if cfg!(feature = "models") {
+    #[cfg(feature = "models")]
+    {
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/{name}/predict", get(v1::inference::get))

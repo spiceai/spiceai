@@ -13,26 +13,37 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#[cfg(feature = "models")]
 use crate::{
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     model::run,
 };
+#[cfg(feature = "models")]
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+#[cfg(feature = "models")]
 use app::App;
+#[cfg(feature = "models")]
 use arrow::array::Float32Array;
+#[cfg(feature = "models")]
 use axum::{
     Extension, Json,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+#[cfg(feature = "models")]
 use model_components::{model::Model, modelsource};
+#[cfg(feature = "models")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "models")]
 use std::time::Instant;
+#[cfg(feature = "models")]
 use std::{collections::HashMap, sync::Arc};
+#[cfg(feature = "models")]
 use tokio::sync::RwLock;
 
+#[cfg(feature = "models")]
 #[derive(Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictRequest {
@@ -41,12 +52,14 @@ pub struct BatchPredictRequest {
     pub predictions: Vec<PredictRequest>,
 }
 
+#[cfg(feature = "models")]
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PredictRequest {
     pub model_name: String,
 }
 
+#[cfg(feature = "models")]
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictResponse {
@@ -54,6 +67,7 @@ pub struct BatchPredictResponse {
     pub duration_ms: u128,
 }
 
+#[cfg(feature = "models")]
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PredictResponse {
@@ -79,6 +93,7 @@ pub struct PredictResponse {
     pub duration_ms: u128,
 }
 
+#[cfg(feature = "models")]
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum PredictStatus {
@@ -95,6 +110,7 @@ pub enum PredictStatus {
 /// ML Prediction
 ///
 /// Make a ML prediction using a specific model.
+#[cfg(feature = "models")]
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models/{name}/predict",
@@ -134,6 +150,7 @@ pub enum PredictStatus {
         )))
     )
 ))]
+#[cfg(feature = "models")]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Path(model_name): Path<String>,
@@ -159,6 +176,7 @@ pub(crate) async fn get(
 /// Batch ML Predictions
 ///
 /// Perform a batch of ML predictions, using multiple models, in one request. This is useful for ensembling or A/B testing different models.
+#[cfg(feature = "models")]
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/predict",
@@ -204,6 +222,7 @@ pub(crate) async fn get(
         )))
     )
 ))]
+#[cfg(feature = "models")]
 pub(crate) async fn post(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
@@ -240,6 +259,7 @@ pub(crate) async fn post(
         .into_response()
 }
 
+#[cfg(feature = "models")]
 async fn run_inference(
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,

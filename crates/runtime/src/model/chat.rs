@@ -136,6 +136,11 @@ pub async fn construct_model(
         ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => bedrock(model_id, params).await,
+        #[cfg(not(feature = "bedrock"))]
+        ModelSource::Bedrock => Err(LlmError::UnsupportedTaskForModel {
+            from: "bedrock".into(),
+            task: "llm".into(),
+        }),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),

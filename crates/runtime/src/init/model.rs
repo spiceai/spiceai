@@ -20,6 +20,7 @@ use crate::{
     Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, timing::TimeMeasurement,
 };
 use app::App;
+#[cfg(feature = "models")]
 use model_components::model::Model;
 use opentelemetry::KeyValue;
 use runtime_secrets::get_params_with_secrets;
@@ -34,6 +35,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[cfg(feature = "models")]
     #[snafu(display("Failed to load runnable model: {name}. {source}"))]
     FailedToLoadRunnableModel {
         name: String,
@@ -139,6 +141,7 @@ impl Runtime {
                     source: Box::new(e),
                 }),
             },
+            #[cfg(feature = "models")]
             Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
                 Ok(in_m) => {
                     let mut model_map = self.models.write().await;
@@ -150,6 +153,13 @@ impl Runtime {
                     source: Box::new(e),
                 }),
             },
+            #[cfg(not(feature = "models"))]
+            Some(ModelType::Ml) => {
+                tracing::error!("Cannot load ML model {} without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}", m.name);
+                Err(Error::UnableToDetermineModelType {
+                    name: m.name.clone(),
+                })
+            }
             None => Err(Error::UnableToDetermineModelType {
                 name: m.name.clone(),
             }),
@@ -178,9 +188,15 @@ impl Runtime {
 
     async fn remove_model(&self, m: &SpicepodModel) {
         match m.model_type() {
+            #[cfg(feature = "models")]
             Some(ModelType::Ml) => {
                 let mut ml_map = self.models.write().await;
                 ml_map.remove(&m.name);
+            }
+            #[cfg(not(feature = "models"))]
+            Some(ModelType::Ml) => {
+                tracing::warn!("ML models feature is not enabled");
+                return;
             }
             Some(ModelType::Llm) => {
                 let mut llm_map = self.completion_llms.write().await;

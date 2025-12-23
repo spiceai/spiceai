@@ -26,9 +26,9 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
-tract-onnx = "0.22.0"
+tract-onnx = { version = "0.22.0", optional = true }
 util = { path = "../util" }
 
 [features]
 dev = []
-full = []
+full = ["dep:tract-onnx"]
