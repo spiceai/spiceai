@@ -52,64 +52,119 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+/// Arrow `DataType` to SQL type name conversion for CAST expressions.
+fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Int8 => Some("TINYINT"),
+        DataType::Int16 => Some("SMALLINT"),
+        DataType::Int32 => Some("INT"),
+        DataType::Int64 => Some("BIGINT"),
+        DataType::UInt8 => Some("TINYINT UNSIGNED"),
+        DataType::UInt16 => Some("SMALLINT UNSIGNED"),
+        DataType::UInt32 => Some("INT UNSIGNED"),
+        DataType::UInt64 => Some("BIGINT UNSIGNED"),
+        DataType::Float32 => Some("FLOAT"),
+        DataType::Float64 => Some("DOUBLE"),
+        DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::Date32 | DataType::Date64 => Some("DATE"),
+        DataType::Timestamp(_, _) => Some("TIMESTAMP"),
+        _ => None,
+    }
+}
+
+/// AST visitor that rewrites parameter placeholders to include CAST expressions.
+///
+/// This uses proper SQL parsing to avoid incorrectly replacing placeholders
+/// inside string literals or comments.
+struct ParameterCastRewriter<'a> {
+    param_types: &'a std::collections::HashMap<usize, &'static str>,
+}
+
+impl VisitorMut for ParameterCastRewriter<'_> {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Value(value_with_span) = expr
+            && let Value::Placeholder(ref placeholder) = value_with_span.value
+        {
+            // Check if this is a $N style placeholder
+            if let Some(stripped) = placeholder.strip_prefix('$') {
+                if let Ok(idx) = stripped.parse::<usize>() {
+                    if let Some(sql_type) = self.param_types.get(&idx) {
+                        // Replace $N with CAST($N AS type) by wrapping in a Cast expression
+                        let original_placeholder = placeholder.clone();
+                        let cast_expr = Expr::Cast {
+                            expr: Box::new(Expr::Value(
+                                Value::Placeholder(original_placeholder).into(),
+                            )),
+                            data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
+                                datafusion::sql::sqlparser::ast::ObjectName(vec![
+                                    datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                                        datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
+                                    ),
+                                ]),
+                                vec![],
+                            ),
+                            format: None,
+                            kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
+                        };
+                        *expr = cast_expr;
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Attempts to rewrite SQL to include explicit type casts for parameters.
 /// This helps `DataFusion` infer parameter types for queries like "SELECT $1 + $2".
 ///
+/// Uses AST-based rewriting to avoid incorrectly modifying placeholders inside
+/// string literals or comments.
+///
 /// For each parameter $N, wraps it in a CAST($N AS <type>) based on the schema.
 fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
-    use arrow::datatypes::DataType;
-
-    let mut rewritten = sql.to_string();
-
-    // For each field in the schema (representing each parameter), replace $N with CAST($N AS type)
+    // Build a map from parameter index to SQL type string
+    let mut param_types = std::collections::HashMap::new();
     for (idx, field) in schema.fields().iter().enumerate() {
         let param_num = idx + 1;
-        let param_placeholder = format!("${param_num}");
-
-        // Determine the SQL type name from Arrow DataType
-        let sql_type = match field.data_type() {
-            DataType::Int8 => "TINYINT",
-            DataType::Int16 => "SMALLINT",
-            DataType::Int32 => "INT",
-            DataType::Int64 => "BIGINT",
-            DataType::UInt8 => "TINYINT UNSIGNED",
-            DataType::UInt16 => "SMALLINT UNSIGNED",
-            DataType::UInt32 => "INT UNSIGNED",
-            DataType::UInt64 => "BIGINT UNSIGNED",
-            DataType::Float32 => "FLOAT",
-            DataType::Float64 => "DOUBLE",
-            DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
-            DataType::Boolean => "BOOLEAN",
-            DataType::Date32 | DataType::Date64 => "DATE",
-            DataType::Timestamp(_, _) => "TIMESTAMP",
-            _ => {
-                // For unsupported types, skip casting
-                tracing::warn!(
-                    "Cannot cast parameter ${} with unsupported type: {:?}",
-                    param_num,
-                    field.data_type()
-                );
-                continue;
-            }
-        };
-
-        // Replace all occurrences of $N with CAST($N AS type)
-        // Use word boundaries to avoid replacing $1 in $10, $11, etc.
-        let cast_expr = format!("CAST({param_placeholder} AS {sql_type})");
-
-        // Simple replacement - this could be improved with proper SQL parsing
-        // but should work for most cases
-        rewritten = rewritten.replace(&format!("{param_placeholder} "), &format!("{cast_expr} "));
-        rewritten = rewritten.replace(&format!("{param_placeholder})"), &format!("{cast_expr})"));
-        rewritten = rewritten.replace(&format!("{param_placeholder},"), &format!("{cast_expr},"));
-
-        // Handle cases where parameter is at the end of the SQL
-        if rewritten.ends_with(&param_placeholder) {
-            rewritten = rewritten.trim_end_matches(&param_placeholder).to_string() + &cast_expr;
+        if let Some(sql_type) = arrow_type_to_sql_type(field.data_type()) {
+            param_types.insert(param_num, sql_type);
+        } else {
+            tracing::warn!(
+                "Cannot cast parameter ${} with unsupported type: {:?}",
+                param_num,
+                field.data_type()
+            );
         }
     }
 
-    rewritten
+    // Parse the SQL into an AST
+    let dialect = GenericDialect {};
+    let mut ast = match Parser::parse_sql(&dialect, sql) {
+        Ok(ast) => ast,
+        Err(e) => {
+            tracing::warn!("Failed to parse SQL for type cast rewriting: {e}");
+            return sql.to_string();
+        }
+    };
+
+    // Rewrite parameter placeholders in each statement
+    let mut rewriter = ParameterCastRewriter {
+        param_types: &param_types,
+    };
+    for stmt in &mut ast {
+        let _ = stmt.visit(&mut rewriter);
+    }
+
+    // Convert AST back to SQL string
+    ast.iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -354,7 +409,7 @@ pub(crate) async fn do_get(
         parameter_schema,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    tracing::info!(
+    tracing::debug!(
         "do_get: Query: {}, Parameters length: {}",
         sql,
         parameters.len()
@@ -362,12 +417,12 @@ pub(crate) async fn do_get(
 
     let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
 
-    tracing::info!("do_get: Decoded parameters: {:?}", param_values);
+    tracing::debug!("do_get: Decoded parameters: {:?}", param_values);
 
     // If we have parameter schema from DoPut, try to use it to help with type inference
     // by rewriting the SQL to include explicit type casts
     let sql_to_execute = if let Some(schema_bytes) = &parameter_schema {
-        tracing::info!("do_get: Have parameter schema, attempting to rewrite SQL with type casts");
+        tracing::debug!("do_get: Have parameter schema, attempting to rewrite SQL with type casts");
 
         // Decode the parameter schema
         let schema = {
@@ -376,11 +431,11 @@ pub(crate) async fn do_get(
             reader.schema()
         };
 
-        tracing::info!("do_get: Parameter schema: {:?}", schema);
+        tracing::debug!("do_get: Parameter schema: {:?}", schema);
 
         // Try to rewrite the SQL with type casts to help DataFusion infer types
         let rewritten = rewrite_sql_with_type_casts(&sql, &schema);
-        tracing::info!("do_get: Rewritten SQL: {}", rewritten);
+        tracing::debug!("do_get: Rewritten SQL: {}", rewritten);
         Cow::Owned(rewritten)
     } else {
         Cow::Borrowed(sql.as_str())
@@ -414,7 +469,7 @@ pub(crate) async fn do_put_query(
     query: CommandPreparedStatementQuery,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-    tracing::info!("do_put_query: Binding parameters to prepared statement");
+    tracing::debug!("do_put_query: Binding parameters to prepared statement");
 
     let streaming_flight = streaming_flight
         .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
@@ -424,7 +479,7 @@ pub(crate) async fn do_put_query(
     // Read the schema first - Arrow Flight always sends schema before batches
     let schema = decode_schema(&mut decoder).await?;
 
-    tracing::info!("do_put_query: Parameter schema: {:?}", schema);
+    tracing::debug!("do_put_query: Parameter schema: {:?}", schema);
 
     let mut parameters = Vec::new();
     let mut encoder = StreamWriter::try_new(&mut parameters, &schema).map_err(error_to_status)?;

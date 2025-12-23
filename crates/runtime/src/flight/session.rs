@@ -20,6 +20,12 @@ limitations under the License.
 //! statements across multiple Flight SQL requests. Each session maintains its own
 //! `SessionContext` which stores prepared statements in its `SessionState`.
 //!
+//! ## Session Lifecycle
+//!
+//! Sessions are automatically expired after 1 hour of inactivity (configurable via
+//! `SESSION_TTL_SECS`). The store also enforces a maximum of 10,000 concurrent sessions
+//! (configurable via `MAX_SESSIONS`) with LRU eviction when the limit is reached.
+//!
 //! ## Session ID Resolution
 //!
 //! The session ID is extracted from request metadata in the following priority order:
@@ -45,35 +51,47 @@ limitations under the License.
 //!    -> Server finds session, retrieves prepared statement, executes query
 //! ```
 
-use dashmap::DashMap;
 use datafusion::prelude::SessionContext;
 use http::HeaderMap;
+use moka::sync::Cache;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::metadata::MetadataMap;
 use uuid::Uuid;
+
+/// Default session time-to-live in seconds (1 hour)
+const SESSION_TTL_SECS: u64 = 3600;
+
+/// Maximum number of concurrent sessions (with LRU eviction)
+const MAX_SESSIONS: u64 = 10_000;
 
 /// Manages Flight SQL sessions, mapping session IDs to `DataFusion` `SessionContext` instances.
 ///
 /// This enables stateful operations like SQL PREPARE/EXECUTE across multiple Flight SQL requests.
+/// Sessions are automatically expired after `SESSION_TTL_SECS` of inactivity and the store
+/// enforces a maximum of `MAX_SESSIONS` concurrent sessions with LRU eviction.
 #[derive(Clone)]
 pub struct SessionStore {
-    sessions: Arc<DashMap<String, Arc<SessionContext>>>,
+    sessions: Cache<String, Arc<SessionContext>>,
 }
 
 impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore")
-            .field("session_count", &self.sessions.len())
+            .field("session_count", &self.sessions.entry_count())
             .finish()
     }
 }
 
 impl SessionStore {
-    /// Creates a new empty session store.
+    /// Creates a new empty session store with default TTL and max capacity.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(DashMap::new()),
+            sessions: Cache::builder()
+                .max_capacity(MAX_SESSIONS)
+                .time_to_idle(Duration::from_secs(SESSION_TTL_SECS))
+                .build(),
         }
     }
 
@@ -82,21 +100,21 @@ impl SessionStore {
     /// The session context is created from the provided base context's state.
     #[must_use]
     pub fn create_session(&self, base_ctx: &SessionContext) -> (String, Arc<SessionContext>) {
-        let session_id = Uuid::new_v4().hyphenated().to_string();
+        let session_id = Uuid::now_v7().hyphenated().to_string();
         let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
         self.sessions
             .insert(session_id.clone(), Arc::clone(&session_ctx));
+        self.sessions.sync();
         (session_id, session_ctx)
     }
 
     /// Gets an existing session context by ID.
     ///
-    /// Returns `None` if the session doesn't exist.
+    /// Returns `None` if the session doesn't exist or has expired.
+    /// Accessing a session refreshes its TTL.
     #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
-        self.sessions
-            .get(session_id)
-            .map(|entry| Arc::clone(entry.value()))
+        self.sessions.get(session_id)
     }
 
     /// Gets or creates a session from the request metadata.
@@ -121,6 +139,7 @@ impl SessionStore {
             // Create new session with the provided ID (from auth token)
             let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
             self.sessions.insert(session_id, Arc::clone(&session_ctx));
+            self.sessions.sync();
             Some(session_ctx)
         }
     }
@@ -154,6 +173,7 @@ impl SessionStore {
             // Create new session with the provided ID (from auth token)
             let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
             self.sessions.insert(session_id, Arc::clone(&session_ctx));
+            self.sessions.sync();
             Some(session_ctx)
         }
     }
@@ -163,13 +183,15 @@ impl SessionStore {
     /// Returns `true` if the session existed and was removed.
     #[must_use]
     pub fn remove_session(&self, session_id: &str) -> bool {
-        self.sessions.remove(session_id).is_some()
+        let removed = self.sessions.remove(session_id).is_some();
+        self.sessions.sync();
+        removed
     }
 
     /// Returns the number of active sessions.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        self.sessions.entry_count() as usize
     }
 }
 
@@ -304,14 +326,14 @@ mod tests {
             Some("test-session-id".to_string())
         );
 
-        // Without Bearer prefix
+        // Without Bearer prefix - should return None since we require "Bearer " prefix
         metadata.insert(
             "authorization",
             "test-session-id-2".parse().expect("Valid header"),
         );
-        assert_eq!(
-            extract_session_id(&metadata),
-            Some("test-session-id-2".to_string())
+        assert!(
+            extract_session_id(&metadata).is_none(),
+            "Authorization header without 'Bearer ' prefix should return None"
         );
     }
 

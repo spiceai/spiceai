@@ -32,7 +32,10 @@ use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
-    datafusion::request_context_extension::get_current_datafusion,
+    datafusion::{
+        request_context_extension::get_current_datafusion,
+        sql_validator::validate_sql_query_operations,
+    },
     flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -106,6 +109,14 @@ pub(crate) async fn do_get(
         .create_logical_plan(&sql)
         .await
         .map_err(|e| Status::internal(format!("Failed to create logical plan: {e}")))?;
+
+    // Validate the plan to ensure only allowed operations are executed
+    // This prevents SQL injection attacks via prepared statement updates
+    if let Err(e) = validate_sql_query_operations(&plan, &datafusion) {
+        return Err(Status::permission_denied(format!(
+            "Operation not allowed: {e}"
+        )));
+    }
 
     let plan = if let Some(params) = parameters {
         plan.with_param_values(params)

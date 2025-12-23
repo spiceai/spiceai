@@ -106,7 +106,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
-mod sql_validator;
+pub(crate) mod sql_validator;
 pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
