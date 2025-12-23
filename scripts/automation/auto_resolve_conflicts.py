@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Attempt to resolve merge conflicts using an LLM and emit a report."""
+"""Attempt to resolve merge conflicts using OpenAI Codex CLI and emit a report."""
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
-
-from openai import OpenAI
 
 
 @dataclass
@@ -62,46 +62,77 @@ def write_report(report_path: Path, header: str, results: List[ResolutionResult]
     report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def llm_client() -> Optional[OpenAI]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+def codex_available() -> bool:
+    """Check if the codex CLI is available."""
+    return shutil.which("codex") is not None
 
 
-def resolve_file(client: OpenAI, model: str, path: Path) -> ResolutionResult:
+def has_api_key() -> bool:
+    """Check if OPENAI_API_KEY is set."""
+    return bool(os.environ.get("OPENAI_API_KEY"))
+
+
+def resolve_file(model: str, path: Path) -> ResolutionResult:
     original = path.read_text(encoding="utf-8")
-    system_prompt = (
-        "You are a code merge assistant. Resolve merge conflicts in source files. "
-        "Only produce the final merged file content without conflict markers."
+    prompt = (
+        f"Resolve the merge conflicts in file '{path}'. "
+        "The file contains git conflict markers (<<<<<<< HEAD, =======, >>>>>>>). "
+        "Analyze both versions and produce a clean merged result that preserves the intent of both changes. "
+        "Write the resolved content directly to the file, removing all conflict markers."
     )
-    user_prompt = (
-        "Resolve the merge conflicts in the following file. "
-        "Return ONLY the full file contents that should replace the file, with no explanations.\n\n"
-        f"File path: {path}\n\n"
-        "File content (including conflict markers):\n\n"
-        f"{original}"
-    )
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-    except Exception as exc:  # pragma: no cover - runtime path
-        return ResolutionResult(path=path, status="failed", comment=f"LLM request failed: {exc}")
 
-    resolved_content = getattr(response, "output_text", "").strip()
-    if not resolved_content:
+    try:
+        result = subprocess.run(
+            [
+                "codex",
+                "--model", model,
+                "--approval-mode", "full-auto",
+                "--full-auto-error-mode", "ignore-and-continue",
+                "--quiet",
+                prompt,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout per file
+        )
+    except subprocess.TimeoutExpired:
         return ResolutionResult(
             path=path,
             status="failed",
-            comment="LLM response did not contain replacement content.",
+            comment="Codex CLI timed out after 5 minutes.",
+        )
+    except Exception as exc:  # pragma: no cover - runtime path
+        return ResolutionResult(path=path, status="failed", comment=f"Codex CLI failed: {exc}")
+
+    if result.returncode != 0:
+        error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+        return ResolutionResult(
+            path=path,
+            status="failed",
+            comment=f"Codex CLI returned non-zero exit code: {error_msg}",
         )
 
-    path.write_text(resolved_content + ("\n" if not resolved_content.endswith("\n") else ""), encoding="utf-8")
+    # Read the potentially modified file
+    try:
+        new_content = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return ResolutionResult(
+            path=path,
+            status="failed",
+            comment=f"Failed to read file after resolution: {exc}",
+        )
+
+    # Check if conflict markers are still present
+    if "<<<<<<< HEAD" in new_content or "=======" in new_content or ">>>>>>>" in new_content:
+        # Restore original and report failure
+        path.write_text(original, encoding="utf-8")
+        return ResolutionResult(
+            path=path,
+            status="failed",
+            comment="Conflict markers still present after resolution attempt.",
+        )
+
+    # Stage the resolved file
     add_result = subprocess.run(["git", "add", str(path)], capture_output=True, text=True)
     if add_result.returncode != 0:
         return ResolutionResult(
@@ -109,12 +140,13 @@ def resolve_file(client: OpenAI, model: str, path: Path) -> ResolutionResult:
             status="failed",
             comment=f"Failed to stage resolved file: {add_result.stderr.strip()}",
         )
-    return ResolutionResult(path=path, status="resolved", comment=resolved_content[-500:].strip())
+
+    return ResolutionResult(path=path, status="resolved", comment=new_content[-500:].strip())
 
 
 def main() -> int:
     report_path = Path(os.environ.get("LLM_REPORT_PATH", "merge_conflict_report.md"))
-    model = os.environ.get("LLM_MODEL", "gpt-5.1-codex-mini")
+    model = os.environ.get("LLM_MODEL", "o4-mini")
 
     try:
         files = git_conflict_files()
@@ -128,8 +160,14 @@ def main() -> int:
         append_output(status="no_conflicts", report_file=str(report_path))
         return 0
 
-    client = llm_client()
-    if client is None:
+    if not codex_available():
+        notes = "Codex CLI is not installed or not in PATH; skipping automatic resolution."
+        results = [ResolutionResult(path=file, status="skipped", comment="") for file in files]
+        write_report(report_path, "Skipped due to missing Codex CLI", results, model, notes=notes)
+        append_output(status="skipped", report_file=str(report_path), reason="missing_codex_cli")
+        return 0
+
+    if not has_api_key():
         notes = "OPENAI_API_KEY is not set; skipping automatic resolution."
         results = [ResolutionResult(path=file, status="skipped", comment="") for file in files]
         write_report(report_path, "Skipped due to missing API key", results, model, notes=notes)
@@ -138,7 +176,7 @@ def main() -> int:
 
     results: List[ResolutionResult] = []
     for file in files:
-        result = resolve_file(client, model, file)
+        result = resolve_file(model, file)
         results.append(result)
 
     unresolved = [r for r in results if r.status != "resolved"]

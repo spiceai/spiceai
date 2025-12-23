@@ -134,6 +134,11 @@ jobs:
         if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
         uses: astral-sh/setup-uv@v6
 
+      - name: Install OpenAI Codex CLI
+        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
+        run: |
+          npm install -g @openai/codex
+
       - name: Attempt automated conflict resolution
         if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
         id: llm
@@ -143,7 +148,7 @@ jobs:
           LLM_MODEL: ${{ vars.UPSTREAM_MERGE_LLM_MODEL }}
           LLM_REPORT_PATH: ${{ env.REPORT_FILE }}
         run: |
-          uv run --with openai python scripts/automation/auto_resolve_conflicts.py
+          uv run python scripts/automation/auto_resolve_conflicts.py
 
       - name: Mark unresolved files for commit
         id: mark_conflicts
