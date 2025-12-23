@@ -104,7 +104,7 @@ impl SessionStore {
         let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
         self.sessions
             .insert(session_id.clone(), Arc::clone(&session_ctx));
-        self.sessions.sync();
+        self.sessions.run_pending_tasks();
         (session_id, session_ctx)
     }
 
@@ -139,7 +139,7 @@ impl SessionStore {
             // Create new session with the provided ID (from auth token)
             let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
             self.sessions.insert(session_id, Arc::clone(&session_ctx));
-            self.sessions.sync();
+            self.sessions.run_pending_tasks();
             Some(session_ctx)
         }
     }
@@ -173,7 +173,7 @@ impl SessionStore {
             // Create new session with the provided ID (from auth token)
             let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
             self.sessions.insert(session_id, Arc::clone(&session_ctx));
-            self.sessions.sync();
+            self.sessions.run_pending_tasks();
             Some(session_ctx)
         }
     }
@@ -184,14 +184,17 @@ impl SessionStore {
     #[must_use]
     pub fn remove_session(&self, session_id: &str) -> bool {
         let removed = self.sessions.remove(session_id).is_some();
-        self.sessions.sync();
+        self.sessions.run_pending_tasks();
         removed
     }
 
     /// Returns the number of active sessions.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        self.sessions.entry_count() as usize
+        // On 32-bit platforms this could truncate, but MAX_SESSIONS is 10,000 which fits
+        #[expect(clippy::cast_possible_truncation)]
+        let count = self.sessions.entry_count() as usize;
+        count
     }
 }
 

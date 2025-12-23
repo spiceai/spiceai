@@ -66,7 +66,7 @@ pub(crate) async fn handle(
     let mut resp: Response<HandshakeResponseStream> = Response::new(Box::pin(output));
 
     // Add session ID as a header for standard session tracking
-    let session_header = MetadataValue::try_from(session_id.clone())
+    let session_header = MetadataValue::try_from(session_id)
         .map_err(|_| Status::internal("generated session ID could not be parsed"))?;
     resp.metadata_mut().insert("x-session-id", session_header);
 

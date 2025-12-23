@@ -90,29 +90,26 @@ impl VisitorMut for ParameterCastRewriter<'_> {
             && let Value::Placeholder(ref placeholder) = value_with_span.value
         {
             // Check if this is a $N style placeholder
-            if let Some(stripped) = placeholder.strip_prefix('$') {
-                if let Ok(idx) = stripped.parse::<usize>() {
-                    if let Some(sql_type) = self.param_types.get(&idx) {
-                        // Replace $N with CAST($N AS type) by wrapping in a Cast expression
-                        let original_placeholder = placeholder.clone();
-                        let cast_expr = Expr::Cast {
-                            expr: Box::new(Expr::Value(
-                                Value::Placeholder(original_placeholder).into(),
-                            )),
-                            data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
-                                datafusion::sql::sqlparser::ast::ObjectName(vec![
-                                    datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
-                                        datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
-                                    ),
-                                ]),
-                                vec![],
+            if let Some(stripped) = placeholder.strip_prefix('$')
+                && let Ok(idx) = stripped.parse::<usize>()
+                && let Some(sql_type) = self.param_types.get(&idx)
+            {
+                // Replace $N with CAST($N AS type) by wrapping in a Cast expression
+                let original_placeholder = placeholder.clone();
+                let cast_expr = Expr::Cast {
+                    expr: Box::new(Expr::Value(Value::Placeholder(original_placeholder).into())),
+                    data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
+                        datafusion::sql::sqlparser::ast::ObjectName(vec![
+                            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                                datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
                             ),
-                            format: None,
-                            kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
-                        };
-                        *expr = cast_expr;
-                    }
-                }
+                        ]),
+                        vec![],
+                    ),
+                    format: None,
+                    kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
+                };
+                *expr = cast_expr;
             }
         }
         ControlFlow::Continue(())
@@ -177,7 +174,7 @@ pub(crate) struct PreparedStatement {
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod param_values_serde {
     use arrow::array::RecordBatch;
     use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
@@ -1209,7 +1206,7 @@ mod tests {
         // 4. The parameterized query pattern (used by prepared statements) functions properly
     }
 
-    #[allow(
+    #[expect(
         clippy::similar_names,
         clippy::redundant_closure_for_method_calls,
         clippy::too_many_lines

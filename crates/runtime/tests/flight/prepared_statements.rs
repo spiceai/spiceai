@@ -1,4 +1,4 @@
-#[allow(clippy::similar_names)]
+#[expect(clippy::similar_names)]
 mod flight_prepared_statements {
 
     use std::sync::Arc;
