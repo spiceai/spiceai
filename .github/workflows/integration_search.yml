@@ -55,7 +55,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          cargo insta test --test integration_models -p runtime  --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
+          cargo test --test integration_models -p runtime  --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
