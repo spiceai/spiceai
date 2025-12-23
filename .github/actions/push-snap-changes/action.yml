@@ -4,6 +4,10 @@ inputs:
   token:
     description: 'GitHub token with permissions to push to the repository'
     required: true
+  title:
+    description: 'Title for the PR created in this action'
+    required: false
+    default: 'fix: Update test snapshots'
 runs:
   using: 'composite'
   steps:
@@ -47,7 +51,7 @@ runs:
             echo "PR already exists -> ${PR_URL}"
             exit 0
           else
-            gh pr create --title "fix: Update test snapshots" --body "Updates some test snapshots" --base trunk --head ${BRANCH_NAME} --label kind/bug
+            gh pr create --title "${{ inputs.title }}" --body "Updates some test snapshots" --base trunk --head ${BRANCH_NAME} --label kind/bug
           fi
         fi
       env:
