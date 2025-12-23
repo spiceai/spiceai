@@ -40,10 +40,6 @@ jobs:
         with:
           os: 'darwin'
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
       - name: Set up API Keys
         run: |
           echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
@@ -59,7 +55,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          cargo nextest run --test integration_models -p runtime --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
+          cargo insta test --test integration_models -p runtime  --features models,metal,s3_vectors,kafka,duckdb,extended_tests -- search
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
