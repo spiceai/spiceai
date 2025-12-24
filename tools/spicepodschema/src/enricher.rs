@@ -1178,27 +1178,27 @@ fn update_acceleration_params(
     }
 
     // Update Acceleration definition to use allOf with conditionals
-    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration") {
-        if !conditionals.is_empty() {
-            let accelerator_names: Vec<&str> =
-                data_accelerators.iter().map(|a| a.name.as_str()).collect();
+    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration")
+        && !conditionals.is_empty()
+    {
+        let accelerator_names: Vec<&str> =
+            data_accelerators.iter().map(|a| a.name.as_str()).collect();
 
-            // Update description for params field
-            if let Some(Value::Object(properties)) = accel_def.get_mut("properties")
-                && let Some(Value::Object(params_prop)) = properties.get_mut("params")
-            {
-                params_prop.insert(
-                    "description".to_string(),
-                    Value::String(format!(
-                        "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: {}.",
-                        accelerator_names.join(", ")
-                    )),
-                );
-            }
-
-            // Add allOf with conditionals to the Acceleration schema
-            accel_def.insert("allOf".to_string(), Value::Array(conditionals));
+        // Update description for params field
+        if let Some(Value::Object(properties)) = accel_def.get_mut("properties")
+            && let Some(Value::Object(params_prop)) = properties.get_mut("params")
+        {
+            params_prop.insert(
+                "description".to_string(),
+                Value::String(format!(
+                    "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: {}.",
+                    accelerator_names.join(", ")
+                )),
+            );
         }
+
+        // Add allOf with conditionals to the Acceleration schema
+        accel_def.insert("allOf".to_string(), Value::Array(conditionals));
     }
 }
 
