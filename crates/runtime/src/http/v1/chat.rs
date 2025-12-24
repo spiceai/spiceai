@@ -390,7 +390,7 @@ mod tests {
     };
     use async_openai::{
         error::OpenAIError,
-        types::{
+        types::chat::{
             ChatCompletionResponseStream, CreateChatCompletionRequest,
             CreateChatCompletionStreamResponse,
         },

@@ -889,7 +889,12 @@ mod tests {
         tool_calls: Vec<ChatCompletionMessageToolCall>,
     ) -> ChatCompletionRequestMessage {
         ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(tool_calls)
+            .tool_calls(
+                tool_calls
+                    .into_iter()
+                    .map(|t| ChatCompletionMessageToolCalls::Function(t))
+                    .collect::<Vec<_>>(),
+            )
             .build()
             .expect("couldn't create assistant message w. tools")
             .into()
