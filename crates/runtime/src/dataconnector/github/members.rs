@@ -18,12 +18,20 @@ use crate::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::client::UnnestBehavior;
+use data_components::graphql::{GraphQLContext, client::UnnestBehavior};
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub struct MembersTableArgs {
     pub org: String,
     pub component: ConnectorComponent,
+}
+
+impl GraphQLContext for MembersTableArgs {
+    fn query_cost(&self) -> Option<u32> {
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(1)
+    }
 }
 
 impl GitHubTableArgs for MembersTableArgs {

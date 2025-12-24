@@ -95,6 +95,7 @@ impl GraphQLTableProviderBuilder {
                     None,
                     None,
                     self.context.clone().and_then(|o| o.error_checker()),
+                    None,
                 )
                 .await?;
         }
@@ -107,6 +108,7 @@ impl GraphQLTableProviderBuilder {
                 None,
                 None,
                 self.context.clone().and_then(|o| o.error_checker()),
+                None,
             )
             .await?;
 
@@ -189,7 +191,7 @@ impl TableProvider for GraphQLTableProvider {
         let mut query = GraphQLQuery::try_from(Arc::clone(&self.base_query))
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-        let error_checker = if let Some(context) = &self.context {
+        let (error_checker, query_cost) = if let Some(context) = &self.context {
             let parameters = filters
                 .iter()
                 .map(|f| context.filter_pushdown(f))
@@ -197,20 +199,23 @@ impl TableProvider for GraphQLTableProvider {
 
             context.inject_parameters(&parameters, &mut query)?;
 
-            context.error_checker()
+            (context.error_checker(), context.query_cost())
         } else {
-            None
+            (None, None)
         };
 
-        let graphql_exec = Arc::new(GraphQLTableProviderExec::new(
-            Arc::clone(&self.client),
-            query,
-            Arc::clone(&self.gql_schema),
-            Arc::clone(&self.table_schema),
-            limit,
-            error_checker,
-            self.transform_fn,
-        ));
+        let graphql_exec = Arc::new(
+            GraphQLTableProviderExec::new(
+                Arc::clone(&self.client),
+                query,
+                Arc::clone(&self.gql_schema),
+                Arc::clone(&self.table_schema),
+            )
+            .with_limit(limit)
+            .with_error_checker(error_checker)
+            .with_transform_fn(self.transform_fn)
+            .with_query_cost(query_cost),
+        );
 
         if let Some(projection) = projection {
             let mut projection_expr = Vec::with_capacity(projection.len());
@@ -239,6 +244,7 @@ pub struct GraphQLTableProviderExec {
     error_checker: Option<ErrorChecker>,
     transform_fn: Option<TransformFn>,
     properties: PlanProperties,
+    query_cost: Option<u32>,
 }
 
 impl GraphQLTableProviderExec {
@@ -248,25 +254,47 @@ impl GraphQLTableProviderExec {
         query: GraphQLQuery,
         gql_schema: SchemaRef,
         table_schema: SchemaRef,
-        limit: Option<usize>,
-        error_checker: Option<ErrorChecker>,
-        transform_fn: Option<TransformFn>,
     ) -> Self {
         Self {
             client,
             query,
             gql_schema,
             table_schema: Arc::clone(&table_schema),
-            limit,
-            error_checker,
-            transform_fn,
+            limit: None,
+            error_checker: None,
+            transform_fn: None,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
+            query_cost: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_error_checker(mut self, error_checker: Option<ErrorChecker>) -> Self {
+        self.error_checker = error_checker;
+        self
+    }
+
+    #[must_use]
+    pub fn with_transform_fn(mut self, transform_fn: Option<TransformFn>) -> Self {
+        self.transform_fn = transform_fn;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_cost(mut self, query_cost: Option<u32>) -> Self {
+        self.query_cost = query_cost;
+        self
     }
 }
 
@@ -331,6 +359,7 @@ impl ExecutionPlan for GraphQLTableProviderExec {
             Arc::clone(&self.table_schema),
             self.limit,
             self.error_checker.clone(),
+            self.query_cost,
         );
 
         if let Some(transform_fn) = &self.transform_fn {

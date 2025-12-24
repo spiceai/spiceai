@@ -180,7 +180,7 @@ impl CacheRefreshHelper {
         accelerator: Arc<dyn TableProvider>,
         dataset_name: &str,
         ttl: Duration,
-        accelerator_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> DataFusionResult<usize> {
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -238,7 +238,7 @@ impl CacheRefreshHelper {
             let federated = Arc::clone(&federated);
             let accelerator = Arc::clone(&accelerator);
             let dataset_name = dataset_name.to_string();
-            let accelerator_mutex = Arc::clone(&accelerator_mutex);
+            let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
 
             async move {
                 tracing::debug!(
@@ -257,7 +257,7 @@ impl CacheRefreshHelper {
                 let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
                 // Acquire the mutex to protect accelerator operations
-                let lock_guard = accelerator_mutex.lock().await;
+                let lock_guard = accelerator_write_mutex.lock().await;
 
                 // Upsert this specific cache entry - removes rows matching the filters
                 // and adds the new data, preserving other cache entries.
@@ -712,7 +712,7 @@ impl CacheRefreshHelper {
     ///   when the upstream source returns an error instead of propagating the error.
     /// * `expired_batches` - The expired cached data to serve if `stale_if_error` is enabled and
     ///   the source returns an error.
-    /// * `accelerator_mutex` - Mutex to protect concurrent access to the accelerator.
+    /// * `accelerator_write_mutex` - Mutex to protect concurrent access to the accelerator.
     /// * `synchronized_children` - Child accelerators that should also receive the cached data.
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
@@ -725,7 +725,7 @@ impl CacheRefreshHelper {
         is_expired: bool,
         stale_if_error: bool,
         expired_batches: Option<Vec<RecordBatch>>,
-        accelerator_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
         synchronized_children: SynchronizedChildren,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
@@ -739,7 +739,7 @@ impl CacheRefreshHelper {
                 );
 
                 // Acquire the mutex to protect accelerator operations
-                let lock_guard = accelerator_mutex.lock().await;
+                let lock_guard = accelerator_write_mutex.lock().await;
 
                 // Store in accelerator for future queries
                 let store_result = if is_expired {
@@ -843,7 +843,7 @@ impl CacheRefreshHelper {
         stale_while_revalidate: Option<Duration>,
         io_runtime: &Handle,
         schema: SchemaRef,
-        accelerator_mutex: &Arc<Mutex<()>>,
+        accelerator_write_mutex: &Arc<Mutex<()>>,
         filters: &[Expr],
         in_flight_revalidations: &InFlightRevalidations,
     ) -> SendableRecordBatchStream {
@@ -904,7 +904,7 @@ impl CacheRefreshHelper {
                         let federated_clone = Arc::clone(federated);
                         let accelerator_clone = Arc::clone(accelerator);
                         let dataset_name_clone = dataset_name.to_string();
-                        let accelerator_mutex_clone = Arc::clone(accelerator_mutex);
+                        let accelerator_write_mutex_clone = Arc::clone(accelerator_write_mutex);
                         let in_flight_clone = Arc::clone(in_flight_revalidations);
 
                         io_runtime.spawn(async move {
@@ -916,7 +916,7 @@ impl CacheRefreshHelper {
                                 accelerator_clone,
                                 &dataset_name_clone,
                                 max_age,
-                                accelerator_mutex_clone,
+                                accelerator_write_mutex_clone,
                             )
                             .await;
 
@@ -977,8 +977,8 @@ pub struct CachingAccelerationScanExec {
     filters: Vec<Expr>,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
-    /// Mutex to protect concurrent access to the accelerator during cache operations
-    accelerator_mutex: Arc<Mutex<()>>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
+    accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: InFlightRevalidations,
     /// Child accelerators that should receive cached data when this parent stores new cache entries
@@ -999,7 +999,7 @@ impl CachingAccelerationScanExec {
         filters: Vec<Expr>,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
-        accelerator_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
         in_flight_revalidations: InFlightRevalidations,
         synchronized_children: SynchronizedChildren,
     ) -> Self {
@@ -1025,7 +1025,7 @@ impl CachingAccelerationScanExec {
             filters,
             projection,
             limit,
-            accelerator_mutex,
+            accelerator_write_mutex,
             in_flight_revalidations,
             synchronized_children,
         }
@@ -1085,7 +1085,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             self.filters.clone(),
             self.projection.clone(),
             self.limit,
-            Arc::clone(&self.accelerator_mutex),
+            Arc::clone(&self.accelerator_write_mutex),
             Arc::clone(&self.in_flight_revalidations),
             Arc::clone(&self.synchronized_children),
         )))
@@ -1115,7 +1115,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let stale_while_revalidate = self.stale_while_revalidate;
         let stale_if_error = self.stale_if_error;
         let io_runtime = self.io_runtime.clone();
-        let accelerator_mutex = Arc::clone(&self.accelerator_mutex);
+        let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
         let in_flight_revalidations = Arc::clone(&self.in_flight_revalidations);
         let synchronized_children = Arc::clone(&self.synchronized_children);
 
@@ -1185,7 +1185,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             true, // is_expired = true, will upsert
                             stale_if_error,
                             expired_batches,
-                            Arc::clone(&accelerator_mutex),
+                            Arc::clone(&accelerator_write_mutex),
                             Arc::clone(&synchronized_children),
                         )
                         .await;
@@ -1202,7 +1202,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     stale_while_revalidate,
                     &io_runtime,
                     Arc::clone(&schema_clone),
-                    &accelerator_mutex,
+                    &accelerator_write_mutex,
                     &filters,
                     &in_flight_revalidations,
                 )
@@ -1222,7 +1222,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     false, // is_expired = false, will insert (append)
                     false, // stale_if_error = false, no expired data to fall back to
                     None,  // no expired batches
-                    accelerator_mutex,
+                    accelerator_write_mutex,
                     synchronized_children,
                 )
                 .await
