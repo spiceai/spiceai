@@ -12,6 +12,7 @@ version.workspace = true
 arrow.workspace = true
 arrow-json.workspace = true
 clap.workspace = true
+itertools.workspace = true
 hf-hub = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true

@@ -222,7 +222,8 @@ WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' orde
             "could not find task history for text to SQL"
         ));
     };
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_sign_loss)]
     let count = rb
         .column(0)
         .as_any()
@@ -271,27 +272,27 @@ async fn retry_query_expecting_results(
     use crate::utils::wait_until_true;
     use tokio::time::sleep;
 
-    let spice_client = Arc::new(spice_client.clone());
     let query = query.to_string();
     let data = Arc::new(tokio::sync::Mutex::new(None));
 
     wait_until_true(wait_for, || {
-        let spice_client = Arc::clone(&spice_client);
+        let spice_client = spice_client.clone();
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
             match spice_client.query(&query).await {
                 Ok(stream) => {
-                    let z = stream.try_collect::<Vec<RecordBatch>>().await.ok();
-                    let no_data = z
+                    let rb_opt = stream.try_collect::<Vec<RecordBatch>>().await.ok();
+                    let no_data = rb_opt
                         .as_ref()
                         .is_none_or(|z| z.first().is_none_or(|rb| rb.num_rows() == 0));
                     if no_data {
-                        return false;
+                        sleep(Duration::from_secs(1)).await;
+                        false
+                    } else {
+                        *data.lock().await = rb_opt;
+                        true
                     }
-                    *data.lock().await = z;
-                    sleep(Duration::from_secs(1)).await;
-                    true
                 }
                 Err(_) => false,
             }

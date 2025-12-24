@@ -39,7 +39,7 @@ mod search;
 pub use search::SearchTestArgs;
 
 mod text_to_sql;
-pub use text_to_sql::{TextToSqlArgs, TextToSqlQuery};
+pub use text_to_sql::TextToSqlArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {

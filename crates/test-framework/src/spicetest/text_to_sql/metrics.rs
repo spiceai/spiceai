@@ -23,7 +23,6 @@ use arrow::{
     datatypes::{DataType, Field},
 };
 
-// Don't love this name.
 pub struct TextToSqlMetric {
     pub generated_sql: String,
     pub expected_sql: String,

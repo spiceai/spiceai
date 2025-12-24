@@ -16,8 +16,10 @@ limitations under the License.
 
 use super::CommonArgs;
 use clap::{Parser, ValueEnum};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+
+use std::{fs, iter::Product, path::PathBuf};
 use test_framework::{
     anyhow,
     spicetest::text_to_sql::{TextToSqlConfig, TextToSqlRequest},
@@ -69,8 +71,8 @@ impl TextToSqlArgs {
         Ok(TextToSqlConfig::new(
             self.load_queries()?
                 .into_iter()
-                .zip(self.sample_data_enabled.values())
-                .zip(self.return_sql.values())
+                .cartesian_product(self.sample_data_enabled.values())
+                .cartesian_product(self.return_sql.values())
                 .map(
                     |(
                         (
