@@ -35,6 +35,7 @@ use rdkafka::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{any::Any, sync::Arc};
@@ -368,6 +369,8 @@ impl KafkaConsumer {
     }
 
     fn create(group_id: String, kafka_config: &KafkaConfig) -> Result<Self> {
+        tracing::debug!("Using kafka group_id: {}", group_id);
+
         let (_, version) = get_rdkafka_version();
         tracing::debug!("rd_kafka_version: {}", version);
 
@@ -470,6 +473,18 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
         &self.value
     }
 
+    pub fn topic(&self) -> &str {
+        self.msg.topic()
+    }
+
+    pub fn partition(&self) -> i32 {
+        self.msg.partition()
+    }
+
+    pub fn offset(&self) -> i64 {
+        self.msg.offset()
+    }
+
     pub fn mark_processed(&self) -> Result<()> {
         self.consumer
             .store_offset_from_message(&self.msg)
@@ -482,6 +497,51 @@ impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
         self.mark_processed()
             .boxed()
             .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
+        Ok(())
+    }
+}
+
+pub struct MessageBatchCommitter {
+    consumer: &'static KafkaConsumer,
+    offsets: Vec<(String, i32, i64)>,
+}
+
+impl MessageBatchCommitter {
+    pub fn from_messages<K, V>(
+        consumer: &'static KafkaConsumer,
+        messages: &[KafkaMessage<'_, K, V>],
+    ) -> Self {
+        let mut max_offsets: HashMap<(String, i32), i64> = HashMap::new();
+
+        for msg in messages {
+            let key = (msg.topic().to_string(), msg.partition());
+            max_offsets
+                .entry(key)
+                .and_modify(|existing| {
+                    if msg.offset() > *existing {
+                        *existing = msg.offset();
+                    }
+                })
+                .or_insert(msg.offset());
+        }
+
+        let offsets = max_offsets
+            .into_iter()
+            .map(|((topic, partition), offset)| (topic, partition, offset))
+            .collect();
+
+        Self { consumer, offsets }
+    }
+}
+
+impl CommitChange for MessageBatchCommitter {
+    fn commit(&self) -> Result<(), CommitError> {
+        for (topic, partition, offset) in &self.offsets {
+            self.consumer
+                .store_offset(topic, *partition, *offset)
+                .boxed()
+                .map_err(|e| CommitError::UnableToCommitChange { source: e })?;
+        }
         Ok(())
     }
 }
@@ -530,6 +590,7 @@ impl Kafka {
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let flatten_json = self.flatten_json.clone();
+        let consumer = self.consumer;
         let stream = self
             .consumer
             .stream_json::<serde_json::Value, serde_json::Value>()
@@ -553,12 +614,9 @@ impl Kafka {
                     &schema,
                 );
 
-                // Take the last message for the envelope
-                let Some(last_msg) = messages.pop() else {
-                    unreachable!("checked non-empty above");
-                };
+                let committer = MessageBatchCommitter::from_messages(consumer, &messages);
 
-                change_batch.map(|rb| ChangeEnvelope::new(Box::new(last_msg), rb, true))
+                change_batch.map(|rb| ChangeEnvelope::new(Box::new(committer), rb, true))
             });
 
         Box::pin(stream)
