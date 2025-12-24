@@ -7,6 +7,12 @@ on:
       - 'crates/spicepod/**'
 
   workflow_dispatch:
+    inputs:
+      create_pr:
+        description: 'Create PR'
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,7 +55,7 @@ jobs:
           path: .schema/spicepod.schema.json
 
       - name: Create PR
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.create_pr
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
@@ -67,7 +73,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
         with:
           python-version: '3.12'
 
@@ -75,10 +81,10 @@ jobs:
         continue-on-error: true
         run: |
           pip install check-jsonschema
-          
+
           echo "## Schema Validation Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           VALIDATION_FAILED=0
           for file in tools/spicepodschema/tests/*.yaml; do
             filename=$(basename "$file")
@@ -97,7 +103,7 @@ jobs:
               VALIDATION_FAILED=1
             fi
           done
-          
+
           if [ $VALIDATION_FAILED -eq 1 ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "⚠️ **Some test files failed validation. Please fix the errors above.**" >> $GITHUB_STEP_SUMMARY
