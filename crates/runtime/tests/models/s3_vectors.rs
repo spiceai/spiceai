@@ -1052,7 +1052,7 @@ async fn delete_index(
     Ok(())
 }
 
-/// This function redacts the S3Vector index name from [`S3VectorsQueryExec`] in LogicalPlan output.
+/// This function redacts the `S3Vector` index name from [`S3VectorsQueryExec`] in `LogicalPlan` output.
 ///
 /// It keeps different index names unique via `INDEX_NAME_{i}`.
 pub(crate) fn replace_s3_vector_index_names(input: &str) -> String {
@@ -1082,7 +1082,7 @@ pub(crate) fn replace_s3_vector_index_names(input: &str) -> String {
             let replacement = index_map
                 .entry(index_name.to_string())
                 .or_insert_with(|| {
-                    let name = format!("INDEX_NAME_{}", counter);
+                    let name = format!("INDEX_NAME_{counter}");
                     counter += 1;
                     name
                 })
