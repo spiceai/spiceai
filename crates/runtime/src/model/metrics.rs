@@ -47,7 +47,6 @@ pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock:
         .build()
 });
 
-#[expect(deprecated)] // user field is deprecated in async-openai
 pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue> {
     #[expect(clippy::cast_possible_wrap)]
     let mut labels = vec![

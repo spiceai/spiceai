@@ -351,7 +351,7 @@ impl ToolUsingChat {
         if let Some(ref request_tools) = req.tools {
             runtime_tools.extend(request_tools.iter().filter_map(|t| match t {
                 ChatCompletionTools::Function(f) => Some(f.clone()),
-                _ => None,
+                ChatCompletionTools::Custom(_) => None,
             }));
         }
         // Ensure function names are unique. Tool-use recursion sometimes creates duplicates.
