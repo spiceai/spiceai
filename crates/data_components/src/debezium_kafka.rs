@@ -113,7 +113,7 @@ impl DebeziumKafka {
                     return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
                 }
 
-                let mut messages: Vec<_> = msgs
+                let messages: Vec<_> = msgs
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(cdc::StreamError::Kafka)?;

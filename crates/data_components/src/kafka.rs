@@ -311,6 +311,12 @@ impl KafkaConsumer {
         })
     }
 
+    pub fn store_offset(&self, topic: &str, partition: i32, offset: i64) -> Result<()> {
+        self.consumer
+            .store_offset(topic, partition, offset)
+            .context(UnableToCommitMessageSnafu)
+    }
+
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
         let mut assignment = self
             .consumer
@@ -599,7 +605,7 @@ impl Kafka {
                 let schema = Arc::clone(&schema);
 
                 // Collect all successful messages, fail on first error
-                let mut messages: Vec<_> = msgs
+                let messages: Vec<_> = msgs
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(cdc::StreamError::Kafka)?;
