@@ -13046,6 +13046,7 @@ dependencies = [
  "aws-sdk-credential-bridge",
  "aws-sdk-dynamodb",
  "aws-sdk-glue",
+ "aws-sdk-s3",
  "aws-sdk-sts",
  "axum",
  "axum-extra",
