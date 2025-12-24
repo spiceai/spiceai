@@ -58,6 +58,16 @@ models:
       aws_region: us-east-1
 
   # ---------------------------------------------------------------------------
+  # Google model
+  # Runtime params: google_api_key, endpoint
+  # ---------------------------------------------------------------------------
+  - name: google_gemini
+    from: google:gemini-1.5-pro
+    params:
+      google_api_key: google-api-key
+      endpoint: https://generativelanguage.googleapis.com
+
+  # ---------------------------------------------------------------------------
   # Huggingface model (if enabled)
   # Runtime params: model_type
   # ---------------------------------------------------------------------------
