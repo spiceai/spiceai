@@ -309,6 +309,38 @@ impl CayenneAccelerator {
         }
     }
 
+    /// Returns the `Cayenne` metadata connection path for checkpointing.
+    /// This returns the path to the SQLite or Turso database file used by Cayenne for metadata storage.
+    /// The checkpoint system will use this same database for storing checkpoint information.
+    pub fn cayenne_metadata_connection_path(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<String> {
+        let Some(acceleration) = source.acceleration() else {
+            return Err(Error::AccelerationNotEnabled {
+                dataset: Arc::from(source.name().to_string()),
+            });
+        };
+
+        let metadata_dir = if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir")
+        {
+            custom_dir.clone()
+        } else {
+            format!("{}/metadata", crate::spice_data_base_path())
+        };
+
+        let metastore_type = acceleration
+            .params
+            .get("cayenne_metastore")
+            .map_or("sqlite", String::as_str);
+
+        // Return the connection path in the format expected by the checkpoint system
+        match metastore_type {
+            "turso" => Ok(format!("{metadata_dir}/cayenne.db")),
+            _ => Ok(format!("{metadata_dir}/cayenne.db")), // SQLite (default)
+        }
+    }
+
     /// Returns the `Cayenne` data directory path that would be used for a file-based `Cayenne` accelerator from this dataset.
     /// Cayenne uses a directory-based approach to support append operations.
     ///

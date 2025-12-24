@@ -320,7 +320,90 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
-        Engine::Arrow | Engine::Cayenne => UnsupportedEngineSnafu {
+        Engine::Cayenne => {
+            // Cayenne uses SQLite or Turso for its metadata catalog
+            // We can reuse this metadata database for checkpointing
+            let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineUnavailableSnafu {
+                    engine: Engine::Cayenne,
+                })?;
+
+            let cayenne_accelerator = accelerator
+                .as_any()
+                .downcast_ref::<super::cayenne::CayenneAccelerator>()
+                .context(DowncastFailedSnafu {
+                    target: "CayenneAccelerator",
+                })?;
+
+            // Get the metadata connection path
+            let metadata_file = cayenne_accelerator
+                .cayenne_metadata_connection_path(source)
+                .map_err(|e| Error::External {
+                    source: Box::new(e),
+                })?;
+
+            if open_option == OpenOption::OpenExisting && !Path::new(&metadata_file).exists() {
+                return Err(Error::External {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Cayenne metadata file does not exist at {metadata_file}"),
+                    )),
+                });
+            }
+
+            // Check if using Turso or SQLite based on the metastore parameter
+            let metastore_type = acceleration_settings
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            match metastore_type {
+                #[cfg(feature = "turso")]
+                "turso" => {
+                    // For Turso, create a connection pool to the Cayenne metadata file
+                    // Use MVCC disabled and default timestamp format for checkpoint tables
+                    let pool = super::turso::TursoConnectionPool::new_with_timestamp_format(
+                        &metadata_file,
+                        false, // mvcc disabled
+                        data_components::turso::TimestampFormat::Rfc3339,
+                    )
+                    .await
+                    .map_err(|e| Error::External {
+                        source: Box::new(e),
+                    })?;
+
+                    Ok(AccelerationConnection::Turso(Arc::new(pool)))
+                }
+                #[cfg(not(feature = "turso"))]
+                "turso" => TursoFeatureNotEnabledSnafu.fail(),
+                _ => {
+                    // Default to SQLite
+                    #[cfg(feature = "sqlite")]
+                    {
+                        use datafusion_table_providers::sql::db_connection_pool::{
+                            JoinPushDown, Mode as PoolMode,
+                        };
+
+                        // For SQLite, we can directly create a connection pool to the metadata file
+                        let conn = SqliteConnectionPool::new(
+                            &metadata_file,
+                            PoolMode::File,
+                            JoinPushDown::Disallow,
+                            vec![],
+                            std::time::Duration::from_millis(5000),
+                        )
+                        .await
+                        .map_err(Error::external)?;
+
+                        Ok(AccelerationConnection::SQLite(conn))
+                    }
+                    #[cfg(not(feature = "sqlite"))]
+                    SqliteFeatureNotEnabledSnafu.fail()
+                }
+            }
+        }
+        Engine::Arrow => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }
         .fail(),
