@@ -892,7 +892,7 @@ mod tests {
             .tool_calls(
                 tool_calls
                     .into_iter()
-                    .map(|t| ChatCompletionMessageToolCalls::Function(t))
+                    .map(ChatCompletionMessageToolCalls::Function)
                     .collect::<Vec<_>>(),
             )
             .build()
