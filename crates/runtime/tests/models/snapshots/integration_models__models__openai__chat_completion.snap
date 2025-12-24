@@ -8,6 +8,7 @@ expression: "normalize_chat_completion_response(response, false)"
       "finish_reason": "stop",
       "index": 0,
       "message": {
+        "annotations": [],
         "content": "10",
         "role": "assistant"
       }
