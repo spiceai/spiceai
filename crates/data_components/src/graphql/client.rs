@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::{graphql::InvalidPaginationRegexSnafu, rate_limit::RateLimiter};
+use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 
@@ -648,6 +649,7 @@ pub struct GraphQLClient {
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
 }
 
@@ -772,6 +774,7 @@ impl GraphQLClient {
         unnest_behavior: UnnestBehavior,
         schema: Option<SchemaRef>,
         rate_limiter: Option<Arc<dyn RateLimiter>>,
+        rate_controller: Option<Arc<RateController>>,
         semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
         // Validate unnest depth to prevent excessive recursion
@@ -810,6 +813,7 @@ impl GraphQLClient {
             auth,
             schema,
             rate_limiter,
+            rate_controller,
             semaphore,
         })
     }
@@ -821,6 +825,7 @@ impl GraphQLClient {
         limit: Option<usize>,
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
         // Validate cursor if present
         if let Some(ref cursor_val) = cursor {
@@ -847,6 +852,19 @@ impl GraphQLClient {
                 })?;
         }
 
+        let rate_controller_permit = if let Some(rate_controller) = &self.rate_controller {
+            Some(
+                rate_controller
+                    .acquire_weighted_opt(query_cost)
+                    .await
+                    .map_err(|e| Error::RateLimited {
+                        message: format!("{e}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let query_string = query.to_string(limit, cursor.clone())?;
 
         // Validate query string is not empty
@@ -865,6 +883,7 @@ impl GraphQLClient {
         let mut request = self.client.post(self.endpoint.clone()).body(body);
         request = request_with_auth(request, self.auth.as_ref());
 
+        // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
         let permit = if let Some(semaphore) = &self.semaphore {
             Some(
                 semaphore
@@ -882,6 +901,10 @@ impl GraphQLClient {
 
         if let Some(permit) = permit {
             drop(permit);
+        }
+
+        if let Some(rate_controller_permit) = rate_controller_permit {
+            drop(rate_controller_permit);
         }
 
         let response_headers = response.headers().clone();
@@ -1083,6 +1106,7 @@ impl GraphQLClient {
         table_schema: SchemaRef,
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
     ) -> SendableRecordBatchStream {
         const MAX_PAGINATION_ITERATIONS: usize = 1000;
         let mut builder = RecordBatchReceiverStream::builder(table_schema, 2);
@@ -1100,6 +1124,7 @@ impl GraphQLClient {
                     limit,
                     None,
                     error_checker.clone(),
+                    query_cost,
                 )
                 .await
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -1157,6 +1182,7 @@ impl GraphQLClient {
                         limit,
                         Some(next_cursor_val),
                         error_checker.clone(),
+                        query_cost,
                     )
                     .await
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;

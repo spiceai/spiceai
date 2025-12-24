@@ -70,6 +70,7 @@ rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
+runtime-rate-control = { path = "../runtime-rate-control" }
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }

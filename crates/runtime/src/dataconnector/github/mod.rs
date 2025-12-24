@@ -45,6 +45,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use governor::Quota;
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
@@ -52,10 +53,12 @@ use issues::IssuesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
+use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::{StaticTokenProvider, TokenProvider};
@@ -79,6 +82,28 @@ mod workflows;
 
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static GLOBAL_GITHUB_RATE_CONTROLLER: LazyLock<Arc<RateController>> = LazyLock::new(|| {
+    // GitHub secondary rate limit for GraphQL is 2000 points per minute
+    let Some(secondary_quota_per_minute) = NonZeroU32::new(2000) else {
+        unreachable!("2000 is non-zero");
+    };
+
+    // GitHub secondary rate limit for requests per minute cannot exceed 90 CPU time per 60 seconds wall time
+    let Some(cpu_time_limit) = NonZeroU32::new(90) else {
+        unreachable!("90 is non-zero");
+    };
+
+    let rate_controller = RateControllerBuilder::new()
+        .with_weighted_quota(Quota::per_minute(secondary_quota_per_minute))
+        .add_quota(Quota::per_minute(cpu_time_limit))
+        .with_jitter(JitterConfig::new(
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        ));
+
+    rate_controller.build()
+});
 
 const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
 
@@ -326,6 +351,7 @@ impl Github {
         .with_schema(gql_client_params.schema)
         .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
+        .with_rate_controller(Some(Arc::clone(&GLOBAL_GITHUB_RATE_CONTROLLER)))
         .build(client)
         .boxed()
     }
@@ -733,7 +759,7 @@ fn warn_if_provided(
     }
 }
 
-const MAX_COMMENTS_FETCHED: u32 = 100;
+const MAX_COMMENTS_FETCHED: u32 = 75;
 
 // Organization-level resources (2 segments: owner/resource_type)
 const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
@@ -949,7 +975,7 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     component,
                 });
-                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
+                self.create_gql_table_provider(Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>, Some(table_args), Github::get_health_check_for_owner_and_repo(parsed.owner, repo)).await
             }
             ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
@@ -1064,7 +1090,7 @@ impl DataConnector for Github {
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
-                    None,
+                    Some(table_args),
                     Github::get_health_check_for_org(parsed.owner)
                 )
                 .await
