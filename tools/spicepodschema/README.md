@@ -42,6 +42,38 @@ The schema is automatically generated via `.github/workflows/generate_json_schem
 3. Upload as artifact
 4. (On manual dispatch) Create PR with updated schema
 
+## Validating the Generated Schema
+
+You can validate the generated schema against test spicepod files using `check-jsonschema` via `uvx` (no installation required):
+
+```bash
+# Validate a single file
+uvx check-jsonschema --schemafile .schema/spicepod.schema.json <path/to/spicepod.yaml>
+
+# Validate all test files
+uvx check-jsonschema --schemafile .schema/spicepod.schema.json tools/spicepodschema/tests/*.yaml
+
+# Show all validation errors (verbose mode)
+uvx check-jsonschema --schemafile .schema/spicepod.schema.json tools/spicepodschema/tests/*.yaml --verbose
+```
+
+### Test Files
+
+The `tests/` directory contains comprehensive test files for schema validation:
+
+| File | Purpose |
+|------|---------|
+| `spicepod.all.yaml` | Unified test with all components and parameters |
+| `spicepod.datasets.yaml` | Dataset connector tests |
+| `spicepod.accelerators.yaml` | Accelerator tests |
+| `spicepod.catalogs.yaml` | Catalog connector tests |
+| `spicepod.models.yaml` | Model source tests |
+| `spicepod.embeddings.yaml` | Embedding source tests |
+| `spicepod.tools.yaml` | Tool type tests |
+| `spicepod.secrets.yaml` | Secret store tests |
+| `spicepod.views.yaml` | View tests |
+| `spicepod.runtime.yaml` | Runtime configuration tests |
+
 ## Architecture
 
 ### Source Structure
