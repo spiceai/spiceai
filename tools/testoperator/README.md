@@ -302,14 +302,14 @@ Running search tests with the testoperator is still experimental, and uses stati
 Running text to sql tests with the testoperator is still experimental.
 
 ```bash
-testoperator run text_to_sql [OPTIONS]
+testoperator run text-to-sql [OPTIONS]
 ```
 Where options are:
 - `--model <MODEL NAME>`: The language model (named in spicepod) to perform text-to-sql.
 - `--queryset-file <FILE_PATH>`: File path to a JSONL of test questions and expected SQL (see `--queryset` for format). Cannot be used in conjunction with `--queryset`
 - `--queryset`: inline JSON array of test questions and expected SQL. Example:
   ```bash
-    testoperator run text_to_sql --queryset '[ 
+    testoperator run text-to-sql --queryset '[ 
       {"question": "how many sales have I made", "sql": "select count(1) from sales"},
       {"question": "Who has the most sales?", "sql": "select sold_by from sales group by sold_by order by count(1) desc limit 1"}
     ]'
