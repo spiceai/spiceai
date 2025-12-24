@@ -89,7 +89,7 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "afaaba8
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.11"
+aws-config = "1.8.12"
 aws-credential-types = "1.2.10"
 aws-runtime = "1.5.16"
 aws-sdk-bedrockruntime = "1.117.0"
@@ -179,7 +179,7 @@ indexmap = "2"
 insta = { version = "1.43.0", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
-logos = "0.15.1"
+logos = "0.16.0"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.3.0", features = ["openssl-tls"] }

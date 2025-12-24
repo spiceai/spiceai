@@ -43,6 +43,8 @@ mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
+#[cfg(feature = "snapshots")]
+mod snapshot_mutex;
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);
