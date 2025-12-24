@@ -38,11 +38,8 @@ spice models
 			return
 		}
 
-		model_statuses, _, err := api.GetComponentStatuses(rtcontext)
-		if err != nil {
-			slog.Error("getting component statuses", "error", err)
-		}
-
+		// The /v1/models?status=true endpoint returns the correct status
+		// directly from RuntimeStatus, including Refreshing, Initializing, etc.
 		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 		if err != nil {
 			slog.Error("listing spiced models", "error", err)
@@ -50,10 +47,6 @@ spice models
 
 		table := make([]interface{}, len(models.Data))
 		for i, model := range models.Data {
-			statusEnum, exists := model_statuses[model.Id]
-			if exists {
-				model.Status = statusEnum.String()
-			}
 			table[i] = model
 		}
 		util.WriteTable(table)

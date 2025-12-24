@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use clap::{ArgAction, Parser, ValueEnum};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 use test_framework::TestType;
 
@@ -44,6 +44,13 @@ pub struct DispatchArgs {
 
     #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
+
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) validate: bool,
+
+    /// Maximum number of concurrent workflow runs allowed
+    #[arg(long)]
+    pub(crate) max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -79,15 +86,22 @@ pub struct DispatchTestFile {
 
 /// Represents the tests that can be defined in a test file
 /// The tests correspond to the different workflows that can be dispatched
+/// Each test type can be defined as a single section or as an array of sections
 /// If a test is not defined, it will be skipped for that workflow
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchTests {
-    pub bench: Option<BenchArgs>,
-    pub throughput: Option<BenchArgs>,
-    pub load: Option<LoadArgs>,
-    pub append: Option<AppendArgs>,
-    pub http_consistency: Option<HttpConsistencyArgs>,
-    pub http_overhead: Option<HttpOverheadArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub bench: Vec<BenchArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub throughput: Vec<BenchArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub load: Vec<LoadArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub append: Vec<AppendArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub http_consistency: Vec<HttpConsistencyArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub http_overhead: Vec<HttpOverheadArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -96,6 +110,7 @@ pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySetArg,
     pub query_overrides: Option<QueryOverridesArg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +124,25 @@ pub struct BenchArgs {
     pub scale_factor: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scrape_spiced_metrics: Option<bool>,
+}
+
+/// Custom deserializer that accepts either a single item or a vector of items
+fn deserialize_single_or_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SingleOrVec<T> {
+        Single(T),
+        Vec(Vec<T>),
+    }
+
+    match SingleOrVec::deserialize(deserializer)? {
+        SingleOrVec::Single(single) => Ok(vec![single]),
+        SingleOrVec::Vec(vec) => Ok(vec),
+    }
 }
 
 #[expect(clippy::cast_possible_truncation)]
@@ -161,6 +195,12 @@ pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
     pub duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub random_param_set_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_clients: Option<bool>,
 }
 
 /// Append workflow arguments, defined in the test files
@@ -192,6 +232,9 @@ impl<'de> Deserialize<'de> for LoadArgs {
             #[serde(flatten)]
             bench_args: BenchArgs,
             duration: Option<u64>,
+            concurrency: Option<u64>,
+            random_param_set_count: Option<usize>,
+            http_clients: Option<bool>,
         }
 
         let mut helper = LoadArgsHelper::deserialize(deserializer)?;
@@ -201,9 +244,21 @@ impl<'de> Deserialize<'de> for LoadArgs {
             helper.bench_args.scrape_spiced_metrics = Some(true);
         }
 
+        // Remove ready_wait parameter as it's not supported by testoperator_run_load workflow
+        if helper.bench_args.ready_wait.is_some() {
+            eprintln!(
+                "Warning: ready_wait parameter (spicepod_path = {}) is not supported by testoperator_run_load workflow and will be ignored",
+                helper.bench_args.spicepod_path.display()
+            );
+            helper.bench_args.ready_wait = None;
+        }
+
         Ok(LoadArgs {
             bench_args: helper.bench_args,
             duration: helper.duration,
+            concurrency: helper.concurrency,
+            random_param_set_count: helper.random_param_set_count,
+            http_clients: helper.http_clients,
         })
     }
 }
@@ -276,4 +331,162 @@ pub struct WorkflowArgs<T: Serialize> {
     #[serde(flatten)]
     pub specific_args: T,
     pub spiced_commit: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_framework::queries::QuerySet;
+
+    #[test]
+    fn test_single_section_deserialization() {
+        let yaml = "
+tests:
+  bench:
+    spicepod_path: s3[parquet]-turso[file].yaml
+    query_set: tpch
+    ready_wait: 300
+    runner_type: spiceai-dev-runners
+  load:
+    spicepod_path: s3[parquet]-turso[file].yaml
+    query_set: tpch
+    ready_wait: 300
+    runner_type: spiceai-dev-runners
+    concurrency: 128
+    duration: 1800
+    random_param_set_count: 1000
+";
+
+        let test_file: DispatchTestFile =
+            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+
+        // Verify bench section (single item becomes vec with one element)
+        assert_eq!(test_file.tests.bench.len(), 1);
+        assert_eq!(
+            test_file.tests.bench[0].spicepod_path.to_string_lossy(),
+            "s3[parquet]-turso[file].yaml"
+        );
+        assert_eq!(test_file.tests.bench[0].query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.bench[0].ready_wait, Some(300));
+
+        // Verify load section (single item becomes vec with one element)
+        assert_eq!(test_file.tests.load.len(), 1);
+        assert_eq!(
+            test_file.tests.load[0]
+                .bench_args
+                .spicepod_path
+                .to_string_lossy(),
+            "s3[parquet]-turso[file].yaml"
+        );
+        assert_eq!(test_file.tests.load[0].bench_args.query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.load[0].bench_args.ready_wait, Some(300));
+        assert_eq!(test_file.tests.load[0].concurrency, Some(128));
+        assert_eq!(test_file.tests.load[0].duration, Some(1800));
+        assert_eq!(test_file.tests.load[0].random_param_set_count, Some(1000));
+
+        // Verify empty sections default to empty vectors
+        assert_eq!(test_file.tests.throughput.len(), 0);
+        assert_eq!(test_file.tests.http_consistency.len(), 0);
+        assert_eq!(test_file.tests.http_overhead.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_sections_deserialization() {
+        let yaml = "
+tests:
+  load:
+    - spicepod_path: s3[parquet]-turso[file].yaml
+      query_set: tpch
+      ready_wait: 300
+      runner_type: spiceai-dev-runners
+      concurrency: 128
+      duration: 1800
+      random_param_set_count: 1000
+    - spicepod_path: s3[parquet]-turso[file].yaml
+      query_set: tpch
+      ready_wait: 600
+      runner_type: spicehq-dev-large-runners
+      concurrency: 256
+      duration: 3600
+      random_param_set_count: 2000
+    - spicepod_path: different-spicepod.yaml
+      query_set: tpch
+      ready_wait: 120
+      runner_type: spiceai-dev-runners
+      concurrency: 64
+      duration: 900
+      random_param_set_count: 500
+";
+
+        let test_file: DispatchTestFile =
+            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+
+        // Verify we have 3 load sections
+        assert_eq!(test_file.tests.load.len(), 3);
+
+        // Verify first load section
+        assert_eq!(
+            test_file.tests.load[0]
+                .bench_args
+                .spicepod_path
+                .to_string_lossy(),
+            "s3[parquet]-turso[file].yaml"
+        );
+        assert_eq!(test_file.tests.load[0].bench_args.query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.load[0].bench_args.ready_wait, Some(300));
+        assert_eq!(test_file.tests.load[0].concurrency, Some(128));
+        assert_eq!(test_file.tests.load[0].duration, Some(1800));
+        assert_eq!(test_file.tests.load[0].random_param_set_count, Some(1000));
+
+        // Verify second load section
+        assert_eq!(
+            test_file.tests.load[1]
+                .bench_args
+                .spicepod_path
+                .to_string_lossy(),
+            "s3[parquet]-turso[file].yaml"
+        );
+        assert_eq!(test_file.tests.load[1].bench_args.query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.load[1].bench_args.ready_wait, Some(600));
+        assert_eq!(test_file.tests.load[1].concurrency, Some(256));
+        assert_eq!(test_file.tests.load[1].duration, Some(3600));
+        assert_eq!(test_file.tests.load[1].random_param_set_count, Some(2000));
+
+        // Verify third load section
+        assert_eq!(
+            test_file.tests.load[2]
+                .bench_args
+                .spicepod_path
+                .to_string_lossy(),
+            "different-spicepod.yaml"
+        );
+        assert_eq!(test_file.tests.load[2].bench_args.query_set, QuerySet::Tpch);
+        assert_eq!(test_file.tests.load[2].bench_args.ready_wait, Some(120));
+        assert_eq!(test_file.tests.load[2].concurrency, Some(64));
+        assert_eq!(test_file.tests.load[2].duration, Some(900));
+        assert_eq!(test_file.tests.load[2].random_param_set_count, Some(500));
+
+        // Verify other sections are empty
+        assert_eq!(test_file.tests.bench.len(), 0);
+        assert_eq!(test_file.tests.throughput.len(), 0);
+        assert_eq!(test_file.tests.http_consistency.len(), 0);
+        assert_eq!(test_file.tests.http_overhead.len(), 0);
+    }
+
+    #[test]
+    fn test_empty_sections_default_to_empty_vec() {
+        let yaml = "
+tests: {}
+";
+
+        let test_file: DispatchTestFile =
+            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+
+        // All sections should default to empty vectors
+        assert_eq!(test_file.tests.bench.len(), 0);
+        assert_eq!(test_file.tests.throughput.len(), 0);
+        assert_eq!(test_file.tests.load.len(), 0);
+        assert_eq!(test_file.tests.http_consistency.len(), 0);
+        assert_eq!(test_file.tests.http_overhead.len(), 0);
+    }
 }

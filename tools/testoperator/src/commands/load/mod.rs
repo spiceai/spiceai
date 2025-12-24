@@ -21,7 +21,7 @@ use test_framework::{
     TestType, anyhow,
     app::AppBuilder,
     arrow::util::pretty::print_batches,
-    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus, StatisticsCollector},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
@@ -81,16 +81,17 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // warm up run
     println!("Performing warm up");
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
+    let (baseline_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )?;
+    )
+    .await?;
 
-    let warm_up = SpiceTest::new(app.name.clone(), test_builder)
+    let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
@@ -114,7 +115,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_disable_caching(args.test_args.disable_caching)
             .with_http_client(args.test_args.http_clients),
-    )?;
+    )
+    .await?;
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
@@ -167,7 +169,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     }
 
     let (query_set, test_builder) =
-        super::build_test_with_validation(&args.test_args, test_builder)?;
+        super::build_test_with_validation(&args.test_args, test_builder).await?;
 
     // Use the same query overrides that were applied in build_test_with_validation
     let query_overrides = args
@@ -175,7 +177,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+    let _queries = query_set.get_queries(query_overrides, None, None).await?;
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
@@ -201,14 +203,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let _test_durations = test.get_query_durations().statistical_set()?;
+    let test_durations = test.get_query_durations().statistical_set()?;
 
     // Get all query durations for overall statistics before ending the test
     let all_durations = test.get_query_durations().clone();
+    let all_duration_values: Vec<_> = all_durations.values().flatten().copied().collect();
 
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end()?;
-    let (max_memory, _median_memory) = if let Some(readings) = memory_readings {
+    let (max_memory, median_memory) = if let Some(readings) = memory_readings {
         observe_memory(memory_token, readings).await?
     } else {
         println!("Memory monitoring not available for external spiced instances");
@@ -217,24 +220,82 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     // Set up telemetry for load test metrics
     let commit_sha = metrics.commit_sha.clone();
+    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
     let spiced_version = metrics.spiced_version.clone();
     let spicepod = args.test_args.common.spicepod_path.display().to_string();
+    let app_name = app.name.clone();
+
+    let attributes = vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "load_test"),
+        KeyValue::new("name", app_name.clone()),
+        KeyValue::new("spiced_version", spiced_version),
+        KeyValue::new("query_set", query_set.to_string()),
+        KeyValue::new("testoperator_commit_sha", commit_sha),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+        KeyValue::new("branch_name", metrics.branch_name.clone()),
+        KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
+        KeyValue::new("spicepod", spicepod),
+        // If not specified, default to 1 meaning single fixed params set was used
+        KeyValue::new(
+            "param_set_variants",
+            args.test_args
+                .random_param_set_count
+                .unwrap_or(1)
+                .to_string(),
+        ),
+        KeyValue::new(
+            "protocol",
+            if args.test_args.http_clients {
+                "http"
+            } else {
+                "flight"
+            },
+        ),
+    ];
 
     telemetry.set_resource(
-        Resource::builder()
-            .with_attribute(KeyValue::new("test", "load"))
-            .with_attribute(KeyValue::new("commit_sha", commit_sha.clone()))
-            .with_attribute(KeyValue::new("spiced_version", spiced_version.clone()))
-            .with_attribute(KeyValue::new("spicepod", spicepod.clone()))
+        Resource::builder_empty()
+            .with_attributes(attributes.clone())
             .build(),
     );
 
-    let attributes = [
-        KeyValue::new("test", "load"),
-        KeyValue::new("commit_sha", commit_sha),
-        KeyValue::new("spiced_version", spiced_version),
-        KeyValue::new("spicepod", spicepod),
-    ];
+    // Record per-query metrics for load test
+    for query in &metrics.metrics {
+        let query_name = &query.query_name;
+        let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
+
+        let status: u64 = u64::from(match &query.query_status {
+            QueryStatus::Passed => true,
+            QueryStatus::Failed(_) => false,
+        });
+
+        crate::metrics::QUERY_STATUS.record(status, &attributes);
+        crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+        crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
+        crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
+        crate::metrics::ITERATIONS.record(query.iterations.try_into()?, &attributes);
+        crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+        crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+        crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+    }
+
+    // Calculate and record overall load test percentiles
+    if !all_duration_values.is_empty() {
+        let overall_p90 = all_duration_values.percentile(90.0)?;
+        let overall_p95 = all_duration_values.percentile(95.0)?;
+        let overall_p99 = all_duration_values.percentile(99.0)?;
+
+        // Record overall load test metrics (without query_name attribute)
+        // Metric can be identified as overall by the absence of query_name attribute
+        crate::metrics::P90_DURATION.record(overall_p90.as_millis().try_into()?, &[]);
+        crate::metrics::P95_DURATION.record(overall_p95.as_millis().try_into()?, &[]);
+        crate::metrics::P99_DURATION.record(overall_p99.as_millis().try_into()?, &[]);
+    }
+    crate::metrics::TEST_DURATION
+        .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
+    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;
@@ -262,13 +323,19 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
-    for query in queries {
+
+    // Use baseline_queries that represent unique query names, otherwise the same failure
+    // could be reported multiple times for each parameterized query params set variation
+    for query in baseline_query_set
+        .get_queries(query_overrides, None, None)
+        .await?
+    {
         let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
             // Query Failed, no percentile statistics recorded
             continue;
         };
 
-        let Some(duration) = all_durations.get(&query.name) else {
+        let Some(duration) = test_durations.get(&query.name) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
                 query.name
