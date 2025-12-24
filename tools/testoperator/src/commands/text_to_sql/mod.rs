@@ -87,6 +87,8 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
 async fn emit_telemetry(
     mut telemetry: Telemetry,
     metrics: &QueryMetrics<TextToSqlMetric, TextToSqlRunMetric>,
@@ -120,7 +122,7 @@ async fn emit_telemetry(
         crate::metrics::AVERAGE_TEXT_TO_SQL_ATTEMPTS.record(run_metrics.avg_attempts, &[]);
         crate::metrics::P95_DURATION.record(run_metrics.p95_latency_ms as u64, &[]);
         crate::metrics::MEDIAN_DURATION.record(run_metrics.median_latency_ms as u64, &[]);
-    };
+    }
 
     telemetry.emit().await?;
 

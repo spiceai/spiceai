@@ -19,7 +19,7 @@ use clap::{Parser, ValueEnum};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use std::{fs, iter::Product, path::PathBuf};
+use std::{fs, path::PathBuf};
 use test_framework::{
     anyhow,
     spicetest::text_to_sql::{TextToSqlConfig, TextToSqlRequest},
@@ -42,7 +42,7 @@ pub struct TextToSqlArgs {
     #[arg(long, conflicts_with = "queryset_file")]
     pub(crate) queryset: Option<String>,
 
-    /// Whether to use the sample_data_enabled HTTP parameter in the v1/nsql endpoint
+    /// Whether to use the `sample_data_enabled` HTTP parameter in the v1/nsql endpoint
     #[arg(long, default_value = "both")]
     pub(crate) sample_data_enabled: SampleDataOption,
 
@@ -112,7 +112,7 @@ pub enum SampleDataOption {
 }
 
 impl SampleDataOption {
-    pub fn values(&self) -> Vec<bool> {
+    pub fn values(self) -> Vec<bool> {
         match self {
             SampleDataOption::True => vec![true],
             SampleDataOption::False => vec![false],
@@ -132,7 +132,7 @@ pub enum ReturnSqlOption {
 }
 
 impl ReturnSqlOption {
-    pub fn values(&self) -> Vec<bool> {
+    pub fn values(self) -> Vec<bool> {
         match self {
             ReturnSqlOption::True => vec![true],
             ReturnSqlOption::False => vec![false],
