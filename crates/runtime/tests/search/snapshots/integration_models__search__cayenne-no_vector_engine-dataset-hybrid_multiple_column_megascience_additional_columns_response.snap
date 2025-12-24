@@ -1,37 +1,10 @@
 ---
 source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "data": {
-        "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
-      },
-      "primary_key": {
-        "id": 772
-      },
-      "score": 0.01
-    },
-    {
-      "data": {
-        "question": "How many groups of 3 are in 18?"
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
-        "question": "How many groups of 3 are in 18?"
-      },
-      "primary_key": {
-        "id": 463
-      },
-      "score": 0.01
-    },
     {
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
@@ -47,14 +20,40 @@ snapshot_kind: text
     },
     {
       "data": {
-        "question": "How many groups of 5 are in 25?"
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "How many groups of 5 are in 25?"
+        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
       "primary_key": {
-        "id": 464
+        "id": 361
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+      },
+      "primary_key": {
+        "id": 772
+      },
+      "score": 0.01
+    },
+    {
+      "data": {
+        "question": "How many groups of 2 are in 14?"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "How many groups of 2 are in 14?"
+      },
+      "primary_key": {
+        "id": 462
       },
       "score": 0.01
     }
