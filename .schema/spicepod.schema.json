@@ -2265,37 +2265,13 @@
           ]
         },
         "params": {
-          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine'. Available engines: cayenne, duckdb, postgres, arrow, sqlite, duckdb, turso, duckdb. See $defs for engine-specific parameter schemas (e.g., DuckdbAcceleratorParams, PostgresAcceleratorParams).",
+          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: cayenne, duckdb, postgres, arrow, sqlite, duckdb, turso, duckdb.",
           "anyOf": [
             {
-              "$ref": "#/$defs/CayenneAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/DuckdbAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/PostgresAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/ArrowAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/SqliteAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/DuckdbAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/TursoAcceleratorParams"
-            },
-            {
-              "$ref": "#/$defs/DuckdbAcceleratorParams"
+              "$ref": "#/$defs/Params"
             },
             {
               "type": "null"
-            },
-            {
-              "$ref": "#/$defs/Params"
             }
           ]
         },
@@ -2375,7 +2351,216 @@
           "$ref": "#/$defs/SnapshotBehavior"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "cayenne"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CayenneAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "duckdb"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/DuckdbAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "postgres"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/PostgresAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "arrow"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ArrowAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "sqlite"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/SqliteAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "duckdb"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/DuckdbAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "turso"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TursoAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "duckdb"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/DuckdbAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "engine"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ArrowAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
     },
     "Mode": {
       "oneOf": [

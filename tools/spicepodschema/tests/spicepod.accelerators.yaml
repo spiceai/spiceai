@@ -118,21 +118,21 @@ datasets:
   # Cayenne Accelerator (if enabled)
   # Runtime params: file_watcher
   # ===========================================================================
-  # - name: accel_cayenne
-  #   from: postgres:public.large_table
-  #   params:
-  #     pg_host: localhost
-  #     pg_port: "5432"
-  #     pg_db: testdb
-  #     pg_user: postgres
-  #     pg_pass: secret
-  #   acceleration:
-  #     enabled: true
-  #     engine: cayenne
-  #     mode: file
-  #     refresh_mode: full
-  #     params:
-  #       cayenne_file_path: ./data/accel.cayenne
-  #       cayenne_metastore: sqlite
-  #       file_watcher: "true"
-  #       cayenne_footer_cache_mb: "256"
+  - name: accel_cayenne
+    from: postgres:public.large_table
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params:
+        cayenne_file_path: ./data/accel.cayenne
+        cayenne_metastore: sqlite
+        file_watcher: "true"
+        cayenne_footer_cache_mb: "256"

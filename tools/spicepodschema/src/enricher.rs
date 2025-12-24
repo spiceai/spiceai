@@ -1080,10 +1080,25 @@ fn update_acceleration_params(
     defs_obj: &mut Map<String, Value>,
     data_accelerators: &[ConnectorSchema],
 ) {
-    // Build anyOf array for Acceleration params (data accelerators)
-    let acceleration_params_refs: Vec<Value> = data_accelerators
+    // Find the Arrow accelerator for the default case
+    let arrow_accelerator = data_accelerators.iter().find(|a| a.name == "arrow");
+
+    // Build if/then conditionals for each accelerator based on engine field
+    let mut conditionals: Vec<Value> = data_accelerators
         .iter()
         .map(|a| {
+            // Build the "if" condition - matches when "engine" equals accelerator name
+            let mut if_props = Map::new();
+            let mut engine_const = Map::new();
+            engine_const.insert("const".to_string(), Value::String(a.name.clone()));
+            if_props.insert("engine".to_string(), Value::Object(engine_const));
+
+            let mut if_obj = Map::new();
+            if_obj.insert("properties".to_string(), Value::Object(if_props));
+
+            // Build the "then" clause - params uses the accelerator-specific schema
+            let mut then_props = Map::new();
+            let mut params_schema = Map::new();
             let mut ref_obj = Map::new();
             ref_obj.insert(
                 "$ref".to_string(),
@@ -1092,60 +1107,99 @@ fn update_acceleration_params(
                     to_pascal_case(&a.name)
                 )),
             );
-            Value::Object(ref_obj)
+            // Allow null as well
+            params_schema.insert(
+                "anyOf".to_string(),
+                Value::Array(vec![
+                    Value::Object(ref_obj),
+                    Value::Object({
+                        let mut null_obj = Map::new();
+                        null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                        null_obj
+                    }),
+                ]),
+            );
+            then_props.insert("params".to_string(), Value::Object(params_schema));
+
+            let mut then_obj = Map::new();
+            then_obj.insert("properties".to_string(), Value::Object(then_props));
+
+            // Combine into if/then object
+            let mut conditional = Map::new();
+            conditional.insert("if".to_string(), Value::Object(if_obj));
+            conditional.insert("then".to_string(), Value::Object(then_obj));
+
+            Value::Object(conditional)
         })
         .collect();
 
-    // Update Acceleration params field
-    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration")
-        && let Some(Value::Object(properties)) = accel_def.get_mut("properties")
-        && !acceleration_params_refs.is_empty()
-    {
-        let accelerator_names: Vec<&str> =
-            data_accelerators.iter().map(|a| a.name.as_str()).collect();
-        let description = format!(
-            "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine'. Available engines: {}. See $defs for engine-specific parameter schemas (e.g., DuckdbAcceleratorParams, PostgresAcceleratorParams).",
-            accelerator_names.join(", ")
+    // Add default case: when engine is not specified, use Arrow params (Arrow is the default engine)
+    if let Some(arrow) = arrow_accelerator {
+        // Match when engine property is not present using JSON Schema "not" + "required"
+        let mut required_obj = Map::new();
+        required_obj.insert(
+            "required".to_string(),
+            Value::Array(vec![Value::String("engine".to_string())]),
         );
-        update_params_property(
-            properties,
-            "params",
-            &acceleration_params_refs,
-            &description,
+        let mut not_obj = Map::new();
+        not_obj.insert("not".to_string(), Value::Object(required_obj));
+
+        let mut then_props = Map::new();
+        let mut params_schema = Map::new();
+        let mut ref_obj = Map::new();
+        ref_obj.insert(
+            "$ref".to_string(),
+            Value::String(format!(
+                "#/$defs/{}AcceleratorParams",
+                to_pascal_case(&arrow.name)
+            )),
         );
+        params_schema.insert(
+            "anyOf".to_string(),
+            Value::Array(vec![
+                Value::Object(ref_obj),
+                Value::Object({
+                    let mut null_obj = Map::new();
+                    null_obj.insert("type".to_string(), Value::String("null".to_string()));
+                    null_obj
+                }),
+            ]),
+        );
+        then_props.insert("params".to_string(), Value::Object(params_schema));
+
+        let mut then_obj = Map::new();
+        then_obj.insert("properties".to_string(), Value::Object(then_props));
+
+        let mut default_conditional = Map::new();
+        default_conditional.insert("if".to_string(), Value::Object(not_obj));
+        default_conditional.insert("then".to_string(), Value::Object(then_obj));
+
+        conditionals.push(Value::Object(default_conditional));
     }
-}
 
-/// Updates a params property to use anyOf with the given schema references.
-fn update_params_property(
-    properties: &mut Map<String, Value>,
-    field_name: &str,
-    refs: &[Value],
-    description: &str,
-) {
-    let mut any_of = refs.to_vec();
+    // Update Acceleration definition to use allOf with conditionals
+    if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration") {
+        if !conditionals.is_empty() {
+            let accelerator_names: Vec<&str> =
+                data_accelerators.iter().map(|a| a.name.as_str()).collect();
 
-    // Add null option
-    let mut null_type = Map::new();
-    null_type.insert("type".to_string(), Value::String("null".to_string()));
-    any_of.push(Value::Object(null_type));
+            // Update description for params field
+            if let Some(Value::Object(properties)) = accel_def.get_mut("properties")
+                && let Some(Value::Object(params_prop)) = properties.get_mut("params")
+            {
+                params_prop.insert(
+                    "description".to_string(),
+                    Value::String(format!(
+                        "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: {}.",
+                        accelerator_names.join(", ")
+                    )),
+                );
+            }
 
-    // Also keep the generic Params reference for flexibility
-    let mut generic_ref = Map::new();
-    generic_ref.insert(
-        "$ref".to_string(),
-        Value::String("#/$defs/Params".to_string()),
-    );
-    any_of.push(Value::Object(generic_ref));
-
-    let mut new_params = Map::new();
-    new_params.insert(
-        "description".to_string(),
-        Value::String(description.to_string()),
-    );
-    new_params.insert("anyOf".to_string(), Value::Array(any_of));
-
-    properties.insert(field_name.to_string(), Value::Object(new_params));
+            // Add allOf with conditionals to the Acceleration schema
+            accel_def.insert("allOf".to_string(), Value::Array(conditionals));
+        }
+    }
 }
 
 /// Adds connector metadata as a JSON Schema extension (`x-spice-connectors`).
