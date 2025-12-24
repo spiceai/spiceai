@@ -22,10 +22,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of groups of 7 in 21."
+        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
       },
       "primary_key": {
-        "id": 359
+        "id": 787
       },
       "score": 0.01
     },
@@ -42,10 +42,10 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+        "question": "Find the number of groups of 7 in 21."
       },
       "primary_key": {
-        "id": 787
+        "id": 359
       },
       "score": 0.01
     }

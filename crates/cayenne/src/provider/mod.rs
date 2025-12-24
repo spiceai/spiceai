@@ -49,7 +49,7 @@ pub(crate) mod utils;
 
 // Re-export the main type at the module level for convenience
 pub use scan::CayenneAccelerationExec;
-pub use table::CayenneTableProvider;
+pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};

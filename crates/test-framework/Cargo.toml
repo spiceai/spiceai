@@ -11,7 +11,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 app = { path = "../app" }
-arrow = { workspace = true, features = ["prettyprint"] }
+arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
 arrow-json.workspace = true
 async-openai.workspace = true
 async-trait.workspace = true

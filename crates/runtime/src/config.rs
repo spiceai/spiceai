@@ -46,8 +46,8 @@ pub struct Config {
     pub cluster: ClusterConfig,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
-pub enum ClusterMode {
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ClusterRole {
     Scheduler,
     Executor,
 }
@@ -85,47 +85,61 @@ impl Default for Config {
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, clap::Parser)]
 pub struct ClusterConfig {
-    /// Configure cluster mode role
-    #[arg(
-        long = "cluster-mode",
-        value_name = "CLUSTER_MODE",
-        required = false,
-        action
-    )]
-    pub mode: Option<ClusterMode>,
+    /// Configure cluster node role: scheduler or executor
+    #[arg(long = "role", value_name = "ROLE", required = false, action)]
+    pub role: Option<ClusterRole>,
 
-    /// Configure cluster scheduler URI. Used by executors to
-    /// join a cluster, or by schedulers to control their bind
-    /// address.
+    /// The bind address for the internal cluster gRPC service.
+    /// Used by both schedulers and executors.
     #[arg(
-        long = "scheduler-url",
-        value_name = "SCHEDULER_URL",
-        default_value = "spiced://localhost:50051",
+        long = "node-bind-address",
+        value_name = "NODE_BIND_ADDRESS",
+        default_value = "0.0.0.0:50052",
         action
     )]
-    pub scheduler_url: Url,
+    pub node_bind_address: SocketAddr,
 
+    /// The path to the CA certificate used to validate cluster node identities.
     #[arg(
-        long = "allow-insecure-connections",
-        value_name = "ALLOW_INSECURE_CONNECTIONS",
-        required = false,
-        action
+        long = "node-mtls-ca-certificate-file",
+        value_name = "NODE_MTLS_CA_CERTIFICATE_FILE"
     )]
-    pub allow_insecure_connections: bool,
+    pub node_mtls_ca_certificate_file: Option<String>,
+
+    /// The path to the certificate file used for both server TLS and client mTLS.
+    #[arg(
+        long = "node-mtls-certificate-file",
+        value_name = "NODE_MTLS_CERTIFICATE_FILE"
+    )]
+    pub node_mtls_certificate_file: Option<String>,
+
+    /// The path to the private key file for the cluster certificate.
+    #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
+    pub node_mtls_key_file: Option<String>,
+
+    /// The URL of the scheduler service. Required for executors to join a cluster.
+    /// If set, --role executor is implied and can be omitted.
+    #[arg(long = "scheduler-address", value_name = "SCHEDULER_ADDRESS")]
+    pub scheduler_address: Option<Url>,
+
+    /// The hostname and port that this node advertises to other cluster nodes.
+    /// For schedulers: used as the URL for distributed query planning.
+    /// For executors: used during registration to tell the scheduler how to contact this node.
+    #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
+    pub node_advertise_address: Option<String>,
 }
 
 #[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
-        let url = match Url::parse("spiced://localhost:50051") {
-            Ok(url) => url,
-            Err(e) => unreachable!("The default URI could not be parsed: {}", e),
-        };
-
         Self {
-            mode: None,
-            scheduler_url: url,
-            allow_insecure_connections: false,
+            role: None,
+            node_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50052),
+            node_mtls_ca_certificate_file: None,
+            node_mtls_certificate_file: None,
+            node_mtls_key_file: None,
+            scheduler_address: None,
+            node_advertise_address: None,
         }
     }
 }
@@ -133,14 +147,20 @@ impl Default for ClusterConfig {
 #[cfg(feature = "cluster")]
 impl ClusterConfig {
     #[must_use]
-    pub fn with_mode(mut self, mode: ClusterMode) -> Self {
-        self.mode = Some(mode);
+    pub fn with_role(mut self, role: ClusterRole) -> Self {
+        self.role = Some(role);
         self
     }
 
     #[must_use]
-    pub fn with_scheduler_url(mut self, url: Url) -> Self {
-        self.scheduler_url = url;
+    pub fn with_node_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.node_bind_address = addr;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scheduler_address(mut self, url: Url) -> Self {
+        self.scheduler_address = Some(url);
         self
     }
 }

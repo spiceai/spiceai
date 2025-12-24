@@ -19,6 +19,7 @@ pub mod azure;
 pub mod bedrock;
 pub mod databricks;
 pub mod file;
+pub mod google;
 pub mod huggingface;
 pub mod openai;
 pub mod perplexity;
@@ -46,6 +47,7 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
         ModelSource::Xai => Some(xai::PARAMETERS),
         ModelSource::Bedrock => Some(bedrock::PARAMETERS),
         ModelSource::SpiceAI => None,
+        ModelSource::Google => Some(google::PARAMETERS),
     }
 }
 

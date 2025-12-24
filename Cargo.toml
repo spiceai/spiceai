@@ -69,7 +69,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.90"
-version = "1.10.1-unstable"
+version = "1.11.0-unstable"
 
 [workspace.dependencies]
 ahash = "0.8.12"
@@ -89,7 +89,7 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "afaaba8
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"
-aws-config = "1.8.11"
+aws-config = "1.8.12"
 aws-credential-types = "1.2.10"
 aws-runtime = "1.5.16"
 aws-sdk-bedrockruntime = "1.117.0"
@@ -179,7 +179,7 @@ indexmap = "2"
 insta = { version = "1.43.0", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
-logos = "0.15.1"
+logos = "0.16.0"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.3.0", features = ["openssl-tls"] }
@@ -230,7 +230,7 @@ r2d2 = "0.8.10"
 rand = "0.9.2"
 rdkafka = { version = "0.38.0" }
 regex = "1.12.2"
-reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.26", features = ["json", "rustls-tls"] }
 rmcp = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a66f66ae345a0fafde1e2ee496ec137d77aef82a" }
 roaring = "0.11"
 rusqlite = { version = "0.37.0", features = ["bundled-decimal", "chrono"] }
@@ -248,7 +248,7 @@ sqlparser = "0.58.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.35.2"
-tantivy = "0.24.2"
+tantivy = "0.25.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
     "tds73",
@@ -261,6 +261,7 @@ tokio = { version = "1", features = [
     "signal",
     "macros",
     "test-util",
+    "time",
 ] }
 tokio-postgres = { version = "0.7.15", features = [
     "with-chrono-0_4",
@@ -281,7 +282,6 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-tract-core = "0.22.0"
 turso = "0.3.0"
 twox-hash = "2.1.2"
 url = "2.5"
@@ -328,13 +328,13 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "b645aa11f67bf2921d3c6701344a172972e81611" }               # spiceai/spiceai-50
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "b645aa11f67bf2921d3c6701344a172972e81611" }                   # spiceai/spiceai-50
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "4a9f784fc15a795ca428860b65602b1d777faf9a" } # spiceai
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c9363befa430a53c471fc18a811ea0769e631114" } # spiceai
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "afcbd1ce99703f1322d176fc1b99745f647234d0" } # spiceai:spiceai-50
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "12957e480d1433b97bbb5de328e6bc0387d8551a" }      # spiceai/spiceai-50
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "12957e480d1433b97bbb5de328e6bc0387d8551a" }  # spiceai/spiceai-50
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "12957e480d1433b97bbb5de328e6bc0387d8551a" } # spiceai/spiceai-50
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "9c17685db62a1511ecf2e90aa72b19feabdea1cb" }           # spiceai:spiceai-50
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "9c17685db62a1511ecf2e90aa72b19feabdea1cb" }   # spiceai:spiceai-50
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "9c17685db62a1511ecf2e90aa72b19feabdea1cb" } # spiceai:spiceai-50
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d" } # spiceai-0.16.0
 

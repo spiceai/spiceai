@@ -124,8 +124,8 @@ pub enum Error {
     #[snafu(display("Missing the `value` parameter for VariableScaleDecimal"))]
     MissingValueForVariableScaleDecimal,
 
-    #[snafu(display("VariableScaleDecimal expects either string or object"))]
-    UnsupportedTypeForVariableScaleDecimal,
+    #[snafu(display("VariableScaleDecimal expects either string or object, got: {actual_type}"))]
+    UnsupportedTypeForVariableScaleDecimal { actual_type: String },
 
     #[snafu(display("scale must be integer"))]
     NonIntegerScaleForVariableScaleDecimal,
@@ -213,7 +213,10 @@ fn append_field_value_to_builder(
         }
         DataType::Decimal128(_, scale) => {
             let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
-            decimal_builder.append_value(convert_json_to_decimal(field_value, *scale)?);
+            match convert_json_to_decimal(field_value, *scale)? {
+                Some(val) => decimal_builder.append_value(val),
+                None => decimal_builder.append_null(),
+            }
         }
         DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
             (TimeUnit::Microsecond, None) => {
@@ -472,7 +475,7 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
 /// Supported inputs:
 /// - JSON string: base64-encoded
 /// - JSON object: {"scale": <int>, "value": <base64>}
-pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
+pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
     if !(0..=38).contains(&target_scale) {
         return InvalidDecimalJsonSnafu {
             reason: "target_scale must be in 0..=38".to_string(),
@@ -481,8 +484,8 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
     }
 
     match v {
-        Json::String(s) => convert_string_to_decimal(s),
-
+        Json::Null => Ok(None),
+        Json::String(s) => Ok(Some(convert_string_to_decimal(s)?)),
         Json::Object(m) => {
             #[expect(clippy::cast_possible_truncation)]
             let src_scale =
@@ -498,10 +501,18 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
 
             let unscaled = convert_string_to_decimal(value)?;
             let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
-            Ok(normalized)
+            Ok(Some(normalized))
         }
-
-        _ => UnsupportedTypeForVariableScaleDecimalSnafu.fail(),
+        _ => {
+            let actual_type = match v {
+                Json::Null => "null",
+                Json::Bool(_) => "boolean",
+                Json::Number(_) => "number",
+                Json::Array(_) => "array",
+                _ => "unknown",
+            };
+            UnsupportedTypeForVariableScaleDecimalSnafu { actual_type }.fail()
+        }
     }
 }
 
@@ -606,7 +617,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), n);
+        assert_eq!(result.ok().flatten(), Some(n));
     }
 
     #[test]
@@ -614,7 +625,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
@@ -622,7 +633,7 @@ mod tests {
         let n: i128 = 12345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 4);
-        assert_eq!(result.expect("Parse decimal"), 1_234_500);
+        assert_eq!(result.ok().flatten(), Some(1_234_500));
     }
 
     #[test]
@@ -630,7 +641,7 @@ mod tests {
         let n: i128 = 1_234_500;
         let input = json!({"scale": 4, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]

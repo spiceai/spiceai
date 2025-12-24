@@ -9,6 +9,7 @@ runtime:
       item_ttl: 5s
   params:
     github_max_concurrent_connections: 5 # Defaults to 10
+  dataset_load_parallelism: 1
 
 datasets:
   # Fetch stargazers of the spiceai repository every 1 hour, materialize locally

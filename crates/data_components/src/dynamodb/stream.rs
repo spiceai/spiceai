@@ -17,7 +17,7 @@ use super::{Error, Result};
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
-use crate::dynamodb::unnest::unnest_dynamodb_item;
+use crate::dynamodb::unnest::unnest_dynamodb_row;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder, make_builder};
@@ -145,7 +145,7 @@ pub fn process_batch(
 
                     let (unnested_streams_item, _) = match unnest_depth {
                         None => (streams_item, HashSet::new()),
-                        Some(depth) => unnest_dynamodb_item(&streams_item, depth)
+                        Some(depth) => unnest_dynamodb_row(&streams_item, depth)
                             .context(FailedToUnnestSnafu)?,
                     };
 

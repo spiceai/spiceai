@@ -26,6 +26,7 @@ use llms::{
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
+    google::Google,
     openai::new_openai_client,
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -133,6 +134,17 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
 
     Ok(Arc::new(sonar))
+}
+
+pub(crate) fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
+        .or_else(|_| std::env::var("GEMINI_API_KEY"))
+        .context("SPICE_GOOGLE_API_KEY or GEMINI_API_KEY not set")?;
+
+    let google = Google::new(&SecretString::from(api_key), model_id)
+        .map_err(|e| anyhow::anyhow!("Failed to create Google client: {e}"))?;
+
+    Ok(Arc::new(google))
 }
 
 pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
