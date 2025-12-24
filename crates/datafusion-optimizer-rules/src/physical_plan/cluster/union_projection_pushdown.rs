@@ -327,7 +327,7 @@ mod tests {
     /// Tests that the optimizer validates child schemas before pushing down projections.
     ///
     /// This test verifies that when the optimizer encounters a valid plan structure
-    /// (Projection -> intermediate nodes -> Union -> DataSources), it correctly
+    /// (`Projection` -> intermediate nodes -> `Union` -> `DataSources`), it correctly
     /// validates that the union children's schemas match the expected schema before
     /// applying the projection pushdown optimization.
     ///
