@@ -17,7 +17,7 @@ limitations under the License.
 use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     DATABRICKS_PARAM_LEN,
     PARAM_WITH_DEPRE_LEN,

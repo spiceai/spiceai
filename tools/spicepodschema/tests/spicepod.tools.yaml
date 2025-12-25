@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+version: v1
+kind: Spicepod
+name: schema-test-tools
+
+# =============================================================================
+# TOOLS
+# =============================================================================
+tools:
+  # Web search tool
+  - name: the_internet
+    from: websearch
+    description: "Search the web for information."
+    params:
+      engine: perplexity
+
+  # Built-in tools
+  - name: list_datasets
+    from: builtin:list_datasets
+
+  - name: sql_tool
+    from: builtin:sql
+
+  - name: table_schema
+    from: builtin:table_schema
+
+  - name: sample_distinct_columns
+    from: builtin:sample_distinct_columns
+
+  - name: random_sample
+    from: builtin:random_sample
+
+  # Document similarity tool
+  - name: doc_similarity
+    from: builtin:document_similarity
+
+  # MCP tool
+  # - name: mcp_tool
+  #   from: mcp://localhost:3000/tool
+  #   description: "An MCP-based tool."

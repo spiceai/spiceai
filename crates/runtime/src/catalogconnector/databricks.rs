@@ -64,7 +64,7 @@ impl Databricks {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .required()
         .secret()
