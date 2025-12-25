@@ -72,6 +72,14 @@ impl GraphQLContext for IssuesTableArgs {
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
     }
+
+    fn query_cost(&self) -> Option<u32> {
+        // issues(first: 100) could retrieve up to 100 issues
+        // each query returns labels, comments and assignees which are each additional requests
+        // 1 + 100 (labels) + 100 (comments) + 100 (assignees) = 301 points
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(301)
+    }
 }
 
 impl GitHubTableArgs for IssuesTableArgs {
