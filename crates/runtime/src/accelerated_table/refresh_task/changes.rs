@@ -239,6 +239,7 @@ impl RefreshTask {
             Box::pin(stream::once(async move { Ok(selected_batch) })),
         ));
 
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         let insert_plan = self
             .accelerator
             .insert_into(
@@ -249,7 +250,6 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-
         collect(insert_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
@@ -286,12 +286,12 @@ impl RefreshTask {
             all_where_exprs.extend(delete_where_exprs);
         }
 
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         let delete_plan = deletion_provider
             .delete_from(&session_state, &all_where_exprs)
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-
         collect(delete_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)

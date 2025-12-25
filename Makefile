@@ -187,6 +187,12 @@ docker-run:
 	docker stop spiceai && docker rm spiceai || true
 	docker run --name spiceai -p 8090:8090 -p 50051:50051 spiceai-rust:local-dev
 
+.PHONY: docker-local
+docker-local:
+	cp ~/.spice/bin/spiced .spiced-local-tmp
+	docker build -f Dockerfile.local -t spiceai.org/spiceai:local .
+	rm .spiced-local-tmp
+
 .PHONY: deps-licenses
 dep-licenses:
 	@cargo install cargo-license --quiet

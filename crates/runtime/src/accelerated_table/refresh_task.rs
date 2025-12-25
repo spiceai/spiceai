@@ -116,8 +116,8 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// Mutex to protect concurrent access to the accelerator during cache operations.
-    accelerator_mutex: Arc<Mutex<()>>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
+    accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
 
@@ -130,7 +130,7 @@ impl RefreshTaskBuilder {
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
-        accelerator_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
@@ -144,7 +144,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
-            accelerator_mutex,
+            accelerator_write_mutex,
             on_stream_batch_process_callback: None,
         }
     }
@@ -238,7 +238,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
             resource_monitor: self.resource_monitor,
-            accelerator_mutex: self.accelerator_mutex,
+            accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
         }
     }
@@ -258,8 +258,8 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// Mutex to protect concurrent access to the accelerator during cache operations.
-    accelerator_mutex: Arc<Mutex<()>>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
+    accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
 }
 
@@ -291,7 +291,7 @@ impl RefreshTask {
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
         io_runtime: Handle,
-        accelerator_mutex: Arc<Mutex<()>>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -300,7 +300,7 @@ impl RefreshTask {
             federated_source,
             accelerator,
             io_runtime,
-            accelerator_mutex,
+            accelerator_write_mutex,
         )
     }
 
@@ -706,6 +706,7 @@ impl RefreshTask {
         let sink_lock = self.sink.read().await;
         let sink = &*sink_lock;
 
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
             self.set_refresh_status(sql, status::ComponentStatus::Error)
                 .await;
@@ -824,7 +825,7 @@ impl RefreshTask {
             Arc::clone(&self.accelerator),
             self.dataset_name.to_string().as_str(),
             ttl,
-            Arc::clone(&self.accelerator_mutex),
+            Arc::clone(&self.accelerator_write_mutex),
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
