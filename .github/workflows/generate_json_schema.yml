@@ -82,7 +82,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate schema against test files
-        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         continue-on-error: true
         run: |
           python3 -m pip install --user check-jsonschema
