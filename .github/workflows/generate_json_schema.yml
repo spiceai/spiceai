@@ -8,6 +8,11 @@ on:
 
   workflow_dispatch:
     inputs:
+      run_build:
+        description: 'Run build and generation'
+        required: false
+        type: boolean
+        default: true
       create_pr:
         description: 'Create PR'
         required: false
@@ -29,16 +34,19 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
 
       - name: Set up make
-        if: runner.os != 'macOS'
+        if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
         uses: ./.github/actions/setup-make
 
       - name: Build Cargo project
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 
       - name: Run Cargo project
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
 
       - name: Verify JSON schema file
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: |
           if [ -f ".schema/spicepod.schema.json" ]; then
             echo ".schema/spicepod.schema.json file was successfully created."
@@ -49,13 +57,14 @@ jobs:
           fi
 
       - name: Upload JSON schema artifact
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json
 
       - name: Create PR
-        if: github.event_name == 'workflow_dispatch' && inputs.create_pr
+        if: github.event_name == 'workflow_dispatch' && inputs.create_pr && inputs.run_build
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
@@ -73,6 +82,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate schema against test files
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         continue-on-error: true
         run: |
           python3 -m pip install --user check-jsonschema
@@ -83,7 +93,7 @@ jobs:
           VALIDATION_FAILED=0
           for file in tools/spicepodschema/tests/*.yaml; do
             filename=$(basename "$file")
-            if check-jsonschema --schemafile .schema/spicepod.schema.json "$file" 2>&1; then
+            if python3 -m check_jsonschema --schemafile .schema/spicepod.schema.json "$file" 2>&1; then
               echo "✅ \`$filename\` - Valid" >> $GITHUB_STEP_SUMMARY
             else
               echo "❌ \`$filename\` - Invalid" >> $GITHUB_STEP_SUMMARY
@@ -91,7 +101,7 @@ jobs:
               echo "<details><summary>Validation errors</summary>" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
               echo '```' >> $GITHUB_STEP_SUMMARY
-              check-jsonschema --schemafile .schema/spicepod.schema.json "$file" --verbose 2>&1 || true >> $GITHUB_STEP_SUMMARY
+              python3 -m check_jsonschema --schemafile .schema/spicepod.schema.json "$file" --verbose 2>&1 || true >> $GITHUB_STEP_SUMMARY
               echo '```' >> $GITHUB_STEP_SUMMARY
               echo "</details>" >> $GITHUB_STEP_SUMMARY
               echo "" >> $GITHUB_STEP_SUMMARY
