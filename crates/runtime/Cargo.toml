@@ -277,6 +277,7 @@ models = [
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
+nfs = ["runtime-object-store/nfs"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 oracle = ["data_components/oracle"]
@@ -292,6 +293,7 @@ s3_vectors = [
     "search/s3_vectors",
 ]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
+smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",

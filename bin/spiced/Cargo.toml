@@ -81,6 +81,7 @@ default = [
     "iceberg-write",
     "turso",
     "cluster",
+    "smb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -99,12 +100,14 @@ models = ["runtime/models"]
 mongodb = ["runtime/mongodb"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
+nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
 oracle = ["runtime/oracle"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
 sharepoint = ["runtime/sharepoint"]
+smb = ["runtime/smb"]
 snapshots = ["runtime/snapshots"]
 snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
