@@ -30,8 +30,8 @@ use object_store::{
 };
 use smb::resource::file_util::ReadAt;
 use smb::{
-    Client, ClientConfig, CreateDisposition, CreateOptions, FileAccessMask, FileAttributes,
-    FileBothDirectoryInformation, FileStandardInformation, Resource, UncPath,
+    Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, FileAccessMask,
+    FileAttributes, FileBothDirectoryInformation, FileStandardInformation, Resource, UncPath,
     resource::{Directory, FileCreateArgs},
 };
 
@@ -62,7 +62,6 @@ struct SMBClientConfig {
     share: String,
     username: String,
     password: String,
-    #[expect(dead_code)]
     timeout: Option<Duration>,
 }
 
@@ -106,7 +105,14 @@ impl SMBClientConfig {
     }
 
     async fn connect(&self) -> object_store::Result<Client> {
-        let client = Client::new(ClientConfig::default());
+        let client_config = ClientConfig {
+            connection: ConnectionConfig {
+                timeout: self.timeout,
+                ..ConnectionConfig::default()
+            },
+            ..ClientConfig::default()
+        };
+        let client = Client::new(client_config);
         let target_path = self.unc_path()?;
 
         client

@@ -45,7 +45,10 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
 struct NFSClientConfig {
     server: String,
     export_path: String,
-    #[allow(dead_code)]
+    // Note: The libnfs Rust bindings (v0.1.1) do not expose timeout configuration.
+    // The underlying C library (libnfs) supports nfs_set_timeout(), but this is not
+    // wrapped in the Rust bindings. This field is kept for API consistency and future use.
+    #[expect(dead_code)]
     timeout: Option<Duration>,
 }
 
