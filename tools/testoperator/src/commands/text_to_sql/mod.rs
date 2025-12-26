@@ -19,7 +19,7 @@ use test_framework::{
     TestType,
     anyhow::{self, Context},
     git,
-    metrics::{MetricCollector, QueryMetrics},
+    metrics::{MetricCollector, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     process::MemoryReading,
@@ -76,7 +76,13 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
         .collect(TestType::TextToSql)?
         .with_run_metric(test.get_run_metrics()?);
 
-    metrics.show_run(None)?;
+    metrics.show_run(metrics.run_metric.as_ref().map(|m| {
+        if m.error_rate > 0.0 {
+            QueryStatus::Failed(None)
+        } else {
+            QueryStatus::Passed
+        }
+    }))?;
     let () = emit_telemetry(telemetry, &metrics, memory_usage_opt).await?;
 
     let mut spiced_instance = test.end()?;

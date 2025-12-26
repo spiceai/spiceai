@@ -29,6 +29,7 @@ pub struct TextToSqlMetric {
     pub number_of_attempts: usize,
     pub sample_data_enabled: bool,
     pub return_sql: bool,
+    pub is_error: bool,
 }
 
 impl ExtendedMetrics for TextToSqlMetric {
@@ -92,6 +93,7 @@ impl TextToSqlMetric {
         number_of_attempts: usize,
         sample_data_enabled: bool,
         return_sql: bool,
+        is_error: bool,
     ) -> Self {
         Self {
             generated_sql,
@@ -99,6 +101,7 @@ impl TextToSqlMetric {
             number_of_attempts,
             sample_data_enabled,
             return_sql,
+            is_error,
         }
     }
 }
@@ -108,6 +111,7 @@ pub struct TextToSqlRunMetric {
     pub median_latency_ms: f64,
     pub avg_attempts: f64,
     pub exact_match_rate: f64,
+    pub error_rate: f64,
 }
 
 impl ExtendedMetrics for TextToSqlRunMetric {
@@ -117,6 +121,7 @@ impl ExtendedMetrics for TextToSqlRunMetric {
             Field::new("median_latency_ms", DataType::Float64, false),
             Field::new("avg_attempts", DataType::Float64, false),
             Field::new("exact_match_rate", DataType::Float64, false),
+            Field::new("error_rate", DataType::Float64, false),
         ]
     }
 
@@ -138,6 +143,10 @@ impl ExtendedMetrics for TextToSqlRunMetric {
                 "exact_match_rate".to_string(),
                 Builder::Float64(Float64Builder::new()),
             ),
+            (
+                "error_rate".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
         ])
     }
 
@@ -147,6 +156,7 @@ impl ExtendedMetrics for TextToSqlRunMetric {
             BuilderTarget::Float64(("median_latency_ms".to_string(), self.median_latency_ms)),
             BuilderTarget::Float64(("avg_attempts".to_string(), self.avg_attempts)),
             BuilderTarget::Float64(("exact_match_rate".to_string(), self.exact_match_rate)),
+            BuilderTarget::Float64(("error_rate".to_string(), self.exact_match_rate)),
         ])
     }
 }
@@ -158,12 +168,14 @@ impl TextToSqlRunMetric {
         median_latency_ms: f64,
         avg_attempts: f64,
         exact_match_rate: f64,
+        error_rate: f64,
     ) -> Self {
         Self {
             p95_latency_ms,
             median_latency_ms,
             avg_attempts,
             exact_match_rate,
+            error_rate,
         }
     }
 }

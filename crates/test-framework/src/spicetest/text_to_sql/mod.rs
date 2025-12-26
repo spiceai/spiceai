@@ -136,6 +136,7 @@ impl SpiceTest<Completed> {
             self.get_median_response_time_metric()?,
             self.get_average_attempts_metric(),
             self.get_exact_match_count(),
+            self.get_error_rate(),
         ))
     }
 
@@ -149,6 +150,19 @@ impl SpiceTest<Completed> {
 
         #[expect(clippy::cast_precision_loss)]
         let rate = count as f64 / self.state.results.len() as f64;
+        rate
+    }
+
+    fn get_error_rate(&self) -> f64 {
+        let errors = self
+            .state
+            .results
+            .values()
+            .map(|result| result.is_error as u8)
+            .count();
+
+        #[expect(clippy::cast_precision_loss)]
+        let rate = errors as f64 / self.state.results.len() as f64;
         rate
     }
 
@@ -233,6 +247,7 @@ impl MetricCollector<TextToSqlMetric, TextToSqlRunMetric> for SpiceTest<Complete
                         result.number_of_attempts,
                         result.sample_data_enabled,
                         result.return_sql,
+                        result.is_error,
                     ))
                 })
             })

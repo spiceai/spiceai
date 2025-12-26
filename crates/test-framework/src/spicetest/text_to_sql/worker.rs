@@ -89,6 +89,7 @@ pub(crate) struct TextToSqlWorkerResult {
 pub struct TextToSqlResult {
     pub generated_sql: String,
     pub expected_sql: String,
+    pub is_error: bool,
     pub number_of_attempts: usize,
     pub duration: Duration,
     pub sample_data_enabled: bool,
@@ -147,12 +148,14 @@ impl TextToSqlWorker {
                     .send()
                     .await?;
 
-                let status = response.status();
-                let text = response.text().await?;
-
-                if !status.is_success() {
-                    return Err(anyhow::anyhow!("HTTP error: {text}"));
-                }
+                let mut is_error = false;
+                let text = match response.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        is_error = true;
+                        format!("HTTP error: {e}")
+                    }
+                };
 
                 let (number_of_attempts, sql) = if request.return_sql {
                     (1, text)
@@ -182,6 +185,7 @@ impl TextToSqlWorker {
                         expected_sql: request.expected_sql,
                         number_of_attempts,
                         duration,
+                        is_error,
                         sample_data_enabled: request.sample_data_enabled,
                         return_sql: request.return_sql,
                     },
