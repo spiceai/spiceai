@@ -35,8 +35,8 @@ use async_openai::types::chat::{
 };
 use async_openai::types::embeddings::EmbeddingInput;
 use async_openai::types::responses::{
-    CreateResponseArgs, FunctionTool, OutputItem, OutputMessage,
-    OutputMessageContent, ResponseStreamEvent, Status, Tool as ToolDefinition,
+    CreateResponseArgs, FunctionTool, OutputItem, OutputMessage, OutputMessageContent,
+    ResponseStreamEvent, Status, Tool as ToolDefinition,
 };
 use async_openai::types::responses::{OutputTextContent, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
