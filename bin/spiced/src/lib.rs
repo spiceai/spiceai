@@ -336,7 +336,17 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context(UnableToInitializeTlsSnafu)?;
 
-    start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
+    let telemetry_enabled = args.telemetry_enabled;
+    let telemetry_config_clone = telemetry_config.clone();
+    let app_name_clone = app_name.clone();
+    tokio::spawn(async move {
+        start_anonymous_telemetry(
+            telemetry_enabled,
+            telemetry_config_clone.as_ref(),
+            app_name_clone.as_ref(),
+        )
+        .await;
+    });
 
     let rt = Arc::new(rt);
 
@@ -484,7 +494,7 @@ fn create_otel_reader(
 }
 
 async fn start_anonymous_telemetry(
-    args: &Args,
+    telemetry_enabled: Option<bool>,
     spicepod_telemetry_config: Option<&TelemetryConfig>,
     spicepod_name: Option<&String>,
 ) {
@@ -495,8 +505,8 @@ async fn start_anonymous_telemetry(
         .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
     hardware_info.log_debug();
 
-    let explicitly_disabled = args.telemetry_enabled == Some(false)
-        || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
+    let explicitly_disabled =
+        telemetry_enabled == Some(false) || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
     let telemetry_properties = match spicepod_telemetry_config {
         Some(config) => config
