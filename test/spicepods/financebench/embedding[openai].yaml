@@ -11,12 +11,13 @@ dependencies:
   - evals
 
 datasets:
-  - from: spice.ai/spiceai/financebench/datasets/spice.financebench.data
+  - from: flightsql:spice.financebench.data
     name: financebench.data
     description: Financial information
     params:
-      spiceai_api_key: ${ secrets:SPICEAI_FINANCEBENCH_API_KEY }
-      spiceai_endpoint: https://flight.spiceai.io
+      flightsql_endpoint: https://flight.spiceai.io
+      flightsql_username: ''
+      flightsql_password: ${ secrets:SPICEAI_FINANCEBENCH_API_KEY }
     acceleration:
       enabled: true
       engine: duckdb
