@@ -154,15 +154,15 @@ impl SpiceTest<Completed> {
     }
 
     fn get_error_rate(&self) -> f64 {
-        let errors = self
+        let errors: f64 = self
             .state
             .results
             .values()
-            .map(|result| result.is_error as u8)
-            .count();
+            .map(|result| u8::from(result.is_error) as f64)
+            .sum();
 
         #[expect(clippy::cast_precision_loss)]
-        let rate = errors as f64 / self.state.results.len() as f64;
+        let rate = errors / self.state.results.len() as f64;
         rate
     }
 
