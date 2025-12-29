@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   enforce-pull-with-spice:
-    runs-on: self-hosted
+    runs-on: spiceai-dev-runners
     steps:
       - uses: spiceai/pulls-with-spice-action@8f7e144a912dc5ab3c36e9ad816ecb445f2d1427 # v1.0.7
         if: github.event_name == 'pull_request_target'

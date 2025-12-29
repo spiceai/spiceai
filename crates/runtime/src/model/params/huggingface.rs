@@ -17,13 +17,12 @@ limitations under the License.
 use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<
-        ParameterSpec,
-        HF_PARAM_LEN,
-        PARAM_WITH_DEPRE_LEN,
-        { HF_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
-    >(HF_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
+pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+    ParameterSpec,
+    HF_PARAM_LEN,
+    PARAM_WITH_DEPRE_LEN,
+    { HF_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
+>(HF_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
 const HF_PARAM_LEN: usize = 2;
 

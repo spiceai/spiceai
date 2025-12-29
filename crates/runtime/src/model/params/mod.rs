@@ -14,24 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod anthropic;
-mod azure;
-mod bedrock;
-mod databricks;
-mod file;
-mod google;
-mod huggingface;
-mod openai;
-mod perplexity;
-mod xai;
+pub mod anthropic;
+pub mod azure;
+pub mod bedrock;
+pub mod databricks;
+pub mod file;
+pub mod google;
+pub mod huggingface;
+pub mod openai;
+pub mod perplexity;
+pub mod xai;
 
 use spicepod::component::model::ModelSource;
 
-use crate::parameters::ParameterSpec;
+pub use crate::parameters::ParameterSpec;
 
 const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.";
 
-pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]> {
+/// Returns the parameter specifications for a given model source.
+///
+/// This function is used by the schema generator to collect all model parameters.
+#[must_use]
+pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]> {
     match source {
         ModelSource::OpenAi => Some(openai::PARAMETERS),
         ModelSource::Azure => Some(azure::PARAMETERS),
@@ -48,7 +52,7 @@ pub(crate) fn get_params_spec(source: &ModelSource) -> Option<&'static [Paramete
 }
 
 // Use the const function to reduce the duplicated common model parameters definition in each model provider param spec.
-pub(crate) const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
+pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
     a: [T; N],
     b: [T; M],
 ) -> [T; S] {
@@ -66,12 +70,12 @@ pub(crate) const fn concat_arrays<T: Copy, const N: usize, const M: usize, const
     out
 }
 
-pub(crate) const PARAM_LEN: usize = 24;
-pub(crate) const PARAM_WITH_DEPRE_LEN: usize = 45;
+pub const PARAM_LEN: usize = 24;
+pub const PARAM_WITH_DEPRE_LEN: usize = 45;
 
 // Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
 // OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
-pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
+pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
         .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),
@@ -103,7 +107,7 @@ pub(crate) const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
 ];
 
 // Common model parameters that are used for all model providers except openai.
-pub(crate) const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
+pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
     // Common parameters for all models
     ParameterSpec::runtime("tools")
         .description("Which tools should be made available to the model. Set to 'auto' to use all available tools."),

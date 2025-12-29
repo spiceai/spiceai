@@ -24,13 +24,13 @@ datasets:
       refresh_sql: "SELECT * FROM issues WHERE created_at='2024-11-09T22:47:45'"
     embeddings:
       - column: body
-        use: minilm_l6_v2
+        use: bge_base
         column_pk:
           - id
         chunking:
           enabled: true
-          target_chunk_size: 256
-          overlap_size: 128
+          target_chunk_size: 512
+          overlap_size: 64
           trim_whitespace: false
 
   - from: s3://spiceai-public-datasets/tpcds/catalog_page/
@@ -47,10 +47,10 @@ datasets:
           - cp_catalog_page_sk
         chunking:
           enabled: true
-          target_chunk_size: 256
-          overlap_size: 128
+          target_chunk_size: 512
+          overlap_size: 64
           trim_whitespace: false
-        use: minilm_l6_v2
+        use: bge_base
 
 models:
   - name: hf_local_model
@@ -61,5 +61,5 @@ models:
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:
-  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-    name: minilm_l6_v2
+  - from: huggingface:huggingface.co/BAAI/bge-base-en-v1.5
+    name: bge_base
