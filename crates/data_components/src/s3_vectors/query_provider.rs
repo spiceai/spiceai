@@ -503,17 +503,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable;
-    use crate::s3_vectors::{MetadataColumns, partition::PartitionedIndexName};
+    use crate::s3_vectors::MetadataColumns;
 
     use super::*;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::limit::GlobalLimitExec;
     use datafusion::physical_plan::union::UnionExec;
-    use datafusion::{
-        prelude::{SessionContext, col},
-        scalar::ScalarValue,
-    };
+    use datafusion::prelude::SessionContext;
     use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
     #[derive(Debug)]

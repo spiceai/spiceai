@@ -58,7 +58,6 @@ use aws_sdk_s3vectors::{
         DataType, DistanceMetric, Index, IndexSummary, ListOutputVector,
         error::{
             ConflictException, NotFoundException, ServiceQuotaExceededException,
-            builders::ConflictExceptionBuilder,
         },
     },
 };
@@ -263,7 +262,7 @@ impl S3Vectors for MockClient {
             None => Err(SdkError::service_error(
                 GetIndexError::NotFoundException(
                     NotFoundException::builder()
-                        .message(format!("Index '{}/{}' not found", bucket_name, index_name))
+                        .message(format!("Index '{bucket_name}/{index_name}' not found"))
                         .build()
                         .expect("msg"),
                 ),

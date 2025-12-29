@@ -120,7 +120,7 @@ mod tests {
     use datafusion::{
         logical_expr::col,
         physical_plan::{
-            display::DisplayableExecutionPlan, limit::GlobalLimitExec, union::UnionExec,
+            limit::GlobalLimitExec, union::UnionExec,
         },
         prelude::SessionContext,
         scalar::ScalarValue,
