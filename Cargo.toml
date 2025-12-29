@@ -361,22 +361,22 @@ candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" } # spiceai-0.8.4-cudarc-0.12
 
 # Use patched arrow-rs 55.2 until next release
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }        # spiceai-56
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }  # spiceai-56
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }  # spiceai-56
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" } # spiceai-56
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }   # spiceai-56
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }    # spiceai-56
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }   # spiceai-56
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" } # spiceai-56
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }    # spiceai-56
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }   # spiceai-56
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }    # spiceai-56
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }    # spiceai-56
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" } # spiceai-56
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" } # spiceai-56
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" } # spiceai-56
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "a55ba62893e8b351888cc46e410ff60039875352" }      # spiceai-56
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }        # spiceai-56
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }  # spiceai-56
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }  # spiceai-56
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }   # spiceai-56
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }    # spiceai-56
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }   # spiceai-56
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }    # spiceai-56
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }   # spiceai-56
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }    # spiceai-56
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }    # spiceai-56
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }      # spiceai-56
 
 # Note: Turso's bindings/rust/src/lib.rs defines #[global_allocator] which conflicts with spiced's allocator
 # We need to fork and remove the global allocator or patch it out
