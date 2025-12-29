@@ -70,7 +70,7 @@ pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usi
     out
 }
 
-pub const PARAM_LEN: usize = 45;
+pub const PARAM_LEN: usize = 44;
 pub const PARAM_WITH_DEPRE_LEN: usize = 45;
 
 // Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
