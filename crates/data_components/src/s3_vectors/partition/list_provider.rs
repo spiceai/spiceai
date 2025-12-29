@@ -119,9 +119,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
         logical_expr::col,
-        physical_plan::{
-            limit::GlobalLimitExec, union::UnionExec,
-        },
+        physical_plan::{limit::GlobalLimitExec, union::UnionExec},
         prelude::SessionContext,
         scalar::ScalarValue,
     };

@@ -56,9 +56,7 @@ use aws_sdk_s3vectors::{
     },
     types::{
         DataType, DistanceMetric, Index, IndexSummary, ListOutputVector,
-        error::{
-            ConflictException, NotFoundException, ServiceQuotaExceededException,
-        },
+        error::{ConflictException, NotFoundException, ServiceQuotaExceededException},
     },
 };
 use aws_smithy_runtime_api::{client::result::ServiceError, http::StatusCode};

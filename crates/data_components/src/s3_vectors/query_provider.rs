@@ -502,8 +502,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable;
     use crate::s3_vectors::MetadataColumns;
+    use crate::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable;
 
     use super::*;
 
