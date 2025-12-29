@@ -155,6 +155,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
 
   test-ai-udf:
     name: Test AI UDF
@@ -244,6 +245,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
 
   test-hf:
     name: Test Huggingface Models
@@ -292,6 +294,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
 
   test-local:
     name: Test Local Models
@@ -334,6 +337,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
 
   test-bedrock:
     name: Test Bedrock Models
@@ -368,6 +372,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
 
   test-workers:
     name: Test Workers
@@ -408,6 +413,7 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
 
   test-search:
     name: Test Search
@@ -450,3 +456,4 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event_name == 'schedule' && 'snapshot-update/search-integration' || (github.ref_name != 'trunk' && github.ref_name || '') }}
