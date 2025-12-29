@@ -17,6 +17,7 @@ limitations under the License.
 
 use std::{
     fmt,
+    hash::DefaultHasher,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +27,8 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use std::hash::Hash;
+use std::hash::Hasher;
 use token_provider::{Result, TokenProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -73,6 +76,14 @@ pub struct GitHubAppTokenProvider {
     _handle: Arc<JoinHandle<()>>,
 }
 
+impl Hash for GitHubAppTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Only hash non-sensitive identifiers; do not include the private key.
+        self.app_client_id.hash(state);
+        self.installation_id.hash(state);
+    }
+}
+
 impl std::fmt::Debug for GitHubAppTokenProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHubAppTokenProvider")
@@ -86,6 +97,12 @@ impl std::fmt::Debug for GitHubAppTokenProvider {
 impl TokenProvider for GitHubAppTokenProvider {
     fn get_token(&self) -> String {
         self.rx.borrow().expose_secret().to_string()
+    }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {

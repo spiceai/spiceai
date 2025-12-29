@@ -62,7 +62,7 @@ use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use token_provider::{StaticTokenProvider, TokenProvider};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 
 use super::{
@@ -83,7 +83,20 @@ mod workflows;
 static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static GLOBAL_GITHUB_RATE_CONTROLLER: LazyLock<Arc<RateController>> = LazyLock::new(|| {
+static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
+    RwLock<HashMap<String, Arc<RateController>>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static UNAUTHENTICATED_AUTH_CONTEXT: &str = "unauthenticated";
+
+async fn get_github_auth_context_rate_controller(auth_context: String) -> Arc<RateController> {
+    let rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.read().await;
+    if let Some(controller) = rate_controllers.get(&auth_context) {
+        return Arc::clone(controller);
+    }
+
+    drop(rate_controllers);
+    let mut rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.write().await;
+
     // GitHub secondary rate limit for GraphQL is 2000 points per minute
     let Some(secondary_quota_per_minute) = NonZeroU32::new(2000) else {
         unreachable!("2000 is non-zero");
@@ -102,8 +115,11 @@ static GLOBAL_GITHUB_RATE_CONTROLLER: LazyLock<Arc<RateController>> = LazyLock::
             Duration::from_millis(10),
         ));
 
-    rate_controller.build()
-});
+    let controller = rate_controller.build();
+    rate_controllers.insert(auth_context.clone(), Arc::clone(&controller));
+
+    controller
+}
 
 const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
 
@@ -325,7 +341,7 @@ impl Github {
         }
     }
 
-    pub(crate) fn create_graphql_client(
+    pub(crate) async fn create_graphql_client(
         &self,
         tbl: &Arc<dyn GitHubTableArgs>,
     ) -> std::result::Result<GraphQLClient, Box<dyn std::error::Error + Send + Sync>> {
@@ -337,6 +353,13 @@ impl Github {
             .token
             .as_ref()
             .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
+
+        let auth_context = token.as_ref().map_or_else(
+            || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
+            |t| t.dyn_hash(),
+        );
+
+        let rate_controller = get_github_auth_context_rate_controller(auth_context).await;
 
         let client = default_spice_client("application/json").boxed()?;
 
@@ -351,7 +374,7 @@ impl Github {
         .with_schema(gql_client_params.schema)
         .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
         .with_semaphore(Some(Arc::clone(&self.semaphore)))
-        .with_rate_controller(Some(Arc::clone(&GLOBAL_GITHUB_RATE_CONTROLLER)))
+        .with_rate_controller(Some(rate_controller))
         .build(client)
         .boxed()
     }
@@ -384,7 +407,7 @@ impl Github {
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self.create_graphql_client(&table_args).context(
+        let client = self.create_graphql_client(&table_args).await.context(
             super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),

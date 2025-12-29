@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+version: v1
+kind: Spicepod
+name: schema-test-models
+
+# =============================================================================
+# MODELS
+# Runtime params vary by provider: endpoint, tools, system_prompt,
+#                                  parameterized_prompt, chat_template,
+#                                  model_type, aws_*, responses_api
+# =============================================================================
+models:
+  # ---------------------------------------------------------------------------
+  # OpenAI model
+  # ---------------------------------------------------------------------------
+  - name: openai_gpt4
+    from: openai:gpt-4
+    params:
+      openai_api_key: sk-test
+      tools: auto
+      system_prompt: You are a helpful assistant.
+
+  # ---------------------------------------------------------------------------
+  # Anthropic model
+  # Runtime params: endpoint
+  # ---------------------------------------------------------------------------
+  - name: anthropic_claude
+    from: anthropic:claude-3-sonnet
+    params:
+      anthropic_api_key: sk-ant-test
+      endpoint: https://api.anthropic.com
+      tools: auto
+      system_prompt: You are a helpful AI assistant.
+
+  # ---------------------------------------------------------------------------
+  # Azure OpenAI model
+  # Runtime params: endpoint, responses_api
+  # ---------------------------------------------------------------------------
+  - name: azure_openai
+    from: azure:gpt-4
+    params:
+      azure_api_key: azure-key
+      azure_api_version: "2024-02-15-preview"
+      azure_deployment_name: gpt4-deployment
+      endpoint: https://myresource.openai.azure.com
+      responses_api: disabled
+      tools: auto
+
+  # ---------------------------------------------------------------------------
+  # AWS Bedrock model
+  # Runtime params: aws_access_key_id, aws_secret_access_key, aws_session_token, aws_region
+  # ---------------------------------------------------------------------------
+  - name: bedrock_claude
+    from: bedrock:anthropic.claude-3-sonnet-20240229-v1:0
+    params:
+      aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      aws_secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+      aws_region: us-east-1
+
+  # ---------------------------------------------------------------------------
+  # Google model
+  # Runtime params: google_api_key, endpoint
+  # ---------------------------------------------------------------------------
+  - name: google_gemini
+    from: google:gemini-1.5-pro
+    params:
+      google_api_key: google-api-key
+      endpoint: https://generativelanguage.googleapis.com
+
+  # ---------------------------------------------------------------------------
+  # Huggingface model (if enabled)
+  # Runtime params: model_type
+  # ---------------------------------------------------------------------------
+  # - name: hf_mistral
+  #   from: huggingface:mistralai/Mistral-7B-Instruct-v0.2
+  #   params:
+  #     huggingface_token: hf_xxx
+  #     model_type: mistral
+
+  # ---------------------------------------------------------------------------
+  # File-based model (if enabled)
+  # Runtime params: chat_template
+  # ---------------------------------------------------------------------------
+  # - name: local_model
+  #   from: file:models/my_model.gguf
+  #   params:
+  #     chat_template: chatml

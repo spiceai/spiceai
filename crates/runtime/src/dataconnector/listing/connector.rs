@@ -212,6 +212,13 @@ impl TableProvider for LocationPruningListingTable {
             return self.inner.scan(state, projection, filters, limit).await;
         };
 
+        // Ensure the query runtime uses the same object store configuration (endpoint/region)
+        // as the listing table, even when we bypass listing.
+        state.runtime_env().register_object_store(
+            self.object_store_url().as_ref(),
+            Arc::clone(&self.object_store),
+        );
+
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
         for loc in locations {
