@@ -119,10 +119,24 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
                 };
 
                 let projection_expr = projection.expr().to_vec();
+                let expected_schema = projection.input().schema();
 
                 // Take the projection and apply it on top of the union inputs. Specifically, on top
                 // of the repartition exec emitted by `DistributeFileScanOptimizer`
                 for leaf in union_exec.children() {
+                    // Verify the leaf schema matches the projection's input schema
+                    // to ensure the column indices in projection_expr are valid.
+                    // Without this check, we could get "project index N out of bounds" errors
+                    // when the leaf has fewer columns than the projection expressions expect.
+                    if leaf.schema() != expected_schema {
+                        tracing::debug!(
+                            expected_fields = expected_schema.fields().len(),
+                            leaf_fields = leaf.schema().fields().len(),
+                            "Skipping projection pushdown: union child schema differs from projection input schema"
+                        );
+                        return Ok(Transformed::no(p));
+                    }
+
                     let leaf_key: PlanNodeKey = leaf.as_ref().into();
 
                     // Decorate the projection atop the union input
@@ -190,5 +204,215 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use chrono::DateTime;
+    use datafusion::datasource::physical_plan::ArrowSource;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion_datasource::file_groups::FileGroup;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_datasource::{FileRange, PartitionedFile};
+    use object_store::{ObjectMeta, path::Path};
+
+    use std::sync::LazyLock;
+
+    #[must_use]
+    pub fn create_partitioned_file(
+        path: &str,
+        size: u64,
+        range: Option<FileRange>,
+    ) -> PartitionedFile {
+        PartitionedFile {
+            object_meta: ObjectMeta {
+                location: Path::from(path),
+                last_modified: DateTime::default(),
+                size,
+                e_tag: None,
+                version: None,
+            },
+            partition_values: vec![],
+            range,
+            statistics: None,
+            extensions: None,
+            metadata_size_hint: None,
+        }
+    }
+    fn file_scan_config_builder() -> FileScanConfigBuilder {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+            schema,
+            Arc::new(ArrowSource::default()),
+        )
+    }
+
+    #[must_use]
+    pub fn create_data_source_exec(files: Vec<PartitionedFile>) -> Arc<dyn ExecutionPlan> {
+        let fsc = file_scan_config_builder()
+            .with_file_group(FileGroup::new(files))
+            .build();
+
+        DataSourceExec::from_data_source(fsc)
+    }
+
+    static OPTIMIZER: LazyLock<PhysicalOptimizer> = LazyLock::new(|| {
+        PhysicalOptimizer::with_rules(vec![UnionProjectionPushdownOptimizer::new()])
+    });
+
+    fn optimize(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        OPTIMIZER.rules.iter().fold(Arc::clone(plan), |acc, rule| {
+            rule.optimize(acc, &ConfigOptions::default())
+                .expect("Must optimize")
+        })
+    }
+
+    #[ignore = "See #8313"]
+    #[test]
+    fn test_projection_pushdown() {
+        let files = vec![
+            create_partitioned_file("file:///file4.parquet", 256_000_000, None),
+            create_partitioned_file("file:///file5.parquet", 256_000_000, None),
+        ];
+
+        let data_source_exec = create_data_source_exec(files);
+        let projection_exec = ProjectionExec::try_new(
+            vec![(
+                col("id", data_source_exec.schema().as_ref()).expect("Must bind expr"),
+                "foo".to_string(),
+            )],
+            data_source_exec,
+        )
+        .expect("Must make projection_exec");
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(projection_exec);
+
+        // We start with 1 projection
+        assert_eq!(
+            SearchVisitor::collect_concrete_down::<ProjectionExec>(&plan)
+                .expect("Must collect")
+                .len(),
+            1
+        );
+
+        let optimized = optimize(&plan);
+
+        let data_source_exec_leaves =
+            SearchVisitor::collect_concrete_down::<DataSourceExec>(&optimized)
+                .expect("Must collect")
+                .len();
+
+        // Make sure we have enough leaves to test with
+        assert!(data_source_exec_leaves > 1);
+
+        // The number of projections must match the number of DataSourceExec leaves
+        assert_eq!(
+            SearchVisitor::collect_concrete_down::<ProjectionExec>(&optimized)
+                .expect("Must collect")
+                .len(),
+            data_source_exec_leaves
+        );
+    }
+
+    /// Tests that the optimizer validates child schemas before pushing down projections.
+    ///
+    /// This test verifies that when the optimizer encounters a valid plan structure
+    /// (`Projection` -> intermediate nodes -> `Union` -> `DataSources`), it correctly
+    /// validates that the union children's schemas match the expected schema before
+    /// applying the projection pushdown optimization.
+    ///
+    /// This is a defensive check to prevent "project index N out of bounds" errors
+    /// that could occur if projection expressions (with column indices bound to one
+    /// schema) are applied to plan nodes with different schemas.
+    #[test]
+    fn test_projection_pushdown_validates_schemas() {
+        // Create a schema for the test
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        // Create DataSourceExec with the schema
+        let fsc1 = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+            Arc::clone(&schema),
+            Arc::new(ArrowSource::default()),
+        )
+        .with_file_group(FileGroup::new(vec![create_partitioned_file(
+            "file:///file1.parquet",
+            100,
+            None,
+        )]))
+        .build();
+        let data_source1: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(fsc1);
+
+        let fsc2 = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+            Arc::clone(&schema),
+            Arc::new(ArrowSource::default()),
+        )
+        .with_file_group(FileGroup::new(vec![create_partitioned_file(
+            "file:///file2.parquet",
+            100,
+            None,
+        )]))
+        .build();
+        let data_source2: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(fsc2);
+
+        // Create a UnionExec
+        let union_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(UnionExec::new(vec![data_source1, data_source2]));
+
+        // Verify all schemas match
+        assert_eq!(union_exec.schema().fields().len(), 3);
+        for child in union_exec.children() {
+            assert_eq!(
+                child.schema(),
+                union_exec.schema(),
+                "Union child schema should match union schema"
+            );
+        }
+
+        // Create projection expressions
+        let projection_expr = vec![
+            (
+                col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
+                "id".to_string(),
+            ),
+            (
+                col("value", union_exec.schema().as_ref()).expect("Must bind expr"),
+                "value".to_string(),
+            ),
+        ];
+
+        // Create projection on top of union
+        let projection_exec =
+            ProjectionExec::try_new(projection_expr, union_exec).expect("Must make projection");
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(projection_exec);
+
+        // Run the optimizer - it should succeed without errors
+        let result = OPTIMIZER.rules[0].optimize(Arc::clone(&plan), &ConfigOptions::default());
+        assert!(result.is_ok(), "Optimization should not error");
+
+        let optimized = result.expect("Must optimize");
+
+        // The plan should still be valid (either optimized or unchanged)
+        let projections = SearchVisitor::collect_concrete_down::<ProjectionExec>(&optimized)
+            .expect("Must collect");
+        assert!(
+            !projections.is_empty(),
+            "Plan should contain at least one projection"
+        );
     }
 }

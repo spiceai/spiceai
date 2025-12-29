@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
+use async_openai::types::chat::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
 use serde_json::{Value, json};
@@ -435,7 +435,8 @@ async fn run_single_test(
         let mut req = test.req.clone();
         req.stream = Some(true);
         req.stream_options = Some(ChatCompletionStreamOptions {
-            include_usage: true,
+            include_usage: Some(true),
+            include_obfuscation: None,
         });
         accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
             panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
@@ -589,6 +590,7 @@ macro_rules! generate_model_tests {
         // test_model_case!(hf_phi3, supports_all_message_roles, true);
     };
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
