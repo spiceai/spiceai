@@ -1,0 +1,4 @@
+tests:
+  text_to_sql:
+    spicepod_path: /models/nsql_bench.yaml
+    runner_type: spiceai-dev-runners

@@ -62,6 +62,7 @@ pub enum Workflow {
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
+    TextToSql,
 }
 
 impl From<Workflow> for TestType {
@@ -74,6 +75,7 @@ impl From<Workflow> for TestType {
             Workflow::DataConsistency => TestType::DataConsistency,
             Workflow::HttpConsistency => TestType::HttpConsistency,
             Workflow::HttpOverhead => TestType::HttpOverhead,
+            Workflow::TextToSql => TestType::TextToSql,
         }
     }
 }
@@ -102,6 +104,8 @@ pub struct DispatchTests {
     pub http_consistency: Vec<HttpConsistencyArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub http_overhead: Vec<HttpOverheadArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub text_to_sql: Vec<TextToSqlArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -290,6 +294,19 @@ pub struct HttpConsistencyArgs {
     pub concurrency: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u64>,
+}
+
+/// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator_run_texttosql.yml`.
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TextToSqlArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    pub model_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queryset_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queryset: Option<String>,
 }
 
 /// Payload sent to the GitHub Actions workflow request for HTTP overhead tests
