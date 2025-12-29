@@ -29,7 +29,7 @@ use crate::{
         utils::create_tool_use_messages,
     },
 };
-use async_openai::types::ChatCompletionRequestMessage;
+use async_openai::types::chat::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,
     http::StatusCode,

@@ -19,8 +19,8 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 
-use async_openai::types::CreateEmbeddingRequest;
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::CreateEmbeddingRequest;
+use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;

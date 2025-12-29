@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{
-    ChatCompletionStreamOptions, CreateChatCompletionRequest, CreateChatCompletionResponse,
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+    CreateChatCompletionResponse,
 };
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
@@ -193,7 +194,8 @@ async fn run_test(
         let mut req = req;
         req.stream = Some(true);
         req.stream_options = Some(ChatCompletionStreamOptions {
-            include_usage: true,
+            include_usage: Some(true),
+            include_obfuscation: None,
         });
         accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
             panic!("For test {test_name}/{model_name}, chat_stream failed. Error: {e:#?}")
@@ -537,21 +539,23 @@ async fn test_tool_use(
     };
 
     // JSON Parse the function arguments to ensure robust to ordering.
-    let args: serde_json::Value = serde_json::from_str(
-        resp.choices
-            .first()
-            .expect("no choices in response")
-            .message
-            .tool_calls
-            .as_ref()
-            .expect("no tool calls in message")
-            .first()
-            .expect("no tool calls")
-            .function
-            .arguments
-            .as_str(),
-    )
-    .expect("failed to parse tool call arguments");
+    let tool_calls = resp
+        .choices
+        .first()
+        .expect("no choices in response")
+        .message
+        .tool_calls
+        .as_ref()
+        .expect("no tool calls in message");
+
+    let first_tool_call = tool_calls.first().expect("no tool calls");
+    let function = match first_tool_call {
+        ChatCompletionMessageToolCalls::Function(f) => &f.function,
+        ChatCompletionMessageToolCalls::Custom(_) => panic!("unexpected custom tool call"),
+    };
+
+    let args: serde_json::Value = serde_json::from_str(function.arguments.as_str())
+        .expect("failed to parse tool call arguments");
 
     insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }

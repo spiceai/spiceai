@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{sync::LazyLock, time::Duration};
 
-use async_openai::types::{CreateEmbeddingRequest, EncodingFormat};
+use async_openai::types::embeddings::{CreateEmbeddingRequest, EncodingFormat};
 use opentelemetry::{
     Key, KeyValue, Value, global,
     metrics::{Counter, Histogram, Meter},
