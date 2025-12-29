@@ -128,6 +128,7 @@ macro_rules! register_data_connector {
 }
 
 pub mod abfs;
+pub mod abfss;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "databricks")]
