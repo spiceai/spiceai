@@ -17,10 +17,10 @@ limitations under the License.
 use super::types::{MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
+        ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
+        FinishReason, FunctionCallStream, FunctionType, Role,
     },
 };
 use futures::{Stream, StreamExt};
@@ -93,7 +93,7 @@ impl ContentBlock {
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                         index: 0,
                         id: Some(id),
-                        r#type: Some(ChatCompletionToolType::Function),
+                        r#type: Some(FunctionType::Function),
                         function: Some(FunctionCallStream {
                             name: Some(name),
                             arguments: None,
@@ -152,7 +152,7 @@ impl Delta {
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                     index: 0,
                     id: Some(id.clone()),
-                    r#type: Some(ChatCompletionToolType::Function),
+                    r#type: Some(FunctionType::Function),
                     function: Some(FunctionCallStream {
                         name: None, // Intentially leave empty to match OpenAI's format.
                         arguments: Some(partial_json),
@@ -184,6 +184,7 @@ impl Delta {
     }
 }
 
+#[expect(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicStreamError {
     #[serde(rename = "type")]
@@ -260,9 +261,7 @@ pub struct MessageDelta {
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
 pub fn transform_stream(
-    stream: Pin<
-        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
-    >,
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
@@ -397,12 +396,7 @@ pub fn transform_stream(
                     ) => None,
                     Err(e) => {
                         tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(OpenAIError::ApiError(ApiError {
-                            message: e.error.message,
-                            r#type: Some("AnthropicStreamError".to_string()),
-                            param: None,
-                            code: None,
-                        })))
+                        Some(Err(e))
                     }
                 }
             }

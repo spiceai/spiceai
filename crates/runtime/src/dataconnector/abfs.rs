@@ -16,14 +16,22 @@ limitations under the License.
 
 use super::listing::{ListingTableConnector, build_fragments};
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters,
+    parameters::{
+        Validator,
+        azure::{
+            AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator,
+            AzureSasTokenNormalizer,
+        },
+    },
 };
 
 use crate::{
-    component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
     register_data_connector,
 };
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -33,6 +41,19 @@ use std::string::String;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 use url::Url;
+
+static PREFIX: &str = "abfs";
+
+static VALIDATORS: LazyLock<
+    Vec<Box<dyn Validator<Error = super::parameters::azure::Error> + Send + Sync + 'static>>,
+> = LazyLock::new(|| {
+    vec![
+        Box::new(AzureSasTokenNormalizer),
+        Box::new(AzureEndpointValidator),
+        Box::new(AzureAccountValidator),
+        Box::new(AzureAuthValidator),
+    ]
+});
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -45,25 +66,37 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Multiple authentication methods were provided. Specify only one of the following: access key, bearer token, or client credentials. Use skip_signature to disable all authentication."
+        "Azure managed identity authentication failed. Are you sure you're running in an environment with a managed identity? {source} For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#auth"
     ))]
-    InvalidKeyAuthCombination,
+    ManagedIdentityAuthenticationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display(
-        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided. Specify a valid HTTP/S URL."
+        "Azure client credentials authentication failed. Verify your client_id, client_secret, and tenant_id are correct. {source} For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#auth"
     ))]
-    InvalidEndpoint { endpoint: String },
+    ClientCredentialsAuthenticationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display(
-        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        "Azure SAS token authentication failed. Verify your sas_string is valid and not expired. {source} For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#auth"
     ))]
-    InsecureEndpointWithoutAllowHTTP { endpoint: String },
+    SasAuthenticationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
-#[derive(Debug)]
 pub struct AzureBlobFS {
     params: Parameters,
+    runtime: Option<Runtime>,
     tokio_io_runtime: Handle,
+}
+
+impl std::fmt::Debug for AzureBlobFS {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AzureBlobFS(params: {:?})", self.params)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -157,7 +190,11 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("disable_tagging")
             .description("Ignore any tags provided to put_opts")
             .is_boolean(),
-
+        ParameterSpec::runtime("client_timeout")
+            .description("The timeout setting for Azure client."),
+        ParameterSpec::component("versioning")
+            .description("Enables Azure blob versioning support when set to 'enabled'. Defaults to 'disabled'.")
+            .default("disabled"),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -172,70 +209,35 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         &self,
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(sas_token) = params.parameters.get("sas_string").expose().ok()
-            && let Some(sas_token) = sas_token.strip_prefix('?')
+        // Validate versioning parameter early
+        if let Some(versioning) = params.parameters.get("versioning").expose().ok()
+            && !matches!(versioning, "enabled" | "disabled")
         {
+            tracing::warn!(
+                "Invalid Azure versioning setting '{versioning}'. Defaulting to 'disabled'."
+            );
             params
                 .parameters
-                .insert("sas_string".to_string(), sas_token.to_string().into());
+                .insert("versioning".to_string(), "disabled".to_string().into());
         }
 
         Box::pin(async move {
-            if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
-                if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-                    return Err(Box::new(Error::InvalidEndpoint {
-                        endpoint: endpoint.to_string(),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-
-                if endpoint.starts_with("http://")
-                    && params.parameters.get("allow_http").expose().ok() != Some("true")
-                {
-                    return Err(Box::new(Error::InsecureEndpointWithoutAllowHTTP {
-                        endpoint: endpoint.to_string(),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
+            // Run all validators
+            for validator in VALIDATORS.iter() {
+                validator.validate(&mut params).await?;
             }
 
-            let access_key = params.parameters.get("access_key").expose().ok();
-            let bearer_token = params.parameters.get("bearer_token").expose().ok();
-            let sas_string = params.parameters.get("sas_string").expose().ok();
-            let skip_signature = params.parameters.get("skip_signature").expose().ok();
-            let use_emulator = params.parameters.get("use_emulator").expose().ok();
-
-            let use_emulator = use_emulator.is_some_and(|b| b.parse::<bool>().unwrap_or(false));
-
-            if use_emulator {
-                let azure = AzureBlobFS {
-                    params: params.parameters,
-                    tokio_io_runtime: params.io_runtime,
-                };
-                Ok(Arc::new(azure) as Arc<dyn DataConnector>)
-            } else {
-                let conflicting = [
-                    access_key.is_some(),
-                    bearer_token.is_some(),
-                    sas_string.is_some(),
-                    skip_signature.is_some(),
-                ];
-                if conflicting.iter().filter(|b| **b).count() > 1 {
-                    Err(Box::new(Error::InvalidKeyAuthCombination)
-                        as Box<dyn std::error::Error + Send + Sync>)
-                } else {
-                    let azure = AzureBlobFS {
-                        params: params.parameters,
-                        tokio_io_runtime: params.io_runtime,
-                    };
-                    Ok(Arc::new(azure) as Arc<dyn DataConnector>)
-                }
-            }
+            let azure = AzureBlobFS {
+                params: params.parameters,
+                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                tokio_io_runtime: params.io_runtime,
+            };
+            Ok(Arc::new(azure) as Arc<dyn DataConnector>)
         })
     }
 
     fn prefix(&self) -> &'static str {
-        "abfs"
+        PREFIX
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -245,11 +247,19 @@ impl DataConnectorFactory for AzureBlobFSFactory {
 
 impl std::fmt::Display for AzureBlobFS {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "abfs")
+        write!(f, "{PREFIX}")
     }
 }
 
 impl ListingTableConnector for AzureBlobFS {
+    fn object_versioning_type(&self) -> Option<ObjectVersionType> {
+        if self.params.get("versioning").expose().ok() != Some("enabled") {
+            return None;
+        }
+
+        Some(ObjectVersionType::Version)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -274,7 +284,7 @@ impl ListingTableConnector for AzureBlobFS {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
+                    message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 
@@ -307,11 +317,167 @@ impl ListingTableConnector for AzureBlobFS {
                 "use_cli",
                 "skip_signature",
                 "disable_tagging",
+                "client_timeout",
             ],
         );
         azure_url.set_fragment(Some(&params));
         Ok(azure_url)
     }
+
+    fn get_runtime(&self) -> Option<Runtime> {
+        self.runtime.clone()
+    }
+
+    fn handle_object_store_error(
+        &self,
+        dataset: &Dataset,
+        error: object_store::Error,
+    ) -> DataConnectorError {
+        match error {
+            object_store::Error::Generic { source, .. } => {
+                // Try to provide more specific error messages based on auth method
+                let has_msi = self.params.get("msi_endpoint").expose().ok().is_some();
+                let has_use_cli = self
+                    .params
+                    .get("use_cli")
+                    .expose()
+                    .ok()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+                let has_client_creds = self.params.get("client_id").expose().ok().is_some();
+                let has_sas = self.params.get("sas_string").expose().ok().is_some();
+
+                if has_msi || has_use_cli {
+                    let err = Error::ManagedIdentityAuthenticationFailed { source };
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: format!("{self}"),
+                        message: format!("{err}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: err.into(),
+                    }
+                } else if has_client_creds {
+                    let err = Error::ClientCredentialsAuthenticationFailed { source };
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: format!("{self}"),
+                        message: format!("{err}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: err.into(),
+                    }
+                } else if has_sas {
+                    let err = Error::SasAuthenticationFailed { source };
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: format!("{self}"),
+                        message: format!("{err}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: err.into(),
+                    }
+                } else {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source,
+                    }
+                }
+            }
+            error => DataConnectorError::UnableToConnectInternal {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: error.into(),
+            },
+        }
+    }
 }
 
 register_data_connector!("abfs", AzureBlobFSFactory);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataconnector::listing::ListingTableConnector;
+    use crate::parameters::ParameterSpec;
+    use datafusion::parquet::arrow::async_reader::ObjectVersionType;
+    use datafusion_table_providers::util::secrets::to_secret_map;
+    use std::collections::HashMap;
+
+    const TEST_PARAMETERS: &[ParameterSpec] = &[
+        ParameterSpec::component("account").secret(),
+        ParameterSpec::component("versioning").default("disabled"),
+        ParameterSpec::component("use_cli").is_boolean(),
+        ParameterSpec::component("msi_endpoint").secret(),
+        ParameterSpec::component("client_id").secret(),
+        ParameterSpec::component("sas_string").secret(),
+    ];
+
+    fn create_test_connector(
+        params: HashMap<String, String>,
+        handle: tokio::runtime::Handle,
+    ) -> AzureBlobFS {
+        AzureBlobFS {
+            params: Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                "abfs",
+                TEST_PARAMETERS,
+            ),
+            runtime: None,
+            tokio_io_runtime: handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_object_versioning_type_disabled_by_default() {
+        let connector = create_test_connector(HashMap::new(), tokio::runtime::Handle::current());
+        assert!(connector.object_versioning_type().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_object_versioning_type_explicitly_disabled() {
+        let connector = create_test_connector(
+            [("versioning".to_string(), "disabled".to_string())].into(),
+            tokio::runtime::Handle::current(),
+        );
+        assert!(connector.object_versioning_type().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_object_versioning_type_enabled() {
+        let connector = create_test_connector(
+            [("versioning".to_string(), "enabled".to_string())].into(),
+            tokio::runtime::Handle::current(),
+        );
+        assert_eq!(
+            connector.object_versioning_type(),
+            Some(ObjectVersionType::Version)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_display_format() {
+        let connector = create_test_connector(HashMap::new(), tokio::runtime::Handle::current());
+        assert_eq!(format!("{connector}"), "abfs");
+    }
+
+    #[tokio::test]
+    async fn test_get_runtime_returns_none_when_not_set() {
+        let connector = create_test_connector(HashMap::new(), tokio::runtime::Handle::current());
+        assert!(connector.get_runtime().is_none());
+    }
+
+    #[test]
+    fn test_factory_prefix() {
+        let factory = AzureBlobFSFactory::new();
+        assert_eq!(factory.prefix(), "abfs");
+    }
+
+    #[test]
+    fn test_factory_parameters_includes_versioning() {
+        let factory = AzureBlobFSFactory::new();
+        let params = factory.parameters();
+        assert!(params.iter().any(|p| p.name == "versioning"));
+    }
+
+    #[test]
+    fn test_factory_parameters_includes_client_timeout() {
+        let factory = AzureBlobFSFactory::new();
+        let params = factory.parameters();
+        assert!(params.iter().any(|p| p.name == "client_timeout"));
+    }
+}

@@ -19,9 +19,11 @@ use async_openai::{
     Client as OpenAIClient,
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateEmbeddingRequest,
-        EncodingFormat,
+        chat::{
+            ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
+            CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        },
+        embeddings::{CreateEmbeddingRequest, EmbeddingInput, EncodingFormat},
     },
 };
 use reqwest::Client;
@@ -167,7 +169,7 @@ impl HttpComponent {
                         }
                         Err(_) => CreateEmbeddingRequest {
                             model: embedding.clone(),
-                            input: async_openai::types::EmbeddingInput::String(payload.to_string()),
+                            input: EmbeddingInput::String(payload.to_string()),
                             encoding_format: Some(EncodingFormat::Float),
                             user: None,
                             dimensions: None,

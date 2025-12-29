@@ -84,8 +84,12 @@ arrow-ipc = "56.0.0"
 arrow-json = "56.0.0"
 arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13ac969eea8bef7b496a2ba334ebd4e6e06" }
 arrow-schema = "56.0.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "afaaba87a10e48853e59c809bf296aefbb08c9bd", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "1a56314792cea0bda8854d82c456a6d1a607b191", features = [
     "byot",
+    "embedding",
+    "chat-completion",
+    "responses",
+    "model",
 ] }
 async-stream = "0.3.5"
 async-trait = "0.1.89"

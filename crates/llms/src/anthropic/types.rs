@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{error::OpenAIError, types::ChatCompletionTool};
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{ChatCompletionTool, ChatCompletionTools},
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -265,6 +268,14 @@ impl From<&ChatCompletionTool> for ToolParam {
                 }
             )),
         }
+    }
+}
+
+/// Converts a `ChatCompletionTools` enum to a `ToolParam`, returning `None` for custom tools.
+pub fn tool_from_completion_tools(val: &ChatCompletionTools) -> Option<ToolParam> {
+    match val {
+        ChatCompletionTools::Function(tool) => Some(ToolParam::from(tool)),
+        ChatCompletionTools::Custom(_) => None,
     }
 }
 

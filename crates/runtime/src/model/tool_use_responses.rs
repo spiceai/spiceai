@@ -16,14 +16,12 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::{
-        CompletionTokensDetails, PromptTokensDetails,
-        responses::{
-            CodeInterpreter, CodeInterpreterContainer, CodeInterpreterContainerKind,
-            CreateResponse, Function, FunctionCall, Input, InputContent, InputItem, InputMessage,
-            InputMessageType, OutputContent, OutputItem, Response, ResponseEvent, ResponseStream,
-            Role, ToolChoice, ToolChoiceMode, ToolDefinition, Usage, WebSearchPreview,
-        },
+    types::responses::{
+        CodeInterpreterTool, CreateResponse, EasyInputContent, EasyInputMessage,
+        FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem,
+        InputParam, InputTokenDetails, Item, MessageType, OutputItem, OutputTokenDetails, Response,
+        ResponseStream, ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition,
+        ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
     },
 };
 use async_trait::async_trait;
@@ -41,7 +39,7 @@ use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
-use crate::model::tool_use::{combine_opt_u32, encode_tool_name};
+use crate::model::tool_use::encode_tool_name;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Clone, Debug)]
@@ -54,16 +52,11 @@ impl From<OpenAIResponsesTools> for ToolDefinition {
     fn from(tool: OpenAIResponsesTools) -> Self {
         match tool {
             OpenAIResponsesTools::CodeInterpreter => {
-                ToolDefinition::CodeInterpreter(CodeInterpreter {
-                    container: CodeInterpreterContainer::Container(
-                        CodeInterpreterContainerKind::Auto { file_ids: None },
-                    ),
-                })
+                ToolDefinition::CodeInterpreter(CodeInterpreterTool::default())
             }
-            OpenAIResponsesTools::WebSearch => ToolDefinition::WebSearchPreview(WebSearchPreview {
-                search_context_size: None,
-                user_location: None,
-            }),
+            OpenAIResponsesTools::WebSearch => {
+                ToolDefinition::WebSearchPreview(WebSearchTool::default())
+            }
         }
     }
 }
@@ -106,14 +99,7 @@ impl ToolUsingResponses {
     }
 
     fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
-        let existing_items = match req.input.clone() {
-            Input::Text(input) => vec![InputItem::Message(InputMessage {
-                content: InputContent::TextInput(input),
-                kind: InputMessageType::default(),
-                role: Role::User,
-            })],
-            Input::Items(items) => items,
-        };
+        let existing_items = to_input_item(req.input.clone());
 
         let openai_tool_definitions: Vec<ToolDefinition> = self
             .openai_tools
@@ -123,7 +109,7 @@ impl ToolUsingResponses {
             .collect();
         req.tools = Some(openai_tool_definitions);
 
-        req.input = Input::Items(existing_items);
+        req.input = InputParam::Items(existing_items);
 
         req
     }
@@ -133,40 +119,51 @@ impl ToolUsingResponses {
         self.tools
             .iter()
             .map(|t| {
-                ToolDefinition::Function(Function {
-                    strict: t.strict().unwrap_or(false),
+                ToolDefinition::Function(FunctionTool {
+                    strict: t.strict(),
                     name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
-                    parameters: t
-                        .parameters()
-                        .map(|mut params| {
-                            if let Value::Object(ref mut obj) = params {
-                                obj.insert("additionalProperties".to_string(), Value::Bool(false));
-                            }
-                            params
-                        })
-                        .unwrap_or(json!({})),
+                    parameters: Some(
+                        t.parameters()
+                            .map(|mut params| {
+                                if let Value::Object(ref mut obj) = params {
+                                    obj.insert(
+                                        "additionalProperties".to_string(),
+                                        Value::Bool(false),
+                                    );
+                                }
+                                params
+                            })
+                            .unwrap_or(json!({})),
+                    ),
                 })
             })
             .collect()
     }
 
-    fn as_spiced_tool(&self, t: &FunctionCall) -> Option<Arc<dyn SpiceModelTool>> {
+    // This is a bad function name. Its more like `find_spiced_tool`.
+    fn as_spiced_tool(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         self.tools
             .iter()
-            .find(|tool| encode_tool_name(tool.name().as_ref()) == t.name)
+            .find(|tool| encode_tool_name(tool.name().as_ref()) == name)
             .cloned()
     }
 
-    async fn call_tool(&self, tool_call: &FunctionCall) -> Value {
-        match self.as_spiced_tool(tool_call) {
-            Some(t) => match t.call(&tool_call.arguments).await {
+    async fn call_tool(&self, tool_call: &FunctionToolCall) -> Value {
+        let FunctionToolCall {
+            name,
+            arguments,
+            id,
+            ..
+        } = tool_call;
+        match self.as_spiced_tool(name) {
+            Some(t) => match t.call(arguments).await {
                 Ok(v) => {
                     tracing::info!(
                         target: "task_history",
                         progress = Progress::log()
-                            .id(tool_call.id.clone())
-                            .title(format!("'{}' tool completed successfully", tool_call.name))
+                            .id(id.clone())
+                            .title(format!("'{name}' tool completed successfully"))
                             .json_content(v.clone())
                             .to_jsonl(),
                     );
@@ -176,8 +173,8 @@ impl ToolUsingResponses {
                     tracing::info!(
                         target: "task_history",
                         progress = Progress::error()
-                            .id(tool_call.id.clone())
-                            .title(format!("'{}' tool completed unsuccessfully", tool_call.name))
+                            .id(id.clone())
+                            .title(format!("'{name}' tool completed unsuccessfully"))
                             .content(e.to_string())
                             .to_jsonl(),
                     );
@@ -191,13 +188,11 @@ impl ToolUsingResponses {
                 // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
                 if cfg!(feature = "dev") {
                     panic!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.name
+                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible."
                     );
                 } else {
                     tracing::warn!(
-                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
-                        tool_call.name
+                        "Tool '{name}' was provided to LLM, but now no longer exists. This should not be possible.",
                     );
                     Value::Null
                 }
@@ -208,11 +203,11 @@ impl ToolUsingResponses {
     async fn process_tool_calls_and_run_spice_tools(
         &self,
         original_messages: Vec<InputItem>,
-        requested_tools: Vec<FunctionCall>,
+        requested_tools: Vec<FunctionToolCall>,
     ) -> Result<Option<Vec<InputItem>>, OpenAIError> {
         let spiced_tools = requested_tools
             .iter()
-            .filter(|&t| self.as_spiced_tool(t).is_some())
+            .filter(|&t| self.as_spiced_tool(&t.name).is_some())
             .cloned()
             .collect_vec();
 
@@ -237,25 +232,27 @@ impl ToolUsingResponses {
         }
 
         // Tell model the assistant used these tools, and provided result.
-        let mut tool_messages: Vec<Value> = vec![];
-        for (tool_call, response_content) in &tool_and_response_content {
-            // Add the function call
-            tool_messages.push(json!({
-                "type": "function_call",
-                "call_id": tool_call.id.clone(),
-                "name": tool_call.name.clone(),
-                "arguments": tool_call.arguments.clone()
-            }));
-            // Add the function call output
-            tool_messages.push(json!({
-                "type": "function_call_output",
-                "call_id": tool_call.id.clone(),
-                "output": serde_json::to_string(&response_content).unwrap_or("Error calling tool.".to_string())
-            }));
-        }
-
         let mut messages = original_messages.clone();
-        messages.extend(tool_messages.into_iter().map(InputItem::Custom));
+        for (tool_call, response_content) in &tool_and_response_content {
+            messages.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                arguments: tool_call.arguments.clone(),
+                call_id: tool_call.id.clone().unwrap_or_default(),
+                name: tool_call.name.clone(),
+                id: Some(tool_call.name.clone()),
+                status: None,
+            })));
+            messages.push(InputItem::Item(Item::FunctionCallOutput(
+                FunctionCallOutputItemParam {
+                    call_id: tool_call.id.clone().unwrap_or_default(),
+                    output: FunctionCallOutput::Text(
+                        serde_json::to_string(&response_content)
+                            .unwrap_or("Error calling tool.".to_string()),
+                    ),
+                    id: Some(tool_call.name.clone()),
+                    status: None,
+                },
+            )));
+        }
 
         if !messages.is_empty() {
             let used_tools = spiced_tools.len();
@@ -278,7 +275,7 @@ impl ToolUsingResponses {
             if req
                 .tool_choice
                 .as_ref()
-                .is_some_and(|t| matches!(t, ToolChoice::Mode(ToolChoiceMode::None)))
+                .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
             {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return self.inner_responses.responses_request(req).await;
@@ -306,7 +303,7 @@ impl ToolUsingResponses {
                 .iter()
                 .cloned()
                 .filter_map(|c| match c {
-                    OutputContent::FunctionCall(t) => Some(t),
+                    OutputItem::FunctionCall(t) => Some(t),
                     _ => None,
                 })
                 .collect_vec();
@@ -342,7 +339,7 @@ impl ToolUsingResponses {
             if req
                 .tool_choice
                 .as_ref()
-                .is_some_and(|t| matches!(t, ToolChoice::Mode(ToolChoiceMode::None)))
+                .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
             {
                 tracing::debug!("User asked for no tools, calling inner responses model");
                 return self.inner_responses.responses_stream(req).await;
@@ -416,11 +413,11 @@ impl Responses for ToolUsingResponses {
 }
 
 struct CustomResponseStream {
-    receiver: mpsc::Receiver<Result<ResponseEvent, OpenAIError>>,
+    receiver: mpsc::Receiver<Result<ResponseStreamEvent, OpenAIError>>,
 }
 
 impl Stream for CustomResponseStream {
-    type Item = Result<ResponseEvent, OpenAIError>;
+    type Item = Result<ResponseStreamEvent, OpenAIError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)
@@ -440,9 +437,9 @@ fn make_responses_stream(
     tokio::spawn(
         request_context
             .scope(async move {
-                let function_call_builders: Arc<Mutex<HashMap<String, FunctionCall>>> =
+                let function_call_builders: Arc<Mutex<HashMap<String, FunctionToolCall>>> =
                     Arc::new(Mutex::new(HashMap::new()));
-                let ready_to_call_functions: Arc<Mutex<Vec<FunctionCall>>> =
+                let ready_to_call_functions: Arc<Mutex<Vec<FunctionToolCall>>> =
                     Arc::new(Mutex::new(Vec::new()));
 
                 let mut captured_output = String::new();
@@ -464,10 +461,10 @@ fn make_responses_stream(
                     let mut should_process_tools = false;
 
                     match &response_event {
-                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                             captured_output.push_str(&delta.delta);
                         }
-                        ResponseEvent::ResponseOutputItemAdded(item_added) => {
+                        ResponseStreamEvent::ResponseOutputItemAdded(item_added) => {
                             if let OutputItem::FunctionCall(function_call) = &item_added.item {
                                 let function_call_builders_clone =
                                     Arc::clone(&function_call_builders);
@@ -477,11 +474,11 @@ fn make_responses_stream(
                                 };
 
                                 builders_lock
-                                    .insert(function_call.id.clone(), function_call.clone());
+                                    .insert(function_call.call_id.clone(), function_call.clone());
                                 should_forward = false;
                             }
                         }
-                        ResponseEvent::ResponseFunctionCallArgumentsDelta(delta) => {
+                        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
                             let function_call_builders_clone = Arc::clone(&function_call_builders);
                             let Ok(mut builders_lock) = function_call_builders_clone.lock() else {
                                 return;
@@ -491,7 +488,7 @@ fn make_responses_stream(
                                 state.arguments.push_str(&delta.delta);
                             }
                         }
-                        ResponseEvent::ResponseFunctionCallArgumentsDone(done) => {
+                        ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done) => {
                             let function_call_builders_clone = Arc::clone(&function_call_builders);
                             let Ok(builders_lock) = function_call_builders_clone.lock() else {
                                 return;
@@ -506,7 +503,7 @@ fn make_responses_stream(
                                 ready_to_call_lock.push(function_call.clone());
                             }
                         }
-                        ResponseEvent::ResponseOutputItemDone(item_done) => {
+                        ResponseStreamEvent::ResponseOutputItemDone(item_done) => {
                             // When an output item (like a function call) is done, just note it but don't process tools yet
                             // Tool processing will happen when the entire response is complete
                             if let OutputItem::FunctionCall(function_call) = &item_done.item {
@@ -521,7 +518,9 @@ fn make_responses_stream(
                                     ready_to_call_lock
                                         .iter()
                                         .find(|call| call.id == function_call.id)
-                                        .is_some_and(|call| model.as_spiced_tool(call).is_some())
+                                        .is_some_and(|call| {
+                                            model.as_spiced_tool(&call.name).is_some()
+                                        })
                                 };
 
                                 if spice_tool_found {
@@ -531,8 +530,8 @@ fn make_responses_stream(
                                 }
                             }
                         }
-                        ResponseEvent::ResponseCompleted(_)
-                        | ResponseEvent::ResponseIncomplete(_) => {
+                        ResponseStreamEvent::ResponseCompleted(_)
+                        | ResponseStreamEvent::ResponseIncomplete(_) => {
                             // Only process tools if we haven't already done so and there are spice tools
                             if !should_process_tools {
                                 let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
@@ -543,7 +542,7 @@ fn make_responses_stream(
 
                                     ready_to_call_lock
                                         .iter()
-                                        .any(|call| model.as_spiced_tool(call).is_some())
+                                        .any(|call| model.as_spiced_tool(&call.name).is_some())
                                 };
 
                                 if has_spice_tools {
@@ -558,14 +557,14 @@ fn make_responses_stream(
                     // Process completed spiced tool calls when response is complete
                     if should_process_tools {
                         let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
-                        let spice_tools: Vec<FunctionCall> = {
+                        let spice_tools: Vec<FunctionToolCall> = {
                             let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
                                 return;
                             };
 
                             ready_to_call_lock
                                 .iter()
-                                .filter(|call| model.as_spiced_tool(call).is_some())
+                                .filter(|call| model.as_spiced_tool(&call.name).is_some())
                                 .cloned()
                                 .collect()
                         }; // Lock is dropped here
@@ -672,20 +671,20 @@ fn get_tool_name(tool: &ToolDefinition) -> &str {
 fn create_new_recursive_req(
     req: &CreateResponse,
     new_msg: Vec<InputItem>,
-    marginal_usage: Option<&Usage>,
+    marginal_usage: Option<&ResponseUsage>,
 ) -> CreateResponse {
     let mut new_req = req.clone();
-    new_req.input = Input::Items(new_msg);
+    new_req.input = InputParam::Items(new_msg);
 
     // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
     // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
     if matches!(
         new_req.tool_choice,
-        Some(ToolChoice::Function { .. }) | None
+        Some(ToolChoiceParam::Function(ToolChoiceFunction { .. })) | None
     ) {
         // Auto is default when tools exist.
         tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
-        new_req.tool_choice = Some(ToolChoice::Mode(ToolChoiceMode::Auto));
+        new_req.tool_choice = Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
     }
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
@@ -698,62 +697,37 @@ fn create_new_recursive_req(
     new_req
 }
 
-fn to_input_item(input: Input) -> Vec<InputItem> {
+fn to_input_item(input: InputParam) -> Vec<InputItem> {
     match input {
-        Input::Text(text) => vec![InputItem::Message(InputMessage {
-            content: InputContent::TextInput(text),
-            kind: InputMessageType::default(),
+        InputParam::Text(text) => vec![InputItem::EasyMessage(EasyInputMessage {
+            content: EasyInputContent::Text(text),
             role: Role::User,
+            r#type: MessageType::Message,
         })],
-        Input::Items(items) => items,
+        InputParam::Items(items) => items,
     }
 }
 
-pub fn combine_usage(u1: Option<Usage>, u2: Option<Usage>) -> Option<Usage> {
+pub fn combine_usage(
+    u1: Option<ResponseUsage>,
+    u2: Option<ResponseUsage>,
+) -> Option<ResponseUsage> {
     match (u1, u2) {
-        (Some(u1), Some(u2)) => Some(Usage {
+        (Some(u1), Some(u2)) => Some(ResponseUsage {
             input_tokens: u1.input_tokens + u2.input_tokens,
-            input_tokens_details: combine_token_details(
-                &u1.input_tokens_details,
-                &u2.input_tokens_details,
-            ),
+            input_tokens_details: InputTokenDetails {
+                cached_tokens: u1.input_tokens_details.cached_tokens
+                    + u2.input_tokens_details.cached_tokens,
+            },
             output_tokens: u1.output_tokens + u2.output_tokens,
-            output_tokens_details: combine_completion_token_details(
-                &u1.output_tokens_details,
-                &u2.output_tokens_details,
-            ),
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: u1.output_tokens_details.reasoning_tokens
+                    + u2.output_tokens_details.reasoning_tokens,
+            },
             total_tokens: u1.total_tokens + u2.total_tokens,
         }),
         (Some(u1), None) => Some(u1),
         (None, Some(u2)) => Some(u2),
         (None, None) => None,
-    }
-}
-
-pub fn combine_token_details(
-    a: &PromptTokensDetails,
-    b: &PromptTokensDetails,
-) -> PromptTokensDetails {
-    PromptTokensDetails {
-        audio_tokens: combine_opt_u32(a.audio_tokens, b.audio_tokens),
-        cached_tokens: combine_opt_u32(a.cached_tokens, b.cached_tokens),
-    }
-}
-
-pub fn combine_completion_token_details(
-    a: &CompletionTokensDetails,
-    b: &CompletionTokensDetails,
-) -> CompletionTokensDetails {
-    CompletionTokensDetails {
-        accepted_prediction_tokens: combine_opt_u32(
-            a.accepted_prediction_tokens,
-            b.accepted_prediction_tokens,
-        ),
-        audio_tokens: combine_opt_u32(a.audio_tokens, b.audio_tokens),
-        reasoning_tokens: combine_opt_u32(a.reasoning_tokens, b.reasoning_tokens),
-        rejected_prediction_tokens: combine_opt_u32(
-            a.rejected_prediction_tokens,
-            b.rejected_prediction_tokens,
-        ),
     }
 }

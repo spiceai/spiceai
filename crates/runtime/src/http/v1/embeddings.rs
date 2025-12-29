@@ -17,9 +17,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::model::EmbeddingModelStore;
-use async_openai::types::CreateEmbeddingRequest;
+use async_openai::types::embeddings::CreateEmbeddingRequest;
 #[cfg(feature = "openapi")]
-use async_openai::types::CreateEmbeddingResponse;
+use async_openai::types::embeddings::CreateEmbeddingResponse;
 use axum::{
     Extension, Json,
     http::StatusCode,

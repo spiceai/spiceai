@@ -29,7 +29,7 @@ limitations under the License.
 
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
