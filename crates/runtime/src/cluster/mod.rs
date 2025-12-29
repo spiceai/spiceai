@@ -63,9 +63,6 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use url::Url;
 use uuid::Uuid;
 
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
-
 pub mod datafusion;
 mod servers;
 mod service;
@@ -166,7 +163,7 @@ impl ResolvedClusterConfig {
             if tls_config.is_none() && !config.insecure_node {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mode without mTLS requires --insecure-node. Specify all of: --node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file or pass --insecure-node",
+                    "Cluster mode requires mTLS configuration unless --insecure-node is specified. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --insecure-node to skip mTLS.",
                 ));
             }
             if config.node_advertise_address.is_none() {
@@ -344,11 +341,11 @@ pub async fn initialize_cluster_executor(
     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
         scheduler_endpoint
             .tls_config(tls_config)
-            .boxed()
             .context(FailedToStartClusterExecutorSnafu)?
     } else {
         scheduler_endpoint
     };
+    let scheduler_endpoint = scheduler_endpoint.boxed();
 
     let scheduler_connection =
         scheduler_endpoint
@@ -501,6 +498,9 @@ pub async fn initialize_cluster_executor(
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+    type SchedulerEndpointOverride =
+        Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+
     let bind_addr = rt.df.cluster_config.node_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
@@ -574,9 +574,11 @@ async fn create_cluster_service_client(
     if let Some(tls_config) = client_tls_config {
         endpoint = endpoint
             .tls_config(tls_config)
-            .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
     }
+    let endpoint = endpoint
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
 
     let channel = endpoint
         .connect()
