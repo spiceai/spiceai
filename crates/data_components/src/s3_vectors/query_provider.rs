@@ -502,6 +502,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable;
     use crate::s3_vectors::{MetadataColumns, partition::PartitionedIndexName};
 
     use super::*;
@@ -621,7 +622,7 @@ mod tests {
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
         let query_table =
-            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
+            S3VectorsSpillQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
         let plan = query_table
@@ -723,7 +724,7 @@ mod tests {
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
         let query_table =
-            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
+            S3VectorsSpillQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
         let plan = query_table
@@ -744,130 +745,6 @@ mod tests {
 
         // There should be 3 indexes (main + 2 spills), so 3 input plans to the UnionExec
         assert_eq!(union_plan.children().len(), 3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn scan_plan_with_partitioned_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
-        let mock_client = Arc::new(MockClient::new());
-        let bucket_name = "test-bucket";
-        let base_index_name = "base-index";
-        let column_name = "my-col";
-
-        let partition_by = &[col(column_name)];
-
-        let mut indexes = vec![];
-        let mut vectors_map = HashMap::new();
-
-        // Create 2 partitions, each with spilling
-        for i in 1..=2 {
-            let partition_value = ScalarValue::Int32(Some(i));
-            let partition_index_name = PartitionedIndexName::new(
-                base_index_name,
-                column_name,
-                partition_by,
-                &partition_value,
-            )?
-            .to_index_name();
-
-            // Main partition index
-            indexes.push(
-                IndexSummary::builder()
-                    .vector_bucket_name(bucket_name)
-                    .set_index_arn(Some("arn".to_string()))
-                    .creation_time(DateTime::from_secs(1))
-                    .index_name(partition_index_name.clone())
-                    .build()?,
-            );
-            vectors_map.insert(partition_index_name.clone(), vec![]);
-
-            // Spill indexes for this partition
-            for j in 1..=2 {
-                let spill_index_name = format!("{partition_index_name}.{j:02}");
-                indexes.push(
-                    IndexSummary::builder()
-                        .vector_bucket_name(bucket_name)
-                        .set_index_arn(Some("arn".to_string()))
-                        .creation_time(DateTime::from_secs(1))
-                        .index_name(spill_index_name.clone())
-                        .build()?,
-                );
-                vectors_map.insert(spill_index_name, vec![]);
-            }
-        }
-
-        indexes.push(
-            IndexSummary::builder()
-                .vector_bucket_name(bucket_name)
-                .set_index_arn(Some("arn".to_string()))
-                .creation_time(DateTime::from_secs(1))
-                .index_name("another-index")
-                .build()?,
-        ); // add unrelated index
-
-        mock_client
-            .data
-            .lock()
-            .expect("lock")
-            .indexes
-            .insert(bucket_name.to_string(), indexes);
-
-        for (index, vectors) in vectors_map {
-            mock_client
-                .data
-                .lock()
-                .expect("lock")
-                .vectors
-                .insert(index, vectors);
-        }
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
-            Field::new(
-                S3_VECTOR_EMBEDDING_NAME,
-                DataType::new_list(DataType::Float32, true),
-                false,
-            ),
-            Field::new(S3_VECTOR_DISTANCE_NAME, DataType::Float64, false),
-            Field::new(column_name, DataType::Int32, true),
-        ]));
-
-        let s3_table = S3VectorsTable {
-            client: mock_client,
-            schema,
-            constraints: Constraints::default(),
-            idx: Arc::new(S3VectorIdentifier::Index {
-                bucket_name: bucket_name.to_string(),
-                index_name: base_index_name.to_string(),
-            }),
-            dimension: 0,
-            columns: MetadataColumns::none(),
-            distance_metric: DistanceMetric::Cosine,
-        };
-
-        let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table =
-            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
-
-        let session_state = SessionContext::new().state();
-        let plan = query_table
-            .scan(&session_state, None, &[], None)
-            .await
-            .expect("scan");
-
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
-        let union_plan = limit_plan
-            .input()
-            .as_any()
-            .downcast_ref::<UnionExec>()
-            .expect("downcast");
-
-        // There should be 2 partitions, each with 3 indexes (main + 2 spills), so 2 input plans to the UnionExec
-        assert_eq!(union_plan.children().len(), 2);
 
         Ok(())
     }

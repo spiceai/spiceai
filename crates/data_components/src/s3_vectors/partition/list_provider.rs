@@ -118,7 +118,11 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
-        logical_expr::col, physical_plan::union::UnionExec, prelude::SessionContext,
+        logical_expr::col,
+        physical_plan::{
+            display::DisplayableExecutionPlan, limit::GlobalLimitExec, union::UnionExec,
+        },
+        prelude::SessionContext,
         scalar::ScalarValue,
     };
     use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
@@ -218,7 +222,15 @@ mod tests {
             .expect("scan");
 
         // The plan should be a UnionExec
-        let union_plan = plan.as_any().downcast_ref::<UnionExec>().expect("downcast");
+        let global_limit_plan = plan
+            .as_any()
+            .downcast_ref::<GlobalLimitExec>()
+            .expect("downcast");
+        let union_plan = global_limit_plan
+            .input()
+            .as_any()
+            .downcast_ref::<UnionExec>()
+            .expect("downcast");
 
         // There should be 2 partitions, so 2 input plans to the UnionExec
         assert_eq!(union_plan.children().len(), 2);

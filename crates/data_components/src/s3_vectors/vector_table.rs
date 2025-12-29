@@ -530,12 +530,13 @@ impl S3VectorsTable {
                     ) {
                         // Increment spill index and try to create a new index
                         if let Some(ref spill) = spill_index {
-                            current_index = next_index(&current_index, spill)?;
+                            current_index = next_index(&self.idx, spill)?;
                         }
+
                         Self::create_index(
                             &self.client,
                             self.dimension,
-                            &current_index,
+                            &self.idx,
                             self.columns.non_filterable_names(),
                             &self.distance_metric,
                         )
@@ -771,15 +772,22 @@ mod tests {
             )
             .await?;
 
+        let spill_index = Arc::new(AtomicU8::new(0));
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors, None).await;
-        result.expect("Should write without error");
+        table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await
+            .expect("Should write without error");
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors, None).await;
-        result.expect("Should write without error");
+        table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await
+            .expect("Should write without error");
         let vectors = create_test_vectors(3);
-        let result = table.write_chunk_with_spilling(&vectors, None).await;
-        result.expect("Should write without error");
+        table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await
+            .expect("Should write without error");
 
         assert_eq!(mock_client.get_vector_count("test-index"), 3);
         assert_eq!(mock_client.get_vector_count("test-index.01"), 3);
@@ -825,13 +833,18 @@ mod tests {
             )
             .await?;
 
+        let spill_index = Arc::new(AtomicU8::new(0));
         for _ in 0..100 {
             let vectors = create_test_vectors(1);
-            table.write_chunk_with_spilling(&vectors, None).await?;
+            table
+                .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+                .await?;
         }
 
         let vectors = create_test_vectors(1);
-        let result = table.write_chunk_with_spilling(&vectors, None).await;
+        let result = table
+            .write_chunk_with_spilling(&vectors, Some(Arc::clone(&spill_index)))
+            .await;
 
         assert!(result.is_err());
 
