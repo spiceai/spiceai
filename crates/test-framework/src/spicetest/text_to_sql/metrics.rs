@@ -156,7 +156,7 @@ impl ExtendedMetrics for TextToSqlRunMetric {
             BuilderTarget::Float64(("median_latency_ms".to_string(), self.median_latency_ms)),
             BuilderTarget::Float64(("avg_attempts".to_string(), self.avg_attempts)),
             BuilderTarget::Float64(("exact_match_rate".to_string(), self.exact_match_rate)),
-            BuilderTarget::Float64(("error_rate".to_string(), self.exact_match_rate)),
+            BuilderTarget::Float64(("error_rate".to_string(), self.error_rate)),
         ])
     }
 }
