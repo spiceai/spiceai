@@ -74,7 +74,7 @@ impl TestType {
             TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
             TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
             TestType::Search => "testoperator_run_search.yml",
-            TestType::TextToSql => "testoperator_run_text_to_sql.yml",
+            TestType::TextToSql => "testoperator_run_texttosql.yml",
         }
     }
 }
