@@ -207,6 +207,13 @@ pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(||
         .with_unit("ratio")
         .build()
 });
+pub static TEXT_TO_SQL_ERROR_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_error_rate")
+        .with_description("The rate at which a text-to-SQL operation returns an error externally")
+        .with_unit("ratio")
+        .build()
+});
 
 // Spiced runtime metrics (scraped from /metrics endpoint)
 

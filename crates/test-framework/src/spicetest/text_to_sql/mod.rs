@@ -158,7 +158,7 @@ impl SpiceTest<Completed> {
             .state
             .results
             .values()
-            .map(|result| u8::from(result.is_error) as f64)
+            .map(|result| f64::from(result.is_error))
             .sum();
 
         #[expect(clippy::cast_precision_loss)]
