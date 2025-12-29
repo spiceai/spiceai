@@ -96,9 +96,9 @@ async-trait = "0.1.89"
 aws-config = "1.8.12"
 aws-credential-types = "1.2.10"
 aws-runtime = "1.5.16"
-aws-sdk-bedrockruntime = "1.117.0"
+aws-sdk-bedrockruntime = "1.120.0"
 aws-sdk-cognitoidentity = "1.91.0"
-aws-sdk-cognitoidentityprovider = "1.104.0"
+aws-sdk-cognitoidentityprovider = "1.105.0"
 aws-sdk-dynamodb = "1.100.0"
 aws-sdk-dynamodbstreams = "1.87.0"
 aws-sdk-glue = "1.132.0"
@@ -285,7 +285,7 @@ tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.30"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 turso = "0.3.0"
 twox-hash = "2.1.2"
 url = "2.5"
