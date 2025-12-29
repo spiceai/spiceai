@@ -15,7 +15,11 @@ limitations under the License.
 */
 
 use crate::{
-    component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect, register_data_connector,
+    component::dataset::Dataset,
+    component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
+    component::ComponentType,
+    datafusion::dialect::new_duckdb_dialect,
+    register_data_connector,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -24,8 +28,11 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
-use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::{
+    DuckDBPoolMetrics, DuckDbConnectionPool,
+};
 use duckdb::AccessMode;
+use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -175,6 +182,66 @@ impl DataConnector for DuckDB {
                 dataconnector: "duckdb",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(DuckDBMetricsProvider::new(
+            self.duckdb_factory.conn_pool_metrics(),
+        )))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DuckDBMetricsProvider {
+    metrics: DuckDBPoolMetrics,
+}
+
+impl DuckDBMetricsProvider {
+    fn new(metrics: DuckDBPoolMetrics) -> Self {
+        Self { metrics }
+    }
+}
+
+const METRICS: &[MetricSpec] = &[
+    MetricSpec::new("connection_count", MetricType::ObservableGaugeU64)
+        .description("Total number of connections currently managed by the pool"),
+    MetricSpec::new("idle_connections", MetricType::ObservableGaugeU64)
+        .description("Number of idle connections currently in the pool"),
+    MetricSpec::new("max_size", MetricType::ObservableGaugeU64)
+        .description("Configured maximum pool size"),
+];
+
+impl MetricsProvider for DuckDBMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        let metrics = self.metrics.clone();
+        match metric.name {
+            "connection_count" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(u64::from(metrics.connection_count()), &attributes);
+            }))),
+            "idle_connections" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(u64::from(metrics.idle_connections()), &attributes);
+            }))),
+            "max_size" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(u64::from(metrics.max_size()), &attributes);
+            }))),
+            _ => None,
+        }
     }
 }
 
