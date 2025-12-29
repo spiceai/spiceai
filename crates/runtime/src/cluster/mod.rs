@@ -341,11 +341,12 @@ pub async fn initialize_cluster_executor(
     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
         scheduler_endpoint
             .tls_config(tls_config)
-            .context(FailedToStartClusterExecutorSnafu)?
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            })?
     } else {
         scheduler_endpoint
     };
-    let scheduler_endpoint = scheduler_endpoint.boxed();
 
     let scheduler_connection =
         scheduler_endpoint
@@ -574,11 +575,10 @@ async fn create_cluster_service_client(
     if let Some(tls_config) = client_tls_config {
         endpoint = endpoint
             .tls_config(tls_config)
-            .context(FailedToStartClusterExecutorSnafu)?;
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            })?;
     }
-    let endpoint = endpoint
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
 
     let channel = endpoint
         .connect()
