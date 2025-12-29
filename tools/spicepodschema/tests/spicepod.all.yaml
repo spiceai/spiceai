@@ -1,0 +1,1454 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+#
+# Unified Spicepod Schema Test File
+# Contains ALL possible components with ALL known parameters
+# Purpose: Comprehensive schema validation and IDE autocomplete testing
+#
+version: v1
+kind: Spicepod
+name: spicepod-all-components
+
+# Custom metadata
+metadata:
+  author: schema-test
+  environment: test
+  custom_key: custom_value
+
+# =============================================================================
+# RUNTIME CONFIGURATION
+# All runtime-level settings
+# =============================================================================
+runtime:
+  # Dataset loading parallelism
+  dataset_load_parallelism: 4
+
+  # Shutdown timeout
+  shutdown_timeout: 30s
+
+  # Output level (info, verbose, very_verbose)
+  output_level: info
+
+  # Query configuration
+  query:
+    memory_limit: 4GiB
+    temp_directory: /tmp/spice-query
+    spill_compression: zstd # zstd, lz4_frame, uncompressed
+
+  # Caching configuration (new style)
+  caching:
+    sql_results:
+      enabled: true
+      max_size: 1GiB
+      item_ttl: 5m
+      caching_policy: tiny_lfu # lru, tiny_lfu
+      hashing_algorithm: xxh3 # siphash, ahash, blake3, xxh3, xxh32, xxh64, xxh128
+      cache_key_type: plan # plan, sql
+      stale_while_revalidate_ttl: 30s
+      encoding: zstd
+    search_results:
+      enabled: true
+      max_size: 512MiB
+      item_ttl: 10m
+      caching_policy: lru
+      hashing_algorithm: blake3
+    embeddings:
+      enabled: true
+      max_size: 256MiB
+      item_ttl: 1h
+      caching_policy: lru
+      hashing_algorithm: xxh64
+
+  # Legacy results cache (deprecated but still supported)
+  results_cache:
+    enabled: true
+    cache_max_size: 128MiB
+    item_ttl: 1s
+    caching_policy: lru
+    cache_key_type: plan
+    hashing_algorithm: xxh3
+    max_stale_while_revalidate: 30s
+
+  # TLS configuration
+  tls:
+    enabled: true
+    certificate_file: /path/to/cert.pem
+    key_file: /path/to/key.pem
+    # Or inline certificates:
+    # certificate: |
+    #   -----BEGIN CERTIFICATE-----
+    #   ...
+    #   -----END CERTIFICATE-----
+    # key: |
+    #   -----BEGIN PRIVATE KEY-----
+    #   ...
+    #   -----END PRIVATE KEY-----
+
+  # Tracing configuration
+  tracing:
+    zipkin_enabled: true
+    zipkin_endpoint: http://localhost:9411/api/v2/spans
+
+  # Telemetry configuration
+  telemetry:
+    enabled: true
+    user_agent_collection: full # full, anonymized, disabled
+    properties:
+      deployment_id: test-deployment
+      cluster_name: test-cluster
+    otel_exporter:
+      enabled: true
+      endpoint: http://localhost:4317
+      push_interval: 60s
+      metrics:
+        - runtime.query_duration_ms
+        - runtime.memory_usage_bytes
+
+  # Task history configuration
+  task_history:
+    enabled: true
+    captured_output: truncated # none, truncated, full
+    retention_period: 24h
+    retention_check_interval: 30m
+    min_sql_duration: 100ms
+    captured_plan: logical # none, logical, physical
+    min_plan_duration: 500ms
+
+  # Authentication configuration
+  auth:
+    api_key:
+      enabled: true
+      keys:
+        - ReadOnly:
+            key: read-only-api-key-12345
+        - ReadWrite:
+            key: read-write-api-key-67890
+
+  # CORS configuration
+  cors:
+    enabled: true
+    allowed_origins:
+      - https://example.com
+      - https://app.example.com
+
+  # Flight configuration
+  flight:
+    max_message_size: 16MiB
+
+  # Metrics configuration
+  metrics:
+    metrics:
+      - name: runtime.query_count
+        enabled: true
+      - name: runtime.query_duration_ms
+        enabled: true
+      - name: runtime.memory_usage_bytes
+        enabled: false
+
+  # Runtime params
+  params:
+    custom_runtime_param: value
+
+# =============================================================================
+# MANAGEMENT CONFIGURATION
+# =============================================================================
+management:
+  enabled: true
+  api_key: management-api-key-secret
+  params:
+    custom_management_param: value
+
+# =============================================================================
+# SNAPSHOTS CONFIGURATION
+# For file-mode acceleration bootstrapping from object storage
+# =============================================================================
+snapshots:
+  enabled: true
+  location: s3://my-bucket/spice/snapshots/
+  bootstrap_on_failure_behavior: fallback # warn, retry, fallback
+  params:
+    s3_region: us-east-1
+    s3_auth: iam_role
+
+# =============================================================================
+# EXTENSIONS
+# =============================================================================
+extensions:
+  my_extension:
+    enabled: true
+    params:
+      extension_param: value
+
+# =============================================================================
+# SECRETS
+# All secret store types
+# =============================================================================
+secrets:
+  # Environment variable secret store
+  - from: env
+    name: env
+    description: Environment variables
+    params:
+      file_path: .env
+
+  # Kubernetes secret store
+  - from: kubernetes:my_secret
+    name: k8s
+    description: Kubernetes secrets
+
+  # AWS Secrets Manager (feature-gated)
+  # - from: aws_secrets_manager:my-secret
+  #   name: aws
+  #   params:
+  #     aws_region: us-east-1
+
+  # Keyring secret store (feature-gated)
+  # - from: keyring:my_service
+  #   name: keyring
+
+# =============================================================================
+# CATALOGS
+# All catalog connector types with full params
+# =============================================================================
+catalogs:
+  # Databricks catalog
+  - name: databricks_catalog
+    from: databricks:my_catalog
+    description: Databricks Unity Catalog
+    metadata:
+      env: production
+    access: read
+    include:
+      - "schema1.*"
+      - "schema2.table*"
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      mode: spark_connect # spark_connect, delta_lake, sql_warehouse
+      client_timeout: 60s
+      databricks_cluster_id: cluster-123
+      databricks_use_ssl: "true"
+      databricks_sql_warehouse_id: warehouse-id
+      databricks_client_id: client-id
+      databricks_client_secret: client-secret
+      # AWS storage params
+      databricks_aws_region: us-east-1
+      databricks_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      databricks_aws_secret_access_key: secret
+      databricks_aws_endpoint: https://s3.amazonaws.com
+      # Azure storage params
+      databricks_azure_storage_account_name: account
+      databricks_azure_storage_account_key: key
+      databricks_azure_storage_client_id: client-id
+      databricks_azure_storage_client_secret: client-secret
+      databricks_azure_storage_sas_key: sas-key
+      databricks_azure_storage_endpoint: https://account.blob.core.windows.net
+      # GCP storage params
+      databricks_google_service_account: service-account@project.iam.gserviceaccount.com
+    dataset_params:
+      default_param: value
+    dependsOn:
+      - other_catalog
+    metrics:
+      metrics:
+        - name: catalog.tables_loaded
+          enabled: true
+
+  # Unity Catalog
+  - name: unity_catalog
+    from: unity_catalog:another_catalog
+    params:
+      unity_catalog_token: token
+      # AWS storage
+      unity_catalog_aws_region: us-west-2
+      unity_catalog_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      unity_catalog_aws_secret_access_key: secret
+      unity_catalog_aws_endpoint: https://s3.amazonaws.com
+      # Azure storage
+      unity_catalog_azure_storage_account_name: account
+      unity_catalog_azure_storage_account_key: key
+      unity_catalog_azure_storage_client_id: client-id
+      unity_catalog_azure_storage_client_secret: secret
+      unity_catalog_azure_storage_sas_key: sas
+      unity_catalog_azure_storage_endpoint: endpoint
+      # GCP storage
+      unity_catalog_google_service_account: sa@project.iam.gserviceaccount.com
+
+  # Iceberg catalog
+  - name: iceberg_catalog
+    from: iceberg:my_iceberg_catalog
+    params:
+      iceberg_token: token
+      iceberg_oauth2_credential: credential
+      iceberg_oauth2_token_url: https://auth.example.com/token
+      iceberg_oauth2_scope: catalog
+      iceberg_oauth2_server_url: https://auth.example.com
+      iceberg_sigv4_enabled: "true"
+      iceberg_signing_region: us-east-1
+      iceberg_signing_name: execute-api
+      iceberg_warehouse: warehouse
+      iceberg_s3_endpoint: https://s3.amazonaws.com
+      iceberg_s3_access_key_id: AKIAIOSFODNN7EXAMPLE
+      iceberg_s3_secret_access_key: secret
+      iceberg_s3_session_token: token
+      iceberg_s3_region: us-east-1
+      iceberg_s3_role_session_name: session
+      iceberg_s3_role_arn: arn:aws:iam::123456789012:role/role
+      iceberg_s3_connect_timeout: 30s
+
+  # Spice.ai catalog
+  - name: spiceai_catalog
+    from: spice.ai
+    params:
+      spiceai_api_key: my-api-key
+      spiceai_flight_endpoint: https://flight.spiceai.io
+      spiceai_http_endpoint: https://api.spiceai.io
+
+# =============================================================================
+# DATASETS
+# All data connectors with full params
+# =============================================================================
+datasets:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL connector (full params)
+  # ---------------------------------------------------------------------------
+  - name: postgres_full
+    from: postgres:public.users
+    description: PostgreSQL dataset with all params
+    metadata:
+      source: production
+    access: read_write
+    has_metadata_table: true
+    time_column: created_at
+    time_format: timestamp # timestamp, timestamptz, unix_seconds, unix_millis, ISO8601
+    time_partition_column: partition_date
+    time_partition_format: ISO8601
+    ready_state: on_load # on_load, on_registration
+    check_availability: auto # auto, disabled
+    unsupported_type_action: warn # error, warn, ignore, string
+    replication:
+      enabled: true
+    columns:
+      - name: id
+        description: Primary key
+        metadata:
+          pk: true
+      - name: content
+        description: Text content for embeddings
+        embeddings:
+          - from: openai_embeddings
+            chunking:
+              enabled: true
+              target_chunk_size: 512
+              overlap_size: 50
+              trim_whitespace: true
+            row_id:
+              - id
+            vector_size: 1536
+        full_text_search:
+          enabled: true
+          row_id:
+            - id
+          index_store: memory # memory, file
+          index_directory: /tmp/fts-index
+    params:
+      pg_connection_string: postgresql://user:pass@localhost:5432/db
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+      pg_sslmode: prefer
+      pg_sslrootcert: /path/to/ca.pem
+      pg_connection_pool_min_idle: "2"
+      connection_pool_size: "10"
+    embeddings:
+      - column: content
+        use: openai_embeddings
+        column_pk:
+          - id
+        chunking:
+          enabled: true
+          target_chunk_size: 512
+          overlap_size: 50
+          trim_whitespace: true
+        vector_size: 1536
+    vectors:
+      enabled: true
+      engine: duckdb
+      partition_by:
+        - name: category
+          expression: category
+      params:
+        duckdb_file: ./vectors.duckdb
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file # memory, file, file_create
+      refresh_on_startup: auto # always, auto
+      refresh_mode: full # full, append, changes, caching
+      refresh_check_interval: 10s
+      refresh_cron: "0 */6 * * *"
+      refresh_sql: SELECT * FROM source WHERE updated_at > $last_refresh
+      refresh_data_window: 7d
+      refresh_append_overlap: 1h
+      refresh_retry_enabled: true
+      refresh_retry_max_attempts: 3
+      refresh_jitter_enabled: true
+      refresh_jitter_max: 5s
+      retention_period: 30d
+      retention_sql: DELETE FROM table WHERE created_at < NOW() - INTERVAL '30 days'
+      retention_check_interval: 1h
+      retention_check_enabled: true
+      on_zero_results: return_empty # return_empty, use_source
+      primary_key: id
+      indexes:
+        email: enabled
+        username: unique
+      on_conflict:
+        id: upsert # drop, upsert, upsert_dedup, upsert_dedup_by_row_id
+      partition_by:
+        - name: created_date
+          expression: DATE(created_at)
+      snapshots: enabled # disabled, enabled, bootstrap_only, create_only
+      params:
+        duckdb_file: ./data/postgres.duckdb
+        file_watcher: "true"
+        partition_mode: auto
+        connection_pool_size: "5"
+        on_refresh_recompute_statistics: "true"
+        partitioned_write_buffer: "1000"
+        optimizer_duckdb_aggregate_pushdown: "true"
+      metrics:
+        metrics:
+          - name: acceleration.refresh_duration_ms
+            enabled: true
+    dependsOn:
+      - other_dataset
+    metrics:
+      metrics:
+        - name: dataset.row_count
+          enabled: true
+
+  # ---------------------------------------------------------------------------
+  # MySQL connector
+  # ---------------------------------------------------------------------------
+  - name: mysql_dataset
+    from: mysql:database.table
+    params:
+      mysql_connection_string: mysql://user:pass@localhost:3306/db
+      mysql_user: root
+      mysql_pass: secret
+      mysql_host: localhost
+      mysql_tcp_port: "3306"
+      mysql_db: testdb
+      mysql_sslmode: REQUIRED
+      mysql_sslrootcert: /path/to/ca.pem
+      mysql_pool_min: "1"
+      mysql_pool_max: "10"
+      mysql_time_zone: UTC
+
+  # ---------------------------------------------------------------------------
+  # DuckDB connector
+  # ---------------------------------------------------------------------------
+  - name: duckdb_dataset
+    from: duckdb:data.parquet
+    params:
+      duckdb_open: data/test.db
+
+  # ---------------------------------------------------------------------------
+  # SQLite accelerator test
+  # ---------------------------------------------------------------------------
+  - name: sqlite_accel
+    from: postgres:public.data
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: db
+      pg_user: user
+      pg_pass: pass
+    acceleration:
+      enabled: true
+      engine: sqlite
+      mode: file
+      params:
+        sqlite_file: ./data/accel.sqlite
+        busy_timeout: "5000"
+        file_watcher: "true"
+
+  # ---------------------------------------------------------------------------
+  # Arrow accelerator test
+  # ---------------------------------------------------------------------------
+  - name: arrow_accel
+    from: postgres:public.small
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: db
+      pg_user: user
+      pg_pass: pass
+    acceleration:
+      enabled: true
+      engine: arrow
+      params:
+        file_watcher: "true"
+        arrow_sort_columns: id,created_at
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL accelerator test
+  # ---------------------------------------------------------------------------
+  - name: postgres_accel
+    from: duckdb:source.parquet
+    params:
+      duckdb_open: data/source.db
+    acceleration:
+      enabled: true
+      engine: postgres
+      params:
+        pg_host: localhost
+        pg_port: "5432"
+        pg_db: accel_db
+        pg_user: postgres
+        pg_pass: secret
+        pg_sslmode: prefer
+        pg_sslrootcert: /path/to/ca.pem
+        pg_connection_pool_min: "2"
+        file_watcher: "false"
+        connection_pool_size: "15"
+
+  # ---------------------------------------------------------------------------
+  # Turso accelerator test
+  # ---------------------------------------------------------------------------
+  - name: turso_accel
+    from: postgres:public.data
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: db
+      pg_user: user
+      pg_pass: pass
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_turso_file: ./data/accel.turso
+        turso_turso_mvcc: enabled
+        turso_internal_timestamp_format: integer_millis # rfc3339, integer_millis
+
+  # ---------------------------------------------------------------------------
+  # Cayenne accelerator test
+  # ---------------------------------------------------------------------------
+  - name: cayenne_accel
+    from: postgres:public.large
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: db
+      pg_user: user
+      pg_pass: pass
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      params:
+        cayenne_file_path: ./data/accel.cayenne
+        cayenne_metastore: sqlite
+        file_watcher: "true"
+        cayenne_unsupported_type_action: warn
+        cayenne_cayenne_s3_region: us-east-1
+        cayenne_cayenne_s3_endpoint: https://s3.amazonaws.com
+        cayenne_cayenne_s3_key: AKIAIOSFODNN7EXAMPLE
+        cayenne_cayenne_s3_secret: secret
+        cayenne_cayenne_s3_session_token: token
+        cayenne_cayenne_s3_auth: iam_role
+        cayenne_cayenne_s3_client_timeout: 30s
+        cayenne_cayenne_s3_allow_http: "false"
+        cayenne_cayenne_s3_zone_ids: zone1,zone2
+        cayenne_footer_cache_mb: "256"
+        cayenne_segment_cache_mb: "512"
+        cayenne_cayenne_target_file_size_mb: "128"
+        cayenne_sort_columns: id,timestamp
+        cayenne_compression_strategy: zstd
+
+  # ---------------------------------------------------------------------------
+  # S3 connector (full params)
+  # ---------------------------------------------------------------------------
+  - name: s3_dataset
+    from: s3://my-bucket/data/
+    params:
+      s3_region: us-east-1
+      s3_endpoint: https://s3.amazonaws.com
+      s3_key: AKIAIOSFODNN7EXAMPLE
+      s3_secret: secret
+      s3_session_token: token
+      s3_auth: public # public, iam_role, key_secret
+      s3_versioning: "true"
+      client_timeout: 30s
+      allow_http: "false"
+      file_format: parquet
+      file_extension: .parquet
+      schema_infer_max_records: "1000"
+      hive_partitioning_enabled: "true"
+      schema_source_path: s3://bucket/schema.parquet
+      json_format: jsonl # json, jsonl
+      flatten_json: "true"
+      refresh_skip: enabled # enabled, disabled
+      # CSV params
+      csv_has_header: "true"
+      csv_quote: '"'
+      csv_escape: "\\"
+      csv_delimiter: ","
+      # TSV params
+      tsv_has_header: "true"
+      tsv_quote: '"'
+      tsv_escape: "\\"
+      file_compression_type: GZIP # UNCOMPRESSED, GZIP, BZIP2, BROTLI, LZ4, LZ4_RAW, SNAPPY, ZSTD, XZ
+
+  # ---------------------------------------------------------------------------
+  # Azure Blob Storage (ABFS) connector (full params)
+  # ---------------------------------------------------------------------------
+  - name: abfs_dataset
+    from: abfs://container@account.dfs.core.windows.net/path/
+    params:
+      abfs_account: mystorageaccount
+      abfs_container_name: container
+      abfs_access_key: key
+      abfs_bearer_token: token
+      abfs_client_id: client-id
+      abfs_client_secret: secret
+      abfs_tenant_id: tenant-id
+      abfs_sas_string: sas
+      abfs_endpoint: https://account.dfs.core.windows.net
+      abfs_use_emulator: "false"
+      abfs_use_fabric_endpoint: "false"
+      allow_http: "false"
+      abfs_authority_host: https://login.microsoftonline.com
+      abfs_max_retries: "3"
+      abfs_retry_timeout: 30s
+      abfs_backoff_initial_duration: 1s
+      abfs_backoff_max_duration: 30s
+      abfs_backoff_base: "2"
+      abfs_proxy_url: http://proxy:8080
+      abfs_proxy_ca_certificate: /path/to/ca.pem
+      abfs_proxy_excludes: localhost,127.0.0.1
+      abfs_msi_endpoint: http://169.254.169.254/metadata/identity/oauth2/token
+      abfs_federated_token_file: /var/run/secrets/token
+      abfs_use_cli: "false"
+      abfs_skip_signature: "false"
+      abfs_disable_tagging: "false"
+      file_format: parquet
+
+  # ---------------------------------------------------------------------------
+  # Delta Lake connector
+  # ---------------------------------------------------------------------------
+  - name: delta_lake_dataset
+    from: delta_lake:s3://bucket/delta-table/
+    params:
+      client_timeout: 60s
+      delta_lake_aws_region: us-east-1
+      delta_lake_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      delta_lake_aws_secret_access_key: secret
+      delta_lake_aws_session_token: token
+      delta_lake_aws_endpoint: https://s3.amazonaws.com
+      delta_lake_aws_allow_http: "false"
+      # Azure params
+      delta_lake_azure_storage_account_name: account
+      delta_lake_azure_storage_account_key: key
+      delta_lake_azure_storage_client_id: client-id
+      delta_lake_azure_storage_client_secret: secret
+      delta_lake_azure_storage_sas_key: sas
+      delta_lake_azure_storage_endpoint: endpoint
+      # GCP params
+      delta_lake_google_service_account: sa@project.iam.gserviceaccount.com
+
+  # ---------------------------------------------------------------------------
+  # Databricks connector
+  # ---------------------------------------------------------------------------
+  - name: databricks_dataset
+    from: databricks:catalog.schema.table
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_sql_warehouse_id: warehouse-id
+      mode: spark_connect # spark_connect, delta_lake, sql_warehouse
+      client_timeout: 120s
+      databricks_cluster_id: cluster-123
+      databricks_use_ssl: "true"
+      databricks_client_id: client-id
+      databricks_client_secret: secret
+      # AWS storage
+      databricks_aws_region: us-east-1
+      databricks_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      databricks_aws_secret_access_key: secret
+      databricks_aws_endpoint: https://s3.amazonaws.com
+      databricks_aws_allow_http: "false"
+      # Azure storage
+      databricks_azure_storage_account_name: account
+      databricks_azure_storage_account_key: key
+      databricks_azure_storage_client_id: client-id
+      databricks_azure_storage_client_secret: secret
+      databricks_azure_storage_sas_key: sas
+      databricks_azure_storage_endpoint: endpoint
+      # GCP storage
+      databricks_google_service_account: sa@project.iam.gserviceaccount.com
+
+  # ---------------------------------------------------------------------------
+  # Snowflake connector
+  # ---------------------------------------------------------------------------
+  - name: snowflake_dataset
+    from: snowflake:database.schema.table
+    params:
+      snowflake_username: user
+      snowflake_password: password
+      snowflake_private_key_path: /path/to/key.pem
+      snowflake_private_key_passphrase: passphrase
+      snowflake_account: account.us-east-1
+      snowflake_warehouse: COMPUTE_WH
+      snowflake_role: ANALYST
+      snowflake_auth_type: password # password, keypair
+
+  # ---------------------------------------------------------------------------
+  # Oracle connector
+  # ---------------------------------------------------------------------------
+  - name: oracle_dataset
+    from: oracle:schema.table
+    params:
+      oracle_username: user
+      oracle_password: password
+      oracle_host: localhost
+      oracle_port: "1521"
+      oracle_service_name: ORCL
+      oracle_connection_string: user/pass@localhost:1521/ORCL
+      oracle_wallet_sso_cert: /path/to/cert.pem
+      oracle_wallet: /path/to/wallet
+
+  # ---------------------------------------------------------------------------
+  # SQL Server (MSSQL) connector
+  # ---------------------------------------------------------------------------
+  - name: mssql_dataset
+    from: mssql:database.schema.table
+    params:
+      mssql_connection_string: Server=localhost;Database=db;User Id=sa;Password=pass;
+      mssql_username: sa
+      mssql_password: password
+      mssql_host: localhost
+      mssql_port: "1433"
+      mssql_database: testdb
+      mssql_encrypt: "true"
+      mssql_trust_server_certificate: "false"
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse connector
+  # ---------------------------------------------------------------------------
+  - name: clickhouse_dataset
+    from: clickhouse:database.table
+    params:
+      clickhouse_connection_string: tcp://localhost:9000
+      clickhouse_user: default
+      clickhouse_pass: password
+      clickhouse_host: localhost
+      clickhouse_tcp_port: "9000"
+      clickhouse_db: default
+      clickhouse_secure: "true"
+      connection_timeout: "30000"
+
+  # ---------------------------------------------------------------------------
+  # MongoDB connector
+  # ---------------------------------------------------------------------------
+  - name: mongodb_dataset
+    from: mongodb:database.collection
+    params:
+      mongodb_connection_string: mongodb://localhost:27017
+      mongodb_user: user
+      mongodb_pass: password
+      mongodb_host: localhost
+      mongodb_port: "27017"
+      mongodb_db: testdb
+      mongodb_sslmode: disabled
+      mongodb_sslrootcert: /path/to/ca.pem
+      mongodb_auth_source: admin
+      mongodb_direct_connection: "false"
+      mongodb_time_zone: UTC
+      mongodb_unnest_depth: "3"
+      mongodb_num_docs_to_infer_schema: "100"
+      mongodb_pool_min: "1"
+      mongodb_pool_max: "10"
+
+  # ---------------------------------------------------------------------------
+  # GitHub connector
+  # ---------------------------------------------------------------------------
+  - name: github_issues
+    from: github:github.com/spiceai/spiceai/issues
+    params:
+      github_token: ghp_xxx
+      github_client_id: client-id
+      github_private_key: private-key
+      github_installation_id: "123456"
+      github_query_mode: search # search, rest
+      github_endpoint: https://api.github.com
+      github_include_comments: "true"
+      github_max_comments_fetched: "100"
+      github_include_commits: "true"
+      github_workflow_logs: "true"
+      include: "*.md"
+
+  # ---------------------------------------------------------------------------
+  # Git connector
+  # ---------------------------------------------------------------------------
+  - name: git_dataset
+    from: git:https://github.com/spiceai/spiceai.git
+    params:
+      include: "*.rs;*.md"
+      fetch_content: "true"
+      cache_path: /tmp/git-cache
+      max_files: "1000"
+      max_file_bytes: "524288"
+
+  # ---------------------------------------------------------------------------
+  # GraphQL connector
+  # ---------------------------------------------------------------------------
+  - name: graphql_dataset
+    from: graphql:https://api.example.com/graphql
+    params:
+      graphql_auth_token: Bearer token123
+      graphql_auth_user: user
+      graphql_auth_pass: password
+      graphql_query: "query { users { id name } }"
+      json_pointer: /data/users
+      unnest_depth: "2"
+
+  # ---------------------------------------------------------------------------
+  # HTTP/HTTPS connector
+  # ---------------------------------------------------------------------------
+  - name: https_dataset
+    from: https://api.example.com/data.json
+    params:
+      http_username: user
+      http_password: password
+      http_port: "443"
+      client_timeout: "30"
+      connect_timeout: "10"
+      pool_max_idle_per_host: "10"
+      pool_idle_timeout: "90"
+      http_headers: "Authorization: Bearer token, X-Custom: value"
+      max_retries: "3"
+      retry_backoff_method: fibonacci
+      retry_max_duration: "60s"
+      retry_jitter: "0.3"
+      allowed_request_paths: "/api/v1,/api/v2"
+      request_query_filters: enabled # enabled, disabled
+      max_request_query_length: "2048"
+      request_body_filters: enabled
+      max_request_body_bytes: "32768"
+      health_probe: /health
+      file_format: json
+
+  # ---------------------------------------------------------------------------
+  # Iceberg connector
+  # ---------------------------------------------------------------------------
+  - name: iceberg_dataset
+    from: iceberg:catalog.db.table
+    params:
+      metadata_path: s3://bucket/warehouse/db/table/metadata/v1.metadata.json
+      iceberg_token: token
+      iceberg_oauth2_credential: credential
+      iceberg_oauth2_token_url: https://auth.example.com/token
+      iceberg_oauth2_scope: catalog
+      iceberg_oauth2_server_url: https://auth.example.com
+      iceberg_sigv4_enabled: "true"
+      iceberg_signing_region: us-east-1
+      iceberg_signing_name: execute-api
+      iceberg_warehouse: warehouse
+      iceberg_s3_endpoint: https://s3.amazonaws.com
+      iceberg_s3_access_key_id: AKIAIOSFODNN7EXAMPLE
+      iceberg_s3_secret_access_key: secret
+      iceberg_s3_session_token: token
+      iceberg_s3_region: us-east-1
+      iceberg_s3_role_session_name: session
+      iceberg_s3_role_arn: arn:aws:iam::123456789012:role/role
+      iceberg_s3_connect_timeout: 30s
+
+  # ---------------------------------------------------------------------------
+  # Glue connector
+  # ---------------------------------------------------------------------------
+  - name: glue_dataset
+    from: glue:database.table
+    params:
+      glue_catalog_id: "123456789012"
+      glue_region: us-east-1
+      glue_endpoint: https://glue.us-east-1.amazonaws.com
+      glue_key: AKIAIOSFODNN7EXAMPLE
+      glue_secret: secret
+      glue_session_token: token
+      glue_auth: iam_role
+      glue_versioning: "true"
+      client_timeout: 30s
+      allow_http: "false"
+      file_format: parquet
+
+  # ---------------------------------------------------------------------------
+  # Kafka connector
+  # ---------------------------------------------------------------------------
+  - name: kafka_dataset
+    from: kafka:my_topic
+    params:
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: sasl_ssl
+      kafka_sasl_mechanism: SCRAM-SHA-512
+      kafka_sasl_username: user
+      kafka_sasl_password: password
+      kafka_ssl_ca_location: /path/to/ca.pem
+      kafka_enable_ssl_certificate_verification: "true"
+      kafka_ssl_endpoint_identification_algorithm: https
+      kafka_consumer_group_id: spice-consumer
+      schema_infer_max_records: "10"
+      flatten_json: "true"
+      batch_max_size: "1000"
+      batch_max_duration: 5s
+
+  # ---------------------------------------------------------------------------
+  # Debezium connector
+  # ---------------------------------------------------------------------------
+  - name: debezium_dataset
+    from: debezium:my_table
+    params:
+      debezium_transport: kafka
+      debezium_message_format: json
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: sasl_ssl
+      kafka_sasl_mechanism: SCRAM-SHA-512
+      kafka_sasl_username: debezium
+      kafka_sasl_password: secret
+      kafka_ssl_ca_location: /path/to/ca.pem
+      kafka_enable_ssl_certificate_verification: "true"
+      kafka_ssl_endpoint_identification_algorithm: https
+      kafka_consumer_group_id: spice-debezium
+      batch_max_size: "500"
+      batch_max_duration: 10s
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB connector
+  # ---------------------------------------------------------------------------
+  - name: dynamodb_dataset
+    from: dynamodb:my_table
+    params:
+      dynamodb_aws_region: us-east-1
+      dynamodb_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      dynamodb_aws_secret_access_key: secret
+      dynamodb_aws_session_token: token
+      unnest_depth: "3"
+      schema_infer_max_records: "100"
+      scan_segments: auto
+      scan_interval: 1s
+      time_format: "2006-01-02T15:04:05Z07:00"
+      ready_lag: 5s
+      endpoint_url: http://localhost:8000
+
+  # ---------------------------------------------------------------------------
+  # Spark connector
+  # ---------------------------------------------------------------------------
+  - name: spark_dataset
+    from: spark:catalog.schema.table
+    params:
+      spark_remote: sc://localhost:15002
+
+  # ---------------------------------------------------------------------------
+  # FlightSQL connector
+  # ---------------------------------------------------------------------------
+  - name: flightsql_dataset
+    from: flightsql:catalog.schema.table
+    params:
+      flightsql_username: user
+      flightsql_password: password
+      flightsql_endpoint: grpc://localhost:50051
+
+  # ---------------------------------------------------------------------------
+  # Dremio connector
+  # ---------------------------------------------------------------------------
+  - name: dremio_dataset
+    from: dremio:source.schema.table
+    params:
+      dremio_username: user
+      dremio_password: password
+      dremio_endpoint: grpc://localhost:32010
+
+  # ---------------------------------------------------------------------------
+  # FTP connector
+  # ---------------------------------------------------------------------------
+  - name: ftp_dataset
+    from: ftp://ftp.example.com/data/
+    params:
+      ftp_user: anonymous
+      ftp_pass: guest
+      ftp_port: "21"
+      client_timeout: 30s
+      file_format: csv
+
+  # ---------------------------------------------------------------------------
+  # SFTP connector
+  # ---------------------------------------------------------------------------
+  - name: sftp_dataset
+    from: sftp://sftp.example.com/data/
+    params:
+      sftp_user: user
+      sftp_pass: password
+      sftp_port: "22"
+      client_timeout: 30s
+      file_format: parquet
+
+  # ---------------------------------------------------------------------------
+  # IMAP connector
+  # ---------------------------------------------------------------------------
+  - name: imap_dataset
+    from: imap:mail.example.com
+    params:
+      imap_username: user@example.com
+      imap_password: password
+      imap_host: mail.example.com
+      imap_mailbox: INBOX
+      imap_port: "993"
+      imap_ssl_mode: required
+
+  # ---------------------------------------------------------------------------
+  # SharePoint connector
+  # ---------------------------------------------------------------------------
+  - name: sharepoint_dataset
+    from: sharepoint:sites/MySite/Shared Documents/data.xlsx
+    params:
+      sharepoint_client_id: client-id
+      sharepoint_bearer_token: token
+      sharepoint_tenant_id: tenant-id
+      sharepoint_client_secret: client-secret
+      file_format: xlsx
+
+  # ---------------------------------------------------------------------------
+  # File connector (local)
+  # ---------------------------------------------------------------------------
+  - name: file_dataset
+    from: file:data/sample.csv
+    params:
+      file_format: csv
+      file_extension: .csv
+      schema_infer_max_records: "1000"
+      csv_has_header: "true"
+      csv_quote: '"'
+      csv_escape: "\\"
+      csv_delimiter: ","
+      file_compression_type: UNCOMPRESSED
+      hive_partitioning_enabled: "false"
+      schema_source_path: data/schema.csv
+
+  # ---------------------------------------------------------------------------
+  # Memory connector
+  # ---------------------------------------------------------------------------
+  - name: memory_dataset
+    from: memory:temp_table
+
+  # ---------------------------------------------------------------------------
+  # Sink connector
+  # ---------------------------------------------------------------------------
+  - name: sink_dataset
+    from: sink:null
+
+  # ---------------------------------------------------------------------------
+  # Localpod connector
+  # ---------------------------------------------------------------------------
+  - name: localpod_dataset
+    from: localpod:other_dataset
+
+  # ---------------------------------------------------------------------------
+  # Spice.ai connector
+  # ---------------------------------------------------------------------------
+  - name: spiceai_dataset
+    from: spice.ai/spiceai/quickstart/taxi_trips
+    params:
+      spiceai_api_key: spice-key
+      spiceai_token: token
+      spiceai_endpoint: https://data.spiceai.io
+
+# =============================================================================
+# VIEWS
+# SQL-based views with all options
+# =============================================================================
+views:
+  # Simple view
+  - name: simple_view
+    description: A simple SQL view
+    metadata:
+      created_by: test
+    sql: SELECT * FROM postgres_full WHERE id > 100
+    ready_state: on_load
+    dependsOn:
+      - postgres_full
+    columns:
+      - name: id
+        description: Primary key
+      - name: content
+        embeddings:
+          - from: openai_embeddings
+
+  # View with external SQL file reference
+  - name: external_view
+    sql_ref: ./queries/complex_view.sql
+
+  # Accelerated view
+  - name: accelerated_view
+    sql: |
+      SELECT
+        DATE(created_at) as day,
+        COUNT(*) as count
+      FROM postgres_full
+      GROUP BY 1
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_mode: full
+      refresh_check_interval: 5m
+
+  # View with vector store
+  - name: vector_view
+    sql: SELECT id, content FROM postgres_full
+    vectors:
+      enabled: true
+      engine: duckdb
+      params:
+        duckdb_file: ./vectors/view.duckdb
+
+# =============================================================================
+# MODELS
+# All model sources with full params
+# =============================================================================
+models:
+  # ---------------------------------------------------------------------------
+  # OpenAI model (full params)
+  # ---------------------------------------------------------------------------
+  - name: openai_model
+    from: openai:gpt-4o
+    description: OpenAI GPT-4o model
+    metadata:
+      version: "2024"
+    files:
+      - path: ./prompts/system.txt
+        name: system_prompt
+        params:
+          encoding: utf-8
+    datasets:
+      - postgres_full
+    params:
+      endpoint: https://api.openai.com/v1
+      openai_api_key: sk-test
+      openai_org_id: org-123
+      openai_project_id: proj-123
+      openai_usage_tier: tier5
+      responses_api: enabled # enabled, disabled
+      openai_responses_tools: "true"
+      tools: auto
+      system_prompt: You are a helpful assistant.
+      parameterized_prompt: "Answer the question: {question}"
+      openai_frequency_penalty: "0.5"
+      openai_logit_bias: '{"50256": -100}'
+      openai_logprobs: "true"
+      openai_top_logprobs: "5"
+      openai_max_completion_tokens: "4096"
+      openai_reasoning_effort: medium
+      openai_store: "true"
+      openai_metadata: '{"user": "test"}'
+      openai_n: "1"
+      openai_presence_penalty: "0.5"
+      openai_response_format: '{"type": "json_object"}'
+      openai_seed: "42"
+      openai_stop: '["END", "STOP"]'
+      openai_stream: "true"
+      openai_stream_options: '{"include_usage": true}'
+      openai_temperature: "0.7"
+      openai_top_p: "0.9"
+      openai_tools: '[{"type": "function", "function": {"name": "search"}}]'
+      openai_tool_choice: auto
+      openai_parallel_tool_calls: "true"
+      openai_user: user-123
+    dependsOn:
+      - openai_embeddings
+    metrics:
+      metrics:
+        - name: model.inference_duration_ms
+          enabled: true
+
+  # ---------------------------------------------------------------------------
+  # Azure OpenAI model
+  # ---------------------------------------------------------------------------
+  - name: azure_model
+    from: azure:gpt-4
+    params:
+      endpoint: https://myresource.openai.azure.com
+      azure_api_version: "2024-02-15-preview"
+      azure_deployment_name: gpt4-deployment
+      azure_api_key: azure-key
+      azure_entra_token: entra-token
+      azure_openai_responses_tools: "true"
+      responses_api: enabled
+      tools: auto
+      system_prompt: You are a helpful AI assistant.
+      azure_frequency_penalty: "0.5"
+      azure_temperature: "0.7"
+      azure_max_completion_tokens: "4096"
+
+  # ---------------------------------------------------------------------------
+  # Anthropic model
+  # ---------------------------------------------------------------------------
+  - name: anthropic_model
+    from: anthropic:claude-3-sonnet
+    params:
+      endpoint: https://api.anthropic.com
+      anthropic_api_key: sk-ant-test
+      anthropic_auth_token: auth-token
+      tools: auto
+      system_prompt: You are Claude, an AI assistant.
+      anthropic_temperature: "0.7"
+      anthropic_max_completion_tokens: "4096"
+
+  # ---------------------------------------------------------------------------
+  # AWS Bedrock model
+  # ---------------------------------------------------------------------------
+  - name: bedrock_model
+    from: bedrock:anthropic.claude-3-sonnet-20240229-v1:0
+    params:
+      aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      aws_secret_access_key: secret
+      aws_session_token: token
+      aws_region: us-east-1
+      bedrock_guardrail_identifier: guardrail-123
+      bedrock_guardrail_version: "1"
+      bedrock_trace: enabled # enabled, disabled
+      tools: auto
+      system_prompt: You are a helpful assistant.
+      bedrock_temperature: "0.7"
+
+  # ---------------------------------------------------------------------------
+  # Google model
+  # ---------------------------------------------------------------------------
+  - name: google_model
+    from: google:gemini-1.5-pro
+    params:
+      google_api_key: google-api-key
+      tools: auto
+      system_prompt: You are Gemini.
+      google_temperature: "0.7"
+
+  # ---------------------------------------------------------------------------
+  # Databricks model
+  # ---------------------------------------------------------------------------
+  - name: databricks_model
+    from: databricks:databricks-meta-llama-3-70b-instruct
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_client_id: client-id
+      databricks_client_secret: secret
+      tools: auto
+      system_prompt: You are a helpful assistant.
+
+  # ---------------------------------------------------------------------------
+  # Perplexity model
+  # ---------------------------------------------------------------------------
+  - name: perplexity_model
+    from: perplexity:llama-3.1-sonar-large-128k-online
+    params:
+      perplexity_auth_token: pplx-token
+      perplexity_return_images: "true"
+      perplexity_return_related_questions: "true"
+      perplexity_search_domain_filter: '["example.com"]'
+      perplexity_search_recency_filter: week
+      tools: auto
+      system_prompt: You are a search assistant.
+
+  # ---------------------------------------------------------------------------
+  # xAI model
+  # ---------------------------------------------------------------------------
+  - name: xai_model
+    from: xai:grok-beta
+    params:
+      xai_api_key: xai-key
+      tools: auto
+      system_prompt: You are Grok.
+
+  # ---------------------------------------------------------------------------
+  # Huggingface model
+  # ---------------------------------------------------------------------------
+  - name: huggingface_model
+    from: huggingface:mistralai/Mistral-7B-Instruct-v0.2
+    params:
+      model_type: mistral
+      huggingface_token: hf_xxx
+      tools: auto
+      system_prompt: You are a helpful assistant.
+
+  # ---------------------------------------------------------------------------
+  # File-based model
+  # ---------------------------------------------------------------------------
+  - name: file_model
+    from: file:models/my_model.gguf
+    params:
+      chat_template: chatml
+      tools: auto
+      system_prompt: You are a local AI.
+      file_temperature: "0.7"
+
+# =============================================================================
+# EMBEDDINGS
+# All embedding sources
+# =============================================================================
+embeddings:
+  # OpenAI embeddings
+  - name: openai_embeddings
+    from: openai:text-embedding-3-small
+    params:
+      openai_api_key: sk-test
+    files:
+      - path: ./models/adapter.bin
+        name: adapter
+    datasets:
+      - postgres_full
+    dependsOn: []
+    metrics:
+      metrics:
+        - name: embeddings.inference_duration_ms
+          enabled: true
+
+  # OpenAI embeddings (large)
+  - name: openai_embeddings_large
+    from: openai:text-embedding-3-large
+    params:
+      openai_api_key: sk-test
+
+  # Azure OpenAI embeddings
+  - name: azure_embeddings
+    from: azure:text-embedding-ada-002
+    params:
+      azure_api_key: azure-key
+      azure_api_version: "2024-02-15-preview"
+      azure_deployment_name: ada-embedding
+      endpoint: https://myresource.openai.azure.com
+
+  # Huggingface embeddings
+  - name: hf_embeddings
+    from: huggingface:sentence-transformers/all-MiniLM-L6-v2
+    params:
+      huggingface_token: hf_xxx
+
+  # File-based embeddings
+  - name: file_embeddings
+    from: file:models/embeddings.gguf
+
+# =============================================================================
+# EVALS
+# Evaluation configurations
+# =============================================================================
+evals:
+  - name: model_eval
+    description: Evaluate model quality
+    dataset: eval_dataset
+    scorers:
+      - accuracy
+      - f1_score
+      - bleu
+    dependsOn:
+      - openai_model
+    metrics:
+      metrics:
+        - name: eval.accuracy
+          enabled: true
+
+# =============================================================================
+# TOOLS
+# All tool types
+# =============================================================================
+tools:
+  # Web search tool
+  - name: web_search
+    from: websearch
+    description: Search the web for information
+    params:
+      engine: perplexity
+    env:
+      API_KEY: ${SEARCH_API_KEY}
+    dependsOn: []
+    metrics:
+      metrics:
+        - name: tool.invocations
+          enabled: true
+
+  # Built-in tools
+  - name: list_datasets
+    from: builtin:list_datasets
+    description: List available datasets
+
+  - name: sql_tool
+    from: builtin:sql
+    description: Execute SQL queries
+
+  - name: table_schema
+    from: builtin:table_schema
+    description: Get table schema
+
+  - name: sample_distinct_columns
+    from: builtin:sample_distinct_columns
+    description: Sample distinct column values
+
+  - name: random_sample
+    from: builtin:random_sample
+    description: Get random sample of data
+
+  - name: doc_similarity
+    from: builtin:document_similarity
+    description: Find similar documents
+
+  - name: get_readiness
+    from: builtin:get_readiness
+    description: Check component readiness
+
+  # MCP tool
+  - name: mcp_tool
+    from: mcp://localhost:3000/tool
+    description: MCP-based tool
+    params:
+      mcp_args: '["--config", "/path/to/config"]'
+
+# =============================================================================
+# WORKERS
+# Background worker configurations
+# =============================================================================
+workers:
+  # SQL-based worker with cron
+  - name: daily_aggregation
+    description: Daily data aggregation
+    sql: |
+      INSERT INTO aggregated_data
+      SELECT DATE(created_at) as day, COUNT(*) as count
+      FROM postgres_full
+      GROUP BY 1
+    cron: "0 0 * * *"
+    params:
+      timeout: 300s
+      retry_count: 3
+
+  # Load-balanced worker
+  - name: load_balanced_worker
+    description: Worker with load balancing
+    sql: SELECT 1
+    load_balance:
+      routing:
+        - from: model_a
+          order: 1
+        - from: model_b
+          order: 2
+        - from: model_c
+          weight: 50
+
+# =============================================================================
+# DEPENDENCIES
+# External spicepod dependencies
+# =============================================================================
+dependencies:
+  - spiceai/quickstart
+  - github.com/org/repo/path/to/spicepod
