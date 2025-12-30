@@ -126,6 +126,7 @@ impl TursoMetastore {
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
             file_size_bytes BIGINT NOT NULL,
+            source_data_file_path TEXT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";

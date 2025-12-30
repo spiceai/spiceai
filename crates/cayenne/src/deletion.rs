@@ -84,7 +84,8 @@ impl DeletionIdentifier {
 /// Specification describing a deletion-vector file that should be produced.
 ///
 /// A single deletion-vector file applies to one virtual data file (identified by
-/// `data_file_id`) and contains the logical row IDs to mark as deleted.
+/// `source_data_file_path` for position-based deletions) and contains the logical
+/// row IDs to mark as deleted.
 #[derive(Debug)]
 pub struct DeletionVectorWriteSpec {
     /// Row identifiers (position-based or key-based)
@@ -351,6 +352,7 @@ fn build_delete_file(
     Ok(DeleteFile {
         delete_file_id: 0,
         table_id: table.table_id,
+        source_data_file_path: None, // Set by caller for position-based deletions
         path: file_path.to_string_lossy().to_string(),
         path_is_relative: false,
         format: DELETION_FILE_FORMAT.to_string(),

@@ -19,7 +19,7 @@ limitations under the License.
 //! This module contains the main `CayenneTableProvider` struct which implements
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
-use super::constants::LISTING_TABLE_LOCK_POISONED;
+use super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
 use super::delete::{
     read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
@@ -859,6 +859,28 @@ impl CayenneTableProvider {
         // and retention filters are applied atomically.
         let _write_guard = self.write_lock.lock().await;
 
+        // For position-based deletion tables with pending deletions, we must compact
+        // before appending to prevent row ID conflicts. Position-based row IDs are global
+        // and become invalid when new files are added.
+        if self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
+            let has_pending_deletions = {
+                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "check deletion cache".to_string(),
+                    }
+                })?;
+                !guard.is_empty()
+            };
+
+            if has_pending_deletions {
+                tracing::info!(
+                    "Table {} has pending position-based deletions, performing merge-insert with compaction",
+                    self.table_metadata.table_name
+                );
+                return self.merge_insert_stream_with_compaction(stream).await;
+            }
+        }
+
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
         // Process stream in chunks and write them in parallel with bounded concurrency
@@ -1151,6 +1173,282 @@ impl CayenneTableProvider {
         }
 
         Ok((total_rows, chunk_count))
+    }
+
+    /// Write a stream of record batches to a specific snapshot directory, chunking into
+    /// parallel writes for efficiency.
+    ///
+    /// This is similar to `chunk_and_write_parallel` but writes to a specified snapshot
+    /// directory rather than the current listing table's location. This is used during
+    /// compaction operations where data needs to be written to a new snapshot.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - The stream of record batches to write
+    /// * `target_size_bytes` - Target size for each output file in bytes
+    /// * `snapshot_id` - The snapshot ID to write to
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (total rows written, number of files written)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write operation fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Parallel chunked writing requires orchestration logic"
+    )]
+    async fn chunk_and_write_parallel_to_snapshot(
+        &self,
+        mut stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+    ) -> CatalogResult<(u64, usize)> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::Instant;
+        use tokio::sync::Semaphore;
+
+        // Construct snapshot directory URL
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            snapshot_id,
+        );
+
+        // Create a new ListingTable pointing to the snapshot directory
+        let snapshot_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )?;
+
+        // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
+        let semaphore = Arc::new(Semaphore::new(4));
+
+        // Progress tracking for S3 Express uploads
+        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
+        let start_time = Instant::now();
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let total_bytes_written = Arc::new(AtomicUsize::new(0));
+        let files_written = Arc::new(AtomicUsize::new(0));
+        let mut write_tasks = tokio::task::JoinSet::new();
+
+        // Log when starting S3 upload process
+        if is_s3_storage {
+            tracing::info!(
+                "Starting S3 upload to snapshot {} for table {} (target chunk size: {})",
+                snapshot_id,
+                self.table_metadata.table_name,
+                format_bytes(target_size_bytes)
+            );
+        }
+
+        // Pre-allocate chunk vector with estimated capacity
+        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
+        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
+        let mut current_size = 0usize;
+        let mut total_rows = 0u64;
+        let mut chunk_count = 0usize;
+
+        let snapshot_listing_table = Arc::new(snapshot_listing_table);
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to read batch from stream.".to_string(),
+                source: Box::new(e),
+            })?;
+
+            let batch_size = batch.get_array_memory_size();
+
+            // If adding this batch would exceed target size and we have data, write current chunk
+            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
+                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
+                    CatalogError::InvalidOperation {
+                        message: "Failed to acquire write permit.".to_string(),
+                        source: Box::new(e),
+                    }
+                })?;
+
+                let chunk_to_write = std::mem::replace(
+                    &mut current_chunk,
+                    Vec::with_capacity(estimated_batches_per_chunk),
+                );
+                let chunk_size = current_size;
+                current_size = 0;
+                chunk_count += 1;
+
+                let listing_table_clone = Arc::clone(&snapshot_listing_table);
+                let total_bytes = Arc::clone(&total_bytes_written);
+                let files_count = Arc::clone(&files_written);
+                let progress_time = Arc::clone(&last_progress_ms);
+                let is_s3 = is_s3_storage;
+                let table_name = self.table_metadata.table_name.clone();
+                let start = start_time;
+                let current_chunk_num = chunk_count;
+
+                if is_s3 {
+                    tracing::info!(
+                        "Starting S3 upload for {} chunk {} ({})...",
+                        table_name,
+                        current_chunk_num,
+                        format_bytes(chunk_size)
+                    );
+                }
+
+                write_tasks.spawn(async move {
+                    let result =
+                        Self::write_chunk_to_listing_table(&listing_table_clone, chunk_to_write)
+                            .await;
+
+                    if is_s3 {
+                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
+                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        let elapsed = start.elapsed();
+                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                        let last_logged = progress_time.load(Ordering::Relaxed);
+                        let should_log =
+                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
+                        if should_log {
+                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                                #[expect(clippy::cast_precision_loss)]
+                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
+                                format_bytes_per_sec(bytes_per_sec)
+                            } else {
+                                "calculating...".to_string()
+                            };
+                            tracing::info!(
+                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                table_name,
+                                file_num,
+                                format_bytes(bytes_so_far),
+                                elapsed.as_secs_f64(),
+                                throughput
+                            );
+                            progress_time.store(elapsed_ms, Ordering::Relaxed);
+                        }
+                    }
+
+                    drop(permit);
+                    result
+                });
+            }
+
+            current_size += batch_size;
+            current_chunk.push(batch);
+        }
+
+        // Write final chunk if non-empty
+        if !current_chunk.is_empty() {
+            let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to acquire write permit for final chunk.".to_string(),
+                    source: Box::new(e),
+                }
+            })?;
+
+            chunk_count += 1;
+            let final_chunk_size = current_size;
+
+            let listing_table_clone = Arc::clone(&snapshot_listing_table);
+            let total_bytes = Arc::clone(&total_bytes_written);
+            let files_count = Arc::clone(&files_written);
+            let is_s3 = is_s3_storage;
+
+            write_tasks.spawn(async move {
+                let result =
+                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk).await;
+
+                if is_s3 {
+                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
+                    files_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                drop(permit);
+                result
+            });
+        }
+
+        // Wait for all writes to complete and collect row counts
+        while let Some(result) = write_tasks.join_next().await {
+            let row_count = result.map_err(|e| CatalogError::InvalidOperation {
+                message: "Write task panicked.".to_string(),
+                source: Box::new(e),
+            })??;
+            total_rows += row_count;
+        }
+
+        // Log final summary for S3 Express uploads
+        if is_s3_storage {
+            let elapsed = start_time.elapsed();
+            let total_bytes = total_bytes_written.load(Ordering::Relaxed);
+            let files_count = files_written.load(Ordering::Relaxed);
+            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                #[expect(clippy::cast_precision_loss)]
+                let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
+                format_bytes_per_sec(bytes_per_sec)
+            } else {
+                "N/A".to_string()
+            };
+            tracing::info!(
+                "Completed S3 upload for {} to snapshot {}: {} rows in {} files ({}) in {:.1}s, {}",
+                self.table_metadata.table_name,
+                snapshot_id,
+                total_rows,
+                files_count,
+                format_bytes(total_bytes),
+                elapsed.as_secs_f64(),
+                throughput
+            );
+        }
+
+        Ok((total_rows, chunk_count))
+    }
+
+    /// Write a chunk of record batches to a specific `ListingTable`.
+    ///
+    /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
+    async fn write_chunk_to_listing_table(
+        listing_table: &ListingTable,
+        chunk: Vec<RecordBatch>,
+    ) -> CatalogResult<u64> {
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = chunk[0].schema();
+        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
+
+        // Create a stream from the chunk batches
+        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
+        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+
+        let stream_exec = Arc::new(StreamingExec::new(
+            Arc::clone(&schema),
+            Box::pin(chunk_stream),
+        ));
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let insert_plan = listing_table
+            .insert_into(&state, stream_exec, InsertOp::Append)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to create insert plan for chunk.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        collect(insert_plan, state.task_ctx()).await.map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: "Failed to execute insert for chunk.".to_string(),
+                source: Box::new(e),
+            }
+        })?;
+
+        Ok(row_count)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -1542,6 +1840,386 @@ impl CayenneTableProvider {
         Err(CatalogError::NotImplemented {
             function: "delete_by_primary_key".to_string(),
         })
+    }
+
+    /// Perform a merge-insert: read existing data with deletion filter, combine with new data,
+    /// and write to a new snapshot. This is used for position-based deletion tables to ensure
+    /// deletions are applied before new data is added, preventing row ID conflicts.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - The session state for query execution
+    /// * `new_input` - The execution plan for new data to insert
+    ///
+    /// # Returns
+    ///
+    /// An execution plan that writes the merged data to a new snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge-insert operation fails.
+    async fn merge_insert_with_compaction(
+        &self,
+        state: &dyn Session,
+        new_input: Arc<dyn ExecutionPlan>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        use super::delete::DeletionFilterExec;
+        use datafusion_physical_plan::union::UnionExec;
+
+        // Get the existing listing table
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
+            })?;
+            Arc::clone(&guard)
+        };
+
+        // Create a new session context for the scan
+        let ctx = SessionContext::new();
+
+        // Scan existing data with deletion filter applied
+        let existing_scan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await?;
+
+        // Apply deletion filter to existing data
+        let filtered_existing = {
+            let deleted_row_ids = {
+                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                Arc::clone(&guard)
+            };
+
+            Arc::new(DeletionFilterExec::new(existing_scan, deleted_row_ids))
+        };
+
+        // Union the filtered existing data with new input
+        let union_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(UnionExec::new(vec![filtered_existing, new_input]));
+
+        // Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Construct snapshot directory URL
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+
+        // For local paths, ensure the directory exists
+        if !self.table_metadata.path.starts_with("s3://") {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        // Create a new ListingTable pointing to the snapshot directory
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )
+        .map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to create listing table for compaction snapshot: {e}"
+            ))
+        })?;
+
+        // Perform the insert using the new listing table with append mode
+        let result = new_listing_table
+            .insert_into(state, union_plan, InsertOp::Append)
+            .await?;
+
+        // Update the catalog to point to the new snapshot
+        self.catalog
+            .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to update snapshot after compaction: {e}"
+                ))
+            })?;
+
+        // Clear the cached deletion vectors since they've been applied
+        {
+            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    DELETION_CACHE_LOCK_POISONED.to_string(),
+                )
+            })?;
+            *guard = Arc::new(roaring::RoaringBitmap::new());
+        }
+
+        // Update the provider's listing table to point to the new snapshot
+        {
+            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
+            })?;
+            *listing_table_guard = new_listing_table;
+        }
+
+        // Cleanup old snapshots
+        if self.table_metadata.path.starts_with("s3://") {
+            let current_snapshot = new_snapshot_id.clone();
+            if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
+                tracing::warn!(
+                    "Failed to cleanup old S3 snapshots for table {}: {err}",
+                    self.table_metadata.table_id
+                );
+            }
+        } else {
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                    &table_path,
+                    table_id,
+                    &current_snapshot,
+                ) {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
+        }
+
+        tracing::info!(
+            "Completed merge-insert with compaction for table {}",
+            self.table_metadata.table_name
+        );
+
+        Ok(result)
+    }
+
+    /// Perform a merge-insert with compaction using a stream of new data.
+    ///
+    /// This is the stream-based version used by the `insert()` method.
+    /// It reads existing data with the deletion filter applied, combines with the new stream,
+    /// and writes everything to a new snapshot.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_stream` - Stream of new data batches to insert
+    ///
+    /// # Returns
+    ///
+    /// The total number of rows written (existing + new).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge-insert operation fails.
+    async fn merge_insert_stream_with_compaction(
+        &self,
+        new_stream: SendableRecordBatchStream,
+    ) -> CatalogResult<u64> {
+        use super::delete::DeletionFilterExec;
+
+        // First, collect all new data batches
+        let new_batches: Vec<RecordBatch> = new_stream
+            .try_collect()
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to collect new data stream".to_string(),
+                source: Box::new(e),
+            })?;
+
+        let new_row_count: u64 = new_batches
+            .iter()
+            .map(|b| u64::try_from(b.num_rows()).unwrap_or(0))
+            .sum();
+
+        // Get existing data with deletion filter applied
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| CatalogError::LockPoisoned {
+                operation: "read listing table".to_string(),
+            })?;
+            Arc::clone(&guard)
+        };
+
+        let ctx = SessionContext::new();
+
+        // Scan existing data
+        let existing_scan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to scan existing data for compaction".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // Apply deletion filter
+        let deleted_row_ids = {
+            let guard = self.cached_deleted_row_ids.read().map_err(|_| CatalogError::LockPoisoned {
+                operation: "read deletion cache".to_string(),
+            })?;
+            Arc::clone(&guard)
+        };
+
+        let filtered_plan = Arc::new(DeletionFilterExec::new(existing_scan, deleted_row_ids));
+
+        // Collect existing (filtered) data
+        let existing_batches = collect(filtered_plan, ctx.task_ctx())
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to collect existing data for compaction".to_string(),
+                source: Box::new(e),
+            })?;
+
+        let existing_row_count: u64 = existing_batches
+            .iter()
+            .map(|b| u64::try_from(b.num_rows()).unwrap_or(0))
+            .sum();
+
+        // Combine all batches
+        let all_batches: Vec<RecordBatch> = existing_batches
+            .into_iter()
+            .chain(new_batches)
+            .collect();
+
+        if all_batches.is_empty() {
+            // Nothing to write - just clear deletions and return
+            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "clear deletion cache".to_string(),
+                }
+            })?;
+            *guard = Arc::new(roaring::RoaringBitmap::new());
+            return Ok(0);
+        }
+
+        // Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Construct snapshot directory URL
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+
+        // For local paths, ensure the directory exists
+        if !self.table_metadata.path.starts_with("s3://") {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::ensure_snapshot_dir_exists(&snapshot_dir)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to create snapshot directory".to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+
+        // Write all batches to new snapshot
+        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+
+        // Create a stream from the batches
+        let schema = Arc::clone(&self.table_metadata.schema);
+        let batch_stream = futures::stream::iter(all_batches.into_iter().map(Ok));
+        let stream: SendableRecordBatchStream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batch_stream),
+        );
+
+        // Use chunk_and_write with the new listing table's path
+        let (total_rows, chunk_count) = self
+            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .await?;
+
+        tracing::debug!(
+            "Compaction completed: wrote {} rows to {} chunks",
+            total_rows,
+            chunk_count
+        );
+
+        // Create a new ListingTable pointing to the snapshot directory AFTER files are written
+        // This ensures the ListingTable discovers all the newly written files
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )?;
+
+        // Update the catalog to point to the new snapshot
+        self.catalog
+            .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
+            .await?;
+
+        // Clear deletion files from catalog since they've been applied
+        self.catalog
+            .clear_delete_files(self.table_metadata.table_id)
+            .await?;
+
+        // Clear the cached deletion vectors since they've been applied
+        {
+            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "clear deletion cache after compaction".to_string(),
+                }
+            })?;
+            *guard = Arc::new(roaring::RoaringBitmap::new());
+        }
+
+        // Update the provider's listing table to point to the new snapshot
+        {
+            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "update listing table after compaction".to_string(),
+                }
+            })?;
+            *listing_table_guard = new_listing_table;
+        }
+
+        // Cleanup old snapshots
+        if self.table_metadata.path.starts_with("s3://") {
+            let current_snapshot = new_snapshot_id.clone();
+            if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
+                tracing::warn!(
+                    "Failed to cleanup old S3 snapshots for table {}: {err}",
+                    self.table_metadata.table_id
+                );
+            }
+        } else {
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                    &table_path,
+                    table_id,
+                    &current_snapshot,
+                ) {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
+        }
+
+        tracing::info!(
+            "Completed merge-insert stream with compaction for table {}: {} existing + {} new = {} total rows",
+            self.table_metadata.table_name,
+            existing_row_count,
+            new_row_count,
+            total_rows
+        );
+
+        Ok(total_rows)
     }
 
     /// Update rows matching the given primary key values.
@@ -2184,6 +2862,28 @@ impl TableProvider for CayenneTableProvider {
                 &self.table_metadata.current_snapshot_id,
             );
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        // For position-based deletion tables with pending deletions, we must compact
+        // before appending to prevent row ID conflicts. Position-based row IDs are global
+        // and become invalid when new files are added.
+        if self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
+            let has_pending_deletions = {
+                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                !guard.is_empty()
+            };
+
+            if has_pending_deletions {
+                tracing::info!(
+                    "Table {} has pending position-based deletions, converting append to merge-insert",
+                    self.table_metadata.table_name
+                );
+                return self.merge_insert_with_compaction(state, input).await;
+            }
         }
 
         // Clone the Arc and drop the lock before awaiting

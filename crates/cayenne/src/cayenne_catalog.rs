@@ -476,9 +476,9 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
                     table_id, path, path_is_relative,
-                    format, delete_count, file_size_bytes
+                    format, delete_count, file_size_bytes, source_data_file_path
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7
                 )
             ",
                 params: vec![
@@ -488,6 +488,10 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Text(delete_file.format.clone()),
                     MetastoreValue::Integer(delete_file.delete_count),
                     MetastoreValue::Integer(delete_file.file_size_bytes),
+                    delete_file
+                        .source_data_file_path
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Text),
                 ],
             })
             .await;
@@ -539,7 +543,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: "SELECT delete_file_id, table_id, path, path_is_relative, 
-                        format, delete_count, file_size_bytes 
+                        format, delete_count, file_size_bytes, source_data_file_path 
                  FROM cayenne_delete_file 
                  WHERE table_id = ?1",
                     params: vec![MetastoreValue::Integer(table_id)],
@@ -548,6 +552,7 @@ impl MetadataCatalog for CayenneCatalog {
                     Ok(DeleteFile {
                         delete_file_id: row.get_i64(0)?,
                         table_id: row.get_i64(1)?,
+                        source_data_file_path: row.get_optional_string(7)?,
                         path: row.get_string(2)?,
                         path_is_relative: row.get_bool(3)?,
                         format: row.get_string(4)?,
@@ -563,6 +568,19 @@ impl MetadataCatalog for CayenneCatalog {
             .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
                 source: Box::new(e),
             })
+    }
+
+    async fn clear_delete_files(&self, table_id: i64) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_delete_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
+                source: Box::new(e),
+            })?;
+        Ok(())
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64> {
@@ -897,6 +915,7 @@ mod tests {
                 let delete_file = DeleteFile {
                     delete_file_id: 0, // Will be assigned by catalog
                     table_id,
+                    source_data_file_path: None,
                     path: format!("/tmp/delete_file_{i}.parquet"),
                     path_is_relative: false,
                     format: "parquet".to_string(),

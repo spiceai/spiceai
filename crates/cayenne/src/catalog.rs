@@ -190,6 +190,12 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: i64) -> CatalogResult<Vec<DeleteFile>>;
 
+    /// Clear all delete files for a table.
+    ///
+    /// This is called after compaction to remove deletion vectors that have been
+    /// applied to the data files.
+    async fn clear_delete_files(&self, table_id: i64) -> CatalogResult<()>;
+
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64>;
 

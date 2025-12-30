@@ -95,6 +95,10 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
+    /// Path of the data file this deletion vector applies to (for position-based deletions).
+    /// `None` for key-based deletions which apply to the entire table.
+    /// For position-based deletions, row IDs are relative to this specific data file.
+    pub source_data_file_path: Option<String>,
     /// Path to the delete file (Arrow IPC format)
     pub path: String,
     /// Whether the path is relative
