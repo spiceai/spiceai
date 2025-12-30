@@ -26,8 +26,8 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use smb::resource::file_util::ReadAt;
 use smb::{
@@ -38,8 +38,8 @@ use smb::{
 use tokio::sync::OnceCell;
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error,
-    process_directory_entries, process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
+    process_directory_entries_shallow, resolve_range,
 };
 
 const STORE_NAME: &str = "SMB";
@@ -94,12 +94,11 @@ impl bb8::ManageConnection for SMBConnectionManager {
             let client = Client::new(client_config);
 
             let unc_string = format!(r"\\{server}\{share}");
-            let target_path = UncPath::from_str(&unc_string).map_err(|e| {
-                object_store::Error::Generic {
+            let target_path =
+                UncPath::from_str(&unc_string).map_err(|e| object_store::Error::Generic {
                     store: STORE_NAME,
                     source: format!("Invalid UNC path {unc_string}: {e}").into(),
-                }
-            })?;
+                })?;
 
             client
                 .share_connect(&target_path, &username, password)
@@ -544,10 +543,7 @@ impl ObjectStore for SMBObjectStore {
         .boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.list_directory_shallow(prefix).await
     }
 

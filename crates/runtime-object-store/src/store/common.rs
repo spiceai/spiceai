@@ -202,11 +202,7 @@ pub fn build_byte_range(start: u64, end: u64) -> Range<u64> {
 
 /// Create an `ObjectMeta` from basic file information.
 #[must_use]
-pub fn build_object_meta(
-    location: Path,
-    size: u64,
-    last_modified: DateTime<Utc>,
-) -> ObjectMeta {
+pub fn build_object_meta(location: Path, size: u64, last_modified: DateTime<Utc>) -> ObjectMeta {
     ObjectMeta {
         location,
         size,
@@ -306,8 +302,8 @@ mod tests {
 
     #[test]
     fn test_process_directory_entries_shallow() {
-        let timestamp = chrono::DateTime::from_timestamp(1700000000, 0)
-            .expect("valid timestamp for test");
+        let timestamp =
+            chrono::DateTime::from_timestamp(1700000000, 0).expect("valid timestamp for test");
         let entries = vec![
             DirEntry::file("file1.txt".to_string(), 100, timestamp),
             DirEntry::directory("subdir".to_string()),
@@ -323,21 +319,17 @@ mod tests {
 
     #[test]
     fn test_build_object_meta() {
-        let timestamp = chrono::DateTime::from_timestamp(1700000000, 0)
-            .expect("valid timestamp for test");
-        let meta = build_object_meta(
-            Path::from("test/file.parquet"),
-            4096,
-            timestamp,
-        );
+        let timestamp =
+            chrono::DateTime::from_timestamp(1700000000, 0).expect("valid timestamp for test");
+        let meta = build_object_meta(Path::from("test/file.parquet"), 4096, timestamp);
 
         assert_debug_snapshot!(meta);
     }
 
     #[test]
     fn test_dir_entry_constructors() {
-        let timestamp = chrono::DateTime::from_timestamp(1700000000, 0)
-            .expect("valid timestamp for test");
+        let timestamp =
+            chrono::DateTime::from_timestamp(1700000000, 0).expect("valid timestamp for test");
         let file = DirEntry::file("data.csv".to_string(), 1024, timestamp);
         let dir = DirEntry::directory("subdir".to_string());
 
@@ -350,4 +342,3 @@ mod tests {
         assert_eq!(dir.size, 0);
     }
 }
-
