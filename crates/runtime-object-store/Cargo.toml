@@ -23,7 +23,6 @@ http.workspace = true
 libnfs = { version = "0.1", optional = true }
 nix = { version = "0.30", optional = true }
 object_store.workspace = true
-parking_lot = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 smb = { version = "0.11", optional = true }
@@ -38,6 +37,7 @@ url.workspace = true
 insta = { workspace = true, features = ["json", "redactions"] }
 
 [features]
-ftp = ["dep:suppaftp", "dep:ssh2", "dep:bb8"]
+ftp = ["dep:suppaftp", "dep:bb8"]
 nfs = ["dep:libnfs", "dep:nix"]
+sftp = ["dep:ssh2"]
 smb = ["dep:smb", "dep:bb8"]

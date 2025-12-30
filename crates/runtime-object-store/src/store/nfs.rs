@@ -129,7 +129,7 @@ impl NFSObjectStore {
             .collect()
     }
 
-    /// List all files recursively with parallel directory traversal.
+    /// List all files recursively, offloading blocking NFS traversal to a dedicated thread.
     async fn list_all_files(
         &self,
         prefix: Option<String>,

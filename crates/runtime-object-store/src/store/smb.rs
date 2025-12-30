@@ -63,13 +63,25 @@ fn filetime_to_datetime(filetime: u64) -> DateTime<Utc> {
 }
 
 /// Connection manager for bb8 connection pool.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SMBConnectionManager {
     server: String,
     share: String,
     username: String,
     password: String,
     timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for SMBConnectionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SMBConnectionManager")
+            .field("server", &self.server)
+            .field("share", &self.share)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl bb8::ManageConnection for SMBConnectionManager {
@@ -121,13 +133,25 @@ impl bb8::ManageConnection for SMBConnectionManager {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SMBClientConfig {
     server: String,
     share: String,
     username: String,
     password: String,
     timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for SMBClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SMBClientConfig")
+            .field("server", &self.server)
+            .field("share", &self.share)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl SMBClientConfig {

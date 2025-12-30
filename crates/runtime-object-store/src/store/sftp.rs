@@ -39,13 +39,25 @@ use super::common::{
 
 const STORE_NAME: &str = "SFTP";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SFTPClientConfig {
     user: String,
     password: String,
     host: String,
     port: String,
     timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for SFTPClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SFTPClientConfig")
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl SFTPClientConfig {

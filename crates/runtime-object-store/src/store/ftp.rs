@@ -45,13 +45,25 @@ const MAX_CONCURRENT_LISTINGS: usize = 4;
 const DEFAULT_POOL_SIZE: u32 = 4;
 
 /// Connection manager for bb8 connection pool.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct FTPConnectionManager {
     user: String,
     password: String,
     host: String,
     port: String,
     timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for FTPConnectionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FTPConnectionManager")
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl bb8::ManageConnection for FTPConnectionManager {
@@ -111,13 +123,25 @@ impl bb8::ManageConnection for FTPConnectionManager {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct FTPClientConfig {
     user: String,
     password: String,
     host: String,
     port: String,
     timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for FTPClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FTPClientConfig")
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl FTPClientConfig {
@@ -318,7 +342,7 @@ impl FTPObjectStore {
         Ok(entries)
     }
 
-    /// List all files recursively with parallel directory traversal.
+    /// List all files recursively using batched directory traversal.
     async fn list_all_files(
         &self,
         location: Option<Path>,
