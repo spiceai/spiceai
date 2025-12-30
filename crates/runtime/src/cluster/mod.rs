@@ -168,7 +168,7 @@ impl ResolvedClusterConfig {
             let mut missing_flags = Vec::new();
 
             if tls_config.is_none() && !config.insecure {
-                missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --insecure)");
+                missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --allow-insecure-connections)");
             }
             if config.node_advertise_address.is_none() {
                 missing_flags.push("--node-advertise-address");
@@ -309,8 +309,8 @@ impl ResolvedClusterConfig {
 
     /// Returns whether this node allows insecure cluster communication.
     #[must_use]
-    pub fn insecure(&self) -> bool {
-        self.config.insecure
+    pub fn allow_insecure_connections(&self) -> bool {
+        self.config.allow_insecure_connections
     }
 
     /// Returns the client TLS config for connecting to other cluster nodes.
