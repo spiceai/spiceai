@@ -140,10 +140,8 @@ impl BuiltinToolCatalog {
                     .boxed()
                     .context(FailedToConstructToolSnafu { id })?,
                 )
-            } else if let Some(ref model_allowlist) = self.model_table_allowlist {
-                Some(model_allowlist.clone())
             } else {
-                None
+                self.model_table_allowlist.clone()
             };
 
         match id {
