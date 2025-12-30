@@ -545,7 +545,7 @@ impl SpiceObjectStoreRegistry {
             return self.prepare_s3_object_store(url);
         }
 
-        if url.as_str().starts_with("abfs://") {
+        if url.as_str().starts_with("abfs://") || url.as_str().starts_with("abfss://") {
             return self.prepare_azure_object_store(url);
         }
 
