@@ -14,18 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::ops::Range;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bb8::{Pool, PooledConnection};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use smb::resource::file_util::ReadAt;
@@ -34,10 +35,18 @@ use smb::{
     FileAttributes, FileBothDirectoryInformation, FileStandardInformation, Resource, UncPath,
     resource::{Directory, FileCreateArgs},
 };
+use tokio::sync::OnceCell;
 
-use super::common::{DirEntry, generic_error, process_directory_entries};
+use super::common::{
+    DirEntry, build_byte_range, build_object_meta, generic_error,
+    process_directory_entries, process_directory_entries_shallow, resolve_range,
+};
 
 const STORE_NAME: &str = "SMB";
+/// Maximum number of concurrent directory listings for parallel traversal.
+const MAX_CONCURRENT_LISTINGS: usize = 8;
+/// Default connection pool size.
+const DEFAULT_POOL_SIZE: u32 = 4;
 
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
@@ -48,12 +57,69 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
 /// Convert Windows FILETIME (100-nanosecond intervals since Jan 1, 1601)
 /// to Unix timestamp (seconds since Jan 1, 1970)
 fn filetime_to_datetime(filetime: u64) -> DateTime<Utc> {
-    // FILETIME is 100-nanosecond intervals since Jan 1, 1601
-    // Unix epoch is Jan 1, 1970
-    // Difference is 11644473600 seconds (369 years)
     let unix_secs = (filetime / 10_000_000).saturating_sub(11_644_473_600);
     let secs_i64 = i64::try_from(unix_secs).unwrap_or(i64::MAX);
     DateTime::<Utc>::from_timestamp(secs_i64, 0).unwrap_or_else(Utc::now)
+}
+
+/// Connection manager for bb8 connection pool.
+#[derive(Debug, Clone)]
+struct SMBConnectionManager {
+    server: String,
+    share: String,
+    username: String,
+    password: String,
+    timeout: Option<Duration>,
+}
+
+impl bb8::ManageConnection for SMBConnectionManager {
+    type Connection = Client;
+    type Error = object_store::Error;
+
+    fn connect(&self) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
+        let server = self.server.clone();
+        let share = self.share.clone();
+        let username = self.username.clone();
+        let password = self.password.clone();
+        let timeout = self.timeout;
+
+        Box::pin(async move {
+            let client_config = ClientConfig {
+                connection: ConnectionConfig {
+                    timeout,
+                    ..ConnectionConfig::default()
+                },
+                ..ClientConfig::default()
+            };
+            let client = Client::new(client_config);
+
+            let unc_string = format!(r"\\{server}\{share}");
+            let target_path = UncPath::from_str(&unc_string).map_err(|e| {
+                object_store::Error::Generic {
+                    store: STORE_NAME,
+                    source: format!("Invalid UNC path {unc_string}: {e}").into(),
+                }
+            })?;
+
+            client
+                .share_connect(&target_path, &username, password)
+                .await
+                .map_err(handle_error)?;
+
+            Ok(client)
+        })
+    }
+
+    fn is_valid(
+        &self,
+        _conn: &mut Self::Connection,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +151,7 @@ impl SMBClientConfig {
     fn unc_path(&self) -> object_store::Result<UncPath> {
         let unc_string = format!(r"\\{}\{}", self.server, self.share);
         UncPath::from_str(&unc_string).map_err(|e| object_store::Error::Generic {
-            store: "SMB",
+            store: STORE_NAME,
             source: format!("Invalid UNC path {unc_string}: {e}").into(),
         })
     }
@@ -95,38 +161,72 @@ impl SMBClientConfig {
         if subpath.is_empty() {
             return Ok(base);
         }
-        // Convert forward slashes to backslashes for SMB paths
         let smb_path = subpath.replace('/', r"\");
         let unc_string = format!(r"{base}\{smb_path}");
         UncPath::from_str(&unc_string).map_err(|e| object_store::Error::Generic {
-            store: "SMB",
+            store: STORE_NAME,
             source: format!("Invalid UNC path {unc_string}: {e}").into(),
         })
     }
 
-    async fn connect(&self) -> object_store::Result<Client> {
-        let client_config = ClientConfig {
-            connection: ConnectionConfig {
-                timeout: self.timeout,
-                ..ConnectionConfig::default()
-            },
-            ..ClientConfig::default()
-        };
-        let client = Client::new(client_config);
-        let target_path = self.unc_path()?;
-
-        client
-            .share_connect(&target_path, &self.username, self.password.clone())
-            .await
-            .map_err(handle_error)?;
-
-        Ok(client)
+    fn create_pool_manager(&self) -> SMBConnectionManager {
+        SMBConnectionManager {
+            server: self.server.clone(),
+            share: self.share.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            timeout: self.timeout,
+        }
     }
 }
 
-#[derive(Debug)]
-pub struct SMBObjectStore {
+/// Inner state holding the lazily-initialized connection pool.
+struct SMBInner {
     config: Arc<SMBClientConfig>,
+    pool: OnceCell<Pool<SMBConnectionManager>>,
+}
+
+impl SMBInner {
+    fn new(config: Arc<SMBClientConfig>) -> Self {
+        Self {
+            config,
+            pool: OnceCell::new(),
+        }
+    }
+
+    async fn get_pool(&self) -> object_store::Result<&Pool<SMBConnectionManager>> {
+        self.pool
+            .get_or_try_init(|| async {
+                let manager = self.config.create_pool_manager();
+                Pool::builder()
+                    .max_size(DEFAULT_POOL_SIZE)
+                    .build(manager)
+                    .await
+                    .map_err(handle_error)
+            })
+            .await
+    }
+
+    async fn get_connection(
+        &self,
+    ) -> object_store::Result<PooledConnection<'_, SMBConnectionManager>> {
+        let pool = self.get_pool().await?;
+        pool.get().await.map_err(handle_error)
+    }
+}
+
+impl std::fmt::Debug for SMBInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SMBInner")
+            .field("config", &self.config)
+            .field("pool_initialized", &self.pool.initialized())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SMBObjectStore {
+    inner: Arc<SMBInner>,
 }
 
 impl std::fmt::Display for SMBObjectStore {
@@ -136,6 +236,8 @@ impl std::fmt::Display for SMBObjectStore {
 }
 
 impl SMBObjectStore {
+    /// Create a new SMB object store with lazy connection pooling.
+    /// The connection pool is initialized on first use.
     #[must_use]
     pub fn new(
         server: String,
@@ -144,73 +246,70 @@ impl SMBObjectStore {
         password: String,
         timeout: Option<Duration>,
     ) -> Self {
+        let config = Arc::new(SMBClientConfig::new(
+            server, share, username, password, timeout,
+        ));
         Self {
-            config: Arc::new(SMBClientConfig::new(
-                server, share, username, password, timeout,
-            )),
+            inner: Arc::new(SMBInner::new(config)),
         }
     }
 
-    /// List all files recursively starting from a given path
-    async fn list_all_files(
-        &self,
-        prefix: Option<String>,
-    ) -> object_store::Result<Vec<ObjectMeta>> {
-        let client = self.config.connect().await?;
-        let mut results = Vec::new();
-        let mut queue = vec![prefix.unwrap_or_default()];
+    async fn list_directory(
+        client: &Client,
+        config: &SMBClientConfig,
+        dir_path: &str,
+    ) -> object_store::Result<Vec<DirEntry>> {
+        let unc_path = config.unc_path_with_subpath(dir_path)?;
 
-        while let Some(current_path) = queue.pop() {
-            let dir_path = self.config.unc_path_with_subpath(&current_path)?;
+        let dir_open_args = FileCreateArgs {
+            desired_access: FileAccessMask::new().with_generic_read(true),
+            disposition: CreateDisposition::Open,
+            options: CreateOptions::new().with_directory_file(true),
+            attributes: FileAttributes::default(),
+        };
 
-            // Open directory for listing
-            let dir_open_args = FileCreateArgs {
-                desired_access: FileAccessMask::new().with_generic_read(true),
-                disposition: CreateDisposition::Open,
-                options: CreateOptions::new().with_directory_file(true),
-                attributes: FileAttributes::default(),
-            };
+        let resource = match client.create_file(&unc_path, &dir_open_args).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Failed to open directory {unc_path}: {e}");
+                return Ok(Vec::new());
+            }
+        };
 
-            let resource = match client.create_file(&dir_path, &dir_open_args).await {
-                Ok(r) => r,
+        let Resource::Directory(directory) = resource else {
+            tracing::warn!("Expected directory but got different resource type for {unc_path}");
+            return Ok(Vec::new());
+        };
+
+        let dir_arc = Arc::new(directory);
+        let query_stream =
+            match Directory::query::<FileBothDirectoryInformation>(&dir_arc, "*").await {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("Failed to open directory {dir_path}: {e}");
-                    continue;
+                    tracing::warn!("Failed to query directory {unc_path}: {e}");
+                    let _ = dir_arc.close().await;
+                    return Ok(Vec::new());
                 }
             };
 
-            let Resource::Directory(directory) = resource else {
-                tracing::warn!("Expected directory but got different resource type for {dir_path}");
-                continue;
-            };
-
-            // Query directory contents
-            let dir_arc = Arc::new(directory);
-            let query_stream =
-                match Directory::query::<FileBothDirectoryInformation>(&dir_arc, "*").await {
-                    Ok(s) => s,
+        let smb_entries: Vec<_> = query_stream
+            .filter_map(|r| async {
+                match r {
+                    Ok(entry) => Some(entry),
                     Err(e) => {
-                        tracing::warn!("Failed to query directory {dir_path}: {e}");
-                        continue;
+                        tracing::warn!("Error reading directory entry: {e}");
+                        None
                     }
-                };
+                }
+            })
+            .collect()
+            .await;
 
-            // Collect entries from the stream
-            let smb_entries: Vec<_> = query_stream
-                .filter_map(|r| async {
-                    match r {
-                        Ok(entry) => Some(entry),
-                        Err(e) => {
-                            tracing::warn!("Error reading directory entry: {e}");
-                            None
-                        }
-                    }
-                })
-                .collect()
-                .await;
+        let _ = dir_arc.close().await;
 
-            // Convert SMB entries to common DirEntry format
-            let entries = smb_entries.into_iter().map(|e| {
+        let entries = smb_entries
+            .into_iter()
+            .map(|e| {
                 if e.file_attributes.directory() {
                     DirEntry::directory(e.file_name.to_string())
                 } else {
@@ -220,18 +319,96 @@ impl SMBObjectStore {
                         filetime_to_datetime(*e.last_write_time),
                     )
                 }
-            });
+            })
+            .collect();
 
-            // Use common utility to process entries
-            let (files, dirs) = process_directory_entries(&current_path, entries);
-            results.extend(files);
-            queue.extend(dirs);
+        Ok(entries)
+    }
 
-            // Close the directory handle
-            let _ = dir_arc.close().await;
+    async fn list_all_files(
+        &self,
+        prefix: Option<String>,
+    ) -> object_store::Result<Vec<ObjectMeta>> {
+        let conn = self.inner.get_connection().await?;
+        let config = Arc::clone(&self.inner.config);
+        let mut results = Vec::new();
+        let mut queue = vec![prefix.unwrap_or_default()];
+
+        while !queue.is_empty() {
+            let batch: Vec<_> = queue
+                .drain(..queue.len().min(MAX_CONCURRENT_LISTINGS))
+                .collect();
+
+            let futures: Vec<_> = batch
+                .iter()
+                .map(|dir_path| Self::list_directory(&conn, &config, dir_path))
+                .collect();
+
+            let batch_results = futures::future::join_all(futures).await;
+
+            for (dir_path, result) in batch.into_iter().zip(batch_results) {
+                match result {
+                    Ok(entries) => {
+                        let (files, dirs) = process_directory_entries(&dir_path, entries);
+                        results.extend(files);
+                        queue.extend(dirs);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to list directory {dir_path}: {e}");
+                    }
+                }
+            }
         }
 
         Ok(results)
+    }
+
+    async fn list_directory_shallow(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<ListResult> {
+        let conn = self.inner.get_connection().await?;
+        let prefix_str = prefix.map_or(String::new(), |p| p.to_string());
+
+        let entries = Self::list_directory(&conn, &self.inner.config, &prefix_str).await?;
+        Ok(process_directory_entries_shallow(&prefix_str, entries))
+    }
+
+    async fn get_file_metadata(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        let conn = self.inner.get_connection().await?;
+        let location_str = location.to_string();
+        let file_path = self.inner.config.unc_path_with_subpath(&location_str)?;
+
+        let file_open_args = FileCreateArgs {
+            desired_access: FileAccessMask::new().with_file_read_attributes(true),
+            disposition: CreateDisposition::Open,
+            options: CreateOptions::new().with_non_directory_file(true),
+            attributes: FileAttributes::default(),
+        };
+
+        let resource = conn
+            .create_file(&file_path, &file_open_args)
+            .await
+            .map_err(|e| object_store::Error::NotFound {
+                path: location_str.clone(),
+                source: e.into(),
+            })?;
+
+        let Resource::File(file) = resource else {
+            return Err(object_store::Error::NotFound {
+                path: location_str,
+                source: "Path is not a file".into(),
+            });
+        };
+
+        let file_info: FileStandardInformation = file.query_info().await.map_err(handle_error)?;
+        let _ = file.close().await;
+
+        Ok(build_object_meta(
+            location.clone(),
+            file_info.end_of_file,
+            Utc::now(),
+        ))
     }
 }
 
@@ -263,11 +440,10 @@ impl ObjectStore for SMBObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = self.config.connect().await?;
+        let conn = self.inner.get_connection().await?;
         let location_str = location.to_string();
-        let file_path = self.config.unc_path_with_subpath(&location_str)?;
+        let file_path = self.inner.config.unc_path_with_subpath(&location_str)?;
 
-        // Open file for reading
         let file_open_args = FileCreateArgs {
             desired_access: FileAccessMask::new()
                 .with_generic_read(true)
@@ -278,7 +454,7 @@ impl ObjectStore for SMBObjectStore {
             attributes: FileAttributes::default(),
         };
 
-        let resource = client
+        let resource = conn
             .create_file(&file_path, &file_open_args)
             .await
             .map_err(|e| object_store::Error::NotFound {
@@ -293,27 +469,13 @@ impl ObjectStore for SMBObjectStore {
             });
         };
 
-        // Get file info for size and modification time
         let file_info: FileStandardInformation = file.query_info().await.map_err(handle_error)?;
 
         let size = file_info.end_of_file;
-        let object_meta = ObjectMeta {
-            location: location.clone(),
-            size,
-            last_modified: Utc::now(), // Standard info doesn't include times
-            e_tag: None,
-            version: None,
-        };
+        let object_meta = build_object_meta(location.clone(), size, Utc::now());
 
-        let mut start = 0u64;
-        let mut end = size;
+        let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
 
-        if let Some(GetRange::Bounded(range)) = options.range {
-            start = range.start;
-            end = range.end;
-        }
-
-        let data_to_read = end.saturating_sub(start);
         #[expect(clippy::cast_possible_truncation)]
         let mut buffer = vec![0u8; data_to_read as usize];
         file.read_at(&mut buffer, start)
@@ -328,9 +490,13 @@ impl ObjectStore for SMBObjectStore {
         Ok(GetResult {
             meta: object_meta,
             payload: GetResultPayload::Stream(Box::pin(stream)),
-            range: Range { start, end },
+            range: build_byte_range(start, end),
             attributes: Attributes::default(),
         })
+    }
+
+    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        self.get_file_metadata(location).await
     }
 
     async fn delete(&self, _location: &Path) -> object_store::Result<()> {
@@ -352,11 +518,8 @@ impl ObjectStore for SMBObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let config = Arc::clone(&self.config);
+        let store = self.clone();
         let prefix_str = prefix.map(ToString::to_string);
-
-        // Create a future that lists all files, then convert to stream
-        let store = Self { config };
 
         let fut = async move {
             match store.list_all_files(prefix_str).await {
@@ -365,7 +528,6 @@ impl ObjectStore for SMBObjectStore {
             }
         };
 
-        // Use try_flatten_stream pattern to convert Future<Stream> to Stream
         futures::stream::once(fut).flatten().boxed()
     }
 
@@ -384,11 +546,9 @@ impl ObjectStore for SMBObjectStore {
 
     async fn list_with_delimiter(
         &self,
-        _prefix: Option<&Path>,
+        prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
-        Err(object_store::Error::NotSupported {
-            source: "SMB list_with_delimiter not implemented".into(),
-        })
+        self.list_directory_shallow(prefix).await
     }
 
     async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
@@ -401,5 +561,54 @@ impl ObjectStore for SMBObjectStore {
         Err(object_store::Error::NotSupported {
             source: "SMB copy_if_not_exists not implemented".into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filetime_to_datetime() {
+        // Windows FILETIME epoch is Jan 1, 1601.
+        // 11644473600 seconds between 1601 and 1970 (Unix epoch)
+        // For 2024-01-01 00:00:00 UTC: Unix timestamp = 1704067200
+        // FILETIME = (1704067200 + 11644473600) * 10_000_000
+        let unix_ts = 1704067200u64; // 2024-01-01 00:00:00 UTC
+        let filetime = (unix_ts + 11_644_473_600) * 10_000_000;
+        let dt = filetime_to_datetime(filetime);
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2024-01-01");
+    }
+
+    #[test]
+    fn test_filetime_to_datetime_zero() {
+        let dt = filetime_to_datetime(0);
+        // Should return a valid DateTime (possibly before Unix epoch)
+        assert!(dt.timestamp() <= 0);
+    }
+
+    #[test]
+    fn test_smb_object_store_display() {
+        let store = SMBObjectStore::new(
+            "server.local".to_string(),
+            "share".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            None,
+        );
+        assert_eq!(format!("{store}"), "SMB");
+    }
+
+    #[test]
+    fn test_dir_entry_from_file_info() {
+        // Test that file information creates correct DirEntry
+        let entry = DirEntry::file(
+            "test.txt".to_string(),
+            1024,
+            DateTime::<Utc>::from_timestamp(1700000000, 0).expect("valid timestamp"),
+        );
+        assert_eq!(entry.name, "test.txt");
+        assert!(!entry.is_dir);
+        assert_eq!(entry.size, 1024);
     }
 }
