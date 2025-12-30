@@ -63,6 +63,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use url::Url;
 use uuid::Uuid;
 
+type SchedulerEndpointOverride =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+
 pub mod datafusion;
 mod servers;
 mod service;
@@ -163,7 +166,7 @@ impl ResolvedClusterConfig {
             if tls_config.is_none() && !config.insecure {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mode requires mTLS configuration unless --insecure is specified. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --insecure to skip mTLS.",
+                    "Cluster mode requires mTLS configuration or the --insecure flag. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --insecure.",
                 ));
             }
             if config.node_advertise_address.is_none() {
@@ -499,9 +502,6 @@ pub async fn initialize_cluster_executor(
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
-    type SchedulerEndpointOverride =
-        Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
-
     let bind_addr = rt.df.cluster_config.node_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`

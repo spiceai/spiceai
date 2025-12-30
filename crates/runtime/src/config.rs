@@ -117,7 +117,7 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
-    /// Allow insecure cluster communication without mTLS.
+    /// Allow insecure cluster communication without mTLS. WARNING: Only use this flag in development or testing environments and never in production.
     #[arg(long = "insecure", default_value_t = false, action = ArgAction::SetTrue)]
     pub insecure: bool,
 
