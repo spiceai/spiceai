@@ -59,6 +59,7 @@ pub enum TestType {
     HttpConsistency,
     HttpOverhead,
     Search,
+    TextToSql,
 }
 
 impl TestType {
@@ -73,6 +74,7 @@ impl TestType {
             TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
             TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
             TestType::Search => "testoperator_run_search.yml",
+            TestType::TextToSql => "testoperator_run_texttosql.yml",
         }
     }
 }
@@ -88,6 +90,7 @@ impl Display for TestType {
             TestType::HttpConsistency => write!(f, "http_consistency"),
             TestType::HttpOverhead => write!(f, "http_overhead"),
             TestType::Search => write!(f, "search"),
+            TestType::TextToSql => write!(f, "text_to_sql"),
         }
     }
 }

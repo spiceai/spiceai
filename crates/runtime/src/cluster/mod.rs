@@ -63,6 +63,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use url::Url;
 use uuid::Uuid;
 
+type SchedulerEndpointOverride =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+
 pub mod datafusion;
 mod servers;
 mod service;
@@ -120,7 +123,7 @@ impl ClusterTlsConfig {
 #[derive(Debug, Default)]
 pub struct ResolvedClusterConfig {
     config: ClusterConfig,
-    /// Cached cluster TLS config for mTLS (required when cluster mode is enabled).
+    /// Cached cluster TLS config for mTLS when configured.
     tls_config: Option<ClusterTlsConfig>,
     /// Pre-computed scheduler URL string for Ballista configuration.
     scheduler_url: Option<String>,
@@ -137,7 +140,7 @@ impl ResolvedClusterConfig {
     /// - Cluster mode is set but advertise address is not specified
     /// - Certificate files cannot be read
     pub fn try_new(config: ClusterConfig) -> std::io::Result<Self> {
-        // Cluster mode requires mTLS - all certificate files must be specified
+        // Cluster mTLS configuration must be complete when provided
         let tls_config = match (
             &config.node_mtls_ca_certificate_file,
             &config.node_mtls_certificate_file,
@@ -160,10 +163,10 @@ impl ResolvedClusterConfig {
 
         // Validate cluster role requirements
         if is_cluster_role {
-            if tls_config.is_none() {
+            if tls_config.is_none() && !config.insecure {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mode requires mTLS. Specify all of: --node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
+                    "Cluster mode requires mTLS configuration or the --insecure flag. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --insecure.",
                 ));
             }
             if config.node_advertise_address.is_none() {
@@ -175,10 +178,15 @@ impl ResolvedClusterConfig {
         }
 
         // Pre-compute scheduler URL from advertise address
+        let scheme = if tls_config.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let scheduler_url = config
             .node_advertise_address
             .as_ref()
-            .map(|addr| format!("https://{addr}"));
+            .map(|addr| format!("{scheme}://{addr}"));
 
         Ok(Self {
             config,
@@ -242,6 +250,18 @@ impl ResolvedClusterConfig {
         self.tls_config.as_ref()
     }
 
+    /// Returns whether cluster mTLS is enabled.
+    #[must_use]
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_config.is_some()
+    }
+
+    /// Returns whether this node allows insecure cluster communication.
+    #[must_use]
+    pub fn insecure(&self) -> bool {
+        self.config.insecure
+    }
+
     /// Returns the client TLS config for connecting to other cluster nodes.
     #[must_use]
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
@@ -293,26 +313,23 @@ pub async fn initialize_cluster_executor(
         });
     };
 
-    // mTLS is required for cluster mode
-    let Some(client_tls_config) = rt.df.cluster_config.client_tls_config().cloned() else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Cluster mode requires mTLS configuration"
-                .to_string()
-                .into(),
-        });
-    };
-
+    let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
+    let tls_enabled = client_tls_config.is_some();
     let config_producer_tls = client_tls_config.clone();
 
     // Configure mTLS for executor-to-executor gRPC connections (e.g., shuffle fetch)
     let config_producer: ConfigProducer = Arc::new(move || {
-        SessionConfig::new_with_ballista()
+        let mut config = SessionConfig::new_with_ballista()
             .with_option_extension(SpiceClusterConfig::default())
-            .with_ballista_use_tls(true)
-            .with_ballista_override_create_grpc_client_endpoint({
-                let tls_config = config_producer_tls.clone();
+            .with_ballista_use_tls(tls_enabled);
+
+        if let Some(tls_config) = config_producer_tls.clone() {
+            config = config.with_ballista_override_create_grpc_client_endpoint({
                 Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
-            })
+            });
+        }
+
+        config
     });
 
     let work_dir = rt
@@ -323,10 +340,16 @@ pub async fn initialize_cluster_executor(
 
     let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
         .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?
-        .tls_config(client_tls_config.clone())
-        .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
+    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
+        scheduler_endpoint
+            .tls_config(tls_config)
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            })?
+    } else {
+        scheduler_endpoint
+    };
 
     let scheduler_connection =
         scheduler_endpoint
@@ -485,12 +508,10 @@ async fn create_scheduler_server(
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
-    // mTLS is required for cluster mode
-    let Some(client_tls_config) = rt.df.cluster_config.client_tls_config().cloned() else {
-        return Err(FailedToStartClusterScheduler {
-            source: "Cluster mode requires mTLS configuration".into(),
-        });
-    };
+    let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
+    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
+        .clone()
+        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -519,9 +540,7 @@ async fn create_scheduler_server(
                     .build(),
             )
         })),
-        override_create_grpc_client_endpoint: Some(Arc::new(move |ep| {
-            ep.tls_config(client_tls_config.clone())
-        })),
+        override_create_grpc_client_endpoint,
         ..Default::default()
     };
 
@@ -547,15 +566,19 @@ async fn create_scheduler_server(
 /// Creates a gRPC client for the scheduler's internal cluster service.
 async fn create_cluster_service_client(
     scheduler_url: &Url,
-    client_tls_config: ClientTlsConfig,
+    client_tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<ClusterServiceClient<Channel>> {
     let endpoint_url = scheduler_url.to_string();
-    let endpoint = Endpoint::from_shared(endpoint_url.clone())
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?
-        .tls_config(client_tls_config)
+    let mut endpoint = Endpoint::from_shared(endpoint_url.clone())
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
+    if let Some(tls_config) = client_tls_config {
+        endpoint = endpoint
+            .tls_config(tls_config)
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            })?;
+    }
 
     let channel = endpoint
         .connect()
@@ -606,7 +629,7 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
     executor_id: String,
-    client_tls_config: ClientTlsConfig,
+    client_tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<()> {
     let Some(scheduler_url) = rt.df.cluster_config.scheduler_address() else {
         return Err(FailedToStartClusterExecutor {

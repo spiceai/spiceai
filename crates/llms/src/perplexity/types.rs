@@ -18,7 +18,7 @@ use std::pin::Pin;
 
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         CreateChatCompletionRequest, CreateChatCompletionResponse,
         CreateChatCompletionStreamResponse,
     },

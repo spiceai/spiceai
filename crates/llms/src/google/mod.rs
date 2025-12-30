@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{CompletionTokensDetails, CompletionUsage, PromptTokensDetails},
+    types::chat::{CompletionTokensDetails, CompletionUsage, PromptTokensDetails},
 };
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use google_genai::types::UsageMetadata;

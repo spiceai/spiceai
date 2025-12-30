@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{sync::Arc, time::Instant};
 
-use async_openai::types::{
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
 };
 use async_trait::async_trait;
@@ -152,8 +152,8 @@ fn add_request_labels_to_span(req: &CreateEmbeddingRequest, span: &Span) {
 
     if let Some(encoding_format) = &req.encoding_format {
         let encoding_format_str = match encoding_format {
-            async_openai::types::EncodingFormat::Base64 => "base64",
-            async_openai::types::EncodingFormat::Float => "float",
+            async_openai::types::embeddings::EncodingFormat::Base64 => "base64",
+            async_openai::types::embeddings::EncodingFormat::Float => "float",
         };
         tracing::info!(target: "task_history", encoding_format = %encoding_format_str, "labels");
     }

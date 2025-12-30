@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::kafka::MessageBatchCommitter;
 use crate::{
     cdc::{self, ChangeEnvelope, ChangesStream},
     debezium::{
@@ -99,6 +100,7 @@ impl DebeziumKafka {
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();
+        let consumer = self.consumer;
         let stream = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
@@ -111,7 +113,7 @@ impl DebeziumKafka {
                     return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
                 }
 
-                let mut messages: Vec<_> = msgs
+                let messages: Vec<_> = msgs
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(cdc::StreamError::Kafka)?;
@@ -124,11 +126,9 @@ impl DebeziumKafka {
                 let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
                     .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
 
-                let Some(last_msg) = messages.pop() else {
-                    unreachable!("checked non-empty above");
-                };
+                let committer = MessageBatchCommitter::from_messages(consumer, &messages);
 
-                Ok(ChangeEnvelope::new(Box::new(last_msg), rb, true))
+                Ok(ChangeEnvelope::new(Box::new(committer), rb, true))
             });
 
         Box::pin(stream)

@@ -16,10 +16,12 @@ limitations under the License.
 
 use std::{sync::LazyLock, time::Duration};
 
-use async_openai::types::{
-    ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
-    responses::CreateResponse,
+use async_openai::types::chat::{
+    ChatCompletionNamedToolChoice, ChatCompletionNamedToolChoiceCustom,
+    ChatCompletionToolChoiceOption, CreateChatCompletionRequest, CustomName, FunctionName,
+    ToolChoiceOptions,
 };
+use async_openai::types::responses::CreateResponse;
 use opentelemetry::{
     Key, KeyValue, StringValue, Value, global,
     metrics::{Counter, Histogram, Meter},
@@ -61,13 +63,16 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
 
     if let Some(ref choice) = req.tool_choice {
         let choice_str: StringValue = match choice {
-            ChatCompletionToolChoiceOption::None => "none".into(),
-            ChatCompletionToolChoiceOption::Auto => "auto".into(),
-            ChatCompletionToolChoiceOption::Required => "required".into(),
-            ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
-                function,
-                ..
-            }) => format!("function:{}", function.name).into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => "auto".into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => "none".into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => "required".into(),
+            ChatCompletionToolChoiceOption::AllowedTools(_) => "allowed_tools".into(),
+            ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
+                function: FunctionName { name, .. },
+            })
+            | ChatCompletionToolChoiceOption::Custom(ChatCompletionNamedToolChoiceCustom {
+                custom: CustomName { name },
+            }) => format!("function:{name}").into(),
         };
         labels.push(KeyValue::new(
             Key::new("tool_choice"),
@@ -75,6 +80,7 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
         ));
     }
 
+    #[expect(deprecated)]
     if let Some(ref user) = req.user {
         labels.push(KeyValue::new(
             Key::new("user"),
@@ -85,7 +91,7 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
     if let Some(ref metadata) = req.metadata {
         labels.push(KeyValue::new(
             Key::new("metadata"),
-            Value::String(metadata.to_string().into()),
+            Value::String(format!("{metadata:?}").into()),
         ));
     }
 
@@ -103,7 +109,10 @@ pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
             Key::new("request_level_tools"),
             Value::I64(req.tools.as_deref().unwrap_or_default().len() as i64),
         ),
-        KeyValue::new(Key::new("model"), Value::String(req.model.clone().into())),
+        KeyValue::new(
+            Key::new("model"),
+            Value::String(req.model.clone().unwrap_or_default().into()),
+        ),
         KeyValue::new(Key::new("responses_api"), Value::Bool(true)),
     ];
 

@@ -18,7 +18,7 @@ use crate::embeddings::{
     Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu, Result,
     candle::ModelConfig,
 };
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use hf_hub::{
     Repo, RepoType,
     api::tokio::{ApiBuilder, ApiRepo},
