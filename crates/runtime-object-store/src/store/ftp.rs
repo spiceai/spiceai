@@ -26,17 +26,16 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{Attributes, ListResult, MultipartUpload, PutMultipartOptions, PutPayload};
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ObjectMeta, ObjectStore, PutOptions,
-    PutResult, path::Path,
+    GetOptions, GetResult, GetResultPayload, ObjectMeta, ObjectStore, PutOptions, PutResult,
+    path::Path,
 };
 use suppaftp::AsyncFtpStream;
 use suppaftp::types::FileType;
 use tokio::sync::OnceCell;
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error,
-    process_directory_entries, process_directory_entries_shallow, resolve_range,
-    should_skip_entry,
+    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
+    process_directory_entries_shallow, resolve_range, should_skip_entry,
 };
 
 const STORE_NAME: &str = "FTP";
@@ -104,11 +103,7 @@ impl bb8::ManageConnection for FTPConnectionManager {
         conn: &mut Self::Connection,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let noop_future = conn.noop();
-        Box::pin(async move {
-            noop_future
-                .await
-                .map_err(|e| generic_error(STORE_NAME, e))
-        })
+        Box::pin(async move { noop_future.await.map_err(|e| generic_error(STORE_NAME, e)) })
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
@@ -257,7 +252,11 @@ impl FTPObjectStore {
         conn: &mut AsyncFtpStream,
         dir_path: &str,
     ) -> object_store::Result<Vec<DirEntry>> {
-        let path = if dir_path.is_empty() { None } else { Some(dir_path) };
+        let path = if dir_path.is_empty() {
+            None
+        } else {
+            Some(dir_path)
+        };
 
         let list = conn
             .nlst(path)
@@ -276,12 +275,13 @@ impl FTPObjectStore {
             }
 
             // Check if it's a directory by listing it
-            let children = conn.nlst(Some(&item)).await.map_err(|e| {
-                object_store::Error::NotFound {
-                    path: item.clone(),
-                    source: e.into(),
-                }
-            })?;
+            let children =
+                conn.nlst(Some(&item))
+                    .await
+                    .map_err(|e| object_store::Error::NotFound {
+                        path: item.clone(),
+                        source: e.into(),
+                    })?;
 
             if children.is_empty() {
                 continue;
@@ -289,18 +289,20 @@ impl FTPObjectStore {
 
             if children[0] == item {
                 // It's a file
-                let size = conn.size(&item).await.map_err(|e| {
-                    object_store::Error::NotFound {
+                let size = conn
+                    .size(&item)
+                    .await
+                    .map_err(|e| object_store::Error::NotFound {
                         path: item.clone(),
                         source: e.into(),
-                    }
-                })?;
-                let last_modified = conn.mdtm(&item).await.map_err(|e| {
-                    object_store::Error::NotFound {
-                        path: item.clone(),
-                        source: e.into(),
-                    }
-                })?;
+                    })?;
+                let last_modified =
+                    conn.mdtm(&item)
+                        .await
+                        .map_err(|e| object_store::Error::NotFound {
+                            path: item.clone(),
+                            source: e.into(),
+                        })?;
 
                 entries.push(DirEntry::file(
                     name.to_string(),
@@ -355,13 +357,13 @@ impl FTPObjectStore {
         Ok(results)
     }
 
-    /// List a single directory level (for list_with_delimiter).
+    /// List a single directory level (for `list_with_delimiter`).
     async fn list_directory_shallow(
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
         let mut conn = self.inner.get_connection().await?;
-        let prefix_str = prefix.map_or(String::new(), |p| p.to_string());
+        let prefix_str = prefix.map_or(String::new(), Path::to_string);
 
         let entries = Self::list_directory(&mut conn, &prefix_str).await?;
         Ok(process_directory_entries_shallow(&prefix_str, entries))
@@ -569,10 +571,7 @@ impl ObjectStore for FTPObjectStore {
         .boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.list_directory_shallow(prefix).await
     }
 

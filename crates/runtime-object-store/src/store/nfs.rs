@@ -26,13 +26,13 @@ use futures::stream::BoxStream;
 use libnfs::{EntryType, Nfs};
 use nix::fcntl::OFlag;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error,
-    process_directory_entries, process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
+    process_directory_entries_shallow, resolve_range,
 };
 
 const STORE_NAME: &str = "NFS";
@@ -195,8 +195,9 @@ impl NFSObjectStore {
                 }
             })?;
 
-            let last_modified = DateTime::<Utc>::from_timestamp(stat.nfs_mtime, stat.nfs_mtime_nsec)
-                .unwrap_or_else(Utc::now);
+            let last_modified =
+                DateTime::<Utc>::from_timestamp(stat.nfs_mtime, stat.nfs_mtime_nsec)
+                    .unwrap_or_else(Utc::now);
             Ok(build_object_meta(location, stat.nfs_size, last_modified))
         })
         .await
@@ -250,11 +251,9 @@ impl ObjectStore for NFSObjectStore {
                 })?;
 
                 let size = stat.nfs_size;
-                let last_modified = DateTime::<Utc>::from_timestamp(
-                    stat.nfs_mtime,
-                    stat.nfs_mtime_nsec,
-                )
-                .unwrap_or_else(Utc::now);
+                let last_modified =
+                    DateTime::<Utc>::from_timestamp(stat.nfs_mtime, stat.nfs_mtime_nsec)
+                        .unwrap_or_else(Utc::now);
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 
                 let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
@@ -329,10 +328,7 @@ impl ObjectStore for NFSObjectStore {
         .boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.list_directory_shallow(prefix).await
     }
 

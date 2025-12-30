@@ -27,14 +27,14 @@ use chrono::DateTime;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use ssh2::Session;
 
 use super::common::{
-    DirEntry, build_byte_range, build_object_meta, generic_error,
-    process_directory_entries, process_directory_entries_shallow, resolve_range,
+    DirEntry, build_byte_range, build_object_meta, generic_error, process_directory_entries,
+    process_directory_entries_shallow, resolve_range,
 };
 
 const STORE_NAME: &str = "SFTP";
@@ -174,7 +174,7 @@ impl SFTPObjectStore {
         .map_err(|e| generic_error(STORE_NAME, e))?
     }
 
-    /// List a single directory level (for list_with_delimiter).
+    /// List a single directory level (for `list_with_delimiter`).
     async fn list_directory_shallow(
         &self,
         prefix: Option<&Path>,
@@ -182,7 +182,11 @@ impl SFTPObjectStore {
         let config = Arc::clone(&self.config);
         let prefix_str = prefix.map_or("/".to_string(), |p| {
             let s = p.to_string();
-            if s.is_empty() { "/".to_string() } else { format!("/{s}") }
+            if s.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{s}")
+            }
         });
 
         tokio::task::spawn_blocking(move || {
@@ -204,12 +208,12 @@ impl SFTPObjectStore {
             let sftp = session.sftp().map_err(handle_error)?;
             let location_string = format!("/{location}");
 
-            let stat = sftp.stat(std::path::Path::new(&location_string)).map_err(|e| {
-                object_store::Error::NotFound {
+            let stat = sftp
+                .stat(std::path::Path::new(&location_string))
+                .map_err(|e| object_store::Error::NotFound {
                     path: location_string.clone(),
                     source: e.into(),
-                }
-            })?;
+                })?;
 
             let size = stat.size.ok_or_else(|| object_store::Error::Generic {
                 store: STORE_NAME,
@@ -365,7 +369,11 @@ impl ObjectStore for SFTPObjectStore {
         let store = self.clone();
         let prefix_str = prefix.map(|p| {
             let s = p.to_string();
-            if s.is_empty() { "/".to_string() } else { format!("/{s}") }
+            if s.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{s}")
+            }
         });
 
         let fut = async move {
@@ -391,10 +399,7 @@ impl ObjectStore for SFTPObjectStore {
         .boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.list_directory_shallow(prefix).await
     }
 

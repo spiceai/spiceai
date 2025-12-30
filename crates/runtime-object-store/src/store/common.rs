@@ -132,8 +132,8 @@ pub fn process_directory_entries(
     (files, dirs)
 }
 
-/// Process directory entries for a shallow listing (list_with_delimiter).
-/// Returns a `ListResult` with objects (files) and common_prefixes (directories).
+/// Process directory entries for a shallow listing (`list_with_delimiter`).
+/// Returns a `ListResult` with objects (files) and `common_prefixes` (directories).
 pub fn process_directory_entries_shallow(
     prefix: &str,
     entries: impl IntoIterator<Item = DirEntry>,

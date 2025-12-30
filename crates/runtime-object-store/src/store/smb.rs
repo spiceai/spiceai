@@ -367,7 +367,7 @@ impl SMBObjectStore {
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
         let conn = self.inner.get_connection().await?;
-        let prefix_str = prefix.map_or(String::new(), |p| p.to_string());
+        let prefix_str = prefix.map_or(String::new(), Path::to_string);
 
         let entries = Self::list_directory(&conn, &self.inner.config, &prefix_str).await?;
         Ok(process_directory_entries_shallow(&prefix_str, entries))
