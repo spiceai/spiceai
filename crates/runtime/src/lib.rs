@@ -46,7 +46,6 @@ use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 
-#[cfg(feature = "cluster")]
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
 use builder::RuntimeBuilder;
@@ -115,7 +114,6 @@ pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;
 }
-#[cfg(feature = "cluster")]
 pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
@@ -417,22 +415,18 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Failed to start or register Ballista executor: {source}"))]
     FailedToStartClusterExecutor {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
-#[cfg(feature = "cluster")]
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
-#[cfg(feature = "cluster")]
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
@@ -655,13 +649,11 @@ impl Runtime {
 
         // - Scheduler: does some init, starts internal cluster gRPC server on separate port
         // - Executor: does some init, but has a polling loop to fetch work from scheduler
-        #[cfg(feature = "cluster")]
         #[expect(
             clippy::items_after_statements,
-            reason = "type alias scoped to cluster feature"
+            reason = "type alias scoped to cluster setup"
         )]
         type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
-        #[cfg(feature = "cluster")]
         let maybe_cluster_future: Option<BoxedClusterFuture> =
             match self.df.cluster_config.effective_role() {
                 Some(ClusterRole::Scheduler) => {
@@ -702,7 +694,6 @@ impl Runtime {
                 _ => None,
             };
 
-        #[cfg(feature = "cluster")]
         if self.df.cluster_config.effective_role().is_some() {
             tracing::warn!(
                 "Distributed Query (Alpha) is in preview and should not be used in production."
@@ -713,70 +704,50 @@ impl Runtime {
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
-        #[cfg(feature = "cluster")]
-        let flight_future: std::pin::Pin<
-            Box<dyn Future<Output = Result<(), Error>> + Send>,
-        > = if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
-            Box::pin(
-                self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                    cluster::start_executor_flight_server(
-                        config.flight_bind_address,
-                        Arc::clone(&self_ref),
-                        Some(flight_shutdown),
+        let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
+            if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            cluster::start_executor_flight_server(
+                                config.flight_bind_address,
+                                Arc::clone(&self_ref),
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
                     )
-                    .await
-                    .context(UnableToStartFlightServerSnafu)
-                })
-                .await,
-            )
-        } else {
-            let cloned_endpoint_auth = endpoint_auth.clone();
-            let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+                    .await,
+                )
+            } else {
+                let cloned_endpoint_auth = endpoint_auth.clone();
+                let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
-            Box::pin(
-                self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                    flight::start(
-                        config.flight_bind_address,
-                        cloned_app_ref,
-                        Arc::clone(&self_ref),
-                        cloned_tls_config,
-                        cloned_endpoint_auth,
-                        Arc::clone(&self_ref.rate_limits),
-                        Some(flight_shutdown),
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            flight::start(
+                                config.flight_bind_address,
+                                cloned_app_ref,
+                                Arc::clone(&self_ref),
+                                cloned_tls_config,
+                                cloned_endpoint_auth,
+                                Arc::clone(&self_ref.rate_limits),
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
                     )
-                    .await
-                    .context(UnableToStartFlightServerSnafu)
-                })
-                .await,
-            )
-        };
+                    .await,
+                )
+            };
 
-        #[cfg(not(feature = "cluster"))]
-        let flight_future: std::pin::Pin<
-            Box<dyn Future<Output = Result<(), Error>> + Send>,
-        > = {
-            let cloned_endpoint_auth = endpoint_auth.clone();
-            let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-            Box::pin(
-                self.start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                    flight::start(
-                        config.flight_bind_address,
-                        cloned_app_ref,
-                        Arc::clone(&self_ref),
-                        cloned_tls_config,
-                        cloned_endpoint_auth,
-                        Arc::clone(&self_ref.rate_limits),
-                        Some(flight_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartFlightServerSnafu)
-                })
-                .await,
-            )
-        };
-
-        #[cfg(feature = "cluster")]
         // If this is an executor, we only need the shutdown signal and flight server
         if matches!(
             self.df.cluster_config.effective_role(),
@@ -853,7 +824,6 @@ impl Runtime {
             .await;
 
         // wait for all servers to shut down or if any of the servers fail to start
-        #[cfg(feature = "cluster")]
         if let Some(cluster_future) = maybe_cluster_future {
             return match tokio::try_join!(
                 http_future,
