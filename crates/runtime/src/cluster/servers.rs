@@ -78,7 +78,9 @@ pub async fn start_internal_cluster_server(
             message: "Cluster mode without mTLS requires the --insecure flag".to_string(),
         });
     } else {
-        tracing::warn!("Cluster mTLS disabled for internal cluster server (--insecure flag is set)");
+        tracing::warn!(
+            "Cluster mTLS disabled for internal cluster server (--insecure flag is set)"
+        );
     }
 
     let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
