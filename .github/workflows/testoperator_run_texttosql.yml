@@ -1,4 +1,4 @@
-name: testoperator search tests
+name: testoperator text-to-sql tests
 
 on:
   workflow_dispatch:
@@ -9,6 +9,14 @@ on:
         type: string
       spicepod_path:
         description: 'The spicepod file to test with'
+        required: true
+        type: string
+      model_name:
+        description: 'The model name to call in text-to-sql operations. Must be defined in the `spicepod_path` file.'
+        required: true
+        type: string
+      queryset_file:
+        description: 'The queryset file to use for the text-to-sql benchmark'
         required: true
         type: string
       runner_type:
@@ -22,7 +30,7 @@ on:
 
 jobs:
   run-bench:
-    name: Run Search tests
+    name: Run Text-to-SQL tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
@@ -80,14 +88,15 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
-          testoperator run search \
+          testoperator run text-to-sql \
             --ready-wait 1800 \
-            --concurrency 10 \
-            --benchmark-dataset quora_retrieval \
+            --queryset-file "${{ github.event.inputs.queryset_file }}" \
+            --model ${{ github.event.inputs.model_name }} \
             -p "${{ github.event.inputs.spicepod_path }}"
         env:
-          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}

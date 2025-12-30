@@ -182,27 +182,21 @@ impl Query {
             });
         };
 
-        // TLS is always required for cluster mode
-        let client_tls_config = self
-            .df
-            .cluster_config
-            .client_tls_config()
-            .cloned()
-            .ok_or_else(|| Error::UnableToExecuteQuery {
-                source: datafusion::error::DataFusionError::Configuration(
-                    "Cluster mode requires mTLS configuration".to_string(),
-                ),
-            })?;
+        let client_tls_config = self.df.cluster_config.client_tls_config().cloned();
+        let tls_enabled = client_tls_config.is_some();
 
-        let cfg = self
+        let mut cfg = self
             .df
             .ctx
             .copied_config()
             .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
-                ep.tls_config(client_tls_config.clone()).boxed()
-            }))
-            .with_ballista_use_tls(true);
+            .with_ballista_use_tls(tls_enabled);
+
+        if let Some(tls_config) = client_tls_config {
+            cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
+                ep.tls_config(tls_config.clone()).boxed()
+            }));
+        }
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
