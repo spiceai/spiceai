@@ -22,6 +22,7 @@ on:
       queryset:
         description: 'The queryset to use for the text-to-sql benchmark'
         required: false
+        required: true
         type: string
       runner_type:
         description: 'Runner type'

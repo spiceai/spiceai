@@ -32,7 +32,7 @@ pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 7] = [
     ParameterSpec::component("guardrail_version").description("Guardrail version. Pattern: `(([1-9][0-9]{0,7})|(DRAFT))`"),
     ParameterSpec::component("trace").description("Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`").one_of(&["enabled", "disabled", "enabled_full"]),
 ];
-pub(crate) const PARAMETERS: &[ParameterSpec] =
+pub const PARAMETERS: &[ParameterSpec] =
     &concat_arrays::<ParameterSpec, 7, PARAM_WITH_DEPRE_LEN, { 7 + PARAM_WITH_DEPRE_LEN }>(
         BEDROCK_PARAMETERS,
         COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,

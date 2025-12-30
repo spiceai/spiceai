@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
         CreateChatCompletionRequestArgs,
     },

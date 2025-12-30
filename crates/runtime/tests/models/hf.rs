@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use app::AppBuilder;
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::caching::CacheConfig;
 use spicepod::component::{embeddings::Embeddings, model::Model};

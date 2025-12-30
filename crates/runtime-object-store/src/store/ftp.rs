@@ -18,10 +18,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::AsyncReadExt;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{Attributes, GetRange, MultipartUpload, PutMultipartOptions, PutPayload};
 use object_store::{
@@ -30,6 +30,10 @@ use object_store::{
 };
 use suppaftp::AsyncFtpStream;
 use suppaftp::types::FileType;
+
+use super::common::generic_error;
+
+const STORE_NAME: &str = "FTP";
 
 #[derive(Debug)]
 struct FTPClient {
@@ -114,93 +118,123 @@ impl FTPObjectStore {
         }
     }
 
-    fn walk_path(
+    /// List all files recursively starting from a given path
+    async fn list_all_files(
         &self,
         location: Option<Path>,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let ftp_client = Arc::clone(&self.client);
-        let stream = stream! {
-            let mut client = ftp_client.get_async_client().await?;
-            let path = location.map(|v| v.to_string());
-            let mut queue = vec![path];
-            while let Some(path) = queue.pop() {
-                let list = client.nlst(path.as_deref())
+    ) -> object_store::Result<Vec<ObjectMeta>> {
+        let mut client = self.client.get_async_client().await?;
+        let path = location.map(|v| v.to_string());
+        let mut queue = vec![path];
+        let mut results = Vec::new();
+
+        while let Some(path) = queue.pop() {
+            let list =
+                client
+                    .nlst(path.as_deref())
                     .await
-                    .map_err(|e| object_store::Error::NotFound { path: path.unwrap_or("/".to_string()), source: e.into() })?;
-                for item in list {
-                    let children = client.nlst(Some(&item)).await.map_err(|e| {
-                        object_store::Error::NotFound { path: item.clone(), source: e.into() }
+                    .map_err(|e| object_store::Error::NotFound {
+                        path: path.clone().unwrap_or_else(|| "/".to_string()),
+                        source: e.into(),
                     })?;
-                    if children.is_empty() {
-                        continue;
-                    }
-                    if children[0] == item {
-                        let meta = ObjectMeta {
-                            location: Path::from(item.clone()),
-                            size: client.size(&item).await.map_err(|e| {
-                                object_store::Error::NotFound { path: item.clone(), source: e.into() }
-                            })? as u64,
-                            last_modified: client.mdtm(&item).await.map_err(|e| {
-                                object_store::Error::NotFound { path: item.clone(), source: e.into() }
-                            })?.and_utc(),
-                            e_tag: None,
-                            version: None,
-                        };
-                        yield Ok(meta);
-                    } else {
-                        queue.push(Some(item));
-                    }
+
+            for item in list {
+                let children =
+                    client
+                        .nlst(Some(&item))
+                        .await
+                        .map_err(|e| object_store::Error::NotFound {
+                            path: item.clone(),
+                            source: e.into(),
+                        })?;
+
+                if children.is_empty() {
+                    continue;
+                }
+
+                if children[0] == item {
+                    // It's a file - get metadata
+                    let size =
+                        client
+                            .size(&item)
+                            .await
+                            .map_err(|e| object_store::Error::NotFound {
+                                path: item.clone(),
+                                source: e.into(),
+                            })?;
+                    let last_modified =
+                        client
+                            .mdtm(&item)
+                            .await
+                            .map_err(|e| object_store::Error::NotFound {
+                                path: item.clone(),
+                                source: e.into(),
+                            })?;
+
+                    results.push(ObjectMeta {
+                        location: Path::from(item),
+                        size: u64::try_from(size).unwrap_or(0),
+                        last_modified: last_modified.and_utc(),
+                        e_tag: None,
+                        version: None,
+                    });
+                } else {
+                    // It's a directory - add to queue
+                    queue.push(Some(item));
                 }
             }
-        };
+        }
 
-        Box::pin(stream)
+        Ok(results)
     }
 }
 
-fn pipe_stream(
+/// Read data from an FTP stream asynchronously
+async fn read_ftp_data(
     mut client: AsyncFtpStream,
     location: String,
     start: usize,
     read_size: usize,
-) -> BoxStream<'static, std::result::Result<Bytes, object_store::Error>> {
-    let stream = stream! {
-        let mut total = 0;
-        let mut buf = vec![0; 4096];
+) -> object_store::Result<Vec<u8>> {
+    client
+        .transfer_type(FileType::Binary)
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))?;
 
-        client
-            .transfer_type(FileType::Binary)
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "FTP",
-                source: e.into(),
-            })?;
-        client.resume_transfer(start).await.map_err(|e| {
-            object_store::Error::Generic { store: "FTP", source: e.into() }
-        })?;
-        let mut stream = client
-            .retr_as_stream(location.clone())
-            .await
-            .map_err(|e| object_store::Error::Generic { store: "FTP", source: e.into() })?;
-        loop {
-            if total > read_size {
-                break;
-            }
-            let mut n = stream.read(&mut buf).await.map_err(|e| {
-                object_store::Error::Generic { store: "FTP", source: e.into() }
-            })?;
+    client
+        .resume_transfer(start)
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))?;
 
-            total += n;
-            if n == 0 {
-                break;
-            }
-            if total > read_size {
-                n -= total - read_size;
-            }
-            yield Ok(Bytes::copy_from_slice(&buf[..n]));
+    let mut stream = client
+        .retr_as_stream(location)
+        .await
+        .map_err(|e| generic_error(STORE_NAME, e))?;
+
+    let mut result = Vec::with_capacity(read_size);
+    let mut buf = vec![0; 4096];
+    let mut total = 0;
+
+    loop {
+        if total >= read_size {
+            break;
         }
-    };
-    Box::pin(stream)
+
+        let n = stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| generic_error(STORE_NAME, e))?;
+
+        if n == 0 {
+            break;
+        }
+
+        let bytes_to_take = (read_size - total).min(n);
+        result.extend_from_slice(&buf[..bytes_to_take]);
+        total += n;
+    }
+
+    Ok(result)
 }
 
 #[async_trait]
@@ -227,32 +261,41 @@ impl ObjectStore for FTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let mut client = self.client.get_async_client().await?;
+        let client = self.client.get_async_client().await?;
 
         let location_string = location.to_string();
+
+        // Create a new client for metadata queries
+        let mut meta_client = self.client.get_async_client().await?;
+
+        let size: u64 = u64::try_from(meta_client.size(&location_string).await.map_err(|e| {
+            object_store::Error::NotFound {
+                path: location_string.clone(),
+                source: e.into(),
+            }
+        })?)
+        .unwrap_or(0);
+
+        let last_modified = meta_client
+            .mdtm(&location_string)
+            .await
+            .map_err(|e| object_store::Error::NotFound {
+                path: location_string.clone(),
+                source: e.into(),
+            })?
+            .and_utc();
+
         let object_meta = ObjectMeta {
             location: location.clone(),
-            size: client.size(&location_string).await.map_err(|e| {
-                object_store::Error::NotFound {
-                    path: location_string.clone(),
-                    source: e.into(),
-                }
-            })? as u64,
-            last_modified: client
-                .mdtm(&location_string)
-                .await
-                .map_err(|e| object_store::Error::NotFound {
-                    path: location_string.clone(),
-                    source: e.into(),
-                })?
-                .and_utc(),
+            size,
+            last_modified,
             e_tag: None,
             version: None,
         };
 
-        let mut start = 0;
-        let mut end = object_meta.size;
-        let mut data_to_read = object_meta.size;
+        let mut start = 0u64;
+        let mut end = size;
+        let mut data_to_read = size;
 
         if let Some(GetRange::Bounded(range)) = options.range {
             data_to_read = range.end - range.start;
@@ -260,14 +303,20 @@ impl ObjectStore for FTPObjectStore {
             end = range.end;
         }
 
+        #[expect(clippy::cast_possible_truncation)]
+        let data = read_ftp_data(
+            client,
+            location_string,
+            start as usize,
+            data_to_read as usize,
+        )
+        .await?;
+
+        let stream = futures::stream::once(async move { Ok(Bytes::from(data)) });
+
         Ok(GetResult {
             meta: object_meta,
-            payload: GetResultPayload::Stream(pipe_stream(
-                client,
-                location_string,
-                usize::try_from(start).unwrap_or_default(),
-                usize::try_from(data_to_read).unwrap_or_default(),
-            )),
+            payload: GetResultPayload::Stream(Box::pin(stream)),
             range: Range { start, end },
             attributes: Attributes::default(),
         })
@@ -288,7 +337,18 @@ impl ObjectStore for FTPObjectStore {
         &self,
         location: Option<&Path>,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.walk_path(location.map(ToOwned::to_owned))
+        let ftp_client = Arc::clone(&self.client);
+        let location = location.map(ToOwned::to_owned);
+
+        let fut = async move {
+            let store = FTPObjectStore { client: ftp_client };
+            match store.list_all_files(location).await {
+                Ok(files) => futures::stream::iter(files.into_iter().map(Ok)).boxed(),
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+            }
+        };
+
+        futures::stream::once(fut).flatten().boxed()
     }
 
     fn list_with_offset(

@@ -35,7 +35,7 @@ use crate::embeddings::{
     Embed, Error as EmbedError, FailedToAcquireRateControllerPermitSnafu,
     FailedToCreateEmbeddingSnafu, Result as EmbedResult,
 };
-use async_openai::types::{
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
 };
 
@@ -267,7 +267,7 @@ fn is_retriable_error(err: &OpenAIError) -> bool {
             // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
             matches!(api_err.code.as_deref(), None | Some("429" | "500" | "503"))
         }
-        OpenAIError::JSONDeserialize(_) => true,
+        OpenAIError::JSONDeserialize(..) => true,
         OpenAIError::Reqwest(request) => {
             request.is_timeout()
                 || request.is_connect()

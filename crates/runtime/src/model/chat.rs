@@ -528,24 +528,16 @@ async fn file(
 }
 
 // Get OpenAI compatible request parameter overrides.
-// Prioritizes parameters with the model prefix (e.g., `hf_temperature`) over deprecated (e.g. `openai_temperature`) parameters.
+// Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
-    let prefix_str = format!("{prefix}_");
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
-
-    for (k, v) in &model.params {
-        if k.starts_with(&prefix_str) {
-            if let Some(new_k) = k.strip_prefix(&prefix_str)
-                && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-            {
-                request_overrides.insert(new_k.to_string(), v.clone());
-            }
-        } else if k.starts_with("openai_")
-            && let Some(new_k) = k.strip_prefix("openai_")
-            && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-            && !request_overrides.contains_key(new_k)
-        {
-            request_overrides.insert(new_k.to_string(), v.clone());
+    for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
+        if let Some(v) = model.params.get(key) {
+            request_overrides.insert(key.to_string(), v.clone());
+        } else if let Some(v) = model.params.get(&format!("{prefix}_{key}")) {
+            request_overrides.insert(key.to_string(), v.clone());
+        } else if let Some(v) = model.params.get(&format!("openai_{key}")) {
+            request_overrides.insert(key.to_string(), v.clone());
         }
     }
 

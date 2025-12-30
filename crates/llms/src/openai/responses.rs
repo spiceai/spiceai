@@ -42,7 +42,13 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
 
         req.max_output_tokens = Some(150);
 
-        if let Err(e) = self.responses_request(req).instrument(span.clone()).await {
+        let result = self.responses_request(req).instrument(span.clone()).await;
+        tracing::debug!(
+            "{} model responses API health check response: {:?}",
+            self.model,
+            result
+        );
+        if let Err(e) = result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
             return Err(HealthCheckError { source: e.into() });
         }
@@ -51,13 +57,13 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
 
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
         let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
+        inner_req.model = Some(self.model.clone());
 
         let permit = self
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         let stream = self.client.responses().create_stream(inner_req).await?;
 
@@ -67,21 +73,19 @@ impl<C: Config + Send + Sync + Clone> Responses for Openai<C> {
     }
 
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
-        let outer_model = req.model.clone();
         let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
+        inner_req.model = Some(self.model.clone());
 
         let permit = self
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
-        let mut resp = self.client.responses().create(inner_req).await?;
+        let resp = self.client.responses().create(inner_req).await?;
 
         drop(permit);
 
-        resp.model = outer_model;
         Ok(resp)
     }
 }

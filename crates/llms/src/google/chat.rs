@@ -19,16 +19,16 @@ limitations under the License.
 use crate::chat::{Chat, nsql::SqlGeneration};
 use crate::google::{openai_api_error, to_completion_usage};
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType,
-    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionCallStream, Role,
+    ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -149,12 +149,16 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                     None => String::new(),
                 };
                 if let Some(tools) = msg.tool_calls {
-                    for ChatCompletionMessageToolCall {
-                        id,
-                        function: FunctionCall { name, arguments },
-                        ..
-                    } in tools
-                    {
+                    for tool_call_enum in tools {
+                        let async_openai::types::chat::ChatCompletionMessageToolCalls::Function(
+                            ChatCompletionMessageToolCall {
+                                id,
+                                function: FunctionCall { name, arguments },
+                            },
+                        ) = tool_call_enum
+                        else {
+                            continue;
+                        };
                         contents.push(Content {
                             role: Some("assistant".to_string()),
                             parts: vec![Part::FunctionCall {
@@ -198,17 +202,21 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
     if let Some(openai_tools) = req.tools {
         let google_tools: Vec<google_genai::types::Tool> = openai_tools
             .into_iter()
-            .map(|tool| {
+            .filter_map(|tool| {
+                let async_openai::types::chat::ChatCompletionTools::Function(func_tool) = tool
+                else {
+                    return None;
+                };
                 let func_decl = FunctionDeclaration {
-                    name: tool.function.name,
-                    description: tool.function.description.unwrap_or_default(),
-                    parameters: tool.function.parameters.and_then(|params| {
+                    name: func_tool.function.name,
+                    description: func_tool.function.description.unwrap_or_default(),
+                    parameters: func_tool.function.parameters.and_then(|params| {
                         serde_json::from_value::<google_genai::types::Schema>(params).ok()
                     }),
                 };
-                google_genai::types::Tool {
+                Some(google_genai::types::Tool {
                     function_declarations: Some(vec![func_decl]),
-                }
+                })
             })
             .collect();
 
@@ -225,7 +233,7 @@ fn convert_google_response_to_openai(
     response: GenerateContentResponse,
     model: &str,
 ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-    use async_openai::types::ChatChoice;
+    use async_openai::types::chat::ChatChoice;
 
     let choices = response
         .candidates
@@ -246,7 +254,6 @@ fn convert_google_response_to_openai(
 
                         tool_calls.push(ChatCompletionMessageToolCall {
                             id: format!("call_{}", tool_calls.len()),
-                            r#type: ChatCompletionToolType::Function,
                             function: FunctionCall {
                                 name: function_call.name,
                                 arguments: args,
@@ -266,7 +273,12 @@ fn convert_google_response_to_openai(
             let tool_calls_opt = if tool_calls.is_empty() {
                 None
             } else {
-                Some(tool_calls)
+                Some(
+                    tool_calls
+                        .into_iter()
+                        .map(async_openai::types::chat::ChatCompletionMessageToolCalls::Function)
+                        .collect(),
+                )
             };
 
             let finish_reason = candidate.finish_reason.map(|fr| match fr {
@@ -288,6 +300,7 @@ fn convert_google_response_to_openai(
                     role: Role::Assistant,
                     content,
                     tool_calls: tool_calls_opt,
+                    annotations: None,
                     function_call: None,
                     refusal: None,
                     audio: None,
@@ -324,7 +337,7 @@ fn convert_google_stream_response_to_openai(
         .into_iter()
         .enumerate()
         .map(|(idx, candidate)| {
-            use async_openai::types::ChatCompletionMessageToolCallChunk;
+            use async_openai::types::chat::ChatCompletionMessageToolCallChunk;
 
             let mut text_parts = Vec::new();
             let mut tool_calls = Vec::new();
@@ -341,7 +354,7 @@ fn convert_google_stream_response_to_openai(
                         tool_calls.push(ChatCompletionMessageToolCallChunk {
                             index: tool_calls.len() as u32,
                             id: Some(format!("call_{}", tool_calls.len())),
-                            r#type: Some(ChatCompletionToolType::Function),
+                            r#type: Some(FunctionType::Function),
                             function: Some(FunctionCallStream {
                                 name: Some(function_call.name),
                                 arguments: Some(args),
