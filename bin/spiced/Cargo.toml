@@ -49,7 +49,6 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
-cluster = ["runtime/cluster"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -80,7 +79,6 @@ default = [
     "mongodb",
     "iceberg-write",
     "turso",
-    "cluster",
     "smb",
 ]
 delta_lake = ["runtime/delta_lake"]

@@ -46,7 +46,6 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
-#[cfg(feature = "cluster")]
 use {
     crate::config::ClusterRole,
     crate::datafusion::builder::default_extension_planners,
@@ -60,14 +59,12 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
-#[cfg(feature = "cluster")]
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
-#[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
@@ -75,7 +72,6 @@ use crate::datafusion::{
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-#[cfg(feature = "cluster")]
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
@@ -162,13 +158,6 @@ macro_rules! handle_error {
 }
 
 impl Query {
-    #[cfg(not(feature = "cluster"))]
-    #[expect(clippy::unnecessary_wraps)]
-    fn get_session_state(&self) -> Result<SessionState> {
-        Ok(self.df.ctx.state())
-    }
-
-    #[cfg(feature = "cluster")]
     fn get_session_state(&self) -> Result<SessionState> {
         if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
             return Ok(self.df.ctx.state());
@@ -216,7 +205,6 @@ impl Query {
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
     }
 
-    #[cfg(feature = "cluster")]
     fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
         let mut should_distribute = true;
 
@@ -437,12 +425,8 @@ impl Query {
             });
 
             // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
-            #[cfg(feature = "cluster")]
             let should_distribute =
                 Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
-
-            #[cfg(not(feature = "cluster"))]
-            let should_distribute = false;
 
             let session_for_execution = if should_distribute {
                 session

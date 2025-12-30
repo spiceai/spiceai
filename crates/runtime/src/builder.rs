@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "cluster")]
 use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
@@ -57,7 +56,6 @@ pub struct RuntimeBuilder {
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
-    #[cfg(feature = "cluster")]
     resolved_cluster_config: Option<ResolvedClusterConfig>,
 }
 
@@ -78,7 +76,6 @@ impl RuntimeBuilder {
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
-            #[cfg(feature = "cluster")]
             resolved_cluster_config: None,
         }
     }
@@ -152,7 +149,6 @@ impl RuntimeBuilder {
         self
     }
 
-    #[cfg(feature = "cluster")]
     pub fn with_resolved_cluster_config(
         mut self,
         resolved_cluster_config: ResolvedClusterConfig,
@@ -233,7 +229,6 @@ impl RuntimeBuilder {
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone());
 
-        #[cfg(feature = "cluster")]
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
             df_builder = df_builder.with_cluster_config(resolved_cluster_config);
         }
