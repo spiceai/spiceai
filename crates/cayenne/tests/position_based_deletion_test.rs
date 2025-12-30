@@ -44,7 +44,10 @@ limitations under the License.
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{
+    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider,
+    CayenneTableProviderBuilder, MetadataCatalog,
+};
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
@@ -183,7 +186,8 @@ async fn test_position_based_delete_all_rows() -> TestResult<()> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
-    let (table, ctx, schema) = setup_no_pk_table(&data_dir, &metadata_dir, "delete_all_test").await?;
+    let (table, ctx, schema) =
+        setup_no_pk_table(&data_dir, &metadata_dir, "delete_all_test").await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -219,12 +223,12 @@ async fn test_position_based_delete_all_rows() -> TestResult<()> {
 }
 
 /// Test: Insert new data after deleting all rows.
-/// 
+///
 /// **KNOWN LIMITATION**: Position-based deletion vectors store global row IDs that are
 /// computed based on file ordering during the deletion scan. When new files are inserted,
 /// the row IDs for the new data may overlap with the deleted row IDs from the old data,
 /// causing the wrong rows to be filtered out.
-/// 
+///
 /// This test documents this limitation. The proper fix requires either:
 /// 1. Using file-scoped row IDs: `(data_file_id, position_within_file)`
 /// 2. Using the `row_id_start` field from the catalog to compute global row IDs
@@ -308,7 +312,8 @@ async fn test_position_based_idempotent_delete() -> TestResult<()> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
-    let (table, ctx, schema) = setup_no_pk_table(&data_dir, &metadata_dir, "idempotent_test").await?;
+    let (table, ctx, schema) =
+        setup_no_pk_table(&data_dir, &metadata_dir, "idempotent_test").await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -328,7 +333,10 @@ async fn test_position_based_idempotent_delete() -> TestResult<()> {
 
     // Second delete with same filter - should be idempotent
     let deleted2 = delete_records(&table, col("category").eq(lit("A"))).await?;
-    assert_eq!(deleted2, 0, "Second delete should return 0 (already deleted)");
+    assert_eq!(
+        deleted2, 0,
+        "Second delete should return 0 (already deleted)"
+    );
     assert_eq!(
         get_row_count(&ctx, "idempotent_test").await?,
         2,
@@ -367,7 +375,8 @@ async fn test_position_based_sequential_deletes() -> TestResult<()> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
-    let (table, ctx, schema) = setup_no_pk_table(&data_dir, &metadata_dir, "sequential_test").await?;
+    let (table, ctx, schema) =
+        setup_no_pk_table(&data_dir, &metadata_dir, "sequential_test").await?;
 
     // Insert data with 3 categories
     let batch = RecordBatch::try_new(
@@ -411,7 +420,8 @@ async fn test_position_based_projection_after_delete() -> TestResult<()> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
-    let (table, ctx, schema) = setup_no_pk_table(&data_dir, &metadata_dir, "projection_test").await?;
+    let (table, ctx, schema) =
+        setup_no_pk_table(&data_dir, &metadata_dir, "projection_test").await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -478,7 +488,8 @@ async fn test_position_based_multi_file_deletion() -> TestResult<()> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
-    let (table, ctx, schema) = setup_no_pk_table(&data_dir, &metadata_dir, "multi_file_test").await?;
+    let (table, ctx, schema) =
+        setup_no_pk_table(&data_dir, &metadata_dir, "multi_file_test").await?;
 
     // Insert 3 separate batches (3 files)
     for file_num in 0..3i64 {
@@ -562,7 +573,10 @@ async fn test_position_based_persistence_after_full_delete() -> TestResult<()> {
 
         let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
         let ctx = SessionContext::new();
-        ctx.register_table("full_delete_persist", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+        ctx.register_table(
+            "full_delete_persist",
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+        )?;
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -592,7 +606,10 @@ async fn test_position_based_persistence_after_full_delete() -> TestResult<()> {
         );
 
         let ctx = SessionContext::new();
-        ctx.register_table("full_delete_persist", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+        ctx.register_table(
+            "full_delete_persist",
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+        )?;
 
         assert_eq!(
             get_row_count(&ctx, "full_delete_persist").await?,
@@ -753,7 +770,8 @@ async fn test_position_based_complex_filter() -> TestResult<()> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 
-    let (table, ctx, schema) = setup_no_pk_table(&data_dir, &metadata_dir, "complex_filter").await?;
+    let (table, ctx, schema) =
+        setup_no_pk_table(&data_dir, &metadata_dir, "complex_filter").await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -853,7 +871,11 @@ async fn test_position_based_partial_batch() -> TestResult<()> {
                 .copied()
         })
         .collect();
-    assert_eq!(values, vec![1, 2, 3, 7, 8, 9, 10], "Values 4,5,6 should be deleted");
+    assert_eq!(
+        values,
+        vec![1, 2, 3, 7, 8, 9, 10],
+        "Values 4,5,6 should be deleted"
+    );
 
     Ok(())
 }
@@ -875,7 +897,9 @@ async fn test_position_based_boundary_rows() -> TestResult<()> {
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(StringArray::from(vec!["FIRST", "MID", "MID", "MID", "LAST"])),
+            Arc::new(StringArray::from(vec![
+                "FIRST", "MID", "MID", "MID", "LAST",
+            ])),
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
             Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
         ],

@@ -864,11 +864,12 @@ impl CayenneTableProvider {
         // and become invalid when new files are added.
         if self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
             let has_pending_deletions = {
-                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                    CatalogError::LockPoisoned {
-                        operation: "check deletion cache".to_string(),
-                    }
-                })?;
+                let guard =
+                    self.cached_deleted_row_ids
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "check deletion cache".to_string(),
+                        })?;
                 !guard.is_empty()
             };
 
@@ -1880,9 +1881,7 @@ impl CayenneTableProvider {
         let ctx = SessionContext::new();
 
         // Scan existing data with deletion filter applied
-        let existing_scan = listing_table
-            .scan(&ctx.state(), None, &[], None)
-            .await?;
+        let existing_scan = listing_table.scan(&ctx.state(), None, &[], None).await?;
 
         // Apply deletion filter to existing data
         let filtered_existing = {
@@ -1983,11 +1982,9 @@ impl CayenneTableProvider {
             let table_id = self.table_metadata.table_id;
             let current_snapshot = new_snapshot_id.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = Self::cleanup_old_snapshots_blocking(
-                    &table_path,
-                    table_id,
-                    &current_snapshot,
-                ) {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
                     tracing::warn!(
                         "Failed to cleanup old snapshots for table {}: {e}",
                         table_id
@@ -2028,13 +2025,14 @@ impl CayenneTableProvider {
         use super::delete::DeletionFilterExec;
 
         // First, collect all new data batches
-        let new_batches: Vec<RecordBatch> = new_stream
-            .try_collect()
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to collect new data stream".to_string(),
-                source: Box::new(e),
-            })?;
+        let new_batches: Vec<RecordBatch> =
+            new_stream
+                .try_collect()
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to collect new data stream".to_string(),
+                    source: Box::new(e),
+                })?;
 
         let new_row_count: u64 = new_batches
             .iter()
@@ -2043,9 +2041,12 @@ impl CayenneTableProvider {
 
         // Get existing data with deletion filter applied
         let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| CatalogError::LockPoisoned {
-                operation: "read listing table".to_string(),
-            })?;
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "read listing table".to_string(),
+                })?;
             Arc::clone(&guard)
         };
 
@@ -2062,21 +2063,24 @@ impl CayenneTableProvider {
 
         // Apply deletion filter
         let deleted_row_ids = {
-            let guard = self.cached_deleted_row_ids.read().map_err(|_| CatalogError::LockPoisoned {
-                operation: "read deletion cache".to_string(),
-            })?;
+            let guard =
+                self.cached_deleted_row_ids
+                    .read()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "read deletion cache".to_string(),
+                    })?;
             Arc::clone(&guard)
         };
 
         let filtered_plan = Arc::new(DeletionFilterExec::new(existing_scan, deleted_row_ids));
 
         // Collect existing (filtered) data
-        let existing_batches = collect(filtered_plan, ctx.task_ctx())
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
+        let existing_batches = collect(filtered_plan, ctx.task_ctx()).await.map_err(|e| {
+            CatalogError::InvalidOperation {
                 message: "Failed to collect existing data for compaction".to_string(),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         let existing_row_count: u64 = existing_batches
             .iter()
@@ -2084,18 +2088,17 @@ impl CayenneTableProvider {
             .sum();
 
         // Combine all batches
-        let all_batches: Vec<RecordBatch> = existing_batches
-            .into_iter()
-            .chain(new_batches)
-            .collect();
+        let all_batches: Vec<RecordBatch> =
+            existing_batches.into_iter().chain(new_batches).collect();
 
         if all_batches.is_empty() {
             // Nothing to write - just clear deletions and return
-            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "clear deletion cache".to_string(),
-                }
-            })?;
+            let mut guard =
+                self.cached_deleted_row_ids
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear deletion cache".to_string(),
+                    })?;
             *guard = Arc::new(roaring::RoaringBitmap::new());
             return Ok(0);
         }
@@ -2166,21 +2169,23 @@ impl CayenneTableProvider {
 
         // Clear the cached deletion vectors since they've been applied
         {
-            let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "clear deletion cache after compaction".to_string(),
-                }
-            })?;
+            let mut guard =
+                self.cached_deleted_row_ids
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear deletion cache after compaction".to_string(),
+                    })?;
             *guard = Arc::new(roaring::RoaringBitmap::new());
         }
 
         // Update the provider's listing table to point to the new snapshot
         {
-            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "update listing table after compaction".to_string(),
-                }
-            })?;
+            let mut listing_table_guard =
+                self.listing_table
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "update listing table after compaction".to_string(),
+                    })?;
             *listing_table_guard = new_listing_table;
         }
 
@@ -2198,11 +2203,9 @@ impl CayenneTableProvider {
             let table_id = self.table_metadata.table_id;
             let current_snapshot = new_snapshot_id.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = Self::cleanup_old_snapshots_blocking(
-                    &table_path,
-                    table_id,
-                    &current_snapshot,
-                ) {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
                     tracing::warn!(
                         "Failed to cleanup old snapshots for table {}: {e}",
                         table_id
