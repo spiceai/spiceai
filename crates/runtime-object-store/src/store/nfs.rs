@@ -66,7 +66,7 @@ impl NFSClientConfig {
     }
 
     fn connect(&self) -> object_store::Result<Nfs> {
-        let mut nfs = Nfs::new().map_err(handle_error)?;
+        let nfs = Nfs::new().map_err(handle_error)?;
         nfs.mount(&self.server, &self.export_path)
             .map_err(handle_error)?;
         Ok(nfs)
@@ -195,9 +195,14 @@ impl NFSObjectStore {
                 }
             })?;
 
-            let last_modified =
-                DateTime::<Utc>::from_timestamp(stat.nfs_mtime, stat.nfs_mtime_nsec)
-                    .unwrap_or_else(Utc::now);
+            let last_modified = {
+                #[expect(clippy::cast_possible_wrap)]
+                let mtime = stat.nfs_mtime as i64;
+                #[expect(clippy::cast_possible_truncation)]
+                let mtime_nsec = stat.nfs_mtime_nsec as u32;
+                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
+                    .unwrap_or_else(Utc::now)
+            };
             Ok(build_object_meta(location, stat.nfs_size, last_modified))
         })
         .await
@@ -251,9 +256,14 @@ impl ObjectStore for NFSObjectStore {
                 })?;
 
                 let size = stat.nfs_size;
-                let last_modified =
-                    DateTime::<Utc>::from_timestamp(stat.nfs_mtime, stat.nfs_mtime_nsec)
-                        .unwrap_or_else(Utc::now);
+                let last_modified = {
+                    #[expect(clippy::cast_possible_wrap)]
+                    let mtime = stat.nfs_mtime as i64;
+                    #[expect(clippy::cast_possible_truncation)]
+                    let mtime_nsec = stat.nfs_mtime_nsec as u32;
+                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
+                        .unwrap_or_else(Utc::now)
+                };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 
                 let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
