@@ -73,12 +73,12 @@ pub async fn start_internal_cluster_server(
         server = server_with_cluster_mtls(server, tls_config)
             .map_err(|source| Error::UnableToConfigureTls { source })?;
         tracing::info!("Cluster mTLS enabled for internal cluster server");
-    } else if !rt.df.cluster_config.insecure_node() {
+    } else if !rt.df.cluster_config.insecure() {
         return Err(Error::InsecureConfiguration {
-            message: "Cluster mode without mTLS requires --insecure-node".to_string(),
+            message: "Cluster mode without mTLS requires --insecure".to_string(),
         });
     } else {
-        tracing::warn!("Cluster mTLS disabled for internal cluster server due to --insecure-node");
+        tracing::warn!("Cluster mTLS disabled for internal cluster server due to --insecure");
     }
 
     let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
@@ -117,7 +117,7 @@ pub async fn start_internal_cluster_server(
 
 /// Starts the executor Ballista Flight server used for receiving query fragments.
 ///
-/// mTLS is optional when `--insecure-node` is used.
+/// mTLS is optional when `--insecure` is used.
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
@@ -130,12 +130,12 @@ pub async fn start_executor_flight_server(
         server = server_with_cluster_mtls(server, tls_config)
             .map_err(|source| Error::UnableToConfigureTls { source })?;
         tracing::info!("Cluster mTLS enabled for executor flight server");
-    } else if !rt.df.cluster_config.insecure_node() {
+    } else if !rt.df.cluster_config.insecure() {
         return Err(Error::InsecureConfiguration {
-            message: "Cluster mode without mTLS requires --insecure-node".to_string(),
+            message: "Cluster mode without mTLS requires --insecure".to_string(),
         });
     } else {
-        tracing::warn!("Cluster mTLS disabled for executor flight server due to --insecure-node");
+        tracing::warn!("Cluster mTLS disabled for executor flight server due to --insecure");
     }
 
     // Executor: serve only BallistaFlightService for receiving query fragments.
