@@ -17,9 +17,6 @@ limitations under the License.
 use clap::{ArgAction, ValueEnum};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-#[cfg(feature = "cluster")]
-use url::Url;
-
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Config {
     /// Configure runtime HTTP address.
@@ -123,12 +120,16 @@ pub struct ClusterConfig {
 
     /// The URL of the scheduler service. Required for executors to join a cluster.
     /// If set, --role executor is implied and can be omitted.
+    /// If the scheme (http/https) is omitted, it will be inferred from TLS configuration.
     #[arg(long = "scheduler-address", value_name = "SCHEDULER_ADDRESS")]
-    pub scheduler_address: Option<Url>,
+    pub scheduler_address: Option<String>,
 
-    /// The hostname and port that this node advertises to other cluster nodes.
+    /// The hostname or IP address that this node advertises to other cluster nodes.
     /// For schedulers: used as the URL for distributed query planning.
     /// For executors: used during registration to tell the scheduler how to contact this node.
+    ///
+    /// The fully qualified advertise URL will be constructed as:
+    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// if --insecure is set)
     #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
     pub node_advertise_address: Option<String>,
 }
@@ -164,8 +165,8 @@ impl ClusterConfig {
     }
 
     #[must_use]
-    pub fn with_scheduler_address(mut self, url: Url) -> Self {
-        self.scheduler_address = Some(url);
+    pub fn with_scheduler_address(mut self, url: impl Into<String>) -> Self {
+        self.scheduler_address = Some(url.into());
         self
     }
 }
