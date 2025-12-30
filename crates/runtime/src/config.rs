@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::ValueEnum;
+use clap::{ArgAction, ValueEnum};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[cfg(feature = "cluster")]
@@ -117,6 +117,10 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
+    /// Allow insecure cluster communication without mTLS. WARNING: Only use this flag in development or testing environments and never in production.
+    #[arg(long = "insecure", default_value_t = false, action = ArgAction::SetTrue)]
+    pub insecure: bool,
+
     /// The URL of the scheduler service. Required for executors to join a cluster.
     /// If set, --role executor is implied and can be omitted.
     #[arg(long = "scheduler-address", value_name = "SCHEDULER_ADDRESS")]
@@ -138,6 +142,7 @@ impl Default for ClusterConfig {
             node_mtls_ca_certificate_file: None,
             node_mtls_certificate_file: None,
             node_mtls_key_file: None,
+            insecure: false,
             scheduler_address: None,
             node_advertise_address: None,
         }

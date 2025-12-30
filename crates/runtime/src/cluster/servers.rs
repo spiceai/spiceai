@@ -50,7 +50,6 @@ fn server_with_cluster_mtls(
 /// - `ClusterServiceServer`: Spice-specific RPCs (`GetAppDefinition`, `ExpandSecret`)
 ///
 /// This server should only be started when running in scheduler mode.
-/// mTLS is required and enforced, requiring client certificates.
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
@@ -67,17 +66,22 @@ pub async fn start_internal_cluster_server(
         return Err(Error::ClusterSchedulerNotInitialized {});
     };
 
-    // mTLS is required for cluster mode
-    let Some(tls_config) = rt.df.cluster_config.tls_config() else {
+    let tls_config = rt.df.cluster_config.tls_config();
+    let mut server = Server::builder();
+
+    if let Some(tls_config) = tls_config {
+        server = server_with_cluster_mtls(server, tls_config)
+            .map_err(|source| Error::UnableToConfigureTls { source })?;
+        tracing::info!("Cluster mTLS enabled for internal cluster server");
+    } else if !rt.df.cluster_config.insecure() {
         return Err(Error::InsecureConfiguration {
-            message: "Cluster mode requires mTLS configuration".to_string(),
+            message: "Cluster mode without mTLS requires the --insecure flag".to_string(),
         });
-    };
-
-    let mut server = server_with_cluster_mtls(Server::builder(), tls_config)
-        .map_err(|source| Error::UnableToConfigureTls { source })?;
-
-    tracing::info!("Cluster mTLS enabled for internal cluster server");
+    } else {
+        tracing::warn!(
+            "Cluster mTLS disabled for internal cluster server (--insecure flag is set)"
+        );
+    }
 
     let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
         .max_decoding_message_size(usize::MAX)
@@ -115,23 +119,26 @@ pub async fn start_internal_cluster_server(
 
 /// Starts the executor Ballista Flight server used for receiving query fragments.
 ///
-/// mTLS is required and enforced, requiring client certificates.
+/// mTLS is optional when `--insecure` is used.
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
-    // mTLS is required for cluster mode
-    let Some(tls_config) = rt.df.cluster_config.tls_config() else {
+    let tls_config = rt.df.cluster_config.tls_config();
+    let mut server = Server::builder();
+
+    if let Some(tls_config) = tls_config {
+        server = server_with_cluster_mtls(server, tls_config)
+            .map_err(|source| Error::UnableToConfigureTls { source })?;
+        tracing::info!("Cluster mTLS enabled for executor flight server");
+    } else if !rt.df.cluster_config.insecure() {
         return Err(Error::InsecureConfiguration {
-            message: "Cluster mode requires mTLS configuration".to_string(),
+            message: "Cluster mode without mTLS requires the --insecure flag".to_string(),
         });
-    };
-
-    let mut server = server_with_cluster_mtls(Server::builder(), tls_config)
-        .map_err(|source| Error::UnableToConfigureTls { source })?;
-
-    tracing::info!("Cluster mTLS enabled for executor flight server");
+    } else {
+        tracing::warn!("Cluster mTLS disabled for executor flight server (--insecure flag is set)");
+    }
 
     // Executor: serve only BallistaFlightService for receiving query fragments.
     // No OTel service needed on executors.
