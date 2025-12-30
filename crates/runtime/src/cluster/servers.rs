@@ -73,7 +73,7 @@ pub async fn start_internal_cluster_server(
         server = server_with_cluster_mtls(server, tls_config)
             .map_err(|source| Error::UnableToConfigureTls { source })?;
         tracing::info!("Cluster mTLS enabled for internal cluster server");
-    } else if !rt.df.cluster_config.insecure() {
+    } else if !rt.df.cluster_config.allow_insecure_connections() {
         return Err(Error::InsecureConfiguration {
             message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
                 .to_string(),
@@ -133,7 +133,7 @@ pub async fn start_executor_flight_server(
         server = server_with_cluster_mtls(server, tls_config)
             .map_err(|source| Error::UnableToConfigureTls { source })?;
         tracing::info!("Cluster mTLS enabled for executor flight server");
-    } else if !rt.df.cluster_config.insecure() {
+    } else if !rt.df.cluster_config.allow_insecure_connections() {
         return Err(Error::InsecureConfiguration {
             message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
                 .to_string(),

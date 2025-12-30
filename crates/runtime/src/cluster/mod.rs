@@ -258,7 +258,7 @@ impl ResolvedClusterConfig {
 
     /// Returns whether this node allows insecure cluster communication.
     #[must_use]
-    pub fn insecure(&self) -> bool {
+    pub fn allow_insecure_connections(&self) -> bool {
         self.config.allow_insecure_connections
     }
 
