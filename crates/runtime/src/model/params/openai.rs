@@ -17,7 +17,7 @@ limitations under the License.
 use super::{COMMON_MODEL_PARAMETERS, PARAM_LEN, concat_arrays};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] =
+pub const PARAMETERS: &[ParameterSpec] =
     &concat_arrays::<ParameterSpec, OPENAI_PARAM_LEN, PARAM_LEN, { OPENAI_PARAM_LEN + PARAM_LEN }>(
         OPENAI_PARAMETERS,
         COMMON_MODEL_PARAMETERS,

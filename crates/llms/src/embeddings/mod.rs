@@ -12,8 +12,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-pub use async_openai::types::EmbeddingInput;
-use async_openai::types::{
+pub use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingUsage, EmbeddingVector,
     EncodingFormat,
 };
