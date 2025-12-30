@@ -130,7 +130,7 @@ pub async fn get_tools_with_allowlist(
                 ) {
                     (None, Some(_)) => {
                         tracing::info!(
-                            "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{catalog_name}"
+                            "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{catalog_name}'"
                         );
                         Arc::clone(catalog)
                     }
