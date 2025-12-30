@@ -57,8 +57,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone)]
 pub struct BuiltinToolCatalog {
     rt: Arc<Runtime>,
-    /// An optional table allowlist that overrides any per-tool `table_allowlist` param.
-    /// Used when the model specifies `datasets` to restrict all tools to those datasets.
+    /// An optional table allowlist. Overriden by any per-tool `table_allowlist` param.
     model_table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
@@ -126,26 +125,25 @@ impl BuiltinToolCatalog {
 
         // Use model-level table allowlist if set, otherwise parse from params
         let table_allowlist: Option<ResolvedTableAwareAllowlist> =
-            if let Some(ref model_allowlist) = self.model_table_allowlist {
+            if let Some(allowlist) = params.get("table_allowlist") {
+                let tables = allowlist
+                    .expose_secret()
+                    .split(',')
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>();
+                Some(
+                    ResolvedTableAwareAllowlist::with_defaults(
+                        SPICE_DEFAULT_CATALOG,
+                        SPICE_DEFAULT_SCHEMA,
+                    )
+                    .with_table_patterns(tables)
+                    .boxed()
+                    .context(FailedToConstructToolSnafu { id })?,
+                )
+            } else if let Some(ref model_allowlist) = self.model_table_allowlist {
                 Some(model_allowlist.clone())
             } else {
-                params
-                    .get("table_allowlist")
-                    .map(|t| {
-                        let tables = t
-                            .expose_secret()
-                            .split(',')
-                            .map(ToString::to_string)
-                            .collect::<Vec<String>>();
-                        ResolvedTableAwareAllowlist::with_defaults(
-                            SPICE_DEFAULT_CATALOG,
-                            SPICE_DEFAULT_SCHEMA,
-                        )
-                        .with_table_patterns(tables)
-                    })
-                    .transpose()
-                    .boxed()
-                    .context(FailedToConstructToolSnafu { id })?
+                None
             };
 
         match id {
