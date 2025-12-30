@@ -206,7 +206,7 @@ fn google(
     };
 
     let dimensions: Option<u32> = params
-        .get("google_dimensions")
+        .get("dimensions")
         .map(|d| d.expose_secret().parse())
         .transpose()
         // Only error if user provided dimensions.
