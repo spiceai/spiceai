@@ -82,6 +82,7 @@ default = [
     "turso",
     "cluster",
     "smb",
+    "nfs",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
