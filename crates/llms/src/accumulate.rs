@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{
-    ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionResponseMessage,
-    ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType,
+use async_openai::types::chat::{
+    ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
 };
 use futures::StreamExt;
 
 #[must_use]
+#[expect(deprecated)]
 pub fn empty_completion_response() -> CreateChatCompletionResponse {
     CreateChatCompletionResponse {
         id: String::new(),
@@ -80,8 +81,9 @@ pub fn fold_completion_stream(
                     content: None,
                     refusal: None,
                     tool_calls: None,
+                    annotations: None,
                     function_call: None,
-                    role: async_openai::types::Role::User,
+                    role: async_openai::types::chat::Role::User,
                     audio: None,
                 },
             })
@@ -141,30 +143,29 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
                 if acc_tools.get(i).is_none() {
                     acc_tools.insert(
                         i,
-                        ChatCompletionMessageToolCall {
+                        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
                             id: String::new(),
-                            r#type: ChatCompletionToolType::Function,
                             function: FunctionCall {
                                 name: String::new(),
                                 arguments: String::new(),
                             },
-                        },
+                        }),
                     );
                 }
 
-                if let Some(id) = &tool.id {
-                    acc_tools[i].id.clone_from(id);
-                }
-                if let Some(r#type) = &tool.r#type {
-                    acc_tools[i].r#type = r#type.clone();
-                }
-
-                if let Some(fun) = &tool.function {
-                    if let Some(args) = &fun.arguments {
-                        acc_tools[i].function.arguments += args;
+                // Access the inner tool call through the enum variant
+                if let ChatCompletionMessageToolCalls::Function(ref mut inner_tool) = acc_tools[i] {
+                    if let Some(id) = &tool.id {
+                        inner_tool.id.clone_from(id);
                     }
-                    if let Some(name) = &fun.name {
-                        acc_tools[i].function.name += name;
+
+                    if let Some(fun) = &tool.function {
+                        if let Some(args) = &fun.arguments {
+                            inner_tool.function.arguments += args;
+                        }
+                        if let Some(name) = &fun.name {
+                            inner_tool.function.name += name;
+                        }
                     }
                 }
             }
@@ -203,7 +204,7 @@ pub mod tests {
         let stream: ChatCompletionResponseStream =
             Box::pin(futures::stream::iter(parts.into_iter().map(|s| {
                 serde_json::from_str::<CreateChatCompletionStreamResponse>(s)
-                    .map_err(OpenAIError::from)
+                    .map_err(|e| OpenAIError::JSONDeserialize(e, s.to_string()))
             })));
 
         let resp = accumulate(stream).await;

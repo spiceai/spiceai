@@ -67,10 +67,10 @@ impl Runtime {
         };
 
         if let Some(model) = &responses_model
-            && model.health().await.is_err()
+            && let Err(e) = model.health().await
         {
             tracing::warn!(
-                "Failed to load Responses API endpoint for model '{}'. Verify the Spicepod configuration and try again.",
+                "Failed to load Responses API endpoint for model '{}': {e}. Verify the Spicepod configuration and try again.",
                 m.name.clone()
             );
             responses_model = None;

@@ -29,7 +29,7 @@ use arrow::array::{
 };
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatChoice, ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
     },

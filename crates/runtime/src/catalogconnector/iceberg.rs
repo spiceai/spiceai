@@ -153,8 +153,8 @@ impl IcebergCatalog {
     }
 }
 
-pub(crate) const ICEBERG_PARAM_LEN: usize = 17;
-pub(crate) const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
+pub const ICEBERG_PARAM_LEN: usize = 17;
+pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
         .description("Bearer token value to use for Authorization header."),

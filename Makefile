@@ -27,7 +27,6 @@ build: build-cli build-runtime
 build-dev:
 	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
-	cargo build --profile dev -p spicepod-validator
 
 .PHONY: ci
 ci:
