@@ -18,9 +18,6 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
-mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
-
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
 
@@ -60,10 +57,6 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    /// Run an HTTP consistency test
-    HttpConsistency(HttpConsistencyTestArgs),
-    /// Run an HTTP overhead test
-    HttpOverhead(HttpOverheadTestArgs),
     /// Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]

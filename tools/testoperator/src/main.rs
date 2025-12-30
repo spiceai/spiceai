@@ -24,8 +24,7 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
-    HttpOverheadTestArgs, LoadTestArgs, TestCommands,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
 };
 
 use crate::args::SearchTestArgs;
@@ -52,8 +51,6 @@ async fn main() -> anyhow::Result<()> {
                 test_args: DatasetTestArgs { common, .. },
                 ..
             })
-            | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
-            | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::Evals(EvalsTestArgs { common, .. })
             | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
@@ -73,12 +70,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::DataConsistency(args)) => {
             commands::data_consistency::run(&args).await?;
-        }
-        Commands::Run(TestCommands::HttpOverhead(args)) => {
-            commands::http::overhead_run(&args).await?;
-        }
-        Commands::Run(TestCommands::HttpConsistency(args)) => {
-            commands::http::consistency_run(&args).await?;
         }
         Commands::Dispatch(args) => {
             commands::dispatch::dispatch(args).await?;
