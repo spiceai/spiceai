@@ -57,6 +57,7 @@ pub enum TestType {
     Append,
     DataConsistency,
     Search,
+    TextToSql,
 }
 
 impl TestType {
@@ -69,6 +70,7 @@ impl TestType {
             TestType::Append => "testoperator_run_append.yml",
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::Search => "testoperator_run_search.yml",
+            TestType::TextToSql => "testoperator_run_texttosql.yml",
         }
     }
 }
@@ -82,6 +84,7 @@ impl Display for TestType {
             TestType::Append => write!(f, "append"),
             TestType::DataConsistency => write!(f, "data_consistency"),
             TestType::Search => write!(f, "search"),
+            TestType::TextToSql => write!(f, "text_to_sql"),
         }
     }
 }

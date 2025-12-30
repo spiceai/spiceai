@@ -17025,9 +17025,11 @@ dependencies = [
 name = "testoperator"
 version = "1.11.0-unstable"
 dependencies = [
+ "arrow",
  "arrow-json",
  "clap 4.5.53",
  "hf-hub",
+ "itertools 0.14.0",
  "reqwest",
  "serde",
  "serde_json",

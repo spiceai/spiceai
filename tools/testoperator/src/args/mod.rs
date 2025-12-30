@@ -35,6 +35,9 @@ pub use evals::EvalsTestArgs;
 mod search;
 pub use search::SearchTestArgs;
 
+mod text_to_sql;
+pub use text_to_sql::TextToSqlArgs;
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run a test
@@ -64,6 +67,8 @@ pub enum TestCommands {
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
     Query(QueryArgs),
+    /// Run a text-to-sql test
+    TextToSql(TextToSqlArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
