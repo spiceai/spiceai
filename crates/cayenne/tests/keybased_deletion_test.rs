@@ -40,7 +40,10 @@ mod common;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{
+    metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
+    MetadataCatalog,
+};
 use common::TestFixture;
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
@@ -86,10 +89,9 @@ async fn setup_string_pk_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options).await?,
-    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -111,10 +113,9 @@ async fn setup_composite_pk_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options).await?,
-    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -189,7 +190,9 @@ async fn test_string_pk_basic_deletion_impl(fixture: TestFixture) -> TestResult<
         schema,
         vec![
             Arc::new(StringArray::from(vec!["A", "B", "C", "D", "E"])),
-            Arc::new(StringArray::from(vec!["alpha", "bravo", "charlie", "delta", "echo"])),
+            Arc::new(StringArray::from(vec![
+                "alpha", "bravo", "charlie", "delta", "echo",
+            ])),
             Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
         ],
     )?;
@@ -202,7 +205,10 @@ async fn test_string_pk_basic_deletion_impl(fixture: TestFixture) -> TestResult<
     delete_records(&table, col("code").eq(lit("D"))).await?;
 
     assert_eq!(get_row_count(&ctx, "string_pk_basic").await?, 3);
-    assert_eq!(get_codes(&ctx, "string_pk_basic").await?, vec!["A", "C", "E"]);
+    assert_eq!(
+        get_codes(&ctx, "string_pk_basic").await?,
+        vec!["A", "C", "E"]
+    );
 
     Ok(())
 }
@@ -309,9 +315,9 @@ async fn test_string_pk_special_characters_impl(fixture: TestFixture) -> TestRes
         vec![
             Arc::new(StringArray::from(vec![
                 "hello",
-                "世界",     // Chinese
-                "🚀",       // Emoji
-                "café",     // Accented
+                "世界",      // Chinese
+                "🚀",        // Emoji
+                "café",      // Accented
                 "tab\there", // Tab character
             ])),
             Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
@@ -507,7 +513,8 @@ test_with_backends!(test_composite_pk_partial_key_deletion_impl);
 
 // Edge Case 10: Composite PK - delete non-existent key
 async fn test_composite_pk_delete_nonexistent_impl(fixture: TestFixture) -> TestResult<()> {
-    let (table, ctx, schema) = setup_composite_pk_table(&fixture, "composite_pk_nonexistent").await?;
+    let (table, ctx, schema) =
+        setup_composite_pk_table(&fixture, "composite_pk_nonexistent").await?;
 
     let batch = RecordBatch::try_new(
         schema,
@@ -534,7 +541,8 @@ test_with_backends!(test_composite_pk_delete_nonexistent_impl);
 
 // Edge Case 11: Composite PK - idempotent deletion
 async fn test_composite_pk_idempotent_delete_impl(fixture: TestFixture) -> TestResult<()> {
-    let (table, ctx, schema) = setup_composite_pk_table(&fixture, "composite_pk_idempotent").await?;
+    let (table, ctx, schema) =
+        setup_composite_pk_table(&fixture, "composite_pk_idempotent").await?;
 
     let batch = RecordBatch::try_new(
         schema,
@@ -564,7 +572,8 @@ test_with_backends!(test_composite_pk_idempotent_delete_impl);
 
 // Edge Case 12: Composite PK - multi-file deletion
 async fn test_composite_pk_multi_file_deletion_impl(fixture: TestFixture) -> TestResult<()> {
-    let (table, ctx, schema) = setup_composite_pk_table(&fixture, "composite_pk_multi_file").await?;
+    let (table, ctx, schema) =
+        setup_composite_pk_table(&fixture, "composite_pk_multi_file").await?;
 
     // Batch 1
     let batch1 = RecordBatch::try_new(
@@ -632,7 +641,9 @@ async fn test_composite_pk_stress_interleaved_impl(fixture: TestFixture) -> Test
     // Delete all rows from region A with even ids
     let deleted = delete_records(
         &table,
-        col("region").eq(lit("A")).and((col("id") % lit(2i64)).eq(lit(0i64))),
+        col("region")
+            .eq(lit("A"))
+            .and((col("id") % lit(2i64)).eq(lit(0i64))),
     )
     .await?;
     assert_eq!(deleted, 5); // A: 2, 4, 6, 8, 10
@@ -678,10 +689,10 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(
-        CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?,
-    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table =
+        Arc::new(CayenneTableProvider::create_table(Arc::clone(&catalog), table_options).await?);
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),

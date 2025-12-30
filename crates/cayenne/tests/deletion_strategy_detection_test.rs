@@ -17,9 +17,9 @@ limitations under the License.
 //! Integration tests for proper detection of deletion vector strategies.
 //!
 //! Cayenne supports three deletion strategies:
-//! 1. **Int64Pk**: Single-column Int64 primary key using `HashSet<i64>` - most efficient
-//! 2. **RowConverterBased (key-based)**: Composite or non-integer primary keys using `RowConverter`
-//! 3. **PositionBased**: Tables without primary keys using `RoaringBitmap`
+//! 1. `Int64Pk`: Single-column Int64 primary key using `HashSet<i64>` - most efficient
+//! 2. `RowConverterBased` (key-based): Composite or non-integer primary keys using `RowConverter`
+//! 3. `PositionBased`: Tables without primary keys using `RoaringBitmap`
 //!
 //! These tests verify that the correct strategy is selected based on table schema.
 
@@ -29,7 +29,10 @@ mod common;
 
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{
+    metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
+    MetadataCatalog,
+};
 use common::TestFixture;
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
@@ -47,7 +50,7 @@ fn get_catalog(fixture: &TestFixture) -> Arc<dyn MetadataCatalog> {
 // Test Strategy Detection by Schema Configuration
 // =============================================================================
 
-/// Test that Int64Pk strategy is selected for single Int64 primary key.
+/// Test that `Int64Pk` strategy is selected for single Int64 primary key.
 async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false), // Single Int64 PK
@@ -63,9 +66,8 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -76,10 +78,12 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete and verify it works correctly (Int64Pk strategy)
@@ -98,11 +102,19 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
         .copied()
         .unwrap_or(0);
 
-    assert_eq!(deleted, 1, "Should delete exactly 1 row with Int64Pk strategy");
+    assert_eq!(
+        deleted, 1,
+        "Should delete exactly 1 row with Int64Pk strategy"
+    );
 
     // Verify remaining data
-    ctx.register_table("int64_pk_table", Arc::clone(&table) as Arc<dyn TableProvider>)?;
-    let df = ctx.sql("SELECT COUNT(*) as cnt FROM int64_pk_table").await?;
+    ctx.register_table(
+        "int64_pk_table",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM int64_pk_table")
+        .await?;
     let results = df.collect().await?;
     let count = results
         .first()
@@ -118,7 +130,7 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
 
 test_with_backends!(test_detects_int64_pk_strategy_impl);
 
-/// Test that RowConverter-based strategy is selected for String primary key.
+/// Test that `RowConverter`-based strategy is selected for String primary key.
 async fn test_detects_rowconverter_strategy_for_string_pk_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
@@ -136,9 +148,8 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -149,10 +160,12 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete and verify
@@ -176,8 +189,13 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
         "Should delete exactly 1 row with RowConverter strategy"
     );
 
-    ctx.register_table("string_pk_table", Arc::clone(&table) as Arc<dyn TableProvider>)?;
-    let df = ctx.sql("SELECT COUNT(*) as cnt FROM string_pk_table").await?;
+    ctx.register_table(
+        "string_pk_table",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM string_pk_table")
+        .await?;
     let results = df.collect().await?;
     let count = results
         .first()
@@ -193,7 +211,7 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
 
 test_with_backends!(test_detects_rowconverter_strategy_for_string_pk_impl);
 
-/// Test that RowConverter-based strategy is selected for composite primary key.
+/// Test that `RowConverter`-based strategy is selected for composite primary key.
 async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
@@ -212,9 +230,8 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -226,10 +243,12 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete with composite key
@@ -253,7 +272,10 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
         "Should delete exactly 1 row with composite key RowConverter strategy"
     );
 
-    ctx.register_table("composite_pk_table", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    ctx.register_table(
+        "composite_pk_table",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
     let df = ctx
         .sql("SELECT COUNT(*) as cnt FROM composite_pk_table")
         .await?;
@@ -272,7 +294,7 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
 
 test_with_backends!(test_detects_rowconverter_strategy_for_composite_pk_impl);
 
-/// Test that PositionBased strategy is selected for tables without primary key.
+/// Test that `PositionBased` strategy is selected for tables without primary key.
 async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -288,9 +310,8 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -301,10 +322,12 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete by value (not PK)
@@ -345,7 +368,7 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
 
 test_with_backends!(test_detects_position_based_strategy_impl);
 
-/// Test that Int32 primary key uses RowConverter strategy (not Int64Pk).
+/// Test that Int32 primary key uses `RowConverter` strategy (not `Int64Pk`).
 async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false), // Int32, not Int64
@@ -361,9 +384,8 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -374,10 +396,12 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete and verify
@@ -401,8 +425,13 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
         "Should delete exactly 1 row (Int32 PK uses RowConverter strategy)"
     );
 
-    ctx.register_table("int32_pk_table", Arc::clone(&table) as Arc<dyn TableProvider>)?;
-    let df = ctx.sql("SELECT COUNT(*) as cnt FROM int32_pk_table").await?;
+    ctx.register_table(
+        "int32_pk_table",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
+    let df = ctx
+        .sql("SELECT COUNT(*) as cnt FROM int32_pk_table")
+        .await?;
     let results = df.collect().await?;
     let count = results
         .first()
@@ -438,9 +467,8 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -450,10 +478,12 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete a row
@@ -476,7 +506,10 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     // Verify count
-    ctx2.register_table("persist_int64pk", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
+    ctx2.register_table(
+        "persist_int64pk",
+        Arc::clone(&table2) as Arc<dyn TableProvider>,
+    )?;
     let df = ctx2
         .sql("SELECT COUNT(*) as cnt FROM persist_int64pk")
         .await?;
@@ -495,7 +528,7 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
 
 test_with_backends!(test_strategy_persists_on_reopen_int64pk_impl);
 
-/// Verify that PositionBased strategy persists on table reopen.
+/// Verify that `PositionBased` strategy persists on table reopen.
 async fn test_strategy_persists_on_reopen_position_based_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
@@ -513,9 +546,8 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = Arc::new(
-        CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(get_catalog(&fixture), table_options).await?);
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -525,10 +557,12 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
         ],
     )?;
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    ));
+    let boxed_stream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            stream,
+        ),
+    );
     table.insert(boxed_stream).await?;
 
     // Delete
@@ -549,7 +583,10 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
     let plan2 = table2.delete_from(&ctx2.state(), &[filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
-    ctx2.register_table("persist_position", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
+    ctx2.register_table(
+        "persist_position",
+        Arc::clone(&table2) as Arc<dyn TableProvider>,
+    )?;
     let df = ctx2
         .sql("SELECT COUNT(*) as cnt FROM persist_position")
         .await?;
@@ -603,10 +640,12 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
         ],
     )?;
     let stream1 = futures::stream::once(async { Ok(batch1) });
-    let boxed_stream1 = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema1),
-        stream1,
-    ));
+    let boxed_stream1 = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema1),
+            stream1,
+        ),
+    );
     table1.insert(boxed_stream1).await?;
 
     // Table 2: String PK strategy
@@ -636,10 +675,12 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
         ],
     )?;
     let stream2 = futures::stream::once(async { Ok(batch2) });
-    let boxed_stream2 = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema2),
-        stream2,
-    ));
+    let boxed_stream2 = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema2),
+            stream2,
+        ),
+    );
     table2.insert(boxed_stream2).await?;
 
     // Table 3: PositionBased strategy
@@ -669,10 +710,12 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
         ],
     )?;
     let stream3 = futures::stream::once(async { Ok(batch3) });
-    let boxed_stream3 = Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema3),
-        stream3,
-    ));
+    let boxed_stream3 = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema3),
+            stream3,
+        ),
+    );
     table3.insert(boxed_stream3).await?;
 
     // Delete from each table

@@ -36,7 +36,10 @@ mod common;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::{
+    metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
+    MetadataCatalog,
+};
 use common::TestFixture;
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
@@ -73,10 +76,9 @@ async fn setup_int64_pk_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options).await?,
-    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
@@ -276,7 +278,10 @@ async fn test_int64_pk_sequential_deletes_impl(fixture: TestFixture) -> TestResu
     }
 
     assert_eq!(get_row_count(&ctx, "sequential_test").await?, 6);
-    assert_eq!(get_ids(&ctx, "sequential_test").await?, vec![1, 2, 4, 6, 8, 10]);
+    assert_eq!(
+        get_ids(&ctx, "sequential_test").await?,
+        vec![1, 2, 4, 6, 8, 10]
+    );
 
     Ok(())
 }
@@ -443,10 +448,9 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, table_options).await?,
-    );
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -464,7 +468,8 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
     delete_records(&table, col("id").eq(lit(3i64))).await?;
 
     // Reopen the table
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table2 = Arc::new(
         CayenneTableProviderBuilder::new(catalog)
             .open(table_name)
@@ -494,9 +499,13 @@ async fn test_int64_pk_complex_filter_impl(fixture: TestFixture) -> TestResult<(
         vec![
             Arc::new(Int64Array::from((1..=20).collect::<Vec<_>>())),
             Arc::new(StringArray::from(
-                (1..=20).map(|i| if i % 2 == 0 { "even" } else { "odd" }).collect::<Vec<_>>(),
+                (1..=20)
+                    .map(|i| if i % 2 == 0 { "even" } else { "odd" })
+                    .collect::<Vec<_>>(),
             )),
-            Arc::new(Int64Array::from((1..=20).map(|i| i * 10).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (1..=20).map(|i| i * 10).collect::<Vec<_>>(),
+            )),
         ],
     )?;
     insert_batch(&table, batch).await?;
@@ -509,7 +518,7 @@ async fn test_int64_pk_complex_filter_impl(fixture: TestFixture) -> TestResult<(
         .and(col("id").lt(lit(15i64)))
         .and(col("name").eq(lit("even")));
     let deleted = delete_records(&table, filter).await?;
-    
+
     // Should delete ids 6, 8, 10, 12, 14
     assert_eq!(deleted, 5);
     assert_eq!(get_row_count(&ctx, "complex_filter_test").await?, 15);
@@ -534,7 +543,9 @@ async fn test_int64_pk_stress_interleaved_impl(fixture: TestFixture) -> TestResu
             Arc::new(StringArray::from(
                 (1..=100).map(|i| format!("name_{i}")).collect::<Vec<_>>(),
             )),
-            Arc::new(Int64Array::from((1..=100).map(|i| i * 10).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (1..=100).map(|i| i * 10).collect::<Vec<_>>(),
+            )),
         ],
     )?;
     insert_batch(&table, batch1).await?;
@@ -554,7 +565,9 @@ async fn test_int64_pk_stress_interleaved_impl(fixture: TestFixture) -> TestResu
             Arc::new(StringArray::from(
                 (101..=150).map(|i| format!("name_{i}")).collect::<Vec<_>>(),
             )),
-            Arc::new(Int64Array::from((101..=150).map(|i| i * 10).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (101..=150).map(|i| i * 10).collect::<Vec<_>>(),
+            )),
         ],
     )?;
     insert_batch(&table, batch2).await?;

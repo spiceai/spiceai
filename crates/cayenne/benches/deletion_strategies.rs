@@ -31,7 +31,9 @@ limitations under the License.
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+use cayenne::{
+    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
+};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
@@ -168,7 +170,10 @@ async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> u64 {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await.expect("delete");
+    let plan = table
+        .delete_from(&ctx.state(), &[filter])
+        .await
+        .expect("delete");
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx())
         .await
         .expect("collect");
@@ -474,8 +479,7 @@ fn bench_stringpk_batch_delete(c: &mut Criterion) {
 
                     // Delete rows with value < 20% of max
                     let deleted =
-                        delete_records(&table, col("value").lt(lit((size as i64 / 5) * 100)))
-                            .await;
+                        delete_records(&table, col("value").lt(lit((size as i64 / 5) * 100))).await;
                     black_box(deleted);
                 });
             });
@@ -733,8 +737,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                 insert_batch(&table, batch).await;
 
                 // Delete 10% of rows
-                let deleted =
-                    delete_records(&table, col("id").lt(lit(size as i64 / 10))).await;
+                let deleted = delete_records(&table, col("id").lt(lit(size as i64 / 10))).await;
                 black_box(deleted);
             });
         });
@@ -767,8 +770,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
 
                 // Delete 10% of rows
                 let deleted =
-                    delete_records(&table, col("value").lt(lit((size as i64 / 10) * 100)))
-                        .await;
+                    delete_records(&table, col("value").lt(lit((size as i64 / 10) * 100))).await;
                 black_box(deleted);
             });
         });
@@ -801,8 +803,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
 
                 // Delete 10% of rows
                 let deleted =
-                    delete_records(&table, col("value").lt(lit((size as i64 / 10) * 100)))
-                        .await;
+                    delete_records(&table, col("value").lt(lit((size as i64 / 10) * 100))).await;
                 black_box(deleted);
             });
         });

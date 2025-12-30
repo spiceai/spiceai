@@ -701,7 +701,10 @@ async fn test_position_based_stress_interleaved() -> TestResult<()> {
 
     // Verify count makes sense
     let remaining = get_row_count(&ctx, "stress_test").await?;
-    assert_eq!(remaining, 125 - deleted_b as i64);
+    assert_eq!(
+        remaining,
+        125 - i64::try_from(deleted_b).expect("deleted_b fits in i64")
+    );
 
     // Verify no A's or B's remain
     // Note: A's from batch2 DO remain because:
