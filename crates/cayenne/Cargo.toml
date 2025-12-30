@@ -11,6 +11,7 @@ version = "0.1.0"
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }

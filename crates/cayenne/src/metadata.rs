@@ -76,6 +76,18 @@ pub struct DataFile {
     pub row_id_start: i64,
 }
 
+/// The type of deletion vector: position-based or key-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeletionType {
+    /// Position-based deletion using row IDs (for tables without primary key).
+    /// Requires consistent ordering between delete and read operations.
+    #[default]
+    PositionBased,
+    /// Key-based deletion using primary key bytes (for tables with primary key).
+    /// Position-independent, survives data reorganization.
+    KeyBased,
+}
+
 /// Represents a deletion vector file tracking deleted rows.
 #[derive(Debug, Clone)]
 pub struct DeleteFile {
@@ -83,16 +95,19 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
-    /// Path to the delete file (Parquet format)
+    /// Path to the delete file (Arrow IPC format)
     pub path: String,
     /// Whether the path is relative
     pub path_is_relative: bool,
-    /// Format of the delete file (always "parquet")
+    /// Format of the delete file (always `arrow_ipc`)
     pub format: String,
     /// Number of deleted rows in this file
     pub delete_count: i64,
     /// Size of the file in bytes
     pub file_size_bytes: i64,
+    /// The type of deletion vector (position-based or key-based).
+    /// Inferred from the file schema when read, or set when writing.
+    pub deletion_type: DeletionType,
 }
 
 /// Metadata about a partition in a table.

@@ -553,6 +553,9 @@ impl MetadataCatalog for CayenneCatalog {
                         format: row.get_string(4)?,
                         delete_count: row.get_i64(5)?,
                         file_size_bytes: row.get_i64(6)?,
+                        // The actual deletion type is determined when reading the file
+                        // based on the schema (row_id = position-based, row_key = key-based)
+                        deletion_type: crate::metadata::DeletionType::default(),
                     })
                 },
             )
@@ -671,6 +674,7 @@ impl MetadataCatalog for CayenneCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::DeletionType;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -898,6 +902,7 @@ mod tests {
                     format: "parquet".to_string(),
                     delete_count: 10,
                     file_size_bytes: 512,
+                    deletion_type: DeletionType::default(),
                 };
 
                 catalog_clone.add_delete_file(delete_file).await

@@ -20,12 +20,16 @@ limitations under the License.
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
 use super::constants::LISTING_TABLE_LOCK_POISONED;
-use super::delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
+use super::delete::{
+    read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec,
+};
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use arrow::record_batch::RecordBatch;
+use arrow_row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionTableProvider};
@@ -41,13 +45,17 @@ use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::compressor::CompactCompressor;
@@ -55,6 +63,23 @@ use vortex::file::WriteStrategyBuilder;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
 use vortex_session::VortexSession;
+
+/// Strategy for primary key-based deletion filtering.
+///
+/// Determines which cache and filter execution plan to use at query time.
+/// Chosen based on the table's primary key configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkDeletionStrategy {
+    /// No primary key - use position-based deletion with `RoaringBitmap`.
+    /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
+    PositionBased,
+    /// Single-column Int64 primary key - use direct `HashSet<i64>` lookup.
+    /// Most efficient: no serialization, 8 bytes per key, parallel reads.
+    Int64Pk,
+    /// Composite or non-integer primary key - use `RowConverter` + `HashSet<Box<[u8]>>`.
+    /// Handles all PK types but has serialization overhead.
+    RowConverterBased,
+}
 
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
@@ -82,8 +107,10 @@ pub struct CayenneTableProvider {
     retention_filters: Vec<Expr>,
     /// Vortex encoding configuration for hardware-accelerated compression
     vortex_config: crate::metadata::VortexConfig,
-    /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
-    /// This is loaded once during table provider initialization and invalidated when delete files change.
+    /// Cached deletion vectors (deleted row IDs) for position-based deletion.
+    /// Used for tables WITHOUT a primary key.
+    ///
+    /// Loaded once during table provider initialization and invalidated when delete files change.
     /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
     /// The inner `Arc<RoaringBitmap>` enables zero-copy sharing: scans clone the Arc (cheap ref count
     /// increment) rather than cloning the entire bitmap, aligning with zero-copy principles.
@@ -92,6 +119,27 @@ pub struct CayenneTableProvider {
     /// contains operations. Limited to u32 row IDs (4 billion rows). Tables with excessive deleted rows
     /// (approaching billions) should trigger compaction to maintain query performance and clear deletion vectors.
     cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
+    /// Cached deletion vectors for Int64 primary key-based deletion.
+    /// Used for tables with a single-column Int64 primary key.
+    ///
+    /// This is the most efficient deletion strategy - direct i64 comparison without
+    /// any serialization overhead. 8 bytes per deleted key.
+    cached_deleted_pk_i64: Arc<RwLock<Arc<HashSet<i64>>>>,
+    /// Cached deletion vectors (deleted row keys) for key-based deletion.
+    /// Used for tables with composite or non-integer primary keys.
+    ///
+    /// Keys are the byte representation of primary key columns via Arrow's `RowConverter`.
+    /// This approach is position-independent and survives data reorganization.
+    #[expect(clippy::type_complexity)]
+    cached_deleted_row_keys: Arc<RwLock<Arc<HashSet<Box<[u8]>>>>>,
+    /// Strategy for primary key-based deletion filtering.
+    /// Determines which cache and filter exec to use at query time.
+    pk_deletion_strategy: PkDeletionStrategy,
+    /// `RowConverter` for converting primary key columns to byte representation.
+    /// Only set for tables with composite or non-integer primary keys.
+    pk_row_converter: Option<Arc<RowConverter>>,
+    /// Indices of primary key columns in the table schema.
+    pk_column_indices: Vec<usize>,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -619,10 +667,66 @@ impl CayenneTableProvider {
             &vortex_config,
         )?;
 
+        // Determine if this table has a primary key for key-based deletion
+        let has_primary_key = !table_metadata.primary_key.is_empty();
+
+        // Determine PK deletion strategy and build RowConverter if needed
+        let (pk_deletion_strategy, pk_row_converter, pk_column_indices) = if has_primary_key {
+            let schema = &table_metadata.schema;
+            let mut indices = Vec::with_capacity(table_metadata.primary_key.len());
+            let mut pk_fields = Vec::with_capacity(table_metadata.primary_key.len());
+
+            for pk_col in &table_metadata.primary_key {
+                let (idx, field) = schema.column_with_name(pk_col).ok_or_else(|| {
+                    CatalogError::InvalidOperation {
+                        message: format!(
+                            "Primary key column '{pk_col}' not found in schema for table {table_name}"
+                        ),
+                        source: Box::new(std::io::Error::other("missing primary key column")),
+                    }
+                })?;
+                indices.push(idx);
+                pk_fields.push(field.clone());
+            }
+
+            // Check if we can use the optimized Int64 PK strategy:
+            // - Single column primary key
+            // - Column type is Int64
+            if pk_fields.len() == 1
+                && *pk_fields[0].data_type() == arrow::datatypes::DataType::Int64
+            {
+                // Optimized path: single Int64 PK - no RowConverter needed
+                (PkDeletionStrategy::Int64Pk, None, indices)
+            } else {
+                // General path: composite or non-integer PK - use RowConverter
+                let sort_fields: Vec<SortField> = pk_fields
+                    .iter()
+                    .map(|f| SortField::new(f.data_type().clone()))
+                    .collect();
+
+                let row_converter =
+                    RowConverter::new(sort_fields).map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to create RowConverter for primary key columns"
+                            .to_string(),
+                        source: Box::new(e),
+                    })?;
+
+                (
+                    PkDeletionStrategy::RowConverterBased,
+                    Some(Arc::new(row_converter)),
+                    indices,
+                )
+            }
+        } else {
+            (PkDeletionStrategy::PositionBased, None, Vec::new())
+        };
+
         // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
         let table_id = table_metadata.table_id;
         let catalog_for_load = Arc::clone(&catalog);
-        let deleted_row_ids = Self::load_deletion_vectors(table_id, catalog_for_load).await?;
+        let (deleted_row_ids, deleted_pk_i64, deleted_row_keys) =
+            Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy)
+                .await?;
 
         Ok(Self {
             table_metadata,
@@ -632,6 +736,11 @@ impl CayenneTableProvider {
             vortex_config,
             // Wrap in Arc for zero-copy sharing across concurrent scans
             cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
+            cached_deleted_pk_i64: Arc::new(RwLock::new(Arc::new(deleted_pk_i64))),
+            cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(deleted_row_keys))),
+            pk_deletion_strategy,
+            pk_row_converter,
+            pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
         })
@@ -1072,6 +1181,11 @@ impl CayenneTableProvider {
             vortex_config: self.vortex_config.clone(),
             retention_filters: Vec::new(), // Applied once after all chunks complete, not per-chunk
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
+            cached_deleted_pk_i64: Arc::clone(&self.cached_deleted_pk_i64),
+            cached_deleted_row_keys: Arc::clone(&self.cached_deleted_row_keys),
+            pk_deletion_strategy: self.pk_deletion_strategy,
+            pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
+            pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             object_store_config: self.object_store_config.clone(),
         }
@@ -1356,6 +1470,11 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_metadata.schema),
             &filters,
             Arc::clone(&self.cached_deleted_row_ids),
+            Arc::clone(&self.cached_deleted_pk_i64),
+            Arc::clone(&self.cached_deleted_row_keys),
+            self.pk_deletion_strategy,
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
         );
 
         let deleted_count =
@@ -1553,6 +1672,120 @@ impl CayenneTableProvider {
 
         Ok(deleted_row_ids)
     }
+
+    /// Load both position-based and key-based deletion vectors from the catalog.
+    ///
+    /// This method queries the catalog for delete files and loads them into memory,
+    /// routing to the appropriate cache based on the PK deletion strategy:
+    /// - `PositionBased`: Load into `RoaringBitmap` (row positions)
+    /// - `Int64Pk`: Load into `HashSet<i64>` (direct PK values)
+    /// - `RowConverterBased`: Load into `HashSet<Box<[u8]>>` (serialized PK bytes)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(position_based_row_ids, int64_pk_values, key_based_row_keys)`.
+    async fn load_deletion_vectors_all(
+        table_id: i64,
+        catalog: Arc<dyn MetadataCatalog>,
+        strategy: PkDeletionStrategy,
+    ) -> CatalogResult<(RoaringBitmap, HashSet<i64>, HashSet<Box<[u8]>>)> {
+        use super::delete::detect_deletion_type_and_read;
+
+        // Query catalog for delete files
+        let delete_files = catalog
+            .get_table_delete_files(table_id)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to load deletion vectors from catalog.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        if delete_files.is_empty() {
+            return Ok((RoaringBitmap::new(), HashSet::new(), HashSet::new()));
+        }
+
+        // Read deletion vector files in a blocking task, detecting type from schema
+        let (deleted_row_ids, deleted_row_keys) =
+            task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: "Deletion vector reader task panicked or was cancelled.".to_string(),
+                    source: Box::new(err),
+                })
+                .and_then(|result| {
+                    result.map_err(|err| CatalogError::InvalidOperation {
+                        message: "Failed to read deletion vectors.".to_string(),
+                        source: Box::new(err),
+                    })
+                })?;
+
+        // Route data to appropriate caches based on strategy
+        let (position_ids, int64_pks, row_keys) = match strategy {
+            PkDeletionStrategy::PositionBased => {
+                // Position-based uses RoaringBitmap
+                (deleted_row_ids, HashSet::new(), HashSet::new())
+            }
+            PkDeletionStrategy::Int64Pk => {
+                // Int64 PK - convert row_keys (which contain Int64 bytes) to i64
+                // For now, load from row_keys and convert, or use separate read path
+                // TODO: Optimize to store Int64 PK values directly in deletion files
+                let int64_pks: HashSet<i64> = deleted_row_keys
+                    .iter()
+                    .filter_map(|bytes| {
+                        if bytes.len() >= 8 {
+                            // RowConverter uses big-endian for i64 with sign bit flipped
+                            // But we can also check if this is a raw i64
+                            Some(i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                (RoaringBitmap::new(), int64_pks, HashSet::new())
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // RowConverter-based uses the byte keys directly
+                (RoaringBitmap::new(), HashSet::new(), deleted_row_keys)
+            }
+        };
+
+        tracing::debug!(
+            "Cached deletion vectors for table_id {table_id}: {} position-based, {} int64-pk, {} key-based",
+            position_ids.len(),
+            int64_pks.len(),
+            row_keys.len(),
+        );
+
+        Ok((position_ids, int64_pks, row_keys))
+    }
+
+    /// Creates a projection that strips additional columns added for deletion filtering.
+    ///
+    /// When filtering by PK, we may have added PK columns to the scan that weren't in the
+    /// original projection. This creates a `ProjectionExec` that only outputs the originally
+    /// requested columns.
+    #[expect(clippy::unused_self)]
+    fn create_projection_strip(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        num_columns_to_keep: usize,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let input_schema = input.schema();
+        let mut projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(num_columns_to_keep);
+
+        for idx in 0..num_columns_to_keep {
+            let field = input_schema.field(idx);
+            let col_name = field.name().clone();
+            projection_expr.push((
+                Arc::new(Column::new(&col_name, idx)) as Arc<dyn PhysicalExpr>,
+                col_name,
+            ));
+        }
+
+        let projection = ProjectionExec::try_new(projection_expr, input)?;
+        Ok(Arc::new(CayenneAccelerationExec::new(Arc::new(projection))))
+    }
 }
 
 #[async_trait]
@@ -1586,7 +1819,72 @@ impl TableProvider for CayenneTableProvider {
             Self::register_object_store_if_needed(state.runtime_env(), config);
         }
 
-        // Delegate to the underlying listing table first
+        // Determine if we need PK-based deletion (Int64 or RowConverter based)
+        let need_pk_deletion = match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                !guard.is_empty()
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                !guard.is_empty()
+            }
+            PkDeletionStrategy::PositionBased => false,
+        };
+
+        // For PK-based deletion, we need to ensure PK columns are included in the projection
+        // so we can filter by key. We may need to strip them out afterward if they weren't
+        // originally requested.
+        let (effective_projection, pk_indices_in_projection, need_projection_strip) =
+            if need_pk_deletion {
+                if let Some(proj) = projection {
+                    // Check which PK columns are missing from the projection
+                    let mut extended_proj: Vec<usize> = proj.clone();
+                    let mut pk_indices: Vec<usize> =
+                        Vec::with_capacity(self.pk_column_indices.len());
+                    let mut added_columns = false;
+
+                    for &pk_idx in &self.pk_column_indices {
+                        if let Some(pos) = extended_proj.iter().position(|&p| p == pk_idx) {
+                            // PK column already in projection
+                            pk_indices.push(pos);
+                        } else {
+                            // PK column not in projection - add it at the end
+                            pk_indices.push(extended_proj.len());
+                            extended_proj.push(pk_idx);
+                            added_columns = true;
+                        }
+                    }
+
+                    (Some(extended_proj), pk_indices, added_columns)
+                } else {
+                    // No projection means all columns are selected
+                    (None, self.pk_column_indices.clone(), false)
+                }
+            } else {
+                // No PK-based deletion needed, use original projection
+                let pk_indices = if let Some(proj) = projection {
+                    self.pk_column_indices
+                        .iter()
+                        .filter_map(|&orig_idx| {
+                            proj.iter().position(|&proj_idx| proj_idx == orig_idx)
+                        })
+                        .collect()
+                } else {
+                    self.pk_column_indices.clone()
+                };
+                (projection.cloned(), pk_indices, false)
+            };
+
+        // Delegate to the underlying listing table
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
@@ -1597,30 +1895,112 @@ impl TableProvider for CayenneTableProvider {
             Arc::clone(&guard)
         };
         let plan = listing_table
-            .scan(state, projection, filters, limit)
+            .scan(state, effective_projection.as_ref(), filters, limit)
             .await?;
 
-        // Use cached deletion vectors instead of querying the catalog on every scan.
-        // This dramatically improves concurrent query performance by avoiding repeated
-        // SQLite queries and spawn_blocking tasks.
-        // Zero-copy Arc clone: just increments reference count, no HashSet allocation.
-        let deleted_row_ids = {
-            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
+        // Apply deletion filter based on strategy
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                // Optimized Int64 PK deletion - direct HashSet<i64> lookup
+                let deleted_pk_values = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
 
-        // If there are any deleted rows, apply filtering
-        if !deleted_row_ids.is_empty() {
-            tracing::debug!(
-                "Applying cached deletion filter ({} deleted rows) to scan of table {}",
-                deleted_row_ids.len(),
-                self.table_metadata.table_name
-            );
-            return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+                if !deleted_pk_values.is_empty() {
+                    tracing::debug!(
+                        "Applying Int64 PK deletion filter ({} deleted keys) to scan of table {}",
+                        deleted_pk_values.len(),
+                        self.table_metadata.table_name
+                    );
+
+                    // For Int64 PK, we only have one PK column
+                    let pk_column_index =
+                        pk_indices_in_projection.first().copied().ok_or_else(|| {
+                            datafusion_common::DataFusionError::Internal(
+                                "Int64 PK strategy requires exactly one PK column index"
+                                    .to_string(),
+                            )
+                        })?;
+
+                    let deletion_filter = Arc::new(Int64PkDeletionFilterExec::new(
+                        plan,
+                        deleted_pk_values,
+                        pk_column_index,
+                    ));
+
+                    // Strip extra PK columns if needed
+                    if need_projection_strip {
+                        if let Some(orig_proj) = projection {
+                            return self.create_projection_strip(deletion_filter, orig_proj.len());
+                        }
+                    }
+
+                    return Ok(deletion_filter);
+                }
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // RowConverter-based deletion for composite/non-integer PKs
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let deleted_row_keys = {
+                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+
+                    if !deleted_row_keys.is_empty() {
+                        tracing::debug!(
+                            "Applying RowConverter-based deletion filter ({} deleted keys) to scan of table {}",
+                            deleted_row_keys.len(),
+                            self.table_metadata.table_name
+                        );
+
+                        let deletion_filter = Arc::new(KeyBasedDeletionFilterExec::new(
+                            plan,
+                            deleted_row_keys,
+                            pk_indices_in_projection.clone(),
+                            Arc::clone(row_converter),
+                        ));
+
+                        // Strip extra PK columns if needed
+                        if need_projection_strip {
+                            if let Some(orig_proj) = projection {
+                                return self
+                                    .create_projection_strip(deletion_filter, orig_proj.len());
+                            }
+                        }
+
+                        return Ok(deletion_filter);
+                    }
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Position-based deletion for tables WITHOUT primary key
+                let deleted_row_ids = {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                if !deleted_row_ids.is_empty() {
+                    tracing::debug!(
+                        "Applying position-based deletion filter ({} deleted rows) to scan of table {}",
+                        deleted_row_ids.len(),
+                        self.table_metadata.table_name
+                    );
+                    return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+                }
+            }
         }
 
         Ok(Arc::new(CayenneAccelerationExec::new(plan)))
@@ -1862,6 +2242,11 @@ impl DeletionTableProvider for CayenneTableProvider {
                 Arc::clone(&self.table_metadata.schema),
                 filters,
                 Arc::clone(&self.cached_deleted_row_ids),
+                Arc::clone(&self.cached_deleted_pk_i64),
+                Arc::clone(&self.cached_deleted_row_keys),
+                self.pk_deletion_strategy,
+                self.pk_row_converter.as_ref().map(Arc::clone),
+                self.pk_column_indices.clone(),
             )),
             &self.table_metadata.schema,
         )))

@@ -2983,6 +2983,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "arrow-ipc",
+ "arrow-row",
  "arrow-schema",
  "async-stream",
  "async-trait",
