@@ -525,8 +525,14 @@ mod tests {
 
     #[test]
     fn test_format_parse_invalid() {
-        assert!("json".parse::<Format>().is_err());
-        assert!("".parse::<Format>().is_err());
-        assert!("invalid".parse::<Format>().is_err());
+        let _ = "json"
+            .parse::<Format>()
+            .expect_err("json should not parse as a valid format");
+        let _ = ""
+            .parse::<Format>()
+            .expect_err("empty format should be rejected");
+        let _ = "invalid"
+            .parse::<Format>()
+            .expect_err("invalid format should be rejected");
     }
 }
