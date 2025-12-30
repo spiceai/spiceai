@@ -118,8 +118,8 @@ pub struct ClusterConfig {
     pub node_mtls_key_file: Option<String>,
 
     /// Allow insecure cluster communication without mTLS. WARNING: Only use this flag in development or testing environments and never in production.
-    #[arg(long = "insecure", default_value_t = false, action = ArgAction::SetTrue)]
-    pub insecure: bool,
+    #[arg(long = "allow-insecure-connections", default_value_t = false, action = ArgAction::SetTrue)]
+    pub allow_insecure_connections: bool,
 
     /// The URL of the scheduler service. Required for executors to join a cluster.
     /// If set, --role executor is implied and can be omitted.
@@ -142,7 +142,7 @@ impl Default for ClusterConfig {
             node_mtls_ca_certificate_file: None,
             node_mtls_certificate_file: None,
             node_mtls_key_file: None,
-            insecure: false,
+            allow_insecure_connections: false,
             scheduler_address: None,
             node_advertise_address: None,
         }
