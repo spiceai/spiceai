@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use rand::Rng;
 use regex::Regex;
 use std::{
     fs,
@@ -44,16 +43,6 @@ where
     }
 
     false
-}
-
-pub(crate) fn get_random_element<T>(vec: &[T]) -> Option<&T> {
-    if vec.is_empty() {
-        None
-    } else {
-        let mut rng = rand::rng();
-        let index = rng.random_range(0..vec.len());
-        Some(&vec[index])
-    }
 }
 
 pub fn hash<T: Hash>(value: &T) -> u64 {
