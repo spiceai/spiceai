@@ -314,4 +314,16 @@ impl ListingTableConnector for AzureBlobFS {
     }
 }
 
-register_data_connector!("abfs", AzureBlobFSFactory);
+register_data_connector!(
+    register_abfs_connector,
+    REGISTER_ABFS_CONNECTOR,
+    "abfs",
+    AzureBlobFSFactory
+);
+
+register_data_connector!(
+    register_abfss_connector,
+    REGISTER_ABFSS_CONNECTOR,
+    "abfss",
+    AzureBlobFSFactory
+);
