@@ -100,6 +100,10 @@ pub enum Error {
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 
+    #[cfg(feature = "cluster")]
+    #[snafu(display("Invalid cluster configuration: {source}"))]
+    InvalidClusterConfig { source: std::io::Error },
+
     #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`. {reason}"))]
     FailedToApplyOverridesGeneric { reason: String },
 
@@ -248,8 +252,17 @@ pub async fn run(args: Args) -> Result<()> {
         .with_io_runtime(Handle::current());
 
     #[cfg(feature = "cluster")]
-    if let Ok(resolved_cluster_config) = resolved_cluster_config {
-        builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+    match resolved_cluster_config {
+        Ok(resolved_cluster_config) => {
+            builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+        }
+        Err(e) if args.runtime.cluster.role.is_some() => {
+            // If --role was explicitly specified, surface the configuration error
+            return Err(Error::InvalidClusterConfig { source: e });
+        }
+        Err(_) => {
+            // No explicit role specified, silently continue in standalone mode
+        }
     }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
