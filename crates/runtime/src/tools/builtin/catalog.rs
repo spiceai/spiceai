@@ -54,16 +54,46 @@ pub enum Error {
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
 pub struct BuiltinToolCatalog {
     rt: Arc<Runtime>,
+    /// An optional table allowlist that overrides any per-tool `table_allowlist` param.
+    /// Used when the model specifies `datasets` to restrict all tools to those datasets.
+    model_table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
+
 impl BuiltinToolCatalog {
     pub(crate) fn new(rt: Arc<Runtime>) -> Self {
-        Self { rt }
+        Self {
+            rt,
+            model_table_allowlist: None,
+        }
+    }
+
+    /// Create a new `BuiltinToolCatalog` with a table allowlist applied to all tools.
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: ResolvedTableAwareAllowlist) -> Self {
+        self.model_table_allowlist = Some(allowlist);
+        self
     }
 
     pub(crate) fn name() -> &'static str {
         "auto"
+    }
+
+    pub(crate) fn is_builtin_tool(name: &str) -> bool {
+        [
+            "websearch",
+            "get_readiness",
+            "search",
+            "table_schema",
+            "sql",
+            "sample_distinct_columns",
+            "random_sample",
+            "top_n_sample",
+            "list_datasets",
+        ]
+        .contains(&name)
     }
 
     pub(crate) fn construct_builtin(
@@ -93,23 +123,30 @@ impl BuiltinToolCatalog {
             ("list_datasets", None) => "List available datasets",
             (_, None) => "",
         };
-        let table_allowlist: Option<ResolvedTableAwareAllowlist> = params
-            .get("table_allowlist")
-            .map(|t| {
-                let tables = t
-                    .expose_secret()
-                    .split(',')
-                    .map(ToString::to_string)
-                    .collect::<Vec<String>>();
-                ResolvedTableAwareAllowlist::with_defaults(
-                    SPICE_DEFAULT_CATALOG,
-                    SPICE_DEFAULT_SCHEMA,
-                )
-                .with_table_patterns(tables)
-            })
-            .transpose()
-            .boxed()
-            .context(FailedToConstructToolSnafu { id })?;
+
+        // Use model-level table allowlist if set, otherwise parse from params
+        let table_allowlist: Option<ResolvedTableAwareAllowlist> =
+            if let Some(ref model_allowlist) = self.model_table_allowlist {
+                Some(model_allowlist.clone())
+            } else {
+                params
+                    .get("table_allowlist")
+                    .map(|t| {
+                        let tables = t
+                            .expose_secret()
+                            .split(',')
+                            .map(ToString::to_string)
+                            .collect::<Vec<String>>();
+                        ResolvedTableAwareAllowlist::with_defaults(
+                            SPICE_DEFAULT_CATALOG,
+                            SPICE_DEFAULT_SCHEMA,
+                        )
+                        .with_table_patterns(tables)
+                    })
+                    .transpose()
+                    .boxed()
+                    .context(FailedToConstructToolSnafu { id })?
+            };
 
         match id {
             "websearch" => Ok(Arc::new(
@@ -199,5 +236,8 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
 
     fn name(&self) -> &str {
         Self::name()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

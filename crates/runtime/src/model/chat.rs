@@ -38,7 +38,10 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use crate::{
     Runtime,
     parameters::Parameters,
-    tools::{options::SpiceToolsOptions, utils::get_tools},
+    tools::{
+        options::SpiceToolsOptions,
+        utils::{create_table_allowlist, get_tools_with_allowlist},
+    },
 };
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
@@ -104,11 +107,14 @@ pub async fn try_to_chat_model(
         // Prevent infinite recursion in case of circular tool calls.
         .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
+    // Create table allowlist from model's datasets if specified
+    let table_allowlist = create_table_allowlist(&component.datasets);
+
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingChat::new(
             model,
             Arc::clone(&rt),
-            get_tools(Arc::clone(&rt), &opts).await,
+            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
             spice_recursion_limit,
         )),
         Some(_) | None => model,
