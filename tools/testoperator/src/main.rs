@@ -25,7 +25,7 @@ mod spiced_metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
-    TextToSqlArgs
+    TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
