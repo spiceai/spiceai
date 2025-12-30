@@ -21,6 +21,7 @@ serde-value = "0.7.0"
 serde_json.workspace = true
 serde_yaml.workspace = true
 snafu.workspace = true
+yaml-merge-keys = { version = "0.8", features = ["serde_yaml"] }
 subtle = "2.6"
 tokio.workspace = true
 tracing.workspace = true

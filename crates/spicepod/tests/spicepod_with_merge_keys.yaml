@@ -1,0 +1,29 @@
+version: v1
+kind: Spicepod
+name: spicepod_with_merge_keys
+
+# Define common dataset configuration with anchors
+x-common-acceleration: &common-acceleration
+  enabled: true
+  engine: duckdb
+  mode: file
+  refresh_check_interval: 10m
+
+datasets:
+  - name: users
+    from: postgres:public.users
+    acceleration:
+      <<: *common-acceleration
+
+  - name: orders
+    from: postgres:public.orders
+    acceleration:
+      <<: *common-acceleration
+      mode: memory  # Override the default mode
+      refresh_check_interval: 5m  # Override the default interval
+
+  - name: products
+    from: postgres:public.products
+    # This dataset uses different configuration, no merge keys
+    acceleration:
+      enabled: false

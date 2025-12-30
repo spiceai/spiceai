@@ -47,6 +47,7 @@ pub mod reader;
 pub mod semantic;
 pub mod spec;
 pub mod vector;
+pub mod yaml_merge;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -228,7 +229,8 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
         let spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+            yaml_merge::from_reader_with_merge(spicepod_rdr)
+                .context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -373,7 +375,8 @@ impl Spicepod {
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
         let spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+            yaml_merge::from_reader_with_merge(spicepod_rdr)
+                .context(UnableToParseSpicepodSnafu)?;
 
         Ok(spicepod_definition)
     }
@@ -441,5 +444,78 @@ mod tests {
                 .await
                 .expect("Should load spicepod");
         }
+    }
+
+    #[tokio::test]
+    async fn test_spicepod_with_merge_keys() {
+        let path = PathBuf::from("./tests/spicepod_with_merge_keys.yaml");
+        let spicepod = Spicepod::load_exact(&path)
+            .await
+            .expect("Should load spicepod with merge keys");
+
+        assert_eq!(spicepod.name, "spicepod_with_merge_keys");
+        assert_eq!(spicepod.datasets.len(), 3);
+
+        // Check the first dataset (users) - should have merged common-acceleration
+        let users = &spicepod.datasets[0];
+        assert_eq!(users.name(), "users");
+        let users_accel = users.acceleration.as_ref().expect("users should have acceleration");
+        assert!(users_accel.enabled);
+        assert_eq!(users_accel.engine.as_deref(), Some("duckdb"));
+        assert_eq!(users_accel.mode.to_string(), "file");
+
+        // Check the second dataset (orders) - should have merged with overrides
+        let orders = &spicepod.datasets[1];
+        assert_eq!(orders.name(), "orders");
+        let orders_accel = orders
+            .acceleration
+            .as_ref()
+            .expect("orders should have acceleration");
+        assert!(orders_accel.enabled);
+        assert_eq!(orders_accel.engine.as_deref(), Some("duckdb"));
+        // mode should be overridden to "memory"
+        assert_eq!(orders_accel.mode.to_string(), "memory");
+
+        // Check the third dataset (products) - no merge keys, different config
+        let products = &spicepod.datasets[2];
+        assert_eq!(products.name(), "products");
+        let products_accel = products
+            .acceleration
+            .as_ref()
+            .expect("products should have acceleration");
+        assert!(!products_accel.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_spicepod_definition_with_merge_keys() {
+        // Test using yaml_merge::from_str_with_merge directly with a SpicepodDefinition
+        let yaml = r#"
+version: v1
+kind: Spicepod
+name: test_merge_definition
+
+x-common-params: &common-params
+  refresh_interval: 1h
+  mode: file
+
+datasets:
+  - name: dataset1
+    from: postgres:table1
+    params:
+      <<: *common-params
+      custom_param: value1
+
+  - name: dataset2
+    from: postgres:table2
+    params:
+      <<: *common-params
+      refresh_interval: 30m  # Override
+"#;
+
+        let definition: spec::SpicepodDefinition =
+            yaml_merge::from_str_with_merge(yaml).expect("Should parse with merge keys");
+
+        assert_eq!(definition.name, "test_merge_definition");
+        assert_eq!(definition.datasets.len(), 2);
     }
 }

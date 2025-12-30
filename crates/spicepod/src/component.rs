@@ -26,6 +26,7 @@ use serde_value::Value;
 use snafu::prelude::*;
 
 use crate::reader;
+use crate::yaml_merge;
 pub mod access;
 pub mod caching;
 pub mod catalog;
@@ -158,12 +159,12 @@ where
                                 path: component_base_path.clone(),
                             })?;
 
-                        let component_definition: ComponentType = serde_yaml::from_reader(
-                            component_rdr,
-                        )
-                        .context(UnableToParseSpicepodComponentSnafu {
-                            path: component_base_path,
-                        })?;
+                        let component_definition: ComponentType =
+                            yaml_merge::from_reader_with_merge(component_rdr).context(
+                                UnableToParseSpicepodComponentSnafu {
+                                    path: component_base_path,
+                                },
+                            )?;
 
                         let component = component_definition.depends_on(&reference.depends_on);
 
