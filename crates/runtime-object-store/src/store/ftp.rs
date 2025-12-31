@@ -118,8 +118,11 @@ impl bb8::ManageConnection for FTPConnectionManager {
         Box::pin(async move { noop_future.await.map_err(|e| generic_error(STORE_NAME, e)) })
     }
 
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        false
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        // Use the underlying TCP stream as a simple, non-blocking health heuristic.
+        // If we cannot obtain the peer address, treat the connection as broken so
+        // that the pool can proactively discard it.
+        conn.get_ref().peer_addr().is_err()
     }
 }
 
@@ -342,7 +345,11 @@ impl FTPObjectStore {
         Ok(entries)
     }
 
-    /// List all files recursively using batched directory traversal.
+    /// List all files recursively using sequential directory traversal.
+    ///
+    /// Note: FTP is a stateful protocol where commands like NLST, SIZE, and MDTM modify
+    /// connection state. We must use fresh connections for each directory to avoid race
+    /// conditions. The batching here is for queue management, not parallelism.
     async fn list_all_files(
         &self,
         location: Option<Path>,
@@ -352,11 +359,13 @@ impl FTPObjectStore {
         let mut results = Vec::new();
 
         while !queue.is_empty() {
+            // Drain up to MAX_CONCURRENT_LISTINGS from the queue for processing.
+            // Note: directories are processed sequentially (not in parallel) because FTP
+            // is a stateful protocol and each operation requires its own fresh connection.
             let batch: Vec<_> = queue
                 .drain(..queue.len().min(MAX_CONCURRENT_LISTINGS))
                 .collect();
 
-            // Process directories - need to use fresh connections for each due to FTP state
             let mut batch_results = Vec::with_capacity(batch.len());
             for dir_path in &batch {
                 let mut client = self.inner.config.get_fresh_client().await?;

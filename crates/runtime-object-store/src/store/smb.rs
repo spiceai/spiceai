@@ -32,7 +32,8 @@ use object_store::{
 use smb::resource::file_util::ReadAt;
 use smb::{
     Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, FileAccessMask,
-    FileAttributes, FileBothDirectoryInformation, FileStandardInformation, Resource, UncPath,
+    FileAttributes, FileBasicInformation, FileBothDirectoryInformation, FileStandardInformation,
+    Resource, UncPath,
     resource::{Directory, FileCreateArgs},
 };
 use tokio::sync::OnceCell;
@@ -43,8 +44,6 @@ use super::common::{
 };
 
 const STORE_NAME: &str = "SMB";
-/// Maximum number of concurrent directory listings for parallel traversal.
-const MAX_CONCURRENT_LISTINGS: usize = 8;
 /// Default connection pool size.
 const DEFAULT_POOL_SIZE: u32 = 4;
 
@@ -348,6 +347,11 @@ impl SMBObjectStore {
         Ok(entries)
     }
 
+    /// List all files recursively using sequential directory traversal.
+    ///
+    /// Note: We process directories sequentially with a single pooled connection.
+    /// While the SMB client may support concurrent operations, sequential processing
+    /// is safer and avoids potential race conditions with shared connection state.
     async fn list_all_files(
         &self,
         prefix: Option<String>,
@@ -357,28 +361,15 @@ impl SMBObjectStore {
         let mut results = Vec::new();
         let mut queue = vec![prefix.unwrap_or_default()];
 
-        while !queue.is_empty() {
-            let batch: Vec<_> = queue
-                .drain(..queue.len().min(MAX_CONCURRENT_LISTINGS))
-                .collect();
-
-            let futures: Vec<_> = batch
-                .iter()
-                .map(|dir_path| Self::list_directory(&conn, &config, dir_path))
-                .collect();
-
-            let batch_results = futures::future::join_all(futures).await;
-
-            for (dir_path, result) in batch.into_iter().zip(batch_results) {
-                match result {
-                    Ok(entries) => {
-                        let (files, dirs) = process_directory_entries(&dir_path, entries);
-                        results.extend(files);
-                        queue.extend(dirs);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to list directory {dir_path}: {e}");
-                    }
+        while let Some(dir_path) = queue.pop() {
+            match Self::list_directory(&conn, &config, &dir_path).await {
+                Ok(entries) => {
+                    let (files, dirs) = process_directory_entries(&dir_path, entries);
+                    results.extend(files);
+                    queue.extend(dirs);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to list directory {dir_path}: {e}");
                 }
             }
         }
@@ -424,13 +415,16 @@ impl SMBObjectStore {
             });
         };
 
+        let basic_info: FileBasicInformation = file.query_info().await.map_err(handle_error)?;
         let file_info: FileStandardInformation = file.query_info().await.map_err(handle_error)?;
         let _ = file.close().await;
+
+        let last_modified = filetime_to_datetime(*basic_info.last_write_time);
 
         Ok(build_object_meta(
             location.clone(),
             file_info.end_of_file,
-            Utc::now(),
+            last_modified,
         ))
     }
 }

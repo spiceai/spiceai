@@ -143,7 +143,10 @@ impl NFSObjectStore {
             let mut queue = vec![prefix];
 
             while !queue.is_empty() {
-                // Process directories in batches (sequential within spawn_blocking)
+                // Process directories in batches. Note: this is still sequential within a single
+                // spawn_blocking task, so MAX_CONCURRENT_LISTINGS does not introduce parallelism
+                // here. The batching pattern and constant are kept for consistency with other
+                // object stores and to allow easy future parallelization if needed.
                 let batch: Vec<_> = queue
                     .drain(..queue.len().min(MAX_CONCURRENT_LISTINGS))
                     .collect();
@@ -200,8 +203,7 @@ impl NFSObjectStore {
                 let mtime = stat.nfs_mtime as i64;
                 #[expect(clippy::cast_possible_truncation)]
                 let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
-                    .unwrap_or_else(Utc::now)
+                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(Utc::now)
             };
             Ok(build_object_meta(location, stat.nfs_size, last_modified))
         })
@@ -261,8 +263,7 @@ impl ObjectStore for NFSObjectStore {
                     let mtime = stat.nfs_mtime as i64;
                     #[expect(clippy::cast_possible_truncation)]
                     let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
-                        .unwrap_or_else(Utc::now)
+                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(Utc::now)
                 };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 
