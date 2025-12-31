@@ -36,8 +36,6 @@ use super::common::{
 };
 
 const STORE_NAME: &str = "NFS";
-/// Maximum number of parallel spawn_blocking tasks for directory traversal.
-const MAX_CONCURRENT_LISTINGS: usize = 4;
 
 fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     error: T,
