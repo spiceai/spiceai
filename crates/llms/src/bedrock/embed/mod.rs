@@ -32,7 +32,7 @@ use crate::embeddings::{
     Embed, Error as EmbedError, FailedToCreateEmbeddingSnafu, FailedToPrepareInputSnafu,
     Result as EmbedResult,
 };
-use async_openai::types::{
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
     EmbeddingVector,
 };

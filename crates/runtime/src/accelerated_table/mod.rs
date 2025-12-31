@@ -231,8 +231,8 @@ pub struct AcceleratedTable {
     cache_stale_while_revalidate_ttl: Option<Duration>,
     cache_stale_if_error: bool,
     io_runtime: Handle,
-    /// Mutex to protect concurrent cache operations (insert, upsert) to the accelerator
-    cache_mutex: Arc<Mutex<()>>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
+    accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,
 }
@@ -603,8 +603,8 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        // Create the cache mutex early so it can be shared between the Refresher and the AcceleratedTable.
-        let cache_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        // Create the accelerator write mutex early so it can be shared between the Refresher and the AcceleratedTable.
+        let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -617,7 +617,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
-            Arc::clone(&cache_mutex),
+            Arc::clone(&accelerator_write_mutex),
         );
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -736,7 +736,7 @@ impl Builder {
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             cache_stale_if_error: self.caching_stale_if_error,
             io_runtime: self.io_runtime,
-            cache_mutex,
+            accelerator_write_mutex,
             in_flight_revalidations,
         })
     }
@@ -987,7 +987,7 @@ impl TableProvider for AcceleratedTable {
                     filters.to_vec(),
                     projection.cloned(),
                     limit,
-                    Arc::clone(&self.cache_mutex),
+                    Arc::clone(&self.accelerator_write_mutex),
                     Arc::clone(&self.in_flight_revalidations),
                     Arc::clone(&self.synchronized_children),
                 ))

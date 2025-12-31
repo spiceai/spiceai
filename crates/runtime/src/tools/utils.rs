@@ -15,10 +15,10 @@ limitations under the License.
 */
 use async_openai::{
     error::OpenAIError,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionToolType,
-        FunctionCall,
+    types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestToolMessageArgs, FunctionCall,
     },
 };
 use schemars::{JsonSchema, schema_for};
@@ -52,14 +52,15 @@ pub async fn create_tool_use_messages(
 
     Ok(vec![
         ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(vec![ChatCompletionMessageToolCall {
-                id: id.to_string(),
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionCall {
-                    name: tool.name().to_string(),
-                    arguments: arg.to_string(),
+            .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: id.to_string(),
+                    function: FunctionCall {
+                        name: tool.name().to_string(),
+                        arguments: arg.to_string(),
+                    },
                 },
-            }])
+            )])
             .build()?
             .into(),
         ChatCompletionRequestToolMessageArgs::default()

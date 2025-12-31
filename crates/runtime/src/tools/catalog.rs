@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
+use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
 use async_trait::async_trait;
 use tools::SpiceModelTool;
 
@@ -34,7 +34,6 @@ pub trait SpiceToolCatalog: Send + Sync {
             .await
             .into_iter()
             .map(|t| ChatCompletionTool {
-                r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: t.strict(),
                     name: t.name().to_string(),

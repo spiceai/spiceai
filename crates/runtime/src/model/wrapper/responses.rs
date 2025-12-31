@@ -18,8 +18,7 @@ limitations under the License.
 use async_openai::{
     error::OpenAIError,
     types::responses::{
-        CreateResponse, Response, ResponseCompleted, ResponseEvent, ResponseMetadata,
-        ResponseStream,
+        CreateResponse, Response, ResponseCompletedEvent, ResponseStream, ResponseStreamEvent,
     },
 };
 use async_trait::async_trait;
@@ -80,7 +79,12 @@ impl Responses for ResponsesWrapper {
     async fn responses_stream(&self, req: CreateResponse) -> Result<ResponseStream, OpenAIError> {
         let start = Instant::now();
         let req = self.prepare_req(req);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
+        let Some(ref model_id) = req.model else {
+            return Err(OpenAIError::InvalidArgument(
+                "Model ID must be specified in the request".into(),
+            ));
+        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=true, model = %model_id, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", metadata = ?metadata);
@@ -120,8 +124,14 @@ impl Responses for ResponsesWrapper {
     async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
         let start = Instant::now();
 
+        let Some(model_id) = req.model.clone() else {
+            return Err(OpenAIError::InvalidArgument(
+                "Model ID must be specified in the request".into(),
+            ));
+        };
+
         let req = self.prepare_req(req);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "responses", stream=false, model = %model_id, input = %serde_json::to_string(&req).unwrap_or_default());
 
         let labels = request_labels_responses(&req);
         if let Some(metadata) = &req.metadata {
@@ -171,7 +181,7 @@ impl Responses for ResponsesWrapper {
 /// [`TracedResponseStream`] wraps a [`ResponseStream`]-like stream and provides metrics and `task_history` tracing.
 struct TracedResponseStream<S> {
     inner: S,
-    accumulated_response: Arc<Mutex<Option<ResponseMetadata>>>,
+    accumulated_response: Arc<Mutex<Option<Response>>>,
     span: tracing::Span,
     model_public_name: String,
     started: Instant,
@@ -180,7 +190,7 @@ struct TracedResponseStream<S> {
 
 impl<S> TracedResponseStream<S>
 where
-    S: Stream<Item = Result<ResponseEvent, OpenAIError>> + Unpin,
+    S: Stream<Item = Result<ResponseStreamEvent, OpenAIError>> + Unpin,
 {
     pub fn new(
         inner: S,
@@ -201,15 +211,18 @@ where
 
 impl<S> Stream for TracedResponseStream<S>
 where
-    S: Stream<Item = Result<ResponseEvent, OpenAIError>> + Unpin,
+    S: Stream<Item = Result<ResponseStreamEvent, OpenAIError>> + Unpin,
 {
-    type Item = Result<ResponseEvent, OpenAIError>;
+    type Item = Result<ResponseStreamEvent, OpenAIError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(mut item))) => {
                 match &mut item {
-                    ResponseEvent::ResponseCompleted(ResponseCompleted { response, .. }) => {
+                    ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent {
+                        response,
+                        ..
+                    }) => {
                         if let Ok(mut guard) = self.accumulated_response.lock() {
                             *guard = Some(response.clone());
                         }
@@ -231,9 +244,9 @@ where
                             );
                         }
 
-                        response.model = Some(self.model_public_name.clone());
+                        response.model.clone_from(&self.model_public_name);
                     }
-                    ResponseEvent::ResponseFailed(_) => {
+                    ResponseStreamEvent::ResponseFailed(_) => {
                         handle_metrics(self.started.elapsed(), true, &self.labels);
                         tracing::error!(
                             target: "task_history",

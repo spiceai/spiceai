@@ -21,11 +21,11 @@ use arrow_schema::DataType;
 #[cfg(test)]
 use async_openai::error::ApiError;
 #[cfg(test)]
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse, FinishReason, Role,
 };
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions,
     CreateChatCompletionRequestArgs,
 };
@@ -326,7 +326,8 @@ impl Ai {
                     ])
                     .stream(true)
                     .stream_options(ChatCompletionStreamOptions {
-                        include_usage: true,
+                        include_usage: Some(true),
+                        include_obfuscation: None,
                     })
                     .build()?,
             )
@@ -504,7 +505,11 @@ impl Ai {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+    use async_openai::types::chat::{
+        ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
+    };
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::{ScalarFunctionArgs, ScalarUDFImpl, Volatility};
     use std::collections::HashMap;
@@ -535,18 +540,18 @@ mod tests {
                 .messages
                 .first()
                 .and_then(|msg| match msg {
-                    async_openai::types::ChatCompletionRequestMessage::System(sys_msg) => {
-                        match &sys_msg.content {
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                    ChatCompletionRequestMessage::System(sys_msg) => match &sys_msg.content {
+                        ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestSystemMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
-                    async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
-                        match &user_msg.content {
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
+                    },
+                    ChatCompletionRequestMessage::User(user_msg) => match &user_msg.content {
+                        ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestUserMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
+                    },
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -577,18 +582,18 @@ mod tests {
                 .messages
                 .first()
                 .and_then(|msg| match msg {
-                    async_openai::types::ChatCompletionRequestMessage::System(sys_msg) => {
-                        match &sys_msg.content {
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(_) => Some("Array content".to_string()),
+                    ChatCompletionRequestMessage::System(sys_msg) => match &sys_msg.content {
+                        ChatCompletionRequestSystemMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestSystemMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
-                    async_openai::types::ChatCompletionRequestMessage::User(user_msg) => {
-                        match &user_msg.content {
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
-                            async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => Some("Array content".to_string()),
+                    },
+                    ChatCompletionRequestMessage::User(user_msg) => match &user_msg.content {
+                        ChatCompletionRequestUserMessageContent::Text(text) => Some(text.clone()),
+                        ChatCompletionRequestUserMessageContent::Array(_) => {
+                            Some("Array content".to_string())
                         }
-                    }
+                    },
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -610,6 +615,7 @@ mod tests {
                         tool_calls: None,
                         refusal: None,
                         audio: None,
+                        annotations: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: None,
@@ -621,6 +627,7 @@ mod tests {
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
+                #[expect(deprecated)]
                 system_fingerprint: None,
                 service_tier: None,
             })
@@ -846,9 +853,9 @@ mod tests {
                     model: "null-model".to_string(),
                     object: "chat.completion.chunk".to_string(),
                     created: 0,
-                    choices: vec![async_openai::types::ChatChoiceStream {
+                    choices: vec![ChatChoiceStream {
                         index: 0,
-                        delta: async_openai::types::ChatCompletionStreamResponseDelta {
+                        delta: ChatCompletionStreamResponseDelta {
                             content: None, // Empty content
                             role: Some(Role::Assistant),
                             tool_calls: None,
@@ -860,6 +867,7 @@ mod tests {
                         logprobs: None,
                     }],
                     usage: None,
+                    #[expect(deprecated)]
                     system_fingerprint: None,
                     service_tier: None,
                 });
@@ -878,6 +886,7 @@ mod tests {
                         prompt_tokens_details: None,
                         completion_tokens_details: None,
                     }),
+                    #[expect(deprecated)]
                     system_fingerprint: None,
                     service_tier: None,
                 });
@@ -905,6 +914,7 @@ mod tests {
                         tool_calls: None,
                         refusal: None,
                         audio: None,
+                        annotations: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: None,
@@ -916,6 +926,7 @@ mod tests {
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
+                #[expect(deprecated)]
                 system_fingerprint: None,
                 service_tier: None,
             })
@@ -1406,9 +1417,9 @@ mod tests {
                         model: "slow-model".to_string(),
                         object: "chat.completion.chunk".to_string(),
                         created: 0,
-                        choices: vec![async_openai::types::ChatChoiceStream {
+                        choices: vec![ChatChoiceStream {
                             index: 0,
-                            delta: async_openai::types::ChatCompletionStreamResponseDelta {
+                            delta: ChatCompletionStreamResponseDelta {
                                 content: Some("Starting...".to_string()),
                                 role: Some(Role::Assistant),
                                 tool_calls: None,
@@ -1420,6 +1431,7 @@ mod tests {
                             logprobs: None,
                         }],
                         usage: None,
+                        #[expect(deprecated)]
                         system_fingerprint: None,
                         service_tier: None,
                     });
@@ -1434,6 +1446,7 @@ mod tests {
                         created: 0,
                         choices: vec![],
                         usage: None,
+                        #[expect(deprecated)]
                         system_fingerprint: None,
                         service_tier: None,
                     });

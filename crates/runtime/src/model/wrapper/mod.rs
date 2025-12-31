@@ -17,7 +17,7 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
@@ -163,12 +163,14 @@ impl ChatWrapper {
         ) {
             // Template existing system prompt
             (Some(prompt), true) => {
-                let ctx = match req.metadata.as_ref() {
-                    Some(serde_json::Value::Object(m)) => {
-                        m.clone()
-                            .into_iter()
-                            .collect::<HashMap<String, serde_json::Value>>()
-                    }
+                let ctx = match req
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::to_value(m).ok())
+                {
+                    Some(serde_json::Value::Object(m)) => m
+                        .into_iter()
+                        .collect::<HashMap<String, serde_json::Value>>(),
                     Some(_) | None => HashMap::new(),
                 };
 
@@ -208,11 +210,12 @@ impl ChatWrapper {
         if req.stream.is_some_and(|s| s) {
             req.stream_options = match req.stream_options {
                 Some(mut opts) => {
-                    opts.include_usage = true;
+                    opts.include_usage = Some(true);
                     Some(opts)
                 }
                 None => Some(ChatCompletionStreamOptions {
-                    include_usage: true,
+                    include_obfuscation: None,
+                    include_usage: Some(true),
                 }),
             };
         }
@@ -220,6 +223,7 @@ impl ChatWrapper {
     }
 
     /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
+    #[expect(deprecated)] // seed and user fields are deprecated in async-openai
     fn with_model_defaults(
         &self,
         mut req: CreateChatCompletionRequest,
@@ -288,7 +292,7 @@ impl Chat for ChatWrapper {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata);
+            tracing::info!(target: "task_history", metadata = ?metadata);
         }
 
         let labels = request_labels(&req);
@@ -332,7 +336,7 @@ impl Chat for ChatWrapper {
 
         let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", parent: &span, metadata = ?metadata, "labels");
         }
 
         let result = match self.chat.chat_request(req).instrument(span.clone()).await {

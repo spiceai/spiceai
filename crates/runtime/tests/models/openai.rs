@@ -29,14 +29,16 @@ use crate::{
 use app::AppBuilder;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
-use async_openai::types::responses::{
-    CreateResponseArgs, Function, OutputContent, ResponseEvent, Status, ToolDefinition,
-};
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
-    responses::{Content, Response as OpenAIResponse},
+    CreateChatCompletionRequestArgs,
 };
+use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::responses::{
+    CreateResponseArgs, FunctionTool, OutputItem, OutputMessage, OutputMessageContent,
+    ResponseStreamEvent, Status, Tool as ToolDefinition,
+};
+use async_openai::types::responses::{OutputTextContent, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;
@@ -524,20 +526,18 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 }
 
 fn extract_text(response: &OpenAIResponse) -> Option<String> {
-    response
-        .output
-        .first()
-        .and_then(|out| {
-            if let OutputContent::Message(msg) = out {
-                msg.content.first()
-            } else {
-                None
+    response.output.first().and_then(|out| {
+        if let OutputItem::Message(OutputMessage { content, .. }) = out {
+            match content.first() {
+                Some(OutputMessageContent::OutputText(OutputTextContent { text, .. })) => {
+                    Some(text.clone())
+                }
+                _ => None,
             }
-        })
-        .and_then(|content| match content {
-            Content::OutputText(output_text) => Some(output_text.text.clone()),
-            Content::Refusal(_) => None,
-        })
+        } else {
+            None
+        }
+    })
 }
 
 #[tokio::test]
@@ -648,14 +648,15 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(response_event) => match &response_event {
-                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                             final_response += &delta.delta;
                             delta_count += 1;
                         }
-                        ResponseEvent::ResponseCompleted(_) => {
+                        ResponseStreamEvent::ResponseCompleted(_) => {
                             break;
                         }
-                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => {
                             failure = true;
                             break;
                         }
@@ -744,14 +745,15 @@ async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(response_event) => match &response_event {
-                        ResponseEvent::ResponseOutputTextDelta(delta) => {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                             final_response += &delta.delta;
                             delta_count += 1;
                         }
-                        ResponseEvent::ResponseCompleted(_) => {
+                        ResponseStreamEvent::ResponseCompleted(_) => {
                             break;
                         }
-                        ResponseEvent::ResponseIncomplete(_) | ResponseEvent::ResponseFailed(_) => {
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => {
                             failure = true;
                             break;
                         }
@@ -945,7 +947,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                     ToolDefinition::WebSearchPreview(_) => {
                         assert!(desired_tools.remove("web_search"));
                     }
-                    ToolDefinition::Function(Function { name, .. }) => {
+                    ToolDefinition::Function(FunctionTool { name, .. }) => {
                         assert!(desired_tools.remove(name.as_str()));
                     }
                     _ => {}

@@ -14,8 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+/// Common utilities shared across file-based object stores.
+pub mod common;
+
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod github;
+#[cfg(feature = "nfs")]
+pub mod nfs;
 #[cfg(feature = "ftp")]
 pub mod sftp;
+#[cfg(feature = "smb")]
+pub mod smb;

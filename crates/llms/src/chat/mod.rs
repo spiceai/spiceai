@@ -11,7 +11,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
+use async_openai::types::chat::{
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
@@ -28,10 +30,11 @@ use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
-        ChatChoice, ChatCompletionRequestAssistantMessage,
+    types::chat::{
+        ChatChoice, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
-        ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
+        ChatCompletionRequestDeveloperMessageContent,
+        ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
         ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
@@ -230,15 +233,18 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = array
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(
                             i,
                         ) => i.image_url.url.clone(),
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(
                             a
                         ) => a.input_audio.data.clone(),
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(
+                            f
+                        ) => serde_json::to_string(&f.file).unwrap_or_default(),
                     })
                     .collect();
                 x.join("\n")
@@ -248,12 +254,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             content,
             ..
         }) => match content {
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Text(t) => {
+                t.clone()
+            }
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
                     })
@@ -264,12 +272,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
         }) => match content {
-            async_openai::types::ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestToolMessageContent::Array(parts) => {
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Text(t) => {
+                t.clone()
+            }
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
+                        async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(
                             t,
                         ) => t.text.clone(),
                     })
@@ -286,10 +296,10 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = parts
                         .iter()
                         .map(|p| match p {
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                                 t.text.clone()
                             }
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                            async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                                 i.refusal.clone()
                             }
                         })
@@ -308,7 +318,13 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         }) => match content {
             ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
-                let x: Vec<_> = parts.iter().map(|p| p.text.clone()).collect();
+                let x: Vec<_> = parts
+                    .iter()
+                    .map(|p| {
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                        t.text.clone()
+                    })
+                    .collect();
                 x.join("\n")
             }
         },
@@ -320,7 +336,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
-    use async_openai::types::{
+    use async_openai::types::chat::{
         ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
@@ -337,14 +353,17 @@ pub fn message_to_mistral(
                 ChatCompletionRequestUserMessageContent::Array(array) => {
                     let index_map = array.iter().map(|p| {
                         match p {
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                                 ("content".to_string(), Value::String(t.text.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
                                 ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
                                 ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            }
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(f) => {
+                                ("file".to_string(), serde_json::to_value(&f.file).unwrap_or_default())
                             }
                         }
 
@@ -372,7 +391,13 @@ pub fn message_to_mistral(
             ..
         }) => {
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts.iter().map(|p| p.text.clone()).collect::<Vec<_>>();
+            let content_json = parts
+                .iter()
+                .map(|p| {
+                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                    t.text.clone()
+                })
+                .collect::<Vec<_>>();
             IndexMap::from([
                 (
                     String::from("role"),
@@ -399,7 +424,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -431,7 +456,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -466,10 +491,10 @@ pub fn message_to_mistral(
                 Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
                     // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
                     let content_json= parts.iter().map(|p| match p {
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                             ("text".to_string(), t.text.clone())
                         }
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                             ("refusal".to_string(), i.refusal.clone())
                         }
                     }).collect::<Vec<_>>();
@@ -490,13 +515,16 @@ pub fn message_to_mistral(
                 let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
                     .iter()
                     .filter_map(|t| {
-                        let Ok(function) = serde_json::to_value(&t.function) else {
-                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                        let ChatCompletionMessageToolCalls::Function(func_call) = t else {
+                            return None;
+                        };
+                        let Ok(function) = serde_json::to_value(&func_call.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", func_call.function);
                             return None;
                         };
 
                         let mut map = IndexMap::new();
-                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("id".to_string(), Value::String(func_call.id.to_string()));
                         map.insert("function".to_string(), function);
                         map.insert("type".to_string(), Value::String("function".to_string()));
 
@@ -653,6 +681,7 @@ pub trait Chat: Sync + Send {
                     audio: None,
                     function_call: None,
                     refusal: None,
+                    annotations: None,
                 },
                 index: 0,
                 finish_reason: None,
