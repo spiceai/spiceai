@@ -212,11 +212,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// On success:
     /// - The new snapshot is active
     /// - All delete files for the table are removed (they were applied during compaction)
-    async fn commit_compaction(
-        &self,
-        table_id: i64,
-        new_snapshot_id: &str,
-    ) -> CatalogResult<()>;
+    async fn commit_compaction(&self, table_id: i64, new_snapshot_id: &str) -> CatalogResult<()>;
 
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64>;

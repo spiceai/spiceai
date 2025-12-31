@@ -537,10 +537,10 @@ impl CayenneTableProvider {
         let snapshot_dir = snapshot_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
             // Open the directory and call sync_all to flush metadata
-            let dir = std::fs::File::open(&snapshot_dir).map_err(|source| CatalogError::IoError {
-                source,
-            })?;
-            dir.sync_all().map_err(|source| CatalogError::IoError { source })?;
+            let dir = std::fs::File::open(&snapshot_dir)
+                .map_err(|source| CatalogError::IoError { source })?;
+            dir.sync_all()
+                .map_err(|source| CatalogError::IoError { source })?;
             Ok::<(), CatalogError>(())
         })
         .await
@@ -770,9 +770,7 @@ impl CayenneTableProvider {
                 .await?;
 
         Ok(Self {
-            current_snapshot_id: Arc::new(RwLock::new(
-                table_metadata.current_snapshot_id.clone(),
-            )),
+            current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
@@ -908,35 +906,33 @@ impl CayenneTableProvider {
         // correctness for upserts - we must apply deletions before adding new data to avoid:
         // - Position-based: Row ID conflicts when new files are added
         // - Key-based: New rows with the same key being incorrectly filtered out
-        let has_pending_deletions = match self.pk_deletion_strategy {
-            PkDeletionStrategy::PositionBased => {
-                let guard =
-                    self.cached_deleted_row_ids
-                        .read()
-                        .map_err(|_| CatalogError::LockPoisoned {
+        let has_pending_deletions =
+            match self.pk_deletion_strategy {
+                PkDeletionStrategy::PositionBased => {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
                             operation: "check position-based deletion cache".to_string(),
-                        })?;
-                !guard.is_empty()
-            }
-            PkDeletionStrategy::Int64Pk => {
-                let guard =
-                    self.cached_deleted_pk_i64
-                        .read()
-                        .map_err(|_| CatalogError::LockPoisoned {
+                        }
+                    })?;
+                    !guard.is_empty()
+                }
+                PkDeletionStrategy::Int64Pk => {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
                             operation: "check Int64 PK deletion cache".to_string(),
-                        })?;
-                !guard.is_empty()
-            }
-            PkDeletionStrategy::RowConverterBased => {
-                let guard =
-                    self.cached_deleted_row_keys
-                        .read()
-                        .map_err(|_| CatalogError::LockPoisoned {
+                        }
+                    })?;
+                    !guard.is_empty()
+                }
+                PkDeletionStrategy::RowConverterBased => {
+                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
                             operation: "check key-based deletion cache".to_string(),
-                        })?;
-                !guard.is_empty()
-            }
-        };
+                        }
+                    })?;
+                    !guard.is_empty()
+                }
+            };
 
         if has_pending_deletions {
             tracing::info!(
@@ -1968,12 +1964,12 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the lock is poisoned.
     fn update_current_snapshot_id(&self, new_snapshot_id: &str) -> CatalogResult<()> {
-        let mut guard = self
-            .current_snapshot_id
-            .write()
-            .map_err(|_| CatalogError::LockPoisoned {
-                operation: "update current snapshot id".to_string(),
-            })?;
+        let mut guard =
+            self.current_snapshot_id
+                .write()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "update current snapshot id".to_string(),
+                })?;
         *guard = new_snapshot_id.to_string();
         tracing::debug!(
             "Updated current snapshot ID for table {} to {}",
@@ -2311,12 +2307,11 @@ impl CayenneTableProvider {
             }
             PkDeletionStrategy::Int64Pk => {
                 let deleted_pk_values = {
-                    let guard =
-                        self.cached_deleted_pk_i64
-                            .read()
-                            .map_err(|_| CatalogError::LockPoisoned {
-                                operation: "read Int64 PK deletion cache".to_string(),
-                            })?;
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read Int64 PK deletion cache".to_string(),
+                        }
+                    })?;
                     Arc::clone(&guard)
                 };
                 // For Int64 PK, we only have one PK column
