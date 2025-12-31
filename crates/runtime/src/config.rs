@@ -126,7 +126,7 @@ pub struct ClusterConfig {
     /// For executors: used during registration to tell the scheduler how to contact this node.
     ///
     /// The fully qualified advertise URL will be constructed as:
-    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// if --insecure is set)
+    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// if --allow-insecure-connections is set)
     #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
     pub node_advertise_address: Option<String>,
 }

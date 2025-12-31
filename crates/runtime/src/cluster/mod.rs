@@ -167,7 +167,7 @@ impl ResolvedClusterConfig {
         if is_cluster_role {
             let mut missing_flags = Vec::new();
 
-            if tls_config.is_none() && !config.insecure {
+            if tls_config.is_none() && !config.allow_insecure_connections {
                 missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --allow-insecure-connections)");
             }
             if config.node_advertise_address.is_none() {
