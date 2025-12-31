@@ -140,21 +140,12 @@ impl NFSObjectStore {
             let mut results = Vec::new();
             let mut queue = vec![prefix];
 
-            while !queue.is_empty() {
-                // Process directories in batches. Note: this is still sequential within a single
-                // spawn_blocking task, so MAX_CONCURRENT_LISTINGS does not introduce parallelism
-                // here. The batching pattern and constant are kept for consistency with other
-                // object stores and to allow easy future parallelization if needed.
-                let batch: Vec<_> = queue
-                    .drain(..queue.len().min(MAX_CONCURRENT_LISTINGS))
-                    .collect();
-
-                for current_path in batch {
-                    let entries = Self::list_directory_blocking(&mut nfs, &current_path);
-                    let (files, dirs) = process_directory_entries(&current_path, entries);
-                    results.extend(files);
-                    queue.extend(dirs);
-                }
+            // Process directories sequentially within this blocking task
+            while let Some(current_path) = queue.pop() {
+                let entries = Self::list_directory_blocking(&mut nfs, &current_path);
+                let (files, dirs) = process_directory_entries(&current_path, entries);
+                results.extend(files);
+                queue.extend(dirs);
             }
 
             Ok(results)

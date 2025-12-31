@@ -149,8 +149,8 @@ pub fn process_directory_entries_shallow(
         let full_path = build_full_path(prefix, &entry.name);
 
         if entry.is_dir {
-            // Add trailing slash to indicate it's a prefix/directory
-            common_prefixes.push(Path::from(format!("{full_path}/")));
+            // Directory paths are stored without trailing slashes (Path normalizes them)
+            common_prefixes.push(Path::from(full_path));
         } else {
             objects.push(entry_to_object_meta(full_path, &entry));
         }

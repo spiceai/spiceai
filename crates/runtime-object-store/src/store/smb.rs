@@ -204,8 +204,7 @@ impl SMBClientConfig {
         let normalized = subpath.trim_start_matches('/');
         let path_without_share = normalized
             .strip_prefix(&self.share)
-            .map(|s| s.trim_start_matches('/'))
-            .unwrap_or(normalized);
+            .map_or(normalized, |s| s.trim_start_matches('/'));
 
         if path_without_share.is_empty() {
             return Ok(base);
@@ -235,8 +234,7 @@ impl SMBClientConfig {
         let normalized = subpath.trim_start_matches('/');
         let path_without_share = normalized
             .strip_prefix(&self.share)
-            .map(|s| s.trim_start_matches('/'))
-            .unwrap_or(normalized);
+            .map_or(normalized, |s| s.trim_start_matches('/'));
 
         if path_without_share.is_empty() {
             format!("smb://{}/{}", self.server, self.share)
@@ -271,7 +269,14 @@ impl SMBInner {
                     .max_size(DEFAULT_POOL_SIZE)
                     .build(manager)
                     .await
-                    .map_err(handle_error)
+                    .map_err(|e| object_store::Error::Generic {
+                        store: STORE_NAME,
+                        source: format!(
+                            "Failed to establish connection to SMB share smb://{}/{}. \
+                            Verify the server is accessible and credentials are correct. Details: {e}",
+                            self.config.server, self.config.share
+                        ).into(),
+                    })
             })
             .await
     }
@@ -280,7 +285,13 @@ impl SMBInner {
         &self,
     ) -> object_store::Result<PooledConnection<'_, SMBConnectionManager>> {
         let pool = self.get_pool().await?;
-        pool.get().await.map_err(handle_error)
+        pool.get().await.map_err(|e| object_store::Error::Generic {
+            store: STORE_NAME,
+            source: format!(
+                "Failed to get connection from pool for SMB share smb://{}/{}. Details: {e}",
+                self.config.server, self.config.share
+            ).into(),
+        })
     }
 }
 
@@ -323,6 +334,22 @@ impl SMBObjectStore {
         }
     }
 
+    /// Test the connection to the SMB share.
+    ///
+    /// This performs a health check by:
+    /// 1. Initializing the connection pool if not already done
+    /// 2. Acquiring a connection from the pool
+    /// 3. Verifying the SMB share is accessible
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established or the share is not accessible.
+    pub async fn test_connection(&self) -> object_store::Result<()> {
+        // Acquiring a connection will initialize the pool and test connectivity
+        let _conn = self.inner.get_connection().await?;
+        Ok(())
+    }
+
     async fn list_directory(
         client: &Client,
         config: &SMBClientConfig,
@@ -341,7 +368,15 @@ impl SMBObjectStore {
         let resource = match client.create_file(&unc_path, &dir_open_args).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to open SMB directory {display_path}: {e}");
+                // Check if the path might be a file instead of a directory
+                if dir_path.contains('.') && !dir_path.ends_with('/') {
+                    tracing::debug!(
+                        "Path {display_path} appears to be a file, not a directory. \
+                        Skipping directory listing."
+                    );
+                } else {
+                    tracing::warn!("Failed to open SMB directory {display_path}: {e}");
+                }
                 return Ok(Vec::new());
             }
         };
@@ -404,10 +439,47 @@ impl SMBObjectStore {
         &self,
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
-        let conn = self.inner.get_connection().await?;
+        let conn = self.inner.get_connection().await.map_err(|e| {
+            object_store::Error::Generic {
+                store: STORE_NAME,
+                source: format!(
+                    "Failed to connect to SMB share smb://{}/{}. Verify the server is accessible, \
+                    credentials are correct, and the share exists. Details: {e}",
+                    self.inner.config.server, self.inner.config.share
+                )
+                .into(),
+            }
+        })?;
+
         let config = Arc::clone(&self.inner.config);
+        let prefix_str = prefix.unwrap_or_default();
+
+        // First, verify we can access the share root or the specified path's parent directory
+        let initial_path = if prefix_str.is_empty() {
+            String::new()
+        } else {
+            // Try the parent directory if the prefix looks like a file path
+            let parent = std::path::Path::new(&prefix_str)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("");
+            parent.to_string()
+        };
+
+        // Test share accessibility by listing the initial path
+        let initial_entries = Self::list_directory(&conn, &config, &initial_path).await?;
+        if initial_entries.is_empty() && !initial_path.is_empty() {
+            tracing::warn!(
+                "No files found in SMB path smb://{}/{}/{}. \
+                Verify the path exists and contains files.",
+                config.server,
+                config.share,
+                initial_path
+            );
+        }
+
         let mut results = Vec::new();
-        let mut queue = vec![prefix.unwrap_or_default()];
+        let mut queue = vec![prefix_str];
 
         while let Some(dir_path) = queue.pop() {
             match Self::list_directory(&conn, &config, &dir_path).await {
