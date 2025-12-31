@@ -1256,9 +1256,10 @@ impl GraphQLClient {
                     // Use Fibonacci backoff strategy for retriable errors
                     if let Some(delay) = backoff.next_backoff() {
                         tracing::warn!(
-                            "Page fetch failed (attempt {}/{}), retrying in {:?}: {}",
-                            attempt,
+                            "Page fetch failed (retry {}/{}; total attempt {}), retrying in {:?}: {}",
+                            attempt.saturating_sub(1),
                             PAGE_RETRY_MAX_ATTEMPTS,
+                            attempt,
                             delay,
                             e
                         );

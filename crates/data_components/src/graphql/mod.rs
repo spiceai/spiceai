@@ -200,6 +200,7 @@ pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_is_retriable_error_http_502() {
@@ -470,21 +471,39 @@ mod tests {
 
     #[test]
     fn test_max_attempts_boundary() {
-        // Verify that PAGE_RETRY_MAX_ATTEMPTS is used correctly.
+        use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+
+        // Verify that PAGE_RETRY_MAX_ATTEMPTS is used correctly with FibonacciBackoff.
         // PAGE_RETRY_MAX_ATTEMPTS represents the maximum number of retry attempts,
         // excluding the initial attempt. With PAGE_RETRY_MAX_ATTEMPTS = 3:
         // - Attempt 1: initial try
-        // - Attempt 2: first retry (after first failure)
-        // - Attempt 3: second retry (after second failure)
-        // - Attempt 4: third retry (after third failure), then give up
+        // - Attempt 2: first retry (after first failure) - backoff call 1
+        // - Attempt 3: second retry (after second failure) - backoff call 2
+        // - Attempt 4: third retry (after third failure) - backoff call 3
+        // - After attempt 4 fails, backoff returns None, give up
 
-        // Test using runtime values to avoid constant assertion warnings
-        let max_attempts = PAGE_RETRY_MAX_ATTEMPTS;
-        assert!(1 < max_attempts, "Attempt 1 should allow retry");
-        assert!(2 < max_attempts, "Attempt 2 should allow retry");
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .build();
+
+        // Should allow 3 retries (backoff returns Some 3 times)
         assert!(
-            3 >= max_attempts,
-            "Attempt 3 should NOT allow retry (max reached)"
+            backoff.next_backoff().is_some(),
+            "First retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Second retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Third retry should be allowed"
+        );
+
+        // Fourth call should return None (max retries exhausted)
+        assert!(
+            backoff.next_backoff().is_none(),
+            "Fourth retry should NOT be allowed (max retries exhausted)"
         );
     }
 }
