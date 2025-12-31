@@ -98,9 +98,7 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
             let mut exec_plan =
                 BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback));
 
-            if cfg!(feature = "cluster") {
-                exec_plan = exec_plan.fallback_to_new_context();
-            }
+            exec_plan = exec_plan.fallback_to_new_context();
 
             Ok(Transformed::new(
                 Arc::new(exec_plan),

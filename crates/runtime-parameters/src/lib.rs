@@ -129,11 +129,13 @@ impl Parameters {
 
         // Check for deprecated parameters
         for parameter in all_params {
+            // Must be deprecated and present in user-provided params.
             if let Some(deprecation_message) = parameter.deprecation_message
-                && let Some((param, _)) = params.iter().find(|p| p.0 == parameter.name)
+                && params.iter().any(|p| p.0 == parameter.name)
             {
                 tracing::warn!(
-                    "Parameter '{param}' is deprecated for {component_name}: {deprecation_message}",
+                    "Parameter '{}' is deprecated for {component_name}: {deprecation_message}",
+                    parameter.display_name(prefix)
                 );
             }
         }

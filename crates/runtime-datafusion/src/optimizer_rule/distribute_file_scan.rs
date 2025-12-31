@@ -566,7 +566,6 @@ pub mod tests {
         }
     }
 
-    #[cfg(feature = "cluster")]
     pub mod cluster {
         use super::*;
 

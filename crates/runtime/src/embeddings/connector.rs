@@ -104,11 +104,10 @@ impl EmbeddingConnector {
                 vector_engine,
             )
             .await
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
+            .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
                 dataconnector: dataset.source().to_string(),
                 connector_component: dataset.into(),
                 source: e,
-                message: "Could not instantiate vector index".to_string(),
             });
         }
 
