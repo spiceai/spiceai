@@ -684,7 +684,11 @@ async fn test_int64_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) ->
 
     // Verify the data: should have ids 1, 2, 3, 4 with 2 being the new version
     let ids = get_ids(&ctx, "reuse_pk_test").await?;
-    assert_eq!(ids, vec![1, 2, 3, 4], "Should have all 4 ids including upserted id=2");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "Should have all 4 ids including upserted id=2"
+    );
 
     // Verify id=2 has the new value (999)
     let df = ctx

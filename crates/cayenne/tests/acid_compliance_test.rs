@@ -207,7 +207,11 @@ async fn get_ids(ctx: &SessionContext, table_name: &str) -> TestResult<Vec<i64>>
     Ok(ids)
 }
 
-async fn get_value_for_id(ctx: &SessionContext, table_name: &str, id: i64) -> TestResult<Option<i64>> {
+async fn get_value_for_id(
+    ctx: &SessionContext,
+    table_name: &str,
+    id: i64,
+) -> TestResult<Option<i64>> {
     let df = ctx
         .sql(&format!("SELECT value FROM {table_name} WHERE id = {id}"))
         .await?;
@@ -263,11 +267,7 @@ async fn test_acid_upsert_int64_pk_impl(fixture: TestFixture) -> TestResult<()> 
 
     // ACID check: the value for id=3 should be the new value
     let value = get_value_for_id(&ctx, "acid_upsert_int64", 3).await?;
-    assert_eq!(
-        value,
-        Some(999),
-        "Upserted row should have new value 999"
-    );
+    assert_eq!(value, Some(999), "Upserted row should have new value 999");
 
     // Verify all IDs are present
     let ids = get_ids(&ctx, "acid_upsert_int64").await?;
@@ -328,11 +328,7 @@ async fn test_acid_upsert_string_pk_impl(fixture: TestFixture) -> TestResult<()>
         .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
         .and_then(|a| a.values().first())
         .copied();
-    assert_eq!(
-        value,
-        Some(999),
-        "Upserted row should have new value 999"
-    );
+    assert_eq!(value, Some(999), "Upserted row should have new value 999");
 
     Ok(())
 }
@@ -395,11 +391,7 @@ async fn test_acid_upsert_composite_pk_impl(fixture: TestFixture) -> TestResult<
         .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
         .and_then(|a| a.values().first())
         .copied();
-    assert_eq!(
-        value,
-        Some(999),
-        "Upserted row should have new value 999"
-    );
+    assert_eq!(value, Some(999), "Upserted row should have new value 999");
 
     Ok(())
 }
@@ -511,7 +503,10 @@ async fn test_acid_durability_reopen_impl(fixture: TestFixture) -> TestResult<()
         );
 
         let ctx2 = SessionContext::new();
-        ctx2.register_table(table_name, Arc::clone(&reopened_table) as Arc<dyn TableProvider>)?;
+        ctx2.register_table(
+            table_name,
+            Arc::clone(&reopened_table) as Arc<dyn TableProvider>,
+        )?;
 
         // Durability check: data should persist after reopen
         assert_eq!(
@@ -571,7 +566,7 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
 
         let ctx = SessionContext::new();
         ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
-        
+
         // Verify deletions took effect
         assert_eq!(get_row_count(&ctx, table_name).await?, 3);
         let ids = get_ids(&ctx, table_name).await?;
@@ -589,7 +584,10 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
         );
 
         let ctx2 = SessionContext::new();
-        ctx2.register_table(table_name, Arc::clone(&reopened_table) as Arc<dyn TableProvider>)?;
+        ctx2.register_table(
+            table_name,
+            Arc::clone(&reopened_table) as Arc<dyn TableProvider>,
+        )?;
 
         // Durability check: deletions should persist
         assert_eq!(
@@ -629,18 +627,15 @@ async fn test_acid_batch_upsert_impl(fixture: TestFixture) -> TestResult<()> {
     insert_batch(&table, batch1).await?;
 
     // Delete multiple rows at once
-    let deleted = delete_records(
-        &table,
-        col("id").gt(lit(2i64)).and(col("id").lt(lit(5i64))),
-    )
-    .await?;
+    let deleted =
+        delete_records(&table, col("id").gt(lit(2i64)).and(col("id").lt(lit(5i64)))).await?;
     assert_eq!(deleted, 2, "Should delete rows 3 and 4");
 
     // Insert multiple rows including upserts
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(Int64Array::from(vec![3, 4, 6])),  // 3 and 4 are upserts, 6 is new
+            Arc::new(Int64Array::from(vec![3, 4, 6])), // 3 and 4 are upserts, 6 is new
             Arc::new(StringArray::from(vec!["c_new", "d_new", "f"])),
             Arc::new(Int64Array::from(vec![333, 444, 600])),
         ],
@@ -655,9 +650,18 @@ async fn test_acid_batch_upsert_impl(fixture: TestFixture) -> TestResult<()> {
     );
 
     // Verify specific values
-    assert_eq!(get_value_for_id(&ctx, "acid_batch_upsert", 3).await?, Some(333));
-    assert_eq!(get_value_for_id(&ctx, "acid_batch_upsert", 4).await?, Some(444));
-    assert_eq!(get_value_for_id(&ctx, "acid_batch_upsert", 6).await?, Some(600));
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_batch_upsert", 3).await?,
+        Some(333)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_batch_upsert", 4).await?,
+        Some(444)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_batch_upsert", 6).await?,
+        Some(600)
+    );
 
     Ok(())
 }
@@ -706,9 +710,18 @@ async fn test_acid_delete_all_then_insert_impl(fixture: TestFixture) -> TestResu
     );
 
     // Verify new values
-    assert_eq!(get_value_for_id(&ctx, "acid_delete_all", 1).await?, Some(1000));
-    assert_eq!(get_value_for_id(&ctx, "acid_delete_all", 2).await?, Some(2000));
-    assert_eq!(get_value_for_id(&ctx, "acid_delete_all", 3).await?, Some(3000));
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_delete_all", 1).await?,
+        Some(1000)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_delete_all", 2).await?,
+        Some(2000)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_delete_all", 3).await?,
+        Some(3000)
+    );
 
     Ok(())
 }
@@ -769,12 +782,30 @@ async fn test_acid_interleaved_ops_impl(fixture: TestFixture) -> TestResult<()> 
     );
 
     // Verify specific values
-    assert_eq!(get_value_for_id(&ctx, "acid_interleaved", 1).await?, Some(111));
-    assert_eq!(get_value_for_id(&ctx, "acid_interleaved", 2).await?, Some(222));
-    assert_eq!(get_value_for_id(&ctx, "acid_interleaved", 3).await?, Some(300));
-    assert_eq!(get_value_for_id(&ctx, "acid_interleaved", 4).await?, Some(444));
-    assert_eq!(get_value_for_id(&ctx, "acid_interleaved", 5).await?, Some(500));
-    assert_eq!(get_value_for_id(&ctx, "acid_interleaved", 6).await?, Some(600));
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_interleaved", 1).await?,
+        Some(111)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_interleaved", 2).await?,
+        Some(222)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_interleaved", 3).await?,
+        Some(300)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_interleaved", 4).await?,
+        Some(444)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_interleaved", 5).await?,
+        Some(500)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "acid_interleaved", 6).await?,
+        Some(600)
+    );
 
     Ok(())
 }
@@ -788,7 +819,9 @@ async fn test_acid_interleaved_ops_impl(fixture: TestFixture) -> TestResult<()> 
 // Multi-File Test 1: Delete from File 1, Insert Same PK to File 2 (Int64 PK)
 // =============================================================================
 
-async fn test_multifile_delete_file1_insert_file2_int64_impl(fixture: TestFixture) -> TestResult<()> {
+async fn test_multifile_delete_file1_insert_file2_int64_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
     let (table, ctx, schema) = setup_int64_pk_table(&fixture, "mf_del_ins_int64").await?;
 
     // File 1: Insert initial batch
@@ -833,11 +866,7 @@ async fn test_multifile_delete_file1_insert_file2_int64_impl(fixture: TestFixtur
 
     // Verify id=2 has the NEW value (222), not the old (200)
     let value = get_value_for_id(&ctx, "mf_del_ins_int64", 2).await?;
-    assert_eq!(
-        value,
-        Some(222),
-        "Re-inserted PK should have new value"
-    );
+    assert_eq!(value, Some(222), "Re-inserted PK should have new value");
 
     Ok(())
 }
@@ -846,7 +875,9 @@ async fn test_multifile_delete_file1_insert_file2_int64_impl(fixture: TestFixtur
 // Multi-File Test 2: Delete from File 1, Insert Same PK to File 2 (String PK)
 // =============================================================================
 
-async fn test_multifile_delete_file1_insert_file2_string_impl(fixture: TestFixture) -> TestResult<()> {
+async fn test_multifile_delete_file1_insert_file2_string_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
     let (table, ctx, schema) = setup_string_pk_table(&fixture, "mf_del_ins_string").await?;
 
     // File 1: Insert initial batch (schema: code, name, value)
@@ -933,7 +964,10 @@ async fn test_multifile_multiple_upserts_int64_impl(fixture: TestFixture) -> Tes
     )?;
     insert_batch(&table, batch2).await?;
     assert_eq!(get_row_count(&ctx, "mf_multi_upsert").await?, 3);
-    assert_eq!(get_value_for_id(&ctx, "mf_multi_upsert", 1).await?, Some(111));
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_multi_upsert", 1).await?,
+        Some(111)
+    );
 
     // Delete id=2
     delete_records(&table, col("id").eq(lit(2i64))).await?;
@@ -950,7 +984,10 @@ async fn test_multifile_multiple_upserts_int64_impl(fixture: TestFixture) -> Tes
     )?;
     insert_batch(&table, batch3).await?;
     assert_eq!(get_row_count(&ctx, "mf_multi_upsert").await?, 4);
-    assert_eq!(get_value_for_id(&ctx, "mf_multi_upsert", 2).await?, Some(222));
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_multi_upsert", 2).await?,
+        Some(222)
+    );
 
     // Delete id=1 again
     delete_records(&table, col("id").eq(lit(1i64))).await?;
@@ -970,8 +1007,14 @@ async fn test_multifile_multiple_upserts_int64_impl(fixture: TestFixture) -> Tes
     // Final state: ids 1, 2, 3, 4, 5 with values 1111, 222, 300, 400, 500
     assert_eq!(get_row_count(&ctx, "mf_multi_upsert").await?, 5);
     assert_eq!(get_ids(&ctx, "mf_multi_upsert").await?, vec![1, 2, 3, 4, 5]);
-    assert_eq!(get_value_for_id(&ctx, "mf_multi_upsert", 1).await?, Some(1111));
-    assert_eq!(get_value_for_id(&ctx, "mf_multi_upsert", 2).await?, Some(222));
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_multi_upsert", 1).await?,
+        Some(1111)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_multi_upsert", 2).await?,
+        Some(222)
+    );
 
     Ok(())
 }
@@ -989,7 +1032,11 @@ async fn test_multifile_upsert_composite_pk_impl(fixture: TestFixture) -> TestRe
         vec![
             Arc::new(StringArray::from(vec!["us", "us", "eu"])),
             Arc::new(Int64Array::from(vec![1, 2, 1])),
-            Arc::new(StringArray::from(vec!["US user 1", "US user 2", "EU user 1"])),
+            Arc::new(StringArray::from(vec![
+                "US user 1",
+                "US user 2",
+                "EU user 1",
+            ])),
             Arc::new(Int64Array::from(vec![100, 200, 300])),
         ],
     )?;
@@ -1035,7 +1082,13 @@ async fn test_multifile_upsert_composite_pk_impl(fixture: TestFixture) -> TestRe
     let name = results
         .first()
         .and_then(|b| b.column(0).as_any().downcast_ref::<StringArray>())
-        .and_then(|a| if a.is_empty() { None } else { Some(a.value(0).to_string()) });
+        .and_then(|a| {
+            if a.is_empty() {
+                None
+            } else {
+                Some(a.value(0).to_string())
+            }
+        });
     assert_eq!(name, Some("US user 2 UPDATED".to_string()));
 
     Ok(())
@@ -1077,9 +1130,18 @@ async fn test_multifile_delete_all_readd_all_impl(fixture: TestFixture) -> TestR
 
     // Should have 3 rows with new values
     assert_eq!(get_row_count(&ctx, "mf_delete_all_readd").await?, 3);
-    assert_eq!(get_value_for_id(&ctx, "mf_delete_all_readd", 1).await?, Some(1000));
-    assert_eq!(get_value_for_id(&ctx, "mf_delete_all_readd", 2).await?, Some(2000));
-    assert_eq!(get_value_for_id(&ctx, "mf_delete_all_readd", 3).await?, Some(3000));
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_delete_all_readd", 1).await?,
+        Some(1000)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_delete_all_readd", 2).await?,
+        Some(2000)
+    );
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_delete_all_readd", 3).await?,
+        Some(3000)
+    );
 
     Ok(())
 }
@@ -1129,7 +1191,11 @@ async fn test_multifile_interleaved_many_files_impl(fixture: TestFixture) -> Tes
 
     // At end: should have 5 rows (one per round - the second ID from each)
     // IDs: 2, 4, 6, 8, 10
-    let expected: Vec<i64> = expected_ids.into_iter().collect::<Vec<_>>().into_iter().collect();
+    let expected: Vec<i64> = expected_ids
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
     let mut expected_sorted = expected;
     expected_sorted.sort_unstable();
 
@@ -1187,7 +1253,10 @@ async fn test_multifile_duplicate_pk_in_batch_impl(fixture: TestFixture) -> Test
     // Should have 4 rows: 1 (new), 2, 3, 4
     assert_eq!(get_row_count(&ctx, "mf_dup_pk_batch").await?, 4);
     assert_eq!(get_ids(&ctx, "mf_dup_pk_batch").await?, vec![1, 2, 3, 4]);
-    assert_eq!(get_value_for_id(&ctx, "mf_dup_pk_batch", 1).await?, Some(111));
+    assert_eq!(
+        get_value_for_id(&ctx, "mf_dup_pk_batch", 1).await?,
+        Some(111)
+    );
 
     Ok(())
 }
@@ -1217,7 +1286,10 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
-    ctx.register_table("mf_position_upsert", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    ctx.register_table(
+        "mf_position_upsert",
+        Arc::clone(&table) as Arc<dyn TableProvider>,
+    )?;
 
     // File 1: Initial data
     let batch1 = RecordBatch::try_new(
@@ -1262,7 +1334,11 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
         .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
         .and_then(|a| a.values().first())
         .copied();
-    assert_eq!(value, Some(222), "Re-inserted category B should have new value");
+    assert_eq!(
+        value,
+        Some(222),
+        "Re-inserted category B should have new value"
+    );
 
     Ok(())
 }
