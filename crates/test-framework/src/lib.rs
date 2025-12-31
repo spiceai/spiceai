@@ -56,8 +56,6 @@ pub enum TestType {
     Benchmark,
     Append,
     DataConsistency,
-    HttpConsistency,
-    HttpOverhead,
     Search,
     TextToSql,
 }
@@ -71,8 +69,6 @@ impl TestType {
             TestType::Benchmark => "testoperator_run_bench.yml",
             TestType::Append => "testoperator_run_append.yml",
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
-            TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
-            TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
             TestType::Search => "testoperator_run_search.yml",
             TestType::TextToSql => "testoperator_run_texttosql.yml",
         }
@@ -87,8 +83,6 @@ impl Display for TestType {
             TestType::Benchmark => write!(f, "benchmark"),
             TestType::Append => write!(f, "append"),
             TestType::DataConsistency => write!(f, "data_consistency"),
-            TestType::HttpConsistency => write!(f, "http_consistency"),
-            TestType::HttpOverhead => write!(f, "http_overhead"),
             TestType::Search => write!(f, "search"),
             TestType::TextToSql => write!(f, "text_to_sql"),
         }

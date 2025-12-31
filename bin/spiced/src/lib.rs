@@ -32,9 +32,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
-#[cfg(feature = "cluster")]
 use runtime::cluster::ResolvedClusterConfig;
-#[cfg(feature = "cluster")]
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
@@ -99,6 +97,9 @@ pub enum Error {
 
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
+
+    #[snafu(display("Invalid cluster configuration: {source}"))]
+    InvalidClusterConfig { source: std::io::Error },
 
     #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`. {reason}"))]
     FailedToApplyOverridesGeneric { reason: String },
@@ -229,7 +230,6 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
-    #[cfg(feature = "cluster")]
     let resolved_cluster_config =
         ResolvedClusterConfig::from_config_and_app(args.runtime.cluster.clone(), app.as_deref());
 
@@ -247,9 +247,17 @@ pub async fn run(args: Args) -> Result<()> {
         .with_runtime_config(args.runtime.clone())
         .with_io_runtime(Handle::current());
 
-    #[cfg(feature = "cluster")]
-    if let Ok(resolved_cluster_config) = resolved_cluster_config {
-        builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+    match resolved_cluster_config {
+        Ok(resolved_cluster_config) => {
+            builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+        }
+        Err(e) if args.runtime.cluster.role.is_some() => {
+            // If --role was explicitly specified, surface the configuration error
+            return Err(Error::InvalidClusterConfig { source: e });
+        }
+        Err(_) => {
+            // No explicit role specified, silently continue in standalone mode
+        }
     }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
@@ -388,19 +396,16 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
-    #[cfg(feature = "cluster")]
-    {
-        // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
-        let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
-            || (args.runtime.cluster.role.is_none()
-                && args.runtime.cluster.scheduler_address.is_some());
+    // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
+    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
+        || (args.runtime.cluster.role.is_none()
+            && args.runtime.cluster.scheduler_address.is_some());
 
-        if is_executor {
-            tracing::info!(
-                "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
-            );
-            return Ok((Some(Arc::new(App::default())), None));
-        }
+    if is_executor {
+        tracing::info!(
+            "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
+        );
+        return Ok((Some(Arc::new(App::default())), None));
     }
 
     let spicepod_path = args

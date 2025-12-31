@@ -73,13 +73,14 @@ pub async fn start_internal_cluster_server(
         server = server_with_cluster_mtls(server, tls_config)
             .map_err(|source| Error::UnableToConfigureTls { source })?;
         tracing::info!("Cluster mTLS enabled for internal cluster server");
-    } else if !rt.df.cluster_config.insecure() {
+    } else if !rt.df.cluster_config.allow_insecure_connections() {
         return Err(Error::InsecureConfiguration {
-            message: "Cluster mode without mTLS requires the --insecure flag".to_string(),
+            message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
+                .to_string(),
         });
     } else {
         tracing::warn!(
-            "Cluster mTLS disabled for internal cluster server (--insecure flag is set)"
+            "Cluster mTLS disabled for internal cluster server (--allow-insecure-connections flag is set)"
         );
     }
 
@@ -119,7 +120,7 @@ pub async fn start_internal_cluster_server(
 
 /// Starts the executor Ballista Flight server used for receiving query fragments.
 ///
-/// mTLS is optional when `--insecure` is used.
+/// mTLS is optional when `--allow-insecure-connections` is used.
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
@@ -132,12 +133,15 @@ pub async fn start_executor_flight_server(
         server = server_with_cluster_mtls(server, tls_config)
             .map_err(|source| Error::UnableToConfigureTls { source })?;
         tracing::info!("Cluster mTLS enabled for executor flight server");
-    } else if !rt.df.cluster_config.insecure() {
+    } else if !rt.df.cluster_config.allow_insecure_connections() {
         return Err(Error::InsecureConfiguration {
-            message: "Cluster mode without mTLS requires the --insecure flag".to_string(),
+            message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
+                .to_string(),
         });
     } else {
-        tracing::warn!("Cluster mTLS disabled for executor flight server (--insecure flag is set)");
+        tracing::warn!(
+            "Cluster mTLS disabled for executor flight server (--allow-insecure-connections flag is set)"
+        );
     }
 
     // Executor: serve only BallistaFlightService for receiving query fragments.

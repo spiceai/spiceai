@@ -24,7 +24,6 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
-#[cfg(feature = "cluster")]
 use crate::cluster::ResolvedClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
@@ -120,7 +119,6 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
-    #[cfg(feature = "cluster")]
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
     io_runtime: Handle,
@@ -163,7 +161,6 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
-            #[cfg(feature = "cluster")]
             cluster_config: None,
             metrics: None,
             io_runtime,
@@ -183,7 +180,6 @@ impl DataFusionBuilder {
         self
     }
 
-    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn with_cluster_config(mut self, config: ResolvedClusterConfig) -> Self {
         self.cluster_config = Some(Arc::new(config));
@@ -378,11 +374,8 @@ impl DataFusionBuilder {
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
-            #[cfg(feature = "cluster")]
             cluster_config: self.cluster_config.unwrap_or_default(),
-            #[cfg(feature = "cluster")]
             scheduler_server: RwLock::new(None),
-            #[cfg(feature = "cluster")]
             executor: RwLock::new(None),
         }
     }
