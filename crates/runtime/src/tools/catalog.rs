@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait SpiceToolCatalog: Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
     fn name(&self) -> &str;
 
     /// Retrieve all available tools from a tool catalog.

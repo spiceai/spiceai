@@ -21,7 +21,7 @@ use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
 use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
-use crate::tools::utils::get_tools;
+use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
 use llms::responses::Responses;
@@ -103,11 +103,14 @@ pub async fn try_to_responses_model(
         .transpose()
         .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
+    // Create table allowlist from model's datasets if specified
+    let table_allowlist = create_table_allowlist(&component.datasets);
+
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingResponses::new(
             model,
             openai_responses_tools.unwrap_or_default(),
-            get_tools(Arc::clone(&rt), &opts).await,
+            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
             spice_recursion_limit,
         )),
         Some(_) | None => model,
