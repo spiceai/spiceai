@@ -20,8 +20,8 @@ use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 
 use super::{
-    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_INITIAL_DELAY, PAGE_RETRY_MAX_ATTEMPTS,
-    ReqwestInternalSnafu, Result, is_retriable_error,
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
+    is_retriable_error, rate_limit_wait_duration,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,7 +37,8 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
-use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
+use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc, time::Duration};
+use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
 
 use url::Url;
 
@@ -1210,9 +1211,12 @@ impl GraphQLClient {
 
     /// Executes a GraphQL query with page-level retry for transient errors.
     ///
-    /// This function wraps `execute()` with retry logic using exponential backoff.
-    /// It will retry up to `PAGE_RETRY_MAX_ATTEMPTS` times for retriable errors
-    /// (e.g., 502, 503, 504, timeouts).
+    /// This function wraps `execute()` with retry logic using exponential backoff
+    /// from the `util::retry_strategy` module. It will retry up to `PAGE_RETRY_MAX_ATTEMPTS`
+    /// times for retriable errors (e.g., 502, 503, 504, timeouts).
+    ///
+    /// For rate limit errors with a known reset time, it waits until the rate limit resets
+    /// instead of using exponential backoff.
     async fn execute_with_retry(
         client: &Arc<Self>,
         query: &mut GraphQLQuery,
@@ -1222,7 +1226,15 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
-        let mut attempt = 0;
+        let mut backoff = RetryBackoffBuilder::new()
+            .method(BackoffMethod::Exponential)
+            .base_interval(Duration::from_secs(1))
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
+            .randomization_factor(0.1) // Small jitter to avoid thundering herd
+            .build();
+
+        let mut attempt = 0u32;
 
         loop {
             attempt += 1;
@@ -1240,8 +1252,28 @@ impl GraphQLClient {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    if is_retriable_error(&e) && attempt < PAGE_RETRY_MAX_ATTEMPTS {
-                        let delay = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(attempt - 1);
+                    if !is_retriable_error(&e) {
+                        // Non-retriable error, fail immediately
+                        return Err(e);
+                    }
+
+                    // For rate limit errors with a known reset time, wait until reset
+                    if let Some(rate_limit_delay) = rate_limit_wait_duration(&e) {
+                        // Add a small buffer (5 seconds) to account for clock skew
+                        let delay_with_buffer = rate_limit_delay + Duration::from_secs(5);
+                        tracing::warn!(
+                            "Rate limit exceeded (attempt {}/{}), waiting {:?} until rate limit resets: {}",
+                            attempt,
+                            PAGE_RETRY_MAX_ATTEMPTS,
+                            delay_with_buffer,
+                            e
+                        );
+                        tokio::time::sleep(delay_with_buffer).await;
+                        continue;
+                    }
+
+                    // Use backoff strategy for other retriable errors
+                    if let Some(delay) = backoff.next_backoff() {
                         tracing::warn!(
                             "Page fetch failed (attempt {}/{}), retrying in {:?}: {}",
                             attempt,
@@ -1250,18 +1282,15 @@ impl GraphQLClient {
                             e
                         );
                         tokio::time::sleep(delay).await;
-                        continue;
-                    }
-
-                    // Non-retriable error or max attempts reached
-                    if attempt >= PAGE_RETRY_MAX_ATTEMPTS {
+                    } else {
+                        // Max retries exhausted
                         tracing::error!(
                             "Page fetch failed after {} attempts, giving up: {}",
                             attempt,
                             e
                         );
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             }
         }

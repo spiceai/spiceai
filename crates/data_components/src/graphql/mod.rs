@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use arrow::error::ArrowError;
 use client::GraphQLQuery;
@@ -31,9 +34,6 @@ pub mod rate_limit;
 
 /// Maximum number of retry attempts for a single page fetch during pagination.
 pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 3;
-
-/// Initial delay before first retry (doubles with each attempt).
-pub const PAGE_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -66,6 +66,12 @@ pub enum Error {
 
     #[snafu(display("{message}"))]
     RateLimited { message: String },
+
+    #[snafu(display("{message}. Rate limit resets at {reset_at:?}"))]
+    RateLimitedUntil {
+        message: String,
+        reset_at: SystemTime,
+    },
 
     #[snafu(display("Query response transformation failed. {source}"))]
     ResultTransformError {
@@ -146,8 +152,26 @@ pub fn is_retriable_error(error: &Error) -> bool {
                     )
                 )
         }
-        Error::RateLimited { .. } => true,
+        Error::RateLimited { .. } | Error::RateLimitedUntil { .. } => true,
         _ => false,
+    }
+}
+
+/// Returns the wait duration if the error is a rate-limited error with a known reset time.
+/// Returns `None` for non-rate-limited errors or rate-limited errors without a reset time.
+#[must_use]
+pub fn rate_limit_wait_duration(error: &Error) -> Option<Duration> {
+    match error {
+        Error::RateLimitedUntil { reset_at, .. } => {
+            let now = SystemTime::now();
+            if *reset_at > now {
+                reset_at.duration_since(now).ok()
+            } else {
+                // Reset time has passed, no need to wait
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -327,16 +351,6 @@ mod tests {
     fn test_page_retry_constants() {
         // Verify the constants are reasonable
         assert_eq!(PAGE_RETRY_MAX_ATTEMPTS, 3);
-        assert_eq!(PAGE_RETRY_INITIAL_DELAY, Duration::from_secs(1));
-
-        // Verify exponential backoff produces expected delays
-        let delay_1 = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(0); // 1s
-        let delay_2 = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(1); // 2s
-        let delay_3 = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(2); // 4s
-
-        assert_eq!(delay_1, Duration::from_secs(1));
-        assert_eq!(delay_2, Duration::from_secs(2));
-        assert_eq!(delay_3, Duration::from_secs(4));
     }
 
     #[test]
@@ -438,40 +452,48 @@ mod tests {
         for error in &retriable_errors {
             assert!(
                 is_retriable_error(error),
-                "Error should be retriable: {:?}",
-                error
+                "Error should be retriable: {error:?}"
             );
         }
 
         for error in &non_retriable_errors {
             assert!(
                 !is_retriable_error(error),
-                "Error should NOT be retriable: {:?}",
-                error
+                "Error should NOT be retriable: {error:?}"
             );
         }
     }
 
     #[test]
-    fn test_exponential_backoff_calculation() {
-        // Verify the exponential backoff formula used in execute_with_retry
-        // delay = PAGE_RETRY_INITIAL_DELAY * 2^(attempt - 1)
+    fn test_exponential_backoff_with_retry_strategy() {
+        use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
+
+        // Verify the RetryBackoff produces expected exponential delays
+        // This mirrors the configuration used in execute_with_retry
+        let mut backoff = RetryBackoffBuilder::new()
+            .method(BackoffMethod::Exponential)
+            .base_interval(Duration::from_secs(1))
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .randomization_factor(0.0) // No randomization for predictable testing
+            .build();
 
         // Attempt 1: 1s * 2^0 = 1s
-        let attempt_1_delay = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(1 - 1);
-        assert_eq!(attempt_1_delay, Duration::from_secs(1));
+        let delay_1 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_1, Duration::from_secs(1));
 
         // Attempt 2: 1s * 2^1 = 2s
-        let attempt_2_delay = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(2 - 1);
-        assert_eq!(attempt_2_delay, Duration::from_secs(2));
+        let delay_2 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_2, Duration::from_secs(2));
 
-        // Attempt 3: 1s * 2^2 = 4s (this would be the last retry before giving up)
-        let attempt_3_delay = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(3 - 1);
-        assert_eq!(attempt_3_delay, Duration::from_secs(4));
+        // Attempt 3: 1s * 2^2 = 4s
+        let delay_3 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_3, Duration::from_secs(4));
 
-        // Total maximum wait time for retries: 1 + 2 = 3s (we don't wait after the last attempt)
-        let total_wait_time = attempt_1_delay + attempt_2_delay;
-        assert_eq!(total_wait_time, Duration::from_secs(3));
+        // After max_retries (3), should return None
+        assert!(
+            backoff.next_backoff().is_none(),
+            "Should return None after max retries"
+        );
     }
 
     #[test]
@@ -487,7 +509,7 @@ mod tests {
         assert!(1 < max_attempts, "Attempt 1 should allow retry");
         assert!(2 < max_attempts, "Attempt 2 should allow retry");
         assert!(
-            !(3 < max_attempts),
+            3 >= max_attempts,
             "Attempt 3 should NOT allow retry (max reached)"
         );
     }
