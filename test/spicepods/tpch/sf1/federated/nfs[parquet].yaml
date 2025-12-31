@@ -1,0 +1,29 @@
+version: v1
+kind: Spicepod
+name: nfs[parquet]-federated
+datasets:
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/customer.parquet
+    name: customer
+    params: &nfs_params
+      file_format: parquet
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/lineitem.parquet
+    name: lineitem
+    params: *nfs_params
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/nation.parquet
+    name: nation
+    params: *nfs_params
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/orders.parquet
+    name: orders
+    params: *nfs_params
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/part.parquet
+    name: part
+    params: *nfs_params
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/partsupp.parquet
+    name: partsupp
+    params: *nfs_params
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/region.parquet
+    name: region
+    params: *nfs_params
+  - from: nfs://${env:NFS_HOST}/${env:NFS_EXPORT}/tpch/supplier.parquet
+    name: supplier
+    params: *nfs_params

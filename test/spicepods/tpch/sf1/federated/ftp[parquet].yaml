@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: ftp[parquet]-federated
+datasets:
+  - from: ftp://localhost/tpch/customer.parquet
+    name: customer
+    params: &ftp_params
+      file_format: parquet
+      ftp_user: user
+      ftp_pass: ${env:FTP_PASS}
+      ftp_port: 20021
+  - from: ftp://localhost/tpch/lineitem.parquet
+    name: lineitem
+    params: *ftp_params
+  - from: ftp://localhost/tpch/nation.parquet
+    name: nation
+    params: *ftp_params
+  - from: ftp://localhost/tpch/orders.parquet
+    name: orders
+    params: *ftp_params
+  - from: ftp://localhost/tpch/part.parquet
+    name: part
+    params: *ftp_params
+  - from: ftp://localhost/tpch/partsupp.parquet
+    name: partsupp
+    params: *ftp_params
+  - from: ftp://localhost/tpch/region.parquet
+    name: region
+    params: *ftp_params
+  - from: ftp://localhost/tpch/supplier.parquet
+    name: supplier
+    params: *ftp_params
