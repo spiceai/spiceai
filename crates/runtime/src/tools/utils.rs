@@ -21,13 +21,17 @@ use async_openai::{
         ChatCompletionRequestToolMessageArgs, FunctionCall,
     },
 };
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::Runtime;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::{Runtime, tools::catalog::SpiceToolCatalog};
 
+use super::builtin::catalog::BuiltinToolCatalog;
 use super::{Tooling, options::SpiceToolsOptions};
 use tools::{SpiceModelTool, rename::with_name};
 
@@ -82,8 +86,36 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
     }
 }
 
+/// Create a [`ResolvedTableAwareAllowlist`] from a list of dataset patterns.
+///
+/// Returns `None` if the list is empty.
+pub fn create_table_allowlist(datasets: &[String]) -> Option<ResolvedTableAwareAllowlist> {
+    if datasets.is_empty() {
+        return None;
+    }
+
+    match ResolvedTableAwareAllowlist::with_defaults(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        .with_table_patterns(datasets.to_vec())
+    {
+        Ok(allowlist) => Some(allowlist),
+        Err(e) => {
+            tracing::warn!("Failed to create table allowlist from model datasets: {e}");
+            None
+        }
+    }
+}
+
 #[must_use]
 pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dyn SpiceModelTool>> {
+    get_tools_with_allowlist(rt, opts, None).await
+}
+
+#[must_use]
+pub async fn get_tools_with_allowlist(
+    rt: Arc<Runtime>,
+    opts: &SpiceToolsOptions,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
+) -> Vec<Arc<dyn SpiceModelTool>> {
     let all_tools = rt.tools.read().await;
 
     let mut tools = vec![];
@@ -92,10 +124,29 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
     for tt in opts.tools_by_name() {
         if let Some((catalog_name, catalog_tool)) = tt.split_once(':') {
             if let Some(Tooling::Catalog(catalog)) = all_tools.get(catalog_name) {
+                let catalog = match (
+                    catalog.as_any().downcast_ref::<BuiltinToolCatalog>(),
+                    table_allowlist.clone(),
+                ) {
+                    (None, Some(_)) => {
+                        tracing::info!(
+                            "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{catalog_name}'"
+                        );
+                        Arc::clone(catalog)
+                    }
+                    (Some(builtin_catalog), Some(allowlist)) => Arc::new(
+                        builtin_catalog
+                            .clone()
+                            .with_table_allowlist(allowlist.clone()),
+                    )
+                        as Arc<dyn SpiceToolCatalog>,
+                    _ => Arc::clone(catalog),
+                };
+
                 if let Some(t) = catalog.get(catalog_tool).await {
                     tools.push(with_name(
                         &t,
-                        format!("{}/{}", catalog_name, t.name()).as_str(),
+                        format!("{catalog_name}/{}", t.name()).as_str(),
                     ));
                 } else {
                     tracing::warn!("Tool '{catalog_tool}' is not found in '{catalog_name}'.");
@@ -105,7 +156,26 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
                 missing_tools.push(tt);
             }
         } else if let Some(tool) = all_tools.get(tt) {
-            tools.extend(tool.tools().await);
+            if let Some(ref allowlist) = table_allowlist
+                && BuiltinToolCatalog::is_builtin_tool(tt)
+            {
+                if let Ok(t) = BuiltinToolCatalog::new(Arc::clone(&rt))
+                    .with_table_allowlist(allowlist.clone())
+                    .construct_builtin(tt, None, None, &HashMap::new())
+                {
+                    tools.push(t);
+                } else {
+                    tracing::warn!("Failed to construct tool '{tt}' with table allowlist.");
+                    missing_tools.push(tt);
+                }
+            } else {
+                if table_allowlist.is_some() {
+                    tracing::info!(
+                        "Table allowlist is only applicable to builtin catalog/tools. Allowlist will not be applied to '{tt}'"
+                    );
+                }
+                tools.extend(tool.tools().await);
+            }
         } else {
             missing_tools.push(tt);
         }
