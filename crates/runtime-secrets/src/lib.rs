@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "cluster")]
 pub use crate::stores::scheduler_rpc::ClusterSecretExpander;
-#[cfg(feature = "cluster")]
 use crate::stores::scheduler_rpc::SchedulerRPCSecretStore;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -87,7 +85,6 @@ impl Secrets {
         }
     }
 
-    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn new_for_cluster_executor(
         expander: Box<dyn crate::stores::scheduler_rpc::ClusterSecretExpander>,
@@ -252,7 +249,6 @@ pub enum SecretStoreType {
     Kubernetes(String),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(String),
-    #[cfg(feature = "cluster")]
     SchedulerRPC,
 }
 
@@ -301,7 +297,6 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
         "aws_secrets_manager" => Ok(SecretStoreType::AwsSecretsManager(require_selector(
             provider, selector,
         )?)),
-        #[cfg(feature = "cluster")]
         "scheduler_rpc" => {
             require_no_selector(provider, selector)?;
             Ok(SecretStoreType::SchedulerRPC)
@@ -401,7 +396,6 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 
             Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
         },
-        #[cfg(feature = "cluster")]
         SecretStoreType::SchedulerRPC => {
             Err(Error::UnableToLoadSecrets {
                 source: "The `scheduler_rpc` is automatically configured for cluster mode, and should not be specified in the Spicepod.".into()
