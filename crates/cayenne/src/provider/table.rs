@@ -155,7 +155,7 @@ pub struct CayenneTableProvider {
     /// Current snapshot ID, updated after compaction operations.
     ///
     /// This is separate from `table_metadata.current_snapshot_id` because compaction
-    /// creates a new snapshot but we don't want to modify the original TableMetadata.
+    /// creates a new snapshot but we don't want to modify the original `TableMetadata`.
     /// Uses `RwLock` for concurrent reads during normal operations with occasional
     /// writes on compaction. The lock is held briefly for string operations.
     current_snapshot_id: Arc<RwLock<String>>,
